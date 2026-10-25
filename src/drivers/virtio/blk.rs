@@ -51,6 +51,12 @@ enum Xfer<'a> {
 /// Whether a completion interrupt was armed at bring-up.
 static IRQ_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// How long a parked transfer waits for the wire before polling the ring
+/// once: four milliseconds, one tick — a lost line, not a slow device. Named
+/// against the clock the park answers (§6.24's rule), the same figure and
+/// reason the MMIO driver's wait carries.
+const WAIT_NS: u64 = 4_000_000;
+
 pub struct VirtioBlk {
     /// The device, behind a lock: a request needs the crate's `&mut`, and
     /// [`BlockDev`] hands out `&self` because a filesystem takes the whole
@@ -118,24 +124,42 @@ impl VirtioBlk {
         self.transfer((offset / SECTOR) as usize, Xfer::Write(buf));
     }
 
-    /// One transfer: submit non-blocking, park unmasked until the completion
-    /// interrupt answers, finish by polling if the wire goes quiet.
+    /// One transfer: claim the device, submit non-blocking, and **park the
+    /// task** until the completion interrupt answers.
     ///
-    /// The old shape held the device and the critical section for the *whole*
-    /// transfer - the crate's synchronous call spins on the used ring with
-    /// interrupts masked - which made the mask the device's own latency in a
-    /// unit the rest of the machine feels (§10.5). Now the submit is the only
-    /// masked part; the wait is the scheduler's interruptible park, ended by
-    /// the completion interrupt, a deadline (a lost wire), or a signal, in
-    /// that order of politeness. Boot context has no task to park, and a
-    /// transport without a line has nothing to wait for: both keep the
-    /// synchronous call, which is what this kernel shipped with.
+    /// The two earlier shapes are this file's history: the crate's synchronous
+    /// call spun masked for the device's whole latency (§10.5's mask), and the
+    /// first interrupt-driven cut waited by polling unmasked — because the
+    /// block layer's callers held the ext4 cache's borrow across the call, and
+    /// a parked task let a second walk into it (`RefCell already borrowed`,
+    /// measured). The cache parks holding nothing now, so the wait is the
+    /// scheduler's again: a parked transfer costs the machine nothing but the
+    /// descriptors, and every other task runs for the device's latency.
+    ///
+    /// The park is [`block_until_uninterruptible`]: the request and response
+    /// records sit on this frame and the device's descriptors name them, so a
+    /// fatal signal must not end the wait from inside it. A deadline answers
+    /// only a *lost wire* — one poll of the used ring per period, the old
+    /// shape's recovery, not a slow device's clock. Boot context has no task
+    /// to park, and a transport without a line has nothing to wait for: both
+    /// keep the synchronous call.
     fn transfer(&self, block: usize, mut xfer: Xfer<'_>) {
-        let irq_ok =
+        let parked =
             IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) && crate::sched::started();
-        if !irq_ok {
+        if !parked {
             self.transfer_sync(block, xfer);
             return;
+        }
+        let me = crate::sched::current();
+
+        // One transfer in flight per device: the mailbox is one flag and one
+        // waiter, and a submission under a parked one would clear the flag the
+        // first is sleeping on. The loser of the claim parks on the claim
+        // itself; `finish_request` wakes the queue when the transfer retires.
+        while !blk_irq::begin_request(me) {
+            if blk_irq::wait_for_device(me) {
+                crate::sched::block_until_uninterruptible(|| !blk_irq::busy());
+            }
         }
 
         let mut req = BlkReq::default();
@@ -143,11 +167,9 @@ impl VirtioBlk {
         // Submit under the device lock and the critical section, and leave
         // both before waiting: the interrupt that answers never needs the
         // device, so a parked reader holding neither is what lets the handler
-        // run at all. The mailbox is cleared in the same breath, because it is
-        // still holding the *previous* request's answer.
+        // run at all. The mailbox was cleared with the claim.
         let token = critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
-            blk_irq::begin_request();
             // SAFETY: the buffers are borrowed by the device from here until
             // the matching `complete_*` below; this task parks inside the call
             // holding neither reference, which is the crate's own contract.
@@ -164,24 +186,24 @@ impl VirtioBlk {
         let Some(token) = token else {
             // The ring was full: nothing is in flight, so the synchronous call
             // cannot collide with a parked one. It retires the request by
-            // polling, the way this driver always did.
+            // polling, the way this driver always did, and only then is the
+            // claim worth releasing.
             self.transfer_sync(block, xfer);
+            blk_irq::finish_request();
             return;
         };
 
-        // The wait: an unmasked poll for the mailbox the completion interrupt
-        // marks. Deliberately NOT a scheduler park — the block layer's callers
-        // hold non-reentrant borrows across this call, and a task that yielded
-        // here let a second task walk into the same borrow (measured:
-        // `RefCell already borrowed` in `vfs::ext4`). What the poll buys
-        // anyway is the whole point of the interrupt: the timer, the network
-        // and every other line keep arriving while the device works, where the
-        // old shape held ALL of them for the device's own latency.
-        loop {
+        // The wait: parked, uninterruptible, ended by the completion
+        // interrupt — with one poll per period for a wire that lost the wake.
+        let mut deadline = crate::hal::since_boot_nanos() + WAIT_NS;
+        while !blk_irq::completed() {
+            crate::sched::block_until_uninterruptible(|| {
+                blk_irq::completed() || crate::hal::since_boot_nanos() >= deadline
+            });
+            if blk_irq::completed() {
+                break;
+            }
             let done = critical_section::with(|cs| {
-                if blk_irq::completed() {
-                    return true;
-                }
                 let mut device = self.device.borrow(cs).borrow_mut();
                 if device.peek_used() == Some(token) {
                     // The wire lost the wake but the work is done: mark the
@@ -195,7 +217,7 @@ impl VirtioBlk {
             if done {
                 break;
             }
-            core::hint::spin_loop();
+            deadline = crate::hal::since_boot_nanos() + WAIT_NS;
         }
 
         critical_section::with(|cs| {
@@ -222,6 +244,7 @@ impl VirtioBlk {
                 panic!("virtio-blk reported a completion error");
             }
         });
+        blk_irq::finish_request();
     }
 
     /// The synchronous transfer, exactly as this driver shipped: one masked

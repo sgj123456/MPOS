@@ -114,23 +114,41 @@ enum Xfer<'a> {
 }
 
 impl MmioBlk {
-    /// One transfer: submit non-blocking, park unmasked until the completion
-    /// interrupt answers, finish by polling if the wire goes quiet - the same
-    /// shape the PCI driver's transfer runs, one transport over. A window
-    /// whose tree node named no line (line 0) keeps the synchronous call: the
-    /// machine's answer for a device that cannot interrupt is the shape this
-    /// kernel shipped with, not a park that never ends.
+    /// One transfer: claim the device, submit non-blocking, and **park the
+    /// task** until the completion interrupt answers - the same shape the PCI
+    /// driver's transfer runs, one transport over. The park is
+    /// `block_until_uninterruptible` for the reason the PCI transfer names:
+    /// the descriptors name this frame, so no signal may end the wait from
+    /// inside it. A window whose tree node named no line (line 0) keeps the
+    /// synchronous call: the machine's answer for a device that cannot
+    /// interrupt is the shape this kernel shipped with, not a park that never
+    /// ends.
     fn transfer(&self, block: usize, mut xfer: Xfer<'_>) {
-        if self.line == 0 {
+        if self.line == 0 || !crate::sched::started() {
+            // No line, or the boot context: a machine check reading the
+            // pattern image before any task exists has no task to park, and
+            // takes the synchronous call the pre-interrupt shape shipped
+            // with.
             self.transfer_sync(block, xfer);
             return;
+        }
+        let me = crate::sched::current();
+
+        // One transfer in flight per window, for the reason the mailbox's
+        // header carries: the loser of the claim parks on the claim itself,
+        // and `finish_request` wakes the queue when the transfer retires.
+        while !self.mailbox.begin_request(me) {
+            if self.mailbox.wait_for_device(me) {
+                crate::sched::block_until_uninterruptible(|| {
+                    !self.mailbox.busy.load(Ordering::Acquire)
+                });
+            }
         }
 
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let token = critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
-            self.mailbox.completed.store(false, Ordering::Release);
             // SAFETY: the buffers are borrowed by the device from here until
             // the matching `complete_*` below; this task parks inside the call
             // holding neither reference, which is the crate's own contract.
@@ -145,22 +163,26 @@ impl MmioBlk {
             result.ok()
         });
         let Some(token) = token else {
+            // The ring was full: nothing is in flight, so the synchronous call
+            // cannot collide with a parked one. It retires by polling, the way
+            // this driver always did, and only then is the claim released.
             self.transfer_sync(block, xfer);
+            self.mailbox.finish_request();
             return;
         };
 
-        // The wait: an unmasked poll for this device's mailbox, marked by the
-        // completion interrupt. Deliberately NOT a scheduler park — the block
-        // layer's callers hold non-reentrant borrows across this call, and a
-        // task that yielded here let a second task walk into the same borrow
-        // (measured: `RefCell already borrowed` in `vfs::ext4`). The timer and
-        // every other line keep arriving while the device works, where the old
-        // shape held ALL of them for the device's own latency.
-        loop {
+        // The wait: parked, uninterruptible, ended by this device's completion
+        // interrupt - with one poll per period for a wire that lost the wake.
+        let mut deadline = crate::hal::since_boot_nanos() + WAIT_NS;
+        while !self.mailbox.completed.load(Ordering::Acquire) {
+            crate::sched::block_until_uninterruptible(|| {
+                self.mailbox.completed.load(Ordering::Acquire)
+                    || crate::hal::since_boot_nanos() >= deadline
+            });
+            if self.mailbox.completed.load(Ordering::Acquire) {
+                break;
+            }
             let done = critical_section::with(|cs| {
-                if self.mailbox.completed.load(Ordering::Acquire) {
-                    return true;
-                }
                 let mut device = self.device.borrow(cs).borrow_mut();
                 if device.peek_used() == Some(token) {
                     // The wire lost the wake but the work is done: mark the
@@ -174,7 +196,7 @@ impl MmioBlk {
             if done {
                 break;
             }
-            core::hint::spin_loop();
+            deadline = crate::hal::since_boot_nanos() + WAIT_NS;
         }
 
         critical_section::with(|cs| {
@@ -200,6 +222,7 @@ impl MmioBlk {
                 panic!("virtio-blk over MMIO reported a completion error");
             }
         });
+        self.mailbox.finish_request();
     }
 
     /// The synchronous transfer, exactly as this driver shipped. Kept for the
@@ -256,12 +279,28 @@ impl BlockDev for MmioBlk {
 /// first device's line armed and unserviced: a storm of INTID 79s the boot
 /// check caught as "0 interrupts in 100 ms" while the timer sat pending
 /// behind the unserviced line's own priority.
+///
+/// The mailbox also arbitrates the device itself: one transfer in flight per
+/// window (`busy`), the claim the submitter takes and the retirer releases,
+/// and the queue of tasks waiting for the claim — because a submission under
+/// a parked one would clear the flag the first is sleeping on and retire
+/// against the wrong token. Nothing above asks for two in flight (§10.5
+/// dropped multi-request pipelining on that measurement); the queue exists so
+/// the second task *parks* rather than spins, and its bound is the task
+/// table's own, since a task registers once per wait.
 struct Mailbox {
     /// The device answered. Set by the interrupt handler, cleared by whoever
     /// submits the next request on *this* device.
     completed: AtomicBool,
     /// The parked submitter on this device, or 0.
     waiter: AtomicUsize,
+    /// Whether a transfer is in flight on this device: claimed at submit,
+    /// released when the request is retired.
+    busy: AtomicBool,
+    /// Tasks waiting for the device to go free, in arrival order. Touched
+    /// only by task context under the critical section - the handler never
+    /// reads it.
+    queue: Mutex<RefCell<Vec<usize>>>,
 }
 
 impl Mailbox {
@@ -269,6 +308,51 @@ impl Mailbox {
         Mailbox {
             completed: AtomicBool::new(false),
             waiter: AtomicUsize::new(0),
+            busy: AtomicBool::new(false),
+            queue: Mutex::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Claim the device for one transfer and clear this mailbox for it, or
+    /// report it taken. `me` is recorded as the waiter before the caller's
+    /// first look at `completed` - the lost-wakeup rule's own order. The
+    /// whole claim is one critical section, so a release interleaved between
+    /// the swap and the waiter store cannot admit a second submitter.
+    fn begin_request(&self, me: crate::sched::TaskId) -> bool {
+        critical_section::with(|_| {
+            if self.busy.swap(true, Ordering::AcqRel) {
+                return false;
+            }
+            self.completed.store(false, Ordering::Release);
+            self.waiter.store(me.0, Ordering::Release);
+            true
+        })
+    }
+
+    /// Register `me` as waiting for the device to go free. `false` answers
+    /// "already free - take it", so the caller re-runs its claim instead of
+    /// waiting for a wake that would never come.
+    fn wait_for_device(&self, me: crate::sched::TaskId) -> bool {
+        critical_section::with(|cs| {
+            if !self.busy.load(Ordering::Acquire) {
+                return false;
+            }
+            self.queue.borrow(cs).borrow_mut().push(me.0);
+            true
+        })
+    }
+
+    /// The retirer's half: the request is retired, this device is free. The
+    /// queued tasks are woken outside the critical section, the way every
+    /// wake is handed.
+    fn finish_request(&self) {
+        let queued = critical_section::with(|cs| {
+            self.busy.store(false, Ordering::Release);
+            self.waiter.store(0, Ordering::Release);
+            core::mem::take(&mut *self.queue.borrow(cs).borrow_mut())
+        });
+        for id in queued {
+            crate::sched::wake(crate::sched::TaskId(id));
         }
     }
 }

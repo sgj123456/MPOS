@@ -932,10 +932,63 @@ unarmed, the transfer spins masked and `lost` climbs to `predicted`, firing the 
 Measured, x86_64 `cargo xtask test`: the 64 MiB span read that used to mask for 9-46 ms
 now shows a loss at the window's edge, and the gate figures are x86_64
 `pass=205 fail=0`, aarch64 `pass=204 fail=0`, `mpos-kunit 32/0` on both, both arms green
-in one invocation. What stays named: **task-sleeping block I/O** — a transfer parking
-its task and the scheduler running other work — is the honest next shape, and it waits
-on the ext4 driver growing real re-entrancy (locks where RefCells stand), which is a
-vfs-layer change and not this row's.
+in one invocation.
+
+**Landed, the same day again (2026-10-25): the transfer parks its task, and the block
+layer grew the re-entrancy the park had been refused for.** The wait's own history is
+the section's argument in miniature: the masked spin was the device's whole latency
+held against the machine; the first interrupt-driven cut waited by *polling* unmasked,
+because a parked task let a second walk into the ext4 cache's borrow (`RefCell already
+borrowed`, measured); this landing removes the reason. `docs/notes/` §10.5's last named
+shape is in:
+
+* **The wait is the scheduler's uninterruptible park**
+  (`sched::task::block_until_uninterruptible` — this kernel's `TASK_UNINTERRUPTIBLE`).
+  A signal may not end a wait whose descriptors name the waiting frame: the fatal
+  signal stays pending and acts at the syscall gate, one frame later, Linux's own
+  order (`wait_on_buffer` sleeps in `D` state and `SIGKILL` waits for the I/O). A
+  4 ms deadline answers a *lost wire* — one poll of the used ring per period, the
+  old shape's recovery — never a slow device's clock.
+* **One transfer in flight per device.** The completion mailbox is one flag and one
+  waiter; a submission under a parked one would clear the flag the first is sleeping
+  on and retire against the wrong token. So the mailbox also arbitrates: a claim
+  taken at submit, released at retire, and a wait list the losing claimant parks on
+  — the second task sleeps instead of spins, and the list's bound is the task
+  table's own. Nothing above asks for two in flight (§10.5 dropped pipelining on
+  that measurement); the claim is the shape that makes one-in-flight a *rule*
+  instead of an accident of polling.
+* **The ext4 cache claims; no borrow of it spans a device call.** A slot carries a
+  *loading* claim now: the claimant picks its way out of eviction's reach, takes the
+  fill (or run) scratch out of the cache, releases the borrow, parks on the device,
+  and lands the bytes under a fresh borrow (`vfs::ext4::cache`'s `FillClaim`/`RunClaim`;
+  the host suite pins the machinery — a claim in flight is not a hit and not a
+  victim, the scratch serves one claim at a time, a run claims every way its span
+  touches *ready ones included*, because a slot left serving hits could be evicted
+  before the scatter and the transfer's bytes would land on a stranger). A second
+  asker of the same block finds the claim and waits for it instead of reading the
+  device twice — the buffer lock Linux carries as `BH_Lock`, in the only form a
+  `RefCell` cache can serve it. `update_block` copies the page out before the write,
+  because a write is a device call too; write-through keeps its meaning — the disk
+  holds every modification before the call returns.
+* **The parked transfer's cost during device latency is now the scheduler's to
+  spend.** That is the claim, and the pin is `t-blk-sleep`: a forked sibling spins a
+  counter in a shared page; the parent makes 64 one-sector raw reads and counts how
+  many of them the counter moved across. The probe is one *sector* — a window an
+  order of magnitude under the tick — because the confound is a tick landing inside
+  a probe, and the first cut's 64 KiB probes (a window ~a tick wide under TCG)
+  measured **33 hits of 64 on the non-parking shape**: the tick got in through the
+  read's own duration half the time. One sector collapses it; the bound (40 of 64)
+  sits far from both the parked rate (64 of 64, measured on the first machine) and
+  the non-parked rate (33 of 64 on the second, before this landed — the
+  counterfactual, measured and not assumed). The scheduler-side machinery also has
+  its boot-side witness: `drivers::kunit`'s 64 MiB read parks the boot task now, and
+  its `lost() <= 1` claim passes with it.
+
+Gate figures for this landing: x86_64 `pass=206 fail=0`, aarch64 `pass=205 fail=0`
+(the new program on both arms), `mpos-kunit 32/0` both. What stays named of §10.5's
+block row: nothing — multi-request pipelining stays *dropped* (nothing above asks
+for two in flight, and the claim now says so by design), and task-sleeping block I/O
+is this landing.
 
 **The first machine's figure landed (2026-10-24): the PCI transport is counted in its own
 sweep now, over the disk it had there all along.** The named gap above closes not by

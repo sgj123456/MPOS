@@ -1295,6 +1295,19 @@ are not restated in the phase sections above.
         Measured after: `boot-aarch64` full chain + `INIT_EXITED`; aarch64 sweep `pass=28 fail=0`;
         x86 gate `pass=159 fail=0 (159 built)` exit 33; `alpine-aarch64` exit 0 at `mpos login:`
         with no `[ !! ]` line; `depgraph` within the ratchet; fmt clean.
+  - [ ] 13.32 **observed, not diagnosed**: the boot's EL0 check died once under a load it does not
+        control. 2026-10-25, one lane of a four-lane aarch64 sweep arm (the three sibling lanes and
+        two later arms - one at the same tree, one at its predecessor - all green): after the
+        check's own `EL0: root … active, program at 0x200000 (40 bytes)` line, a synchronous data
+        abort, `ESR_EL1 0x96000047` (EC 0x25, from EL0), `FAR_EL1 0xffffffff802cd000` - the first
+        page past `kernel_end`, and `ELR_EL1` inside `pl011`'s print loop, whose instruction at
+        that address (`tbz`, on a register) cannot be the aborting access. So the dump is not
+        trustworthy at face value: the fault's own report was written by a path whose state is
+        already suspect, and the reading to trust is only the *shape* - a kernel-half address one
+        page past the image, reached from the probe program's exception level. Nothing in the
+        block-path landing of the same day runs before the scheduler, and the crash did not
+        reproduce across two later full arms; the discipline is §6.22's - an observation with its
+        readings, a re-run before believing it, and a second reading as where any diagnosis starts.
   - [x] 13.19 `reboot(2)` answers Linux's shape on **both** machines - two mechanisms behind one
         symptom, and the symptom was on every aarch64 boot.
         **What was seen.** `mpos: syscall 142 -> ENOSYS`, once, between the kernel's handoff and the

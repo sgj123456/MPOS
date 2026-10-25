@@ -110,6 +110,49 @@ pub(crate) use self::super_block::{
     ROCOMPAT_METADATA_CSUM, STATE_VALID_FS,
 };
 
+/// The parking half of a claim, split the way this tree's other
+/// host-compiled waiters are split (`eventfd`'s, `mqueue`'s): on the
+/// machine, a claim's wait is the scheduler's uninterruptible park, the
+/// identity is the waiting task's, and a claim's end wakes the tasks
+/// parked on it. On the host there is no scheduler and no second task,
+/// so no claim is ever in flight behind another, and the doors answer
+/// the degenerate forms - a wait whose condition holds on the first
+/// look, a placeholder identity, a wake with nobody to wake.
+mod claim_park {
+    // `TaskId` is the claim's currency on both builds; the `sched` paths
+    // exist only on the machine, and the bodies name them in full so the
+    // host build imports nothing it cannot use.
+    use crate::sched::policy::TaskId;
+
+    pub(super) fn me() -> TaskId {
+        #[cfg(target_os = "none")]
+        return crate::sched::current();
+        #[cfg(not(target_os = "none"))]
+        return TaskId(0);
+    }
+
+    /// Wait for a claim to end. Uninterruptible on the machine for the
+    /// reason every claim wait is: the task that would end it cannot be
+    /// interrupted mid-transfer either, so the wait has no other end.
+    pub(super) fn wait(cond: impl Fn() -> bool) {
+        #[cfg(target_os = "none")]
+        crate::sched::block_until_uninterruptible(cond);
+        #[cfg(not(target_os = "none"))]
+        while !cond() {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub(super) fn wake(ids: alloc::vec::Vec<TaskId>) {
+        for id in ids {
+            #[cfg(target_os = "none")]
+            crate::sched::wake(id);
+            #[cfg(not(target_os = "none"))]
+            let _ = id;
+        }
+    }
+}
+
 /// The filesystem state shared by every inode of one mount.
 struct Core {
     dev: Arc<dyn BlockDev>,
@@ -261,6 +304,168 @@ impl Core {
     }
 
     // ---- cache primitives ----
+    //
+    // The rule every one of them keeps: **no borrow of the cache spans a
+    // device call.** A transfer parks its task, and a borrow held across a
+    // park is the `RefCell already borrowed` a second task dies of. A miss
+    // is therefore a *claim*: the slot is taken out of eviction's reach, the
+    // scratch is taken out of the cache, the borrow ends, the device works,
+    // and the bytes land under a fresh borrow. A block someone else's claim
+    // is already carrying is waited for, not read twice - the buffer lock
+    // Linux carries as `BH_Lock`.
+
+    /// Run `f` on `block`'s page, resident by the time it runs.
+    ///
+    /// [`Self::ensure_block`] is the whole of the work - the wait, the
+    /// claim, the device call - and this is the copy-out under the borrow
+    /// that follows it. Nothing between the two yields, so on one core the
+    /// block is where the ensure left it.
+    fn cached_block<R>(&self, block: u64, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.ensure_block(block);
+        critical_section::with(|cs| {
+            let mut cache = self.cache.borrow(cs).borrow_mut();
+            let at = cache
+                .ready(block)
+                .expect("ensure_block left the block resident");
+            // The hit is dated, or "least recently used" would be "first
+            // loaded" and the hot block would lose to a scan - the read
+            // count the cache's own tests pin starts with this line.
+            cache.touch(at);
+            f(cache.page(at))
+        })
+    }
+
+    /// Make `block` resident, whatever it takes. The wait conditions read
+    /// the cache through their own borrow, which is the ordinary case.
+    fn ensure_block(&self, block: u64) {
+        enum Step {
+            Ready,
+            /// Someone else's claim: park on it.
+            Wait,
+            /// The fill scratch is out with another claim: park on that.
+            WaitScratch,
+            /// No free way in the block's set - every way is carrying a
+            /// claim. Unreachable while the two scratches are all the claims
+            /// there can be, and answered honestly anyway.
+            WaitSet,
+            /// Our claim: read the device into it, outside every borrow.
+            Go(cache::FillClaim),
+        }
+        loop {
+            let step = critical_section::with(|cs| {
+                let mut cache = self.cache.borrow(cs).borrow_mut();
+                if cache.ready(block).is_some() {
+                    return Step::Ready;
+                }
+                if let Some(at) = cache.loading(block) {
+                    cache.wait_on(at, claim_park::me());
+                    return Step::Wait;
+                }
+                if cache.fill_busy() {
+                    return Step::WaitScratch;
+                }
+                match cache.begin_fill(block, self.block_size()) {
+                    Some(claim) => Step::Go(claim),
+                    None => Step::WaitSet,
+                }
+            });
+            match step {
+                Step::Ready => return,
+                Step::Wait => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.loading(block).is_some()));
+                }
+                Step::WaitScratch => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.fill_busy()));
+                }
+                Step::WaitSet => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.set_in_flight(block)));
+                }
+                Step::Go(mut claim) => {
+                    self.dev.read_at(claim.offset(), claim.scratch_mut());
+                    let woken = critical_section::with(|cs| {
+                        let mut cache = self.cache.borrow(cs).borrow_mut();
+                        cache.end_fill(claim)
+                    });
+                    // Outside every lock, the way every wake is handed.
+                    claim_park::wake(woken);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Make the contiguous run starting at `block` resident in one device
+    /// call where the width allows - [`Self::ensure_block`] for a run, with
+    /// the same waits and the same rule. `want` is the caller's own demand;
+    /// the width it names is clamped by the device and by the cache's
+    /// scratch, and a clamped-to-one run *is* [`Self::ensure_block`].
+    fn ensure_run(&self, block: u64, want: usize) {
+        let width = self.with_cache(|cache| cache.run_width(&*self.dev, want, self.block_size()));
+        if width <= 1 {
+            self.ensure_block(block);
+            return;
+        }
+        enum Step {
+            Ready,
+            /// Someone else's claim on the head block: park on it.
+            Wait,
+            /// The run scratch is out with another claim: park on that.
+            WaitScratch,
+            /// Some way of one of the run's sets is in flight: no free way
+            /// for the span. Unreachable while two scratches are all the
+            /// claims there are, and answered anyway.
+            WaitSet,
+            /// Our claim: one device call into its scratch, outside every
+            /// borrow.
+            Go(cache::RunClaim),
+        }
+        loop {
+            let step = critical_section::with(|cs| {
+                let mut cache = self.cache.borrow(cs).borrow_mut();
+                if cache.ready(block).is_some() {
+                    return Step::Ready;
+                }
+                if let Some(at) = cache.loading(block) {
+                    cache.wait_on(at, claim_park::me());
+                    return Step::Wait;
+                }
+                if cache.run_busy() {
+                    return Step::WaitScratch;
+                }
+                match cache.begin_run(&*self.dev, block, want, self.block_size()) {
+                    Some(claim) => Step::Go(claim),
+                    None => Step::WaitSet,
+                }
+            });
+            match step {
+                Step::Ready => return,
+                Step::Wait => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.loading(block).is_some()));
+                }
+                Step::WaitScratch => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.run_busy()));
+                }
+                Step::WaitSet => {
+                    claim_park::wait(|| !self.with_cache(|cache| cache.set_in_flight(block)));
+                }
+                Step::Go(mut claim) => {
+                    self.dev.read_at(claim.offset(), claim.scratch_mut());
+                    let woken = critical_section::with(|cs| {
+                        let mut cache = self.cache.borrow(cs).borrow_mut();
+                        cache.end_run(claim)
+                    });
+                    // Outside every lock, the way every wake is handed.
+                    claim_park::wake(woken);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The cache, for a read-only question asked outside the claim loops.
+    fn with_cache<R>(&self, f: impl FnOnce(&cache::Cache) -> R) -> R {
+        critical_section::with(|cs| f(&self.cache.borrow(cs).borrow()))
+    }
 
     fn read_bytes(&self, block: u64, off: usize, dst: &mut [u8]) {
         let block_size = self.block_size();
@@ -288,9 +493,7 @@ impl Core {
             dst.fill(0);
             return;
         }
-        critical_section::with(|cs| {
-            let mut cache = self.cache.borrow(cs).borrow_mut();
-            let page = cache.slot(&*self.dev, block, block_size);
+        self.cached_block(block, |page| {
             dst.copy_from_slice(&page[off..off + dst.len()]);
         });
     }
@@ -307,27 +510,28 @@ impl Core {
     /// that was not asked for.
     fn read_run(&self, block: u64, run: usize, in_block: usize, dst: &mut [u8]) {
         let block_size = self.block_size();
-        critical_section::with(|cs| {
-            let mut cache = self.cache.borrow(cs).borrow_mut();
-            let head = (block_size - in_block).min(dst.len());
-            {
-                let page = cache.slot_run(&*self.dev, block, run, block_size);
-                dst[..head].copy_from_slice(&page[in_block..in_block + head]);
-            }
-            // The rest of the run is resident already, so these are hits; the
-            // borrow above ends first because a slot's slice may not outlive the
-            // cache call that follows it.
-            let mut at = head;
-            for i in 1..run {
-                if at >= dst.len() {
-                    break;
-                }
-                let take = block_size.min(dst.len() - at);
-                let page = cache.slot(&*self.dev, block + i as u64, block_size);
-                dst[at..at + take].copy_from_slice(&page[..take]);
-                at += take;
-            }
+        let head = (block_size - in_block).min(dst.len());
+        // The head block and the whole of the contiguous run it asks for, in
+        // one device call where the width allows - the claim made, the device
+        // worked and the scatter landed before any of this runs, so every
+        // block below is a hit.
+        self.ensure_run(block, run);
+        self.cached_block(block, |page| {
+            dst[..head].copy_from_slice(&page[in_block..in_block + head]);
         });
+        // The rest of the run: resident already where the run covered it, and
+        // a one-block demand past its width, exactly as before.
+        let mut at = head;
+        for i in 1..run {
+            if at >= dst.len() {
+                break;
+            }
+            let take = block_size.min(dst.len() - at);
+            self.cached_block(block + i as u64, |page| {
+                dst[at..at + take].copy_from_slice(&page[..take]);
+            });
+            at += take;
+        }
     }
 
     /// How far the **contiguous device run** beginning at `logical` goes, up to
@@ -363,9 +567,6 @@ impl Core {
         })
     }
 
-    /// Run `f` over a cached block; write back through the device only if `f`
-    /// reports a modification. Write-through in one step: the disk never
-    /// trails the cache.
     fn update_block(&self, block: u64, f: impl FnOnce(&mut [u8]) -> bool) -> bool {
         debug_assert!(
             self.block_is_live(block),
@@ -380,17 +581,36 @@ impl Core {
             return false;
         }
         let block_size = self.block_size();
-        critical_section::with(|cs| {
+        // Residency first, edit second - and nothing between them yields:
+        // this task keeps the core from [`ensure_block`]'s return through the
+        // borrow below, and on one core that is the whole guarantee that the
+        // block is still where the ensure left it.
+        self.ensure_block(block);
+        let modified = critical_section::with(|cs| {
             let mut cache = self.cache.borrow(cs).borrow_mut();
-            let dev = self.dev.clone();
-            let page = cache.slot(&*self.dev, block, block_size);
-            if f(page) {
-                dev.write_at(block * block_size as u64, page);
+            let at = cache
+                .ready(block)
+                .expect("ensure_block left the block resident");
+            let page = cache.page_mut(at);
+            if f(page) { Some(page.to_vec()) } else { None }
+        });
+        match modified {
+            // `f` declined to modify.
+            None => false,
+            Some(bytes) => {
+                // The device call, with no borrow of the cache anywhere in
+                // this frame: the transfer may park, and a second task may
+                // walk into the cache while it does. The disk holds every
+                // modification before this returns, which is the whole of
+                // write-through; what the seam between edit and write adds is
+                // only a window in which a concurrent reader sees the new
+                // cache bytes a few microseconds before the disk has them - a
+                // window two writers of the same block were racing across
+                // anyway.
+                self.dev.write_at(block * block_size as u64, &bytes);
                 true
-            } else {
-                false
             }
-        })
+        }
     }
 
     fn write_bytes(&self, block: u64, off: usize, src: &[u8]) {

@@ -35,7 +35,7 @@ A bare `§N` (no `.M`) means the whole phase — file N's top section. A `(§N)`
 
 ## Exceptions worth knowing before you grep
 
-- **§13.1–§13.31**: the numbered *entries* are checklist items in
+- **§13.1–§13.32**: the numbered *entries* are checklist items in
   [appendix-status-board.md](appendix-status-board.md); [13-machine-seam.md](13-machine-seam.md) holds
   the phase's plan and measured starting state (§13.x as table rows). Search both.
 - **§15.10–§15.86**: these entries are table rows inside [15-boot-flow.md](15-boot-flow.md), not

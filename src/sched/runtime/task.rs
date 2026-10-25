@@ -2663,6 +2663,44 @@ pub fn block_until_interruptible_rolling_back(cond: impl Fn() -> bool) -> WaitEn
     }
 }
 
+/// Block until `cond` is true — with **no way out but the condition**.
+///
+/// This is Linux's `TASK_UNINTERRUPTIBLE`, the state `ps` prints as `D`, and
+/// it exists here for the same callers Linux gives it to: a task with an
+/// operation **in flight on a device**. Every other wait in this file answers
+/// a signal somehow — a fatal one by dying inside the park — and for a caller
+/// that took nothing that is right. A transfer is not that caller: its request
+/// and response records live on its own stack, and the device is reading or
+/// writing through descriptors that name that stack. A fatal exit mid-wait
+/// would free the frame under the DMA, leave the mailbox's waiter id naming a
+/// corpse, and strand the in-flight request where no one will ever retire it —
+/// so the wait ignores signals entirely and they stay pending until the
+/// transfer is done, at which point the syscall gate finds them and acts, the
+/// same one-frame-later death every other wait takes. Linux's own order:
+/// `wait_on_buffer` sleeps uninterruptibly, and `SIGKILL` waits for the I/O.
+///
+/// The condition is re-checked inside `schedule`'s closure — the second look
+/// every wait here takes — so a waker that runs between the first check and
+/// the sleep cannot lose its wake: the waker's `wake` needs the task table the
+/// sleeper holds for that second look, so it finds the task either already
+/// asleep or already requeued on a true condition.
+pub fn block_until_uninterruptible(cond: impl Fn() -> bool) {
+    loop {
+        if cond() {
+            return;
+        }
+        schedule(|t| {
+            if cond() {
+                t.requeue_current();
+            } else {
+                let id = t.current;
+                let priority = t.task(id).priority;
+                t.sched.sleep(id, priority, u64::MAX);
+            }
+        });
+    }
+}
+
 pub fn pause() -> ! {
     block_until(|| false);
     unreachable!("a task blocked on `false` is only ever woken to die")

@@ -296,7 +296,7 @@ One-glance status of the whole roadmap.
 - [ ] [~] 10.2 context-switch/fork cost — lazy FPU, one TLB flush, smaller stacks; PCID recorded as a decision (§10.2)
 - [ ] [~] 10.3 syscall path — itimer flag landed; fault-driven user-buffer copy not (§10.3)
 - [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement is recorded (§10.4)
-- [ ] [~] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; interrupt-driven completions measured and re-scoped, multi-request pipelining dropped; the PCI transport counted in its own sweep now (`t-diskbench`'s spare-disk pass, §10.5)
+- [x] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; completions interrupt-driven and the transfer **parking its task** (the ext4 cache claims its slots around the device call; `t-blk-sleep` pins the yield on both machines); multi-request pipelining dropped; the PCI transport counted in its own sweep (`t-diskbench`'s spare-disk pass, §10.5)
 - [x] 10.6 serial TX ring · [x] 10.7 sub-tick sleeps — a deadline is a nanosecond one
   now, and the first machine wakes a wait *between* two clock ticks from the LAPIC's
   one-shot: fifty 1 ms sleeps are 52-59 ms instead of 200 ms, a 25 ms sleep is 25.1 ms
@@ -411,12 +411,18 @@ In the order that keeps each step verifiable on its own:
    tracee reads `-ENOSYS` - while a write at the *exit* stop is a no-op, and the ordering the  
    redirect implies is Linux's too (a `SECCOMP_RET_ERRNO` filter judges the number the tracer  
    wrote, not the one the program asked for). Nothing of the number slot stays unnamed (§8.2).
-2. **interrupt-driven block completions** (§10.5's last row) — **landed** (2026-10-25): both  
-   virtio-blk drivers submit non-blocking and wait on a completion interrupt (x86_64 MSI-X on  
-   vector 0x42; aarch64 each MMIO window's own tree-named SPI through `arm_block_line`), the  
-   masked window a read holds collapsed from the device's latency to the submit/retire edge, and  
-   `drivers::kunit`'s pin flipped to "a wide read no longer holds the machine". What stays named:  
-   task-sleeping block I/O waits on the ext4 driver growing real re-entrancy (§10.5).
+2. **interrupt-driven block completions** (§10.5's last row) — **landed, in two steps, both  
+   2026-10-25**: both virtio-blk drivers submit non-blocking and wait on a completion interrupt  
+   (x86_64 MSI-X on vector 0x42; aarch64 each MMIO window's own tree-named SPI through  
+   `arm_block_line`), the masked window a read holds collapsed from the device's latency to the  
+   submit/retire edge, and `drivers::kunit`'s pin flipped to "a wide read no longer holds the  
+   machine". The same day, the wait became the scheduler's **uninterruptible park** — the ext4  
+   cache grew the re-entrancy the park was refused for (a slot *claim* per miss, per-device  
+   transfer serialization in the mailbox, no borrow spanning a device call — §10.5 carries the  
+   whole measurement) — and the machine-side pin is `t-blk-sleep`: a sibling's counter moves  
+   inside one-sector device calls (64 of 64 parked, 1 of 64 on the non-parking shape, measured  
+   both ways). What stays named of the row: nothing; multi-request pipelining stays dropped  
+   until something above asks for two in flight.
 3. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor  
    queue is configured when the device has one, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted  
    with `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding or moving the plane hands the  
@@ -465,8 +471,9 @@ syscalls, signals, filesystems, networking, memory, devices and security, with t
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
 section states direction only: the frontier is the two namespace kinds with no entry left (IPC and
 cgroup), the second compositor family (the wlroots one, whose first compositor to come up here is
-still unfound — `sway` binds no IPC socket and the GL card is already Mesa's, §7.4), the block
-layer's completion path, and closing the remaining ABI gaps below.
+still unfound — `sway` binds no IPC socket and the GL card is already Mesa's, §7.4), and closing
+the remaining ABI gaps below. The block layer's completion path is off this list: completions
+are interrupt-driven and the transfer parks its task (§10.5, 2026-10-25).
 
 ---
 
