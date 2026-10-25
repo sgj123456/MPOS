@@ -97,7 +97,13 @@ One-glance status of the whole roadmap.
   `struct clone_args` and `CLONE_PIDFD`, so a process and a descriptor naming it
   come back in one call (no `pidfd_open` window); `stack` is the child region's
   **base**, the size decides which fields exist, and `CLONE_DETACHED` is refused
-  as Linux's own `clone3` refuses it (§6.10, item 94)
+  as Linux's own `clone3` refuses it (§6.10, item 94) — and the struct's last
+  word, `cgroup`, is served now too: `CLONE_INTO_CGROUP` is `EBADF` for a node
+  that is not a cgroup directory, `ENOENT` for a removed group or one outside
+  the caller's cgroup namespace, `EACCES` from the common ancestor's
+  `cgroup.procs`, `EOPNOTSUPP` beside `CLONE_THREAD`, and the child (and its own
+  fork) is born in the group the descriptor names, with `CLONE_NEWCGROUP` rooted
+  at that group (§6.26, item 105)
 - [x] an anonymous descriptor has no file type — `eventfd`, `timerfd`, `signalfd`,
   `epoll`, `inotify` and `pidfd` report `st_mode` with the `S_IF*` bits clear
   (`0600`, or `0700` for a pidfd), `/proc/self/fd` reads back its own
@@ -480,8 +486,8 @@ section states direction only: the frontier is the second compositor family (the
 whose first compositor to come up here is still unfound — `sway` binds no IPC socket and the GL
 card is already Mesa's, §7.4) and closing the remaining ABI gaps below. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
-parking its task, §10.5) and the namespace ladder (all eight kinds of `namespaces(7)` served,
-§6.25).
+parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
+§6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).
 
 ---
 
@@ -494,9 +500,41 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
 shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
 and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
-fragments IP; the one namespace kind with no entry at all is cgroup - IPC's four families
-(§6.12-§6.15) and the namespace object that isolates them (§6.16) are all
-served, so cgroup waits alone, on the tree it would hold.  
+fragments IP. The namespace ladder has no rung left - all eight kinds of
+`namespaces(7)` are served, cgroup's last (§6.25) - and `clone3`'s struct has no
+unserved word left either: `CLONE_INTO_CGROUP` names a group now that the tree
+exists to name (§6.26, item 105).
+
+**The child is born in the group a descriptor names: `CLONE_INTO_CGROUP`**
+(`docs/uapi/` §5.1 item 105, landed 2026-10-25). The last unserved word of
+`struct clone_args`, and the one §6.10 deferred honestly - *there is no cgroup
+tree here for a descriptor to name* - which stopped being true when the tree
+landed the day before. Measured whole on a current host first
+(`.workbuddy/probe_clone3_cgroup*.c`, Linux 7.2.11): the child and its own fork
+read the target's path while the caller's line stays put; only a **group
+directory** is a target (a file, a directory on another filesystem, a cgroup
+attribute file and an fd that names nothing are `EBADF`, `O_PATH` is served); a
+group removed after the descriptor was opened is `ENOENT`; `CLONE_THREAD` beside
+the flag is `EOPNOTSUPP` into any group; an unprivileged caller is `EACCES`, and
+the question is the **first common ancestor's** `cgroup.procs` - a world-writable
+target under a root the caller may not write is still `EACCES`,
+`CAP_DAC_OVERRIDE` answers it and `CAP_DAC_READ_SEARCH` alone does not;
+`CLONE_NEWCGROUP` beside the flag roots the new namespace at the **child's own
+group**; a target outside the caller's cgroup namespace is `ENOENT`; and
+`clone(2)` accepts the bit and ignores it, as Linux does. Served by
+`vfs::cgroupfs::clone_target` (the tree's answer: `EBADF`/`ENOENT`/`EACCES`),
+`may_attach` (the common-ancestor DAC question), `proc::handle_clone3` (resolve
+the fd, after every field rule - the measured order) and the spawn's `join_group`
+inside the same critical section as the inheritance. The measurement also closed
+a pre-existing divergence: the tree **reported** Linux's modes and policed
+nothing, so `CgDir`/`CgFile` now keep them (a `0644` `cgroup.procs` is a gate,
+as kernfs's is; procfs/sysfs stay reports, and the difference is recorded).
+Pins: `t-cgroupfs` grows the tree half (12 claims, 26 → 38), `t-clone` the `clone(2)`
+half, `t-clone3`'s `EBADF` claim is reworded to what it measured, and four host
+tests hold the modes, the descriptor's three answers and the path questions in
+`vfs::cgroupfs`. Named: the cgroup namespace's **mount** view is still the
+machine's (the prior rung's divergence), and the tree has no delegation, so a
+nested namespace owner is refused where Linux would let it through (§6.26).
 
 **A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
 (`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a

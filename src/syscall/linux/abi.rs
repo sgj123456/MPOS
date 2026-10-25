@@ -1616,6 +1616,14 @@ pub(crate) fn validate_clone_flags(
         // at 0x80, inside the byte that carries the exit signal, so the mask
         // strips it and the signal check sees 128. That is Linux's own
         // arrangement (`clone` has no `CLONE_NEWTIME`; `unshare` does).
+        // `CLONE_INTO_CGROUP` is `clone3`'s bit alone: `clone(2)` has no
+        // cgroup descriptor argument to pass with it, and Linux **accepts and
+        // ignores** it there rather than refusing the word (measured,
+        // `.workbuddy/probe_clone3_cgroup.c`: a `clone(2)` whose flag word
+        // carries the bit starts an ordinary child, placed where its parent
+        // is grouped). Refusing it would be an `EINVAL` Linux does not answer;
+        // the bit means something only through [`clone3_verdict`].
+        | crate::syscall::linux::nr::CLONE_INTO_CGROUP
         | crate::syscall::linux::nr::CLONE_NAMESPACES;
     if flags & !KNOWN != 0 {
         return Err(err::EINVAL);
@@ -1771,6 +1779,11 @@ pub struct Clone3Plan {
     pub tls: usize,
     /// The user address the new pidfd goes to, when `CLONE_PIDFD` is set.
     pub pidfd: usize,
+    /// The descriptor naming the group the child is to be born in, when
+    /// `CLONE_INTO_CGROUP` is set. Resolving it needs the caller's file table,
+    /// which is the *handler's* (and only the machine's), so the word travels
+    /// here and the handler answers what it names.
+    pub cgroup: usize,
 }
 
 /// Decide what a `clone3` argument struct asks for, before anything is created.
@@ -1796,10 +1809,17 @@ pub struct Clone3Plan {
 ///   `pidfd == parent_tid` is `EINVAL`, and different destinations (a zero
 ///   `parent_tid` among them) are served - measured, and the reason the first
 ///   draft's unconditional refusal was wrong.
-/// * `CLONE_INTO_CGROUP` is `EBADF`: every descriptor this machine can pass is
-///   not a cgroup, which is exactly Linux's answer for one that is not
-///   (`cgroup_get_from_fd`), and there is no cgroup tree here for a descriptor
-///   to name.
+/// * `CLONE_INTO_CGROUP` **is** served, and it is the one bit whose answer is
+///   not in this file alone: the flag says the child is born in the group a
+///   descriptor names, so the *handler* resolves the descriptor (the caller's
+///   file table is there) and answers `EBADF`/`ENOENT`/`EACCES` for it -
+///   [`crate::vfs::cgroupfs::clone_target`] carries the measurement. The two
+///   rules that are the flag word's are here: **beside `CLONE_THREAD` it is
+///   `EOPNOTSUPP`** - a thread joins its group's cgroup, so there is no
+///   target to choose (measured: both a different group and the caller's own
+///   answer `EOPNOTSUPP`) - and the descriptor is looked at *after* every
+///   field rule below, which is the measured order (a bad descriptor beside
+///   `exit_signal` 99 is `EINVAL`, not `EBADF`).
 /// * `CLONE_CLEAR_SIGHAND` resets the child's handler table to `SIG_DFL`,
 ///   where the same child without it inherits the parent's dispositions -
 ///   Linux's `copy_sig` rule, measured on a current host
@@ -1856,8 +1876,14 @@ pub fn clone3_verdict(args: &CloneArgs) -> Result<Clone3Plan, isize> {
     if flags & n::CLONE_THREAD != 0 && (flags & n::CLONE_SIGHAND == 0 || flags & n::CLONE_VM == 0) {
         return Err(err::EINVAL);
     }
-    if flags & n::CLONE_INTO_CGROUP != 0 {
-        return Err(err::EBADF);
+    // `CLONE_INTO_CGROUP` names a group for a *process*: a thread joins its
+    // group's cgroup and cannot be given another one, which Linux answers
+    // `EOPNOTSUPP` for - measured with a target that differs from the
+    // caller's group and with one that does not, both refused
+    // (`.workbuddy/probe_clone3_cgroup.c`, Linux 7.2.11). The descriptor
+    // itself is resolved by the handler, after every field rule below.
+    if flags & n::CLONE_INTO_CGROUP != 0 && flags & n::CLONE_THREAD != 0 {
+        return Err(err::EOPNOTSUPP);
     }
     // Linux's `clone3` check: clearing the table and sharing it are opposite
     // requests. Measured on a current host: `CLEAR|SIGHAND` is `EINVAL`, with
@@ -1905,6 +1931,7 @@ pub fn clone3_verdict(args: &CloneArgs) -> Result<Clone3Plan, isize> {
         child_tid: args.child_tid as usize,
         tls: args.tls as usize,
         pidfd: args.pidfd as usize,
+        cgroup: args.cgroup as usize,
     })
 }
 
@@ -4394,10 +4421,24 @@ mod tests {
         assert!(clone3_verdict(&with(n::CLONE_PARENT_SETTID | n::CLONE_VM, 0)).is_ok());
         assert!(clone3_verdict(&with(n::CLONE_CHILD_CLEARTID | n::CLONE_VM, 0)).is_ok());
 
-        // No descriptor can name a cgroup here.
+        // `CLONE_INTO_CGROUP` is the flag word's own answer only as far as
+        // `EOPNOTSUPP` beside a thread: the descriptor is the handler's
+        // question, and the plan carries the word for it.
+        let into = CloneArgs {
+            flags: n::CLONE_INTO_CGROUP as u64,
+            cgroup: 7,
+            ..Default::default()
+        };
+        assert_eq!(clone3_verdict(&into).map(|p| p.cgroup), Ok(7));
         assert_eq!(
-            clone3_verdict(&with(n::CLONE_INTO_CGROUP, 0)),
-            Err(err::EBADF)
+            clone3_verdict(&CloneArgs {
+                flags: (n::CLONE_INTO_CGROUP | n::CLONE_THREAD | n::CLONE_VM | n::CLONE_SIGHAND)
+                    as u64,
+                cgroup: 7,
+                ..Default::default()
+            }),
+            Err(err::EOPNOTSUPP),
+            "measured: a thread joins its group's cgroup, so there is no target"
         );
 
         // `set_tid`: the pair rule, the size bound, and the one well-formed

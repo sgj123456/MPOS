@@ -21,12 +21,57 @@
 //! mount is the machine's one hierarchy, and a later mount binds the same
 //! one - Linux's rule for the single writable hierarchy, and the reason a
 //! test that cleans its groups leaves nothing behind but the mount point.
+//!
+//! # `clone3`'s `CLONE_INTO_CGROUP`
+//!
+//! The last claims here are the ones §6.10 deferred and the tree made
+//! buildable: a child born in a group the caller names by descriptor rather
+//! than where its parent is grouped. Every answer was measured on a current
+//! host first (`.workbuddy/probe_clone3_cgroup*.c`, Linux 7.2.11): the child
+//! and its own fork read the target's path while the caller's line stays
+//! put, the door accepts an `O_PATH` descriptor and refuses a plain file, a
+//! directory on another filesystem, a cgroup *attribute* file and an fd that
+//! names nothing (`EBADF` each), a group removed after the descriptor was
+//! opened is `ENOENT`, `CLONE_THREAD` beside the flag is `EOPNOTSUPP`, an
+//! unprivileged caller is `EACCES`, and `CLONE_NEWCGROUP` beside the flag
+//! roots the new namespace at the **child's** group - which the child then
+//! reads as `0::/`.
 
 use mpos_user_tests::Report;
-use rustix::fs::{AtFlags, CWD, Mode, mkdir, statat};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, mkdir, open, statat};
 use rustix::io::write;
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+/// `struct clone_args`, the uapi's eleven aligned words - `cgroup` last.
+/// Spelled here rather than taken from `libc` for the reason `t-clone3`
+/// gives: musl binds neither the struct nor a wrapper for the call.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+/// The struct's size at version 2, which is what this file passes.
+const CLONE_ARGS_BYTES: usize = 88;
+/// The flag word's two words this file uses, and the thread trio that is
+/// refused beside the first.
+const CLONE_INTO_CGROUP: usize = 0x0002_0000_0000;
+const CLONE_NEWCGROUP: usize = 0x0200_0000;
+const CLONE_THREAD: usize = 0x0001_0000;
+const CLONE_VM: usize = 0x0000_0100;
+const CLONE_SIGHAND: usize = 0x0000_0800;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -254,6 +299,132 @@ fn main() {
         }
     }
 
+    // ---- clone3's CLONE_INTO_CGROUP ----
+    //
+    // A group of its own for this section, and the process is still in
+    // `/grp` from the section above: the two are siblings, so the first
+    // common ancestor is the machine root and the caller's authority is
+    // root's - the same question the host probe asked.
+    std::fs::create_dir(format!("{AT}/into")).expect("mkdir into");
+    let into_dir = open(
+        format!("{AT}/into"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open the target group");
+    let into_fd = into_dir.as_raw_fd();
+    let into = run_in_group(into_fd, 0, body_into);
+    r.check(
+        &format!("clone3(CLONE_INTO_CGROUP) is served and the child lands there (got {into:?})"),
+        into == Ok(0),
+    );
+    let grandchild = run_in_group(into_fd, 0, body_into_fork);
+    r.check(
+        &format!("the child's own fork stays in the group (got {grandchild:?})"),
+        grandchild == Ok(0),
+    );
+    r.check(
+        "and the caller's own line did not move",
+        read_path("/proc/self/cgroup").as_deref() == Some("0::/grp\n"),
+    );
+    // Into the caller's own group is a valid no-op, measured.
+    let own = open(
+        format!("{AT}/grp"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open the caller's group");
+    let same = run_in_group(own.as_raw_fd(), 0, body_in_own_group);
+    r.check(
+        &format!("the caller's own group is a served target (got {same:?})"),
+        same == Ok(0),
+    );
+    // A namespace beside the flag is rooted at the child's group.
+    let fresh_ns = run_in_group(into_fd, CLONE_NEWCGROUP, body_ns_root);
+    r.check(
+        &format!(
+            "CLONE_NEWCGROUP beside it roots the namespace at the child's group (got {fresh_ns:?})"
+        ),
+        fresh_ns == Ok(0),
+    );
+    // The three descriptors that are not a group, and the one that is gone.
+    let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let plain = clone_into(devnull.as_raw_fd(), 0).err();
+    r.check(
+        &format!("a regular file is EBADF, not a cgroup (got {plain:?})"),
+        plain == Some(9),
+    );
+    let attribute = std::fs::File::open(format!("{AT}/into/cgroup.procs")).expect("open procs");
+    let not_group = clone_into(attribute.as_raw_fd(), 0).err();
+    r.check(
+        &format!("a cgroup attribute file is EBADF too (got {not_group:?})"),
+        not_group == Some(9),
+    );
+    let nowhere = clone_into(9999, 0).err();
+    r.check(
+        &format!("a descriptor that names nothing is EBADF (got {nowhere:?})"),
+        nowhere == Some(9),
+    );
+    let opath = open(
+        format!("{AT}/into"),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open the group O_PATH");
+    let opath_into = run_in_group(opath.as_raw_fd(), 0, body_into);
+    r.check(
+        &format!("an O_PATH descriptor names the group (got {opath_into:?})"),
+        opath_into == Ok(0),
+    );
+    std::fs::create_dir(format!("{AT}/gone")).expect("mkdir gone");
+    let gone = open(
+        format!("{AT}/gone"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open the doomed group");
+    std::fs::remove_dir(format!("{AT}/gone")).expect("rmdir gone");
+    let removed = clone_into(gone.as_raw_fd(), 0).err();
+    r.check(
+        &format!("a group removed after its descriptor opened is ENOENT (got {removed:?})"),
+        removed == Some(2),
+    );
+    let thread = clone_into(into_fd, CLONE_THREAD | CLONE_VM | CLONE_SIGHAND).err();
+    r.check(
+        &format!("CLONE_INTO_CGROUP beside CLONE_THREAD is EOPNOTSUPP (got {thread:?})"),
+        thread == Some(95),
+    );
+    // An unprivileged caller: the gate is the *common ancestor's*
+    // `cgroup.procs` (0644 root), which is Linux's measured answer for a
+    // caller that may not write the machine root's file.
+    match unsafe { libc::fork() } {
+        0 => {
+            unsafe {
+                libc::setgid(65534);
+                libc::setuid(65534);
+            }
+            let code = match std::fs::File::open(format!("{AT}/into")) {
+                Ok(file) => match clone_into(file.as_raw_fd(), 0) {
+                    Err(13) => 0,
+                    Err(e) => e,
+                    Ok(_) => 9,
+                },
+                Err(e) => e.raw_os_error().unwrap_or(0),
+            };
+            unsafe { libc::_exit(code) }
+        }
+        kid => {
+            let denied = wait_pid(kid).unwrap_or(-1);
+            r.check(
+                &format!(
+                    "an unprivileged caller into the machine's group is EACCES (got {denied})"
+                ),
+                denied == 0,
+            );
+        }
+    }
+    std::fs::remove_dir(format!("{AT}/into")).expect("rmdir into");
+
     // ---- back out, and the tree closes cleanly ----
     r.check(
         "writing this pid to the root's procs moves it back",
@@ -295,4 +466,73 @@ fn wait_pid(child: i32) -> Option<i32> {
         Ok(Some((_, status))) => rustix::process::WaitStatus::exit_status(status),
         _ => None,
     }
+}
+
+/// A **fork-shaped** `clone3` into `cgfd` - no stack, so the child comes back
+/// through this same call the way `fork` does and can run ordinary Rust.
+/// `Err` is the door's own answer, read at the call (through musl's errno:
+/// this goes through `libc::syscall`, not rustix's raw backend).
+fn clone_into(cgfd: i32, extra: usize) -> Result<isize, i32> {
+    let args = CloneArgs {
+        flags: (CLONE_INTO_CGROUP | extra) as u64,
+        cgroup: cgfd as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..Default::default()
+    };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const CloneArgs as *const core::ffi::c_void,
+            CLONE_ARGS_BYTES as libc::c_long,
+        )
+    } as isize;
+    if ret < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(ret)
+    }
+}
+
+/// Run `body` in a child born in `cgfd`, answering the child's exit code;
+/// `Err` is the clone's own refusal.
+fn run_in_group(cgfd: i32, extra: usize, body: fn() -> i32) -> Result<i32, i32> {
+    let ret = clone_into(cgfd, extra)?;
+    if ret == 0 {
+        let code = body();
+        unsafe { libc::_exit(code) }
+    }
+    Ok(wait_pid(ret as i32).unwrap_or(-1))
+}
+
+/// Whether this process's own `/proc/self/cgroup` is `want`.
+fn line_is(want: &str) -> i32 {
+    i32::from(read_path("/proc/self/cgroup").as_deref() != Some(want))
+}
+
+/// The child's own line, and then its own fork's: the membership a
+/// `CLONE_INTO_CGROUP` child hands down.
+fn line_with_own_fork(want: &str) -> i32 {
+    if line_is(want) != 0 {
+        return 2;
+    }
+    match unsafe { libc::fork() } {
+        0 => unsafe { libc::_exit(line_is(want)) },
+        pid if pid > 0 => wait_pid(pid).unwrap_or(3),
+        _ => 4,
+    }
+}
+
+fn body_into() -> i32 {
+    line_is("0::/into\n")
+}
+fn body_into_fork() -> i32 {
+    line_with_own_fork("0::/into\n")
+}
+fn body_in_own_group() -> i32 {
+    line_is("0::/grp\n")
+}
+/// The fresh cgroup namespace's root is the child's *own* group, so it reads
+/// its group as `/`.
+fn body_ns_root() -> i32 {
+    line_is("0::/\n")
 }

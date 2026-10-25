@@ -107,9 +107,11 @@ pub const CLONE_PIDFD: usize = 0x0000_1000;
 /// The child starts with every signal disposition reset to `SIG_DFL`, the mask
 /// untouched. This kernel serves it (`CloneRequest::clear_sighand`).
 pub const CLONE_CLEAR_SIGHAND: usize = 0x0001_0000_0000;
-/// Put the child in a cgroup named by a descriptor in the argument struct.
-/// This kernel has no cgroup tree, so no descriptor can name one: the refusal
-/// is the `EBADF` Linux answers for an fd that is not a cgroup.
+/// Put the child in the cgroup a descriptor names (`struct clone_args`'s last
+/// word). Served since the cgroup2 tree landed (`docs/notes/` §6.26): the
+/// descriptor must name a group directory, and `EBADF` is what a node that is
+/// not one answers - Linux's own word. `clone(2)` accepts the bit and ignores
+/// it, there being no descriptor argument there.
 pub const CLONE_INTO_CGROUP: usize = 0x0002_0000_0000;
 
 pub const CLONE_NEWTIME: usize = 0x0000_0080;

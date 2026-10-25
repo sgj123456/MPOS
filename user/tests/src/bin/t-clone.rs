@@ -246,6 +246,18 @@ fn main() {
         refused(ret, libc::EINVAL) || mpos_user_tests::host_run(),
     );
 
+    // `CLONE_INTO_CGROUP` is `clone3`'s bit: `clone(2)` has no descriptor
+    // argument to pass with it, and Linux accepts the word and starts an
+    // ordinary child, placed where its parent is grouped - measured on a
+    // current host (`.workbuddy/probe_clone3_cgroup.c`, Linux 7.2.11): the
+    // bit is known and ignored rather than an `EINVAL` Linux never answers.
+    // The child is process-shaped (no stack), so it leaves at once.
+    let into = probe(0x0002_0000_0000);
+    if into > 0 {
+        collect(into);
+    }
+    r.check("clone(2) accepts and ignores CLONE_INTO_CGROUP", into > 0);
+
     // CLONE_THREAD without the two flags it depends on.
     let ret = probe(libc::CLONE_THREAD as usize);
     r.check(

@@ -5062,7 +5062,9 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (Linux's own `clone3` check, unlike `clone(2)`'s absence of one);
     `CLONE_PIDFD` with `pidfd = 0` is `EFAULT` and two writes aimed at one
     address (`pidfd == parent_tid`) are `EINVAL`, while different destinations
-    are served; `CLONE_INTO_CGROUP` is `EBADF`; `set_tid`/`set_tid_size` must be
+    are served; `CLONE_INTO_CGROUP` was `EBADF` at this landing (there was no
+    cgroup tree for a descriptor to name) and is served since **item 105**;
+    `set_tid`/`set_tid_size` must be
     both set or both zero, a size above one is `EINVAL`, and one well-formed
     entry needs a new pid namespace (this kernel refuses it `EOPNOTSUPP`, Linux
     would serve it).
@@ -5681,3 +5683,79 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `/proc/<pid>/cgroup` path renders from (`t-ns-cgroup`); the mount's
     re-rooting to the view's subtree is the row's one named divergence
     (`docs/uapi/` §1's unshare/setns row).
+
+## item 105 — `CLONE_INTO_CGROUP`: the child is born in the group a descriptor names
+
+    The last unserved word of `struct clone_args`, and the one §6.10 refused
+    with a sentence that was true at the time: *there is no cgroup tree here
+    for a descriptor to name*. The tree landed the day before (§6.25), so the
+    flag became buildable and the refusal became a shape with nothing behind
+    it. Measured whole on a current host first
+    (`.workbuddy/probe_clone3_cgroup{1,2,3,4,5}.c`, `.workbuddy/probe_clone3_order.c`,
+    `.workbuddy/probe_cgroup_cap.c`; Linux 7.2.11, root inside the machine's
+    own hierarchy, a scratch group under the probe's scope):
+
+    **The membership.** The child and its own `fork` read the target's path in
+    `/proc/<pid>/cgroup` (`0::/mposprobe`, `0::/mposprobe/a`), and the caller's
+    own line does not move. **The descriptor's three answers**: only a group
+    *directory* is a target - a regular file, a directory on another
+    filesystem and a cgroup attribute file (`cgroup.procs`) are `EBADF`, and an
+    fd that names nothing is `EBADF`; `O_PATH` is served; a group removed after
+    the descriptor was opened is `ENOENT`. **The flag word's own rule**:
+    `CLONE_THREAD` beside it is `EOPNOTSUPP`, into a different group and into
+    the caller's own group alike, because a thread joins its group's cgroup.
+    **The namespace**: `CLONE_NEWCGROUP` beside it roots the child's namespace
+    at the **child's** group, so the child reads `0::/` while its membership
+    is `/mposprobe/a`. **The permission** is the *first common ancestor's*
+    `cgroup.procs`, asked for write **and** read: uid 1000 into a world-writable
+    (`0666`) target is still `EACCES` because the machine root's `0644` file is
+    on the path, `CAP_DAC_OVERRIDE` turns it into a success,
+    `CAP_DAC_READ_SEARCH` alone does not, and root succeeds with no capability
+    at all - the two triads `may_as` applies. **The view**: a target outside
+    the caller's cgroup namespace is `ENOENT`, even with a descriptor opened
+    before the unshare. **`clone(2)`** accepts the bit and ignores it (it has
+    no cgroup argument), which Linux does rather than answering `EINVAL`. **The
+    order**: a bad descriptor beside `exit_signal = 99` is `EINVAL`, beside
+    `pidfd = 0` is `EFAULT`, so the descriptor is resolved after every field
+    rule and after the pidfd destination.
+
+    **Owner**: `src/vfs/cgroupfs.rs` (the whole answer - `clone_target`,
+    `may_attach`, `under`, `common_root`, `join_group`, and the tree's modes
+    becoming gates), `src/syscall/linux/abi.rs` (`clone3_verdict`'s one flag
+    rule, `Clone3Plan::cgroup`, and `validate_clone_flags` keeping the bit known
+    for `clone(2)`'s ignore), `src/syscall/linux/proc.rs` (resolve the fd
+    through the caller's table), `src/sched/runtime/child_exit.rs`
+    (`CloneRequest::cgroup`, the membership override inside the spawn's critical
+    section, and the cgroup namespace rooted at the child's own group).
+
+    **Pin**: `t-cgroupfs` grows **12 claims** (26 → 38): the child lands in the
+    target and its own fork stays there, the caller's line does not move, the
+    caller's own group is a served target, `CLONE_NEWCGROUP` roots the namespace
+    at the child's group, `EBADF` for a regular file / an attribute file / a
+    descriptor that names nothing, `O_PATH` served, `ENOENT` for a removed
+    group, `EOPNOTSUPP` beside `CLONE_THREAD`, and `EACCES` from a forked
+    uid-65534 caller. `t-clone` gains the `clone(2)` half and `t-clone3`'s
+    `EBADF` claim is reworded to what it measured (fd 0 is not a cgroup). Host
+    tests: `vfs::cgroupfs`'s `the_reported_modes_are_gates`,
+    `a_descriptor_names_a_group_not_a_file`,
+    `a_removed_group_is_gone_not_a_group`,
+    `the_view_and_the_common_ancestor_are_path_questions`, and `abi`'s clone3
+    pair for `EOPNOTSUPP` / the carried word.
+
+    **A pre-existing divergence the measurement exposed and closed**: the tree
+    reported Linux's modes and policed nothing. `CgDir`/`CgFile` now keep
+    them, so a `0644` `cgroup.procs` is a gate as kernfs's is (item 37's
+    procfs/sysfs report stays a report; the difference is in the cgroupfs
+    header).
+
+    **Named**: the cgroup namespace's **mount** view is still the machine's
+    (§6.25's divergence - this change re-roots the namespace a child carries,
+    not a mount), and the tree has **no delegation**: a nested user namespace's
+    owner is refused by the common ancestor's DAC where Linux would let it
+    through, because this tree has no per-cgroup ownership for a namespace to
+    hold.
+
+    **Gate**: x86_64 `pass=208 fail=0` (208 built), `mpos-kunit 32 passed, 0
+    failed`, exit 33; aarch64 `pass=207 fail=0` (207 built), `mpos-kunit 32
+    passed, 0 failed`, reaching `=== END`; host unit suite 1120 tests / 0
+    failed; `t-cgroupfs`'s 38 `ok:` lines byte-identical on both machines.

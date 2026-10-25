@@ -43,9 +43,13 @@
 //!   chain requires `CLONE_SIGHAND`.
 //! * **`CLONE_PIDFD` requires its field and excludes the tid write**: `pidfd =
 //!   0` is `EFAULT`, and the bit beside `CLONE_PARENT_SETTID` is `EINVAL`.
-//! * **`CLONE_INTO_CGROUP` is `EBADF`**, which is Linux's own answer for a
-//!   descriptor that is not a cgroup: there is no cgroup tree here for one to
-//!   name, so no descriptor a caller can pass is one.
+//! * **`CLONE_INTO_CGROUP` is resolved by the door**, and a descriptor that is
+//!   not a cgroup is `EBADF` - which is what this program's fd 0 is, so the
+//!   claim below is Linux's answer too. The tree side of the flag (a child
+//!   born in the group a descriptor names, its own fork inheriting it, `ENOENT`
+//!   for a removed group, `EACCES` for an unprivileged caller, and
+//!   `CLONE_NEWCGROUP` rooted at the child's group) needs a mount and lives in
+//!   `t-cgroupfs`, where the tree and its groups are.
 //!
 //! # What is named rather than claimed
 //!
@@ -505,7 +509,7 @@ fn main() {
             ptrace_ok,
         );
         r.check(
-            "CLONE_INTO_CGROUP is EBADF, no descriptor here being a cgroup",
+            "CLONE_INTO_CGROUP with fd 0 is EBADF, not a cgroup directory",
             refused(
                 unsafe { probe(&word(CLONE_INTO_CGROUP), VER2) },
                 libc::EBADF,

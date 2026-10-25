@@ -25,7 +25,9 @@
 //! * the **modes** are `0444` for the read-only half (`controllers`,
 //!   `events`, `stat`), `0644` for the writable half (`procs`, `threads`,
 //!   `subtree_control`, `type`, both `max.*`), and `0755` for every
-//!   directory;
+//!   directory - and they are **gates**, not a report: kernfs refuses a
+//!   caller the bits refuse (item 37's procfs/sysfs word stayed decoration,
+//!   and this is where the two trees differ);
 //! * the **empty files are empty**: a controller-less `cgroup.controllers`
 //!   and `cgroup.subtree_control` answer **zero bytes**, not a bare newline
 //!   (measured with `wc -c`), while `cgroup.type` answers `domain\n` (7
@@ -218,6 +220,159 @@ pub(crate) fn inherit_membership(parent: crate::sched::TaskId, child: crate::sch
         return;
     }
     set_member(child.0, &parent_group);
+}
+
+/// `clone3`'s `CLONE_INTO_CGROUP`: the child is born in `node` rather than
+/// where its parent is grouped. Called from the scheduler's spawn beside
+/// [`inherit_membership`], and for the same reason - the child is on the
+/// ready queue before the caller sees it, so the answer is written inside the
+/// same critical section rather than after the call returns.
+pub(crate) fn join_group(tid: usize, node: &Arc<CgDir>) {
+    if node.is_root {
+        return;
+    }
+    set_member(tid, node);
+}
+
+/// The running task's cgroup namespace root, when it is inside one: what a
+/// `clone3` target must sit under to be visible to the caller at all. `None`
+/// is the machine's own view, which hides nothing.
+fn current_view() -> Option<Arc<str>> {
+    #[cfg(target_os = "none")]
+    return crate::sched::current_cgroup_root();
+    #[cfg(not(target_os = "none"))]
+    return None;
+}
+
+/// The group the *caller* is grouped in, by membership rather than by view:
+/// Linux asks its attach-permission question about `current`'s cgroup, and
+/// the common ancestor below is where the two meet. The host build has no
+/// task table and therefore no caller; the machine root is what a test that
+/// names no task sees.
+fn caller_group() -> Arc<CgDir> {
+    #[cfg(target_os = "none")]
+    return group_of(crate::sched::current_tgid().0);
+    #[cfg(not(target_os = "none"))]
+    return the_tree();
+}
+
+/// Whether `path` is `root` or sits beneath it - Linux's
+/// `cgroup_is_descendant`, over the absolute paths this tree renders. The
+/// byte after the prefix has to be a separator, or `/ab` would read as
+/// under `/a`.
+pub(crate) fn under(path: &str, root: &str) -> bool {
+    if root == "/" {
+        return true;
+    }
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The first common ancestor of two group paths - the cgroup whose
+/// `cgroup.procs` Linux's `cgroup_procs_write_permission` asks its
+/// permission of. `/` for groups on different branches, the shared path for
+/// nested ones, and one of the two when one is the other's ancestor.
+pub(crate) fn common_root(a: &str, b: &str) -> String {
+    let mut out = String::new();
+    let mut left = a.split('/').filter(|part| !part.is_empty());
+    let mut right = b.split('/').filter(|part| !part.is_empty());
+    loop {
+        match (left.next(), right.next()) {
+            (Some(x), Some(y)) if x == y => {
+                out.push('/');
+                out.push_str(x);
+            }
+            _ => break,
+        }
+    }
+    if out.is_empty() {
+        String::from("/")
+    } else {
+        out
+    }
+}
+
+/// Whether the running caller may attach a task to the group a `clone3`
+/// child is to be born into: Linux's `cgroup_procs_write_permission`, and
+/// the question is *not* the target's own file.
+///
+/// Measured on a current host before it was built
+/// (`.workbuddy/probe_clone3_cgroup*.c`, `probe_cgroup_cap.c`, Linux 7.2.11;
+/// the caller's own group under `user.slice` and the target a fresh group
+/// under the machine root, so the first common ancestor is `/`):
+///
+/// ```text
+/// caller                              target procs 0644   target procs 0666
+/// uid 1000, no capability                    EACCES              EACCES
+/// uid 1000, CAP_DAC_OVERRIDE                    0                   0
+/// uid 1000, CAP_DAC_READ_SEARCH              EACCES              EACCES
+/// uid 0, whole set                              0                   0
+/// uid 0, no CAP_SYS_ADMIN/DAC_OVERRIDE          0                   0
+/// ```
+///
+/// Two things are read off it. The `0666` column says the question is the
+/// **first common ancestor's** `cgroup.procs` and not the target's: a
+/// world-writable target under a root the caller may not write still answers
+/// `EACCES`. And the capability rows say it is a plain DAC question -
+/// `CAP_DAC_OVERRIDE` answers it, `CAP_DAC_READ_SEARCH` alone does not,
+/// exactly the triads [`crate::vfs::may_as`] applies - not a capability of
+/// the cgroup namespace's, which a uid-1000 caller holding `CAP_SYS_ADMIN`
+/// still loses.
+pub(crate) fn may_attach(target: &Arc<CgDir>) -> VfsResult<()> {
+    let mine = caller_group();
+    let ancestor = resolve(&common_root(&mine.path(), &target.path())).ok_or(VfsError::NoEntry)?;
+    // The file the question is asked of is the ancestor's `cgroup.procs`,
+    // minted here rather than looked up through a mount: the check needs its
+    // bits and owner, which are the tree's own word for the file.
+    let procs = Arc::new(CgFile {
+        ino: next_ino(),
+        path: ancestor.path(),
+        which: FileKind::Procs,
+    }) as Arc<dyn Inode>;
+    crate::vfs::may_as(
+        crate::vfs::current_caller(),
+        &procs,
+        crate::vfs::R_OK | crate::vfs::W_OK,
+    )
+}
+
+/// The group a `clone3(CLONE_INTO_CGROUP)` descriptor names, or the errno
+/// Linux answers for it.
+///
+/// Measured on a current host (`.workbuddy/probe_clone3_cgroup*.c`, Linux
+/// 7.2.11, root inside the machine's own hierarchy):
+///
+/// * a descriptor that is not a cgroup **directory** is `EBADF` - a regular
+///   file, a directory on another filesystem and a cgroup *attribute* file
+///   (`cgroup.procs`) all answer it, because only a group node is an attach
+///   point;
+/// * `O_PATH` is served: the descriptor is a name, not a reader;
+/// * a group whose name was removed after the descriptor was opened is
+///   `ENOENT` - a cgroup that is gone is not the same answer as a node that
+///   never was one, and the inode number is what tells a `rmdir`-and-recreate
+///   of the same name apart from the group the descriptor still holds;
+/// * a target outside the caller's cgroup namespace is `ENOENT` too: the
+///   namespace hides it (measured - a caller rooted at `/mposprobe` cannot
+///   attach into the machine root, even with a descriptor opened before the
+///   unshare);
+/// * and the attach itself is [`may_attach`]'s question, `EACCES`.
+pub(crate) fn clone_target(inode: &Arc<dyn Inode>) -> VfsResult<Arc<CgDir>> {
+    let Some(named) = inode.as_any().downcast_ref::<CgDir>() else {
+        return Err(VfsError::BadFd);
+    };
+    let live = match resolve(&named.path()) {
+        Some(live) if live.ino == named.ino => live,
+        _ => return Err(VfsError::NoEntry),
+    };
+    if let Some(view) = current_view() {
+        if !under(&live.path(), &view) {
+            return Err(VfsError::NoEntry);
+        }
+    }
+    may_attach(&live)?;
+    Ok(live)
 }
 
 /// Move one task (by its own slot id) into `node`. The generation is taken
@@ -562,6 +717,18 @@ impl Inode for CgDir {
         0o755
     }
 
+    /// The modes above are **gates**, not a report - unlike procfs and sysfs,
+    /// where the word is decoration (item 37). kernfs polices both halves of
+    /// a cgroup node: a non-root caller cannot `mkdir` in a `0755` group of
+    /// the machine's, and its write to a `0644` `cgroup.procs` is `EACCES`
+    /// (measured: uid 1000 writing a `0666` target still gets `EACCES`,
+    /// because the *common ancestor's* `0644` file is the gate - see
+    /// [`may_attach`]). A tree that reported those bits and refused nothing
+    /// would answer `stat` with a permission model it does not have.
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         if let Some(kind) = FileKind::from_name(name, self.is_root) {
             return Ok(Arc::new(CgFile {
@@ -687,6 +854,13 @@ impl Inode for CgFile {
 
     fn mode(&self) -> u32 {
         self.which.mode()
+    }
+
+    /// The file's own bits are what open and write are judged by, for the
+    /// same reason [`CgDir::keeps_modes`] gives: the measured `0444`/`0644`
+    /// split is a gate.
+    fn keeps_modes(&self) -> bool {
+        true
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -1062,5 +1236,113 @@ mod tests {
         let parent = resolve(&format!("/{name}")).expect("the parent resolves");
         assert_eq!(parent.path(), format!("/{name}"));
         assert_eq!(resolve("").expect("the root resolves").path(), "/");
+    }
+
+    /// The reported bits are the tree's permission model, not a decoration:
+    /// a stranger may read `cgroup.procs` (0644) and may not write it, and
+    /// the machine's root passes through its overrides rather than its uid -
+    /// the same shape every other mode-keeping filesystem here has (item 37's
+    /// procfs/sysfs report stayed a report; kernfs's is a gate).
+    #[test]
+    fn the_reported_modes_are_gates() {
+        let (fs, name, _guard) = locked!("t11");
+        let group = fs.root().create(name, NodeKind::Dir, None).unwrap();
+        let procs = group.lookup("cgroup.procs").unwrap();
+        assert!(
+            crate::vfs::may_as(
+                crate::vfs::Caller::ids(1000, 1000),
+                &procs,
+                crate::vfs::R_OK
+            )
+            .is_ok(),
+            "a 0644 file is readable by anyone"
+        );
+        assert_eq!(
+            crate::vfs::may_as(
+                crate::vfs::Caller::ids(1000, 1000),
+                &procs,
+                crate::vfs::W_OK
+            )
+            .err(),
+            Some(VfsError::Access),
+            "and writable only by its owner - the measured 0644 half"
+        );
+        assert!(
+            crate::vfs::may_as(
+                crate::vfs::Caller::ids(0, 0),
+                &procs,
+                crate::vfs::R_OK | crate::vfs::W_OK
+            )
+            .is_ok(),
+            "root's write is its CAP_DAC_OVERRIDE, the same as any node here"
+        );
+    }
+
+    /// `clone3`'s attach point is a *group directory*, not a file of the
+    /// tree: `EBADF` is Linux's own answer for every node that is not one,
+    /// measured for a regular file, a directory on another filesystem and
+    /// `cgroup.procs` alike.
+    #[test]
+    fn a_descriptor_names_a_group_not_a_file() {
+        let (fs, name, _guard) = locked!("t12");
+        let group = fs.root().create(name, NodeKind::Dir, None).unwrap();
+        assert_eq!(
+            clone_target(&group.lookup("cgroup.procs").unwrap()).err(),
+            Some(VfsError::BadFd),
+            "a cgroup attribute is not an attach point, measured"
+        );
+        let other = crate::vfs::ramfs::RamFs::new().root();
+        assert_eq!(
+            clone_target(&other).err(),
+            Some(VfsError::BadFd),
+            "a directory on another filesystem is not a cgroup either"
+        );
+    }
+
+    /// A descriptor opened before a `rmdir` names a group that is gone, not a
+    /// node that never was one - Linux's `ENOENT`, and the inode number is
+    /// what tells the removed group apart from a new one that took its name.
+    #[test]
+    fn a_removed_group_is_gone_not_a_group() {
+        let (fs, name, _guard) = locked!("t13");
+        let group = fs.root().create(name, NodeKind::Dir, None).unwrap();
+        fs.root().rmdir(name).unwrap();
+        assert_eq!(
+            clone_target(&group).err(),
+            Some(VfsError::NoEntry),
+            "measured: a group removed after its descriptor was opened"
+        );
+        // A same-named group made afterwards is a *different* group: the
+        // descriptor still denotes nothing, which the inode number is what
+        // says.
+        let _again = fs.root().create(name, NodeKind::Dir, None).unwrap();
+        assert_eq!(
+            clone_target(&group).err(),
+            Some(VfsError::NoEntry),
+            "the recreated name is not the group the descriptor holds"
+        );
+        fs.root().rmdir(name).unwrap();
+    }
+
+    /// The two path questions the view and the attach permission are built
+    /// on, each with the prefix that must *not* count: `/ab` is not under
+    /// `/a`, and two groups on different branches share only `/`.
+    #[test]
+    fn the_view_and_the_common_ancestor_are_path_questions() {
+        assert!(under("/", "/"), "the machine root is under itself");
+        assert!(under("/a/b", "/a"), "a child is under its parent");
+        assert!(under("/a", "/a"), "a group is under itself");
+        assert!(under("/a/b", "/"), "the machine root hides nothing");
+        assert!(
+            !under("/ab", "/a"),
+            "a name that merely starts with it is not"
+        );
+        assert!(!under("/a", "/a/b"), "a parent is not under its child");
+
+        assert_eq!(common_root("/a/b/c", "/a/b/d"), "/a/b");
+        assert_eq!(common_root("/a", "/a/b"), "/a");
+        assert_eq!(common_root("/a/b", "/a/b"), "/a/b");
+        assert_eq!(common_root("/x/y", "/a/b"), "/");
+        assert_eq!(common_root("/", "/a"), "/");
     }
 }

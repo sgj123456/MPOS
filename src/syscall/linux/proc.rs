@@ -2072,6 +2072,11 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
         tls,
         net_ns,
         ipc_ns,
+        // `clone(2)` has no cgroup descriptor argument: Linux accepts the bit
+        // in the flag word and ignores it, so the child is placed where its
+        // parent is grouped (`validate_clone_flags` keeps the bit known for
+        // exactly that reason).
+        cgroup: None,
     };
     let child = crate::sched::clone(&ctx, request);
     if child < 0 {
@@ -2168,6 +2173,31 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
     if wants_pidfd && !buffer_ok(plan.pidfd, 4, true, from_user) {
         return err::EFAULT;
     }
+    // `CLONE_INTO_CGROUP`: the descriptor names the group the child is born
+    // in, so it is resolved *here* - the file table is this layer's, and the
+    // tree's own answer (which groups a descriptor may name, and who may
+    // attach a task to one) is `cgroupfs`'s. Asked after the field rules and
+    // the pidfd destination above, which is the order the measurements show:
+    // a bad descriptor beside `exit_signal = 99` is `EINVAL`, and beside
+    // `pidfd = 0` it is `EFAULT` (`.workbuddy/probe_clone3_order.c`).
+    let cgroup = if plan.flags & nr::CLONE_INTO_CGROUP != 0 {
+        let file = match crate::sched::current_fds().clone_at(plan.cgroup as i32) {
+            Ok(file) => file,
+            // No such descriptor: Linux's `fget` refusal, before the node is
+            // even looked at.
+            Err(_) => return err::EBADF,
+        };
+        match crate::vfs::cgroupfs::clone_target(&file.inode()) {
+            Ok(group) => Some(group),
+            // `EBADF` for a node that is not a group directory, `ENOENT` for a
+            // group that is gone or hidden, `EACCES` from the attach
+            // permission - each the tree's own word, mapped where every other
+            // `VfsError` in this file is.
+            Err(e) => return err_of(e),
+        }
+    } else {
+        None
+    };
 
     // SAFETY: the caller hands the gate's own frame for this task.
     let ctx = match unsafe { crate::hal::user_context(regs_ptr, 0) } {
@@ -2194,6 +2224,7 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
         tls: plan.tls,
         net_ns,
         ipc_ns,
+        cgroup,
     };
     let child = crate::sched::clone(&ctx, request);
     if child < 0 {

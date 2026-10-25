@@ -812,6 +812,23 @@ pub struct CloneRequest {
     /// parent's queue while the child finds the key absent and numbers its first
     /// queue `0` - and `clone3`'s own flag field behaves identically.
     pub ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
+    /// The group the child is to be born in, when `clone3`'s
+    /// `CLONE_INTO_CGROUP` named one - `None` for every other door, which
+    /// leaves the child where its parent is grouped.
+    ///
+    /// Resolved by the syscall layer (a descriptor's table is there, and the
+    /// group node is `vfs::cgroupfs`'s to hand out), and consumed *inside*
+    /// the spawn's critical section below: the child is on the ready queue
+    /// before `clone` returns, so a membership write after it would be a
+    /// window in which the child reads the parent's group.
+    ///
+    /// Measured on a current host before it was built
+    /// (`.workbuddy/probe_clone3_cgroup*.c`, Linux 7.2.11): the child and its
+    /// own fork both read the target group in `/proc/<pid>/cgroup`, the
+    /// caller's own line does not move, and a `CLONE_NEWCGROUP` beside the
+    /// flag roots the new namespace at the **child's** group (the target),
+    /// not the caller's.
+    pub cgroup: Option<alloc::sync::Arc<crate::vfs::cgroupfs::CgDir>>,
     /// The signal the child is born to report - `clone`'s low byte, which the
     /// syscall layer split off the flag word before it got here
     /// (`abi::validate_clone_flags`) and which `wait` reads back through
@@ -1321,11 +1338,20 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // The cgroup view-root: the creator's, unless this word asked
             // for a fresh namespace - whose root is the group the creator
             // is in *now*, served as `/` (`crate::vfs::cgroupfs` carries
-            // the tree and the render rule).
+            // the tree and the render rule). Beside `CLONE_INTO_CGROUP` the
+            // root is the **target**, which is the child's own group: Linux
+            // roots a fresh cgroup namespace at the group of the task the
+            // namespace is made for, and with the flag that is not the
+            // parent's group any more (measured: `INTO|NEWCGROUP` into
+            // `/mposprobe/a` leaves the child reading `0::/`).
             cgroup_ns: if request.flags & crate::abi::CLONE_NEWCGROUP != 0 {
-                // Rooted at the group the *parent* is in now - the real one,
-                // membership and not view (the header carries the rule).
-                Some(crate::vfs::cgroupfs::ns_root(parent_id.0))
+                Some(match &request.cgroup {
+                    Some(target) => alloc::sync::Arc::from(target.path().as_str()),
+                    // Rooted at the group the *parent* is in now - the real
+                    // one, membership and not view (the header carries the
+                    // rule).
+                    None => crate::vfs::cgroupfs::ns_root(parent_id.0),
+                })
             } else {
                 t.task(parent_id).cgroup_ns.clone()
             },
@@ -1399,7 +1425,14 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // the field the task struct carries. The membership map is keyed by
         // slot with the generation taken at the write, so a dead parent's
         // slot cannot leak its group to a child born in it later.
-        crate::vfs::cgroupfs::inherit_membership(parent_id, child_id);
+        //
+        // `clone3`'s `CLONE_INTO_CGROUP` is the one word that overrides the
+        // inheritance, and the override is written here for the same reason
+        // the inheritance is: the child is pushed ready two lines down.
+        match &request.cgroup {
+            Some(target) => crate::vfs::cgroupfs::join_group(child_id.0, target),
+            None => crate::vfs::cgroupfs::inherit_membership(parent_id, child_id),
+        }
         let traced_child = attach_new_child(t, parent_id, child_id, fork_event(request.flags));
         if traced_child {
             t.sched.sleep(child_id, parent_priority, u64::MAX);
