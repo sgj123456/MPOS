@@ -3722,3 +3722,27 @@ for first, and it is checkable: record the claim's owner task id in the cache an
 print it beside the site, so `wchan` says not just "waiting for the scratch" but
 "waiting for the scratch *of task N*" - and a cycle through N is the whole
 diagnosis.
+
+**The re-entry reading came back empty - and the reproduction passed.** The next
+instrument was re-entry detection: each task slot records whether it is inside a
+claim's transfer, and a scratch wait taken from that state reports site `10`
+instead of `8`. The same boot then wrote all four files
+(`one|two|three|four`, children reaped, nothing stuck) - so the shape did not
+reproduce at all that time, with nothing in the tree that could have fixed it:
+the change added two stores around the transfer and nothing else. A change that
+only adds timing and hides a deadlock is a **race**, not a fix: the earlier
+readings (4, then 8) were losses of it, and the extra rd/wr timing was enough to
+hide it.
+
+That matters more than it sounds. The same boot still stopped at
+`Starting udev ...`, so **the boot's stall is not the same event as the
+reproduction**: a deadlock in the concurrent-exec shape is one way to park a task
+in the claim path, not the only one, and the boot may be failing differently.
+
+**The next measurement is aimed at the boot, not the shape.** Put the detached
+dumper *in front of* the real sysinit: the inittab's `::sysinit:` runs
+`/root/watch.sh`, which starts `( sleep 20; ps; cat every /proc/<pid>/stat
+field 35 ) &` and then `exec /sbin/openrc sysinit`. At the moment udev has
+stalled, the serial log then carries the **stuck task's own park site** - the one
+number this whole instrument was built to produce, taken from the boot that
+actually fails.
