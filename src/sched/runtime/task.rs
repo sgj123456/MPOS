@@ -2915,8 +2915,24 @@ pub fn pause() -> ! {
 /// calling this, inside the same critical section if the condition is shared
 /// state - otherwise the task may wake, see a false condition, and sleep again.
 pub fn wake(id: TaskId) -> bool {
-    with_table(|t| t.sched.wake(id))
+    let hit = with_table(|t| t.sched.wake(id));
+    WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        WAKE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WAKE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    hit
 }
+
+/// How often [`wake`] was called, and how often the task it named was actually
+/// asleep. A wake that misses is a no-op by contract (a running or ready task
+/// re-checks its condition on its own) - so a stall with `misses` growing and a
+/// task parked anyway is the one reading that separates "the wake went to the
+/// wrong place" from "the woken task slept again" (`docs/notes/` §7 R.9).
+pub static WAKE_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Fire any interval timer whose deadline has passed, waking its sleeper.
 ///
@@ -3231,6 +3247,12 @@ fn heartbeat() {
         "mpos:   claim registrations={} handed-back={}\n",
         CLAIM_REGISTRATIONS.load(Ordering::Relaxed),
         CLAIM_WOKEN.load(Ordering::Relaxed)
+    ));
+    crate::hal::kernel::print_line(format_args!(
+        "mpos:   wakes calls={} hits={} misses={}\n",
+        WAKE_CALLS.load(Ordering::Relaxed),
+        WAKE_HITS.load(Ordering::Relaxed),
+        WAKE_MISSES.load(Ordering::Relaxed)
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {

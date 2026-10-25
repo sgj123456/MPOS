@@ -3929,3 +3929,29 @@ scratch park must re-register **and** re-check before every sleep, so no single
 lost observation can strand it - with a host pin for the property (a waiter that
 is woken with its condition true must return, and one that is woken with its
 condition false must park again *and* stay registered).
+
+**The wake counters do not isolate it; they do say what to count next.** At the
+stall:
+
+    mpos:   claim registrations=1 handed-back=1
+    mpos:   wakes calls=7215 hits=6890 misses=325
+
+Most wakes hit, and the claim list's own hand-back is the single event we care
+about, so a global hit/miss pair cannot separate it from the boot's other 7000
+wakes. The reading that can is narrower, and it is the next one: count **the
+claim wake specifically** (its hit or miss) and count **how many times each slot
+has parked at a claim site**. That pair settles the last two candidates this
+section has left:
+
+* a hit, a wake, and a *second* park at the same site - the waiter slept again
+  after a new claim took the scratch, and in the code as it stands (one
+  registration per wait) the second sleep is unregistered: the re-register shape
+  tried on 2026-10-25 is then right but has to cover the *first* re-entry, and its
+  first run did not, so the reason needs the per-slot count to be seen rather than
+  assumed;
+* a miss, and a park - the wake found the waiter running and the waiter's own
+  re-check failed, which puts the bug in `block_until_uninterruptible_at`'s
+  second look rather than in the list.
+
+Both counters are three lines each; the note in the roadmap's open list records
+this as the next measurement for the udev stall.
