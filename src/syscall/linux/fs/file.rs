@@ -3120,11 +3120,22 @@ fn note_poll_spin(
     // serving as the wrong kind (`docs/notes/` §7 R.9).
     // And *who* is spinning: the slot alone can be reused, and the reading that
     // matters is which process polls a file on stdin (`docs/notes/` §7 R.9).
+    //
+    // `nfds`/`nodes` are carried because `fd` and the node fields are taken from
+    // different places - `fd` off the caller's first record, the kind/ino/size off
+    // the first *resolved* node - and those two agree only for a one-descriptor
+    // poll. A caller that polls several at once (openrc waits with `pipe2`/`poll`
+    // beside a `sigprocmask`) could otherwise be read as if the node described were
+    // the one `fd` names, which is the difference between "the caller spins on its
+    // own stdin" and "the caller spins on a pipe it owns" - and only the first of
+    // those is the bug this instrument was built for.
     let exe = crate::sched::current_exe();
     let before = crate::sched::prev_syscall(me.0);
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={} exe={} before={before} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
-        me.0, exe
+        "mpos: poll spin slot={} exe={} before={before} fd={fd} events={events:#x} nfds={nfds} nodes={} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
+        me.0,
+        nodes.iter().filter(|n| n.is_some()).count(),
+        exe
     ));
 }
 
