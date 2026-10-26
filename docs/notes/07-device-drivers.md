@@ -5644,3 +5644,55 @@ delivery that never completed; (3) the MSI-X table's entry was rewritten (the pf
 owners). (3) is the one that fits "works thousands of times, then stops" with a clean
 handler, and it is testable: read MSI-X entry 0 back at the stall and compare it with
 what `msix::enable` wrote.
+
+**The real cause, and it is the one this section first suspected: a used-ring head that
+nobody pops. The frozen interrupt count was a *consequence*, not the cause.** A
+non-invasive probe - five lines inside `transfer`'s wait loop, in task context where the
+device borrow is legal, printing the used-ring head and the interrupt count every 500
+rounds - gives the reading that closes this:
+
+    mpos: blk probe: me=13 token=1 head=Some(0) irq=9699     (32 samples, all identical)
+
+**`token=1`, `head=Some(0)`, and both frozen.** The request this task submitted owns
+token 1; the used ring's head has held **token 0** the whole time. `virtio-drivers`'
+`pop_used(token, ..)` is strictly FIFO - it reads `used.ring[last_used_idx]` and answers
+`Error::WrongToken` when the id there is not the token asked for, advancing
+`last_used_idx` only on a successful pop - so an entry at the head that no task will pop
+pins every later completion behind it.
+
+**The causal order is the reverse of the last two entries.** `irq=9699` in every sample
+means the device delivered **9699 interrupts** before this state was reached, so the MSI
+path was healthy; and it stops here because with token 1 stuck the driver submits no
+further request, so the device has nothing to complete and raises nothing. Reading the
+ISR (`6de21ef`'s reverted attempt) therefore could not have helped, and that negative
+result is now explained rather than merely recorded. The line that matters is not "why
+did interrupts stop" but **"whose completion is sitting at the head of the used ring,
+and why was it never popped"**.
+
+**The answer is already in the tree, in another worker's uncommitted change, and that is
+why HEAD cannot boot.** `src/drivers/virtio/mod.rs` - uncommitted in this working tree -
+carries `drain_abandoned`, whose own doc says exactly what it is for: "an abandoned entry
+… the originals are gone, so dummies stand in", called from `transfer` before the claim's
+submission. It pops completed entries whose submitter never came back. **HEAD does not
+have it**, so a `transfer` that leaves an entry completed-and-unpopped - a task killed
+mid-flight, or the `transfer_sync` fallback path - wedges the disk for the rest of the
+boot. That is the whole stall, and it is the mechanism this section guessed at three
+entries ago ("a used-ring head nobody pops") before chasing two wrong causes past it.
+
+**What this means for the fix, concretely.** The drain must land - and it is not this
+thread's to land as a drive-by, since it is another worker's in-progress work with its
+own self-test suite (`blk.rs`'s `selftest_submit_and_abandon` builds exactly the
+abandoned-entry shape on purpose, which is how the shape came to be understood). What
+this thread can honestly contribute is the *evidence* it now has: the exact signature
+(`head=Some(token0)` frozen while a later token waits, `irq` frozen at whatever count
+the abandonment happened at, `blk-waiter` naming whichever udevd worker is unlucky), and
+the fact that it reproduces on every boot at a different token and a different slot.
+
+**Corrected summary of the seven faults.** The boot has been stopped by, in the order
+they became reachable: the claim's single registration (`93865d7`), the unbounded device
+wait (`f761cc4`), the claim leak on death (`4e927ce`), the block holder taken for a guess
+(`d945e29`), a named `wait4` on a reused slot (`626f58a`), the wildcard `wait4` on the
+same (`1b36efb`), and finally **the unpopped used-ring head**, which is the one that
+actually keeps the machine from a login and which `drain_abandoned` closes. The first six
+were real and are fixed and gated; each of them was *downstream* of this one, which is
+why fixing them moved the stall a step at a time without ever reaching the login prompt.
