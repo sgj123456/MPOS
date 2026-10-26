@@ -4644,3 +4644,25 @@ syscall stop, and a signal stop answers `NONE`. The pin still owed is the pair
 entry/exit pair walked *to* the call the child made (expecting `rt_sigreturn`
 first), and the smoke test is `strace /bin/true` in a guest - which is what
 motivated all of this.
+
+**Where the ptrace thread stands, and what the gate did.** The fix and its pin are
+committed (`fdc69f7`, `6add34c`); the pin's six checks were read green off a lane
+(`a signal stop answers PTRACE_SYSCALL_INFO_NONE`, `the NONE answer still carries
+the tracee's ip and sp`, `the entry stop names the call the child made (getpid)`,
+`the exit stop carries that call's result`), and the smoke test the note asked for
+passed on the real machine: `strace -o ... /bin/true` exits 0 with an 11-line trace
+ending in `exit_group(0 <unfinished ...` / `+++ exited with 0 +++`, and
+`strace -f /bin/sh -c true` exits 0 with 27 lines - where before the fix the same
+attempt reported `ptrace_syscall_info.op == 2` and killed its tracee on a user page
+fault at `0x8c`.
+
+The x86 gate arm, however, aborted on **lane 1's 900 s timeout**, and that lane's
+own serial log shows a *finished* sweep (`=== SUMMARY pass=34 fail=0`, `=== END`,
+`mpos: reboot(0x4321fedc)`). A lane whose machine concluded but whose harness lost
+the exit is this repository's documented flake shape, and its prescription is: kill
+the lane's QEMU, re-run alone, quote the green run. **That re-run has not happened** -
+the working tree at that moment carried another worker's in-progress
+`drivers/virtio` block/poll changes (`drain_abandoned`, `note_blk_submit`, a kunit
+suite), and a gate run builds the working tree, so a red there would not be a
+verdict on this thread. The gate line for `fdc69f7`/`6add34c` is therefore **owed**,
+to be taken on a tree that contains only the ptrace change.
