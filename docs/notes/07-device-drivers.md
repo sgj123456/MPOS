@@ -4813,3 +4813,41 @@ the claim would report as the kernel refusing the namespace. That is the shape o
 nondeterministic single-lane failure, and it is the first thing to rule out if the
 claim goes red again - the fix, when it is taken, is to spell the call the way the
 file's own helper already does.
+
+**The cgroup claim's one-lane red, found and closed - and it was the test answering
+both ways.** Running `t-ns-mnt` alone on the gate's own test machine turned the
+earlier reading on its head: the claim printed **both** lines,
+
+    ok:    clone(CLONE_NEWCGROUP) starts a child, view-rooted where its parent is grouped
+    FAIL:  clone(CLONE_NEWCGROUP) starts a child, view-rooted where its parent is grouped
+    FAILED
+    PASS
+
+and the harness counted `PASS`, because `Report::finish` is what prints the verdict
+and the *last* one wins. Two things were wrong and both are this file's own
+lessons, missed in this one claim:
+
+1. **The clone's door named two arguments of the five x86_64's `clone` reads**
+   (`flags, stack, parent_tid, child_tid, tls`), so `parent_tid`/`child_tid`/`tls`
+   were whatever the variadic trampoline left in them - a garbage `child_tid` is a
+   birth that fails for a reason the claim reads as the kernel refusing the
+   namespace. Every other clone in the file goes through its own `clone_raw` with
+   all five; this one did not.
+2. **The child was never told to leave.** This clone is process-shaped (no stack),
+   so the child returns from `clone_raw` and runs the parent's remainder - printing
+   the claim a second time with `cloned_cgroup == 0`, i.e. a `FAIL` from the child
+   beside the parent's `ok`. The file's two branches above already exit from the
+   child (`libc::syscall(SYS_exit, 0)` then `std::process::exit(0)`); this one was
+   added without that guard, which is exactly the `t-memfd-shm` rule the migration
+   wrote down (a `check` after the fork is printed by both processes).
+
+Either alone is enough to make the claim answer two ways, and which report landed
+last is what a reader saw - so the 2026-10-26 gate's "one lane, one claim" red was
+this, not a kernel answer and not an unrelated flake. Fixed both ways and measured
+on the same machine, one program in one lane: one `ok:` for the claim, no second
+line, `=== PASS t-ns-mnt`, `=== SUMMARY pass=1 fail=0`, exit 33.
+
+The reading matters beyond this claim: a flake whose *own program* can print both a
+pass and a fail is not the same thing as a flake in a service (the `t-posix`
+priority and `t-clock-gettime` entries), and the two want different responses -
+those are re-run and quoted green, this one had a bug to find.

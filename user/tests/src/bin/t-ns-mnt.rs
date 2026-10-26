@@ -393,13 +393,40 @@ fn main() {
     // "refused whole" once per missing rung - PID, then NET, then IPC - and the
     // claim that replaced each refusal was the birth, which is this one now
     // that the ladder is complete.
-    let cloned_cgroup = fix(unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            (libc::CLONE_NEWCGROUP as usize | libc::SIGCHLD as usize) as libc::c_long,
-            0isize as libc::c_long,
-        )
-    });
+    //
+    // The door is this file's own `clone_raw`, not a two-argument `syscall`:
+    // x86_64's `clone` reads five registers (`flags, stack, parent_tid,
+    // child_tid, tls`), so a call that names two leaves the other three as
+    // whatever the variadic trampoline left in them - and a garbage `child_tid`
+    // is a birth that fails for a reason the claim below would read as the
+    // kernel refusing the namespace. That is a nondeterministic red dressed as a
+    // kernel answer, and it is what made this claim's one-lane failure in the
+    // 2026-10-26 gate worth ruling out (docs/notes/07-device-drivers.md, R.9's
+    // ledger). Every other clone in this file already went through the helper;
+    // this one did not.
+    let cloned_cgroup =
+        unsafe { clone_raw(libc::CLONE_NEWCGROUP as usize | libc::SIGCHLD as usize) };
+    if cloned_cgroup == 0 {
+        // The child leaves at once, the way the two branches above do: this
+        // clone is process-shaped, so the child returns *here* and would run
+        // the parent's remainder - printing the claim below a second time with
+        // `cloned_cgroup == 0`, i.e. a `FAIL` from the child beside the parent's
+        // `ok`, and whichever report `Report::finish` prints last is the one a
+        // reader sees. Measured on the gate's test machine before this guard
+        // existed: one run of this program alone printed
+        //
+        //     ok:    clone(CLONE_NEWCGROUP) starts a child, ...
+        //     FAIL:  clone(CLONE_NEWCGROUP) starts a child, ...
+        //     FAILED
+        //     PASS
+        //
+        // with the harness reading `PASS` - a claim that answers both ways is
+        // the shape the 2026-10-26 gate reported as a one-lane red, and it costs
+        // nothing to remove: `_exit` takes no share of the parent's buffered
+        // stdout, which is this file's `child reported cleanly` rule.
+        unsafe { libc::syscall(libc::SYS_exit, 0isize as libc::c_long) };
+        std::process::exit(0); // unreachable
+    }
     r.check(
         "clone(CLONE_NEWCGROUP) starts a child, view-rooted where its parent is grouped",
         cloned_cgroup > 0,
