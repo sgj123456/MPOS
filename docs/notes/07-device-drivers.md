@@ -4912,3 +4912,14 @@ userspace construct in busybox's `read` builtin blocks its signal mask
 (`rt_sigprocmask`, syscall 14) and polls a regular file, and why it re-polls instead
 of consuming to end-of-file. That is a question about the shell, and it is
 answerable by reading busybox's `read` rather than this kernel.
+
+The arm with `t-fd-restore` in it, on a clean worktree at `9161020`:
+
+    User tests: 211 programs over 6 lane(s)
+    lane 0: 36 programs, exit 33   (the new one rides lane 0)
+    lane 1..5: 35 programs each, exit 33
+    self-test (x86_64): pass=211 fail=0 (211 built)
+    exit 0
+
+one more than the 210 of the run before it, which is the added program and
+nothing else.
