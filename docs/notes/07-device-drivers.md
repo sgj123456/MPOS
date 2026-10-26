@@ -4923,3 +4923,39 @@ The arm with `t-fd-restore` in it, on a clean worktree at `9161020`:
 
 one more than the 210 of the run before it, which is the added program and
 nothing else.
+
+**The userland candidate narrowed to the shell's own binary, measured off the image.**
+With the kernel side eliminated, the remaining question was which userspace construct
+polls - and the image answers most of it without a boot:
+
+* the shell is **busybox 1.38.0** (`strings /bin/busybox`: `BusyBox v1.38.0
+  (2026-10-25 19:58:26 UTC)`), and the *same binary* run here on a current Linux
+  completes the loop shape cleanly - `for f in *; do read a b c <"$f"; done` over
+  three scripts, `iterations=3`, rc=0 - including with openrc's own fd dance in
+  front of it (`exec 3>&1 1>&2`, stdin `/dev/null`). So the shell, the loop and the
+  redirect are all sound; nothing about the construct is wrong on a correct kernel.
+* `gendepends.sh` itself (dumped from the image's root partition, 130 lines) has
+  exactly one wait-shaped line - line 74's `read one two three <"$RC_SERVICE"` - and
+  the script it heads with is `#!/bin/sh`, so its own `case` arm at 78-89 is the
+  `#!` one.
+* openrc is **0.63.2** (`/sbin/openrc`'s strings carry `0.63.2`, `RC_VERSION`, and a
+  `poll: %s` error path beside `fork: %s`), so the `rt_sigprocmask` → `poll` pair the
+  spin line recorded is openrc's own child-waiting, not a shell construct.
+
+That last point is the reading that matters: `rt_sigprocmask` immediately before a
+`poll` on a *file* descriptor is what a parent does around waiting for a child with a
+saved mask - and openrc forks (`fork: %s`, `waitpid: %s`, `pipe2: %s` all in its
+strings). So the spin is most likely openrc's own wait loop over a `pipe2`/`poll`,
+with `fd=0` in the instrument's line naming the *inherited* descriptor rather than
+the one the poll is on, and the mask dance being `sigprocmask`-around-`poll` the way
+`pselect`/`ppoll` spells it.
+
+What is *not* yet measured is which of those it is, and the difference matters: an
+openrc-side loop is userspace's to fix, while a `ppoll` whose mask handling this
+kernel gets wrong is ours. The one instrument that separates them is already in the
+tree - the poll line prints the descriptor *and* the syscall before it - and it needs
+`fd=` to be the number the poll was actually called with, which the next step is to
+check it prints (it currently reports the *watched* descriptor, which for a `ppoll`
+with a one-element array is what we want, but for a multi-descriptor poll would be
+the first entry only). Until that is confirmed, the ledger's shape stops here rather
+than guessing between the two.
