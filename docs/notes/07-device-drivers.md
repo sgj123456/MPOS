@@ -5479,3 +5479,60 @@ that is loading and the task that owns it. That is one line in the heartbeat and
 separates "the owner's transfer never completed" from "the owner's transfer completed
 and its retirement was lost" - which are different fixes, and the boot cannot tell them
 apart today.
+
+**The bottom of the stack: the block device's completion interrupt stops being
+delivered, and the counter proves it.** The live-pair instrument - `HOLDER` and `WAITER`
+read straight out of `blk_irq` beside the interrupt count, rather than trusting the
+heartbeat's last-written mirror - gives the reading this whole thread was missing:
+
+    mpos: heartbeat fill-owner=slot 10/pid 10 alive=true fill-busy=true
+                    blk-busy=true blk-waiter=slot 12 holder=12 waiter=12 irq=9268
+    mpos:   slot 12 /sbin/udevd  park 4 (block_until_uninterruptible) parks=19653
+
+and the count sampled three times across eighteen seconds:
+
+    irq=9268   irq=9268   irq=9268
+
+**`irq` does not move.** The handler chain is intact and complete - `BLK_IRQ_VECTOR`
+0x42 → `virtio_blk` → `service_blk` → `complete_irq` → `IRQ_COUNT`, with the LAPIC EOI
+afterwards - so what has stopped is not the software path but the **delivery**: the
+device is no longer raising the vector, or the vector is masked. Meanwhile slot 12
+holds the mailbox (`holder=12`) and is the recorded waiter (`waiter=12`), re-parking at
+`19653 × 4 ms ≈ 78 s`, which is `WAIT_NS` exactly. One task, holding the device,
+waiting for a completion nothing will deliver.
+
+That closes the causal chain this section has been walking down since the boot's first
+stall, and every link is now measured rather than argued:
+
+    device interrupt stops  ->  holder never sees `completed`
+      ->  `transfer`'s wait loops on `WAIT_NS` for ever
+      ->  the ext4 fill claim it owns is never `end_fill`ed  (`out=2`)
+      ->  seven udevd workers park on `ext4_slot_wait`
+      ->  `udevd` never finishes its work, so `openrc sysinit`'s udev-trigger never returns
+      ->  `init`'s `wait4(-1)` has a child that never changes state
+      ->  inittab's later lines (`openrc boot`, `openrc default`, four gettys) never run
+
+**`out=2` is therefore explained, not mysterious:** it is what a fill looks like when its
+owner is stalled mid-transfer. The two readings that disagreed (11377/11377 diff=0 in one
+boot, `out=2` in two others) are the same rule under different interrupt luck - which is
+also why it looked "intermittent" and why that label was wrong.
+
+**The next step, and it is a different subsystem from everything above:** why the MSI-X
+vector stops being delivered after ~9268 completions. Three candidates, each with a
+measure, and they are cheap to separate: (1) the device's ISR was never read, so virtio
+holds the line asserted and the MSI controller has nothing new to send - the ack a
+virtio-pci driver owes is `read(isr)` after the used ring is consumed, and neither
+`complete_irq` nor `finish_request` reads it; (2) an interrupt was delivered while the
+vector was masked and never re-armed (the `used_event` / `avail_event` pair); (3) the
+queue's `should_notify` bookkeeping stops notifying once the used index and the event
+index agree. (1) is the one that fits "works 9268 times, then never again", because an
+unread ISR latches and blocks further MSI-X messages on that vector - and it is the
+first thing to measure, by reading the ISR in `service_blk` and printing what it held.
+
+**Where the thread stands, honestly.** Seven faults have stopped this boot; the six
+fixed and gated are `93865d7`, `f761cc4`, `4e927ce`, `d945e29`, `626f58a` and `1b36efb`.
+The seventh is this interrupt delivery, and it is **underneath** the block layer the
+previous six were found in - so the boot still does not reach a login, and this entry
+does not claim otherwise. What has changed is the quality of the question: it is no
+longer "why does the boot stop" but "why does MSI-X vector 0x42 stop being delivered
+after 9268 completions", which is one probe away from an answer.
