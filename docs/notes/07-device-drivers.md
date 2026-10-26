@@ -5068,3 +5068,46 @@ fixed - the claim's single registration (`93865d7`), the unbounded device wait
 than a thousand lines to make boot: the faults are **layered**, and no instrument can
 see layer N+1 until layer N stops moving, because a task asleep on a fault never
 reaches the code that has the next one.
+
+**The remaining stall is a leaked fill claim, and the counter says so exactly.** With
+`d945e29` in, the block layer's own deadlock is gone (`blk stall` 0, no unpopped used
+entry), and the next boot's instrument reads the stall one level up - in the ext4
+cache's fill scratch, not in the device:
+
+    mpos:   wakes calls=23365 hits=22032 misses=1333 claim-hits=4343 claim-misses=0
+            fill=8771/8769(out=2 age=201134ms slot=10 syscall=4) run=0/0(out=0)
+    mpos:   slot 10 pid 10 /sbin/udevd  park 4 (block_until_uninterruptible) parks=4376..50068
+    mpos:   slot 17..19 /sbin/udevd      park 7 (ext4_slot_wait) parks=3..7
+
+Two facts, and the first is the answer:
+
+1. **`out=2`** - the fill lifecycle counters say two fills were *begun* and never
+   *ended*. The cache serves exactly one fill at a time (`fill_busy` is one flag), so
+   two outstanding claims is not a busy cache, it is a violated invariant - and the
+   `age=201134ms` dates both leaks to the first minutes of the boot, long before the
+   stall. The claim has to come back exactly once per `Step::Go`, and twice it did not.
+2. **The counters also falsify what the heartbeat appears to say.** `blk-waiter=slot
+   10` and `park 4 … syscall 61` are the *last* values the task wrote, not its current
+   ones: `blk-waiter` is only stored on a *successful* `begin_request` (a failed claim
+   leaves it alone) and `PARK_SITE` is documented as "a task that parked once and is
+   now running keeps its last site". So reading them as "udevd holds the block and is
+   in wait4" is wrong; the trustworthy fields are the ones with a *counter* beside
+   them, and `parks` climbing at ~400/s on slot 10 while `fill out=2` sits at 201 s is
+   the pair that actually describes the stall.
+
+**The next reading is one line in `ensure_block`'s `Step::Go` arm**, printing
+`claim.at()`, the task, and the syscall when `end_fill` is reached - against the same
+line at `note_fill_begin`, so the two unpaired ones name themselves. The suspect is a
+`Step::Go` that never reaches `read_at` (an early return or a panic-adjacent path
+between the claim and the device call), because `note_fill_end` sits immediately after
+`end_fill` on the only path that has one.
+
+**Where this leaves the four-fault accounting.** The boot has now been stopped by:
+the claim's single registration (`93865d7`), the unbounded device wait (`f761cc4`),
+the claim leak on *death* (`4e927ce`), the holder-as-guess (`d945e29`), and now the
+claim leak on a *living* task - `out=2` with both leaks dated to boot. Each was only
+visible after the one before it stopped moving. That is why a thousand-line change has
+cost many thousand lines to make boot, and it is worth writing down plainly: the
+change added four new waiting contracts across drivers, vfs and sched, and shipped
+none of them with an invariant assertion. `out != 0` at quiescence is exactly such an
+assertion, and it exists now precisely because this bug needed it.
