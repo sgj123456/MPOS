@@ -4785,3 +4785,31 @@ answers the *gateway* under every host's QEMU build - is the fixture's now-named
 dependency, the same shape `t-dhcp`/`t-dns` carry by living in the `external`
 group; it is measured green on this host and the program names the address it
 needs rather than assuming one.)
+
+**The green gate line, taken at last - and the second red was not one.** With the
+`t-epoll-socket` fixture corrected, a clean worktree at that commit and the x86_64
+arm run whole:
+
+    User tests: 210 programs over 6 lane(s)
+    lane 0..5: 35 programs each, exit 33
+    self-test (x86_64): pass=210 fail=0 (210 built)
+    self-test (x86_64): mpos-kunit 32 passed, 0 failed
+    exit 0
+
+So the ptrace fix (`fdc69f7`) now stands on a green arm rather than only on the
+`strace` smoke test, and `t-ns-mnt`'s cgroup claim - the ledger's other red - is
+green in the same run: it is a **flake of the same lane-and-one-claim shape** the
+`t-posix` priority claim has (`docs/notes/` §6.18's entry, and this file's
+known-traps row), not a live bug, and a re-run is the answer to it as it is there.
+
+One thing the two reds' reports *did* turn up, worth a line because it is a
+weakness no claim currently catches: `t-ns-mnt`'s cgroup claim forks through the
+raw `libc::syscall(SYS_clone, flags, 0)` - **two** arguments - while the same file's
+other four clone claims go through its own `clone_raw`, which passes all five
+(`flags, stack, parent_tid, child_tid, tls`). x86_64's `clone` reads five registers,
+so the three the short call does not name are whatever the variadic trampoline left
+in them: a garbage `child_tid` pointer is a birth that fails or faults for a reason
+the claim would report as the kernel refusing the namespace. That is the shape of a
+nondeterministic single-lane failure, and it is the first thing to rule out if the
+claim goes red again - the fix, when it is taken, is to spell the call the way the
+file's own helper already does.
