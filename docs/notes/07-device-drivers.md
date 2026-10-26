@@ -5738,3 +5738,48 @@ the symptom is not the same as the mechanism that causes it**, and only a
 build-and-boot that reaches a login can tell them apart. The instruments that make that
 distinction cheap are now all in the tree; what has been expensive is believing an
 explanation before the boot confirmed it.
+
+**`init` never enters the child wait at all - it parks on an *uninterruptible* site that
+`wait4` does not use.** The instrument that was thrown away twice was finally kept: a
+line at `block_until_child_event`'s guard printing `id / guard / alive / code / retired`
+for pid 1. With the drain also in, one boot gives:
+
+    mpos: INITSYNC ...            <- zero lines, all boot
+    mpos: blk drain: token=0 submitter=6 status=RespStatus(3) drained=1
+    mpos: slot 1 /sbin/init  park 4 (block_until_uninterruptible) syscall 61 parks=369
+    heartbeats: 12, slot 1's `parks` frozen at 369 throughout
+
+Three facts, and together they move the question off the scheduler:
+
+1. **Zero `INITSYNC` lines.** `init` never reaches `block_until_child_event`, so neither
+   `626f58a` nor `1b36efb` is even on the path it is stuck on - which is why two rounds
+   of fixing the child-wait guards changed nothing about this boot. That is the answer to
+   "why did the guards not prevent it": they are never called.
+2. **`park 4` is `block_until_uninterruptible`** (`PARK_SITES[4]`), and **`wait4` has no
+   uninterruptible park anywhere in its path** (verified: no `block_until_uninterruptible`
+   in `child_exit.rs` or `proc.rs`). So the site the heartbeat prints is a *stale last
+   value*, exactly as `PARK_SITE`'s own doc warns ("a task that parked once and is now
+   running keeps its last site").
+3. **`parks=369` frozen across 12 heartbeats** with every resource idle means `init` is
+   not parking and not progressing - and `parks` is only incremented by a park, so the
+   number says nothing about where `init` is *now*. Combined with (2) that leaves one
+   reading: `init` is **running or spinning**, not asleep, and `PARK_SITE` is telling us
+   where it last slept rather than where it is.
+
+**So the next probe is not a child-wait one at all.** It is: is `init` inside the kernel
+or in ring 3? A task that is spinning in ring 3 shows as `park 4` with a frozen `parks`
+and a live `syscall 61` - which is exactly this - and a task spinning in the wait loop of
+`handle_wait` would show the same. The instrument that separates them is a sample of the
+held `syscall`/`ip` pair over time (the boot's `#NM`/preempt path already has the frame),
+or simply adding a print to `handle_wait`'s entry for pid 1 and seeing whether it repeats.
+**The one thing this section should not do again is name a cause before that reading** -
+three times now (the ISR read, the re-entry claim, the drain as *the* cause) a mechanism
+that explained the symptom was implemented and the boot did not move.
+
+**Where the thread honestly ends this round.** The block layer is now clean and measured
+clean (`drain` fires once, then `fill-owner=none`, `blk-busy=false`, no stalls, no `out=2`
+for the rest of the boot). The six scheduler/driver faults fixed earlier are gated green.
+The boot still stops after `Populating /dev ... [ ok ]`, and the remaining fault is
+narrowed to one question - *is `init` asleep or spinning, and on what* - which is a
+five-line reading away, with every instrument needed already in the tree and the
+`PARK_SITE`-is-stale trap now written down so it is not misread again.
