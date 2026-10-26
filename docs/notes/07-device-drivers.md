@@ -4966,3 +4966,54 @@ The arm behind that instrument change, on a clean worktree at `35533e9`:
     self-test (x86_64): pass=211 fail=0 (211 built)
     self-test (x86_64): mpos-kunit 32 passed, 0 failed
     exit 0
+
+**The block layer's deadlock, read off the wire: a used-ring head nobody pops.** The
+boot on a clean worktree at HEAD does **not** reach a login - 400 s of `cargo xtask
+run` times out with the wire silent after `Populating /dev ... [ ok ]` - and the two
+instruments that were finally pointed at it name the failure exactly.
+
+The first of them was missing until now. The heartbeat fired only from the syscall
+gate and the preempt path, so a machine where **every** task is parked printed
+nothing at all, which is precisely the shape a deadlock has. Firing it from
+`wait_for_interrupt` as well fixed that, and the very next boot said:
+
+    mpos: heartbeat fill-owner=slot 10/pid 10 alive=true exited=false
+                    fill-busy=true blk-busy=true blk-waiter=slot 10
+    mpos:   fill=8805/8803(out=2 age=111304ms slot=10 syscall=4) run=0/0(out=0)
+    mpos:   slot 10 pid 10 /sbin/udevd  park 4 (block_until_uninterruptible) parks=31670
+    mpos:   slot 11..18 pid 11..18 /sbin/udevd  park 7 (ext4_slot_wait) parks=3..1670
+
+so one udevd worker had held the ext4 fill claim for **111 seconds** while eight
+siblings queued behind it, and it was itself parked waiting on a block transfer.
+`parks=31670` at a 4 ms period is that task re-parking on the loss-recovery poll.
+
+The second instrument says why the transfer never ends - the wait loop's own report,
+printed once when it has gone 100 periods without an answer:
+
+    mpos: blk stall: me=8 token=1 rounds=50  ring=Some(0) busy=true waiter=8
+    mpos: blk stall: me=8 token=1 rounds=1000 ring=Some(0) busy=true waiter=8
+
+**`token=1`, `ring=Some(0)`.** The submitted request owns token 1; the used ring's
+head holds **token 0**, and it never moves. `virtio-drivers`' `pop_used(token, ..)` is
+strictly FIFO - it reads `used.ring[last_used_idx]` and answers `Error::WrongToken`
+when the id there is not the token asked for, and it advances `last_used_idx` only on
+a successful pop. So one entry completed but left unpopped pins the head, and every
+later transfer waits for a token that can never arrive. `peek_used() == Some(token)` -
+the whole of this driver's wait condition - can never become true again, while
+`busy=true waiter=8` means nothing else can even try. It is a self-lock: the owner of
+the mailbox is the task waiting for the head to clear.
+
+Which completion was left unpopped is not yet measured, and the shape the next
+reading wants is one line where the pop happens, printing `peek_used()` afterwards:
+the pop is inside `critical_section` after the wait, so a leftover there means the
+device completed an entry the driver never saw (an abandoned submission from a
+`transfer_sync` caller, or a completion delivered for a request whose task left the
+loop by a path that does not pop). What is already certain is that the ring cannot
+recover on its own: nothing in this driver pops an entry it did not submit, so a
+single stray completion wedges the disk for the life of the boot.
+
+Why the previous fixes did not reach it, which is the honest accounting: `93865d7`
+and `4e927ce` both belong to the ext4 **claim** layer, and in this boot that layer is
+healthy - `claim registrations=7041 handed-back=7041`, `claim-misses=0`. The stall was
+one level *below* the claims, in the mailbox and the ring they sit on, and it only
+became readable once the heartbeat could fire on an all-parked machine.
