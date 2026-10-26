@@ -1230,6 +1230,12 @@ impl Inode for Ext4Ino {
         }
     }
 
+    /// The number this handle was built with: free, and the half of the
+    /// process-exit key that must not become a device read.
+    fn number(&self) -> u64 {
+        self.ino as u64
+    }
+
     fn mode(&self) -> u32 {
         (self.fs.read_inode(self.ino).mode as u32) & 0o7777
     }

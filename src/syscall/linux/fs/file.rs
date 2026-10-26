@@ -5439,11 +5439,16 @@ pub fn handle_inotify_add_watch(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
         Ok(node) => node,
         Err(e) => return err_of(e),
     };
-    if in_mask & inotify::IN_ONLYDIR != 0 && watched.metadata().kind != crate::vfs::NodeKind::Dir {
+    // Read the kind once: `IN_ONLYDIR` refuses a non-directory with it, and the
+    // watch records it so a later self-event needs no inode read at all - the
+    // close path runs where a device read would park a task that is never
+    // scheduled again (`docs/notes/` §7 R.9).
+    let is_dir = watched.metadata().kind == crate::vfs::NodeKind::Dir;
+    if in_mask & inotify::IN_ONLYDIR != 0 && !is_dir {
         return err::EINVAL;
     }
     let owner = node.metadata().ino;
-    match inotify::add_watch(&node, owner, inotify::key_of(&watched), in_mask) {
+    match inotify::add_watch(&node, owner, inotify::key_of(&watched), in_mask, is_dir) {
         AddOutcome::New(wd) | AddOutcome::Replaced(wd) | AddOutcome::Exists(wd) => wd as isize,
         AddOutcome::NoSpace => err::ENOSPC,
         AddOutcome::NotAnInstance => err::EINVAL,

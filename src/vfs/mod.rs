@@ -400,6 +400,19 @@ impl dyn Inode {
 pub trait Inode: Send + Sync + core::any::Any {
     fn metadata(&self) -> Metadata;
 
+    /// The node's own number, without reading storage.
+    ///
+    /// The default goes through [`Inode::metadata`], which is honest for every
+    /// caller in task context. It exists as its own door because exactly one
+    /// caller is *not* in task context: the process-exit path, where a park is
+    /// the machine stopped - the picker never schedules a task whose `exited`
+    /// flag is set, so `exit()` must not block, and a filesystem whose metadata
+    /// read is a device transfer must answer this without one (`ext4` overrides
+    /// it with the number it already holds).
+    fn number(&self) -> u64 {
+        self.metadata().ino
+    }
+
     /// The named child of this directory.
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         let _ = name;

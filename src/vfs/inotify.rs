@@ -570,6 +570,15 @@ pub struct Watch {
     owner: Ino,
     pub wd: i32,
     pub mask: u32,
+    /// Whether the watched node is a directory, recorded when the watch was
+    /// added.
+    ///
+    /// It is stored rather than read at each event because a **self-event**'s
+    /// subject is the watched node itself: recording the kind once lets
+    /// [`emit`] and the close path answer `IN_ISDIR` without an inode read, and
+    /// the close path runs where a device read would park a task that is never
+    /// scheduled again (`docs/notes/` §7 R.9).
+    pub is_dir: bool,
 }
 
 struct RegistryState {
@@ -593,11 +602,14 @@ static REGISTRY: Mutex<RefCell<RegistryState>> = Mutex::new(RefCell::new(Registr
 /// The watch key of an inode: its mount's id and its own number - the same
 /// pair the lock table keys on, because it answers the same question
 /// ("which file is this, really") across mounts that reuse inode numbers.
+///
+/// `inode.number()` and not `inode.metadata().ino`: the process-exit path asks
+/// this too ([`emit`], from [`close_at_exit`]), and a filesystem whose metadata
+/// read is a device transfer must not be made to do one there - a task whose
+/// `exited` flag is set is never scheduled again, so a park on that path stops
+/// the machine (`docs/notes/` §7 R.9).
 pub fn key_of(inode: &Arc<dyn Inode>) -> (u64, u64) {
-    (
-        crate::vfs::mount::fs_id_of_inode(inode),
-        inode.metadata().ino,
-    )
+    (crate::vfs::mount::fs_id_of_inode(inode), inode.number())
 }
 
 /// The mask bits `inotify_add_watch` stores for later matching.
@@ -623,7 +635,13 @@ pub enum AddOutcome {
 /// caller checked - and `owner` is its anonymous inode number. Same
 /// instance + same key is the dedup pair Linux defines: it updates in
 /// place and keeps the descriptor number.
-pub fn add_watch(inode: &Arc<dyn Inode>, owner: Ino, key: (u64, u64), in_mask: u32) -> AddOutcome {
+pub fn add_watch(
+    inode: &Arc<dyn Inode>,
+    owner: Ino,
+    key: (u64, u64),
+    in_mask: u32,
+    is_dir: bool,
+) -> AddOutcome {
     let Some(instance) = inode.as_inotify() else {
         return AddOutcome::NotAnInstance;
     };
@@ -662,6 +680,7 @@ pub fn add_watch(inode: &Arc<dyn Inode>, owner: Ino, key: (u64, u64), in_mask: u
             owner,
             wd,
             mask,
+            is_dir,
         });
         AddOutcome::New(wd)
     })
@@ -687,8 +706,7 @@ pub fn remove_watch(instance: &InotifyInstance, owner: Ino, wd: i32) -> bool {
 /// one record, `IN_ONESHOT` watches are spent and retired (with their
 /// `IN_IGNORED`), and the woken tasks are collected for the caller to wake
 /// outside every borrow.
-fn emit_rec(key: (u64, u64), mask: u32, name: &str, cookie: u32, is_dir: bool) {
-    let out_mask = mask | if is_dir { IN_ISDIR } else { 0 };
+fn emit_rec(key: (u64, u64), mask: u32, name: &str, cookie: u32, is_dir: Option<bool>) {
     let mut wake: Vec<crate::sched::TaskId> = Vec::new();
     let mut spent: Vec<(Arc<dyn Inode>, i32)> = Vec::new();
     critical_section::with(|cs| {
@@ -707,9 +725,15 @@ fn emit_rec(key: (u64, u64), mask: u32, name: &str, cookie: u32, is_dir: bool) {
             let Some(instance) = node.as_inotify() else {
                 continue;
             };
+            // The subject's kind: a caller reporting news about a *name* knows
+            // it (the child, not the watched directory), and `None` means the
+            // subject **is** the watched node - whose kind the watch recorded
+            // when it was added, so a self-event needs no inode read.
+            let is_dir = is_dir.unwrap_or(w.is_dir);
             if !event_matches(w.mask, mask, is_dir) {
                 continue;
             }
+            let out_mask = mask | if is_dir { IN_ISDIR } else { 0 };
             // `IN_EXCL_UNLINK` honoured at the unlink boundary: a watch
             // that asked not to hear about removals by name does not get
             // the removal of the name itself reported.
@@ -758,9 +782,14 @@ fn emit_rec(key: (u64, u64), mask: u32, name: &str, cookie: u32, is_dir: bool) {
 /// Report news about an inode, or about a name inside a watched directory.
 /// The mutation hook calls this after its own operation has succeeded;
 /// `name` is empty for events about the inode itself.
+///
+/// The subject's kind is not read here: an event whose subject **is** the
+/// watched node (`name` empty) takes the kind the watch recorded at
+/// `inotify_add_watch` time, so this door - the one [`close_at_exit`] comes
+/// through, on the process-exit path where a device read is fatal - never
+/// reads inode metadata at all (`key_of` says why).
 pub fn emit(inode: &Arc<dyn Inode>, mask: u32, name: &str) {
-    let is_dir = inode.metadata().kind == NodeKind::Dir;
-    emit_rec(key_of(inode), mask, name, 0, is_dir);
+    emit_rec(key_of(inode), mask, name, 0, None);
 }
 
 /// Report news about a *name inside* a watched directory: `IN_CREATE` and
@@ -776,7 +805,7 @@ pub fn emit(inode: &Arc<dyn Inode>, mask: u32, name: &str) {
 /// matches records on their mask (`inotifywait`, `t-inotify`'s six-event
 /// life) then loses the record without ever seeing the wrong bit.
 pub fn emit_child(dir: &Arc<dyn Inode>, mask: u32, name: &str, child_is_dir: bool) {
-    emit_rec(key_of(dir), mask, name, 0, child_is_dir);
+    emit_rec(key_of(dir), mask, name, 0, Some(child_is_dir));
 }
 
 /// Report a data change, `IN_MODIFY`. The scalar `write`/`pwrite` doors reach
@@ -816,9 +845,15 @@ pub fn emit_move(
         reg.cookie = reg.cookie.wrapping_add(1).max(1);
         reg.cookie
     });
-    emit_rec(key_of(old_dir), IN_MOVED_FROM, old_name, cookie, is_dir);
-    emit_rec(key_of(new_dir), IN_MOVED_TO, new_name, cookie, is_dir);
-    emit_rec(key_of(moved), IN_MOVE_SELF, "", cookie, is_dir);
+    emit_rec(
+        key_of(old_dir),
+        IN_MOVED_FROM,
+        old_name,
+        cookie,
+        Some(is_dir),
+    );
+    emit_rec(key_of(new_dir), IN_MOVED_TO, new_name, cookie, Some(is_dir));
+    emit_rec(key_of(moved), IN_MOVE_SELF, "", cookie, Some(is_dir));
 }
 
 /// Report the death of an inode: `IN_DELETE_SELF` to watches on it, then
@@ -827,8 +862,7 @@ pub fn emit_move(
 /// "WATCH DELETE" line is exactly these two records).
 pub fn notify_deleted(child: &Arc<dyn Inode>) {
     let key = key_of(child);
-    let is_dir = child.metadata().kind == NodeKind::Dir;
-    emit_rec(key, IN_DELETE_SELF, "", 0, is_dir);
+    emit_rec(key, IN_DELETE_SELF, "", 0, None);
     let victims: Vec<(Arc<dyn Inode>, i32)> = critical_section::with(|cs| {
         let mut reg = REGISTRY.borrow(cs).borrow_mut();
         let found = reg
@@ -1175,6 +1209,44 @@ mod tests {
             .unwrap()
     }
 
+    /// A node whose metadata read is a panic: the pin for the exit path's rule.
+    ///
+    /// [`close_at_exit`] runs on the process-exit path, where a device transfer
+    /// is not slow but *fatal* - the picker never schedules a task whose
+    /// `exited` flag is set, so a park there stops the machine. `ext4`'s
+    /// metadata read is such a transfer, so the close-event path must take the
+    /// node's number and kind from [`Inode::number`]/[`Inode::is_dir`] instead.
+    /// With the old metadata-reading `key_of`/`emit`, the first line of the test
+    /// below panics - that is the counterfactual.
+    struct MetadataPanics {
+        inner: Arc<dyn Inode>,
+    }
+    impl Inode for MetadataPanics {
+        fn metadata(&self) -> crate::vfs::Metadata {
+            panic!("the close-event path read inode metadata");
+        }
+        fn number(&self) -> u64 {
+            self.inner.number()
+        }
+    }
+
+    /// The close-event path never reads inode metadata.
+    #[test]
+    fn the_close_event_path_reads_no_metadata() {
+        let _g = lock_tests();
+        let inner = watched_dir();
+        let node: Arc<dyn Inode> = Arc::new(MetadataPanics {
+            inner: inner.clone(),
+        });
+        assert_eq!(
+            key_of(&node),
+            key_of(&inner),
+            "the watch key comes from number(), not a metadata read"
+        );
+        assert_eq!(node.number(), inner.number());
+        emit(&node, IN_CLOSE_WRITE, "");
+    }
+
     /// The wd lifecycle: new watches allocate from 1, the same instance
     /// re-adding the same key updates in place and keeps the number,
     /// `IN_MASK_CREATE` says EEXIST (as an outcome, which is where it
@@ -1187,22 +1259,25 @@ mod tests {
         let key = key_of(&dir);
         let owner = node.metadata().ino;
 
-        assert_eq!(add_watch(&node, owner, key, IN_CREATE), AddOutcome::New(1));
         assert_eq!(
-            add_watch(&node, owner, key, IN_DELETE),
+            add_watch(&node, owner, key, IN_CREATE, true),
+            AddOutcome::New(1)
+        );
+        assert_eq!(
+            add_watch(&node, owner, key, IN_DELETE, true),
             AddOutcome::Replaced(1)
         );
         assert_eq!(
-            add_watch(&node, owner, key, IN_CREATE | IN_MASK_CREATE),
+            add_watch(&node, owner, key, IN_CREATE | IN_MASK_CREATE, true),
             AddOutcome::Exists(1)
         );
         assert_eq!(
-            add_watch(&node, owner, key, IN_CREATE | IN_MASK_ADD),
+            add_watch(&node, owner, key, IN_CREATE | IN_MASK_ADD, true),
             AddOutcome::Replaced(1)
         );
         // A second instance watching the same inode gets its own number.
         assert_eq!(
-            add_watch(&other, other.metadata().ino, key, IN_CREATE),
+            add_watch(&other, other.metadata().ino, key, IN_CREATE, true),
             AddOutcome::New(1)
         );
         // And the stored mask after the merge carries both bits the first
@@ -1228,7 +1303,7 @@ mod tests {
         let (node, instance) = instance_node();
         let dir = watched_dir();
         let key = key_of(&dir);
-        add_watch(&node, node.metadata().ino, key, IN_CREATE);
+        add_watch(&node, node.metadata().ino, key, IN_CREATE, true);
 
         emit(&dir, IN_DELETE, "gone"); // mask mismatch
         assert!(
@@ -1262,7 +1337,7 @@ mod tests {
             .root()
             .create("read-me", NodeKind::File, None)
             .unwrap();
-        add_watch(&node, node.metadata().ino, key_of(&file), IN_ACCESS);
+        add_watch(&node, node.metadata().ino, key_of(&file), IN_ACCESS, false);
         // A second watch on the same file that did *not* ask for access.
         let (other_node, other) = instance_node();
         add_watch(
@@ -1270,6 +1345,7 @@ mod tests {
             other_node.metadata().ino,
             key_of(&file),
             IN_OPEN,
+            false,
         );
 
         emit_access(&file);
@@ -1302,7 +1378,13 @@ mod tests {
             .root()
             .create("writable", NodeKind::File, None)
             .unwrap();
-        add_watch(&node, node.metadata().ino, key_of(&file_inode), IN_MODIFY);
+        add_watch(
+            &node,
+            node.metadata().ino,
+            key_of(&file_inode),
+            IN_MODIFY,
+            false,
+        );
         let file = crate::vfs::File::new(file_inode.clone());
 
         assert_eq!(file.write(b"one").unwrap(), 3);
@@ -1330,7 +1412,13 @@ mod tests {
         let (node, instance) = instance_node();
         let dir = watched_dir();
         let key = key_of(&dir);
-        add_watch(&node, node.metadata().ino, key, IN_CREATE | IN_ONESHOT);
+        add_watch(
+            &node,
+            node.metadata().ino,
+            key,
+            IN_CREATE | IN_ONESHOT,
+            true,
+        );
 
         emit(&dir, IN_CREATE, "x");
         // One read carries both halves of a spent watch's news: the
@@ -1364,7 +1452,7 @@ mod tests {
         let (node, instance) = instance_node();
         let dir = watched_dir();
         let key = key_of(&dir);
-        add_watch(&node, node.metadata().ino, key, IN_DELETE_SELF);
+        add_watch(&node, node.metadata().ino, key, IN_DELETE_SELF, true);
 
         notify_deleted(&dir);
         let mut buf = [0u8; 64];
@@ -1398,7 +1486,7 @@ mod tests {
         let (node, instance) = instance_node();
         let dir = watched_dir();
         let key = key_of(&dir);
-        add_watch(&node, node.metadata().ino, key, IN_ATTRIB);
+        add_watch(&node, node.metadata().ino, key, IN_ATTRIB, true);
 
         assert!(!remove_watch(&instance, node.metadata().ino, 404));
         assert!(remove_watch(&instance, node.metadata().ino, 1));
@@ -1424,7 +1512,7 @@ mod tests {
         let dir = watched_dir();
         let key = key_of(&dir);
         let owner = node.metadata().ino;
-        add_watch(&node, owner, key, IN_CREATE);
+        add_watch(&node, owner, key, IN_CREATE, true);
         drop(instance);
         drop(node);
         sweep_dead();

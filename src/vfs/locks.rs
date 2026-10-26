@@ -364,36 +364,67 @@ pub fn release_description(dev: u64, ino: u64, ofd: u64) {
     });
 }
 
-/// Release every lock a *process* held on `(dev, ino)`, in either class - what
-/// process exit does, since its descriptions die with it.
-#[cfg(target_os = "none")]
-pub fn release_process(dev: u64, ino: u64, pid: u32) {
-    critical_section::with(|cs| {
-        let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
-        let before = table.len();
-        table.retain(|l| !(l.dev == dev && l.ino == ino && l.pid == pid));
-        if table.len() != before {
-            wake_waiters(dev, ino);
+/// Remove every lock a *process* holds, whatever file each one names, and
+/// report the distinct files a waiter may now be able to take.
+///
+/// This is the whole of what a dying process's locks come to, and it is a
+/// question about the **owner** rather than about a file: a record (`fcntl`)
+/// lock's owner is the thread group, and a `flock`/`F_OFD_*` lock's owner is an
+/// open file description that dies with the process, so "every lock this owner
+/// holds" is exactly the set Linux's per-filp `locks_remove_posix` leaves. The
+/// `(dev, ino)` pairs are returned because a *waiter* sleeps on a file, and the
+/// caller has to wake the waiters for each one.
+///
+/// It is pure - it takes the lock table and gives back what to wake - so the
+/// host tests can pin the selector without a machine. The exit path's own
+/// wrapper ([`release_on_process_exit`]) is what turns the pairs into wakes,
+/// which is why the selector itself is compiled for the machine and the test
+/// build alone.
+#[cfg(any(target_os = "none", test))]
+fn take_owned(locks: &mut Vec<Lock>, owner: u32) -> Vec<(u64, u64)> {
+    let mut freed: Vec<(u64, u64)> = Vec::new();
+    locks.retain(|l| {
+        if l.pid != owner {
+            return true;
         }
+        if !freed.contains(&(l.dev, l.ino)) {
+            freed.push((l.dev, l.ino));
+        }
+        false
     });
+    freed
 }
 
 /// The whole of a dying process's locks, as the scheduler's exit hook sees it.
 ///
-/// Where [`release_process`] is the rule for one inode, this walks the batch the
-/// teardown hands over - which is why it lives here rather than in `sched`: the
-/// teardown owns *tasks*, and "which of these descriptors names an inode this
-/// process still holds a lock on" is a locking question (`NOTES.md` §11.1.3).
+/// It asks the lock table for the owner's locks rather than walking the batch of
+/// descriptors the teardown hands over, and that is not a shortcut - it is the
+/// fix for a boot that never reached a login.
+///
+/// The per-descriptor walk this replaces asked each `File` for its
+/// `(dev, ino)` through `File::metadata()`, and an `ext4` inode's metadata is
+/// read **through the block cache**: when the inode-table block had been evicted
+/// the call started a virtio-blk transfer. That is device I/O inside `do_exit`,
+/// running with the task table borrowed, and Linux does none of it. Measured on
+/// the desktop image: a leaving `openrc` parked in the locks hook with the fill
+/// scratch out (`fill-owner=slot 6 ... syscall=231` = `exit_group`), its parent
+/// never woken and the boot stopped one line after `Populating /dev ... [ ok ]`
+/// (`docs/notes/` §7 R.9). The lock table already knows every `(dev, ino)` a
+/// process holds, so the descriptors are not needed at all.
+///
 /// Registered by the boot sequence, so the order it runs in among the other
-/// hooks is the registration order (`sched::exit`).
+/// hooks is the registration order (`sched::exit`). The `files` are ignored:
+/// the owner is the whole of the question (`NOTES.md` §11.1.3).
 #[cfg(target_os = "none")]
-pub fn release_on_process_exit(files: &[alloc::sync::Arc<crate::vfs::file::File>], owner: u32) {
-    for file in files {
-        release_process(
-            crate::vfs::mount::fs_id_of_inode(&file.inode()),
-            file.metadata().ino,
-            owner,
-        );
+pub fn release_on_process_exit(_files: &[alloc::sync::Arc<crate::vfs::file::File>], owner: u32) {
+    let freed = critical_section::with(|cs| {
+        let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
+        take_owned(&mut table, owner)
+    });
+    // Outside the borrow, the way every wake is handed: the wake touches the
+    // scheduler table, and no wait/wake path grabs `FILE_LOCKS`.
+    for (dev, ino) in freed {
+        wake_waiters(dev, ino);
     }
 }
 
@@ -858,5 +889,48 @@ mod tests {
         assert!(find_conflict(&t, 1, 1, 7, LockClass::Record, LockKind::Write, 0, INF).is_some());
         // ...while the whole-file family never sees it.
         assert!(find_conflict(&t, 1, 1, 7, LockClass::Whole, LockKind::Write, 0, INF).is_none());
+    }
+
+    /// The exit path releases a process's locks **by owner**: every file it
+    /// holds one on goes, and the distinct files come back so the caller can
+    /// wake each one's waiters.
+    ///
+    /// This is the selector the boot's fix rests on. The per-descriptor walk it
+    /// replaced asked each `File` for its `(dev, ino)` through `metadata()`, and
+    /// an `ext4` inode's metadata is a block-device read on a path where a park
+    /// is fatal (`docs/notes/` §7 R.9). The counterfactual is the table below:
+    /// the owner-8 lock on the *same* file must survive, and both files the
+    /// owner-7 locks name must come back to be woken.
+    #[test]
+    fn a_dying_owner_gives_up_every_lock_on_every_file() {
+        let mut t = vec![
+            Lock {
+                dev: 1,
+                ino: 5,
+                ..lock(7, LockClass::Record, LockKind::Write, 0, INF)
+            },
+            Lock {
+                dev: 1,
+                ino: 9,
+                ..lock(7, LockClass::Record, LockKind::Read, 0, INF)
+            },
+            Lock {
+                dev: 1,
+                ino: 5,
+                ..lock(8, LockClass::Record, LockKind::Write, 0, INF)
+            },
+            Lock {
+                dev: 2,
+                ino: 9,
+                ..lock(7, LockClass::Whole, LockKind::Write, 0, INF)
+            },
+        ];
+        let mut freed = take_owned(&mut t, 7);
+        freed.sort();
+        assert_eq!(freed, vec![(1, 5), (1, 9), (2, 9)]);
+        assert_eq!(t.len(), 1, "only owner 8's lock is left");
+        assert_eq!(t[0].pid, 8);
+        assert_eq!(take_owned(&mut t, 8), vec![(1, 5)], "and then its own");
+        assert!(t.is_empty());
     }
 }
