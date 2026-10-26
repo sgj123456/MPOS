@@ -5696,3 +5696,45 @@ same (`1b36efb`), and finally **the unpopped used-ring head**, which is the one 
 actually keeps the machine from a login and which `drain_abandoned` closes. The first six
 were real and are fixed and gated; each of them was *downstream* of this one, which is
 why fixing them moved the stall a step at a time without ever reaching the login prompt.
+
+**`drain_abandoned` closes the used-ring wedge - measured - and the boot still does not
+reach a login.** The combination was built and booted: HEAD plus the other worker's
+uncommitted `virtio/mod.rs` and `blk.rs`. It compiles, and the drain fires **once**, on
+the exact entry this section has been chasing:
+
+    mpos: blk drain: token=0 submitter=6 status=RespStatus(3) drained=1
+    mpos: heartbeat fill-owner=none run-owner=none fill-busy=false
+                    run-busy=false blk-busy=false blk-waiter=none
+
+`token=0`, `submitter=6` - the head that had pinned every later completion, popped by the
+rule written for it. **The used-ring wedge is real and the drain fixes it**: after that
+one line the block layer is completely idle for the rest of the boot, with no `blk stall`,
+no `out=2`, no udevd workers on `ext4_slot_wait`.
+
+**And the boot still stops after `Populating /dev ... [ ok ]`.** So the honest statement,
+which corrects this entry's predecessor once more, is that the unpopped head was **a**
+blocker and **not the** blocker: fixing it removes every block-layer symptom at once
+(which is why it looked like the cause) and leaves the boot in exactly the same place.
+The signature of what remains is now the cleanest it has been in this whole section -
+`init` parked in `wait4`, `parks=369` frozen across 20 heartbeats (~100 s), **no openrc
+process in the table at all**, and every device and cache idle. A parent asleep on a
+child that has already gone.
+
+**Which is the shape `626f58a` and `1b36efb` were supposed to prevent**, and the reason
+they do not is not yet known - that is the next question, and it is a *scheduler*
+question about `P_ALL` collection, not a driver one. The two guards ask `waitable` /
+`has_matching_children` before parking; if `init` is still asleep with the table empty,
+then one of them answered true when it should not have, or `init` never reaches them.
+The instrument needed is the one that was thrown away with its worktree twice now: the
+child-wait's own `id / alive / code / retired_ids` line at `init`, kept this time.
+
+**The ledger's honest state after this.** Eight faults have stopped this boot. Seven are
+fixed and gated (`93865d7`, `f761cc4`, `4e927ce`, `d945e29`, `626f58a`, `1b36efb`, and
+the drain, which is another worker's and uncommitted here). What remains is a wait that
+parks with nothing to wait for. Three times in this thread I named a cause, implemented
+it, and watched the boot not move - the ISR read, the re-entry claim, and (as *the*
+cause) this drain - and each time the lesson was the same: **a mechanism that explains
+the symptom is not the same as the mechanism that causes it**, and only a
+build-and-boot that reaches a login can tell them apart. The instruments that make that
+distinction cheap are now all in the tree; what has been expensive is believing an
+explanation before the boot confirmed it.
