@@ -2484,6 +2484,29 @@ pub fn block_until_child_event(
     stops: bool,
     continues: bool,
 ) -> WaitPark<WaitEvent> {
+    // No child of ours is in that slot any more, and no record is waiting: this
+    // is `ECHILD`, not a park.
+    //
+    // A `wait4(pid)` names a child by slot, and a slot is **reused** - so the
+    // number can outlive the child it named and now belong to somebody else's
+    // process. Without this check the predicate below answers "nothing yet" for
+    // ever: `child_event_in` reads `t.tasks[id.0]` and finds a live stranger (no
+    // stop, no death), while `exit_code(id)` finds nothing because the real
+    // child's record was already collected. The caller then sleeps with
+    // `u64::MAX` on a child that no longer exists - which is exactly how a boot
+    // stops for ever one line after `Populating /dev ... [ ok ]`
+    // (`docs/notes/` §7 R.9: `openrc` in `wait4(7)`, `alive=true`, `code=None`,
+    // `RETIRED` empty).
+    //
+    // `waitable` is the same parent-and-kind question `child_event_in` asks
+    // before reporting anything, so a slot that *is* still this caller's child -
+    // a zombie's, a live one's, or a tracer's tracee - parks exactly as before.
+    // Linux answers `ECHILD` here for the same reason: its `struct pid` outlives
+    // the task, so a pid that is gone is gone and is never re-pointed at a
+    // stranger.
+    if !with_table(|t| waitable(t, id, t.current, kind) || exit_code(id).is_some()) {
+        return WaitPark::NoChild;
+    }
     if matches!(
         block_until_on_interruptible(|t| {
             exit_code(id).is_some()
