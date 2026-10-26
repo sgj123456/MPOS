@@ -5929,3 +5929,130 @@ plus this case); host unit suite green. The desktop boot's remaining stall - `in
 in `wait4` past a child that is already gone - is the thread below this one and stays
 open; the drain closed the block layer's whole contribution to it, measured as "no
 `blk stall`, no `out=2`, no workers on `ext4_slot_wait`" for the rest of the boot.
+
+**The ninth fault is the exit path itself: a task the picker will never schedule
+again parked on a device transfer.** The boot's remaining stop after the drain
+carried two readings, and both name the same door. The heartbeat showed a
+leaving `openrc` holding the fill scratch from inside its own death -
+`fill-owner=slot 6 ... fill-busy=true` with `syscall=231` (`exit_group`) and the
+claim's age in the hundreds of seconds - and a second boot read
+`fill=9174/9173(out=1)` with `fill-owner=none`, the same leak with the owner
+record already cleared. The mechanism under both: the exit path's two vfs hooks
+each started a **device transfer**. The locks hook walked the batch of open
+files and asked every `File` for its `(dev, ino)` through `File::metadata()` -
+an ext4 inode read, which goes through the block cache and becomes a virtio-blk
+transfer when the inode-table block had been evicted - and the inotify
+close-event path read `metadata()` twice (`key_of`'s ino, `emit`'s kind). The
+teardown marks the task `exited` **before** these hooks run, and the picker
+never schedules a task whose `exited` flag is set, so the transfer's park is
+the machine stopped: the claim leaks (`out=1`, then `out=2` where a second
+dying task queued behind the first), everything above waits, and the boot
+freezes one line after `Populating /dev ... [ ok ]`. Linux does none of this:
+`locks_remove_posix` asks the lock table, not the filesystem.
+
+**The fix takes each exit-path question from a door that cannot park.** Three
+changes, each pinned:
+
+* `Inode::number()` answers the node's own number without reading storage. The
+  default goes through `metadata()`, honest for every caller in task context;
+  ext4 overrides it with the number the handle already holds. `inotify::key_of`
+  uses it, so the watch key is free on every filesystem.
+* A watch records `is_dir` when `inotify_add_watch` adds it (the syscall half
+  already read the kind for `IN_ONLYDIR`'s refusal), so a self-event's
+  `IN_ISDIR` comes from the record and `emit` reads nothing at all;
+  `emit_rec`'s subject kind became `Option<bool>` - `None` means the watched
+  node itself, whose kind the watch keeps.
+* The locks hook releases **by owner** from the lock table instead of walking
+  the descriptor batch: the table already knows every `(dev, ino)` a process
+  holds, so the descriptors are not needed at all. The selector (`take_owned`)
+  is a pure function the host tests pin, and the wrapper wakes each freed
+  file's waiters outside the borrow.
+
+The close-event path's pin is a counterfactual of the strongest kind available
+on the host: an `Inode` whose `metadata()` **panics**. With the old
+metadata-reading `key_of`/`emit`, the first line of
+`the_close_event_path_reads_no_metadata` dies; with the fix, the whole door
+answers from `number()` and the recorded kind. The locks selector's pin
+(`a_dying_owner_gives_up_every_lock_on_every_file`) holds the table shape the
+boot's fix rests on: the owner's locks go from every file they name, the
+distinct files come back to be woken, and a stranger's lock on the same file
+survives.
+
+**The MMIO claim wait gets the same re-armed registration the ext4 cache
+already has.** The aarch64 boot lost a different wake in the same family: `eend`
+opening a file stopped one line after `Starting busybox syslog` with the
+mailbox `busy` and its `waiter` naming a slot that no longer held a transfer.
+The claim wait registered **once**, before the first sleep; a waiter woken
+while another claimant took the device between its wake and its re-check slept
+again unregistered, and no later `finish_request` could reach it. The
+registration now runs before **every** sleep through the armed primitive
+(`block_until_uninterruptible_armed`, the shape `vfs::ext4::claim_park` already
+uses), the registration itself is idempotent per task, and the pin is a boot
+suite of its own - `mmio-mailbox.the_claim_wait_registers_once_however_often_it_is_armed`,
+which `Mailbox` can run without any device on either machine
+(`mpos-kunit` 33 → 34 cases).
+
+**The tenth fault, found by the gate itself: the completion wake's sentinel
+collided with the boot slot.** The first rerun of the aarch64 arm after the two
+fixes above hung one lane **inside the drain suite** - after
+`drain: abandoned token 0 at the ring's head`, the third read never completed,
+and the lane's heartbeat carried the whole diagnosis: the tick alive (the
+heartbeat prints), slot 0 frozen with `parks=2`, site 4 (the completion wait),
+and `wakes calls=0` - **no wake was ever delivered the whole boot**. Slot 0 is
+a task: the boot context the scheduler adopts (`BOOT_SLOT`), which is exactly
+the task the self-test suites run on. Both block transports gated the
+completion wake on `waiter != 0`, so a submitter on the boot slot recorded
+`waiter=0` and the handler **skipped its own wake**. The PCI sibling carries
+the same gate but its wait has a deadline (f761cc4), so the lost wake costs it
+one 4 ms poll; the MMIO wait was still the plain
+`block_until_uninterruptible` - a sleep with no deadline, only a wake can end
+it - and the race (the completion interrupt landing after the submitter
+parked) parked the boot task for the machine's life. One lane in twelve: the
+window is the few instructions between the flag check and the sleep, which is
+why twelve lane boots of the same binary hung exactly once.
+
+**The fix is the sentinel and the clock, both transports.** `waiter`'s
+no-waiter value is `usize::MAX` on the MMIO mailbox and the PCI `WAITER` alike,
+so a wake for slot 0 is a wake like any other; and the MMIO completion wait now
+runs `block_until_uninterruptible_until` - the deadline-carrying shape whose
+"one poll per period for a wire that lost the wake" its own loop already knew
+how to serve, the same fix the PCI transfer got when its boot wedged. Neither
+wait depends on the other: the sentinel makes the wake arrive, the deadline
+bounds every wait whose wake might never come.
+
+**And the boot reaches a login prompt.** With all of it in - the exit path's
+three no-park doors, the re-armed claim wait, the sentinel and the clock - the
+desktop image boots end to end on a plain `cargo xtask run --arch x86_64
+--mode terminal`:
+
+    Welcome to Alpine Linux 3.25.0_alpha20260805 (edge)
+    Kernel 0.1.0 on x86_64 (/dev/tty1)
+    mpos login:
+
+and the heartbeat's slot table reads the whole picture: four `getty`s parked in
+`block_until_nanos` waiting for input (no respawn storm), `udevd` on `epoll`,
+`syslogd`, `crond`, `dbus-daemon`, `seatd`, `udhcpc`, `logger` - the
+`openrc default` runlevel's full service set - with `fill=12752/12752(out=0)`,
+no `blk stall` line and no drain line for the whole boot, `claim-misses=0`, and
+21 heartbeats of a live machine. The `/dev` half the earlier entry tested
+(devtmpfs mounted by the initramfs's own `/init`, the `devfs` service told to
+skip the remount) is what the gettys run against; the login prompt arrives on
+the wire through the console multiplexer carrying `tty1`, the current console.
+
+**Gate, this pass.** x86_64 `pass=211 fail=0` (211 built), `mpos-kunit 34
+passed, 0 failed`; aarch64 `pass=210 fail=0` (210 built), `mpos-kunit 34
+passed, 0 failed`; host unit suite 639/0. The first aarch64 rerun's lane 3 hang
+is the tenth fault above - the measurement that named it, not a flake to re-run
+past.
+
+**The ledger closes at ten.** The boot was stopped, in the order they became
+reachable: the claim's single registration (`93865d7`), the unbounded device
+wait (`f761cc4`), the claim leak on death (`4e927ce`), the block holder taken
+for a guess (`d945e29`), a named `wait4` on a reused slot (`626f58a`), the
+wildcard `wait4` on the same (`1b36efb`), the unpopped used-ring head (the
+drain), the missing `/dev` mount (the image's, devtmpfs from the initramfs),
+the exit path's device I/O (this pass), and the completion wake's sentinel on
+the boot slot (this pass). Each became reachable only after the one before it
+stopped moving; every one is fixed with a measured counterfactual; and the
+login prompt is the run that tells them apart, which is what the thread's own
+rule demanded of every explanation it ever named.
