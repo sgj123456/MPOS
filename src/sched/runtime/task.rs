@@ -2226,7 +2226,6 @@ impl Table {
                 continue;
             };
             task.released = true;
-
             // A thread that leaves does not take the group's memory with it:
             // its siblings are still running on the same frames. Only the last
             // one out does what a process exit has always done here.
@@ -3482,14 +3481,72 @@ fn heartbeat() {
         RUN_BEGINS.load(Ordering::Relaxed) as i64 - RUN_ENDS.load(Ordering::Relaxed) as i64
     ));
     for slot in 0..MAX_TASKS {
-        let live = with_table(|t| {
+        let state = with_table(|t| {
             t.tasks
                 .get(slot)
                 .and_then(|task| task.as_ref())
-                .map(|task| !task.exited)
-                .unwrap_or(false)
+                .map(|task| task.exited)
         });
-        if !live {
+        let Some(exited) = state else {
+            continue;
+        };
+        // A slot still occupied by an exited task is a zombie awaiting its
+        // collect, or a teardown that never finished - invisible to the live
+        // table and exactly the shape the boot's last stall hides behind
+        // (`docs/notes/` §7 R.9). One line for each, every heartbeat.
+        if exited {
+            let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
+            let mut comm = [0u8; 16];
+            let mut tail = [0u8; 40];
+            let parent = with_table(|t| {
+                if let Some(Some(task)) = t.tasks.get(slot) {
+                    comm = task.mm.comm_name_bytes();
+                    let exe = task.exe.as_bytes();
+                    let n = exe.len().min(tail.len());
+                    tail[..n].copy_from_slice(&exe[exe.len() - n..]);
+                    task.parent
+                } else {
+                    None
+                }
+            });
+            let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            let name = if comm_end > 0 {
+                core::str::from_utf8(&comm[..comm_end]).unwrap_or("?")
+            } else {
+                core::str::from_utf8(&tail).unwrap_or("?")
+            };
+            // The two halves of "how far did its exit get": `released` says
+            // whether the teardown pass reached it, and `retired` whether a
+            // collectable record exists. Between them they place a stuck exit
+            // on one side or the other of the record the parent needs
+            // (`docs/notes/` §7 R.9).
+            let released = with_table(|t| {
+                t.tasks
+                    .get(slot)
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.released)
+                    .unwrap_or(false)
+            });
+            let fds_left = with_table(|t| {
+                t.tasks
+                    .get(slot)
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.fds.open_files().len())
+                    .unwrap_or(0)
+            });
+            let retired = critical_section::with(|cs| {
+                RETIRED
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .any(|record| record.id.0 == slot)
+            });
+            crate::hal::kernel::print_line(format_args!(
+                "mpos:   gone slot {slot} pid {pid} name={name} parent={} park {} syscall {} released={released} retired={retired} fds={fds_left}\n",
+                parent.map(|p| p.0).unwrap_or(usize::MAX),
+                park_site(slot),
+                last_syscall(slot),
+            ));
             continue;
         }
         let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
