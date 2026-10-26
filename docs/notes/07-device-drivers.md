@@ -5326,3 +5326,50 @@ with the same `waitable`-shaped care, so `init`'s `wait4(-1)` retires with `ECHI
 once every child is really gone instead of parking on a slot that was reused. The
 measurement that will confirm it is the same one: `parks` frozen on slot 1 with every
 resource idle, then a login prompt.
+
+**The wildcard guard lands too (`1b36efb`), and the next reading is a *different* fault:
+a leaked fill claim with the mailbox held by init.** Gate green on both guards
+(`pass=211 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0). `wait_child_event` now
+asks `has_matching_children` before it parks - "something live, or something
+collectable" - which is what `do_wait` tests before it sleeps; the guard is the
+wildcard sibling of `626f58a`'s and was needed for the same reason (the caller's own
+`has_children` look is one step earlier than the park).
+
+The boot still stops after `Populating /dev ... [ ok ]`, and the reading is now a
+different shape - the counters name it without ambiguity:
+
+    mpos: heartbeat fill-owner=slot 10/pid 10 alive=true exited=false
+                    fill-busy=true run-busy=false blk-busy=true blk-waiter=slot 1
+    mpos:   fill=8762/8760(out=2 age=171328ms slot=10 syscall=4) run=0/0(out=0)
+    mpos:   slot 17..20 /sbin/udevd park 7 (ext4_slot_wait)
+    blk stall: 0        (the device layer is not stuck)
+
+Three facts, and they are at a **different layer** from the last two faults:
+
+* **`out=2`** - two fills were begun and never ended, `age=171328ms`, so the leak is
+  171 s old. `out=2` against a cache that serves one fill at a time is a violated
+  invariant, not a busy cache. The earlier reading that dismissed this as "the previous
+  boot's residue" was **wrong**: it reproduces, and it is the current fault.
+* **`blk-waiter=slot 1`** - init holds the device mailbox. So the same task that is
+  parked in `wait4` also owns a block transfer, which is the `out=2` leak's other half:
+  a claim whose owner never retired it and never released the device.
+* **`blk stall: 0`** - the block layer's own wait is fine. `d945e29` holds. The leak is
+  *above* the device, in the ext4 cache's claim lifecycle, exactly as `4e927ce` left it
+  when it covered only the death case.
+
+**So the ordering is now: five faults fixed, and this is the sixth-and-seventh read
+together** - the fill lifecycle leaking on a *living* task (`out=2`) and the device
+mailbox being held past the transfer that took it (`blk-waiter=slot 1`). The next
+instrument is the paired `fill BEGIN`/`fill END` line already proved out in an earlier
+worktree: it produced 11367 perfect pairs in a boot where nothing leaked, so running it
+on a boot that leaks will name the unpaired `Step::Go` directly.
+
+**The honest summary of where this thread stands.** The commit that started it
+(`eca7398`, +1011 lines across drivers/vfs/sched) has now been followed by seven
+distinct faults, five fixed and gated, and the boot still does not reach a login. The
+reason is not that the fixes are wrong - each is measured, pinned where a pin is
+possible, and green - but that the change **added four waiting contracts and shipped no
+invariant assertion for any of them**, so each fault had to be found by booting.
+`fill out != 0` at quiescence and `blk-busy with a parked non-submitter` are exactly
+those assertions; both exist now, which is why this stage produces readings instead of
+hunts.
