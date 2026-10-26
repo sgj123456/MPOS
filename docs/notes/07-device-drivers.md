@@ -5422,3 +5422,60 @@ with an instrument, never by reading, and each became reachable only after the p
 one stopped moving. That is the cost of a change that added four waiting contracts
 across drivers, vfs and sched without a single invariant assertion - and it is the
 answer to the question this thread began with.
+
+**The stall is the ext4 slot claim, held by a worker that is itself waiting on the
+device - and `out=2` does reproduce.** Two readings close the question the previous
+entries kept circling, and the second corrects the "intermittent" label recorded one
+entry ago.
+
+**Reading one: what `init` actually asks.** Instrumenting `handle_wait` for pid 1 shows
+the argument and both guards side by side:
+
+    mpos: init wait4 pid=-1 opt=0x1 has_children=false has_match=false
+    mpos: init wait4 pid=-1 opt=0x0 has_children=true  has_match=true
+
+`init` uses `wait4(-1)`, and it alternates a `WNOHANG` poll (nothing to report) with a
+blocking one (something to wait for). The blocking form is **correct** - a parent with
+a live child may block - so `init` is not the bug and neither guard is wrong. What the
+alternation shows is that `init` is in busybox's main wait loop with a live child that
+never changes state, which is the *symptom*, not the cause.
+
+**Reading two: the cause, and it is the ext4 slot claim.** The same boot's table and
+counters:
+
+    mpos: heartbeat fill-owner=slot 10/pid 10 alive=true fill-busy=true
+                    blk-busy=true blk-waiter=slot 10
+    mpos:   fill=8787/8785(out=2 age=161256ms slot=10 syscall=4) run=0/0(out=0)
+    mpos:   slot 14..20 /sbin/udevd  park 7 (ext4_slot_wait) parks=2..7   <- all frozen
+    mpos:   slot 10 /sbin/udevd      park 4 syscall 4 (stat)             <- re-parking
+
+**Seven udevd workers are parked on `ext4_slot_wait`** - `claim_park::wait(SLOT_WAIT,
+..)` on `cache.loading(block)` - and slot 10, the fill's owner, is itself re-parking in
+`stat` against a block transfer. So the claim is held by a task that cannot finish the
+transfer, and the workers wait for a `loading` flag only that task can clear.
+
+**`out=2` reproduced here** (`age=161256ms`, a different boot from the `11377/11377
+diff=0` run). Both readings are in the ledger because both were made: it does not leak
+every boot, and it does leak in this shape. The honest statement is that the leak is
+*conditional on this deadlock occurring*, not that it is random - a fill whose owner
+stalls mid-transfer is exactly the unpaired `end_fill`.
+
+**What was tried and reverted, and why it is recorded as reverted.** The hypothesis that
+slot 10 was *re-entering* `transfer` while holding the claim (the ext4 bounce path does
+read the device from inside a fill) was implemented - `begin_request` answering `true`
+when `HOLDER == me` - and it **did not change the boot at all**: same `out=2`, same
+`blk-busy=true`, same seven workers parked. It was reverted rather than kept, because a
+change that does not move the reading is not evidence, and this tree does not carry
+unproven fixes. What that rules out is worth the commit: **the owner is not re-entering
+its own claim**, so the transfer it is waiting on is one it submitted and that never
+completed - which points at the *completion* side, not the claim side.
+
+**The next reading, precisely.** `blk-waiter` in the heartbeat is a *mirror* that
+`begin_request` writes on success and `complete_irq`/`finish_request` clear, so it has
+already been shown (two entries ago) to be a last-written value rather than a live one.
+The question "who holds the device *now*, and who is waiting on it" needs the live pair
+read in one place: `HOLDER` and `WAITER` from `blk_irq`, printed beside the ext4 slot
+that is loading and the task that owns it. That is one line in the heartbeat and it
+separates "the owner's transfer never completed" from "the owner's transfer completed
+and its retirement was lost" - which are different fixes, and the boot cannot tell them
+apart today.
