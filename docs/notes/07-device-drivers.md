@@ -4851,3 +4851,15 @@ The reading matters beyond this claim: a flake whose *own program* can print bot
 pass and a fail is not the same thing as a flake in a service (the `t-posix`
 priority and `t-clock-gettime` entries), and the two want different responses -
 those are re-run and quoted green, this one had a bug to find.
+
+The arm with **both** fixes in, on a clean worktree at `482127d`:
+
+    User tests: 210 programs over 6 lane(s)
+    lane 0..5: 35 programs each, exit 33
+    self-test (x86_64): pass=210 fail=0 (210 built)
+    self-test (x86_64): mpos-kunit 32 passed, 0 failed
+    exit 0
+
+So the ptrace thread that opened this section ends with a green x86_64 arm, a
+named cause for each of the two reds it inherited, and no unproven fix in the
+tree - which is what the section's whole ledger was for.
