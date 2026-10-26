@@ -64,7 +64,38 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 /// The parked submitter, or 0. Set with the claim, before the first look at
 /// [`COMPLETED`], so the handler either finds it (and wakes it) or has
 /// already set `COMPLETED` (and the submitter never sleeps).
+///
+/// This is the *wake* address and nothing else: the completion handler swaps it
+/// out the moment it has woken the submitter. It is therefore **not** a record
+/// of who holds the device - that is [`HOLDER`], and confusing the two is the
+/// bug this file shipped (`docs/notes/` §7 R.9).
 static WAITER: AtomicUsize = AtomicUsize::new(0);
+
+/// The task holding the device's one-in-flight claim, or 0 when it is free.
+///
+/// Set by [`begin_request`] and cleared **only** by [`finish_request`] - never
+/// by the completion handler, which knows a request finished but not that its
+/// submitter has retired it. That is what makes a claim's death observable
+/// without guessing: [`holder_exited`] asks whether *this* slot is still a
+/// live task, instead of inferring death from a timeout.
+///
+/// **The bug this exists to end, measured.** With the holder read off `WAITER`,
+/// the handler cleared it on the interrupt, and a claimant arriving inside the
+/// next 100 ms could not tell "the holder is about to retire this" from "the
+/// holder died", so it *assumed* death and took the claim. Two tasks then held
+/// the same device and submitted tokens 0 and 1 back to back:
+///
+/// ```text
+/// mpos: blk submit: me=6 token=Some(0)
+/// mpos: blk submit: me=8 token=Some(1)
+/// mpos: blk stall:  me=8 token=1 ring=Some(0) busy=true waiter=8
+/// ```
+///
+/// `virtio-drivers`' `pop_used` is strictly FIFO, so token 0 - completed and
+/// owed a pop by `me=6` - pinned the used ring's head, and `me=8` waited for a
+/// token it could never reach while holding the mailbox itself. One boot wedged
+/// nineteen udev workers behind a single ext4 fill claim.
+static HOLDER: AtomicUsize = AtomicUsize::new(0);
 
 /// Tasks waiting for the device to go free, in arrival order. Touched only
 /// by task context under the critical section — the handler never reads it.
@@ -90,29 +121,32 @@ pub fn irq_count() -> u64 {
     IRQ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Whether the mailbox's recorded waiter has exited: a claim whose owner is gone
-/// can never be retired by it, so it is abandoned rather than held (measured:
+/// Whether the claim's **holder** has exited: a claim whose owner is gone can
+/// never be retired by it, so it is abandoned rather than held (measured:
 /// `blk-waiter=slot 6` with slot 6 absent from the task table - `docs/notes/` §7
 /// R.9).
-/// Whether a transfer is in flight.
+///
+/// The question is asked of [`HOLDER`] and is a plain liveness read - no timeout,
+/// no inference from an interrupt's age. The earlier version asked it of `WAITER`
+/// and, finding it cleared by the handler, fell back to "an interrupt landed more
+/// than 100 ms ago, so the owner is not coming back". That is a guess, and it was
+/// wrong exactly where it mattered: a living owner between its interrupt and its
+/// own `finish_request` was pronounced dead, a second task was let in, and the
+/// used ring wedged (the measurement is [`HOLDER`]'s).
 fn holder_exited() -> bool {
-    let waiter = WAITER.load(Ordering::Acquire);
-    if waiter != 0 {
-        return !crate::sched::task_alive(TaskId(waiter));
-    }
-    // No waiter recorded: the completion handler swapped it out, so only the
-    // owner's retirement was left - and no owner is coming back for it
-    // (`docs/notes/` §7 R.9). The grace keeps a living owner's window between
-    // the interrupt and its own finish_request from being mistaken for death.
-    let seen = IRQ_AT_NS.load(Ordering::Relaxed);
-    COMPLETED.load(Ordering::Acquire)
-        && seen != 0
-        && crate::hal::since_boot_nanos().saturating_sub(seen) > 100_000_000
+    let holder = HOLDER.load(Ordering::Acquire);
+    holder != 0 && !crate::sched::task_alive(TaskId(holder))
 }
 
 /// Whether a transfer is in flight **with a living holder**.
 pub fn busy() -> bool {
     BUSY.load(Ordering::Acquire) && !holder_exited()
+}
+
+/// The task holding the device, or 0 when free - for the stall report and the
+/// heartbeat, which need the holder and the wake address as separate facts.
+pub fn holder_slot() -> usize {
+    HOLDER.load(Ordering::Acquire)
 }
 
 /// Claim the device for one transfer and clear the mailbox for it, or report
@@ -124,6 +158,7 @@ pub fn begin_request(me: TaskId) -> bool {
         if BUSY.load(Ordering::Acquire) && holder_exited() {
             BUSY.store(false, Ordering::Release);
             WAITER.store(0, Ordering::Release);
+            HOLDER.store(0, Ordering::Release);
             COMPLETED.store(false, Ordering::Release);
         }
         if BUSY.swap(true, Ordering::AcqRel) {
@@ -131,6 +166,11 @@ pub fn begin_request(me: TaskId) -> bool {
         }
         COMPLETED.store(false, Ordering::Release);
         WAITER.store(me.0, Ordering::Release);
+        // The claim's owner, recorded with it and released only by
+        // `finish_request` - so "is the holder alive?" is a liveness read of a
+        // task that really holds the device, not a guess about an interrupt's
+        // age (`HOLDER`'s note has the measurement).
+        HOLDER.store(me.0, Ordering::Release);
         crate::sched::note_blk_mailbox(true, Some(me.0));
         true
     })
@@ -159,6 +199,11 @@ pub fn finish_request() {
         BUSY.store(false, Ordering::Release);
         crate::sched::note_blk_mailbox(false, None);
         WAITER.store(0, Ordering::Release);
+        // The claim, and only here: the completion handler must not clear this,
+        // because a request that finished is not a claim that was retired and
+        // the difference is what keeps a slow holder from being taken for a dead
+        // one (see `HOLDER`).
+        HOLDER.store(0, Ordering::Release);
         core::mem::take(&mut *QUEUE.borrow(cs).borrow_mut())
     });
     for id in queued {
