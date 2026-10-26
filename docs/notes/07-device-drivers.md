@@ -5275,3 +5275,54 @@ a host test that reuses a slot under a blocked parent - the first pin in this tr
 would have failed for the boot this thread has been chasing. The wide part is `TaskId`'s
 reach across sched, vfs and the drivers; that is a refactor commit of its own, green on
 its own, before the behaviour change.
+
+**The `ECHILD` guard lands, the permanent wait is gone, and the boot gets one stage
+further - where a sixth thing stops it.** `626f58a` makes `block_until_child_event`
+ask `waitable` before it parks: the same parent-and-kind question `child_event_in`
+already asks before reporting anything, so a slot that is still this caller's child
+parks exactly as before and a slot that now belongs to a stranger answers `ECHILD`.
+Measured, one boot on a clean worktree: the two permanent waits are **gone** - slots 6
+and 7 no longer appear in the table and no `childwait` line is printed - so openrc,
+which used to sleep on `wait4(7)` for ever, retires and the boot advances. Gate green
+(`pass=211 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0).
+
+What stops it now is a different waiter, and the table says so plainly:
+
+    mpos:   slot 1 pid 1 /sbin/init  park 4 (block_until_uninterruptible) syscall 61 parks=368  (frozen)
+    mpos: heartbeat age=0ms fill-owner=none run-busy=false blk-busy=false blk-waiter=none
+
+`init` itself is in `wait4` with `parks=368` frozen, every device and cache idle, and
+no openrc process left in the table. So this is init waiting for a child that is not
+coming - the *same class* of bug the guard just fixed, one level up: the guard protects
+`block_until_child_event`, and init's wait reaches it through the `P_ALL` path
+(`wait_any_child_event`), which is a **different entry point** and was not given the
+same treatment. That is the honest reading of the state: the fix is correct and
+measured, it is not the last one, and the next one is the wildcard sibling of the same
+question.
+
+**On the six-fault accounting, and what it says about the original question.** This
+boot has now been stopped in turn by: the claim's single registration (`93865d7`), the
+unbounded device wait (`f761cc4`), the claim leak on death (`4e927ce`), the block holder
+taken for a guess (`d945e29`), a named `wait4` on a reused slot (`626f58a`), and now
+the wildcard `wait4` on the same. Four of the six came from the change this thread
+started with; two (`626f58a` and its wildcard sibling) are the slot-as-identity
+assumption that `crates/pidns` documents as unsolved for the init namespace, and which
+only became *reachable* once the boot got far enough.
+
+That is the direct answer to "a few hundred lines in, thousands of lines of fixes, and
+it still does not boot": the change did not introduce one bug, it introduced **four new
+waiting contracts across drivers, vfs and sched with no invariant assertions**, and the
+boot then surfaced two latent identity assumptions that had never been exercised past
+that point. Each fault is only *reachable* once the one before it stops moving, because
+a task asleep on fault N never executes the code holding fault N+1. No instrument can
+collapse that ordering - but the instruments now in the tree (the all-parked heartbeat,
+the park-site `wchan`, the claim lifecycle counters, the child-wait's `id/alive/code`
+line, and the paired `fill BEGIN`/`END`) make each successive fault a *reading* rather
+than a hunt, which is the difference between this stage of the work and the first.
+
+**The next step is the wildcard half, and it is small:** `wait_any_child_event` /
+`child_alive_for` must answer the same "is there still a child that can report" question
+with the same `waitable`-shaped care, so `init`'s `wait4(-1)` retires with `ECHILD`
+once every child is really gone instead of parking on a slot that was reused. The
+measurement that will confirm it is the same one: `parks` frozen on slot 1 with every
+resource idle, then a login prompt.
