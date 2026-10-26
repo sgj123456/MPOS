@@ -5229,3 +5229,49 @@ and gated; the boot still stops after `Populating /dev ... [ ok ]`, and the reas
 this child-wait identity. Five faults have now stopped this boot in turn; four are
 fixed. The fifth is not a regression from the change that started this thread - it is a
 latent identity assumption that only became reachable once the boot got that far.
+
+**The decider, and it rules out the cheap fix: in the init namespace a pid *is* the
+slot, so the number repeats.** `crates/pidns` was read for the question the last entry
+left open - can a slot's pid number repeat inside a waiting parent's lifetime - and it
+answers plainly, in its own header and in `number_of`:
+
+    pub fn number_of(&self, slot: usize) -> Option<u32> {
+        if self.is_root() {
+            return Some(slot as u32);
+        }
+        ...
+
+so **the root namespace has no table at all: its numbers are the slot numbers.** The
+header states the consequence itself - "a pid here *is* the task table slot
+(`sched::policy::TaskId`), and a slot number is both global and reused" - and then
+names exactly this hole:
+
+> "the *init* namespace still numbers by slot, so slot reuse there is exactly what
+> `docs/notes/` §7.1 records as an open problem, unmoved by this crate"
+
+**The boot never leaves the root namespace**, so it sits in precisely the case the
+crate documents as unsolved. That settles the choice: option 2 from the previous entry
+(a child-wait comparing the slot's *pid number*) cannot work, because in the init
+namespace that number is the slot and therefore repeats - it would be the same bug with
+one more indirection. **A generation counter per slot is the fix**, and it is the only
+one of the two that is sound where this boot actually runs.
+
+Two things the reading also turned up, both worth fixing in the same pass:
+
+1. **The cross-reference is dangling.** `crates/pidns`'s header points at "`docs/notes/`
+   §7.1" for this open problem and §7.1 does not carry it - the phase header's open item
+   is weston's cursor, and no entry in that section mentions slot reuse. A citation a
+   reader cannot follow is worse than no citation, and this one hid the bug's own
+   documentation from every session that walked past it.
+2. **The non-root half is pinned and the root half is not.**
+   `a_released_number_is_spent_rather_than_reused` covers the table, which is the half
+   that already works; nothing pins "the init namespace numbers by slot", so the one
+   property that makes this boot's stall possible is the one with no test beside it.
+
+**So the shape of the work, in order:** version the slot (`TaskId` gains a generation,
+set when the slot is reused), have `Retired` carry the generation it retired, make a
+child-wait match on `(slot, generation)` instead of `task_alive(slot)`, and pin it with
+a host test that reuses a slot under a blocked parent - the first pin in this tree that
+would have failed for the boot this thread has been chasing. The wide part is `TaskId`'s
+reach across sched, vfs and the drivers; that is a refactor commit of its own, green on
+its own, before the behaviour change.
