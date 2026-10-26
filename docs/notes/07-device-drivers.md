@@ -5017,3 +5017,54 @@ and `4e927ce` both belong to the ext4 **claim** layer, and in this boot that lay
 healthy - `claim registrations=7041 handed-back=7041`, `claim-misses=0`. The stall was
 one level *below* the claims, in the mailbox and the ring they sit on, and it only
 became readable once the heartbeat could fire on an all-parked machine.
+
+**The holder fix lands, and the boot still does not reach a login - which is now a
+different fault, measured as such.** `d945e29` separates the block claim's *owner*
+(`HOLDER`, cleared only by `finish_request`) from its *wake address* (`WAITER`, which
+the completion handler must clear), so a living holder between its interrupt and its
+own retirement is no longer pronounced dead after 100 ms. The effect on the boot is
+exact: `blk stall` goes from **3 to 0**, no used-ring entry is left unpopped, and the
+nineteen udevd workers no longer queue behind one ext4 fill claim. The gate is green
+(`pass=211 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0).
+
+The boot, however, still stops after `Populating /dev ... [ ok ]`, and the second
+reading says the block layer is not the reason. The idle-firing heartbeat prints, at
+the stall:
+
+    mpos: heartbeat fill-owner=none run-owner=none fill-busy=false
+                    run-busy=false blk-busy=false blk-waiter=none
+    mpos:   slot 1 pid 1 /sbin/init   park 4 syscall 61 (wait4) parks=369   <- frozen
+    mpos:   slot 2 pid 2              park 1 block_until_on   parks=201..    <- ticking
+    mpos:   slot 10 pid 10 /sbin/udevd park 2 syscall 281    parks=6578     <- frozen
+
+**Every device and every cache is idle** - the ext4 fill and run claims are free, the
+mailbox is free - and the only task moving is slot 2, once per five-second heartbeat.
+No openrc process is in the table at all, so `openrc sysinit` has finished and
+retired; `init` is parked with `parks=369` and does not move.
+
+That is the shape of a **lost child-exit wake**, not of a stuck disk: `init` waits in
+`block_until_child_event`, whose predicate is `exit_code(id).is_some() ||
+child_event_in(..)`, and it never becomes true even though nothing can produce the
+event any more. The instrumented predicate printed **nothing**, which is itself the
+reading - the wait is not spinning on a false predicate, it is asleep on a wake that
+already happened. `parks=369` also tells us it parked *once* and stayed, so the
+event it is waiting for was consumed or recorded before it slept, or recorded against
+an id it is not asking about (`wait4(-1)` is `P_ALL`; the diagnostic names a single id).
+
+**The ledger's next step, and it is narrow:** the wake a child's death sends its
+parent, checked against the `P_ALL` shape busybox init actually uses - whether
+`wake(parent)` is handed before the parent is in the sleep queue, and whether the
+`retired` record outlives the slot reuse that `take_retired_current` performs. The
+instruments are all in the tree now (`/proc/<pid>/wchan` with park sites, the
+all-parked heartbeat, and the child-exit predicate's own report), so this is a
+reading of `wake` and `RETIRED`, not another field trip through the drivers.
+
+**Why this matters for the accounting.** The block deadlock was real, measured and is
+fixed. It was not the whole bug, and it was not the first one either: the boot has now
+been stopped by four distinct faults, each visible only once the one before it was
+fixed - the claim's single registration (`93865d7`), the unbounded device wait
+(`f761cc4`), the claim leak on death (`4e927ce`), and the holder-as-guess
+(`d945e29`). That is the honest reason a change of a thousand lines has cost far more
+than a thousand lines to make boot: the faults are **layered**, and no instrument can
+see layer N+1 until layer N stops moving, because a task asleep on a fault never
+reaches the code that has the next one.
