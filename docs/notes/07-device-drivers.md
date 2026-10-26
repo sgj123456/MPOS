@@ -5111,3 +5111,61 @@ cost many thousand lines to make boot, and it is worth writing down plainly: the
 change added four new waiting contracts across drivers, vfs and sched, and shipped
 none of them with an invariant assertion. `out != 0` at quiescence is exactly such an
 assertion, and it exists now precisely because this bug needed it.
+
+**The stall's cause, finally read: a `wait4` on a slot number that got reused.** With
+`d945e29` in, the boot's remaining stop is not a device, not a claim and not a
+deadlock. Three paired readings close it.
+
+The fill claim is innocent, and the earlier `out=2` was a different boot's residue -
+this run's own counters are exact:
+
+    mpos: fill BEGIN ... / mpos: fill END ...   11367 pairs, diff 0
+    fill=11367/11367(out=0 none) run=0/0(out=0)
+
+with every device and cache idle at the stall and `age=3ms` on the heartbeat. The
+question is only who is asleep on what, and the child-wait entry answers it:
+
+    mpos: childwait id=7 me=6 alive=true code=None
+    mpos: waitchild enter: parent=1 alive=true code=false
+
+`me=6` is **openrc**, and it is in `wait4(7)`; `alive=true` says slot 7 holds a
+non-exited task, `code=None` says there is no exit record for it. Both are true
+because the child that slot *was* has already gone:
+
+    mpos: child exit: id=7 tgid=7 group_dead=true others=[] parent=Some(6)
+
+so slot 7's pid 7 exited, its record was collected, and the **slot was reused** -
+`task_alive` asks `t.tasks.get(id.0).map(!exited)`, so a `TaskId` that outlived its
+task and now names a different one answers `true` for ever. `block_until_child_event`'s
+predicate is `exit_code(id).is_some() || child_event_in(t, id, ..)`, and with slot 7
+reused both halves are false: the exit record is gone, and the new occupant has not
+exited. openrc sleeps on it with `u64::MAX` - no deadline - so nothing ever wakes it,
+init's own `wait4` on openrc never returns, and inittab's later lines (`openrc boot`,
+`openrc default`, the four gettys) are never reached. Every resource idles because
+nothing is wrong with the resources.
+
+**This is a wait identity bug, not a scheduler one:** a `wait` names a child by
+`TaskId`, and a `TaskId` is a **reusable slot index**, so the identity the caller is
+waiting on survives the task it meant. Linux does not have this problem because
+`struct pid` is allocated per process and outlives the slot; this kernel's table has
+the slot as the identity, and every waiter that parks on `id` inherits the reuse.
+
+**The next step is narrow and it is a design question, not a probe:** either a
+waiter's identity must be pinned while anyone waits on it (a generation counter per
+slot, checked with the id, is the cheapest shape - `TaskId` becomes slot+generation),
+or a parked child-wait must re-check that the slot still names *its* child instead of
+merely a live task, and give `ECHILD` once it cannot. The first is the honest fix -
+the second makes reuse a visible error where Linux has none - and the measurement
+that decides it is whether `take_retired_current`'s record already carries a
+generation. The instruments to confirm either are in the tree: the child-wait's own
+`id/alive/code` line, the `child exit` line with its tgid and parent, and the
+all-parked heartbeat.
+
+**The five-fault accounting, now complete.** This boot has been stopped in turn by
+the claim's single registration (`93865d7`), the unbounded device wait (`f761cc4`),
+the claim leak on death (`4e927ce`), the block holder taken for a guess (`d945e29`),
+and now a `wait4` identity that reuse outlives. The first four are fixed and the gate
+is green; the fifth is a design gap in `TaskId`, not a regression from that change -
+which is the honest split, and the reason "fix the commit" could never be the whole
+answer: only two of the five are *that* commit's, and the rest were latent until its
+changes made the boot get far enough to reach them.
