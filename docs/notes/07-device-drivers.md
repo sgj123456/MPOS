@@ -5783,3 +5783,68 @@ The boot still stops after `Populating /dev ... [ ok ]`, and the remaining fault
 narrowed to one question - *is `init` asleep or spinning, and on what* - which is a
 five-line reading away, with every instrument needed already in the tree and the
 `PARK_SITE`-is-stale trap now written down so it is not misread again.
+
+**The last layer is not a kernel fault at all: `init` is respawning a `getty` that has no
+`/dev/tty1` to open, because OpenRC was told not to mount `/dev`.** Two probes close it,
+and the second one turns the whole framing around.
+
+**`init` is not stuck - it is cycling.** Instrumenting `has_children` for pid 1, printing
+which slots are live and what slot 6 is:
+
+    mpos: HASKIDS alive_for=true  live=[0,1,2,3,4,5,6,63] s6=Some("slot6 exited=false parent=Some(1) tgid=6") n=21
+    mpos: HASKIDS alive_for=false live=[0,1,2,3,4,5,63]    s6=None                                             n=22
+    mpos: HASKIDS alive_for=true  live=[0,1,2,3,4,5,6,63] s6=Some("slot6 exited=false parent=Some(1) tgid=6") n=24
+
+**slot 6 appears, exits, and is recreated, over and over**, and it is `init`'s own child
+(`parent=Some(1)`). That is not a stuck wait - it is **`respawn` working**. `inittab` has
+`tty1::respawn:/sbin/getty 38400 tty1`, busybox `init` forks it, the child dies at once,
+`init` reaps it and forks another. The earlier readings that looked like "init asleep on
+a child that never changes state" were the *gaps* between respawns, and the `parks=369`
+freeze was simply that `parks` counts parks and this loop parks rarely - it burns CPU in
+`fork`/`wait` instead. `handle_wait`'s own instrument shows the alternation directly:
+
+    mpos: WAIT4IN pid=-1 opt=0x1 n=32 haskids=false     <- WNOHANG reaps the dead getty
+    mpos: WAIT4IN pid=-1 opt=0x0 n=33 haskids=true      <- blocking wait for the next one
+
+**Why the getty dies: there is no `/dev/tty1`.** The boot's own line says it:
+
+    mpos: * /dev will not be mounted due to user request
+
+OpenRC's `dev` service carries `keyword -containers` in this Alpine version, so it skips
+the `/dev` mount - and nothing else creates the device nodes. `inittab`'s four respawn
+entries then name `tty1..tty4`, `/sbin/getty` (a busybox symlink, so present and
+executable) tries to open `/dev/tty1`, fails, and exits; `init` respawns it. The loop is
+correct behaviour on a machine with no device nodes, and **no login prompt is possible
+without them**.
+
+So the honest final statement of this thread's boot:
+
+* the **kernel** faults are fixed and gated - seven of them, plus the used-ring drain
+  (`drain_abandoned`) which is another worker's and which the measurement shows closes
+  every block-layer symptom;
+* what remains is **the image's `/dev`**: `udevd` runs healthily (`epoll_pwait`,
+  `parks` climbing, no stall, every resource idle) but it is a *udev* daemon, not a
+  `devtmpfs` mount, and OpenRC's own `dev` service declined to mount one.
+
+That is a **rootfs configuration** question - whether this image should mount `devtmpfs`
+at `/dev` (Linux's own answer, and what `udev` expects), or carry static nodes, or have
+the kernel publish a `devtmpfs` the initramfs hands over - and it is *not* the driver or
+scheduler work this section has been doing. It belongs in `docs/ROOTFS`/`rootfs.toml`
+territory and in a session that is looking at the image rather than the kernel.
+
+**The ledger closes here, and this is what it cost.** Eight faults stood between this
+commit and a login. Seven were real kernel faults, all now fixed with measured
+counterfactuals and a green gate: the claim's single registration (`93865d7`), the
+unbounded device wait (`f761cc4`), the claim leak on death (`4e927ce`), the block holder
+taken for a guess (`d945e29`), a named `wait4` on a reused slot (`626f58a`), the wildcard
+`wait4` on the same (`1b36efb`), and the used-ring head that nobody popped (`drain_abandoned`,
+verified by boot). The eighth is the missing `/dev` mount, which is the image's.
+
+**Four times this thread named a cause, implemented it, and watched the boot not move** -
+the ISR read, the claim re-entry, `out=2` as the cause, and the drain as *the* cause. Each
+was a mechanism that explained the symptom and was not the mechanism that produced it.
+The one habit that finally worked was refusing to act on an explanation until a probe had
+either falsified it or shown a login - and every probe that did work is now in the tree:
+the all-parked heartbeat, the park-site `wchan` with its stale-value trap documented, the
+claim lifecycle counters with `out`, the live `HOLDER`/`WAITER`/`irq` triple, the paired
+`fill BEGIN`/`END`, and the child-wait's `id/alive/code/retired` line.
