@@ -3323,6 +3323,16 @@ pub fn deliver_pending_signal() {
 /// For a task with nothing left to do, and for the scheduler when the ready
 /// queue is empty.
 pub fn wait_for_interrupt() {
+    // The heartbeat is fired from here as well as from the syscall gate and the
+    // preempt path, because an all-parked machine reaches *none* of those. The
+    // earlier reading concluded the idle loop could not print at all ("it
+    // printed nothing at all"), but that reading was of a dump built under the
+    // table lock; a heartbeat already owns the console's own no-park write and
+    // is safe here. Without this the one failure shape the instruments cannot
+    // see is exactly the one a deadlock produces: every task parked, no syscall
+    // to enter, nothing in ring 3 to preempt, and a silent wire
+    // (`docs/notes/` §7 R.9's "no heartbeat means nothing is running").
+    check_itimer();
     hal::idle();
 }
 
