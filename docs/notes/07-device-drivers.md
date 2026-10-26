@@ -4666,3 +4666,28 @@ the working tree at that moment carried another worker's in-progress
 suite), and a gate run builds the working tree, so a red there would not be a
 verdict on this thread. The gate line for `fdc69f7`/`6add34c` is therefore **owed**,
 to be taken on a tree that contains only the ptrace change.
+
+**The pin was right and the gate proved it: a stop the tracer never hears.** On a
+clean worktree at the ptrace fix the x86 arm reached the sweep and then **lane 3
+timed out at 900 s**, and that lane's own table names the hang precisely:
+
+    mpos:  slot 6 pid 6 name=/bin/t-ptrace-syscall-info  park 2  syscall 61 parks=89
+    mpos:  slot 7 pid 7 name=/bin/t-ptrace-syscall-info  park 2  syscall 39 parks=34
+
+Slot 6 is the test's parent parked in **`wait4`**, slot 7 its child parked with
+**`getpid`** as its syscall - so the tracee has been resumed with `PTRACE_SYSCALL`,
+has reached the entry of `getpid`, and is stopped there while the tracer waits for a
+stop that is never reported. That is the *second* of the two candidates this section
+had left for strace's desynchronisation (a stop that is missing, rather than one
+whose operation byte is wrong), and it reproduces: the same pin passed in an earlier
+run and hung in this one, so the delivery/report of a syscall stop between
+`PTRACE_SETOPTIONS(PTRACE_O_TRACESYSGOOD)` and the first `PTRACE_SYSCALL` is racy.
+
+The pin is therefore **reverted rather than landed**: it hangs the sweep, and a red
+default sweep says the kernel is broken - which is true, but the fix for *this* one
+is not written yet, and a hanging test is not a pin but a stop-the-line. The next
+fix is on the stop's report side: a task parked in its syscall stop must make its
+tracer's `wait4` answer, and the reading above (parent in `wait4`, tracee stopped in
+the call) is the counterfactual the eventual pin will stand on. The ptrace fix that
+did land (`fdc69f7`) stays: its own evidence is the smoke test on the real machine,
+which the note above records.
