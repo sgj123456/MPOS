@@ -4959,3 +4959,10 @@ check it prints (it currently reports the *watched* descriptor, which for a `ppo
 with a one-element array is what we want, but for a multi-descriptor poll would be
 the first entry only). Until that is confirmed, the ledger's shape stops here rather
 than guessing between the two.
+
+The arm behind that instrument change, on a clean worktree at `35533e9`:
+
+    lane 0: 36 programs, exit 33 · lane 1..5: 35 each, exit 33
+    self-test (x86_64): pass=211 fail=0 (211 built)
+    self-test (x86_64): mpos-kunit 32 passed, 0 failed
+    exit 0
