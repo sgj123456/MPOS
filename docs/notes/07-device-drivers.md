@@ -5169,3 +5169,63 @@ is green; the fifth is a design gap in `TaskId`, not a regression from that chan
 which is the honest split, and the reason "fix the commit" could never be the whole
 answer: only two of the five are *that* commit's, and the rest were latent until its
 changes made the boot get far enough to reach them.
+
+**The identity bug, read to the bottom: `task_alive` answers "is there a live task in
+this slot", not "is this the child I am waiting for".** Three probes close it, and the
+last one corrects the previous entry's guess.
+
+The exit record is not being stolen. Instrumenting `take_retired_for` shows who takes
+each record, and the waiter is taking its own:
+
+    mpos: retire take: id=7 by=6 tracer=None      (8 such takes for id=7)
+    mpos: cw id=7 me=6 alive=true code=None retired_ids=[]
+
+262 takes across the boot, distributed over the ids that exited. `by=6` is **openrc
+itself**, so nothing is stealing its child's record: openrc took it, eight times over
+the boot, once per `wait4(7)` call. There is no retry loop in `handle_wait`, so those
+are eight separate syscalls from openrc's own userland loop - each one returning, and
+openrc asking again.
+
+What makes the last one never return is the predicate's first half. At the stall
+`RETIRED` is **empty** - every record has been collected - and:
+
+    mpos: cw id=7 me=6 alive=true code=None retired_ids=[]
+
+`task_alive(7)` is `t.tasks.get(7).map(|task| !task.exited)`: it asks whether **slot 7
+holds a non-exited task**, which after a reuse is a different process entirely. So the
+predicate is false on both halves - no record to collect, and "a live task" that is not
+openrc's child - and `block_until_on_interruptible` sleeps with `u64::MAX`. openrc is
+waiting for a child that is gone, on a slot number that now belongs to somebody else.
+
+**This is the correction to the previous entry:** it blamed slot reuse for *hiding* the
+record. The record was never hidden - openrc consumed it correctly, eight times. What
+reuse breaks is the **liveness half** of the predicate, which has no notion of identity
+at all. That is a sharper and cheaper statement: the fix does not have to version every
+`TaskId`, only to stop treating "slot occupied" as "my child is alive".
+
+**The shape the fix wants, and why the obvious one is wrong.** `task_alive(id)` cannot
+be the question a child-wait asks; the wait has to know whether the slot still names
+*its* child. Two candidates, and the second is smaller than the previous entry assumed:
+
+1. **A generation counter per slot** (`TaskId` = slot + generation): correct, and the
+   cost is that `TaskId` is compared and stored across sched, vfs and the drivers, so
+   it is a wide change. The `Retired` record would carry the generation it retired, and
+   a waiter would match on it.
+2. **A per-slot pid** already exists for exactly this reason - `Retired` carries
+   `numbers`, "the pid numbers the dead process had at every level of its namespace
+   chain", and its own note says it is carried *because the slot is free by the time a
+   wait reads the record*. The same reasoning applies one step earlier: a **live**
+   check should ask the slot's pid, not its occupancy. A child-wait that compares
+   `pid_of(slot)` with the number it was given answers "my child is still there" or
+   "that slot is somebody else now", without versioning anything.
+
+The measurement that decides between them is whether a slot's pid number is drawn from
+a source that cannot repeat within the lifetime of a waiting parent - if it can, option
+2 is a heuristic and option 1 is the honest one. That is one probe of the pid
+allocator, and it is the next step, not this entry's claim.
+
+**Status of the boot, stated plainly.** With `d945e29` in, the block deadlock is fixed
+and gated; the boot still stops after `Populating /dev ... [ ok ]`, and the reason is
+this child-wait identity. Five faults have now stopped this boot in turn; four are
+fixed. The fifth is not a regression from the change that started this thread - it is a
+latent identity assumption that only became reachable once the boot got that far.
