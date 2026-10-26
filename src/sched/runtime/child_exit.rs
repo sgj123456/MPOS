@@ -2304,6 +2304,21 @@ pub fn wait_child_event(
     nowait: bool,
     exited: bool,
 ) -> WaitPark<WaitEvent> {
+    // The wildcard sibling of `block_until_child_event`'s guard, and the same
+    // bug: a caller that parks when nothing can ever report sleeps for ever. The
+    // `has_children` check its caller makes is one *look* earlier, and a child
+    // can be collected between that look and this park - so the question is
+    // asked again here, against the table the park will use.
+    //
+    // `has_matching_children` and not `child_alive_for` alone: a child that has
+    // already died leaves a *record*, which is exactly what `init`'s
+    // `wait4(-1)` must still be allowed to park on (it is about to collect it).
+    // The pair - something live, or something collectable - is the honest
+    // "is there anything left to wait for", and it is what Linux's
+    // `do_wait` tests before it sleeps.
+    if !has_matching_children(parent, sel, kind, exited) {
+        return WaitPark::NoChild;
+    }
     if matches!(
         block_until_on_interruptible(|t| scan_child_event(
             t, parent, sel, kind, stops, continues, exited
