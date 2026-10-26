@@ -5597,3 +5597,50 @@ Every link is measured. The root is a **missing acknowledgement in one driver**,
 six faults fixed before it were real but were all *downstream* of the boot being unable
 to get past udev - which is why fixing them each moved the stall a step without ever
 reaching a login.
+
+**The ISR-read fix was built, measured, and it does not move the boot - so the missing
+ack is not the root cause either.** This entry exists to record a **negative result**
+that cost a full build-and-boot cycle and that would otherwise be re-attempted, and to
+correct the entry above it.
+
+The change was exactly what the previous entry called for: a module-level
+`IRQ_DEVICE: Mutex<RefCell<Option<Arc<VirtioBlk>>>>` in `blk.rs` holding a borrow-free
+clone of the owner, so the handler's path is one `critical_section`, one `&mut
+VirtIOBlk`, one MMIO read; `pub fn ack_interrupt_irq()` doing that read; a registration
+in `VirtioBlk::init` before the owner is handed out; and `service_blk` calling it beside
+`blk_irq::complete_irq()`. It compiles on both machines (the aarch64 MMIO transport
+already acknowledges inside its own `complete_irq`, so only the PCI path needed the
+call - that asymmetry is real and was verified in `mmio.rs`).
+
+Measured on a clean worktree, one boot, with `irq_count()` added to the heartbeat:
+
+    mpos: heartbeat irq=8971 age=0ms fill-owner=slot 10 ... blk-busy=true blk-waiter=slot 21
+    mpos: heartbeat irq=8971 ... (eight seconds later, unchanged)
+
+**`irq` is still frozen.** `IRQ_COUNT` is incremented *inside* the handler, so a frozen
+count means the handler is not running at all - the acknowledgement cannot be the
+missing step, because the code that would perform it never executes. What the boot did
+show is that it is **not the same stall**: `blk-waiter` moved from slot 12 to **slot
+21**, so the boot now gets a different (and later) udevd worker stuck, which means the
+earlier `slot 12` reading was one instance of a recurring shape rather than a single
+wedged task.
+
+So the ranking in the entry above was **wrong**, and the correction is: reading the ISR
+is something this driver *should* do (the crate says it de-asserts the line, the network
+driver does it, and the asymmetry is a real defect) - but it is **not** what stops this
+boot, and it must not be landed as a fix for it. The change was reverted rather than
+kept, on this repository's rule that a change which does not move the reading is not
+evidence; the analysis is preserved here so the work is not repeated.
+
+**What the frozen count narrows it to.** The handler is on `BLK_IRQ_VECTOR` 0x42, the
+IDT entry is installed, MSI-X entry 0 is unmasked and pointed at the LAPIC, and the
+vector is EOI'd on the way out - all verified by reading. A frozen count therefore means
+the **MSI-X message itself has stopped arriving**, and the candidates are now below the
+driver: (1) the device never raises again because it believes the queue is not ready
+(the `avail_event`/`used_event` notification pair - `should_notify` answering false
+because the two indexes agree); (2) the LAPIC's vector is masked in the ISR/TMR by a
+delivery that never completed; (3) the MSI-X table's entry was rewritten (the pflash /
+9p / GPU drivers also program MSI-X, and a table mapped twice is a table written by two
+owners). (3) is the one that fits "works thousands of times, then stops" with a clean
+handler, and it is testable: read MSI-X entry 0 back at the stall and compare it with
+what `msix::enable` wrote.
