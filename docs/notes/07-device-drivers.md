@@ -4710,3 +4710,32 @@ and `stop.traced` at that instant. That is the cheapest instrument left for this
 bug, and until it is taken the fix would be a guess about which of the three
 functions in the chain (`park`, the wake, `child_event_in`) is the one losing the
 event.
+
+**The gate line, finally taken - and it is red for two things this thread did not
+touch.** On a clean worktree at the ptrace commits (no other worker's changes, pin
+reverted), the x86_64 arm ran every lane to completion and then failed the arm:
+
+    User tests: 210 programs over 6 lane(s)
+    lane 0..5: 35 programs each, exit 33                       (every lane concluded)
+    self-test (x86_64): mpos-kunit 32 passed, 0 failed
+
+with two claims red inside the lanes:
+
+    lane 1: FAIL:  clone(CLONE_NEWCGROUP) starts a child, view-rooted where its parent is grouped
+    lane 5: FAIL:  the reply wakes the epoll wait
+            FAIL:  the echo reply reads back        (t-epoll-socket, exit=1)
+
+Neither is the ptrace change: `PTRACE_GET_SYSCALL_INFO` answers an operation byte,
+and these are a cgroup-view assertion in `t-clone` and a socket/epoll wake in
+`t-epoll-socket`. So **the gate at this commit was red before this thread's work**
+(the earlier "self-test failed" runs were these, not the lane timeouts), and the
+ptrace fix cannot take a green line until they are green or understood.
+
+What that means for the ledger: the ptrace fix's evidence is the smoke test on the
+real machine (strace of `/bin/true` and `strace -f` of `sh -c true`, both exit 0 with
+complete traces, where before the fix the same attempt reported
+`ptrace_syscall_info.op == 2` and killed its tracee). The two reds above are the next
+work - each wants its own reading: `t-clone`'s cgroup assertion against what
+`CLONE_NEWCGROUP` is supposed to root, and `t-epoll-socket`'s wake against the
+socket's `poll_subscribe`/wake path (which is the same wake machinery this whole
+section has been chasing).
