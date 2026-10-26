@@ -5848,3 +5848,46 @@ either falsified it or shown a login - and every probe that did work is now in t
 the all-parked heartbeat, the park-site `wchan` with its stale-value trap documented, the
 claim lifecycle counters with `out`, the live `HOLDER`/`WAITER`/`irq` triple, the paired
 `fill BEGIN`/`END`, and the child-wait's `id/alive/code/retired` line.
+
+**The `/dev` hypothesis is tested and it is only half right: the respawn loop stops, the
+login still does not come.** This is a measured correction to the entry above, which
+blamed the missing `/dev` for the whole remaining stall.
+
+The test was the honest one: a `::sysinit:` line mounting `devtmpfs` on `/dev` before
+`openrc sysinit`, built into the image, with a diagnostic printing the result:
+
+    ::sysinit:/bin/sh -c 'mount -t devtmpfs devtmpfs /dev; echo DEVTMPFS_RC=$?; ...'
+    ...
+    DEVTMPFS_RC=0
+    crw-rw-rw-    1 root     root        4,   1 Jan  1  1970 /dev/tty1
+
+**The mount works and `/dev/tty1` exists.** And the respawn loop does stop - the earlier
+boot had slot 6 being created and destroyed repeatedly (`live=[..6..] s6=Some(..parent=Some(1))`
+alternating with `s6=None`); this one has **no slot 6 at all**, `parks=385` instead of 369,
+and 41 heartbeats of quiet. So the missing node *was* why the getty died, and that half of
+the previous entry is confirmed.
+
+**But there is still no `mpos login:`.** And the last boot shows a second thing going
+wrong that the previous readings had not had: `fill=9174/9173(out=1)` - a **single** fill
+claim leaked, with `fill-owner=none`, which is the intermittent shape seen once before
+and dismissed once before. So the state after fixing `/dev` is: no getty cyclically
+respawning, no block wedge, `udevd` healthy on `epoll_pwait`, one fill claim outstanding,
+everything else idle, and no login prompt.
+
+**What that means, stated without guessing.** Two things are now known and separate:
+(a) the `/dev` mount is **necessary** - without it the getty cannot run at all, and with
+it the respawn storm ends; (b) it is **not sufficient** - the boot still does not print a
+login. What remains is unattributed, and the two candidates the readings support are the
+leaked fill (`out=1` with no owner, which would stall whatever udev worker touches that
+block next) and the possibility that the getty is running but its output is not reaching
+`console=ttyS0` (the kernel's own banner says the shells are on `tty1..tty6` and the wire
+carries the *active* console, so a getty on `tty1` while `ttyS0` is current would be
+silent - the `^A 1` switch is the test, and this session could not deliver it because
+`cargo xtask run` hands QEMU `/dev/null` on stdin).
+
+**That is the exact next measurement, and it needs no kernel change:** boot with a fifo
+on QEMU's stdin, send `^A 1`, and see whether a login prompt appears. If it does, the
+boot has been *working* since the `/dev` mount and the whole stall was a console-selection
+artefact. If it does not, the leaked fill is the next thread. `cargo xtask run` needs
+`--mode terminal` with stdin from a fifo for this; the recipe is in this section's earlier
+entries and works.
