@@ -4863,3 +4863,52 @@ The arm with **both** fixes in, on a clean worktree at `482127d`:
 So the ptrace thread that opened this section ends with a green x86_64 arm, a
 named cause for each of the two reds it inherited, and no unproven fix in the
 tree - which is what the section's whole ledger was for.
+
+**The descriptor-restore candidate is measured and eliminated (`t-fd-restore`).** The
+ledger above left two open questions for the `gendepends.sh` stall: which userspace
+construct polls, and whether the redirect's own save/restore works. The second one is
+answerable on its own and is now answered - it works - so it is off the list.
+
+The pin is a new program, `t-fd-restore` (15 claims, ungroupped: it needs nothing
+but the machine). It spells the exact shape `gendepends.sh` line 74 uses - save the
+descriptor with `F_DUPFD_CLOEXEC`, `dup2` the file over it, read, `dup2` the
+original back on the same number - and pins the invariant a caller depends on
+rather than the mechanics `t-dup2` already covers: the round trip is symmetric, and
+round N+1 starts from the state round N left. A hundred rounds, then a look at what
+a *later* reader finds on that descriptor.
+
+Measured: **15/15 on the guest, 15/15 on the host**, `=== PASS t-fd-restore`. Read
+with the two host probes
+(`.workbuddy/probe_fd_restore.c`, `.workbuddy/probe_pipe_ino.c`): a `for f in *;
+do read a b c <"$f"; done` loop on a current Linux restores fd 0 to the shell's own
+description after every iteration, and reads a different file each time - the
+kernel here does the same, so **neither the restore nor a file's readiness at
+end-of-file is the stall's cause**.
+
+Three things the writing of it cost, each worth more than the claims:
+
+1. **The first draft pinned nothing.** Deleting the restore from the loop left the
+   program green, because the draft re-made the save slot from stdin every round -
+   and a fresh `dup` of stdin *is* the original whatever the last round left
+   behind, so the restore was redundant. Fixed by making the slot once, outside the
+   loop; with that, deleting the restore turns `after the loop the descriptor is
+   the shell's own stdin again` red. A claim that survives the change it names is
+   the failure mode rule 4 exists for, and only the counterfactual run shows it.
+2. **A pipe has no `st_ino` here.** The first fixture used a pipe for the
+   "shell's own stdin", and the guest answered `st_ino == 0` where a current Linux
+   answers a nonzero inode shared by both ends (`probe_pipe_ino.c`). The fixture
+   claim failed, so every claim about the kernel that run was worthless - the
+   program went red for a reason that was not the subject. A regular file is the
+   stand-in now, and it is also the truer one: the stall's own line recorded
+   `kind=0` (a file) on the descriptor.
+3. **Three scripts must have three distinct first words.** The first draft had two
+   beginning `#!/sbin/openrc-run`, so the "each round read the file it opened" claim
+   could not tell three reads from two, and failed on a correct kernel.
+
+Where that leaves the stall: the two questions this could answer are answered and
+both are negative - the restore works and `read` at end-of-file is 0. What remains
+is the one the ledger named first, and it is now the *only* candidate: which
+userspace construct in busybox's `read` builtin blocks its signal mask
+(`rt_sigprocmask`, syscall 14) and polls a regular file, and why it re-polls instead
+of consuming to end-of-file. That is a question about the shell, and it is
+answerable by reading busybox's `read` rather than this kernel.
