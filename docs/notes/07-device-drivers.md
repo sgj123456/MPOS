@@ -5373,3 +5373,52 @@ invariant assertion for any of them**, so each fault had to be found by booting.
 `fill out != 0` at quiescence and `blk-busy with a parked non-submitter` are exactly
 those assertions; both exist now, which is why this stage produces readings instead of
 hunts.
+
+**The `out=2` leak is intermittent and was not the stall's cause; init is now parked on
+an empty table, which means a stale `RETIRED` record is the live suspect.** The paired
+`fill BEGIN`/`END` instrument - the one that produced 11367 perfect pairs in an earlier
+worktree - was run again on a boot with both wait-guards in, and this time it read:
+
+    FILL B = 11377, FILL E = 11377, diff = 0
+    fill=11377/11377(out=0 none) run=0/0(out=0)
+
+so **neither fill leaked on this boot**. The `out=2 age=171328ms` reading from the
+previous one is therefore **intermittent**, and the correction has to be recorded
+against myself twice over: first I dismissed `out=2` as the previous boot's residue
+(wrong - `out` is per-boot state and it reproduced), then this boot shows it does *not*
+reproduce every time (so it is a race, not the standing cause). Both statements are in
+the ledger now because both were made.
+
+What the clean boot shows instead is the sharpest reading of the whole thread:
+
+    mpos: heartbeat fill-owner=none run-owner=none fill-busy=false
+                    run-busy=false blk-busy=false blk-waiter=none
+    mpos:   slot 1 pid 1 /sbin/init  park 4 syscall 61 (wait4) parks=384   <- frozen
+    mpos:   (slots 6, 7, 8 - openrc, udev-trigger, openrc-run.sh - all gone)
+
+Every resource is free, no child process exists, and `init` still sits in `wait4` with
+`parks=384` frozen. The two guards return `NoChild` when *no child can report* - so the
+one way this state is reachable is that `has_matching_children` still answers **true**:
+its second arm is a scan of `RETIRED`, and a record that nobody can collect keeps that
+answer true for ever while `scan_child_event` finds nothing to report. That is a
+*third* identity question, and unlike the first two it is about the record's ownership
+rather than the slot's generation: `sel.names_retired(..)` plus
+`retired.tracer.is_none_or(|tracer| tracer == parent)` decides who may collect, and a
+record whose collector has gone is uncollectable by construction - permanently
+"something to wait for" and permanently unreportable.
+
+**So the next step is one question, and the instruments answer it directly:**
+enumerate `RETIRED` at init's stuck wait (the same `mpos: cw ... retired_ids=[...]`
+line built earlier and thrown away with its worktree) and see whether a record for one
+of init's children survives with a tracer or a parent that will never come back. If it
+does, the fix is to treat an uncollectable record as **not** a reason to park - which is
+the same shape as the two guards just landed, applied to the record list instead of the
+slot table.
+
+**Where the thread honestly stands.** Seven faults have stopped this boot; five are
+fixed and gated green (`93865d7`, `f761cc4`, `4e927ce`, `d945e29`, `626f58a`,
+`1b36efb`); the boot still does not reach a login. Every fault has been found by booting
+with an instrument, never by reading, and each became reachable only after the previous
+one stopped moving. That is the cost of a change that added four waiting contracts
+across drivers, vfs and sched without a single invariant assertion - and it is the
+answer to the question this thread began with.
