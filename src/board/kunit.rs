@@ -46,6 +46,10 @@ pub(crate) const SUITES: &[Suite] = &[
     // The block ring's abandoned-entry drain, one phase later: its case claims
     // the mailbox and parks, which needs the scheduler's boot context.
     mpos::drivers::kunit::DRAIN_SUITE,
+    // The MMIO claim wait's rules, which pin the shape a lost wake wedged the
+    // aarch64 boot with (`docs/notes/` §7 R.9). `Mailbox` needs no device, so
+    // the case runs on either machine.
+    mpos::drivers::virtio::mmio::kunit::SUITE,
     // The display's, which is the one suite that cannot run where the devices are
     // probed: the card's owner is a task, so the card is up a step later
     // (`Phase::Display`) and nowhere before it.

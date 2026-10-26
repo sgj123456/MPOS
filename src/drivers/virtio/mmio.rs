@@ -138,11 +138,24 @@ impl MmioBlk {
         // header carries: the loser of the claim parks on the claim itself,
         // and `finish_request` wakes the queue when the transfer retires.
         while !self.mailbox.begin_request(me) {
-            if self.mailbox.wait_for_device(me) {
-                crate::sched::block_until_uninterruptible(|| {
-                    !self.mailbox.busy.load(Ordering::Acquire)
-                });
-            }
+            // The registration runs before **every** sleep, not once. A waiter
+            // woken while another claimant took the device between its wake and
+            // its re-check would otherwise sleep *unregistered*, and the next
+            // `finish_request` would wake nobody - a lost wake that parks the
+            // task for the machine's life. Measured on the aarch64 boot: `eend`
+            // opening a file stopped one line after `Starting busybox syslog`
+            // with the mailbox `busy` and its `waiter` naming a slot that no
+            // longer held a transfer, and every later read queued behind it
+            // (`docs/notes/` §7 R.9). The PCI sibling escapes the same race only
+            // because its claim wait carries a deadline and so re-registers when
+            // it expires; this one had none. `armed` is the shape that fix
+            // already has a name for - the ext4 cache's own claim wait
+            // (`vfs::ext4::claim_park`).
+            crate::sched::block_until_uninterruptible_armed(
+                4,
+                || !self.mailbox.busy.load(Ordering::Acquire),
+                || self.mailbox.register(me),
+            );
         }
 
         let mut req = BlkReq::default();
@@ -344,16 +357,18 @@ impl Mailbox {
         })
     }
 
-    /// Register `me` as waiting for the device to go free. `false` answers
-    /// "already free - take it", so the caller re-runs its claim instead of
-    /// waiting for a wake that would never come.
-    fn wait_for_device(&self, me: crate::sched::TaskId) -> bool {
+    /// Register `me` as waiting for the device to go free.
+    ///
+    /// Idempotent on purpose: the claim wait calls this **before every sleep**
+    /// (see [`MmioBlk::claim`]'s two callers), so the list's bound stays the
+    /// task table's own - one entry per waiting task, however often it is
+    /// armed.
+    fn register(&self, me: crate::sched::TaskId) {
         critical_section::with(|cs| {
-            if !self.busy.load(Ordering::Acquire) {
-                return false;
+            let mut queue = self.queue.borrow(cs).borrow_mut();
+            if !queue.contains(&me.0) {
+                queue.push(me.0);
             }
-            self.queue.borrow(cs).borrow_mut().push(me.0);
-            true
         })
     }
 
@@ -472,11 +487,24 @@ impl super::SelftestBlk for MmioBlk {
     fn selftest_submit_and_abandon(&self, block: usize, buf: &mut [u8]) -> Option<u16> {
         let me = crate::sched::current();
         while !self.mailbox.begin_request(me) {
-            if self.mailbox.wait_for_device(me) {
-                crate::sched::block_until_uninterruptible(|| {
-                    !self.mailbox.busy.load(Ordering::Acquire)
-                });
-            }
+            // The registration runs before **every** sleep, not once. A waiter
+            // woken while another claimant took the device between its wake and
+            // its re-check would otherwise sleep *unregistered*, and the next
+            // `finish_request` would wake nobody - a lost wake that parks the
+            // task for the machine's life. Measured on the aarch64 boot: `eend`
+            // opening a file stopped one line after `Starting busybox syslog`
+            // with the mailbox `busy` and its `waiter` naming a slot that no
+            // longer held a transfer, and every later read queued behind it
+            // (`docs/notes/` §7 R.9). The PCI sibling escapes the same race only
+            // because its claim wait carries a deadline and so re-registers when
+            // it expires; this one had none. `armed` is the shape that fix
+            // already has a name for - the ext4 cache's own claim wait
+            // (`vfs::ext4::claim_park`).
+            crate::sched::block_until_uninterruptible_armed(
+                4,
+                || !self.mailbox.busy.load(Ordering::Acquire),
+                || self.mailbox.register(me),
+            );
         }
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
@@ -1008,4 +1036,58 @@ pub fn windows_with_lines(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usi
         },
     );
     windows
+}
+
+/// The claim wait's own boot self-test.
+///
+/// `Mailbox` is the one piece of this module with no device behind it - a pair
+/// of atomics and a queue - so the rules its wait rests on can be pinned on
+/// either machine, before any transport is opened. The property under the
+/// microscope is the one whose absence wedged the aarch64 boot: the wait arms
+/// its wake-up registration **before every sleep**, and that registration must
+/// be idempotent, because the list's bound has to stay the task table's own
+/// however often the same waiter re-arms (`docs/notes/` §7 R.9).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit {
+    use super::*;
+    use crate::kunit::{Case, Phase, Suite};
+    use alloc::string::String;
+
+    /// The suite this module contributes to the boot's self-tests.
+    pub const SUITE: Suite = Suite {
+        name: "mmio-mailbox",
+        phase: Phase::Scheduler,
+        cases: &[Case {
+            name: "the_claim_wait_registers_once_however_often_it_is_armed",
+            run: registers_once,
+        }],
+    };
+
+    /// Arm twice, retire once: one queue entry, and the retire empties it.
+    ///
+    /// The counterfactual is the shape this replaced - a registration taken
+    /// once, outside the wait loop - where a waiter woken and sent back to
+    /// sleep was off the list for ever (the `queue` would still hold it, but
+    /// no later `finish_request` could reach it once it had been drained and
+    /// the waiter re-slept unregistered). What *this* case can see is the
+    /// bound: two arms are one entry, which is what lets the wait arm before
+    /// every sleep without the queue growing with the clock.
+    fn registers_once(_boot: &crate::boot::BootInfo) -> Result<(), String> {
+        let mailbox = Mailbox::new();
+        let me = crate::sched::current();
+        mailbox.register(me);
+        mailbox.register(me);
+        let queued = critical_section::with(|cs| mailbox.queue.borrow(cs).borrow().clone());
+        crate::case_check!(
+            queued == alloc::vec![me.0],
+            "two arms queued the waiter {queued:?} times instead of once"
+        );
+        mailbox.finish_request();
+        let after = critical_section::with(|cs| mailbox.queue.borrow(cs).borrow().clone());
+        crate::case_check!(
+            after.is_empty(),
+            "a retire left {after:?} on the claim queue"
+        );
+        Ok(())
+    }
 }
