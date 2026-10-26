@@ -195,10 +195,22 @@ impl MmioBlk {
         // interrupt - with one poll per period for a wire that lost the wake.
         let mut deadline = crate::hal::since_boot_nanos() + WAIT_NS;
         while !self.mailbox.completed.load(Ordering::Acquire) {
-            crate::sched::block_until_uninterruptible(|| {
-                self.mailbox.completed.load(Ordering::Acquire)
-                    || crate::hal::since_boot_nanos() >= deadline
-            });
+            // A timed park, not the plain primitive: the deadline in the
+            // condition cannot end a sleep the plain shape takes with
+            // `u64::MAX`, so a completion wake that never lands (the
+            // `waiter`-as-0 collision the sentinel fix below closed, or any
+            // other lost line) would park the reader for the machine's life.
+            // This is the same fix the PCI transfer got when its own boot
+            // wedged on it (`docs/notes/` §7 R.9), and the loop below already
+            // knows what to do when the clock ends the wait: poll the ring.
+            crate::sched::block_until_uninterruptible_until(
+                4,
+                || {
+                    self.mailbox.completed.load(Ordering::Acquire)
+                        || crate::hal::since_boot_nanos() >= deadline
+                },
+                deadline,
+            );
             if self.mailbox.completed.load(Ordering::Acquire) {
                 break;
             }
@@ -320,7 +332,15 @@ struct Mailbox {
     /// The device answered. Set by the interrupt handler, cleared by whoever
     /// submits the next request on *this* device.
     completed: AtomicBool,
-    /// The parked submitter on this device, or 0.
+    /// The parked submitter on this device, or `usize::MAX` when none.
+    ///
+    /// The sentinel is **not** 0, because slot 0 is a real task - the boot
+    /// context the scheduler adopts (`BOOT_SLOT`), which is exactly the task
+    /// the self-test's transfers run on. A `waiter != 0` wake gate skipped
+    /// task 0's completion wake, and a completion that landed after the
+    /// submitter's park parked the boot task for the machine's life - one
+    /// aarch64 lane in twelve, the race the deadline-carrying wait above now
+    /// bounds (`docs/notes/` §7 R.9).
     waiter: AtomicUsize,
     /// Whether a transfer is in flight on this device: claimed at submit,
     /// released when the request is retired.
@@ -335,7 +355,7 @@ impl Mailbox {
     const fn new() -> Self {
         Mailbox {
             completed: AtomicBool::new(false),
-            waiter: AtomicUsize::new(0),
+            waiter: AtomicUsize::new(usize::MAX),
             busy: AtomicBool::new(false),
             queue: Mutex::new(RefCell::new(Vec::new())),
         }
@@ -378,7 +398,7 @@ impl Mailbox {
     fn finish_request(&self) {
         let queued = critical_section::with(|cs| {
             self.busy.store(false, Ordering::Release);
-            self.waiter.store(0, Ordering::Release);
+            self.waiter.store(usize::MAX, Ordering::Release);
             core::mem::take(&mut *self.queue.borrow(cs).borrow_mut())
         });
         for id in queued {
@@ -428,7 +448,7 @@ pub fn complete_irq() {
             ) {
                 mailbox.completed.store(true, Ordering::Release);
                 let waiter = mailbox.waiter.load(Ordering::Acquire);
-                if waiter != 0 {
+                if waiter != usize::MAX {
                     crate::sched::wake(crate::sched::TaskId(waiter));
                 }
             }

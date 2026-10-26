@@ -61,15 +61,21 @@ static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 /// is retired — the whole serialization of the device's queue.
 static BUSY: AtomicBool = AtomicBool::new(false);
 
-/// The parked submitter, or 0. Set with the claim, before the first look at
-/// [`COMPLETED`], so the handler either finds it (and wakes it) or has
-/// already set `COMPLETED` (and the submitter never sleeps).
+/// The parked submitter, or `usize::MAX` when none. Set with the claim, before
+/// the first look at [`COMPLETED`], so the handler either finds it (and wakes
+/// it) or has already set `COMPLETED` (and the submitter never sleeps).
+///
+/// The sentinel is **not** 0, because slot 0 is a real task - the boot context
+/// the scheduler adopts (`BOOT_SLOT`), which is the task the boot's own
+/// self-test suites run on. A `waiter != 0` wake gate skipped task 0's
+/// completion wake, parking the boot task on a transfer whose interrupt had
+/// already fired (`docs/notes/` §7 R.9).
 ///
 /// This is the *wake* address and nothing else: the completion handler swaps it
 /// out the moment it has woken the submitter. It is therefore **not** a record
 /// of who holds the device - that is [`HOLDER`], and confusing the two is the
 /// bug this file shipped (`docs/notes/` §7 R.9).
-static WAITER: AtomicUsize = AtomicUsize::new(0);
+static WAITER: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// The task holding the device's one-in-flight claim, or 0 when it is free.
 ///
@@ -157,7 +163,7 @@ pub fn begin_request(me: TaskId) -> bool {
     critical_section::with(|_| {
         if BUSY.load(Ordering::Acquire) && holder_exited() {
             BUSY.store(false, Ordering::Release);
-            WAITER.store(0, Ordering::Release);
+            WAITER.store(usize::MAX, Ordering::Release);
             HOLDER.store(0, Ordering::Release);
             COMPLETED.store(false, Ordering::Release);
         }
@@ -198,7 +204,7 @@ pub fn finish_request() {
     let queued = critical_section::with(|cs| {
         BUSY.store(false, Ordering::Release);
         crate::sched::note_blk_mailbox(false, None);
-        WAITER.store(0, Ordering::Release);
+        WAITER.store(usize::MAX, Ordering::Release);
         // The claim, and only here: the completion handler must not clear this,
         // because a request that finished is not a claim that was retired and
         // the difference is what keeps a slow holder from being taken for a dead
@@ -223,11 +229,11 @@ pub fn complete_irq() {
     IRQ_AT_NS.store(crate::hal::since_boot_nanos(), Ordering::Relaxed);
     IRQ_AT_NS.store(crate::hal::since_boot_nanos(), Ordering::Relaxed);
     COMPLETED.store(true, Ordering::Release);
-    let waiter = WAITER.swap(0, Ordering::AcqRel);
+    let waiter = WAITER.swap(usize::MAX, Ordering::AcqRel);
     // The claim is still in flight (the owner retires it), but no slot holds it
     // any more - mirrored so the heartbeat does not report a stale owner.
     crate::sched::note_blk_mailbox(true, None);
-    if waiter != 0 {
+    if waiter != usize::MAX {
         crate::sched::wake(TaskId(waiter));
     }
 }
