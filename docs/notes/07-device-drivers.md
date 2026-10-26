@@ -4691,3 +4691,22 @@ tracer's `wait4` answer, and the reading above (parent in `wait4`, tracee stoppe
 the call) is the counterfactual the eventual pin will stand on. The ptrace fix that
 did land (`fdc69f7`) stays: its own evidence is the smoke test on the real machine,
 which the note above records.
+
+**Where the missing report is *not*.** Reading the stop's two halves narrows the
+search without closing it. `trace::park` **does** wake the tracer
+(`t.sched.wake(tracer)`) before sleeping the tracee with no deadline, and the
+collect side's predicate (`child_event_in`) asks what it should: the stop is
+unreported, and for a traced stop it is reportable only to the task recorded as its
+tracer (`task.trace.tracer == Some(me)`, which the same function's comment already
+explains is what keeps a parent from collecting a born-stop its tracer has not
+looked at).
+
+So neither the wake nor the filter is obviously wrong, and the hang must be in
+between: the tracer woke, asked, was told there is nothing, and parked again - which
+means the question it asked was not the one `child_event_in` answers. The reading
+that would close it is one line in `wait4`'s wake path: the child id it is waiting
+on, the result its predicate gave after the wake, and the child's `stop.reported`
+and `stop.traced` at that instant. That is the cheapest instrument left for this
+bug, and until it is taken the fix would be a guess about which of the three
+functions in the chain (`park`, the wake, `child_event_in`) is the one losing the
+event.
