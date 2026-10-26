@@ -43,6 +43,9 @@ pub(crate) const SUITES: &[Suite] = &[
     // The block layer's, which needs the devices the boot step before this one
     // registered (§10.5's last row is about what a read costs the machine).
     mpos::drivers::kunit::SUITE,
+    // The block ring's abandoned-entry drain, one phase later: its case claims
+    // the mailbox and parks, which needs the scheduler's boot context.
+    mpos::drivers::kunit::DRAIN_SUITE,
     // The display's, which is the one suite that cannot run where the devices are
     // probed: the card's owner is a task, so the card is up a step later
     // (`Phase::Display`) and nowhere before it.

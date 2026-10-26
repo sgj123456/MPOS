@@ -63,6 +63,78 @@ pub const SUITE: Suite = Suite {
     }],
 };
 
+/// The drain's suite, a phase later than [`SUITE`]: its case claims the block
+/// mailbox and parks, which needs the scheduler to have adopted the boot
+/// context, where [`SUITE`]'s clock case must not depend on one.
+pub const DRAIN_SUITE: Suite = Suite {
+    name: "blk-drain",
+    phase: Phase::Scheduler,
+    cases: &[Case {
+        name: "a_ring_entry_nobody_retires_is_drained_by_the_next_reader",
+        run: a_ring_entry_nobody_retires_is_drained_by_the_next_reader,
+    }],
+};
+
+/// A completed ring entry whose submitter has gone must not wedge the device.
+///
+/// The wire named this one: `blk stall: me=10 token=1 peek=Some(0)` - a task
+/// abandoned a transfer (claim given back by the holder-exited reclaim, ring
+/// entry never popped), and every later transfer then waited for its own token
+/// to reach a head that answered the abandoned one forever. The desktop boot's
+/// udev stall, 2026-10-26. The drain (`drivers::virtio::drain_abandoned`) is
+/// the fix: the next claimant pops the ownerless head before submitting.
+///
+/// The counterfactual is direct. The suite submits a real read through the
+/// driver's own path and **stops before retiring it** - the mailbox released
+/// the way a death mid-transfer leaves it, the entry completed and unpopped -
+/// and then reads again through the ordinary [`BlockDev`] door. Without the
+/// drain the second read's wait never sees its token and its retire spins
+/// behind the abandoned head forever, which the gate reads as a hang; with it
+/// the drain's line is on the wire and the read completes.
+fn a_ring_entry_nobody_retires_is_drained_by_the_next_reader(
+    _info: &BootInfo,
+) -> Result<(), String> {
+    let Some(dev) = super::virtio::selftest_device() else {
+        return Err(String::from(
+            "no virtio-blk instance was recorded for the suite",
+        ));
+    };
+    use crate::blk::BlockDev as _;
+    // The control: the ordinary door answers block 1, and a second asking of
+    // the same block answers the same bytes. This is the answer the wedge
+    // must not change. (`read_at` is the trait's byte-offset door; block 1 is
+    // byte 512.)
+    const BLOCK1: u64 = 512;
+    let mut first = vec![0u8; 512];
+    dev.read_at(BLOCK1, &mut first);
+    let mut control = vec![0u8; 512];
+    dev.read_at(BLOCK1, &mut control);
+    case_check!(
+        first == control,
+        "two plain reads of block 1 disagreed before anything was abandoned"
+    );
+
+    // The wedge: submit at the crate's level and stop there.
+    let mut junk = vec![0u8; 512];
+    let Some(token) = dev.selftest_submit_and_abandon(1, &mut junk) else {
+        return Err(String::from(
+            "the abandoned submission never completed - the device did not answer it",
+        ));
+    };
+    println!("drain: abandoned token {token} at the ring's head");
+
+    // The claim under test: the next reader completes despite the head, and
+    // lands the same bytes a clean read answered.
+    let mut after = vec![0u8; 512];
+    dev.read_at(BLOCK1, &mut after);
+    case_check!(
+        after == first,
+        "the read after an abandoned entry returned different bytes than the control read"
+    );
+    println!("drain: the next reader completed past the abandoned head");
+    Ok(())
+}
+
 /// One read's span, and the largest a single allocation can be (`mm::pframe`'s
 /// `MAX_ORDER`, 2^14 pages, 64 MiB): the mask has to span several tick periods
 /// before the count can lose any, so the span is as wide as the allocator allows.

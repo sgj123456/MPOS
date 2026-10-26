@@ -150,6 +150,134 @@ pub(crate) fn device_reaches(buf: &[u8]) -> bool {
     )
 }
 
+/// Which task submitted each in-flight ring token, for the abandoned-entry
+/// drain to name. A token is a descriptor index, so the table is the queue's
+/// own size; `usize::MAX` means "never submitted since boot".
+static SUBMITTED_BY: [core::sync::atomic::AtomicUsize; BLK_QUEUE_SIZE] =
+    [const { core::sync::atomic::AtomicUsize::new(usize::MAX) }; BLK_QUEUE_SIZE];
+
+/// The ring size both block transports run. `virtio-drivers`' `VirtIOBlk` fixes
+/// it at 16, and a token is a descriptor index under it, so this is the table's
+/// bound and the drain's.
+const BLK_QUEUE_SIZE: usize = 16;
+
+/// Record the submitting task beside `token`, at the submit site, before the
+/// first look that could lose it.
+pub(super) fn note_blk_submit(token: u16, me: crate::sched::policy::TaskId) {
+    let at = usize::from(token);
+    if at < BLK_QUEUE_SIZE {
+        SUBMITTED_BY[at].store(me.0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Clear a token's submitter once its own owner has retired it.
+pub(super) fn note_blk_retire(token: u16) {
+    let at = usize::from(token);
+    if at < BLK_QUEUE_SIZE {
+        SUBMITTED_BY[at].store(usize::MAX, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Give back every completed ring entry whose submitter has abandoned it.
+///
+/// The mailbox's rule is one transfer in flight per device: the holder of a
+/// claim is the only task with a chain in the ring, and it retires its own
+/// token. So a completed entry at the ring's head that is not the current
+/// claimant's token has **no owner by construction** - its submitter left it
+/// behind (the shape the wire named: `blk stall: me=10 token=1 peek=Some(0)`,
+/// the desktop boot's udev stall, 2026-10-26 - udevd parked at the transfer's
+/// own 4 ms deadline forever, a dozen workers queued on the fill it held),
+/// and nobody else will ever pop it. Left in place it wedges the device for
+/// the rest of the boot: `peek_used` answers the head forever, so every later
+/// transfer waits for a token that never reaches the head. The drain runs at
+/// each submit site, under the claim that proves the head is abandoned.
+///
+/// The pop hands buffers back because the crate's contract returns them; for
+/// an abandoned entry the originals are gone, so dummies stand in. That is
+/// safe here and only here: [`hal::HalImpl::unshare`] moves nothing (no DMA
+/// bounce, no cache flush), so the call is descriptor bookkeeping and touches
+/// no buffer - and the shape handed back is the only one this module submits:
+/// three descriptors, `[req][data][resp]` whichever direction the data runs.
+/// (`flush` would be two, and nothing in-tree submits one; `device_id` is
+/// three.) A head that refuses to pop under that shape is not a leak this
+/// rule describes, and is left where the next boot's evidence can name it.
+pub(super) fn drain_abandoned<H: virtio_drivers::Hal, T: Transport>(
+    device: &mut virtio_drivers::device::blk::VirtIOBlk<H, T>,
+) -> usize {
+    use virtio_drivers::device::blk::{BlkReq, BlkResp};
+
+    let mut req = BlkReq::default();
+    let mut resp = BlkResp::default();
+    // Any nonzero multiple of a sector: the crate never checks a returned
+    // buffer's length against its descriptor, and our `unshare` copies
+    // nothing into it.
+    let mut data = [0u8; 512];
+    let mut drained = 0;
+    while let Some(head) = device.peek_used() {
+        let submitter = usize::from(head);
+        let submitter = if submitter < BLK_QUEUE_SIZE {
+            SUBMITTED_BY[submitter].load(core::sync::atomic::Ordering::Acquire)
+        } else {
+            usize::MAX
+        };
+        // SAFETY: the entry at the head is completed and ownerless (the rule
+        // above), so nobody else will pass it to a `complete_*`; the dummy
+        // buffers are written by nothing (`HalImpl::unshare` is a no-op); and
+        // the shape matches every chain this module submits.
+        let popped = unsafe { device.complete_read_blocks(head, &req, &mut data, &mut resp) };
+        if device.peek_used() == Some(head) {
+            // The head did not move: not the shape the rule describes. Leave
+            // it rather than spin - the wait above the caller reports a
+            // transfer that never finishes, which is the honest failure.
+            crate::hal::kernel::print_line(format_args!(
+                "mpos: blk drain: head={head} submitter={submitter} resisted the pop\n"
+            ));
+            break;
+        }
+        drained += 1;
+        let _ = popped;
+        // The token's descriptor is recycled: the next submit that takes it
+        // records itself, and clearing here keeps the table's answer "who has
+        // this entry out" honest for a drain-time reader.
+        note_blk_retire(head);
+        crate::hal::kernel::print_line(format_args!(
+            "mpos: blk drain: token={head} submitter={submitter} status={:?} drained={drained}\n",
+            resp.status()
+        ));
+    }
+    drained
+}
+
+/// The submit-and-abandon door the boot's drain suite drives, one method both
+/// block transports implement. Test builds only: a production build carries
+/// neither the trait object nor the static below.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub(crate) trait SelftestBlk: crate::blk::BlockDev {
+    /// Submit one read of `block` into `buf` and stop before retiring it,
+    /// releasing the mailbox the way a death mid-transfer leaves it - the
+    /// abandoned shape the drain exists to recover from. `None` answers a
+    /// device that never completed the submission.
+    fn selftest_submit_and_abandon(&self, block: usize, buf: &mut [u8]) -> Option<u16>;
+}
+
+/// The recorded driver, for the self-test suite.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+static SELFTEST_DEV: Mutex<RefCell<Option<alloc::sync::Arc<dyn SelftestBlk>>>> =
+    Mutex::new(RefCell::new(None));
+
+/// Record a driver instance for the drain suite. Called by whichever block
+/// transport this machine's boot probed.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub(crate) fn record_selftest_dev(dev: alloc::sync::Arc<dyn SelftestBlk>) {
+    critical_section::with(|cs| *SELFTEST_DEV.borrow(cs).borrow_mut() = Some(dev));
+}
+
+/// The recorded driver, for the self-test suite.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub(crate) fn selftest_device() -> Option<alloc::sync::Arc<dyn SelftestBlk>> {
+    critical_section::with(|cs| SELFTEST_DEV.borrow(cs).borrow().clone())
+}
+
 /// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
 /// prints as "Kernel driver in use".
 ///

@@ -147,8 +147,14 @@ impl MmioBlk {
 
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
+        // Submit under the device lock and the critical section, and leave
+        // both before waiting: the interrupt that answers never needs the
+        // device, so a parked reader holding neither is what lets the handler
+        // run at all. The claim is also what lets the drain below run: it
+        // proves any completed entry already in the ring has no living owner.
         let token = critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
             // SAFETY: the buffers are borrowed by the device from here until
             // the matching `complete_*` below; this task parks inside the call
             // holding neither reference, which is the crate's own contract.
@@ -170,6 +176,7 @@ impl MmioBlk {
             self.mailbox.finish_request();
             return;
         };
+        super::note_blk_submit(token, me);
 
         // The wait: parked, uninterruptible, ended by this device's completion
         // interrupt - with one poll per period for a wire that lost the wake.
@@ -222,14 +229,22 @@ impl MmioBlk {
                 panic!("virtio-blk over MMIO reported a completion error");
             }
         });
+        super::note_blk_retire(token);
         self.mailbox.finish_request();
     }
 
     /// The synchronous transfer, exactly as this driver shipped. Kept for the
     /// callers that cannot park (boot context) and for a window with no line.
+    ///
+    /// The crate's synchronous call waits for *any* used entry and then pops
+    /// its own token - so a completed entry already at the head answers
+    /// `WrongToken` and the call leaks its own entry behind it. Under this
+    /// caller's claim any head it finds is abandoned by the same proof the
+    /// drain carries, so the drain runs first.
     fn transfer_sync(&self, block: usize, xfer: Xfer<'_>) {
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
             let result = match xfer {
                 Xfer::Read(buf) => device.read_blocks(block, buf),
                 Xfer::Write(buf) => device.write_blocks(block, buf),
@@ -434,12 +449,67 @@ pub fn blockdev(virt: usize, size: usize, line: u32) -> Option<Arc<dyn BlockDev>
         });
         crate::hal::arm_block_line(line);
     }
-    Some(Arc::new(MmioBlk {
+    let dev = Arc::new(MmioBlk {
         device,
         mailbox,
         sectors,
         line,
-    }))
+    });
+    // The boot self-test drives the concrete driver - the trait's shape cannot
+    // submit and deliberately not retire, which is exactly the shape the drain
+    // exists for. A production build carries neither the record nor the door
+    // below.
+    #[cfg(all(target_os = "none", feature = "selftest"))]
+    super::record_selftest_dev(dev.clone());
+    Some(dev)
+}
+
+#[cfg(all(target_os = "none", feature = "selftest"))]
+impl super::SelftestBlk for MmioBlk {
+    /// The PCI driver's door, over this machine's own mailbox: submit one read
+    /// and stop before retiring it, releasing the claim the way a death
+    /// mid-transfer leaves it - the abandoned shape the drain recovers from.
+    fn selftest_submit_and_abandon(&self, block: usize, buf: &mut [u8]) -> Option<u16> {
+        let me = crate::sched::current();
+        while !self.mailbox.begin_request(me) {
+            if self.mailbox.wait_for_device(me) {
+                crate::sched::block_until_uninterruptible(|| {
+                    !self.mailbox.busy.load(Ordering::Acquire)
+                });
+            }
+        }
+        let mut req = BlkReq::default();
+        let mut resp = BlkResp::default();
+        let token = critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
+            // SAFETY: the buffers are lent to the device for the transfer, and
+            // the suite's buf outlives this call.
+            unsafe { device.read_blocks_nb(block, &mut req, buf, &mut resp) }.ok()
+        });
+        let Some(token) = token else {
+            self.mailbox.finish_request();
+            return None;
+        };
+        super::note_blk_submit(token, me);
+        // Wait for the device's answer by polling the ring, then walk away
+        // from the entry. Two seconds is an order past any real latency.
+        let deadline = crate::hal::since_boot_nanos() + 2_000_000_000;
+        while crate::hal::since_boot_nanos() < deadline {
+            let done = critical_section::with(|cs| {
+                let mut device = self.device.borrow(cs).borrow_mut();
+                device.peek_used() == Some(token)
+            });
+            if done {
+                // The abandoned half: the claim goes back, the entry stays.
+                self.mailbox.finish_request();
+                return Some(token);
+            }
+            core::hint::spin_loop();
+        }
+        self.mailbox.finish_request();
+        None
+    }
 }
 
 /// Receive/transmit queue depth and buffer size the net device is opened with -

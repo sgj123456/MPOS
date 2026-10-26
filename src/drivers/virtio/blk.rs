@@ -168,9 +168,13 @@ impl VirtioBlk {
         // Submit under the device lock and the critical section, and leave
         // both before waiting: the interrupt that answers never needs the
         // device, so a parked reader holding neither is what lets the handler
-        // run at all. The mailbox was cleared with the claim.
+        // run at all. The mailbox was cleared with the claim. The claim is
+        // also what lets the drain below run: it proves any completed entry
+        // already in the ring has no living owner, and ours is submitted
+        // behind a clean head.
         let token = critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
             // SAFETY: the buffers are borrowed by the device from here until
             // the matching `complete_*` below; this task parks inside the call
             // holding neither reference, which is the crate's own contract.
@@ -193,28 +197,46 @@ impl VirtioBlk {
             blk_irq::finish_request();
             return;
         };
+        super::note_blk_submit(token, me);
 
         // The wait: parked, uninterruptible, ended by the completion
         // interrupt — with one poll per period for a wire that lost the wake.
         let mut deadline = crate::hal::since_boot_nanos() + WAIT_NS;
+        let mut foreign_spoken = false;
         while !blk_irq::completed() {
             // A timed park, not `block_until_uninterruptible`: the condition
             // carries a deadline and the park must end at it, or a completion
             // interrupt that never arrives is a task asleep for ever - which is
             // exactly what the poll below exists to recover from.
-            crate::sched::block_until_uninterruptible_until(4, || blk_irq::completed(), deadline);
+            crate::sched::block_until_uninterruptible_until(4, blk_irq::completed, deadline);
             if blk_irq::completed() {
                 break;
             }
             let done = critical_section::with(|cs| {
                 let mut device = self.device.borrow(cs).borrow_mut();
-                if device.peek_used() == Some(token) {
+                match device.peek_used() {
                     // The wire lost the wake but the work is done: mark the
                     // mailbox and finish now.
-                    blk_irq::complete_irq();
-                    true
-                } else {
-                    false
+                    Some(head) if head == token => {
+                        blk_irq::complete_irq();
+                        true
+                    }
+                    // A completed entry that is not ours cannot exist under the
+                    // claim - the drain at submit cleared the ring, and nothing
+                    // else submits while it is held. If one shows up anyway the
+                    // invariant this driver rests on has broken, and the wire
+                    // says so once rather than letting the transfer spin mute.
+                    Some(head) => {
+                        if !foreign_spoken {
+                            foreign_spoken = true;
+                            crate::hal::kernel::print_line(format_args!(
+                                "mpos: blk foreign head: me={} token={token} head={head}\n",
+                                me.0
+                            ));
+                        }
+                        false
+                    }
+                    None => false,
                 }
             });
             if done {
@@ -247,15 +269,24 @@ impl VirtioBlk {
                 panic!("virtio-blk reported a completion error");
             }
         });
+        super::note_blk_retire(token);
         blk_irq::finish_request();
     }
 
     /// The synchronous transfer, exactly as this driver shipped: one masked
     /// spin until the ring answers. Kept for the two callers that cannot park
     /// (boot context, an unarmed line) and for the ring-full fallback.
+    ///
+    /// The crate's synchronous call waits for *any* used entry and then pops
+    /// its own token - so a completed entry already at the head answers
+    /// `WrongToken`, and the call leaks its own entry behind it. Under this
+    /// caller's claim any head it finds is abandoned by the same proof the
+    /// drain carries, so the drain runs first and the pop lands on a clean
+    /// ring.
     fn transfer_sync(&self, block: usize, xfer: Xfer<'_>) {
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
             let result = match xfer {
                 Xfer::Read(buf) => device.read_blocks(block, buf),
                 Xfer::Write(buf) => device.write_blocks(block, buf),
@@ -391,9 +422,66 @@ impl VirtioBlk {
             blk_irq::arm();
         }
 
-        Some(Arc::new(VirtioBlk {
+        let dev = Arc::new(VirtioBlk {
             device: Mutex::new(RefCell::new(device)),
             sectors,
-        }))
+        });
+        // The boot self-test drives the concrete driver - the trait's shape
+        // cannot submit and deliberately not retire, which is exactly the
+        // shape the drain exists for. A production build carries neither the
+        // record nor the door below.
+        #[cfg(all(target_os = "none", feature = "selftest"))]
+        super::record_selftest_dev(dev.clone());
+        Some(dev)
+    }
+}
+
+#[cfg(all(target_os = "none", feature = "selftest"))]
+impl super::SelftestBlk for VirtioBlk {
+    /// Submit one read of `block` into `buf` and **stop before retiring it**,
+    /// releasing the mailbox the way a death mid-transfer leaves it: claim
+    /// given back, ring entry completed and unpopped. This is the shape the
+    /// drain exists to recover from, and the suite's way to build one without
+    /// waiting for a real task to die in the transfer arm.
+    fn selftest_submit_and_abandon(&self, block: usize, buf: &mut [u8]) -> Option<u16> {
+        let me = crate::sched::current();
+        while !blk_irq::begin_request(me) {
+            if blk_irq::wait_for_device(me) {
+                let deadline = crate::hal::since_boot_nanos() + WAIT_NS;
+                crate::sched::block_until_uninterruptible_until(11, || !blk_irq::busy(), deadline);
+            }
+        }
+        let mut req = BlkReq::default();
+        let mut resp = BlkResp::default();
+        let token = critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            super::drain_abandoned(&mut device);
+            // SAFETY: the buffers are lent to the device for the transfer, and
+            // the suite's buf outlives this call.
+            unsafe { device.read_blocks_nb(block, &mut req, buf, &mut resp) }.ok()
+        });
+        let Some(token) = token else {
+            blk_irq::finish_request();
+            return None;
+        };
+        super::note_blk_submit(token, me);
+        // Wait for the device's answer by polling the ring - no park, no
+        // mailbox look - and then walk away from the entry. Two seconds is an
+        // order past any real latency; `None` is the suite's "report it".
+        let deadline = crate::hal::since_boot_nanos() + 2_000_000_000;
+        while crate::hal::since_boot_nanos() < deadline {
+            let done = critical_section::with(|cs| {
+                let mut device = self.device.borrow(cs).borrow_mut();
+                device.peek_used() == Some(token)
+            });
+            if done {
+                // The abandoned half: the claim goes back, the entry stays.
+                blk_irq::finish_request();
+                return Some(token);
+            }
+            core::hint::spin_loop();
+        }
+        blk_irq::finish_request();
+        None
     }
 }

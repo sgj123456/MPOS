@@ -5891,3 +5891,41 @@ boot has been *working* since the `/dev` mount and the whole stall was a console
 artefact. If it does not, the leaked fill is the next thread. `cargo xtask run` needs
 `--mode terminal` with stdin from a fifo for this; the recipe is in this section's earlier
 entries and works.
+
+**The drain lands as code, with its pin and both machines' gate lines.** The
+`drain_abandoned` the two entries above measured is committed now, and the commit carries
+the parts a fix here owes:
+
+- **The rule it rests on**, stated where it is enforced (`drivers::virtio::drain_abandoned`):
+  the mailbox's one-transfer-in-flight means the claimant is the only task with a chain in
+  the ring, so a completed entry at the head that is not the claimant's token has **no
+  owner by construction** - popped with dummy buffers standing in for the originals, which
+  is safe because `HalImpl::unshare` moves nothing (no DMA bounce, no cache flush) and the
+  shape handed back (`[req][data][resp]`) matches every chain this module submits.
+- **Four call sites**: the parked and the synchronous submit of both transports. The
+  synchronous one needs it for its own reason - the crate's `add_notify_wait_pop` waits for
+  *any* used entry and then pops its own token, so a stale head answers `WrongToken` and
+  the call leaks **its own** entry behind it, which is a second way the wedge is built.
+- **The leaker is named**: a queue-sized table records each token's submitter at the
+  submit site, and the drain's line answers `submitter=N` for what it pops (on the boot:
+  `blk drain: token=0 submitter=6 status=RespStatus(3) drained=1`).
+- **The pin**: `blk-drain.a_ring_entry_nobody_retires_is_drained_by_the_next_reader`, at
+  `Phase::Scheduler` (it claims the mailbox and parks). Both transports implement
+  `SelftestBlk::selftest_submit_and_abandon` for the test build - submit a real read,
+  wait for the device's answer, release the claim and *walk away* - which builds the
+  abandoned shape without waiting for a task to die in the arm. On the machine:
+
+      drain: abandoned token 0 at the ring's head
+      mpos: blk drain: token=0 submitter=0 status=RespStatus(3) drained=1
+      drain: the next reader completed past the abandoned head
+      mpos-kunit: blk-drain.a_ring_entry_nobody_retires_is_drained_by_the_next_reader OK
+
+  The case also asserts the read after the wedge answers the same bytes a clean control
+  read did, so it pins the *data* path and not only the liveness.
+
+Gate, this commit: x86_64 `pass=211 fail=0 (211 built)`, `mpos-kunit 33 passed, 0 failed`;
+aarch64 `pass=210 fail=0 (210 built)`, `mpos-kunit 33 passed, 0 failed` (33 is the old 32
+plus this case); host unit suite green. The desktop boot's remaining stall - `init` parked
+in `wait4` past a child that is already gone - is the thread below this one and stays
+open; the drain closed the block layer's whole contribution to it, measured as "no
+`blk stall`, no `out=2`, no workers on `ext4_slot_wait`" for the rest of the boot.
