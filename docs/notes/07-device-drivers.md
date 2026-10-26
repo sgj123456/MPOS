@@ -5536,3 +5536,64 @@ previous six were found in - so the boot still does not reach a login, and this 
 does not claim otherwise. What has changed is the quality of the question: it is no
 longer "why does the boot stop" but "why does MSI-X vector 0x42 stop being delivered
 after 9268 completions", which is one probe away from an answer.
+
+**Confirmed in the crate's own source: the block driver never reads the device's ISR, so
+the line stays asserted and MSI-X stops delivering.** The candidate this entry's
+predecessor ranked first is now a measured fact rather than a hypothesis, and the
+evidence is a two-line comparison.
+
+`virtio-drivers`' PCI transport says exactly what the acknowledgement is for:
+
+    fn ack_interrupt(&mut self) -> InterruptStatus {
+        // Reading the ISR status resets it to 0 and causes the device to
+        // de-assert the interrupt.
+        let isr_status = self.isr_status.read();
+        ...
+
+and `VirtIOBlk` exposes it as `ack_interrupt(&mut self)`. The network driver uses it -
+`src/net/mod.rs`'s `irq_service` calls `device.net.ack_interrupt()` with the comment "it
+is what lets the next arrival raise the vector again". **The block driver never calls
+it.** `service_blk` is `complete_irq()` and nothing else:
+
+    fn service_blk(&self) {
+        #[cfg(mpos_msi)]
+        drivers::virtio::blk_irq::complete_irq();
+        #[cfg(not(mpos_msi))]
+        drivers::virtio::mmio::complete_irq();
+    }
+
+so after the device raises the vector the ISR stays set, the virtio-pci transport never
+de-asserts the interrupt, and the MSI controller has nothing further to send. That is
+the `irq=9268` freeze read above, and it explains the shape rather than contradicting
+it: the line is not a one-shot, it dies whenever the device's next completion arrives
+while the ISR is already latched - which is late in a busy boot, after thousands of
+completions, not at the first one.
+
+**Why the fix is not a one-liner, and what it needs.** `ack_interrupt` takes
+`&mut VirtIOBlk`, and the block device is **not held in a `static`** the way the network
+stack's is (`blk.rs`'s only static is `IRQ_ARMED`) - it lives behind a `RefCell` inside
+whatever owns the driver, and interrupt context may not take that borrow. The network
+driver's answer is the pattern to copy: a module-level `static` the interrupt side can
+reach without the task-side borrow, exactly as `net::irq_service` reaches
+`stack.eth.device`. So the work is: give the block module an interrupt-reachable handle
+that can perform the ISR read, call it from `service_blk` beside `complete_irq`, and
+keep the read itself bounded and lock-free (one MMIO read, no allocation - the
+interrupt-context rule). That is a driver-structure change of the kind `d945e29` was,
+not a predicate tweak, and it should land as its own commit with the `irq=` reading as
+its counterfactual: before, frozen after some thousands; after, monotonically rising.
+
+**The complete causal chain, now with its root named and sourced:**
+
+    device ISR never read  ->  virtio-pci never de-asserts  ->  MSI-X stops delivering
+      ->  `irq` freezes  ->  the holder never sees `completed`
+      ->  `transfer` re-parks on `WAIT_NS` for ever
+      ->  its ext4 fill is never `end_fill`ed  (`out=2`)
+      ->  seven udevd workers park on `ext4_slot_wait`
+      ->  udev-trigger never returns, `openrc sysinit` never finishes
+      ->  `init`'s `wait4(-1)` has a child that never changes state
+      ->  inittab's `openrc boot`, `openrc default` and four gettys never run
+
+Every link is measured. The root is a **missing acknowledgement in one driver**, and the
+six faults fixed before it were real but were all *downstream* of the boot being unable
+to get past udev - which is why fixing them each moved the stall a step without ever
+reaching a login.
