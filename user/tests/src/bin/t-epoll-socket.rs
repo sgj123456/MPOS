@@ -10,10 +10,29 @@
 //!
 //! The shape: a raw ICMP socket watched for EPOLLIN; a forked child that
 //! sleeps a few ticks (so the parent is genuinely parked, not racing the
-//! send) and then pings the loopback address, whose reply rides the same
-//! slirp path `ping 127.0.0.1` does. The parent waits with three seconds of
-//! patience rather than no clock, and the three seconds are the failure being
-//! pinned: answering by clock instead of by event is the counterfactual.
+//! send) and then pings **slirp's gateway**, whose echo slirp answers. The
+//! parent waits with three seconds of patience rather than no clock, and the
+//! three seconds are the failure being pinned: answering by clock instead of
+//! by event is the counterfactual.
+//!
+//! **Which address is asked, and why it is not `127.0.0.1` (measured).** A raw
+//! socket here lives on eth0 and never on the loopback interface
+//! (`src/net/mod.rs`'s two-fabrics note: one socket cannot serve two sets, and
+//! a raw socket's destination is a per-call argument), so an echo aimed at
+//! `127.0.0.1` leaves by the virtual wire and is answered - or not - by slirp.
+//! It is not: QEMU's user-mode backend does not carry ICMP at all
+//! (`Documentation/Networking`: *"ping (ICMP) will not work"*), so that echo
+//! is dropped on the host side and no reply can ever arrive, whatever this
+//! kernel does. Measured on the gate's own test machine, one program in its
+//! own lane: with the peer `127.0.0.1` the two reply claims fail
+//! (`the reply wakes the epoll wait`, `the echo reply reads back`) while
+//! `the child exited clean` still passes - the request *was* sent (28 bytes
+//! handed to `sendto`) and nothing came back. With the peer `10.0.2.2` - the
+//! gateway slirp answers for the host's loopback - the same nine claims are
+//! 9/9 on the same kernel (`=== SUMMARY pass=1 fail=0`, exit 33). So what the
+//! fixture was reaching for is slirp's own echo, and the wake this program
+//! exists to pin has never been broken: answering `127.0.0.1` is a property of
+//! the emulated wire, not of this kernel's raw socket.
 //!
 //! **Two doors, and why.** The socket side is rustix - nothing about it is a
 //! clause-(c) shape - but the epoll side rides the raw `SYS_epoll_*` door for
@@ -188,9 +207,11 @@ fn main() {
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         // The child: park a few ticks so the parent's wait is truly under
-        // way, then send the echo request. The reply rides slirp and the
-        // host's loopback, exactly as `ping 127.0.0.1` does. It leaves
-        // through `_exit`, taking no share of the parent's buffered stdout.
+        // way, then send the echo request. The peer is slirp's gateway, the
+        // one address whose ICMP echo the emulated wire answers - see this
+        // file's header for the measurement that made `127.0.0.1` wrong. It
+        // leaves through `_exit`, taking no share of the parent's buffered
+        // stdout.
         let nap = libc::timespec {
             tv_sec: 0,
             tv_nsec: 100_000_000,
@@ -215,7 +236,7 @@ fn main() {
         pkt[2] = (cs >> 8) as u8;
         pkt[3] = cs as u8;
 
-        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 0);
         let sent = sendto(&sock, &pkt, SendFlags::empty(), &peer).unwrap_or(0);
         unsafe { libc::_exit(if sent == 28 { 0 } else { 1 }) };
     }

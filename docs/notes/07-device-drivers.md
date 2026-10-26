@@ -4739,3 +4739,49 @@ work - each wants its own reading: `t-clone`'s cgroup assertion against what
 `CLONE_NEWCGROUP` is supposed to root, and `t-epoll-socket`'s wake against the
 socket's `poll_subscribe`/wake path (which is the same wake machinery this whole
 section has been chasing).
+
+**`t-epoll-socket` is read, and the wake was never broken: the fixture asked an
+address the emulated wire cannot answer (measured).** The reading came from the
+gate log's own per-claim lines rather than any new instrument, once a run was
+allowed to keep its lane logs (`build/test-lane-5/serial.log`, the x86_64 arm at
+`f83c948`, repeated on a clean worktree to the same verdict - so it is
+reproducible, not a flake):
+
+    ok:    the raw ICMP socket opens          ok:    the child is reaped
+    ok:    epoll_create1 hands back ...       ok:    the child exited clean
+    ok:    ADD of the socket succeeds         FAIL:  the reply wakes the epoll wait
+    ok:    fork succeeds                      FAIL:  the echo reply reads back
+
+`the child exited clean` is the decisive one: the child `_exit`s 0 only when
+`sendto` returned **28**, so the echo request *was* handed to the machine whole,
+and the reply never came back. That separates the two halves the verdict line
+could not - it is not the wake path losing an event the stack had, it is the
+stack never being given one.
+
+Why, measured rather than argued. A raw socket here lives on eth0 and never on the
+loopback interface (this file's two-fabrics note: one socket cannot serve two
+sets, and a raw socket's destination is a per-call argument), so an echo aimed at
+`127.0.0.1` leaves by the virtual wire and is slirp's to answer - and QEMU's
+user-mode backend does not carry ICMP at all (`Documentation/Networking`:
+*"ping (ICMP) will not work"*). The packet is dropped host-side and no reply can
+arrive whatever this kernel does. Confirmed end to end on the gate's own test
+machine, one program in one lane of the sweep's own boot wiring, by changing that
+one address and nothing else:
+
+| peer the child pings | claims |
+|---|---|
+| `127.0.0.1` (what the test had) | `pass=0 fail=1` - the two reply claims red, the other seven green |
+| `10.0.2.2` (slirp's gateway, which it answers for the host's loopback) | `pass=1 fail=0`, **9/9**, exit 33 |
+
+Both runs are the same kernel binary and the same initramfs apart from that
+constant, and the second is `=== END`-clean. So the wake this program exists to
+pin - a parked `epoll_wait` ended by an arriving IP datagram, which is the
+regression that once cost the network stack its frames - answers correctly; what
+was wrong was the test's choice of address, and the earlier "9/9 in batch 34" was
+a measurement of a different wire, not a regression since. The program's header
+now says which address is asked and why, carrying this table, so the next reader
+does not re-open the wake path for it. (The sibling question - whether slirp
+answers the *gateway* under every host's QEMU build - is the fixture's now-named
+dependency, the same shape `t-dhcp`/`t-dns` carry by living in the `external`
+group; it is measured green on this host and the program names the address it
+needs rather than assuming one.)
