@@ -1394,6 +1394,24 @@ fn read_costs(build_dir: &Path, arch: Arch) -> BTreeMap<String, u64> {
         .collect()
 }
 
+/// The staged programs a sweep did not time, named.
+///
+/// A run that timed fewer programs than it staged leaves the cost table alone
+/// (its costs are the costs of a run that lost a program), and the *next* run
+/// therefore still deals from the table that has no entry for them. The count
+/// says that much; the names say where to look. A program goes untimed when its
+/// `=== RUN` line never arrives as a line of its own - a diagnostic printed
+/// without a trailing newline glues it to the instrument before it, and the poll
+/// only records lines that start with `=== ` (`docs/notes/` §15.98, which is
+/// the reading this report was made to name).
+fn untimed<S: AsRef<str>>(names: &[S], measured: &BTreeMap<String, u64>) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| !measured.contains_key(name.as_ref()))
+        .map(|name| name.as_ref().to_string())
+        .collect()
+}
+
 fn write_costs(build_dir: &Path, arch: Arch, costs: &BTreeMap<String, u64>) -> Result<()> {
     let mut text = String::new();
     for (name, millis) in costs {
@@ -1889,11 +1907,13 @@ fn run_lanes(
     if measured.len() == names.len() {
         write_costs(build_dir, arch, &measured)?;
     } else if !measured.is_empty() {
+        let lost = untimed(&names, &measured);
         println!(
             "User tests: {} of {} programs were timed; the cost table is left as it was",
             measured.len(),
             names.len()
         );
+        println!("User tests: untimed: {}", lost.join(" "));
     }
 
     // Each lane as the gate's report shows it: what it carried, how long it
@@ -2611,6 +2631,33 @@ test result: ok. 130 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fi
         fs::remove_file(&path).unwrap();
         assert!(super::read_costs(&dir, crate::arch::Arch::X86_64).is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A shortfall names its programs, not only its size: the count alone leaves
+    /// a reader grepping six lane logs for the name, and the program that goes
+    /// missing is the one the *next* deal still weighs with a stale cost. The
+    /// case this exists for is a `=== RUN` glued to the previous line by a
+    /// diagnostic that was printed without its newline (`docs/notes/` §15.98).
+    #[test]
+    fn an_untimed_program_is_named_not_only_counted() {
+        let names: Vec<String> = ["t-a", "t-glued", "t-c"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let measured: std::collections::BTreeMap<String, u64> = [("t-a", 40u64), ("t-c", 60u64)]
+            .into_iter()
+            .map(|(name, millis)| (name.to_string(), millis))
+            .collect();
+        assert_eq!(
+            super::untimed(&names, &measured),
+            vec!["t-glued".to_string()]
+        );
+        let every: std::collections::BTreeMap<String, u64> =
+            names.iter().map(|name| (name.clone(), 0u64)).collect();
+        assert!(
+            super::untimed(&names, &every).is_empty(),
+            "a run that timed every program names none"
+        );
     }
 
     /// The summed summary is what a reader sees for the whole sweep, so it has

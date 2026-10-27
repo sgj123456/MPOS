@@ -3148,7 +3148,7 @@ fn note_poll_spin(
     let exe = crate::sched::current_exe();
     let before = crate::sched::prev_syscall(me.0);
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={} exe={} before={before} fd={fd} events={events:#x} nfds={nfds} nodes={} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
+        "mpos: poll spin slot={} exe={} before={before} fd={fd} events={events:#x} nfds={nfds} nodes={} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}\n",
         me.0,
         nodes.iter().filter(|n| n.is_some()).count(),
         exe
