@@ -88,7 +88,11 @@ impl DrmCard {
             ino,
             minor,
             lease: None,
-            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
+            // devtmpfs births both the card and the render node `0600
+            // root:root` (measured on Linux 7.2.11: `card0` and `renderD129`
+            // are strict at creation, and the rules then hand the card to
+            // group `video` and widen the render node to `0666`).
+            perms: crate::vfs::devfs::NodePerms::new(crate::vfs::devfs::BIRTH_RESTRICTED, 0, 0),
         })
     }
 
@@ -102,7 +106,10 @@ impl DrmCard {
             ino: LEASE_INO.fetch_add(1, Ordering::Relaxed),
             minor: LEASE_MINOR.fetch_add(1, Ordering::Relaxed),
             lease: Some(Arc::new(LeaseSet::new(objects, sealed))),
-            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
+            // A lease is an fd-only inode - it has no `/dev` name, so this
+            // number is not a birth anyone stats; it starts strict like the
+            // card it leases.
+            perms: crate::vfs::devfs::NodePerms::new(crate::vfs::devfs::BIRTH_RESTRICTED, 0, 0),
         })
     }
 

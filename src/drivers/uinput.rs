@@ -96,7 +96,11 @@ impl Uinput {
     pub(crate) fn new(input_dir: Arc<DevDirNode>, first_index: usize) -> Arc<Uinput> {
         Arc::new(Uinput {
             input_dir,
-            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
+            // devtmpfs births `/dev/uinput` `0600 root:root` (measured with
+            // udev's queue frozen). Neither the host's rules nor the image's
+            // have a static rule for it, so what a caller finds at the node is
+            // the birth mode unless somebody writes a rule.
+            perms: crate::vfs::devfs::NodePerms::new(crate::vfs::devfs::BIRTH_RESTRICTED, 0, 0),
             state: Mutex::new(RefCell::new(State {
                 clients: Vec::new(),
                 next_index: first_index,

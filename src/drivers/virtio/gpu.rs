@@ -427,7 +427,13 @@ pub struct FbDev(Arc<VirtioGpuDev>, crate::vfs::devfs::NodePerms);
 
 impl FbDev {
     pub fn new(dev: Arc<VirtioGpuDev>) -> Self {
-        FbDev(dev, crate::vfs::devfs::NodePerms::new(0o666, 0, 0))
+        // devtmpfs births a framebuffer node `0600 root:root` - measured with
+        // udev's queue frozen: `/dev/fb1` is strict at creation, then the
+        // `graphics` rule hands it to group `video`.
+        FbDev(
+            dev,
+            crate::vfs::devfs::NodePerms::new(crate::vfs::devfs::BIRTH_RESTRICTED, 0, 0),
+        )
     }
 
     /// The resolution the framebuffer was built at.

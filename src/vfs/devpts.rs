@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn the_tree_lists_dynamic_pairs_and_nothing_else() {
-        let pty = crate::vfs::pty::allocate(800, (136, 800));
+        let pty = crate::vfs::pty::allocate(800, (136, 800), 0o666);
         let _ = pty; // minted; devpts reads the registry
         let fs = DevPts::new();
         let listed = fs.root().read_dir().unwrap();
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn a_lookup_by_number_hands_back_a_terminal() {
-        crate::vfs::pty::allocate(801, (136, 801));
+        crate::vfs::pty::allocate(801, (136, 801), 0o666);
         let slave = DevPts::new().root().lookup("801").unwrap();
         assert_eq!(slave.metadata().kind, NodeKind::CharDev);
         assert!(slave.as_tty().is_some(), "the slave is a real terminal");

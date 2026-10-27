@@ -98,11 +98,16 @@ struct State {
 }
 
 impl Pty {
-    fn new(number: u32, slave_dev_id: (u32, u32)) -> Arc<Pty> {
+    fn new(number: u32, slave_dev_id: (u32, u32), slave_mode: u32) -> Arc<Pty> {
         Arc::new(Pty {
             number,
             slave_dev_id,
-            slave: Arc::new(Tty::new(slave_dev_id, TtyOutput::Pty(number))),
+            // The slave is a `/dev` node of its own, so its birth mode is the
+            // caller's to name: a virtual console's slave is born the way
+            // devtmpfs births `/dev/tty0`-`/dev/ttyN` (`0600`), while a
+            // dynamic pair's slave is a devpts entry whose mode is a mount
+            // option's business (see `allocate_dynamic`).
+            slave: Arc::new(Tty::new(slave_dev_id, TtyOutput::Pty(number), slave_mode)),
             state: Mutex::new(RefCell::new(State {
                 to_master: VecDeque::new(),
                 locked: true,
@@ -413,26 +418,31 @@ static NEXT_NUMBER: AtomicU32 = AtomicU32::new(1);
 /// getty looks.
 pub fn init() {
     for number in 1..=VC_COUNT {
-        allocate(number, (4, number));
+        // devtmpfs births `/dev/tty1`..`/dev/ttyN` `0600 root:root` (measured
+        // on Linux 7.2.11 with no udev running; the rules then hand them to
+        // group `tty` as `0620`), so the slave each one is behind is born the
+        // same way.
+        allocate(number, (4, number), super::devfs::BIRTH_RESTRICTED);
     }
 }
 
 /// Allocate the pair numbered `number`, or answer the one that exists.
 /// Virtual consoles call this once each at boot; nothing else uses explicit
-/// numbers.
-pub(crate) fn allocate(number: u32, slave_dev_id: (u32, u32)) -> Arc<Pty> {
+/// numbers. `slave_mode` is the birth mode of the `/dev` node the slave end
+/// backs - the caller names it for the same reason [`Pty::new`] takes it.
+pub(crate) fn allocate(number: u32, slave_dev_id: (u32, u32), slave_mode: u32) -> Arc<Pty> {
     critical_section::with(|cs| {
         let mut pairs = PAIRS.borrow(cs).borrow_mut();
         pairs
             .entry(number)
-            .or_insert_with(|| Pty::new(number, slave_dev_id))
+            .or_insert_with(|| Pty::new(number, slave_dev_id, slave_mode))
             .clone()
     })
 }
 
 /// The virtual console `/dev/tty<n>` is the slave of, 1-based.
 pub fn vc(index: u32) -> Arc<Pty> {
-    allocate(index, (4, index))
+    allocate(index, (4, index), super::devfs::BIRTH_RESTRICTED)
 }
 
 /// Mint a fresh pair for a `/dev/ptmx` open. `ENOSPC` past the pool's end -
@@ -452,7 +462,14 @@ pub fn allocate_dynamic() -> VfsResult<Arc<Pty>> {
             if pairs.contains_key(&number) {
                 return false;
             }
-            pairs.insert(number, Pty::new(number, (PTS_MAJOR, number)));
+            // A dynamic pair's slave is listed under `/dev/pts`, where the
+            // mode is devpts's mount option (Linux's default `mode=0620`) and
+            // this kernel does not implement devpts options yet - a named gap
+            // in `docs/ROADMAP.md`. So the slave keeps `0666`, the mode `stat`
+            // has always reported: this field answers the devpts question, not
+            // a devtmpfs birth, which is why it is not the measured table's
+            // number.
+            pairs.insert(number, Pty::new(number, (PTS_MAJOR, number), 0o666));
             true
         }) {
             let pty = critical_section::with(|cs| PAIRS.borrow(cs).borrow()[&number].clone());
@@ -535,7 +552,8 @@ pub struct Ptmx;
 /// `/dev/ptmx` is one shared inode, and its mode is one shared record:
 /// `chmod` on the name sticks for every later open, the way Linux's single
 /// misc node behaves (see `devfs::NodePerms`).
-static PTMX_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
+static PTMX_PERMS: super::devfs::NodePerms =
+    super::devfs::NodePerms::new(super::devfs::BIRTH_TTYAUX, 0, 0);
 
 impl Inode for Ptmx {
     fn keeps_modes(&self) -> bool {
@@ -776,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_slave_line_arrives_whole_at_the_master() {
-        let pty = allocate(900, (136, 900));
+        let pty = allocate(900, (136, 900), 0o666);
         // A shell writes a line through its slave's write path; the master
         // reads back those bytes with the newline a *terminal* owes its reader:
         // `ONLCR` is on in the default termios, so the program's `LF` leaves as
@@ -804,7 +822,7 @@ mod tests {
 
     #[test]
     fn a_program_may_turn_the_newline_translation_off() {
-        let pty = allocate(904, (136, 904));
+        let pty = allocate(904, (136, 904), 0o666);
         // A full-screen program puts its terminal in raw mode and draws every
         // cell itself: it must get out exactly what it wrote, cursor control
         // included, with nothing rewritten behind its back.
@@ -817,7 +835,7 @@ mod tests {
 
     #[test]
     fn a_read_takes_what_there_is_and_reports_readiness() {
-        let pty = allocate(901, (136, 901));
+        let pty = allocate(901, (136, 901), 0o666);
         assert!(!pty.master_ready(), "nothing printed yet");
         pty.slave().write_at(0, b"abc").unwrap();
         assert!(pty.master_ready());
@@ -830,7 +848,7 @@ mod tests {
 
     #[test]
     fn the_lock_refuses_the_slave_until_it_is_cleared() {
-        let pty = allocate(902, (136, 902));
+        let pty = allocate(902, (136, 902), 0o666);
         let slave = PtySlave::new(pty.clone());
         // Locked as minted: `grantpt`'s job is to clear this.
         assert!(pty.locked());
@@ -861,7 +879,7 @@ mod tests {
 
     #[test]
     fn the_master_is_a_terminal_too_and_carries_the_pair() {
-        let pty = allocate(903, (136, 903));
+        let pty = allocate(903, (136, 903), 0o666);
         let master = PtyMaster { pty: pty.clone() };
         // Both ends are the terminal: a supervisor holds only the master, so
         // `isatty` on it is how it decides whether it can do job control. It

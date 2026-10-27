@@ -197,11 +197,52 @@ call (docs/uapi/ §5.1 item 13, §15.32, §15.35).
   (the generic stream node, the ttys, the DRM card and its leases, evdev,
   `uinput`, `fb0`, `ptmx`) carries a `devfs::NodePerms` and answers
   `keeps_modes() == true`, so the triads below decide what the device really
-  means. Devices are born `0666 root:root` — the number `stat` already gave them —
-  where Linux's devtmpfs births `0600` and lets udev widen it; that difference is
-  the named remainder, and it needs per-class birth modes and group-name
-  resolution, not another mechanism.
-- Host-tested: `a_triad_decides_who_may_do_what` (incl. supplementary groups), `root_passes_everything_but_execute_on_a_file_nobody_made_runnable`, `may_as_answers_for_the_node_and_the_identity_it_is_given`.
+  means.
+- **They are born with devtmpfs's own numbers now, measured.** A udev-free boot
+  of the host's devtmpfs (a static init under QEMU, host kernel `7.2.11-arch1-1`)
+  enumerated 131 nodes; all but nine are `0600 root:root`. The wide ones are the
+  stream family — `/dev/null` (1:3), `zero` (1:5), `full` (1:7), `random` (1:8),
+  `urandom` (1:9) — and the tty auxiliary pair `/dev/tty` (5:0), `/dev/ptmx`
+  (5:2), all `0666 root:root`; `/dev/kmsg` (1:11) and `/dev/autofs` (10:235) are
+  `0644 root:root`. Everything else is `0600`: the console tty (5:1), `tty0`
+  (4:0), `ttyS0` (4:64), the DRM card, evdev, `uinput`, `rtc0`, the block devices,
+  `mem`, `port`. `src/vfs/devfs.rs` stamps that table — `birth_mode(name)` names
+  the eight wide classes and answers `0600` for an unknown one, the block class
+  births `0600`, and each driver names its own class (`DrmCard` and its leases,
+  `uinput`, `FbDev`, `EvdevNode`) rather than trusting the generic node. The
+  direction of the default is the measurement's, not a preference: a node born
+  too tight is what udev widens, one born too wide is wrong in every boot that
+  runs no udev at all.
+- **The image's half is what its own udev makes of that.** The Alpine image runs
+  eudev (`assets/configs/rootfs.toml`; libinput only takes devices udev tagged
+  `ID_INPUT=1`), so a real boot re-widens what it recognises. Measured on the
+  built image ten seconds into udev's work (`stat` through a `/etc/local.d`
+  script): `null|zero|full|random|urandom|tty|ptmx` `0666 root:root`; `kmsg`
+  `0644`; `console|tty0|tty1|ttyS0|uinput|rtc0` `0600 root:root`; `card0` `0660
+  root:video`; `renderD128` `0666 root:video`; `vda|vda1|vda2` `0660 root:disk`.
+  The classes the image's rules reach are widened the way a devtmpfs boot's are;
+  the console/tty family, `uinput` and `rtc0` keep the kernel's number because no
+  rule of this image's `50-udev-default.rules` reached them — so its group
+  ownership for the tty class is not applied and `tty0` is not widened to Linux's
+  `0620 tty`. The kernel does no group-name resolution; that is udev's half, and
+  the split the note used to name as a remainder is what this now measures.
+- **Pinned** by `t-dev-birth` (new, both machines): the seven `0666` classes,
+  `kmsg` at `0644`, `0600 root:root` for `console/tty0/tty1/rtc0`, the first of
+  `ttyS0`/`ttyAMA0`, the drm card and render node, `fb0`, evdev, `uinput`,
+  `hwrng`, `hvc`/`hvc0`, `dsp`/`rtc`, and the block node — each claim skipped,
+  not failed, on a machine without the device. No claim is made for `/dev/pts/N`:
+  devpts `mode=`/`gid=` mount options are not applied here (a named remainder,
+  not folded into this item). `t-dsp`'s chmod cases now widen deliberately to
+  `0666` and restore `0600` — chmod still stores, and the birth number is
+  separate from it.
+- Host-tested: `a_triad_decides_who_may_do_what` (incl. supplementary groups), `root_passes_everything_but_execute_on_a_file_nobody_made_runnable`, `may_as_answers_for_the_node_and_the_identity_it_is_given`, `the_birth_table_is_the_measured_one`, `a_node_is_born_with_devtmpfs_s_mode_for_its_class`.
+- **Counterfactual** (the table reduced to one `0666`, which is the pre-item body):
+  x86_64 gate `pass=215 fail=1 (216 built)`, `t-dev-birth` red on sixteen claims —
+  `console`, `tty0`, `tty1`, `rtc0`, `ttyS0`, `card0`, `renderD128`, `fb0`,
+  `event0`, `uinput`, `hwrng`, `hvc0`, `hvc`, `dsp`, `rtc`, `vda`, each read as
+  `(is 0666 0:0)`. Restoring the table brings the arm back to `pass=216 fail=0`
+  and `pass=215 fail=0` on aarch64 (the documented EL0 boot flake intervenes on
+  some runs; killed and re-run, per `AGENTS.md`'s trap table).
 
 ### 3.5 /proc Enhancements — **DONE**
 

@@ -45,8 +45,9 @@ One-glance status of the whole roadmap.
 - [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — with  
   `fstatfs` naming the filesystem the descriptor was *opened on* (§3.6, item 89), every instance  
   carrying a non-zero `f_fsid` (§3.7, item 90), and the access clock moving on read under  
-  `relatime`/`strictatime` with `O_NOATIME` honoured (§3.3, item 108); what stays open is the  
-  `/dev` node's birth mode - `0666` here where devtmpfs births `0600` and udev widens it (§3.4)
+  `relatime`/`strictatime` with `O_NOATIME` honoured (§3.3, item 108), and a `/dev` node born  
+  with devtmpfs's own number while the image's udev does the widening (§3.4, item 110); what  
+  stays open is a pty slave's devpts `mode=`/`gid=` mount options (§3.4's named remainder)
 
 **Networking (Phase 4)**
 

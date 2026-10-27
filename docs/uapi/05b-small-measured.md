@@ -1057,9 +1057,13 @@ Section numbers are unchanged from the original `UAPI.md`.
   nodes beside `smaps` in `/proc/<pid>`. Pins: **`t-numamaps`**, a new program, 20
   claims, and `t-smaps`' ten more (33 → 43) — every one run against a current host
   first, and byte-identical across the two machines.
-- **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
-  and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
-  mechanism (`docs/notes/` §3.4).
+- **`devfs` birth modes — served (item 110).** A `/dev` node is born with devtmpfs's number:
+  `0666` for `null|zero|full|random|urandom|tty|ptmx`, `0644` for `kmsg`, `0600` for the rest
+  (the console tty, `tty0`, `ttyS0`, DRM, evdev, `uinput`, `rtc0`, block devices). The
+  image's own eudev does the widening, measured on a real boot; the tty class's group
+  ownership is the half its rules do not reach. Pinned by `t-dev-birth` on both machines
+  (`docs/notes/` §3.4, item 110). A pty slave's devpts `mode=`/`gid=` mount options are still
+  not applied - the named remainder.
 - **The console tty is published under the machine's own serial name.** `/dev/ttyS0` on
   x86_64, `/dev/ttyAMA0` on aarch64 - one node (the console tty, where the kernel log goes
   and which the kernel's standard descriptors are) under the name the psABI gives that

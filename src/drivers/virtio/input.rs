@@ -242,7 +242,11 @@ impl EvdevNode {
             nonblocking: AtomicBool::new(false),
             rep_delay: AtomicU32::new(250),
             rep_period: AtomicU32::new(33),
-            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
+            // devtmpfs births an evdev node `0600 root:root` - measured: the
+            // kernel's own `/dev/input/event0` is strict at creation, and the
+            // `input` rule hands it to group `input` without a `MODE` (so the
+            // mode it keeps on the image is the birth one).
+            perms: crate::vfs::devfs::NodePerms::new(crate::vfs::devfs::BIRTH_RESTRICTED, 0, 0),
         })
     }
 

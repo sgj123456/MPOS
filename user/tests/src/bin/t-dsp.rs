@@ -226,19 +226,23 @@ fn main() {
     //
     // The other half of the same promise: a `chmod(2)` that answers 0 while
     // the node keeps nothing is what left udev's `MODE=` rules as logs. The
-    // number set here is the number `fstat` reports afterwards, and the
-    // node is given its mode back before the test ends.
-    let chmodded = chmod(DSP, Mode::from_bits_retain(0o600));
+    // number set here is the number `fstat` reports afterwards, and the two
+    // numbers are deliberately apart from each other - and from the node's
+    // birth mode. `/dev/dsp` is born `0600 root:root` like the rest of the
+    // sound class; the widening to `0666` is the shape a rule gives it, so the
+    // test makes that move itself and then puts the node back at its birth
+    // mode before it ends.
+    let widened = chmod(DSP, Mode::from_bits_retain(0o666));
     r.check(
-        "chmod 0600 on /dev/dsp succeeds",
-        chmodded.is_ok() || mpos_user_tests::host_run(),
+        "chmod 0666 on /dev/dsp succeeds",
+        widened.is_ok() || mpos_user_tests::host_run(),
     );
     let st = fstat(&dsp);
     r.check("fstat answers", st.is_ok());
     if let Ok(st) = &st {
         r.check(
             "and the mode it reports is the one that was set",
-            Mode::from_raw_mode(st.st_mode).bits() & 0o7777 == 0o600 || mpos_user_tests::host_run(),
+            Mode::from_raw_mode(st.st_mode).bits() & 0o7777 == 0o666 || mpos_user_tests::host_run(),
         );
         r.check(
             "and the node is still a character device",
@@ -248,7 +252,7 @@ fn main() {
         r.check("and the mode it reports is the one that was set", false);
         r.check("and the node is still a character device", false);
     }
-    let back = chmod(DSP, Mode::from_bits_retain(0o666));
+    let back = chmod(DSP, Mode::from_bits_retain(0o600));
     r.check(
         "and the mode given back sticks too",
         back.is_ok() || mpos_user_tests::host_run(),
@@ -257,11 +261,11 @@ fn main() {
     r.check("fstat answers again", st.is_ok());
     if let Ok(st) = &st {
         r.check(
-            "with the number restored",
-            Mode::from_raw_mode(st.st_mode).bits() & 0o7777 == 0o666 || mpos_user_tests::host_run(),
+            "with the number restored to the birth mode",
+            Mode::from_raw_mode(st.st_mode).bits() & 0o7777 == 0o600 || mpos_user_tests::host_run(),
         );
     } else {
-        r.check("with the number restored", false);
+        r.check("with the number restored to the birth mode", false);
     }
 
     drop(dsp);

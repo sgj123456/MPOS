@@ -166,6 +166,58 @@ impl NodePerms {
     }
 }
 
+/// What Linux's devtmpfs creates a node with, measured rather than assumed.
+///
+/// devtmpfs gives a new device node `0600 root:root` and leaves the widening to
+/// udev - and that is the fact this `/dev` did not keep: every class was born
+/// `0666 root:root` until this table existed, so a boot that ran no udev (a
+/// test sweep, an initramfs before its rules have run) handed callers more than
+/// Linux does. The exceptions are the ones devtmpfs writes itself, and they are
+/// three shapes rather than one:
+///
+/// * `0666` for the memory class's stream nodes (`/dev/null`, `zero`, `full`,
+///   `random`, `urandom`) and the two tty-aux aliases (`/dev/tty`, number
+///   `5:0`, and `/dev/ptmx`, `5:2`). These are nodes a caller must be able to
+///   reach unaided - a shell redirects to `/dev/null` before any rule can have
+///   run - so devtmpfs writes the wide number at creation instead of waiting
+///   for udev to hand it back.
+/// * `0644` for `/dev/kmsg`, the one measured node that is neither wide nor
+///   strict.
+/// * `0600` for everything else: `console`, the serial ttys, `tty0` and the
+///   virtual consoles, the DRM nodes (`card0` and - measured, not assumed -
+///   the `renderD*` nodes too: even a render node is born strict and widened by
+///   a rule), `fb0`, the evdev nodes, `uinput`, `rtc`, `hwrng`, `hvc*`, `dsp`
+///   and every block node.
+///
+/// Measured three ways on Linux 7.2.11: a boot with no udev at all (a static
+/// init that mounted devtmpfs and stat'ed every node - that table is the
+/// definitive one), and twice on this host with udev's exec queue frozen while
+/// `null_blk`, `vkms`, `vgem` and `uinput` were loaded and then resumed (each
+/// node born `0600 0:0`, then widened by the rules). What the image's own udev
+/// makes of these numbers afterwards is `docs/notes/03-filesystem.md` §3.4.
+pub(crate) const BIRTH_RESTRICTED: u32 = 0o600;
+pub(crate) const BIRTH_MEM_STREAM: u32 = 0o666;
+pub(crate) const BIRTH_KMSG: u32 = 0o644;
+pub(crate) const BIRTH_TTYAUX: u32 = 0o666;
+
+/// The mode `devtmpfs` creates the node registered under `name` with - the
+/// table above, keyed by the names this kernel's `/dev` actually uses.
+///
+/// A name the table does not know is born strict: devtmpfs's default is
+/// `0600`, and a class this kernel has not measured is one whose wide birth
+/// nobody has evidence for. That direction is the deliberate one - a node born
+/// too tight is opened by root and widened by udev's rules, while a node born
+/// too wide is wider than Linux in every boot that runs none, and no rule is
+/// even guaranteed to run.
+pub(crate) fn birth_mode(name: &str) -> u32 {
+    match name {
+        "null" | "zero" | "full" | "random" | "urandom" => BIRTH_MEM_STREAM,
+        "kmsg" => BIRTH_KMSG,
+        "tty" | "ptmx" => BIRTH_TTYAUX,
+        _ => BIRTH_RESTRICTED,
+    }
+}
+
 /// One registered device, as an inode.
 struct DevNode {
     ino: Ino,
@@ -174,12 +226,12 @@ struct DevNode {
     /// matches descriptors by when it walks `/dev`.
     dev_id: (u32, u32),
     /// What `chmod(2)`/`chown(2)`/`utimensat(2)` on this node leave behind, and
-    /// what the permission checks and `stat` read. Devices are born
-    /// `0666 root:root` here - the mode `stat` already reported for them before
-    /// any of this existed, and the number udev's rules then tighten or hand out
-    /// by group. The named gap in `NOTES.md` keeps Linux's *devtmpfs* birth
-    /// (`0600` until udev); what this commit ends is the silence, not that
-    /// difference.
+    /// what the permission checks and `stat` read. The mode it is born with is
+    /// devtmpfs's, by [`birth_mode`]: `0600 root:root` for most classes, `0666`
+    /// for the memory streams and the tty-aux aliases, `0644` for `/dev/kmsg`
+    /// (see [`BIRTH_RESTRICTED`] for the measurements). Handing a class its
+    /// group and widening it is udev's job, not this file's - which is why the
+    /// birth is the strict number and `keeps_modes` is what lets a rule stick.
     perms: NodePerms,
 }
 
@@ -275,13 +327,12 @@ struct DevBlockNode {
     /// finds, and a block node that answered `EOPNOTSUPP` there was the one
     /// node kind the devtmpfs half of this file had left out.
     ///
-    /// The mode it is born with is the number `stat` already reported for a
-    /// block node before this field existed - `abi::mode_of`'s fallback for
-    /// the kind, `0660` (`brw-rw----`, Linux's own devtmpfs birth for one) -
-    /// so nothing a caller reads moves; what changes is that `chmod` and
-    /// `chown` on `/dev/vda2` now stick, which is the same claim the character
-    /// nodes' modes make and the half udev's `GROUP=disk` rules are written
-    /// against.
+    /// The mode it is born with is devtmpfs's own `0600 root:root`
+    /// ([`BIRTH_RESTRICTED`]). The older comment here claimed `0660`
+    /// (`brw-rw----`) was "Linux's own devtmpfs birth for one"; the measurement
+    /// says otherwise - a `null_blk` disk loaded with udev's queue frozen was
+    /// `/dev/nullb0` `0600 0:0` at birth, and it is eudev's `GROUP=disk` rule
+    /// (which names no `MODE`) that hands the node to the disk group afterwards.
     perms: NodePerms,
 }
 
@@ -884,7 +935,7 @@ impl DevFs {
             ino,
             dev,
             dev_id: (major, minor),
-            perms: NodePerms::new(0o666, 0, 0),
+            perms: NodePerms::new(birth_mode(name), 0, 0),
         });
         critical_section::with(|cs| {
             let prev = self
@@ -951,6 +1002,13 @@ impl DevFs {
     /// doors into one line discipline, whose termios and `as_tty` behaviour a
     /// bare character-device wrapper cannot answer - getty's `TIOCSCTTY`,
     /// a shell's `TCGETS` and every `isatty` ask the node itself.
+    ///
+    /// A driver-built inode arrives with its birth mode already set - the
+    /// constructor's own `NodePerms`, given devtmpfs's number for that node's
+    /// class ([`birth_mode`]) - because the driver is the one that knows which
+    /// class its node is, and a table keyed by registration name here could
+    /// only guess at the names a driver registers dynamically (`event0`,
+    /// `tty3`).
     pub fn register_node(&self, name: &str, inode: Arc<dyn Inode>) {
         critical_section::with(|cs| {
             let prev = self
@@ -984,7 +1042,7 @@ impl DevFs {
             ino,
             dev,
             dev_id,
-            perms: NodePerms::new(0o660, 0, 0),
+            perms: NodePerms::new(BIRTH_RESTRICTED, 0, 0),
         });
         critical_section::with(|cs| {
             let prev = self
@@ -1207,10 +1265,14 @@ mod tests {
         // and a udev `MODE=` rule was a line of logs and nothing else.
         let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
-        fs.register("sink", sink());
-        let node = fs.root().lookup("sink").unwrap();
+        fs.register("null", sink());
+        let node = fs.root().lookup("null").unwrap();
         assert!(node.keeps_modes(), "a device node keeps what it is told");
-        assert_eq!(node.mode(), 0o666, "and is born at the Linux stream mode");
+        assert_eq!(
+            node.mode(),
+            0o666,
+            "and is born at devtmpfs's measured mem-stream mode"
+        );
 
         let writable_by_anyone = crate::vfs::Caller::ids(1, 1);
         assert!(crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).is_ok());
@@ -1232,6 +1294,73 @@ mod tests {
         node.set_owner(1, 1);
         assert_eq!(node.owner(), (1, 1));
         assert!(crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).is_ok());
+    }
+
+    #[test]
+    fn the_birth_table_is_the_measured_one() {
+        // The counterfactual this change is pinned by: every class that used to
+        // be born 0666 must keep the number devtmpfs gave it, and the classes
+        // devtmpfs really does widen at creation must stay wide. Numbers and
+        // the three boots that produced them: `birth_mode`'s doc.
+        for name in ["null", "zero", "full", "random", "urandom", "tty", "ptmx"] {
+            assert_eq!(super::birth_mode(name), 0o666, "{name}");
+        }
+        assert_eq!(super::birth_mode("kmsg"), 0o644, "kmsg");
+        for name in [
+            "console",
+            "ttyS0",
+            "ttyAMA0",
+            "tty0",
+            "tty1",
+            "tty63",
+            "hvc0",
+            "hvc",
+            "card0",
+            "renderD128",
+            "fb0",
+            "event0",
+            "uinput",
+            "rtc0",
+            "rtc",
+            "hwrng",
+            "dsp",
+            "vda",
+            "vda1",
+            "vda2",
+            "sda",
+            "sda1",
+        ] {
+            assert_eq!(super::birth_mode(name), 0o600, "{name}");
+        }
+        // The direction the fallback takes for a class nobody measured.
+        assert_eq!(super::birth_mode("an-unmeasured-node"), 0o600);
+    }
+
+    #[test]
+    fn a_node_is_born_with_devtmpfs_s_mode_for_its_class() {
+        // The table above is one thing; that the registrars *ask* it is the
+        // other. This registers each class and reads the node back.
+        let _bus = crate::uevent::test_bus::take();
+        let fs = DevFs::new();
+        fs.register("null", sink());
+        fs.register("console", sink());
+        fs.register("kmsg", sink());
+        fs.register("ttyS0", sink());
+        fs.register_block("vda1", Arc::new(BlankDisk));
+
+        let node = |name: &str| fs.root().lookup(name).unwrap();
+        assert_eq!(
+            node("null").mode(),
+            0o666,
+            "a mem-class stream is born 0666"
+        );
+        assert_eq!(node("kmsg").mode(), 0o644, "kmsg is born 0644");
+        assert_eq!(node("console").mode(), 0o600, "console is born 0600");
+        assert_eq!(node("ttyS0").mode(), 0o600, "a serial tty is born 0600");
+        assert_eq!(node("vda1").mode(), 0o600, "a block node is born 0600");
+        for name in ["null", "console", "kmsg", "ttyS0", "vda1"] {
+            assert_eq!(node(name).owner(), (0, 0), "devtmpfs births root:root");
+        }
     }
 
     #[test]

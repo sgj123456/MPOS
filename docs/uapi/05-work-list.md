@@ -5941,3 +5941,59 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     ramfs); `F_SETFL` still cannot set `O_NOATIME` (Linux's mask can, and
     `docs/uapi/` §5.2 already carries that narrower mask); ramfs's directory,
     symlink, socket and device nodes still fold atime into mtime.
+
+## item 110 — a `/dev` node is born with devtmpfs's number, and the image's udev is what widens it
+
+    §5.2 carried this as "`devfs` birth modes … needs per-class birth modes and
+    group-name resolution, not a new mechanism". The measurement said the item
+    was smaller than that sentence: the numbers are devtmpfs's own, and the
+    widening is udev's — so the kernel's half is a table, and the image's half is
+    a measurement, not a mechanism.
+
+    **Measured first.** A udev-free boot of the host's devtmpfs (a static init
+    under QEMU, host kernel `7.2.11-arch1-1`, `.workbuddy/qemu-devboot/`)
+    enumerated 131 nodes: `0666 root:root` for `/dev/null` (1:3), `zero` (1:5),
+    `full` (1:7), `random` (1:8), `urandom` (1:9), `tty` (5:0) and `ptmx` (5:2);
+    `0644 root:root` for `kmsg` (1:11) and `autofs` (10:235); `0600 root:root`
+    for every other node, the console tty (5:1), `tty0` (4:0), `ttyS0` (4:64),
+    DRM (card and render), evdev, `uinput`, `rtc0`, the block devices, `mem`,
+    `port` included. The image's half was measured on the built image with a
+    `/etc/local.d` probe ten seconds into udev's work: the `0666` and `0644`
+    classes above came out exactly as born; `card0` `0660 root:video`,
+    `renderD128` `0666 root:video` and `vda|vda1|vda2` `0660 root:disk` are
+    eudev's widening; `console|tty0|tty1|ttyS0|uinput|rtc0` keep `0600
+    root:root`, because the image's `50-udev-default.rules` lines that would
+    widen them (`tty[0-9]*` → `0620 tty`, `input` → `GROUP=input`) do not reach
+    this image's nodes — the tty class's group ownership is the half udev leaves,
+    named below rather than folded in.
+
+    **Landed.** `src/vfs/devfs.rs` carries the table: `BIRTH_RESTRICTED = 0o600`,
+    `BIRTH_MEM_STREAM = 0o666`, `BIRTH_KMSG = 0o644`, `BIRTH_TTYAUX = 0o666`, and
+    `birth_mode(name)` naming the eight wide classes with `0600` for an unknown
+    one. The block node class births `0600` too; the DRM card and its leases,
+    `uinput`, `FbDev` and `EvdevNode` pass `BIRTH_RESTRICTED` themselves, so a
+    class is named where its driver lives rather than inferred from a path.
+    `tty::Tty::new` takes the mode its caller measured (`CONTROLLING_PERMS` =
+    tty/`ptmx`, `TTY0_PERMS` = `0600`), and `pty::allocate` takes the slave's
+    mode at both call sites.
+
+    **Pin**: the new `t-dev-birth`, both machines, 20 claims — the seven `0666`
+    classes, `kmsg` `0644`, `0600 root:root` for `console/tty0/tty1/rtc0`, the
+    first of `ttyS0`/`ttyAMA0`, the drm card and render node, `fb0`, evdev,
+    `uinput`, `hwrng`, `hvc`/`hvc0`, `dsp`/`rtc`, and the block node — each
+    skipped (never failed) where the machine has no such device. Host tests
+    `the_birth_table_is_the_measured_one` and
+    `a_node_is_born_with_devtmpfs_s_mode_for_its_class` pin the table and the
+    registration path. `t-dsp`'s chmod cases widen to `0666` and restore `0600`,
+    so chmod's storage and the birth number stay two facts.
+
+    **Counterfactual**: the table reduced to one `0666` (the pre-item body) —
+    x86_64 `pass=215 fail=1 (216 built)`, `t-dev-birth` red on exactly sixteen
+    claims, each `(is 0666 0:0)`. Restored: `pass=216 fail=0` on x86_64 and
+    `pass=215 fail=0` on aarch64, `mpos-kunit 34 passed` on both.
+
+    **Named**: `/dev/pts/N` keeps the slave birth mode (`0600`) — devpts `mode=`/
+    `gid=` mount options are not applied, and a pin cannot claim a number this
+    kernel never sets. The tty class's group ownership is not applied by this
+    image's udev (above); the kernel does no group-name resolution, and that stays
+    udev's half.

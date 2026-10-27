@@ -1423,14 +1423,21 @@ pub struct Tty {
 }
 
 impl Tty {
-    pub const fn new(dev_id: (u32, u32), output: TtyOutput) -> Tty {
+    /// One terminal, created with the mode devtmpfs births the node behind it
+    /// with - `0600 root:root` for the console and for a virtual console's
+    /// slave, `0666` for the tty-aux alias names ([`super::devfs::birth_mode`]
+    /// is the measured table). The caller names the mode because it is the one
+    /// that knows which `/dev` node this terminal is; a terminal that guessed
+    /// `0666` for itself would be wider than Linux in every boot that runs no
+    /// udev, which is what this kernel's test sweeps do.
+    pub const fn new(dev_id: (u32, u32), output: TtyOutput, mode: u32) -> Tty {
         Tty {
             ld: Mutex::new(RefCell::new(LineDiscipline::new())),
             waiters: Mutex::new(RefCell::new(Vec::new())),
             foreground: Mutex::new(RefCell::new(None)),
             output: Mutex::new(RefCell::new(output)),
             dev_id,
-            perms: super::devfs::NodePerms::new(0o666, 0, 0),
+            perms: super::devfs::NodePerms::new(mode, 0, 0),
             winsize: Mutex::new(RefCell::new((0, 0))),
             nonblocking: core::sync::atomic::AtomicBool::new(false),
         }
@@ -2388,7 +2395,11 @@ const CONSOLE_DEV_ID: (u32, u32) = (4, 64);
 
 impl Default for Tty {
     fn default() -> Tty {
-        Tty::new(CONSOLE_DEV_ID, TtyOutput::Serial)
+        Tty::new(
+            CONSOLE_DEV_ID,
+            TtyOutput::Serial,
+            super::devfs::BIRTH_RESTRICTED,
+        )
     }
 }
 
@@ -2404,7 +2415,11 @@ pub fn init() -> Arc<Tty> {
     critical_section::with(|cs| {
         let mut ttys = TTYS.borrow(cs).borrow_mut();
         if ttys.is_empty() {
-            ttys.push(Arc::new(Tty::new(CONSOLE_DEV_ID, TtyOutput::Serial)));
+            ttys.push(Arc::new(Tty::new(
+                CONSOLE_DEV_ID,
+                TtyOutput::Serial,
+                super::devfs::BIRTH_RESTRICTED,
+            )));
         }
         ttys[0].clone()
     });
@@ -2456,11 +2471,16 @@ pub fn by_dev_id(dev_id: (u32, u32)) -> Option<Arc<Tty>> {
 /// login that froze forever for want of a SIGCONT nobody would send.
 pub struct ControllingTty;
 
-/// The alias names keep one shared mode, the way Linux's single `/dev/tty`
-/// and `/dev/tty0` inodes do: a `chmod` on the name sticks for every process
-/// that opens it, and `stat` reports what was set.
-static CONTROLLING_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
-static TTY0_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
+/// The alias names keep one shared mode each, the way Linux's single
+/// `/dev/tty` and `/dev/tty0` inodes do: a `chmod` on the name sticks for every
+/// process that opens it, and `stat` reports what was set. They are born with
+/// different numbers because devtmpfs births them differently - measured:
+/// `/dev/tty` (5:0) is `0666`, `/dev/tty0` `0600` - so `tty0` starts strict and
+/// udev's `tty[0-9]*` rule is what hands it to group `tty` with `0620`.
+static CONTROLLING_PERMS: super::devfs::NodePerms =
+    super::devfs::NodePerms::new(super::devfs::BIRTH_TTYAUX, 0, 0);
+static TTY0_PERMS: super::devfs::NodePerms =
+    super::devfs::NodePerms::new(super::devfs::BIRTH_RESTRICTED, 0, 0);
 
 impl Inode for ControllingTty {
     fn keeps_modes(&self) -> bool {
@@ -3729,7 +3749,7 @@ mod tests {
     /// else's grid.
     #[test]
     fn a_console_reports_its_screens_window_and_others_do_not() {
-        let console = Tty::new((4, 6), TtyOutput::Discard);
+        let console = Tty::new((4, 6), TtyOutput::Discard, 0o600);
         // No screen yet - a headless machine, or before the render task has
         // made one - answers what Linux answers for a terminal nobody has
         // sized: nothing. A number here would be a guess a full-screen program
@@ -3742,7 +3762,7 @@ mod tests {
         // A `/dev/ptmx` pair is not a console however many screens exist, so
         // what it reports is what `TIOCSWINSZ` set - which is the only way a
         // pty's size can be known at all, its emulator being in userspace.
-        let pair = Tty::new((136, 3), TtyOutput::Discard);
+        let pair = Tty::new((136, 3), TtyOutput::Discard, 0o666);
         assert_eq!(pair.window_size(), (0, 0));
         assert!(pair.set_window_size(30, 100), "a new size is a change");
         assert_eq!(pair.window_size(), (30, 100));
