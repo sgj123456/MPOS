@@ -643,6 +643,7 @@ pub unsafe fn dispatch(
         nr::PIDFD_OPEN => proc::handle_pidfd_open(args),
         nr::CLONE3 => proc::handle_clone3(args, regs_ptr, from_user),
         nr::PIDFD_GETFD => proc::handle_pidfd_getfd(args),
+        nr::PROCESS_MADVISE => proc::handle_process_madvise(args, from_user),
         nr::GETRLIMIT => abi::handle_getrlimit(args, from_user),
         nr::SETRLIMIT => abi::handle_setrlimit(args, from_user),
         nr::MEMBARRIER => abi::handle_membarrier(args),

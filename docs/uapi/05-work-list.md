@@ -4967,7 +4967,8 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
 
     **Named**: `pidfd_getfd(2)` (438), `clone3`'s `CLONE_PIDFD` and
     `process_madvise(2)` (440) are not served and fall to the `ENOSYS` catch-all.
-    **`pidfd_getfd` was served by item 93**, below.
+    **`pidfd_getfd` was served by item 93** and **`process_madvise(2)` by item
+    109**, below.
     The older anonymous descriptors' `S_IFCHR` divergence landed as item 99,
     below. `st_blksize` stays 512 where Linux's pidfd answers
     4096 (the global choice, not a pidfd one), and `st_dev`/`st_ino`/uid/gid are
@@ -5038,8 +5039,9 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     passed, 0 failed` on both; host unit suite unchanged, `xtask` 139; `cargo
     fmt --check` clean; depgraph holds (`syscall -> sched` was already an edge).
 
-    **Named**: `clone3`'s `CLONE_PIDFD` and `process_madvise(2)` (440) remain
-    `ENOSYS`. `pidfd_getfd` is the one door that reaches another process's
+    **Named**: `clone3`'s `CLONE_PIDFD` and `process_madvise(2)` (440) remained
+    `ENOSYS` at this landing — **`process_madvise(2)` was served by item 109**,
+    below. `pidfd_getfd` is the one door that reaches another process's
     descriptor table; `pidfd_getfd`'s own `fdinfo` is still not promised, and
     the older anonymous descriptors' `S_IFCHR` divergence landed as item 99.
     The authority rule keeps the known §2.6 divergence: Linux's
@@ -5126,6 +5128,9 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (probed and deferred: its only real advice, `MADV_DONTNEED`, is refused
     `EINVAL` for another process on this host, and the rest are hints this kernel
     answers as no-ops, so a door here would be a shape without work behind it).
+    **Item 109 served it anyway**, on the ground this paragraph under-weighted:
+    the shape *is* the service - a byte count for an answer, a fixed refusal
+    order, and the caller's own range walked and dropped as `madvise` walks it.
     `CLONE_CLEAR_SIGHAND` was `EOPNOTSUPP` at this landing because `fork` here
     started every process at `SIG_DFL` (a divergence of its own, not inherited
     from the parent as POSIX requires), so accepting the bit could not be told
@@ -5941,6 +5946,74 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     ramfs); `F_SETFL` still cannot set `O_NOATIME` (Linux's mask can, and
     `docs/uapi/` §5.2 already carries that narrower mask); ramfs's directory,
     symlink, socket and device nodes still fold atime into mtime.
+
+## item 109 — `process_madvise(2)` (440): the pidfd family's last `ENOSYS`, and only four advices cross
+
+    The door is `madvise(2)` addressed at a descriptor that names a process, and
+    the shape it was deferred on (§6.10, item 94) is exactly what its callers
+    branch on. Six probe programs on a current host (`.workbuddy/probe_process_madvise.c`,
+    `probe3.c` through `probe8.c`, Linux 7.2.11, uid 1000 with an empty
+    capability set) measured every branch before the kernel's side was written:
+
+    * **the answer is a byte count** — 4096 for one page, 8192 for two iovecs,
+      6144 for a 0x1800-byte range (so the length is not rounded to pages), and a
+      range longer than `MAX_RW_COUNT` answers the clamp (`0x7ffff000`), because
+      the import clamps `iov_len` instead of refusing it. Zero-length iovecs
+      contribute nothing.
+    * **the refusal order** is flags (`EINVAL`) → `vlen` above `IOV_MAX = 1024`
+      (`EINVAL`) → the **whole** iovec array (`EFAULT` for unreadable memory;
+      `EINVAL` for an `iov_len` above `SSIZE_MAX`; `EFAULT` for a range past
+      `TASK_SIZE_MAX = (1<<47) - PAGE_SIZE`, so `0x7fffffffe000` is served and
+      `0x7ffffffff000` is refused) → the pidfd (`EBADF`, including a pipe end, a
+      `/dev/null` and a closed number) → the task (`ESRCH` once it exited) → the
+      authority (`EPERM`, asked before the advice is judged — pid 1 answers
+      `EPERM` even with no iovecs) → the vocabulary (`EINVAL`, also with no
+      iovecs: advice 5 at `vlen = 0` is `EINVAL` while 23, 24, 25, 100, 101, 102
+      and 103 are `0`).
+    * **only four advices cross a process boundary** — `MADV_WILLNEED` (3),
+      `COLD` (20), `PAGEOUT` (21), `COLLAPSE` (25) — and the vocabulary is judged
+      **before** `CAP_SYS_NICE`: a same-uid child answers `EPERM` for those four
+      and `EINVAL` for every other advice, `MADV_DONTNEED` included, while an
+      unprivileged caller of a *whitelisted* advice gets `EPERM`. The caller's own
+      process is the exception: every advice `madvise` knows is accepted there,
+      and `DONTNEED` really drops (the host's `mincore` reads 0 afterwards).
+    * **a hole is `ENOMEM`, and what the walk already did stands**: a page belongs
+      to a range when its **start** is before the range's end (a 0x1800-byte range
+      over two pages is served, 0x2001 is not), a `MADV_DONTNEED` over the mapped
+      page before the hole has already dropped it when the call answers `ENOMEM`,
+      a failing iovec stops the loop (the iovecs after it are untouched), and a
+      completed iovec followed by a failing one answers the bytes it served.
+
+    **Owner**: `src/syscall/linux/proc.rs`'s `handle_process_madvise` (the
+    dispatch arm beside the pidfd family) and its `first_hole`; the pure half in
+    `src/syscall/linux/abi.rs` (`process_madvise_import`,
+    `process_madvise_advice_is_served`, `MAX_RW_COUNT`); the number in both
+    `nr_*` tables; `crates/cred`'s `CAP_SYS_NICE`.
+
+    **Pin**: the new `t-process-madvise`, which runs on both machines (ungrouped
+    in `tests.toml`) and is the same claim set on a host with `MPOS_ON_HOST=1` —
+    where four of its claims are named rather than made (advice 100 is this
+    kernel's `EINVAL`, cross-process `WILLNEED` needs a capability the host bench
+    does not hold, `MADV_COLLAPSE` is this kernel's `EOPNOTSUPP`, and the
+    capability-drop child only runs in the guest). Host tests:
+    `abi::tests::process_madvise_import_matches_linux_refusal_order` and
+    `abi::tests::process_madvise_advice_gate_is_linux_cross_set` replay the
+    measured import table and pin the cross set. Counterfactual: the dispatch arm
+    removed — `_ => ENOSYS` — reddens 33 claims of `t-process-madvise` (of the 45 the program made in that run; the fixture and `pidfd_open` claims stay green).
+
+    **Named**: three corners are this kernel's answers, not Linux's. Another
+    process's mapping is not queried: the cross-range walk needs an API this
+    kernel does not have (a per-address-space page query), so a whitelisted hint
+    is answered from the argument shape and a *hole* inside another process's
+    range is not seen — Linux would answer `ENOMEM` there and the difference is
+    unreachable through the four advices this kernel serves as no-ops anyway.
+    `MADV_COLLAPSE` across a process is `EOPNOTSUPP` rather than a lie: a
+    collapse must actually collapse into a huge page and this kernel has no
+    huge-page pool. And the call inherits `madvise`'s own two divergences rather
+    than re-deciding them: `MADV_HWPOISON`/`MADV_SOFT_OFFLINE` (100/101) answer
+    `EINVAL` here where Linux answers `EPERM`, and a plain `madvise` over an
+    unmapped range answers `0` here where Linux answers `ENOMEM` (both are pinned
+    by `t-madvise` as this kernel's answers and recorded in §5.2).
 
 ## item 110 — a `/dev` node is born with devtmpfs's number, and the image's udev is what widens it
 

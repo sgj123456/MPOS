@@ -209,10 +209,14 @@ One-glance status of the whole roadmap.
   one call; `CLONE_DETACHED` refused as Linux's own `clone3` refuses it, the
   `stack` being the *base* of the child's region rather than `clone(2)`'s stack
   pointer (§6.10, item 94)
-- [ ] `process_madvise(2)` (440) — the pidfd family's one `ENOSYS` left, probed and
-  deferred: its one working advice is refused for another process and the rest are
-  hints this kernel answers as no-ops (§6.10); the open/getfd/send/wait doors are
-  served (§6.8/§6.9, items 92–93)
+- [x] `process_madvise(2)` (440) — the pidfd family's last door, served on a host
+  measurement: the answer is the **byte count** of the ranges advised, the refusal
+  order is flags → `vlen` → the iovec array → the pidfd → the task → authority →
+  vocabulary, and only four advices (`WILLNEED`/`COLD`/`PAGEOUT`/`COLLAPSE`) cross a
+  process boundary (`MADV_DONTNEED` is `EINVAL` there, before `CAP_SYS_NICE` is
+  asked); a hole in the caller's own range is `ENOMEM` after the walk has dropped
+  what it met (§6.28, item 109); the open/getfd/send/wait doors are served
+  (§6.8/§6.9, items 92–93)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)

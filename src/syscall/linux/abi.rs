@@ -299,6 +299,85 @@ pub(crate) fn madvise_advice_is_known(advice: usize) -> bool {
     matches!(advice, 0..=4 | 8 | 10..=24 | 102 | 103)
 }
 
+/// Linux's `MAX_RW_COUNT` — the longest single `read`/`write`, and the ceiling
+/// an imported iovec is clamped to. It is `INT_MAX & PAGE_MASK`, so a word the
+/// caller wrote as a length can never name more than it, and `process_madvise`
+/// counts what it served after that clamp rather than after the caller's
+/// number (measured: an iovec of `0x8000_0000` over one lazy 3 GiB VMA answers
+/// `0x7fff_f000` bytes, `.workbuddy/probe7.c`, Linux 7.2.11).
+pub(super) const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+/// `process_madvise(2)`'s advice vocabulary for **another** process's address
+/// space. It is far smaller than `madvise(2)`'s, and the difference is
+/// deliberate on Linux's side: only an advice that cannot lose data is allowed
+/// at a process the caller is not, and the rest are `EINVAL`.
+///
+/// The set below is the measured one (Linux 7.2.11, `.workbuddy/probe_process_madvise.c`
+/// and `probe3.c`): a same-uid child is `EPERM` for exactly these four and
+/// `EINVAL` for every other advice including `MADV_DONTNEED` — the privilege
+/// gate runs *after* this one, which is why `DONTNEED` refuses `EINVAL` rather
+/// than `EPERM` on an unprivileged caller. `MADV_COLLAPSE` (`25`) is in the
+/// vocabulary and still cannot be served here, because collapsing a range into
+/// a huge page is a promise this kernel has no enormous-page pool to keep:
+/// the handler answers `EOPNOTSUPP` for it rather than a silent success.
+pub(crate) fn process_madvise_advice_is_served(advice: usize) -> bool {
+    matches!(
+        advice,
+        MADV_WILLNEED | MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE
+    )
+}
+
+/// The page-fault-adjacent advices `process_madvise(2)` admits across a process
+/// boundary: the ones whose failure mode is "nothing happened".
+pub(super) const MADV_WILLNEED: usize = 3;
+pub(super) const MADV_COLD: usize = 20;
+pub(super) const MADV_PAGEOUT: usize = 21;
+pub(super) const MADV_COLLAPSE: usize = 25;
+
+/// What importing one `process_madvise(2)` iovec does before any range is acted
+/// on: the length clamp and the address-space check, in the order Linux's
+/// `rw_copy_check_uvector` applies them.
+///
+/// The order is the measured one, and it is what makes the refusal classes
+/// distinguishable (`.workbuddy/probe6.c`, Linux 7.2.11):
+///
+/// * the length is read as a **signed** `ssize_t`, so a word above `SSIZE_MAX`
+///   is a negative length — `EINVAL` — even though the same bits written as
+///   `size_t` are merely absurd. `SIZE_MAX` and `SSIZE_MAX+1` both answer
+///   `EINVAL`; `SSIZE_MAX` itself is accepted and then clamped;
+/// * the clamp comes next, which is why `0xffff_ffff` and `0x8000_0000` are
+///   *served* (as `MAX_RW_COUNT` bytes) rather than refused: the caller asked
+///   for at most 4 GiB and Linux gives it the largest length a single transfer
+///   can name;
+/// * the address check is last, after the clamp, so `access_ok` asks about the
+///   length that will actually be walked. `TASK_SIZE_MAX` is inclusive at its
+///   top byte — the page just below the machine's user-space end is `EFAULT`
+///   (`0x7fff_ffff_f000` on x86_64, one page under `USER_LIMIT`), and the whole
+///   user address space above it is too.
+///
+/// The whole array is validated through here before the pidfd is even looked at
+/// (measured: a bad iovec beside pidfd `-1` answers `EFAULT`, and "one good
+/// iovec then one past the address space" answers `EFAULT` rather than a
+/// partial success), which is why the handler makes this pass first and repeats
+/// it as it serves each range.
+pub(crate) fn process_madvise_import(
+    base: usize,
+    len: usize,
+    task_size_max: usize,
+) -> Result<usize, isize> {
+    if (len as isize) < 0 {
+        return Err(err::EINVAL);
+    }
+    let len = len.min(MAX_RW_COUNT);
+    // `task_size_max - len` cannot underflow: the comparison before it is the
+    // guard, and it is spelled this way because `TASK_SIZE_MAX` is Linux's
+    // inclusive top *byte*, not an exclusive end.
+    if len > task_size_max || base > task_size_max - len {
+        return Err(err::EFAULT);
+    }
+    Ok(len)
+}
+
 // ---------------------------------------------------------------------------
 // eventfd(2) flag bits
 // ---------------------------------------------------------------------------
@@ -5806,6 +5885,149 @@ mod tests {
             assert!(
                 !madvise_advice_is_known(a),
                 "advice {a} is not a known value"
+            );
+        }
+    }
+
+    /// `process_madvise`'s import predicate, replayed from the measured host
+    /// table (`.workbuddy/probe6.c`, Linux 7.2.11). Every row here is a call
+    /// the real kernel answered, so the counterfactual is the observable one:
+    /// without the signed-length check a `SIZE_MAX` iovec would be clamped and
+    /// served; without the clamp the same word would be refused `EINVAL`; and
+    /// without the address check the page under `TASK_SIZE_MAX` would be
+    /// walked instead of refused.
+    #[test]
+    fn process_madvise_import_matches_linux_refusal_order() {
+        // `TASK_SIZE_MAX` on x86_64: the inclusive top byte of user space,
+        // one page below `USER_LIMIT`.
+        const LIMIT: usize = 0x7fff_ffff_f000;
+        // A length above `SSIZE_MAX` is a negative `ssize_t`: EINVAL.
+        assert_eq!(
+            process_madvise_import(0x1000, usize::MAX, LIMIT),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            process_madvise_import(0x1000, 0x8000_0000_0000_0000, LIMIT),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            process_madvise_import(0x1000, 0x8000_0000_0000_0001, LIMIT),
+            Err(err::EINVAL)
+        );
+        // A length at or below `SSIZE_MAX` is accepted, then clamped to
+        // MAX_RW_COUNT - which is why the absurd words are *served* (and the
+        // served byte count is the clamp, not the caller's number).
+        for len in [
+            0x7fff_ffff_ffff_ffffusize,
+            0x7fff_f000,
+            0x7fff_f001,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
+            assert_eq!(process_madvise_import(0x1000, len, LIMIT), Ok(MAX_RW_COUNT));
+            assert_eq!(
+                process_madvise_import(0x5000_0000_0000, len, LIMIT),
+                Ok(MAX_RW_COUNT)
+            );
+        }
+        // An ordinary length is left alone, including a page-crossing one.
+        assert_eq!(process_madvise_import(0x1000, 0x1800, LIMIT), Ok(0x1800));
+        assert_eq!(process_madvise_import(0x1000, 0, LIMIT), Ok(0));
+        // The address check is inclusive at the top: the last page below the
+        // limit is fine, the limit itself and everything above it is EFAULT.
+        assert_eq!(
+            process_madvise_import(0x7fff_ffff_e000, 0x1000, LIMIT),
+            Ok(0x1000)
+        );
+        assert_eq!(
+            process_madvise_import(0x7fff_ffff_e000, 0x1001, LIMIT),
+            Err(err::EFAULT)
+        );
+        assert_eq!(
+            process_madvise_import(LIMIT, 0x1000, LIMIT),
+            Err(err::EFAULT)
+        );
+        assert_eq!(
+            process_madvise_import(0x8000_0000_0000, 0x1000, LIMIT),
+            Err(err::EFAULT)
+        );
+        assert_eq!(
+            process_madvise_import(0x8000_0000_0000, 0, LIMIT),
+            Err(err::EFAULT)
+        );
+        // A base near `USIZE_MAX` is EFAULT rather than an overflowed EINVAL:
+        // `access_ok` subtracts the length and never wraps.
+        assert_eq!(
+            process_madvise_import(0xffff_ffff_ffff_f000, 0x1000, LIMIT),
+            Err(err::EFAULT)
+        );
+        assert_eq!(
+            process_madvise_import(0xffff_ffff_ffff_f000, 0x2000, LIMIT),
+            Err(err::EFAULT)
+        );
+        // The same base *with a clamped length* is still past the space.
+        assert_eq!(
+            process_madvise_import(0xffff_ffff_ffff_f000, 0xffff_ffff, LIMIT),
+            Err(err::EFAULT)
+        );
+    }
+
+    /// `process_madvise`'s cross-process vocabulary is a closed set of four,
+    /// and it is not `madvise`'s (`.workbuddy/probe_process_madvise.c`,
+    /// `probe3.c`): a same-uid child answered `EPERM` for exactly these and
+    /// `EINVAL` for every other advice, `MADV_DONTNEED` included. The handler
+    /// gates on this predicate before it asks for `CAP_SYS_NICE`, which is the
+    /// order the same probes measured.
+    #[test]
+    fn process_madvise_advice_gate_is_linux_cross_set() {
+        assert_eq!(MADV_WILLNEED, 3);
+        assert_eq!(MADV_COLD, 20);
+        assert_eq!(MADV_PAGEOUT, 21);
+        assert_eq!(MADV_COLLAPSE, 25);
+        assert_eq!(MAX_RW_COUNT, 0x7fff_f000);
+        for a in [3usize, 20, 21, 25] {
+            assert!(process_madvise_advice_is_served(a), "advice {a} crosses");
+        }
+        for a in [
+            0usize,
+            1,
+            2,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            22,
+            23,
+            24,
+            26,
+            27,
+            30,
+            31,
+            100,
+            101,
+            102,
+            103,
+            104,
+            110,
+            200,
+            usize::MAX,
+        ] {
+            assert!(
+                !process_madvise_advice_is_served(a),
+                "advice {a} stays home"
             );
         }
     }

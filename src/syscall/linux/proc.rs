@@ -2560,8 +2560,244 @@ pub(super) fn handle_pidfd_getfd(args: [usize; ARG_COUNT]) -> isize {
     fd as isize
 }
 
-/// `pidfd_send_signal(pidfd, sig, info, flags)` — `kill` addressed by a
-/// descriptor, with the caller's `siginfo_t` carried through.
+/// `process_madvise(pidfd, iovec, vlen, advice, flags)` — `madvise(2)` at the
+/// address space a pidfd names.
+///
+/// It is the pidfd family's last call, and the shape below is measured on a
+/// current host before any of it was written (`.workbuddy/probe_process_madvise.c`,
+/// `probe3.c` through `probe8.c`, Linux 7.2.11). The measurements that decide
+/// the code:
+///
+/// * **the answer is bytes, not zero.** Linux returns the sum of the iovec
+///   lengths it served — 4096 for one page, 8192 for two, `0x7fff_f000` after
+///   the `MAX_RW_COUNT` clamp — and a caller sizes its next call from that
+///   number. Answering `0` would read as "nothing was advised" beside a hint
+///   that *was* handed over.
+/// * **the refusal order does not follow the arguments.** The flags word is
+///   first (non-zero `EINVAL` even beside a bad descriptor, a bad advice and a
+///   bad iovec), then `vlen` above `IOV_MAX` (1024), then the whole iovec array
+///   — imported and validated before the descriptor is looked at, so a bad
+///   iovec beside `pidfd = -1` is `EFAULT`, not `EBADF`. Only then the pidfd
+///   (`EBADF`), the task (`ESRCH` for one already dead), the authority question
+///   (`EPERM` for a process this caller may not inspect — measured against pid
+///   1, *before* the advice is even looked at), and last the advice vocabulary.
+/// * **the import's three refusals are three different rules** and all three
+///   are measured: a length above `SSIZE_MAX` is a negative `ssize_t`
+///   (`EINVAL`), a length above `MAX_RW_COUNT` is clamped (so `0xffff_ffff`
+///   is *served*, as `0x7fff_f000` bytes), and an address whose clamped range
+///   leaves user space is `EFAULT` — with user space ending one page under
+///   `USER_LIMIT`, because Linux's `TASK_SIZE_MAX` is an inclusive top byte.
+/// * **an advice must be one Linux allows across a process boundary**, and that
+///   set is four — `WILLNEED`, `COLD`, `PAGEOUT`, `COLLAPSE` — not `madvise`'s
+///   whole vocabulary: a same-uid child answered `EPERM` for those four and
+///   `EINVAL` for every other advice, `DONTNEED` included, because the
+///   vocabulary gate runs before the `CAP_SYS_NICE` one. `DONTNEED` never
+///   crosses, which is also the reason this kernel does not need a
+///   cross-process page-drop API to answer it truthfully: Linux refuses it.
+/// * **the per-iovec walk stops at the first hole, and what it did is kept.**
+///   A range with an unmapped page answers `ENOMEM`; mapped ranges before the
+///   hole are still dropped by a `DONTNEED` (measured: a dirtied page reads
+///   back zero after the call that answered `ENOMEM`), and errors after a
+///   completed iovec are answered with the byte count instead (a good iovec
+///   then a hole answers `4096`). A page is part of the range iff its *start*
+///   is before the range's end — the range is not rounded up to a page.
+///
+/// Two deliberate gaps are named rather than approximated, because the
+/// behaviour behind them cannot be observed here: a **cross-process** hint is
+/// answered from the argument shape alone, because this kernel has no per-other
+/// address-space range query to ask whether the target's mapping covers the
+/// range (its own address space is the only one a syscall can walk). And
+/// `MADV_COLLAPSE` is `EOPNOTSUPP` — collapsing a range is a promise this
+/// kernel has no huge-page pool to keep, and `EOPNOTSUPP` is the honest answer
+/// for "present, cannot do that" (§3's rule 2), which a caller falls back from
+/// exactly as it would from a Linux whose THP is unavailable. Both are in
+/// `docs/notes/` §6.10 with their measurements.
+///
+/// The iovec array is read twice rather than copied: 1024 `struct iovec`s are
+/// 16 KiB, which is most of a kernel stack, and the two passes cannot disagree
+/// because this handler never yields the CPU between them. The first pass is
+/// what Linux's `import_iovec` does — the whole array's refusal class is
+/// decided before anything is acted on — and the second is the walk.
+pub(super) fn handle_process_madvise(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+    const IOVEC_BYTES: usize = 16;
+    const IOV_MAX: usize = 1024;
+
+    let (pidfd, vec, vlen, advice, flags) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // The flags word is refused before anything else - measured with every
+    // other argument broken at once, and still EINVAL.
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    // Linux's IOV_MAX: more descriptors than an import can describe is EINVAL,
+    // and it is decided before the array is touched (measured: vlen 1025 beside
+    // an unreadable pointer is EINVAL, not EFAULT).
+    if vlen > IOV_MAX {
+        return err::EINVAL;
+    }
+    let task_size_max = USER_LIMIT - PAGE_SIZE;
+    // The whole array first: unreadable memory is EFAULT, and the per-iovec
+    // refusals are decided here rather than while serving, because Linux's
+    // import does the same - "one good iovec then one past the address space"
+    // measures EFAULT and not a partial success.
+    if !buffer_ok(vec, vlen * IOVEC_BYTES, false, from_user) {
+        return err::EFAULT;
+    }
+    for index in 0..vlen {
+        let Some((base, len)) = read_iovec(vec + index * IOVEC_BYTES) else {
+            return err::EFAULT;
+        };
+        if let Err(refusal) = abi::process_madvise_import(base, len, task_size_max) {
+            return refusal;
+        }
+    }
+    let file = match crate::sched::current_fds().clone_at(pidfd) {
+        Ok(file) => file,
+        Err(_) => return err::EBADF,
+    };
+    // The inode outlives the pidfd borrow (`pidfd_send_signal`'s `Arc`
+    // comment); a descriptor that is not a pidfd is EBADF, like a number that
+    // names nothing.
+    let inode = file.inode();
+    let Some(named) = inode.as_pidfd() else {
+        return err::EBADF;
+    };
+    let (id, generation) = (named.id(), named.generation());
+    if !crate::sched::pidfd_still_names(id, generation) {
+        return err::ESRCH;
+    }
+    // Authority comes before the advice word, which is measured against pid 1:
+    // a caller that may not inspect the target gets EPERM for an advice it
+    // would have got EINVAL for, and for vlen 0 as well.
+    match crate::sched::may_inspect(id) {
+        None => return err::ESRCH,
+        Some(false) => return err::EPERM,
+        Some(true) => {}
+    }
+    // The syscall-level advice gate, which runs even when there is nothing to
+    // advise: `vlen 0` beside advice `5` is still EINVAL, while `23`, `24`,
+    // `25`, `100`, `101`, `102` and `103` answer `0` there. That union is what
+    // Linux gates on — `madvise`'s recognised vocabulary *plus* the four
+    // advices that may cross a process boundary — and it is not the same set
+    // as either half.
+    if !abi::madvise_advice_is_known(advice) && !abi::process_madvise_advice_is_served(advice) {
+        return err::EINVAL;
+    }
+    let own = id == crate::sched::current_tgid();
+    if !own {
+        if !abi::process_madvise_advice_is_served(advice) {
+            return err::EINVAL;
+        }
+        if !crate::sched::current_credentials().capable(crate::cred::CAP_SYS_NICE) {
+            return err::EPERM;
+        }
+    }
+    let mut advised = 0usize;
+    for index in 0..vlen {
+        // Re-read rather than remembered: see the note above on stack size.
+        // Nothing between the two passes can change the array - no park, no
+        // yield - so this is the same array the first pass validated.
+        let Some((base, len)) = read_iovec(vec + index * IOVEC_BYTES) else {
+            return err::EFAULT;
+        };
+        let len = match abi::process_madvise_import(base, len, task_size_max) {
+            Ok(len) => len,
+            Err(refusal) => return refusal,
+        };
+        // A zero-length iovec is not a range: Linux skips it entirely, so not
+        // even the alignment of its base is looked at (measured: an unaligned
+        // base with `len 0` answers `0`, while the same base with a length is
+        // EINVAL).
+        if len == 0 {
+            continue;
+        }
+        if base & (PAGE_SIZE - 1) != 0 {
+            return advised_or_error(advised, err::EINVAL);
+        }
+        if own {
+            // The target is this caller's own address space, so the full
+            // `madvise` vocabulary applies - and only it: `MADV_COLLAPSE` is
+            // in `process_madvise`'s cross set but was measured EINVAL here,
+            // because a collapse this kernel cannot perform is not a hint
+            // either. `MADV_DONTNEED` really drops, through the same
+            // current-task walk `madvise` uses.
+            if !abi::madvise_advice_is_known(advice) {
+                return advised_or_error(advised, err::EINVAL);
+            }
+            let end = base + len;
+            match first_hole(base, end) {
+                Some(hole) => {
+                    // What the range did before the hole stands: Linux drops
+                    // the mapped page before it finds the next one missing and
+                    // still answers ENOMEM.
+                    if advice == abi::MADV_DONTNEED && hole > base {
+                        crate::sched::madvise_dontneed(base, hole - base);
+                    }
+                    return advised_or_error(advised, err::ENOMEM);
+                }
+                None => {
+                    if advice == abi::MADV_DONTNEED {
+                        crate::sched::madvise_dontneed(base, len);
+                    }
+                    // Every other known advice is the best-effort hint
+                    // `madvise` already answers without work - the shared
+                    // policy, restated nowhere.
+                }
+            }
+        } else if advice == abi::MADV_COLLAPSE {
+            // Cross-process and a promise this kernel cannot keep: no
+            // huge-page pool exists to collapse anything into.
+            return err::EOPNOTSUPP;
+        }
+        // A cross-process hint is answered from its shape alone - this kernel
+        // cannot ask another address space about its mappings - and the byte
+        // count is the promise the caller reads.
+        advised += len;
+    }
+    advised as isize
+}
+
+/// The answer a walk that has already advised `advised` bytes gives when the
+/// next range refuses: Linux reports the bytes it served, because a partial
+/// success is not a failure (`.workbuddy/probe6.c`: a good iovec followed by a
+/// hole answers `4096`), and only a walk that served nothing reports the error.
+fn advised_or_error(advised: usize, error: isize) -> isize {
+    if advised > 0 { advised as isize } else { error }
+}
+
+/// The first page of `base..end` that no mapping covers, in the shape the
+/// measured Linux refuses with `ENOMEM`.
+///
+/// The `base..end` cut is deliberate: a page belongs to the range when its
+/// *start* is before `end`, so a range that ends partway into a page still
+/// asks about that page, and a range that starts partway into a page asks
+/// about the page it starts in. Rounding `end` up instead would refuse the
+/// last page of a range Linux serves.
+///
+/// The VMA table names the only *candidates*: a described range is mapped by
+/// definition, so a hole can only be inside a gap — which is why this costs one
+/// table sweep (the gap query already folds in the eager ranges the loader and
+/// a private file mapping place without a description) and not a walk of every
+/// page in the range. The pages a gap names still have to be confirmed one by
+/// one, because the process's stack is placed as present frames with neither a
+/// description nor an eager range, and `user_mapped` is the door that knows
+/// about those. One 2 GiB `MADV_WILLNEED` over a single lazy mapping — the
+/// measured shape that must *not* fail — therefore asks about that mapping
+/// once, not half a million times.
+fn first_hole(base: usize, end: usize) -> Option<usize> {
+    use crate::mm::pframe::PAGE_SIZE;
+    for (gap_start, gap_end) in crate::sched::vma_gaps(base, end) {
+        let mut page = gap_start & !(PAGE_SIZE - 1);
+        while page < gap_end && page < end {
+            if !crate::sched::user_mapped(page) {
+                return Some(page);
+            }
+            page += PAGE_SIZE;
+        }
+    }
+    None
+}
+
 ///
 /// The refusal order is measured, and it is not the order the arguments are
 /// written in (`.workbuddy/probe_pidfd6.c`, Linux 7.2.11):

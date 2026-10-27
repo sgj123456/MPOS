@@ -125,6 +125,15 @@ pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`, which `reboot(2)` requires.
 pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_NICE`, which `process_madvise(2)` requires to advise a process the
+/// caller is not allowed to inspect by ownership alone — the only gate that
+/// call has beyond "may I look at it". The gate is Linux's and it is measured
+/// on a current host: an unprivileged caller advising a same-uid child gets
+/// `EPERM` for exactly the four advices that may cross a process boundary
+/// (`.workbuddy/probe_process_madvise.c`, `docs/notes/` §6.10), while every
+/// other advice is refused by the vocabulary gate first and therefore answers
+/// `EINVAL`. A caller that *does* hold it needs no other credential.
+pub const CAP_SYS_NICE: u32 = 23;
 /// `CAP_SYS_TTY_CONFIG`, which `vhangup(2)` requires.
 pub const CAP_SYS_TTY_CONFIG: u32 = 26;
 /// `CAP_MKNOD`, which a **device** node's `mknod(2)` requires - and only a

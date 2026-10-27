@@ -62,9 +62,11 @@
 //!
 //! # What is deliberately not here
 //!
-//! `clone3`'s `CLONE_PIDFD` and `process_madvise` are named gaps in
-//! `docs/ROADMAP.md`, not claims: neither is served, and a test cannot pin a
-//! call the kernel refuses with `ENOSYS`.
+//! `clone3`'s `CLONE_PIDFD` is a named gap in `docs/ROADMAP.md`, not a claim:
+//! it is not served, and a test cannot pin a call the kernel refuses with
+//! `ENOSYS`. `process_madvise(2)` was the other gap when this program landed
+//! and is served now; its pin is `t-process-madvise`, because the door is a
+//! *memory* call with a fixture arena of its own, not a descriptor claim.
 
 use mpos_user_tests::Report;
 use rustix::thread::gettid;

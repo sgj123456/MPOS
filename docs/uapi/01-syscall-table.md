@@ -8,7 +8,7 @@ section numbers are unchanged from the original `UAPI.md`.
 `src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **256** x86_64
 syscall numbers, `nr_aarch64.rs` the same **256** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **255** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
+explicit arm for **256** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
 
@@ -294,6 +294,7 @@ A call absent from those is served as its phase section records.
 | `openat2` | 437 | fs | 437 |
 | `pidfd_getfd` | 438 | proc | 438 |
 | `faccessat2` | 439 | fs | 439 |
+| `process_madvise` | 440 | proc | 440 |
 | `epoll_pwait2` | 441 | fs | 441 |
 | `fchmodat2` | 452 | fs | 452 |
 | `cleanup_after_kthread` | 999 | kernel | 999 | (the kernel's own kthread-cleanup hook, named by number so the ABI stays Linux-shaped; there is no Linux syscall at 999 on either machine's table)
@@ -338,6 +339,7 @@ is not. Each is tracked in its phase section; the list is here so it is countabl
 | `uname` | **private protocol on an armed boot only.** A kernel launched with `mpos.diskstat` on its command line — which nothing but `cargo xtask test` ever writes, and only when the sweep stages `t-diskbench` — answers `release` with `0x6d706f7300000001` (`abi::DISKSTAT_OSRELEASE_MAGIC`) and `version` with live per-disk counters as `#1 <name>:<reads>:<writes>,…`. An ordinary boot answers Linux's shape. The word is disclosed here because it is ABI-visible: no real kernel's osrelease is a number, so no caller can collide with it, and there is no other door for these counts (`/proc/partitions` is column-parsed by tools; this kernel has no sysfs attribute store). Pinned by `t-diskbench`'s cold/warm device-read claims (§10.5) | `docs/notes/` §10.5 |
 | `mmap` | `MAP_HUGETLB` is `ENOMEM` (an honest refusal); `MAP_HUGETLB` backing is the missing half | §3 below |
 | `madvise` | `MADV_FREE` and a shared mapping's cross-process drop are deliberate no-ops | `docs/notes/` §5.2 |
+| `process_madvise` | served on a measured contract, with the pidfd family's four-advice boundary: the answer is the **byte count**, the refusal order is flags → `vlen` → the whole iovec array → the pidfd → the task → second authority → the vocabulary (each with Linux's errno, `.workbuddy/probe4.c`–`probe8.c`), and only `MADV_WILLNEED`/`COLD`/`PAGEOUT`/`COLLAPSE` cross a process boundary — everything else, `MADV_DONTNEED` included, is `EINVAL` **before** `CAP_SYS_NICE` is asked. Three corners are named, not promised: another process's mapping is answered from the argument shape alone (no cross-address-space range query, so a cross-range hole is invisible), `MADV_COLLAPSE` across a process is `EOPNOTSUPP` (there is no huge-page pool to collapse into), and the call inherits `madvise`'s two divergences (`100`/`101` answer `EINVAL` where Linux asks `EPERM`; a plain `madvise` over an unmapped range answers `0` here where Linux answers `ENOMEM`) | `docs/notes/` §6.28 |
 | `posix_fadvise` | recognised advices are accepted as the no-ops they are (this kernel prefetches nothing) | `docs/notes/` §12.1 |
 | `vhangup` | with a controlling terminal it answers `EOPNOTSUPP`: the tty re-init + `EIO` hang-up is not implemented | `docs/notes/` §12.2 B4 |
 | `getpriority` / `setpriority` / `sched_setattr` | the `nice` round-trips truthfully but carries no scheduling-weight effect | `docs/notes/` §12.2 B5/B5b |

@@ -391,6 +391,8 @@ pub const OPENAT2: u64 = 437;
 /// `faccessat2(2)`: the access check with the flags the original could
 /// not take.
 pub const FACCESSAT2: u64 = 439;
+/// `process_madvise(2)`: `madvise(2)` at the address space a pidfd names.
+pub const PROCESS_MADVISE: u64 = 440;
 /// `creat(2)`: open, spelled the way the 1970s spelled it.
 pub const CREAT: u64 = 85;
 /// `utime(2)`: the seconds-only spelling of the timestamps call.

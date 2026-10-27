@@ -221,6 +221,7 @@ pub const PREADV2: u64 = 286; // 327 on x86_64
 pub const PWRITEV2: u64 = 287; // 328 on x86_64
 pub const OPENAT2: u64 = 437; // 437 on x86_64
 pub const FACCESSAT2: u64 = 439; // 439 on x86_64
+pub const PROCESS_MADVISE: u64 = 440; // 440 on x86_64
 pub const CREAT: u64 = 64030; // no arm64 number; unreachable on aarch64
 pub const UTIME: u64 = 64031; // no arm64 number; unreachable on aarch64
 pub const FCHMODAT: u64 = 53; // 268 on x86_64
