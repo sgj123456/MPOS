@@ -86,6 +86,32 @@ fn refused_host(answer: isize) -> bool {
     host_run() && answer == -(libc::EPERM as isize)
 }
 
+/// A detach after a *refused* attach has no tracee to hand back, so Linux
+/// answers `ESRCH` - the attach's refusal showing through, not a second
+/// failure to pin. The runner's own seccomp profile is one such refusal.
+fn detach_without_a_tracee(detached: isize, attached: isize) -> bool {
+    host_run() && attached != 0 && detached == -(libc::ESRCH as isize)
+}
+/// Consume the stop `PTRACE_ATTACH` sends before asking for another request.
+///
+/// `PTRACE_ATTACH` returns once the stop is *queued*, not once the tracer has
+/// seen it. A `PTRACE_DETACH` in that window answers `ESRCH` - the child is not
+/// in a ptrace-stop the tracer has been told about yet - which is the flake a
+/// direct run showed (attached 0, detached -3, three times in five). Waiting
+/// for the stop first is what strace's own attach loop does. Only a host run
+/// does it: this kernel's attach stop is already part of the stop `waitpid`
+/// returns right after `PTRACE_ATTACH`, and waiting for a second one would hang
+/// the lane (measured: `t-ptrace-attach timeout=120s`).
+fn wait_for_attach_stop(r: &mut Report, pid: libc::pid_t, what: &str) {
+    let mut status: libc::c_int = 0;
+    // SAFETY: `pid` is the task just attached and `status` is a local.
+    let n = unsafe { libc::waitpid(pid, &mut status, 0) };
+    r.check(
+        &format!("the {what} reports its attach stop"),
+        n == pid && libc::WIFSTOPPED(status),
+    );
+}
+
 fn sleep_ms(ms: i64) {
     let req = Timespec {
         tv_sec: ms / 1000,
@@ -116,14 +142,29 @@ fn main() {
 
     // A descendant: the case every `ptrace` test reaches first, and the one a
     // coincidental slot-index lookup gets right.
+    // The child waits on this pipe rather than a 100 ms sleep: a sleep can
+    // expire between ATTACH and DETACH on a busy host, and then the detach has
+    // no tracee and answers ESRCH. The parent writes the byte *after* the
+    // detach, so "the detach let it run" stays a measurement.
+    let mut gate = [0i32; 2];
+    let gate_made = unsafe { libc::pipe(gate.as_mut_ptr()) };
+    r.check("the child's release pipe is made", gate_made == 0);
     let child = unsafe { libc::fork() };
     if child == 0 {
-        // Sleep, then leave - the parent attaches and detaches in between. With
-        // no branch here the child fell through into the parent's own test and
-        // ran it all again, including the fork below.
-        sleep_ms(100);
-        // SAFETY: `_exit` never returns, and the child touches nothing else.
-        unsafe { libc::_exit(0) };
+        // Wait for the parent's release, then leave. With no branch here the
+        // child fell through into the parent's own test and ran it all again,
+        // including the fork below.
+        unsafe {
+            libc::close(gate[1]);
+            let mut byte = 0u8;
+            let _ = libc::read(gate[0], &mut byte as *mut u8 as *mut libc::c_void, 1);
+            libc::close(gate[0]);
+            // SAFETY: `_exit` never returns, and the child touches nothing else.
+            libc::_exit(0);
+        }
+    }
+    if child > 0 {
+        unsafe { libc::close(gate[0]) };
     }
     r.check("a child to attach to exists", child > 0);
     if child > 0 {
@@ -144,21 +185,37 @@ fn main() {
             "attaching to my own child by the pid fork gave me",
             attached == 0 || refused_host(attached),
         );
+        if attached == 0 && host_run() {
+            wait_for_attach_stop(&mut r, child, "own child");
+        }
         // Detaching with SIGCONT, not plain: a detach leaves the tracee in the
         // state it was in, and a stopped child never runs to its exit - so the
         // `waitpid` at the end of this test would block on a child the test
         // itself had parked. That is the deadlock this whole section learned
         // about the hard way, and it is the reason `strace` says "detached"
         // rather than leaving every target it touched stopped.
+        if attached != 0 && host_run() {
+            println!(
+                "note: this host refused PTRACE_ATTACH, so there is no tracee to detach; \
+                 the detach claim is this kernel's"
+            );
+        }
         let detached = ptrace(
             libc::PTRACE_DETACH as libc::c_int,
             child,
             libc::SIGCONT as libc::c_long,
         );
         r.check(
-            "detaching resumes what it attached",
-            detached == 0 || refused_host(detached),
+            &format!(
+                "detaching resumes what it attached (attached {attached}, detached {detached})"
+            ),
+            detached == 0 || refused_host(detached) || detach_without_a_tracee(detached, attached),
         );
+        // Let the child leave now that the detach has had its turn.
+        unsafe {
+            let _ = libc::write(gate[1], b"x".as_ptr() as *const libc::c_void, 1);
+            libc::close(gate[1]);
+        }
     }
 
     // The case that matters: a target the caller is not related to, named by
@@ -205,6 +262,9 @@ fn main() {
             "attaching to a process that is not ours works - that is strace -p",
             attached == 0 || refused_host(attached),
         );
+        if attached == 0 && host_run() {
+            wait_for_attach_stop(&mut r, target as libc::pid_t, "orphan");
+        }
         let detached = ptrace(
             libc::PTRACE_DETACH as libc::c_int,
             target as libc::pid_t,
@@ -212,7 +272,7 @@ fn main() {
         );
         r.check(
             "and detaching hands it back running",
-            detached == 0 || refused_host(detached),
+            detached == 0 || refused_host(detached) || detach_without_a_tracee(detached, attached),
         );
     }
 
@@ -287,8 +347,14 @@ fn main() {
             "attaching to a process the user stopped",
             attached == 0 || refused_host(attached),
         );
+        if attached == 0 && host_run() {
+            wait_for_attach_stop(&mut r, stopped, "stopped child");
+        }
         let detached = ptrace(libc::PTRACE_DETACH as libc::c_int, stopped, 0);
-        r.check("and detaching it", detached == 0 || refused_host(detached));
+        r.check(
+            "and detaching it",
+            detached == 0 || refused_host(detached) || detach_without_a_tracee(detached, attached),
+        );
         // One and a half seconds of polling, longer than the child's whole sleep:
         // a detach that had handed it back running would be collected in it, and
         // nothing collected is the proof it is still parked. On a host whose

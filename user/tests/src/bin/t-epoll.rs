@@ -468,9 +468,24 @@ fn main() {
         ] {
             let ep = create1(CreateFlags::empty().bits()) as i32;
             let e = ev(asked, 0);
+            let added = ctl(ep, ADD, tfd, Some(&e)) == 0;
+            let woke = added && wait(ep, &mut events, 8, 2000) == 1;
+            // Linux's timerfd poll mask carries `EPOLLIN` alone: a caller that
+            // asked for `EPOLLRDNORM` alone is never woken at all. That is a
+            // fact about the guest's mask, not the claim this loop pins (the bit
+            // a caller named is the bit it gets), so the host run states Linux's
+            // answer instead of failing on the corner.
+            if mpos_user_tests::host_run() && asked == EventFlags::RDNORM {
+                r.check(
+                    &format!("a timerfd asked for {name} alone is not woken on Linux"),
+                    added && !woke,
+                );
+                unsafe { libc::close(ep) };
+                continue;
+            }
             r.check(
                 &format!("an epoll watching the timerfd for {name} reports it"),
-                ctl(ep, ADD, tfd, Some(&e)) == 0 && wait(ep, &mut events, 8, 2000) == 1,
+                woke,
             );
             let got = EventFlags::from_bits_retain(events[0].events);
             r.check(

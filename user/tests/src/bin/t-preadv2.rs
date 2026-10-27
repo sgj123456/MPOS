@@ -131,9 +131,13 @@ fn main() {
     // reads never wait and its writes already reach storage), and a bit it
     // does not know is EOPNOTSUPP.
     let mut iov = mk_iov(&mut a, &mut b);
+    let nowait = preadv2(raw, &mut iov, 0, RWF_NOWAIT);
     r.check(
         "RWF_NOWAIT on an eager read is accepted",
-        preadv2(raw, &mut iov, 0, RWF_NOWAIT) == 7,
+        // mpos's eager read has nothing to wait for. A host `/tmp` is often a
+        // tmpfs, and Linux's tmpfs answers RWF_NOWAIT with EOPNOTSUPP rather
+        // than serving it - a filesystem capability, not this ABI's answer.
+        nowait == 7 || (mpos_user_tests::host_run() && refused(nowait, libc::EOPNOTSUPP)),
     );
     let mut iov = mk_iov(&mut a, &mut b);
     r.check(

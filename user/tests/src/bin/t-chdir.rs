@@ -69,9 +69,9 @@ fn main() {
     );
     drop(fd);
 
-    // A relative chdir from / lands in /bin.
+    // A relative chdir from / lands in /etc.
     r.check("chdir(..) leaves /tmp", chdir("..").is_ok());
-    r.check("chdir(bin) relative succeeds", chdir("bin").is_ok());
+    r.check("chdir(etc) relative succeeds", chdir("etc").is_ok());
     let mut cwd = [0u8; 256];
     let answer = getcwd(&mut cwd);
     r.check(
@@ -79,10 +79,10 @@ fn main() {
         answer == cwd.as_mut_ptr().cast(),
     );
     r.check(
-        "the cwd reads /bin",
-        cwd[0] == b'/' && cwd[1] == b'b' && cwd[2] == b'i' && cwd[3] == b'n' && cwd[4] == 0,
+        "the cwd reads /etc",
+        cwd[0] == b'/' && cwd[1] == b'e' && cwd[2] == b't' && cwd[3] == b'c' && cwd[4] == 0,
     );
-    r.check("chdir(..) leaves /bin", chdir("..").is_ok());
+    r.check("chdir(..) leaves /etc", chdir("..").is_ok());
 
     // A file is not a directory, and a missing path is not anything.
     r.check(

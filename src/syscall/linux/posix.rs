@@ -99,6 +99,20 @@ pub fn handle_setuid(args: [usize; ARG_COUNT]) -> isize {
     identity_set_one(args[0], true)
 }
 
+/// Install the ids a `set*id` call produced.
+///
+/// Linux's `setresuid`/`setuid`/`setreuid` (and the group spellings) reset the
+/// **filesystem** id to the new effective one *unconditionally* - measured on a
+/// current host (`.workbuddy/probe_fsuid.c`, Linux 7.2.11): `setresuid(0,0,0)`
+/// with an euid that never moved still carried a `65534` fsuid back to `0`.
+/// `setgroups` deliberately does not come through here: it changes no id, and
+/// Linux's `setgroups` leaves fsuid alone.
+fn apply_ids(mut identity: crate::sched::Identity) {
+    identity.fsuid = identity.euid;
+    identity.fsgid = identity.egid;
+    crate::sched::set_current_identity(identity);
+}
+
 /// `setgid(gid)` — [`handle_setuid`], spelled for groups.
 pub fn handle_setgid(args: [usize; ARG_COUNT]) -> isize {
     identity_set_one(args[0], false)
@@ -208,7 +222,7 @@ fn identity_set_one(word: usize, uid: bool) -> isize {
             identity.egid = word;
         }
     }
-    crate::sched::set_current_identity(identity);
+    apply_ids(identity);
     0
 }
 
@@ -296,7 +310,7 @@ fn identity_set_res(args: [usize; ARG_COUNT], uid: bool) -> isize {
         identity.egid = words[1];
         identity.sgid = words[2];
     }
-    crate::sched::set_current_identity(identity);
+    apply_ids(identity);
     0
 }
 
@@ -330,20 +344,42 @@ fn identity_words(args: [usize; ARG_COUNT], from_user: bool, uid: bool) -> isize
     0
 }
 
-/// `setfsuid(fsuid)` — the filesystem id, which decides who a file
-/// operation acts as. The man page's own observation is that the call
-/// answers with the *previous* fsuid whether or not it took, so a caller
-/// can probe; the answer here is the effective id it would move, because
-/// the fsuid tracks the effective id and no file operation consults it -
-/// modes are not enforced, so a separate word would be one more thing to
-/// keep in step with nothing reading it.
-pub fn handle_setfsuid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().euid as isize
+/// `setfsuid(fsuid)` — the filesystem id, which decides who a **file**
+/// operation acts as.
+///
+/// The man page's own observation is that the call answers with the *previous*
+/// fsuid whether or not it took, and that is the shape measured on a current
+/// host (`.workbuddy/probe_fsuid.c`, Linux 7.2.11): an unprivileged caller's
+/// `setfsuid(0)` returns its own 65534 and leaves the id at 65534 - no
+/// `EPERM`. Only `CAP_SETUID` (in the initial namespace, as
+/// [`crate::cred::Credentials::capable`] asks it) moves it.
+///
+/// This used to be a stub that answered the euid and stored nothing - a shape
+/// that looked like a getter and was a no-op, made "honest" by an old note
+/// saying no file operation consulted the id. That note was already false when
+/// it was written: the permission checks run on [`crate::vfs::current_caller`],
+/// which now reads [`crate::sched::current_fs_owner`].
+pub fn handle_setfsuid(args: [usize; ARG_COUNT]) -> isize {
+    let old = crate::sched::current_identity().fsuid;
+    let word = args[0] as u32;
+    if word != old && crate::sched::current_credentials().capable(crate::cred::CAP_SETUID) {
+        let mut identity = crate::sched::current_identity();
+        identity.fsuid = word;
+        crate::sched::set_current_identity(identity);
+    }
+    old as isize
 }
 
 /// `setfsgid(fsgid)` — [`handle_setfsuid`], spelled for groups.
-pub fn handle_setfsgid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().egid as isize
+pub fn handle_setfsgid(args: [usize; ARG_COUNT]) -> isize {
+    let old = crate::sched::current_identity().fsgid;
+    let word = args[0] as u32;
+    if word != old && crate::sched::current_credentials().capable(crate::cred::CAP_SETGID) {
+        let mut identity = crate::sched::current_identity();
+        identity.fsgid = word;
+        crate::sched::set_current_identity(identity);
+    }
+    old as isize
 }
 
 /// `capget(header, data)` — the capability state.
@@ -1503,7 +1539,7 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     if snap.pid != tgid.0 {
         return err::ESRCH;
     }
-    if !crate::sched::may_signal(tid) {
+    if !crate::sched::may_signal(sig as u8, tid) {
         return err::EPERM;
     }
     if crate::sched::send_signal(tid, sig as u8) {
@@ -1557,7 +1593,7 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // the code check (which is about what the record says) and before the send.
     // Measured on a current host: a caller outside the target's ids and without
     // `CAP_KILL` in its namespace is `EPERM` here exactly as it is at `kill`.
-    if !crate::sched::may_signal(target) {
+    if !crate::sched::may_signal(sig as u8, target) {
         return err::EPERM;
     }
     // The caller's record is the contract, not the sender's identity: Linux

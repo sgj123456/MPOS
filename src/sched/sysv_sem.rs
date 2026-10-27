@@ -84,8 +84,12 @@ pub const SEMVMX: i32 = 32_767;
 pub const SEMAEM: i32 = 32_767;
 
 /// `SEM_UNDO` and `IPC_NOWAIT`, the two bits a `sembuf`'s `sem_flg` carries.
-pub const SEM_UNDO: i16 = 0x1000;
-pub const IPC_NOWAIT: i16 = 0x4000;
+/// The values are `ipc.h`'s octal words: `SEM_UNDO` is `0o10000` (0x1000) and
+/// `IPC_NOWAIT` is `0o4000` (0x800), *not* 0x4000 - the spelling this file used
+/// until a host run blocked in a `semop` that thought it had asked for
+/// `NOWAIT`.
+pub const SEM_UNDO: i16 = 0o10000;
+pub const IPC_NOWAIT: i16 = 0o4000;
 
 /// One `struct sembuf`: a slot, an operation, and its flags. The ABI's six-byte
 /// record, read by the syscall layer and handed here as values.
@@ -986,6 +990,16 @@ pub fn exit_undo(dying: TaskId, group_dead: bool, wake: impl FnMut(TaskId)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two `sem_flg` bits, against `ipc.h`'s octal spelling. `IPC_NOWAIT`
+    /// is the one a hex 0x4000 looks right for and is not: a kernel that used
+    /// it does not see the flag a caller wrote, so a `semop` that should answer
+    /// `EAGAIN` parks instead.
+    #[test]
+    fn the_semaphore_flags_are_ipc_hs_octal_words() {
+        assert_eq!(SEM_UNDO, 0x1000);
+        assert_eq!(IPC_NOWAIT, 0x800);
+    }
 
     /// The limits are what `IPC_INFO` reports and what the table enforces; the
     /// arithmetic tests below do not touch the static table (a host test shares

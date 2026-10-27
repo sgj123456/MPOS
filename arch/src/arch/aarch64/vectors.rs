@@ -1165,7 +1165,7 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                 if crate::hal::kernel::resolve_anon_fault(addr, is_write) {
                     return 0; // A demand-paged anon page now backs the address.
                 }
-                if crate::hal::kernel::resolve_stack_growth(addr, frame.sp as usize) {
+                if crate::hal::kernel::resolve_stack_growth(addr) {
                     return 0; // The stack grew over the faulting address.
                 }
             }

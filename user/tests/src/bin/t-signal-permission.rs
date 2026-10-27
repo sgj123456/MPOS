@@ -17,6 +17,18 @@
 //! same 65534 target is then `EPERM`, which is the capability's own
 //! counterfactual and not a second uid rule.
 //!
+//! `SIGCONT` has one door beside the credential rule: Linux's
+//! `check_kill_permission` lets a caller whose ids and capabilities both refuse
+//! continue a process it shares a **session** with, and no other signal
+//! crosses that line. Measured on a current host with the shape this program
+//! already builds - a 65534 child and its root parent
+//! (`.workbuddy/probe_sigcont_session.c`, Linux 7.2.11): the same-session
+//! child reads `EPERM` for `kill(0)` and `SIGUSR1` but `0` for `SIGCONT`
+//! through `kill`, `tgkill` and `rt_sigqueueinfo`, while a `setsid` child reads
+//! `EPERM` for all four; a caller the ids already allow reads `0` whatever the
+//! sessions are. So the guest pins both sides of the session and the signal
+//! that is not `SIGCONT` as the control.
+//!
 //! `tgkill` and `rt_sigqueueinfo` are the same question at two more doors, and
 //! the record door additionally refuses `SI_TKILL` and a non-negative
 //! `si_code` to somebody else - measured in `.workbuddy/probe_qinfo.c`, where
@@ -52,9 +64,6 @@ struct CapHeader {
 
 /// The version word `libcap`'s v3 uses: `_LINUX_CAPABILITY_VERSION_3`.
 const CAP_VERSION_3: u32 = 0x2008_0522;
-
-/// `CAP_KILL`, the bit this program's third child drops.
-const CAP_KILL: u32 = 5;
 
 /// The errno a call answered, or 0.
 fn errno_of(r: libc::c_int) -> i32 {
@@ -92,6 +101,9 @@ impl RawInfo {
 fn write_all(fd: libc::c_int, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
         if n <= 0 {
             return;
         }
@@ -109,6 +121,12 @@ fn read_all(fd: libc::c_int, bytes: &mut [u8]) {
                 bytes.len() - seen,
             )
         };
+        // The `SIGCONT` this program sends its parent is *delivered* now, and
+        // a signal wakes a parking read: without the retry the collector sees
+        // an empty answer and every claim it owns reads against `-1`.
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
         if n <= 0 {
             return;
         }
@@ -116,28 +134,49 @@ fn read_all(fd: libc::c_int, bytes: &mut [u8]) {
     }
 }
 
-/// A target that has dropped to [`NOBODY`] and asks the four questions the
-/// doors put to the permission rule. It writes its answers as five `i32`s and
+/// A target that has dropped to [`NOBODY`] and asks the questions the doors
+/// put to the permission rule - the credential ones, the `SIGCONT` session
+/// door, and its `SIGUSR1` control. It writes its answers as nine `i32`s and
 /// exits; the parent owns the verdict, because the parent is the one that can
 /// still print.
-fn nobody_child(parent: libc::pid_t, out: libc::c_int, release: libc::c_int) -> ! {
+fn nobody_child(parent: libc::pid_t, out: libc::c_int, release: libc::c_int, detach: bool) -> ! {
+    let mut answer = [-1i32; 9];
+    // A session of its own is what makes the SIGCONT question *cross* one.
+    // Child A answers 1 (it inherited the parent's session); child B has
+    // moved, which is the only difference between the two shapes below.
+    // `None` is a `setsid` that failed, and then there is no session question
+    // to ask - the claim reads `-1` rather than a comparison of two answers
+    // that were never about sessions.
+    let mut detached: Option<bool> = Some(false);
+    if detach && unsafe { libc::setsid() } <= 0 {
+        detached = None;
+    }
     // The drop is all three ids: a saved root id would let the child raise
     // itself back, and the rule asks about the target's *saved* uid as well.
     let dropped = unsafe {
         libc::setresgid(NOBODY, NOBODY, NOBODY) == 0 && libc::setresuid(NOBODY, NOBODY, NOBODY) == 0
     };
-    let mut answer = [-1i32; 5];
     answer[0] =
         if dropped && unsafe { libc::getuid() } == NOBODY && unsafe { libc::geteuid() } == NOBODY {
             0
         } else {
             -1
         };
+    if detached.is_some() {
+        answer[7] = (unsafe { libc::getsid(0) } == unsafe { libc::getsid(parent) }) as i32;
+    }
     answer[1] = errno_of(unsafe { libc::kill(parent, 0) });
     answer[2] = errno_of(unsafe { libc::kill(libc::getpid(), 0) });
     answer[3] = syscall_errno(unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, 0) });
+    // The one signal the credential rule has a door beside: a continuation
+    // crosses the session, and nothing else does. `SIGUSR1` is the control
+    // (the parent swallows it, so a wrong answer cannot kill the program).
+    answer[4] = errno_of(unsafe { libc::kill(parent, libc::SIGCONT) });
+    answer[5] = errno_of(unsafe { libc::kill(parent, libc::SIGUSR1) });
+    answer[8] =
+        syscall_errno(unsafe { libc::syscall(libc::SYS_tgkill, parent, parent, libc::SIGCONT) });
     let info = RawInfo::queue(libc::SIGCONT);
-    answer[4] = syscall_errno(unsafe {
+    answer[6] = syscall_errno(unsafe {
         libc::syscall(
             libc::SYS_rt_sigqueueinfo,
             parent,
@@ -155,6 +194,10 @@ fn nobody_child(parent: libc::pid_t, out: libc::c_int, release: libc::c_int) -> 
     read_all(release, &mut byte);
     unsafe { libc::_exit(0) }
 }
+
+/// The control's handler: a `SIGUSR1` that the credential rule wrongly lets
+/// through must not end the program before the red claim is printed.
+extern "C" fn swallow_usr1(_: libc::c_int) {}
 
 /// A uid-0 child that empties its capability sets after proving it can signal
 /// a [`NOBODY`] grandchild with them.
@@ -240,7 +283,13 @@ fn main() {
         r.finish();
     }
 
-    // ---- a nobody child against its root parent -------------------------
+    // ---- a nobody child against its root parent, in the same session ----
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            swallow_usr1 as *const () as libc::sighandler_t,
+        )
+    };
     let mut pipe = [0 as libc::c_int; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
     let mut release = [0 as libc::c_int; 2];
@@ -252,14 +301,14 @@ fn main() {
             libc::close(pipe[0]);
             libc::close(release[1]);
         }
-        nobody_child(unsafe { libc::getppid() }, pipe[1], release[0]);
+        nobody_child(unsafe { libc::getppid() }, pipe[1], release[0], false);
     }
     unsafe {
         libc::close(pipe[1]);
         libc::close(release[0]);
     }
 
-    let mut answer = [-1i32; 5];
+    let mut answer = [-1i32; 9];
     read_all(pipe[0], unsafe {
         std::slice::from_raw_parts_mut(
             answer.as_mut_ptr() as *mut u8,
@@ -272,6 +321,7 @@ fn main() {
         "the child dropped its real, effective and saved ids",
         answer[0] == 0,
     );
+    r.check("the child is still in its parent's session", answer[7] == 1);
     r.check(
         "a 65534 child's kill(root parent, 0) is EPERM",
         answer[1] == libc::EPERM,
@@ -282,14 +332,75 @@ fn main() {
         answer[3] == libc::EPERM,
     );
     r.check(
-        "a 65534 child's rt_sigqueueinfo(root parent) is EPERM",
-        answer[4] == libc::EPERM,
+        "the same session lets a 65534 child continue its parent",
+        answer[4] == 0,
     );
+    r.check(
+        "the session door is SIGCONT's alone: SIGUSR1 is still EPERM",
+        answer[5] == libc::EPERM,
+    );
+    r.check(
+        "the record door takes the same session door",
+        answer[6] == 0,
+    );
+    r.check("the tgkill door takes it too", answer[8] == 0);
     let live = errno_of(unsafe { libc::kill(child, 0) });
     write_all(release[1], &[0u8]);
     unsafe { libc::close(release[1]) };
     r.check("root may signal the 65534 child (CAP_KILL)", live == 0);
     let mut status = 0;
+    unsafe { libc::waitpid(child, &mut status, 0) };
+
+    // ---- the same child, in a session of its own ------------------------
+    let mut pipe = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let mut release = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(release[1]);
+        }
+        nobody_child(unsafe { libc::getppid() }, pipe[1], release[0], true);
+    }
+    unsafe {
+        libc::close(pipe[1]);
+        libc::close(release[0]);
+    }
+
+    let mut answer = [-1i32; 9];
+    read_all(pipe[0], unsafe {
+        std::slice::from_raw_parts_mut(
+            answer.as_mut_ptr() as *mut u8,
+            std::mem::size_of_val(&answer),
+        )
+    });
+    unsafe { libc::close(pipe[0]) };
+
+    r.check("the detached child dropped its ids", answer[0] == 0);
+    r.check(
+        "the detached child left the parent's session",
+        answer[7] == 0,
+    );
+    r.check(
+        "outside the session a 65534 child's SIGCONT is EPERM",
+        answer[4] == libc::EPERM,
+    );
+    r.check(
+        "the same child's SIGUSR1 is refused too",
+        answer[5] == libc::EPERM,
+    );
+    r.check(
+        "the record door's SIGCONT is refused outside the session",
+        answer[6] == libc::EPERM,
+    );
+    r.check("so is the tgkill door's", answer[8] == libc::EPERM);
+    let live = errno_of(unsafe { libc::kill(child, 0) });
+    write_all(release[1], &[0u8]);
+    unsafe { libc::close(release[1]) };
+    r.check("root may signal the detached 65534 child", live == 0);
     unsafe { libc::waitpid(child, &mut status, 0) };
 
     // ---- the capability's own counterfactual ----------------------------

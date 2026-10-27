@@ -741,12 +741,22 @@ fn main() {
     let waiter = std::thread::Builder::new()
         .name("t-timer-waiter".into())
         .spawn(|| {
+            // Block SIGRTMIN *in the thread itself*, not by inheritance. The
+            // creator's block above is enough on musl, but glibc resets a new
+            // thread's mask to empty (`rt_sigprocmask(SIG_SETMASK, [])` is what
+            // strace shows on this host), so a thread that relied on inheriting
+            // it would let the timer's signal run its default action and kill
+            // the process. The creator waits for THREAD_TID before making the
+            // timer, so blocking here still happens before any signal exists.
+            if sigmask(libc::SIG_BLOCK, RTMIN_BIT).is_err() {
+                THREAD_CODE.store(-1001, Ordering::SeqCst);
+                THREAD_RAN.store(1, Ordering::SeqCst);
+                return;
+            }
             // The thread's whole life: publish its tid (the timer must be aimed
             // at it, and it is the only one who knows it), then wait on the
             // blocking form of `rt_sigtimedwait` for `SIGRTMIN` - the exact call
             // musl's `SIGEV_THREAD` helper parks in - and record what arrived.
-            // The mask was inherited from the creator, so there is no window in
-            // which the signal could run a default action instead.
             THREAD_TID.store(gettid(), Ordering::SeqCst);
             let mut info = Siginfo::zeroed();
             let got = sigtimedwait(RTMIN_BIT, &mut info);

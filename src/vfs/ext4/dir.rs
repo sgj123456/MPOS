@@ -164,7 +164,7 @@ impl Core {
         // symlink, device node and `O_TMPFILE` alike - and because the
         // creator's identity is a fact about *now*: a name does not remember
         // who first wrote it, and nothing later can reconstruct it.
-        let (uid, gid) = crate::sched::current_owner();
+        let (uid, gid) = crate::sched::current_fs_owner();
         let mut data = InodeData {
             uid: uid as u16,
             gid: gid as u16,

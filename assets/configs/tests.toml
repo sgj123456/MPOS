@@ -38,6 +38,22 @@
 # everything that is a check of this machine and of nothing else.
 default = []
 
+# How long one program may run before the runner kills it and carries on with
+# the next one, in seconds. This is a *program's* budget, not the sweep's: the
+# lane still has its own 900-second deadline (`MPOS_TEST_TIMEOUT`), but a single
+# stuck test used to spend that whole budget and hide every program after it.
+# Now it costs its own budget and prints `=== FAIL <name> timeout=<n>s`, so the
+# failure is named and the rest of the suite still runs.
+#
+# The shipped default covers every default-sweep program with room for a busy
+# TCG lane; `t-fill-ramfs` writes up to 1 GiB and is the one slow-group program
+# that needs a longer budget, so it gets its own line. A machine's own section
+# may override either key for its hardware. Read by both the guest runner (the
+# harness writes these values to the host share) and `cargo xtask test-host`, so
+# the two paths cannot drift.
+timeout = 120
+timeouts = ["t-fill-ramfs=600"]
+
 # Needs something outside the machine: the host's network, through QEMU's
 # user-mode stack, or a program listening on the host. A red one of these is a
 # statement about the internet or the host's own services before it is a

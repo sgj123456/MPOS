@@ -2,9 +2,9 @@ use super::PERMANENT_EXTRA;
 
 #[cfg(feature = "selftest")]
 use super::PERMANENT_TASKS;
-use super::USER_STACK_MAX;
 use super::load::spawn;
 use super::task::with_table;
+use super::{USER_STACK_MAX, USER_STACK_PAGES};
 use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use core::cell::RefCell;
 use critical_section::Mutex;
@@ -1147,21 +1147,23 @@ pub(crate) fn split_cow(space: &mut crate::hal::AddressSpace, mm: &Mm, virt: usi
 /// whose dependency walk is exactly that shape, was the one that found it.)
 ///
 /// Two bounds keep this from becoming a way to claim memory by accident. The
-/// address must be at or under `rsp` and within [`STACK_GROWTH_SLACK`] of it,
-/// because a push happens next to the stack pointer and a wild pointer does
-/// not; and it must stay above the stack's floor. Anything else is still the
-/// process's own fault to bear.
+/// fault must lie below the stack top the process was laid out with, and within
+/// [`STACK_GROWTH_SLACK`] of the stack's *own* current floor - not within that
+/// distance of `sp` above it. That distinction is Linux's: `expand_downwards`
+/// measures a stack fault from the `[stack]` vma's `vm_start` plus
+/// `stack_guard_gap`, and never from the stack pointer. An aarch64 prologue
+/// reserves a whole frame with a single `sub sp, sp, #N` and then saves
+/// `x29`/`x30` at the frame's *top*, so the first store into a fresh page lands
+/// *above* `sp`; a bound read from `sp` refused exactly that and ended the task
+/// (`fastfetch`, `ESR 0x92000047`). A wild pointer lands far below the floor and
+/// is still refused.
 ///
-/// Both ends of that region are the process's own, not the kernel's: the floor
-/// is measured from the stack top the process was *laid out* with, which every
-/// program draws afresh at `exec`. A growth check against the old constant would
-/// hand a process pages above the stack it was given, in a region its own page
-/// tables say nothing about.
-pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
+/// The floor itself is the process's own, not the kernel's: it is where the
+/// stack has grown so far, which every program draws afresh at `exec`. A growth
+/// check against the old constant would hand a process pages above the stack it
+/// was given, in a region its own page tables say nothing about.
+pub fn resolve_stack_growth(addr: usize) -> bool {
     let page = addr & !(PAGE_SIZE - 1);
-    if rsp < page || rsp - page > STACK_GROWTH_SLACK {
-        return false;
-    }
     with_table(|t| {
         let id = t.current;
         let stack_top = t.task(id).stack_top;
@@ -1179,6 +1181,18 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
             .map_or(USER_STACK_MAX as u64, |r| r.cur)
             .min(USER_STACK_MAX as u64) as usize;
         if page < stack_top - stack_max {
+            return false;
+        }
+        // The stack's own low-water mark: where growth has reached so far,
+        // which `/proc/<pid>/maps` reports as the `[stack]` line's start. A
+        // fault within SLACK below it is another push; one further down is a
+        // wild pointer and stays the process's own fault to bear.
+        let floor = t
+            .task(id)
+            .mm
+            .stack_floor()
+            .unwrap_or(stack_top - USER_STACK_PAGES * PAGE_SIZE);
+        if page < floor.saturating_sub(STACK_GROWTH_SLACK) {
             return false;
         }
         // The group's space, for the same reason a copy-on-write fault looks
@@ -1477,6 +1491,23 @@ impl Mm {
                 }
             }
         });
+    }
+
+    /// The lowest page the stack currently covers: where growth has reached,
+    /// which is the start of the `[stack]` line `/proc/<pid>/maps` prints and
+    /// the bound [`resolve_stack_growth`] measures a fault against - Linux's
+    /// `vma->vm_start` for the stack, rather than the faulting `sp`. `None`
+    /// before a stack has been laid out, which the caller answers with the
+    /// region the loader reserved.
+    pub(crate) fn stack_floor(&self) -> Option<usize> {
+        critical_section::with(|cs| {
+            self.eager
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .find(|range| range.name.as_deref() == Some("[stack]"))
+                .map(|range| range.start)
+        })
     }
 
     /// The VMA covering `virt`, if the group has one.

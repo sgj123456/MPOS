@@ -18,6 +18,25 @@
 //! isolated tables; the kernel holds one instance, exposed by [`mount_root`],
 //! [`mount`] and [`resolve`].
 
+/// The wall clock in unix seconds, the one every filesystem stamps with.
+///
+/// `ext2/ext4` and `ramfs` each carried this body before the read path needed
+/// it; they are one fact - the RTC anchor riding the tick counter, the same sum
+/// `gettimeofday` reports - so it lives above both. On the host there is no
+/// clock: a counter that moves is what the tests need, and deterministic beats
+/// real.
+#[cfg(target_os = "none")]
+pub fn now_seconds() -> u64 {
+    crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn now_seconds() -> u64 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HOST_NOW: AtomicU32 = AtomicU32::new(1_700_000_000);
+    HOST_NOW.fetch_add(1, Ordering::Relaxed) as u64
+}
+
 /// `/sys/fs/cgroup`: the cgroup2 control-group tree - the hierarchy a
 /// process belongs to, `/proc/<pid>/cgroup`'s answer and the cgroup
 /// namespace's subject. Organizational only (no controllers), measured
@@ -964,6 +983,22 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// word on disk (ext2's `i_ctime`) overrides it.
     fn ctime(&self) -> u64 {
         self.mtime()
+    }
+
+    /// Move the access clock after a successful read - Linux's `touch_atime`,
+    /// called by [`crate::vfs::file::File::read`] rather than by each
+    /// `read_at`. The door is the vfs's because two facts live there and
+    /// nowhere below: the description's `O_NOATIME` flag, and the `relatime`
+    /// policy's "has anything happened since" question. A filesystem answers
+    /// only *where* the clock is kept.
+    ///
+    /// The default does nothing, and that is honest rather than lazy: a
+    /// virtual filesystem whose nodes have no clock to report (a pipe, a
+    /// `procfs` row, a `sysfs` attribute) would be inventing one. A filesystem
+    /// that keeps atime - `ext4` on disk, `ramfs` in memory - overrides it with
+    /// Linux's `relatime_need_update` rule.
+    fn touch_atime(&self, _now: u64) -> VfsResult<()> {
+        Ok(())
     }
 
     /// How many directory names reach this node - `st_nlink`. A hard link is
@@ -1957,11 +1992,12 @@ pub fn remove_privs_as(inode: &Arc<dyn Inode>, caller: Caller) {
     }
 }
 
-/// The running task as the permission checks see it: its effective ids, and the
-/// overrides its credentials carry in the namespace the node's filesystem
-/// belongs to ([`Overrides::of`]).
+/// The running task as the permission checks see it: the **filesystem** ids -
+/// `setfsuid(2)` moves these without moving the effective pair, and Linux's
+/// `inode_permission` reads them - and the overrides its credentials carry in
+/// the namespace the node's filesystem belongs to ([`Overrides::of`]).
 pub fn current_caller() -> Caller {
-    let (uid, gid) = crate::sched::current_owner();
+    let (uid, gid) = crate::sched::current_fs_owner();
     Caller {
         uid,
         gid,

@@ -63,10 +63,22 @@ use std::process::exit;
 const PTRACE_GET_SYSCALL_INFO: c_long = 0x420e;
 const PTRACE_O_TRACESYSGOOD: c_long = 1;
 
-/// `struct ptrace_syscall_info`'s fixed size, and the offsets the ABI gives its
-/// fields. The union at the end is why this is 80 and not 24: the exit shape is
-/// written into the same 56 bytes the entry shape uses.
+/// `struct ptrace_syscall_info`'s size as a buffer, and the offsets the ABI
+/// gives its fields. The union at the end is why the buffer is 80 and not 24:
+/// the entry shape is its largest member.
+///
+/// That is *not* what every stop answers: `PTRACE_GET_SYSCALL_INFO`'s return
+/// value is the number of bytes the stop has available, which Linux reports as
+/// 24 at a signal stop (through `arch`), 80 at an entry stop (through
+/// `args[5]`) and 33 at an exit stop (through `is_error`). A buffer larger than
+/// the answer is fine and a smaller one is truncated by the kernel, with the
+/// full available size still returned.
 const SYSCALL_INFO_BYTES: usize = 80;
+/// `offsetofend(..., arch)` - the signal-stop answer.
+const SYSCALL_INFO_NONE_BYTES: usize = 24;
+/// `offsetofend(..., exit.is_error)` - the exit-stop answer. The entry answer
+/// is the whole buffer ([`SYSCALL_INFO_BYTES`]).
+const SYSCALL_INFO_EXIT_BYTES: usize = 33;
 const OP: usize = 0;
 const ARCH: usize = 4;
 const IP: usize = 8;
@@ -136,10 +148,15 @@ impl Report {
 /// One `ptrace` call, with the two words the request numbers do not use passed
 /// as zero. The number is `libc::SYS_ptrace`, which is the ABI's per-arch table
 /// rather than this file's memory of it.
-fn ptrace(request: c_long, pid: libc::pid_t, addr: usize, data: usize) -> Result<isize, i32> {
+fn raw_ptrace(request: c_long, pid: libc::pid_t, addr: usize, data: usize) -> Result<isize, i32> {
     // SAFETY: `syscall` is a libc entry point; the arguments are the widths the
     // ABI's registers take, and `ptrace`'s own contract is the caller's - every
     // call below passes a pointer this process owns, or null.
+    //
+    // The raw ABI, not the man page's libc-level story: `PEEKTEXT`/`PEEKDATA`
+    // and `PEEKUSER` write the word through `data` and return 0, while their
+    // libc wrappers pass a local and turn that 0 into the word. Calling this
+    // with `data = 0` is what Linux answers `EFAULT` to.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_ptrace,
@@ -159,6 +176,20 @@ fn ptrace(request: c_long, pid: libc::pid_t, addr: usize, data: usize) -> Result
     }
 }
 
+/// A `ptrace` call whose request passes everything by value or by an input
+/// pointer; the result is the call's return value.
+fn ptrace(request: c_long, pid: libc::pid_t, addr: usize, data: usize) -> Result<isize, i32> {
+    raw_ptrace(request, pid, addr, data)
+}
+
+/// A word-reading request: the raw call writes through a local and the word is
+/// that local, not the `0` the syscall returned.
+fn peek(request: c_long, pid: libc::pid_t, addr: usize) -> Result<isize, i32> {
+    let mut word: libc::c_long = 0;
+    raw_ptrace(request, pid, addr, &mut word as *mut libc::c_long as usize)?;
+    Ok(word as isize)
+}
+
 fn main() {
     let mut r = Report { failed: false };
 
@@ -168,7 +199,7 @@ fn main() {
     // relationship, which is what makes `strace -p` possible at all.
     r.check_errno(
         "a pid past the task table names no task",
-        ptrace(libc::PTRACE_PEEKDATA as c_long, 9999, 0, 0).unwrap_err(),
+        peek(libc::PTRACE_PEEKDATA as c_long, 9999, 0).unwrap_err(),
         ESRCH,
     );
     // A request this kernel does not implement, asked of a pid that is not a
@@ -291,6 +322,19 @@ fn entry_stop_rewrite_changes_the_call(r: &mut Report) {
     if n != child {
         return;
     }
+    // `TRACESYSGOOD` has to be set before the stop this walk asks about: Linux
+    // reports `NONE` at a syscall boundary without it (`man 2 ptrace`), so a
+    // loop looking for a call's number would see signal stops for ever.
+    r.check_call(
+        "the redirect's tracee takes TRACESYSGOOD",
+        ptrace(
+            libc::PTRACE_SETOPTIONS as c_long,
+            child,
+            0,
+            PTRACE_O_TRACESYSGOOD as usize,
+        ),
+        0,
+    );
 
     // Walk to the judged call's *entry* the way step 5 does: the tracee was
     // inside a syscall when it stopped, so the next boundary may be that call's
@@ -307,8 +351,17 @@ fn entry_stop_rewrite_changes_the_call(r: &mut Report) {
         if n != child || !libc::WIFSTOPPED(status) {
             break;
         }
-        if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-            != Ok(SYSCALL_INFO_BYTES as isize)
+        // A walk can meet the exit half of a call the tracee was already in
+        // (33 bytes) before the entry it wants; both are boundaries, and only
+        // the entry's number decides what to do next.
+        let got = ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base);
+        // Any honest answer keeps the walk going: a NONE stop (a signal the
+        // tracee took on the way), an exit (the other half of a call it was
+        // already in) and an entry are all rows in the trace, and only the
+        // entry carrying the wanted number is the one this loop is for.
+        if !matches!(got, Ok(n) if n == SYSCALL_INFO_NONE_BYTES as isize
+            || n == SYSCALL_INFO_BYTES as isize
+            || n == SYSCALL_INFO_EXIT_BYTES as isize)
         {
             break;
         }
@@ -368,7 +421,7 @@ fn entry_stop_rewrite_changes_the_call(r: &mut Report) {
         if n == child
             && libc::WIFSTOPPED(status)
             && ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-                == Ok(SYSCALL_INFO_BYTES as isize)
+                == Ok(SYSCALL_INFO_EXIT_BYTES as isize)
             && info[OP] == OP_EXIT
         {
             saw_exit = Some(i64::from_le_bytes(info[NR..NR + 8].try_into().unwrap()));
@@ -468,6 +521,19 @@ fn entry_stop_cancel_skips_the_call(r: &mut Report) {
         unsafe { libc::close(read_fd) };
         return;
     }
+    // `TRACESYSGOOD` has to be set before the stop this walk asks about: Linux
+    // reports `NONE` at a syscall boundary without it (`man 2 ptrace`), so a
+    // loop looking for a call's number would see signal stops for ever.
+    r.check_call(
+        "the cancel probe's tracee takes TRACESYSGOOD",
+        ptrace(
+            libc::PTRACE_SETOPTIONS as c_long,
+            child,
+            0,
+            PTRACE_O_TRACESYSGOOD as usize,
+        ),
+        0,
+    );
 
     // Walk to the judged `write`'s entry stop the way the redirect above does.
     let mut info = [0u8; SYSCALL_INFO_BYTES];
@@ -482,8 +548,17 @@ fn entry_stop_cancel_skips_the_call(r: &mut Report) {
         if n != child || !libc::WIFSTOPPED(status) {
             break;
         }
-        if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-            != Ok(SYSCALL_INFO_BYTES as isize)
+        // A walk can meet the exit half of a call the tracee was already in
+        // (33 bytes) before the entry it wants; both are boundaries, and only
+        // the entry's number decides what to do next.
+        let got = ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base);
+        // Any honest answer keeps the walk going: a NONE stop (a signal the
+        // tracee took on the way), an exit (the other half of a call it was
+        // already in) and an entry are all rows in the trace, and only the
+        // entry carrying the wanted number is the one this loop is for.
+        if !matches!(got, Ok(n) if n == SYSCALL_INFO_NONE_BYTES as isize
+            || n == SYSCALL_INFO_BYTES as isize
+            || n == SYSCALL_INFO_EXIT_BYTES as isize)
         {
             break;
         }
@@ -535,7 +610,7 @@ fn entry_stop_cancel_skips_the_call(r: &mut Report) {
         if n == child
             && libc::WIFSTOPPED(status)
             && ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-                == Ok(SYSCALL_INFO_BYTES as isize)
+                == Ok(SYSCALL_INFO_EXIT_BYTES as isize)
             && info[OP] == OP_EXIT
         {
             saw_result = Some(i64::from_le_bytes(info[NR..NR + 8].try_into().unwrap()));
@@ -614,6 +689,19 @@ fn exit_stop_number_write_is_a_no_op(r: &mut Report) {
     if n != child {
         return;
     }
+    // `TRACESYSGOOD` has to be set before the stop this walk asks about: Linux
+    // reports `NONE` at a syscall boundary without it (`man 2 ptrace`), so a
+    // loop looking for a call's number would see signal stops for ever.
+    r.check_call(
+        "the exit-write probe's tracee takes TRACESYSGOOD",
+        ptrace(
+            libc::PTRACE_SETOPTIONS as c_long,
+            child,
+            0,
+            PTRACE_O_TRACESYSGOOD as usize,
+        ),
+        0,
+    );
 
     let mut info = [0u8; SYSCALL_INFO_BYTES];
     let base = info.as_mut_ptr() as usize;
@@ -627,8 +715,17 @@ fn exit_stop_number_write_is_a_no_op(r: &mut Report) {
         if n != child || !libc::WIFSTOPPED(status) {
             break;
         }
-        if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-            != Ok(SYSCALL_INFO_BYTES as isize)
+        // A walk can meet the exit half of a call the tracee was already in
+        // (33 bytes) before the entry it wants; both are boundaries, and only
+        // the entry's number decides what to do next.
+        let got = ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base);
+        // Any honest answer keeps the walk going: a NONE stop (a signal the
+        // tracee took on the way), an exit (the other half of a call it was
+        // already in) and an entry are all rows in the trace, and only the
+        // entry carrying the wanted number is the one this loop is for.
+        if !matches!(got, Ok(n) if n == SYSCALL_INFO_NONE_BYTES as isize
+            || n == SYSCALL_INFO_BYTES as isize
+            || n == SYSCALL_INFO_EXIT_BYTES as isize)
         {
             break;
         }
@@ -652,7 +749,7 @@ fn exit_stop_number_write_is_a_no_op(r: &mut Report) {
         if n == child
             && libc::WIFSTOPPED(status)
             && ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-                == Ok(SYSCALL_INFO_BYTES as isize)
+                == Ok(SYSCALL_INFO_EXIT_BYTES as isize)
             && info[OP] == OP_EXIT
         {
             saw_result = Some(i64::from_le_bytes(info[NR..NR + 8].try_into().unwrap()));
@@ -737,7 +834,7 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
     r.check_call(
         "PTRACE_GET_SYSCALL_INFO fills the structure",
         ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base),
-        SYSCALL_INFO_BYTES as isize,
+        SYSCALL_INFO_NONE_BYTES as isize,
     );
     r.check("a signal stop reports NONE", info[OP] == OP_NONE);
     let arch = u32::from_le_bytes(info[ARCH..ARCH + 4].try_into().unwrap());
@@ -753,12 +850,21 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
         ip != 0 && sp != 0,
     );
 
-    // A buffer the caller chose to be too small. The structure has a union in
-    // it, so this is a refusal and not a short answer.
-    r.check_errno(
-        "a buffer too small for the structure is EINVAL",
-        ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES - 1, base).unwrap_err(),
-        EINVAL,
+    // A buffer the caller chose to be shorter than the answer. Linux truncates
+    // the copy and still reports the *available* size - it is not a refusal, and
+    // the returned number is what `strace` compares against its own expected size.
+    // Eight bytes is enough for the op byte and the arch word, so the prefix
+    // the caller does receive is usable and the rest is simply not written.
+    let mut short = [0xaau8; 8];
+    let short_base = short.as_mut_ptr() as usize;
+    r.check_call(
+        "a short buffer is truncated, and the answer's full size is returned",
+        ptrace(PTRACE_GET_SYSCALL_INFO, child, short.len(), short_base),
+        SYSCALL_INFO_NONE_BYTES as isize,
+    );
+    r.check(
+        "the truncated prefix is the op byte and the machine's arch",
+        short[OP] == OP_NONE && u32::from_le_bytes(short[ARCH..ARCH + 4].try_into().unwrap()) != 0,
     );
 
     // ---- 3. the options, and the bits this kernel does not have ----
@@ -837,7 +943,14 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
             libc::WSTOPSIG(status) == (libc::SIGTRAP | 0x80),
         );
         let got = ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base);
-        if got != Ok(SYSCALL_INFO_BYTES as isize) {
+        // Any honest answer keeps the walk going: a NONE stop (a signal the
+        // tracee took on the way), an exit (the other half of a call it was
+        // already in) and an entry are all rows in the trace, and only the
+        // entry carrying the wanted number is the one this loop is for.
+        if !matches!(got, Ok(n) if n == SYSCALL_INFO_NONE_BYTES as isize
+            || n == SYSCALL_INFO_BYTES as isize
+            || n == SYSCALL_INFO_EXIT_BYTES as isize)
+        {
             break;
         }
         let nr = u64::from_le_bytes(info[NR..NR + 8].try_into().unwrap());
@@ -865,9 +978,11 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
     // the whole point - a libc calls this as `ptrace(PEEKDATA, pid, addr, 0)`,
     // so a kernel that treated the fourth argument as a buffer to write into
     // would refuse every read a tracer makes.
-    let word = ptrace(libc::PTRACE_PEEKDATA as c_long, child, sp as usize, 0);
+    let word = peek(libc::PTRACE_PEEKDATA as c_long, child, sp as usize);
     r.check(
-        "PTRACE_PEEKDATA answers a word out of the tracee's stack",
+        &format!(
+            "PTRACE_PEEKDATA answers a word out of the tracee's stack (got {word:?}, sp {sp:#x})"
+        ),
         word.is_ok(),
     );
     // And the read is of the *tracee*: the word under its stack pointer is not
@@ -876,9 +991,9 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
     // word that matches this process's stack instead.
     let mut own = [0u8; 8];
     let own_at = own.as_ptr() as usize;
-    let mine = ptrace(libc::PTRACE_PEEKDATA as c_long, child, own_at, 0);
+    let mine = peek(libc::PTRACE_PEEKDATA as c_long, child, own_at);
     r.check(
-        "what it reads is the tracee's memory and not the tracer's",
+        &format!("what it reads is the tracee's memory and not the tracer's (got {mine:?}, word {word:?})"),
         mine.is_ok() && mine != word,
     );
 
@@ -900,7 +1015,7 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
         ),
         0,
     );
-    let peeked = ptrace(libc::PTRACE_PEEKUSER as c_long, child, PC_SLOT * 8, 0);
+    let peeked = peek(libc::PTRACE_PEEKUSER as c_long, child, PC_SLOT * 8);
     r.check(
         &format!(
             "PTRACE_PEEKUSER answers the register, not through a pointer \
@@ -929,7 +1044,7 @@ fn trace_from_parent(r: &mut Report, child: libc::pid_t) {
             break;
         }
         if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
-            != Ok(SYSCALL_INFO_BYTES as isize)
+            != Ok(SYSCALL_INFO_EXIT_BYTES as isize)
         {
             break;
         }

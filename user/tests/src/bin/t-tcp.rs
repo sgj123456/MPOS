@@ -12,6 +12,7 @@
 //! honest answers depending on whether the far end resets or stays silent -
 //! but succeeding is not one of them.
 
+use mpos_user_tests::host_run;
 use rustix::net::{
     AddressFamily, SocketAddrV4, SocketType, bind, connect, getsockname, listen, socket,
 };
@@ -91,8 +92,15 @@ fn main() {
     }
 
     // A connection to a port nobody is listening on: slirp's 10.0.2.2 is
-    // the host, and port 9 (discard) has nothing behind it here.
-    let nowhere = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 9);
+    // the host, and port 9 (discard) has nothing behind it here. A host run
+    // has no slirp - 10.0.2.2 is a black hole there - so it uses a closed
+    // loopback port instead, which refuses (or times out) without waiting for
+    // a route that does not exist.
+    let nowhere = if host_run() {
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT + 1)
+    } else {
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 9)
+    };
     let third = socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
     match connect(&third, &nowhere) {
         Ok(()) => r.check("connecting where nothing listens fails", false),

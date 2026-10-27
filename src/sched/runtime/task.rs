@@ -306,12 +306,22 @@ pub struct Identity {
     pub euid: u32,
     /// The saved user id: who the process may raise its effective id back to.
     pub suid: u32,
+    /// The filesystem user id: who a **file operation** acts as. Usually equal
+    /// to [`Identity::euid`] - `setresuid`/`setuid`/`setreuid` reset it to the
+    /// new effective id unconditionally, measured on a current host
+    /// (`.workbuddy/probe_fsuid.c`, Linux 7.2.11: `setresuid(0,0,0)` with an
+    /// unchanged euid still moved a `65534` fsuid back to `0`) - and moved on
+    /// its own only by `setfsuid(2)`, which is the one door a program uses to
+    /// look at a file as somebody else without changing its privileges.
+    pub fsuid: u32,
     /// The real group id.
     pub rgid: u32,
     /// The effective group id.
     pub egid: u32,
     /// The saved group id.
     pub sgid: u32,
+    /// The filesystem group id: the group half of [`Identity::fsuid`].
+    pub fsgid: u32,
     /// The supplementary groups, in the order `setgroups(2)` was given them.
     /// Empty until a privileged caller names some; `getgroups(2)` reports
     /// this list and a `:group` rule in `doas.conf` matches against it.
@@ -902,10 +912,11 @@ pub(crate) struct Task {
     /// signal stays pending until it is unblocked, which is what makes a
     /// critical section able to say "not now" and be obeyed.
     pub(crate) blocked: signal::Pending,
-    /// What `rt_sigaction` recorded for this process, per signal. Its own
-    /// table, not a shared one: a fresh process must answer `SIG_DFL` for
-    /// everything, whatever its parent or its sibling installed.
-    pub(crate) dispositions: signal::Actions,
+    /// What `rt_sigaction` recorded for this process, per signal - Linux's
+    /// `sighand_struct`, shared by every thread of the group under
+    /// `CLONE_SIGHAND` and copied by a `fork`. See [`signal::SignalHand`] for
+    /// the measurement that says which door shares and which copies.
+    pub(crate) dispositions: Arc<signal::SignalHand>,
     /// The alternate signal stack this process installed with
     /// `sigaltstack`, if it has one.
     pub(crate) alt_stack: Option<signal::AltStack>,
@@ -1428,7 +1439,7 @@ impl Task {
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             rtq: signal::RtQueue::new(),
             blocked: 0,
-            dispositions: signal::Actions::default(),
+            dispositions: signal::SignalHand::new(signal::Actions::default()),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
@@ -2100,7 +2111,7 @@ impl Table {
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             rtq: signal::RtQueue::new(),
             blocked: 0,
-            dispositions: signal::Actions::default(),
+            dispositions: signal::SignalHand::new(signal::Actions::default()),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),

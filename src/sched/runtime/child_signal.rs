@@ -1296,6 +1296,18 @@ pub fn current_owner() -> (u32, u32) {
     (id.euid, id.egid)
 }
 
+/// The pair a **filesystem** asks: `fsuid`/`fsgid`, which `setfsuid(2)` moves
+/// without moving the effective ids. Measured on a current host
+/// (`.workbuddy/probe_fsuid.c`, Linux 7.2.11): a root caller that sets
+/// `fsuid=65534` is refused `EACCES` on a `0600` root file, and allowed again
+/// after `setfsuid(0)`, while its `euid` never moved. `current_owner` stays the
+/// effective pair: Linux's `ipcperms` and the capability questions read that
+/// one, and only file access reads this one.
+pub fn current_fs_owner() -> (u32, u32) {
+    let id = current_identity();
+    (id.fsuid, id.fsgid)
+}
+
 /// The *real* ids of the running task, which is the pair `access(2)` asks
 /// about rather than the effective one above. The distinction is the whole
 /// point of the call: a setuid program asking whether the user who invoked
@@ -1427,8 +1439,9 @@ pub enum GroupSend {
     Delivered,
 }
 
-/// Whether the running caller may signal `target`, by Linux's
-/// `kill_ok_by_cred` plus `CAP_KILL` in the **target's** user namespace.
+/// Whether the running caller may send `sig` to `target` - Linux's
+/// `check_kill_permission`: `kill_ok_by_cred`, `CAP_KILL` in the **target's**
+/// user namespace, and one door beside them for a continuation.
 ///
 /// The uid half is [`crate::cred::kill_ok`] (the sender's real/effective id
 /// against the target's real/saved id); the capability half is
@@ -1438,10 +1451,20 @@ pub enum GroupSend {
 /// uid 1000's `kill(1, 0)` is `EPERM`; `.workbuddy/probe_ns_owner.c`: a
 /// capability is a fact about the object's namespace).
 ///
+/// The third door is the **session**: a caller whose ids and capabilities both
+/// refuse may still send `SIGCONT` to a process it shares a session with, and
+/// nothing else. Measured on a current host with the shape the uid rule needs -
+/// a 65534 child and its root parent (`.workbuddy/probe_sigcont_session.c`,
+/// Linux 7.2.11): the same-session child reads `EPERM` for `kill(0)` and
+/// `SIGUSR1` but `0` for `SIGCONT` through `kill`, `tgkill` and
+/// `rt_sigqueueinfo`, while a `setsid` child reads `EPERM` for all four; a
+/// caller the ids already allow reads `0` whatever the sessions are. So the
+/// session is not a second authority, it is the one bypass `SIGCONT` has.
+///
 /// This is deliberately **not** inside [`send_signal`]: the kernel's own
 /// raises - a timer, a child's death, a console handover - have no userspace
 /// sender to judge and must keep working exactly as they did.
-pub fn may_signal(target: TaskId) -> bool {
+pub fn may_signal(sig: u8, target: TaskId) -> bool {
     with_table(|t| {
         let Some(target) = t.tasks.get(target.0).and_then(Option::as_ref) else {
             return false;
@@ -1455,12 +1478,13 @@ pub fn may_signal(target: TaskId) -> bool {
         ) {
             return true;
         }
-        crate::userns::Caller {
+        let capable = crate::userns::Caller {
             ns: caller.user_ns.clone(),
             euid: caller.identity.euid,
             effective: caller.mm.credentials().effective,
         }
-        .capable_in(&target.user_ns, crate::cred::CAP_KILL)
+        .capable_in(&target.user_ns, crate::cred::CAP_KILL);
+        capable || (sig == crate::sched::signal::SIGCONT && caller.session == target.session)
     })
 }
 
@@ -1478,7 +1502,7 @@ pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
     }
     let mut permitted = false;
     for id in members {
-        if may_signal(id) {
+        if may_signal(sig, id) {
             permitted = true;
             // The signal itself may be discarded by the target's disposition
             // or namespace init rule; that is still Linux's 0, not a refusal.
@@ -1510,7 +1534,7 @@ pub fn send_signal_group_info(
     }
     let mut permitted = false;
     for id in members {
-        if may_signal(id) {
+        if may_signal(sig, id) {
             permitted = true;
             let _ = send_signal_info(id, sig, info);
         }
@@ -1598,7 +1622,7 @@ pub fn send_signal_every_process(sig: u8) -> GroupSend {
     // signal leaves 0, and a target that raced its own exit leaves `ESRCH`.
     let mut answer = GroupSend::Delivered;
     for id in targets {
-        if !may_signal(id) {
+        if !may_signal(sig, id) {
             continue;
         }
         if !send_signal(id, sig) {
@@ -1992,10 +2016,12 @@ pub fn current_disposition(sig: u8) -> crate::sched::signal::Action {
 /// one-shot handler re-entrant-safe.
 pub fn reset_disposition(sig: u8) {
     with_table(|t| {
-        let id = t.current;
-        let mut actions = t.task(id).dispositions;
-        actions.set(sig, crate::sched::signal::Action::default());
-        t.task_mut(id).dispositions = actions;
+        // The table is shared by the thread group, so `SA_RESETHAND` clears the
+        // disposition for every thread - Linux's `sighand_struct` is one object
+        // and `do_sigaction` writes it, not a per-task copy.
+        t.task(t.current)
+            .dispositions
+            .set(sig, crate::sched::signal::Action::default());
     });
 }
 

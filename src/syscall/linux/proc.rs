@@ -107,15 +107,16 @@ fn build_frame(
     // the stack grows under it - which is what Linux's frame write relies on
     // (`expand_stack` answering the `put_user`), and what the fault path here
     // already does for the program's own pushes: the same resolver the EL0
-    // fault takes, anchored on the interrupted pointer, then the write again.
-    // A frame the stack cannot back (beyond the slack, past `RLIMIT_STACK`)
-    // still refuses, and the default action is what follows.
+    // fault takes, measured from the stack's own floor rather than from the
+    // interrupted `sp`, then the write again. A frame the stack cannot back
+    // (beyond the slack, past `RLIMIT_STACK`) still refuses, and the default
+    // action is what follows.
     if !crate::sched::write_user(at.sp, &bytes) {
         let interrupted_sp = unsafe { crate::hal::user_context(regs_ptr, 0) }
             .map(|ctx| ctx.sp())
             .unwrap_or(0);
         if interrupted_sp == 0
-            || !crate::sched::resolve_stack_growth(at.sp, interrupted_sp)
+            || !crate::sched::resolve_stack_growth(at.sp)
             || !crate::sched::write_user(at.sp, &bytes)
         {
             return false;
@@ -1068,12 +1069,13 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // same request to a machine without separate I and D spaces, which is
         // every machine this kernel runs on.
         //
-        // The word *is* the return value. `data` is not a buffer this call
-        // fills, which is why a tracer's `ptrace` binding has a variadic shape
-        // and why a caller reads the result rather than passing somewhere to put
-        // it: measured, the version that wrote to `*(u64 *)data` answered
-        // `EFAULT` to the `ptrace(PEEKDATA, pid, addr, 0)` every libc actually
-        // makes, because zero is not a writable address.
+        // The word goes through `data`, a pointer, and the call returns 0.
+        // That is the *syscall* ABI; every libc's variadic `ptrace` wrapper
+        // passes a local's address and turns the 0 into the word the man page
+        // describes. A kernel that answered the word directly looked right
+        // through those wrappers and failed the raw call `t-ptrace` makes
+        // (`ptrace(PEEKDATA, pid, addr, 0)` is `EFAULT` on Linux, because zero
+        // is not a writable address).
         abi::PTRACE_PEEKTEXT | abi::PTRACE_PEEKDATA => {
             let Some(root) = crate::sched::space_root_of(id) else {
                 return err::ESRCH;
@@ -1082,11 +1084,11 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             if !crate::sched::read_user_of(root, addr, &mut word) {
                 return err::EIO;
             }
-            // Signed, because that is the width the ABI answers with and the
-            // dispatcher carries; a word whose top bit is set is a negative
-            // `long` to the caller, which is Linux's own behaviour and why a
-            // tracer checks `errno` rather than the sign.
-            i64::from_le_bytes(word) as isize
+            if !buffer_ok(data, 8, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { core::ptr::copy_nonoverlapping(word.as_ptr(), data as *mut u8, 8) };
+            0
         }
         // And the writing half. The value arrives in `data` by value, not
         // through a pointer - one of the few places `ptrace`'s arguments do not
@@ -1119,9 +1121,14 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                 return err::ESRCH;
             };
             if request == abi::PTRACE_PEEKUSER {
-                // And this one answers the same way `PEEKDATA` does: the word is
-                // the result, not a value written through a pointer.
-                return regs[addr / 8] as isize;
+                // And this one answers the same way `PEEKDATA` does: the value
+                // is written through the `data` pointer and the call returns 0
+                // (the libc wrapper turns that into the word it promised).
+                if !buffer_ok(data, 8, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe { (data as *mut u64).write_unaligned(regs[addr / 8]) };
+                return 0;
             }
             regs[addr / 8] = data as u64;
             if crate::sched::set_trace_regs(id, &regs) {
@@ -1197,18 +1204,21 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         }
         // The syscall this stop is a boundary of. `addr` is the size of the
         // buffer at `data` and not an address - the other place `ptrace`'s
-        // arguments do not mean what they look like. A buffer too small for the
-        // structure is `EINVAL`, because it has a union in it and a truncated
-        // answer would describe the wrong thing rather than less of the right
-        // one.
+        // arguments do not mean what they look like. Linux's return value is
+        // the number of bytes the *stop* has available, not the number the
+        // caller asked to receive: `NONE` reports 24 (`through arch`), `ENTRY`
+        // 80 (through `args`), `EXIT` 33 (through `is_error`). A smaller buffer
+        // is truncated rather than refused - `man 2 ptrace` says "the output
+        // data is truncated", and `strace`'s startup probe branches on the
+        // returned size. Refusing a short buffer is the shape that made it
+        // stop asking for this structure for the rest of a session.
         abi::PTRACE_GET_SYSCALL_INFO => {
-            if addr < abi::SYSCALL_INFO_BYTES {
-                return err::EINVAL;
-            }
-            if !buffer_ok(data, abi::SYSCALL_INFO_BYTES, true, from_user) {
-                return err::EFAULT;
-            }
-            match crate::sched::trace_syscall(id) {
+            // The full record is built here and only the caller's prefix is
+            // copied, because writing 80 bytes into a buffer the caller
+            // declared shorter would be the overflow Linux avoids.
+            let mut record = [0u8; abi::SYSCALL_INFO_BYTES];
+            let at = record.as_mut_ptr() as usize;
+            let available = match crate::sched::trace_syscall(id) {
                 Some((entry, nr, call_args, ip, sp)) => {
                     // At an exit stop the result is in the saved register file,
                     // where `syscall_exit_stop` put it - so a tracer that
@@ -1217,7 +1227,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                         .map_or(0, |regs| regs[abi::uregs::RESULT] as i64)
                         as isize;
                     abi::write_syscall_info(
-                        data,
+                        at,
                         entry,
                         nr,
                         &call_args,
@@ -1225,6 +1235,11 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                         sp,
                         if entry { 0 } else { ret },
                     );
+                    if entry {
+                        abi::SYSCALL_INFO_ENTRY_BYTES
+                    } else {
+                        abi::SYSCALL_INFO_EXIT_BYTES
+                    }
                 }
                 None => {
                     // Not a syscall stop at all. The operation byte says exactly
@@ -1243,19 +1258,27 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                     //         !info->stack_pointer) {
                     //             debug_func_msg("... signal stop mismatch");
                     //
-                    // and having rejected it, it stops asking for this
-                    // structure for the rest of the session and assumes the
-                    // stops alternate instead. That assumption is one dropped
-                    // stop away from reporting every return value as the *next*
-                    // call's number - which is exactly what it did.
+                    // where `expected_none_size` is this 24, not the 80 the
+                    // whole union needs. A larger answer is what made it stop
+                    // asking for this structure for the rest of the session,
+                    // assume the stops alternate, and report every return value
+                    // as the *next* call's number.
                     let (ip, sp) = crate::sched::trace_regs(id).map_or((0, 0), |regs| {
                         (regs[abi::uregs::IP], regs[abi::uregs::STACK])
                     });
-                    abi::write_syscall_info(data, true, 0, &[0; 6], ip, sp, 0);
-                    unsafe { (data as *mut u8).write_unaligned(abi::SYSCALL_INFO_NONE) };
+                    abi::write_syscall_info(at, true, 0, &[0; 6], ip, sp, 0);
+                    unsafe { (at as *mut u8).write_unaligned(abi::SYSCALL_INFO_NONE) };
+                    abi::SYSCALL_INFO_NONE_BYTES
                 }
+            };
+            let copy = core::cmp::min(addr, available);
+            if !buffer_ok(data, copy, true, from_user) {
+                return err::EFAULT;
             }
-            abi::SYSCALL_INFO_BYTES as isize
+            unsafe {
+                core::ptr::copy_nonoverlapping(record.as_ptr(), data as *mut u8, copy);
+            }
+            available as isize
         }
         abi::PTRACE_SETOPTIONS => {
             // The bits this kernel understands. A request naming one it does
@@ -1856,8 +1879,11 @@ pub(super) fn handle_execve(
 /// time only when it does.
 pub(super) fn handle_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let req = args[0];
+    // Linux's `get_timespec64` on a NULL request is `EFAULT`, not a successful
+    // sleep of no time. Answering zero here told a caller that asked nothing
+    // that it had waited - the one shape this ABI must never produce.
     if req == 0 {
-        return 0;
+        return err::EFAULT;
     }
     sleep_for_timespec(req, args[1], from_user)
 }
@@ -1885,7 +1911,7 @@ pub(super) fn handle_clock_nanosleep(args: [usize; ARG_COUNT], from_user: bool) 
         return err::EINVAL;
     }
     if req == 0 {
-        return 0;
+        return err::EFAULT;
     }
     // `clock_nanosleep(clk_id, flags, req, rem)` - the remainder rides in the
     // fourth argument, one along from `nanosleep`'s.
@@ -1915,8 +1941,8 @@ fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
     }
     let (tv_sec, tv_nsec) = unsafe {
         (
-            (req as *const i64).read_unaligned() as u64,
-            ((req + 8) as *const i64).read_unaligned() as u64,
+            (req as *const i64).read_unaligned(),
+            ((req + 8) as *const i64).read_unaligned(),
         )
     };
     // The `tv_nsec < 1s` check and the truncate-to-milliseconds fold are the
@@ -2362,7 +2388,7 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
             // half and with the two doors that carry a record. Measured on a
             // current host first (`.workbuddy/probe_killperm.c`): uid 1000's
             // `kill(1, 0)` is `EPERM`, while its own child's is 0.
-            if !crate::sched::may_signal(target) {
+            if !crate::sched::may_signal(sig as u8, target) {
                 return err::EPERM;
             }
             if crate::sched::send_signal(target, sig as u8) {
@@ -2653,7 +2679,7 @@ pub(super) fn handle_pidfd_send_signal(args: [usize; ARG_COUNT], from_user: bool
             crate::sched::GroupSend::Delivered => 0,
         };
     }
-    if !crate::sched::may_signal(id) {
+    if !crate::sched::may_signal(sig as u8, id) {
         return err::EPERM;
     }
     let target = if flags & THREAD != 0 {
@@ -3757,7 +3783,7 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
         // alarm-style use - then reads as "disarm": the timer is never armed
         // and whatever waited on it waits forever.
         let (isec, iusec, vsec, vusec) = unsafe {
-            let word = |n: usize| (new_ptr as *const u64).add(n).read_unaligned();
+            let word = |n: usize| (new_ptr as *const i64).add(n).read_unaligned();
             (word(0), word(1), word(2), word(3))
         };
         // The `tv_usec < 1s` checks and the round-up fold into milliseconds

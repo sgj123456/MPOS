@@ -3,10 +3,10 @@
 //! Pinned here, per umask(2): the call answers what the mask *was* while
 //! storing what it is given, so a program can save and restore it; the mask
 //! is the bits a create must clear out of the mode it was asked for, so a
-//! create of `0666` under `0077` arrives `0600`; and only the low twelve
-//! bits survive - those are all a mode has, and `umask(017777)` leaves
-//! `07777` behind on the next read. The mask is the process's own, which is
-//! the reason the test restores it on the way out.
+//! create of `0666` under `0077` arrives `0600`; and only the low nine
+//! bits (`0777`) survive - those are the permission bits a mode has, and
+//! `umask(017777)` leaves `0777` behind on the next read. The mask is the
+//! process's own, which is the reason the test restores it on the way out.
 //!
 //! # The word above the twelve is the whole reason this one is subtle
 //!
@@ -92,8 +92,8 @@ fn main() {
         umask(Mode::from_bits_retain(0o17777)).bits() == 0o077,
     );
     r.check(
-        "the mask kept only its low twelve bits",
-        umask(Mode::empty()).bits() == 0o7777,
+        "the mask kept only its low nine bits",
+        umask(Mode::empty()).bits() == 0o777,
     );
 
     // The mask is process state, not machine state: put back what was found.

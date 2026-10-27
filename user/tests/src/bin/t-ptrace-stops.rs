@@ -45,13 +45,16 @@ struct SyscallInfo {
 }
 
 fn ptrace(
-    request: libc::c_int,
+    // `libc::ptrace`'s first parameter is `c_int` on musl and `c_uint` on
+    // glibc; the wrapper takes the wider one and casts at the call, so this
+    // program builds for both the guest (musl) and the host runner (gnu).
+    request: libc::c_uint,
     pid: libc::pid_t,
     addr: *mut libc::c_void,
     data: *mut libc::c_void,
 ) -> isize {
     // SAFETY: each caller passes the argument word its request documents.
-    unsafe { libc::ptrace(request, pid, addr, data) as isize }
+    unsafe { libc::ptrace(request as _, pid, addr, data) as isize }
 }
 
 fn info_of(child: libc::pid_t) -> Option<SyscallInfo> {
@@ -65,7 +68,7 @@ fn info_of(child: libc::pid_t) -> Option<SyscallInfo> {
     };
     let size = core::mem::size_of::<SyscallInfo>();
     let answer = ptrace(
-        PTRACE_GET_SYSCALL_INFO as libc::c_int,
+        PTRACE_GET_SYSCALL_INFO,
         child,
         size as *mut libc::c_void,
         &mut info as *mut SyscallInfo as *mut libc::c_void,
@@ -83,7 +86,7 @@ fn main() {
         // it touches outlives it.
         unsafe {
             libc::ptrace(
-                libc::PTRACE_TRACEME as libc::c_int,
+                libc::PTRACE_TRACEME as _,
                 0,
                 core::ptr::null_mut::<libc::c_void>(),
                 core::ptr::null_mut::<libc::c_void>(),
@@ -104,7 +107,7 @@ fn main() {
     let mut status: libc::c_int = 0;
     let _ = unsafe { libc::waitpid(child, &mut status, 0) };
     let _ = ptrace(
-        libc::PTRACE_SETOPTIONS,
+        libc::PTRACE_SETOPTIONS as libc::c_uint,
         child,
         core::ptr::null_mut::<libc::c_void>(),
         libc::PTRACE_O_TRACESYSGOOD as usize as *mut libc::c_void,
@@ -114,7 +117,7 @@ fn main() {
     let mut entries = 0;
     loop {
         if ptrace(
-            libc::PTRACE_SYSCALL,
+            libc::PTRACE_SYSCALL as libc::c_uint,
             child,
             core::ptr::null_mut(),
             core::ptr::null_mut(),
@@ -154,7 +157,7 @@ fn main() {
         }
         if entries >= 6 || stops >= 24 {
             let _ = ptrace(
-                libc::PTRACE_KILL,
+                libc::PTRACE_KILL as libc::c_uint,
                 child,
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),

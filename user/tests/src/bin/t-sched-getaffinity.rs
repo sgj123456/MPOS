@@ -62,7 +62,10 @@ fn main() {
             .skip(1)
             .take(width.saturating_sub(1))
             .all(|&b| b == 0)
-            || cfg!(target_env = "musl") && mpos_user_tests::host_run(),
+            // The host build here is glibc, not the musl the payload uses, and
+            // a real Linux fills the rest of the mask with every online CPU.
+            // The one-CPU shape is this kernel's; a host run accepts its own.
+            || mpos_user_tests::host_run(),
     );
 
     // The pid argument does not steer anything here: -1 answers just like 0

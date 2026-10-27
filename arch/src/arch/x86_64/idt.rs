@@ -344,9 +344,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // that make that safe - how far below `rsp`, and how far down in total -
     // live with the stack itself; here all that matters is that the fault is
     // at a user address and the process was running when it happened.
-    if user_address
-        && crate::hal::kernel::resolve_stack_growth(addr, frame.stack_pointer.as_u64() as usize)
-    {
+    if user_address && crate::hal::kernel::resolve_stack_growth(addr) {
         return; // The page is there now; the instruction retries.
     }
 
@@ -360,7 +358,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         // Still extends the stack when the fault is a push past the mapped
         // end - the same call, moved here so its answer can be printed with
         // the rest of what the page tables say.
-        if crate::hal::kernel::resolve_stack_growth(addr, frame.stack_pointer.as_u64() as usize) {
+        if crate::hal::kernel::resolve_stack_growth(addr) {
             return; // The page is there now; the instruction retries.
         }
         crate::hal::kernel::send_signal(11);

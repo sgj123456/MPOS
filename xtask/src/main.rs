@@ -11,6 +11,7 @@ mod depgraph;
 mod disk;
 mod fat;
 mod gates;
+mod hosttest;
 mod initramfs;
 mod paths;
 mod qemu;
@@ -124,6 +125,10 @@ enum Commands {
     /// Run the self-tests: host unit tests plus the user test programs
     /// `tests.toml` selects, booted in QEMU from a test initramfs
     Test,
+    /// Run every `t-*` user test program on the **host** (against this Linux
+    /// kernel, not mpos). Builds the suite for the host target and reports each
+    /// program's answer; refuses to run as root.
+    TestHost,
     /// Measure the kernel's module graph and check it against the ratchet
     /// (NOTES.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
@@ -141,6 +146,7 @@ impl Commands {
             Commands::Run => "run",
             Commands::All => "all",
             Commands::Test => "test",
+            Commands::TestHost => "test-host",
             Commands::Depgraph => "depgraph",
             Commands::Clean => "clean",
         }
@@ -262,7 +268,11 @@ fn main() -> Result<()> {
     };
 
     let needs_root = match cli.command {
-        Commands::Build | Commands::Disk | Commands::Test | Commands::Depgraph => false,
+        Commands::Build
+        | Commands::Disk
+        | Commands::Test
+        | Commands::TestHost
+        | Commands::Depgraph => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         // Root only where the pipeline needs to *exec* the tree it just laid:
         // the first machine's applet farm is `chroot <staging> /bin/busybox
@@ -458,6 +468,7 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
         // `--groups`/`--all-groups` mean the same thing on either arm, and what
         // a plain sweep leaves out it leaves out on both (§15.38).
         Commands::Test => selftest::run(build_dir, profile, &targets, tests),
+        Commands::TestHost => hosttest::run(build_dir),
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
         Commands::Clean => utils::clean(build_dir),
     }

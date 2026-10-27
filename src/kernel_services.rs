@@ -60,8 +60,8 @@ impl Kernel for Services {
         sched::resolve_anon_fault(virt, write)
     }
 
-    fn resolve_stack_growth(&self, addr: usize, sp: usize) -> bool {
-        sched::resolve_stack_growth(addr, sp)
+    fn resolve_stack_growth(&self, addr: usize) -> bool {
+        sched::resolve_stack_growth(addr)
     }
 
     fn kernel_lazy_accessible(&self, virt: usize, write: bool) -> bool {

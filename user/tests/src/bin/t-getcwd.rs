@@ -81,8 +81,8 @@ fn main() {
     let mut tiny = [0u8; 1];
     let answer = getcwd(&mut tiny);
     r.check(
-        "a one-byte buffer answers EINVAL",
-        answer.is_null() && last_errno() == libc::EINVAL,
+        "a one-byte buffer answers ERANGE",
+        answer.is_null() && last_errno() == libc::ERANGE,
     );
 
     // A buffer too small for the path plus its NUL answers ERANGE.

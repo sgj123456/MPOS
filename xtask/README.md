@@ -112,6 +112,7 @@ cargo xtask [global flags] <command>
 | `run` | run | 在 QEMU 中启动该机器的镜像；若产物过期会先自动重建（只改了内核/loader/initramfs → 只刷新引导文件，不重装包） | boot that machine's image in QEMU, rebuilding first if stale (a kernel/loader/initramfs change refreshes the boot files alone — no package install) | 视情况 when needed |
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
 | `test` | test | 自测：宿主单元测试一次 + 对**默认两台机器各跑同一套 sweep**（`--arch` 收窄到一台，`--no-all-targets` 是旧的单机默认）。每台机器同一条 lanes、同一块实时面板（`tui::Panel`）、同一份报告：payload 的载体是唯一差别——第一台的 boot 归档就是它的根（lane 的 QEMU 走完写 debug-exit 33），第二台各 lane 铺自己的盘、跑完打印 `=== END` 由 harness 停机。选哪些程序是同一条规则——一份 `tests.toml` 同时回答两台机器：不属于任何分组、或属于本次点名的分组的程序才跑，唯一不能按名点的是机器自己的 `gaps`；两台机器都不可能静默跑另一台 | self-test: host unit tests once + the **same sweep on both machines by default** (`--arch` narrows to one, `--no-all-targets` is the old single-machine default). Each machine runs the same lanes, the same live dashboard (`tui::Panel`) and the same report; the payload's channel is the only difference — the first machine's boot archive *is* its root (a lane ends on the debug exit 33), the second lays its own disk per lane and ends on `=== END`, stopped by the harness. The *selection* is one rule — one `tests.toml` answers both machines: a program runs when it is in no group or in a group the run asked for, and the only group neither may ask for is a machine's own `gaps`. Neither arm can silently boot the other machine | 否 no |
+| `test-host` | test-host | 在**宿主机**（真实 Linux 内核）上跑全部 `t-*`：为 `x86_64-unknown-linux-gnu` 构建 `mpos-user-tests`，逐个执行，输出留在 `build/test-host/<name>.log`。**不是 mpos 门禁**——它量的是宿主内核；依赖 root、guest 设备或 mpos 专属 `/proc` 行的程序会失败，那正是它要显示的东西。拒绝以 root 运行（`t-reboot-libc` 会真的重启本机）；每个程序独立进程组与工作目录 | run every `t-*` on the **host** (the real Linux kernel): build `mpos-user-tests` for `x86_64-unknown-linux-gnu`, execute each program, keep its output under `build/test-host/<name>.log`. **Not the mpos gate** — it measures the host; programs that expect root, the guest's devices or mpos-only `/proc` rows fail, which is what it is there to show. Refuses to run as root (`t-reboot-libc` would really reboot the machine); each program gets its own process group and working directory | 否 no |
 | `depgraph` | depgraph | 重新测量内核模块图并对照 Phase 11 的棘轮：任何新增的向上依赖或增长的计数都会让命令失败（它同时是一个宿主测试，`cargo xtask test` 会跑到） | re-measure the kernel's module graph against the Phase-11 ratchet; fails when an upward edge appears or a count grows (also a host test, so `test` runs it) | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
@@ -124,6 +125,8 @@ cargo xtask [global flags] <command>
 | `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里**整次扫描**的最长时间（默认 900）：各 lane 共用这一个预算，任一 lane 超时就整体失败 | the **whole sweep's** budget for `test` (default 900s): the lanes share it, and a lane that outlives it fails the run |
 | `MPOS_TEST_LANES` | 台 machines | `test` 同时启动几台测试机（默认：每个宿主核心一台，最多 6 台；`1` 就是串行扫描）。每台是一整台机器（`machine.toml` 的 vCPU 与内存上限），程序按**上一次扫描测出的耗时**从长到短分配（表在 `build/test-costs-x86_64.tsv`；没有表时按数量均分） | how many test machines `test` boots at once (default: one per host core, at most 6; `1` is the serial sweep). Each lane is a whole machine (`machine.toml`'s vCPU and memory ceiling), and the programs are dealt longest-first from **the previous sweep's measured costs** (the table is `build/test-costs-x86_64.tsv`; with no table they are dealt evenly by count) |
 | `MPOS_TEST_TUI` | `0` | 关掉 `test` 的实时面板（默认只在 stdout 是终端时画；重定向、管道、CI 自动是纯文本） | turn off `test`'s live panel (`0`); the panel is only drawn when stdout is a terminal, so a redirect, a pipe or CI is plain text anyway |
+| `MPOS_HOST_TEST_FILTER` | 子串 substring | 仅 `test-host`：只跑名字含该子串的程序。本地调试用；命令本身默认跑**全部** `t-*` | `test-host` only: run the programs whose name contains this substring. Local debugging; the command runs **every** `t-*` by default |
+| `MPOS_HOST_TEST_TIMEOUT_SECS` | 秒 seconds | 仅 `test-host`：覆盖 `tests.toml` 给每个程序的预算（临时逃生口；正常配置写在文件里）；超时按整个进程组终止 | `test-host` only: override every per-program budget from `tests.toml` (a temporary escape hatch; normal configuration lives in the file); a timeout kills the whole process group |
 | `MPOS_BUILD_DIR` | path | 默认构建目录 | default build directory |
 | `PROFILE` | name | 默认构建档 | default profile |
 
@@ -186,6 +189,8 @@ cargo xtask run --mode mirror     # 窗口和终端同时看到控制台 | both 
 # 跑完整自测 | full self-test
 cargo test  -p mpos --lib --target x86_64-unknown-linux-gnu   # 只跑宿主单测
 cargo xtask test        # 宿主单测 + 虚拟机内的用户测试程序
+cargo xtask test-host   # 在宿主 Linux 内核上跑全部 t-*（对照，不是门禁）
+MPOS_HOST_TEST_FILTER=t-mount cargo xtask test-host   # 只跑名字含 t-mount 的
 
 # 看模块依赖有没有长回去 | check the module graph has not grown back
 cargo xtask depgraph    # 打印模块边与互指模块对，越过棘轮就失败
@@ -331,6 +336,32 @@ it of its own `gaps`, because its payload was not always the same set of
 programs the first machine's was. What was skipped is printed group by group,
 and the verdict check only requires a `=== PASS` from the programs that were
 staged — so "N built" and "M left out" are both said out loud.
+
+### 每个程序的超时 | per-program timeouts
+
+`timeout` 是每个程序允许运行的秒数（出厂 120），`timeouts` 给个别程序自己的预算：
+
+```toml
+[default]
+timeout = 120
+timeouts = ["t-fill-ramfs=600"]
+```
+
+超时后 runner 杀掉该程序、打印 `=== FAIL <name> timeout=<n>s`，然后**继续跑同一条 lane
+里的下一个**。没有它时，一个卡住的程序会耗掉 lane 的 900 秒预算，排在它后面的程序一个都不
+会跑。这是诚实失败而不是跳过：该程序计入 `fail`，门禁仍然红，只是红得有名有姓且不掩盖其
+余结果。两台机器按各自段里的值取（机器自己的 `timeout`/`timeouts` 覆盖基线），
+`cargo xtask test-host` 读同一份值，所以宿主与 guest 的预算不会各写一套。超时是「一个程序
+的预算」而不是「一次扫描的预算」——整轮的 900 秒仍是 `MPOS_TEST_TIMEOUT`。
+
+`timeout` is the seconds one program may run (120 as shipped), and `timeouts`
+gives individual programs their own budget. On expiry the runner kills the
+program, prints `=== FAIL <name> timeout=<n>s`, and **carries on with the next
+program in the same lane** — without it, one stuck program spends the lane's
+900-second budget and every program behind it never runs. The failure is named
+rather than hidden: it counts in `fail` and the gate is still red. Each machine
+reads its own section's values, and `cargo xtask test-host` reads the same ones,
+so the host and the guest cannot drift apart.
 
 ---
 
@@ -498,6 +529,6 @@ as `weston` has a marker nothing reads any more; each costs the one refresh, and
 | 烘焙的运行模式 | baked run mode | `build/console.mode` / `build/aarch64-console.mode`——缓存镜像里 `mpos.cmdline` 说的是哪个模式，好让 `run` 不必提权去读 | a cache of the mode `mpos.cmdline` already carries, so `run` need not take root to look |
 | initramfs | initramfs | `build/initramfs.tar`（`--arch aarch64` 是 `build/aarch64-initramfs.tar`） | `--arch aarch64` gets `build/aarch64-initramfs.tar` |
 | 固件变量副本 | firmware vars | `build/OVMF_VARS.4m.fd` / `build/AAVMF_VARS.fd` | per machine |
-| 测试串口日志 | test serial log | x86_64 扫描：`build/test-serial.log` 是**各 lane 按序拼接**的整条线（跑完才写入，因此不能边跑边 tail），每台的原始日志在 `build/test-lane-<n>/serial.log`；aarch64 扫描与任何 headless 启动：`build/aarch64-serial.log` | the x86_64 sweep's `build/test-serial.log` is the whole wire, **lane by lane** (written once the run ends, so it cannot be tailed live); each machine's own log is `build/test-lane-<n>/serial.log` - the aarch64 sweep and any headless boot keep `build/aarch64-serial.log` |
-| 扫描启动盘 | sweep medium | `build/aarch64-sweep.img` + `build/aarch64-sweep.stamp`——`test --arch aarch64` 自己的盘（载荷铺在根分区上），与 `run` 装好的镜像分开，互相不覆盖 | `test --arch aarch64`'s own disk (its payload staged on the root partition), separate from the image `run` installs |
+| 测试串口日志 | test serial log | 扫描的合并日志：`build/test-serial.log`（x86_64）/ `build/aarch64-test-serial.log`（aarch64），都是**各 lane 按序拼接**的整条线（跑完才写入，因此不能边跑边 tail）；每台的原始日志在 `build/test-lane-<arch>-<n>/serial.log`；任何 headless `run` 是 `build/aarch64-serial.log` | each sweep's combined wire is `build/test-serial.log` (x86_64) / `build/aarch64-test-serial.log` (aarch64), **lane by lane** (written once the run ends, so it cannot be tailed live); each lane's own log is `build/test-lane-<arch>-<n>/serial.log`; a headless `run` keeps `build/aarch64-serial.log` |
+| 扫描启动盘 | sweep medium | `build/aarch64-sweep.img` + `build/aarch64-sweep.stamp`——`test --arch aarch64` 自己的盘（载荷铺在根分区上），与 `run` 装好的镜像分开，互相不覆盖；所有 lane **共用这一份**，各自以 `snapshot=on` 启动，写入落在该 lane 的私有 overlay 里 | `test --arch aarch64`'s own disk (its payload staged on the root partition), separate from the image `run` installs; **one file shared by every lane**, each booting it through `snapshot=on` so a lane's writes land in that lane's private overlay |
 | aarch64 内核与 loader | aarch64 kernel + loader | `target/aarch64-unknown-none/<profile>/mpos`、`target/aarch64-unknown-uefi/<profile>/mpos-boot.efi`（`build`/`all`/`run`/`test --arch aarch64`） | built by `build`/`all`/`run`/`test --arch aarch64` |

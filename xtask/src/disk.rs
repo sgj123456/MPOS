@@ -220,7 +220,7 @@ pub fn blk_image(build_dir: &Path, arch: Arch) -> PathBuf {
 }
 
 /// Writes the pattern image unless it is already there.
-fn ensure_pattern_image(build_dir: &Path, arch: Arch) -> Result<()> {
+pub fn ensure_pattern_image(build_dir: &Path, arch: Arch) -> Result<()> {
     let path = blk_image(build_dir, arch);
     if path.exists() {
         return Ok(());
@@ -510,24 +510,13 @@ pub fn sweep_medium(build_dir: &Path, into: &Path, arch: Arch, boot: &Boot<'_>) 
         disk_bytes,
         cmdline,
     } = *boot;
-    // The block check's fixture, laid here rather than by the caller: the wiring
-    // attaches it to *every* boot of this machine (`qemu::boot_args`), and a
-    // sweep on a fresh tree has no `disk`/`rootfs` run behind it to have written
-    // the file. It is a known 1 MiB pattern, so laying it once and reusing it is
-    // the whole cost.
-    // Everything named below lands in `into`, which is the machine's own
-    // medium directory: the sweep's single medium lays it in `build/`, and a
-    // lane lays its own beside its own serial log, so two lanes' disks and the
-    // disks their programs write to (the SATA file, the pattern image) cannot
-    // meet. The *inputs* stay shared in `build/` - the initramfs below is one
-    // archive however many media stage it.
-    ensure_pattern_image(into, arch)?;
-    // The SATA disk, for exactly the same reason: `virt_machine_args` attaches
-    // an AHCI controller to every boot of the second machine, and a sweep on a
-    // fresh tree has no `disk`/`rootfs` run behind it either. Laid *fresh*
-    // rather than merely ensured, because this sweep's own programs write to it
-    // (`reset_sata_image` says why the two are not the same question).
-    reset_sata_image(into)?;
+    // Everything named below lands in `into`, which is the medium's own
+    // directory. A sweep passes `build/` and gets **one** medium shared by every
+    // lane: its contents depend only on the payload (identical for all lanes),
+    // and the lanes' private writable state - the SATA disk and the block
+    // pattern - is laid beside each lane by the caller, where the QEMU wiring
+    // looks for it. A per-lane medium would be one copy of the same 250 MB per
+    // lane, which is the cost this split exists to refuse.
     let disk = medium(into, arch).with_extension("img");
     // Hoisted above the check because it is an *input* to it: `ensure_path` is
     // itself cached, and when it does rebuild the archive the new mtime is
@@ -641,6 +630,26 @@ pub fn sweep_medium(build_dir: &Path, into: &Path, arch: Arch, boot: &Boot<'_>) 
     fs::write(&stamp, medium_fingerprint(entries, disk_bytes, cmdline))?;
 
     Ok(disk)
+}
+
+/// Remove the per-lane medium an older sweep laid in `dir`.
+///
+/// The medium is one shared file in `build/` now; before that change every lane
+/// kept its own copy under these names. A tree that ran the old layout still
+/// holds them - six copies of the same 250 MB image - and nothing reads them any
+/// more, so removing them on sight is the one migration this layout needs. It is
+/// silent on a clean tree.
+pub fn remove_legacy_lane_medium(dir: &Path, arch: Arch) {
+    for file in [
+        medium(dir, arch).with_extension("img"),
+        ext4_image(dir, arch),
+        esp_image(dir, arch),
+        medium_stamp(dir, arch),
+    ] {
+        let _ = fs::remove_file(file);
+    }
+    let _ = fs::remove_dir_all(esp_dir(dir, arch));
+    let _ = fs::remove_dir_all(ext4_staging(dir, arch));
 }
 
 /// The record beside a sweep's disk image that says what went into it.

@@ -1217,17 +1217,18 @@ fn main() {
             "connect to a bound, unlistened name is ECONNREFUSED",
             c == Err(Errno::CONNREFUSED),
         );
-        // An unconnected unix socket reads as ENOTCONN - the answer the file
-        // doors owe a socket whose channel is not there. On a host where the
-        // connect above *succeeded*, the socket is connected and its read
-        // waits for bytes instead: the claim belongs to the refused case, so
-        // it is pinned on the payload and named away under MPOS_ON_HOST with
-        // this measurement beside it.
+        // An unconnected unix socket reads as `EINVAL`, not `ENOTCONN`:
+        // measured on a host first (`read` on a fresh `AF_UNIX`/`SOCK_STREAM`
+        // answers 22, while `getpeername` below answers 107). The read door
+        // has no peer to name, and Linux's socket layer says so as an invalid
+        // argument. On a host where the connect above *succeeded*, the socket
+        // is connected and its read would be the ordinary EAGAIN instead, so
+        // the claim belongs to the refused case and is named away there.
         let mut sink = [0u8; 4];
         let rd = read(reacher, &mut sink);
         r.check(
-            "read on an unconnected socket answers ENOTCONN",
-            mpos_user_tests::host_run() || matches!(&rd, Err(e) if *e == Errno::NOTCONN),
+            "read on an unconnected socket answers EINVAL",
+            matches!(&rd, Err(e) if *e == Errno::INVAL) || mpos_user_tests::host_run(),
         );
         let gp = getpeername(reacher);
         r.check(

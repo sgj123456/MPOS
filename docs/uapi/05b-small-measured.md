@@ -626,7 +626,9 @@ Section numbers are unchanged from the original `UAPI.md`.
   `O_LARGEFILE`, which this kernel neither defines nor invents (`t-open-flags` pins that it is
   ignored on both machines), and the three bits `SETFL_MASK` is narrower by - `O_ASYNC`,
   `O_DIRECT` and `O_NOATIME` are **reported** when an open asked for them but cannot be *set*
-  through `F_SETFL`, where Linux's mask allows all three. A caller that compares the whole word
+  through `F_SETFL`, where Linux's mask allows all three. (`O_NOATIME` itself is served now -
+  the open consults it and the read path honours it, item 108 - it is only `F_SETFL` that cannot
+  set it here.) A caller that compares the whole word
   against what it opened with now agrees on everything it can ask for, which is what `rustix::fs`'s
   `Dir` and any reopened `/proc/self/fd` entry read it for. Owner: `src/vfs/file.rs`'s
   `File::born`/`set_born` and `open_flags`, set at the one open path. `docs/notes/` §15.16,

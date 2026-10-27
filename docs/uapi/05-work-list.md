@@ -4870,12 +4870,28 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     aarch64 `pass=192 fail=0` (192 staged, 14 left out by `tests.toml`),
     `mpos-kunit 32 passed, 0 failed`. Host unit suite 586, xtask 139.
 
-    **Named**: `SIGCONT`'s session clause (Linux also requires the sender and
-    target to share a session when the target is in another thread group;
-    this kernel has process groups standing in for sessions), and `kill(-1)`
-    still means the caller's own group rather than every signalable process -
-    the interpretation the door already carried, now filtered by the same
-    rule.
+    **The `SIGCONT` session clause landed on 2026-10-27** (item 91's last named
+    clause). Linux's `check_kill_permission` lets a caller the ids and the
+    capability both refuse send a **continuation** to a process of its own
+    session, and nothing else. Measured on a current host
+    (`.workbuddy/probe_sigcont_session.c`, Linux 7.2.11, a container's root so
+    the uid drop is reachable): a 65534 child of a root parent reads `EPERM`
+    from `kill(…,0)` and `kill(SIGUSR1)` but `0` from `kill(SIGCONT)`,
+    `tgkill(SIGCONT)` and `rt_sigqueueinfo(SIGCONT)` while the two share a
+    session, and `EPERM` from all of them after the child `setsid`s; a caller
+    the ids allow reads `0` in either session. Served by
+    `sched::may_signal(sig, target)` (the signal is now part of the question,
+    because every door asks it) with the clause after the uid and capability
+    halves. Pin: `t-signal-permission` 12 -> **23 claims**, its old
+    `rt_sigqueueinfo(SIGCONT)` expectation corrected from `EPERM` to `0` (that
+    expectation was the divergence), plus both sessions of all three doors and
+    a `SIGUSR1` control. Counterfactual (the clause removed): exactly the three
+    same-session claims red. `kill(-1)` was named here too and landed in item
+    106 - every signalable process rather than the caller's own group.
+
+    **Named**: *which* thread runs a handler is still the delivery path's
+    choice rather than Linux's `signal_wake_up` scan; the handler table itself
+    is the thread group's one object now under `CLONE_SIGHAND` (§2.7).
 
 ## item 92 — a pidfd names a process, not a number
 
@@ -5226,9 +5242,17 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `mpos-kunit 32 passed, 0 failed`, exit 0. The reasoning and the counterfactual
     detail are §2.7.
 
-    **Named**: a thread's table is still a copy, not Linux's shared
-    `CLONE_SIGHAND` table; the kernel-spawned program path (`load.rs`) still
-    starts at `SIG_DFL`, which is not a user `exec` and is not claimed as one.
+    **The thread table became one object on 2026-10-27**: `CLONE_SIGHAND`
+    (implied by `CLONE_THREAD`, legal beside `CLONE_VM` alone) hands the child
+    the same `Arc<signal::SignalHand>`, a plain `fork` copies it,
+    `CLONE_CLEAR_SIGHAND` starts at `SIG_DFL`, and `exec` unshares before it
+    resets. Measured on a current host first
+    (`.workbuddy/probe_thread_sighand.c`, Linux 7.2.11); pin: `t-thread-sighand`,
+    7 claims on both machines (green there first); counterfactual (the thread
+    path copying again) reddens exactly the two sharing claims. Named: the
+    non-thread `clone(CLONE_SIGHAND)` door is unpinned (a raw child needs the
+    per-machine `clone` argument order), and the kernel-spawned program path
+    (`load.rs`) still starts at `SIG_DFL`, which is not a user `exec`.
 
 ## item 97 — a write to a broken channel is `EPIPE`, and the signal behind it
 
@@ -5883,3 +5907,37 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     still true and still pinned); the *slot* fallback in `pid_answer` survives
     for a record made before the chains were kept and for a stray task outside
     the caller's chain, which no door in the ABI can reach.
+
+## item 108 — a read moves the access clock, `relatime` decides when, and `O_NOATIME` is a promise
+
+    `ext4` carried `i_atime` and bumped it inside `read_at`, under a condition of
+    its own; `ramfs` folded the access clock into `mtime`; and `O_NOATIME` was
+    accepted, reported by `F_GETFL`, and consulted by nothing. Three
+    measurements on a current host (`.workbuddy/probe_atime.c`, Linux 7.2.11;
+    the uid-drop in a container's root) settled what the rule is:
+
+    * **relatime compares `<=` and asks mtime**: a freshly created file's first
+      read **does** move atime, where `atime < ctime` (the old body) said no;
+    * **tmpfs is strictatime**: an atime written into the future is pulled back
+      to the read's moment, where an ext4 mount leaves it standing;
+    * **`O_NOATIME` suppresses the update and is refused with `EPERM`** to a
+      caller that neither owns the file nor holds `CAP_FOWNER`, at the open and
+      after `may_open`'s `EISDIR`/access answers.
+
+    **Owner**: `src/vfs/mod.rs`'s `Inode::touch_atime` (default `Ok(())`) and
+    `now_seconds`; `src/vfs/file.rs`'s `File::read` (the one read door, behind
+    the `O_NOATIME` check) and its `O_NOATIME`; `src/vfs/ext4/mod.rs`'s relatime
+    body; `src/vfs/ramfs.rs`'s three clocks and strictatime body;
+    `src/syscall/linux/fs/file.rs`'s open authority check.
+
+    **Pin**: the new `t-atime`, 7 claims on both machines (host Linux first),
+    plus the rewritten `vfs::ext4` host test for the relatime half - the sweep
+    machine has no disk. Counterfactuals: the read call deleted reddens exactly
+    the three moving claims; `O_NOATIME` ignored plus the authority check
+    deleted reddens exactly the two `O_NOATIME` claims.
+
+    **Named**: a mount's `noatime`/`strictatime` options are not parsed (the
+    policy is each driver's default, relatime for ext4 and strictatime for
+    ramfs); `F_SETFL` still cannot set `O_NOATIME` (Linux's mask can, and
+    `docs/uapi/` §5.2 already carries that narrower mask); ramfs's directory,
+    symlink, socket and device nodes still fold atime into mtime.

@@ -17,6 +17,12 @@
 //! machine's half is *added* to the baseline's list of the same name rather than
 //! replacing it - a group is a list of names, and taking a name away from one
 //! machine is what another group is for.
+//!
+//! Two keys there are not groups: `timeout` is the per-program budget in
+//! seconds, and `timeouts` gives individual programs their own. They answer one
+//! question the groups cannot - *how long a program may hold its lane* - and the
+//! value is read by both the guest runner (through the host share) and
+//! `cargo xtask test-host`, so there is one budget rather than two that drift.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -434,7 +440,35 @@ pub struct TestConfig {
     default: Vec<String>,
     /// Every group the file declares, with the machine whose section wrote it.
     groups: Vec<Group>,
+    /// The per-program budgets, in the order the file wrote them. A later entry
+    /// of the same specificity replaces an earlier one, which is the same
+    /// "last word wins" rule a hand-edited file expects; a more specific entry
+    /// beats a less specific one regardless of order.
+    timeouts: Vec<TimeoutRule>,
 }
+
+/// One `timeout`/`timeouts` entry from `tests.toml`: who it binds and how many
+/// seconds the program may run.
+///
+/// `test: None` is the section's default budget (`timeout = 120`); `Some(name)`
+/// is one program's own (`timeouts = ["t-fill-ramfs=600"]`). Keeping the
+/// machine beside both is what lets the second machine buy a longer budget for
+/// its own hardware without changing the first machine's answer.
+#[derive(Debug, Clone)]
+struct TimeoutRule {
+    machine: Option<Machine>,
+    test: Option<String>,
+    secs: u64,
+}
+
+/// The budget a program gets when `tests.toml` names none.
+///
+/// The default sweep's measured slowest program is a few seconds on either
+/// machine, so this leaves room for TCG and a busy host while still bounding a
+/// stuck program far below the 900-second lane budget. It is the same value for
+/// `test-host`: a real Linux kernel finishes the suite in the same seconds, and
+/// one number in the file is the point.
+pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 120;
 
 /// One group `tests.toml` declares: its name, the machine that owns it, and the
 /// programs in it.
@@ -516,6 +550,7 @@ impl TestConfig {
         };
         let mut default: Vec<String> = Vec::new();
         let mut groups: Vec<Group> = Vec::new();
+        let mut timeouts: Vec<TimeoutRule> = Vec::new();
         for entry in scan(&content)? {
             let machine = match entry.section.as_deref() {
                 None => anyhow::bail!(
@@ -531,6 +566,38 @@ impl TestConfig {
                      both machines read), [x86_64] and [aarch64]"
                 ),
             };
+            // The budget keys are not groups. They are read before the list
+            // split because `timeout` is a scalar and a name in `timeouts`
+            // carries its own `=` (`t-fill-ramfs=600`), which the group split
+            // would shred into two names.
+            if entry.key == "timeout" {
+                timeouts.push(TimeoutRule {
+                    machine,
+                    test: None,
+                    secs: parse_timeout_secs(&entry.key, &entry.value)?,
+                });
+                continue;
+            }
+            if entry.key == "timeouts" {
+                for item in parse_package_list(entry.value) {
+                    let Some((test, secs)) = item.split_once('=') else {
+                        anyhow::bail!(
+                            "`timeouts` entry `{item}` is not `<test>=<seconds>`; write one \
+                             program's budget as `t-fill-ramfs=600`"
+                        );
+                    };
+                    let test = test.trim();
+                    if test.is_empty() {
+                        anyhow::bail!("`timeouts` entry `{item}` names no program");
+                    }
+                    timeouts.push(TimeoutRule {
+                        machine,
+                        test: Some(test.to_string()),
+                        secs: parse_timeout_secs("timeouts", secs)?,
+                    });
+                }
+                continue;
+            }
             let value = parse_package_list(entry.value);
             if entry.key == "default" {
                 default.extend(value);
@@ -561,7 +628,40 @@ impl TestConfig {
                 .cmp(&b.name)
                 .then(section_rank(a.machine).cmp(&section_rank(b.machine)))
         });
-        Ok(Self { default, groups })
+        Ok(Self {
+            default,
+            groups,
+            timeouts,
+        })
+    }
+
+    /// The seconds `test` may run on `machine`.
+    ///
+    /// The most specific rule that matches wins: the program's own entry in
+    /// this machine's section beats the baseline's entry for that program,
+    /// which beats this machine's `timeout`, which beats the baseline's. A tie
+    /// is the file's later line, so a hand-edited override does not have to sit
+    /// in a particular place to be the one that counts. With no matching rule
+    /// the answer is [`DEFAULT_TEST_TIMEOUT_SECS`] - one number in this crate,
+    /// not an unwritten second answer in a runner.
+    pub fn timeout_secs(&self, machine: Machine, test: &str) -> u64 {
+        let mut best: Option<(u8, u64)> = None;
+        for rule in &self.timeouts {
+            if rule.machine.is_some_and(|owner| owner != machine) {
+                continue;
+            }
+            if rule.test.as_deref().is_some_and(|name| name != test) {
+                continue;
+            }
+            // Two bits: naming the program is the stronger statement, naming
+            // the machine breaks a tie between two program-wide budgets.
+            let specificity = u8::from(rule.test.is_some()) * 2 + u8::from(rule.machine.is_some());
+            if best.is_none_or(|(seen, _)| specificity >= seen) {
+                best = Some((specificity, rule.secs));
+            }
+        }
+        best.map(|(_, secs)| secs)
+            .unwrap_or(DEFAULT_TEST_TIMEOUT_SECS)
     }
 
     /// The groups a run will use: an explicit list replaces the file's
@@ -1009,6 +1109,23 @@ fn parse_package_list(list: String) -> Vec<String> {
         .map(|item| unquote(item.trim()))
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// A `timeout`/`timeouts` value in seconds.
+///
+/// Zero is refused rather than honoured: `timeout 0` would kill every program
+/// before its first instruction, which is a sweep that passes nothing and reads
+/// like a machine failure. The upper bound is deliberately absent - the lane's
+/// own 900-second deadline is what bounds the run.
+fn parse_timeout_secs(key: &str, value: &str) -> Result<u64> {
+    let secs = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("`{key}` value `{value}` is not a whole number of seconds"))?;
+    if secs == 0 {
+        anyhow::bail!("`{key}` is 0 seconds; a zero budget would kill every program at once");
+    }
+    Ok(secs)
 }
 
 #[cfg(test)]
@@ -1499,6 +1616,72 @@ qemu.gpu = \"c\"
         assert_eq!(config.group_names(Machine::Aarch64), vec!["external"]);
     }
 
+    /// The budget keys are read by the same loader, with the same section rules:
+    /// the baseline binds both machines, a machine's own line binds only that
+    /// machine, and the most specific matching rule wins.
+    #[test]
+    fn a_programs_budget_is_the_most_specific_rule_that_matches() {
+        let config = groups(
+            "timeouts",
+            "[default]\n\
+             timeout = 90\n\
+             timeouts = [\"t-slow=300\"]\n\
+             \n\
+             [aarch64]\n\
+             timeout = 180\n\
+             timeouts = [\"t-slow=600\", \"t-arm=240\"]\n",
+        );
+        // The baseline's per-program entry beats its own default on both.
+        assert_eq!(config.timeout_secs(X86, "t-slow"), 300);
+        assert_eq!(config.timeout_secs(Machine::Aarch64, "t-slow"), 600);
+        // An unlisted program gets its machine's default, and the second
+        // machine's own default does not leak to the first.
+        assert_eq!(config.timeout_secs(X86, "t-openat"), 90);
+        assert_eq!(config.timeout_secs(Machine::Aarch64, "t-openat"), 180);
+        // A program named only in the second machine's section has no budget
+        // of its own on the first - its baseline default is not an override.
+        assert_eq!(config.timeout_secs(X86, "t-arm"), 90);
+        assert_eq!(config.timeout_secs(Machine::Aarch64, "t-arm"), 240);
+    }
+
+    /// No rule at all is the built-in, not zero and not whatever the last
+    /// program happened to use.
+    #[test]
+    fn an_unwritten_budget_is_the_built_in_default() {
+        let config = groups("no-timeouts", "[default]\ndefault = []\n");
+        assert_eq!(
+            config.timeout_secs(X86, "t-openat"),
+            DEFAULT_TEST_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.timeout_secs(Machine::Aarch64, "t-openat"),
+            DEFAULT_TEST_TIMEOUT_SECS
+        );
+    }
+
+    /// A malformed budget is refused rather than turned into a number the
+    /// sweep would believe: zero kills every program, and a word is not a
+    /// budget. Both would leave a run that looks green or red for a reason
+    /// nobody wrote down.
+    #[test]
+    fn a_malformed_budget_is_refused() {
+        for (name, text) in [
+            ("zero-timeout", "[default]\ntimeout = 0\n"),
+            ("word-timeout", "[default]\ntimeout = soon\n"),
+            ("no-equals", "[default]\ntimeouts = [\"t-slow 300\"]\n"),
+            ("zero-entry", "[default]\ntimeouts = [\"t-slow=0\"]\n"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("mpos-tests-toml-{name}"));
+            let path = dir.join(crate::paths::TESTS_CONFIG);
+            std::fs::create_dir_all(path.parent().expect("a config path has a parent")).unwrap();
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                TestConfig::load(&path).is_err(),
+                "{name} was accepted as {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_flags_replace_or_extend_the_files_default() {
         let config = groups(
@@ -1581,6 +1764,18 @@ qemu.gpu = \"c\"
             assert!(
                 config.group_names(X86).contains(&group),
                 "no `{group}` group"
+            );
+        }
+        // The budget is written down, and the one program that writes 1 GiB is
+        // deliberately allowed longer than the rest. A file without the keys
+        // would still run on the built-in, so what this pins is that the shipped
+        // values are the ones a run of *this* suite gets.
+        let ordinary = config.timeout_secs(X86, "t-openat");
+        assert!(ordinary > 0);
+        for machine in [X86, Machine::Aarch64] {
+            assert!(
+                config.timeout_secs(machine, "t-fill-ramfs") > ordinary,
+                "t-fill-ramfs has no longer budget on {machine:?}"
             );
         }
         // The gap list is the second machine's, and it lives in its own section.

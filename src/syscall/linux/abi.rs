@@ -1382,10 +1382,26 @@ pub(crate) fn read_user_fpregs(at: usize) -> [u8; FPREGS_BYTES] {
 ///      }
 /// ```
 ///
-/// The union is why this is 80 bytes and not 24: the largest member decides
-/// the size, and the exit shape is written into the same 56 bytes the entry
-/// shape uses.
+/// The union is why the *buffer* is 80 bytes and not 24: the largest member
+/// decides how much a caller with room for everything may receive. It is **not**
+/// how much every stop answers: Linux returns the size up to the end of the
+/// union member this stop uses, which is why the three constants below are what
+/// a tracer compares the call's return value against, and why a buffer of 80
+/// bytes is still the right size to hand it.
 pub(crate) const SYSCALL_INFO_BYTES: usize = 80;
+
+/// What `PTRACE_GET_SYSCALL_INFO` reports as *available* at each stop kind:
+/// `offsetofend` of `arch` (24), `entry.args` (80) and `exit.is_error` (33) in
+/// the structure above.
+///
+/// Linux returns this number and truncates the copy to the caller's buffer; a
+/// short buffer is not an error (`man 2 ptrace`: "the output data is
+/// truncated"). A kernel that answered the whole 80 at a signal stop made a
+/// tracer that compares against `strace`'s `NONE` size refuse the answer; that
+/// is the deviation the pin below names.
+pub(crate) const SYSCALL_INFO_NONE_BYTES: usize = 24;
+pub(crate) const SYSCALL_INFO_ENTRY_BYTES: usize = 80;
+pub(crate) const SYSCALL_INFO_EXIT_BYTES: usize = 33;
 /// `PTRACE_SYSCALL_INFO_NONE`: the operation byte at a stop that is not a
 /// syscall boundary. A tracer reads it to tell "here are the arguments" from
 /// "there are no arguments to show you".
@@ -1409,8 +1425,12 @@ pub(crate) const AUDIT_ARCH: u32 = 0xC000_00B7;
 ///
 /// `nr`, `args`, `ip` and `sp` describe the *entry*; at an exit stop the only
 /// field with anything new to say is the return value, and the entry half is
-/// still written because the caller's buffer is 80 bytes either way and
-/// leaving it untouched would hand back whatever was there before.
+/// still written because the full 80-byte record is what this fills and
+/// leaving it untouched would hand back whatever was there before. The caller
+/// copies only as much of this record as the stop kind reports - the lengths
+/// are [`SYSCALL_INFO_NONE_BYTES`], [`SYSCALL_INFO_ENTRY_BYTES`] and
+/// [`SYSCALL_INFO_EXIT_BYTES`] - because Linux's return value is the size the
+/// stop *has*, not the size the caller asked for.
 pub(crate) fn write_syscall_info(
     at: usize,
     entry: bool,
@@ -2194,32 +2214,54 @@ pub(crate) fn reboot_command(args: [usize; crate::syscall::ARG_COUNT]) -> Result
 // The timespec-carrying calls: one validation per man page
 // ---------------------------------------------------------------------------
 
+/// Linux's `KTIME_SEC_MAX`: the whole seconds `i64::MAX` nanoseconds can name
+/// (about 292 years). `timespec64_valid`/`timeval_valid` refuse anything past
+/// it, and so do the doors below - a larger second is not "a long wait", it is
+/// an argument the kernel's own time type cannot hold.
+const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+
+/// Linux's `timespec64_valid`: a non-negative second, no larger than
+/// [`KTIME_SEC_MAX`], and a sub-second field in `[0, 1e9)`.
+///
+/// One rule for `nanosleep`, `clock_nanosleep`, `ppoll` and `timer_settime`,
+/// because Linux has one (`timespec64_valid`). It lives here so no door can get
+/// half of it: the second used to be read as `u64`, so a negative `tv_sec`
+/// became ~2^64 seconds - an endless park instead of `EINVAL` (measured
+/// 2026-10-27: `clock_nanosleep(-1 s)` slept until a signal).
+fn timespec_valid(sec: i64, nsec: i64) -> bool {
+    (0..=KTIME_SEC_MAX).contains(&sec) && (0..1_000_000_000).contains(&nsec)
+}
+
+/// Linux's `timeval_valid`: the same second rule, with a sub-second field in
+/// microseconds.
+fn timeval_valid(sec: i64, usec: i64) -> bool {
+    (0..=KTIME_SEC_MAX).contains(&sec) && (0..1_000_000).contains(&usec)
+}
+
 /// The millisecond duration `nanosleep`'s `struct timespec` names, with the
 /// man page's validation: `tv_nsec` must stay below a second. The sub-second
 /// field truncates - a request that names no whole milliseconds is a request
 /// to sleep no measurable time.
-pub(crate) fn nanosleep_ms(sec: u64, nsec: u64) -> Result<u64, isize> {
-    if nsec >= 1_000_000_000 {
+pub(crate) fn nanosleep_ms(sec: i64, nsec: i64) -> Result<u64, isize> {
+    if !timespec_valid(sec, nsec) {
         return Err(err::EINVAL);
     }
-    // Both folds saturate: a caller that hands over u64::MAX seconds asked
-    // for a wait longer than the tick count can name, and that is a long
-    // sleep, not an overflow - the tick conversion on the machine side
-    // saturates the rest of the way.
-    Ok(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
+    Ok((sec as u64)
+        .saturating_mul(1000)
+        .saturating_add((nsec as u64) / 1_000_000))
 }
 
 /// The millisecond duration a `ppoll` timeout names. `nsec` must stay below
 /// a second, and the sub-second field rounds *up*: a caller that asked for
 /// one nanosecond must not get a zero-millisecond wait, or a poll that
 /// expects "at least until then" returns early.
-pub(crate) fn ppoll_ms(sec: u64, nsec: u64) -> Result<u64, isize> {
-    if nsec >= 1_000_000_000 {
+pub(crate) fn ppoll_ms(sec: i64, nsec: i64) -> Result<u64, isize> {
+    if !timespec_valid(sec, nsec) {
         return Err(err::EINVAL);
     }
-    Ok(sec
+    Ok((sec as u64)
         .saturating_mul(1000)
-        .saturating_add(nsec.div_ceil(1_000_000)))
+        .saturating_add((nsec as u64).div_ceil(1_000_000)))
 }
 
 /// The millisecond duration a `select`/`pselect6` timeout names. `timespec`
@@ -2241,20 +2283,20 @@ pub(crate) fn select_timeout_ms(sec: u64, frac: u64, timespec: bool) -> Result<u
 /// below a second's worth. A zero value is the "disarm" answer the caller
 /// decides on, not an error.
 pub(crate) fn itimerval_ms(
-    vsec: u64,
-    vusec: u64,
-    isec: u64,
-    iusec: u64,
+    vsec: i64,
+    vusec: i64,
+    isec: i64,
+    iusec: i64,
 ) -> Result<(u64, u64), isize> {
-    if vusec >= 1_000_000 || iusec >= 1_000_000 {
+    if !timeval_valid(vsec, vusec) || !timeval_valid(isec, iusec) {
         return Err(err::EINVAL);
     }
-    let value_ms = vsec
+    let value_ms = (vsec as u64)
         .saturating_mul(1000)
-        .saturating_add(vusec.div_ceil(1000));
-    let interval_ms = isec
+        .saturating_add((vusec as u64).div_ceil(1000));
+    let interval_ms = (isec as u64)
         .saturating_mul(1000)
-        .saturating_add(iusec.div_ceil(1000));
+        .saturating_add((iusec as u64).div_ceil(1000));
     Ok((value_ms, interval_ms))
 }
 
@@ -2264,12 +2306,11 @@ pub(crate) fn itimerval_ms(
 /// immediately - the same never-early rule the other timeout conversions here
 /// keep.
 ///
-/// A negative `tv_sec`, or a `tv_nsec` outside `[0, 1e9)`, is the man page's
-/// `EINVAL`; `tv_sec` large enough to overflow the tick arithmetic saturates
-/// rather than wraps, because a caller that asks for a sleep past the end of
-/// the machine's clock has asked for "as late as possible", not "now".
+/// A negative `tv_sec`, a `tv_nsec` outside `[0, 1e9)`, or a second past
+/// [`KTIME_SEC_MAX`] is Linux's `EINVAL`; within the valid range the tick fold
+/// saturates rather than wraps, so no accumulator can overflow.
 pub(crate) fn timespec_ticks(sec: i64, nsec: i64, hz: u64) -> Result<u64, isize> {
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+    if !timespec_valid(sec, nsec) {
         return Err(err::EINVAL);
     }
     let ticks = (sec as u64).saturating_mul(hz);
@@ -2790,7 +2831,7 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
 /// because those are the bits a mode has.
 pub(crate) fn handle_umask(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     let old = crate::sched::current_umask();
-    crate::sched::set_current_umask(args[0] as u32 & 0o7777);
+    crate::sched::set_current_umask(args[0] as u32 & 0o777);
     old as isize
 }
 
@@ -3485,6 +3526,92 @@ pub fn oss_round_rate(requested: u32, supported: &[u32]) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Tests: every item above, against the man page that specifies it
 // ---------------------------------------------------------------------------
+
+/// The order `clone` takes its last two arguments in, reconciled to the one
+/// order the handler reasons in.
+///
+/// Linux's raw `clone` is the syscall whose argument list is *not* the same on
+/// every machine, and the difference has a name in the kernel: `CLONE_BACKWARDS`.
+/// x86-64's `sys_clone` is `(flags, stack, parent_tid, child_tid, tls)`; arm64's
+/// is `(flags, stack, parent_tid, tls, child_tid)`, and glibc's arm64 `__clone`
+/// carries the comment saying so ("X0:flags, x1:newsp, x2:parenttidptr,
+/// x3:newtls, x4:childtid") - it moves `tls` from the C argument's `x5` into the
+/// syscall's `x3`. So a libc on the second machine sends the thread pointer in
+/// the fourth slot, and the handler must be handed the word the other way round.
+///
+/// This is not a wrong number when it is missing, it is a *thread that does not
+/// work*: with the two words swapped, `CLONE_SETTLS` gives the child a thread
+/// pointer that is really the address of its tid word, and
+/// `CLONE_CHILD_SETTID`/`CLEARTID` park the tid at the TLS base. Measured on the
+/// second machine before this existed: `t-clone`'s `CLONE_CHILD_SETTID` claim
+/// was refused `EINVAL` (there was no tid pointer where the handler looked), the
+/// musl thread it then made faulted at `pc 0x3` on its way out - its exit path
+/// walked a TLS block that was never one - and the sweep never reached its end,
+/// because the word `pthread_join` waits on was never woken.
+///
+/// The first machine needs no swap - its order *is* the one the handler speaks -
+/// so the gate is `target_arch = "aarch64"` and not a table of machines.
+pub(super) fn clone_arguments(args: [usize; 6]) -> [usize; 6] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut swapped = args;
+        swapped.swap(3, 4);
+        swapped
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        args
+    }
+}
+
+/// The position and the advice word of a `preadv2`/`pwritev2` call, read the
+/// way *this* machine's ABI spells them.
+///
+/// The two machines do not agree on the shape, and the difference is the
+/// 32-bit `off_t` x86_64 carries for its own historical reasons: there the
+/// position arrives as two halves (`pos_l`, `pos_h`) and the advice word is
+/// the *sixth* argument, while asm-generic - aarch64 - passes the whole
+/// 64-bit position as the fourth and the advice word fifth
+/// (`preadv2(fd, iov, iovcnt, pos, flags)`, which is what musl emits on
+/// arm64). Reading one shape on both machines is wrong on one of them: the
+/// generic read on x86_64 takes the high half of the position for the flags
+/// and truncates the position to its low 32 bits, so a negative position
+/// becomes a huge positive one, the cursor spelling (`-1`) is not
+/// recognised, and every advice bit in the sixth slot is invisible - the
+/// seven claims `t-preadv2` makes about exactly those words.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn position_and_flags(args: [usize; 6]) -> (i64, usize) {
+    (position_offset(args), args[5])
+}
+
+/// The asm-generic reading: see [`position_and_flags`]'s note on the two
+/// machines.
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn position_and_flags(args: [usize; 6]) -> (i64, usize) {
+    (position_offset(args), args[4])
+}
+
+/// The position a `preadv`/`pwritev`/`preadv2`/`pwritev2` call names, which
+/// is the half of the argument shape the four calls share - only the advice
+/// word on the end differs between the `*v2` pair and the plain one, so the
+/// reading of the position lives here once.
+///
+/// x86_64 splits the 64-bit position across two 32-bit words (`pos_l` then
+/// `pos_h`) and asm-generic passes it whole; `-1` arrives as `0xffff_ffff`
+/// in each half there, and the all-ones pair *is* the offset the cursor
+/// spelling means, so the halves have to be rejoined before anything asks
+/// whether the position is negative.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn position_offset(args: [usize; 6]) -> i64 {
+    (args[3] as u32 as u64 | (args[4] as u64) << 32) as i64
+}
+
+/// The asm-generic position: one 64-bit argument, with the fourth slot left
+/// to `flags` where the `*v2` calls have one.
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn position_offset(args: [usize; 6]) -> i64 {
+    args[3] as i64
+}
 
 #[cfg(test)]
 mod tests {
@@ -4916,10 +5043,18 @@ mod tests {
             nanosleep_ms(0, 1_000_000_000),
             Err(crate::syscall::err::EINVAL)
         );
+        // Linux's `timespec64_valid`: a negative second is EINVAL, not a
+        // wrap into ~2^64 seconds (the endless park this used to be), and so
+        // is a second the kernel's time type cannot name.
+        assert_eq!(nanosleep_ms(-1, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(nanosleep_ms(0, -1), Err(crate::syscall::err::EINVAL));
         assert_eq!(
-            nanosleep_ms(u64::MAX, 999_999_999),
-            Ok(u64::MAX),
-            "saturates, never wraps"
+            nanosleep_ms(KTIME_SEC_MAX + 1, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            nanosleep_ms(KTIME_SEC_MAX, 0),
+            Ok(KTIME_SEC_MAX as u64 * 1000)
         );
     }
 
@@ -4933,10 +5068,12 @@ mod tests {
         assert_eq!(ppoll_ms(1, 1), Ok(1001));
         assert_eq!(ppoll_ms(0, 999_999_999), Ok(1000));
         assert_eq!(ppoll_ms(1, 1_000_000_000), Err(crate::syscall::err::EINVAL));
+        // The same `timespec64_valid` rule as `nanosleep`: a negative second
+        // is EINVAL rather than an endless poll.
+        assert_eq!(ppoll_ms(-1, 0), Err(crate::syscall::err::EINVAL));
         assert_eq!(
-            ppoll_ms(u64::MAX, 999_999_999),
-            Ok(u64::MAX),
-            "saturates, never wraps"
+            ppoll_ms(KTIME_SEC_MAX + 1, 0),
+            Err(crate::syscall::err::EINVAL)
         );
     }
 
@@ -4969,8 +5106,20 @@ mod tests {
             Err(crate::syscall::err::EINVAL)
         );
         assert_eq!(timespec_ticks(0, -1, HZ), Err(crate::syscall::err::EINVAL));
-        // A second count large enough to overflow saturates.
-        assert_eq!(timespec_ticks(i64::MAX, 999_999_999, HZ), Ok(u64::MAX));
+        // A second past `KTIME_SEC_MAX` is EINVAL, as Linux's
+        // `timespec64_valid` refuses it; within it, the tick fold saturates.
+        assert_eq!(
+            timespec_ticks(i64::MAX, 999_999_999, HZ),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            timespec_ticks(KTIME_SEC_MAX + 1, 0, HZ),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            timespec_ticks(KTIME_SEC_MAX, 0, HZ),
+            Ok((KTIME_SEC_MAX as u64).saturating_mul(HZ))
+        );
     }
 
     /// `select(2)`/`pselect6(2)`: the sub-second field is validated against
@@ -5021,6 +5170,13 @@ mod tests {
         );
         // A zero timer is how a caller disarms: a valid (0, 0) answer.
         assert_eq!(itimerval_ms(0, 0, 0, 0), Ok((0, 0)));
+        // The same `timeval_valid` rule: a negative second is EINVAL, not a
+        // wrap into an almost-endless timer.
+        assert_eq!(itimerval_ms(-1, 0, 0, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            itimerval_ms(0, 0, KTIME_SEC_MAX + 1, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
     }
 
     /// `prctl(2)`: the name pair round-trips through the `comm` slot - a name
@@ -5118,16 +5274,17 @@ mod tests {
     }
 
     /// `umask(2)`: the previous mask is the answer, and only the low
-    /// twelve bits of the request are kept.
+    /// nine permission bits of the request are kept.
     #[test]
-    fn umask_reports_the_previous_mask_and_keeps_twelve_bits() {
+    fn umask_reports_the_previous_mask_and_keeps_nine_bits() {
         // Init's own call, against the 0o022 the kernel starts with.
         assert_eq!(handle_umask([0o022, 0, 0, 0, 0, 0]), 0o022);
         assert_eq!(handle_umask([0o027, 0, 0, 0, 0, 0]), 0o022);
         assert_eq!(handle_umask([0, 0, 0, 0, 0, 0]), 0o027);
-        // Bits outside the mode word do not exist here.
+        // Bits above the permission word do not exist in a mask: measured on
+        // Linux 7.2.11, `umask(017777)` stores 0777.
         assert_eq!(handle_umask([0o7777, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(handle_umask([0o17777, 0, 0, 0, 0, 0]), 0o7777);
+        assert_eq!(handle_umask([0o17777, 0, 0, 0, 0, 0]), 0o777);
         // Leave the conventional 0o022 in place for whoever reads next.
         handle_umask([0o022, 0, 0, 0, 0, 0]);
     }

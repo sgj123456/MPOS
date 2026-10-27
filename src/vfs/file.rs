@@ -31,6 +31,17 @@ pub const FD_CLOEXEC: u32 = 1;
 /// timeout loop is built on.
 pub const O_NONBLOCK: u32 = 0o4000;
 
+/// The `O_NOATIME` open flag: a read through this description does not move
+/// the file's access clock. Measured on a current host
+/// (`.workbuddy/probe_atime.c`, Linux 7.2.11): a description opened with it
+/// leaves `st_atime` where the last read left the *plain* description's, and a
+/// caller that is neither the file's owner nor holds `CAP_FOWNER` may not ask
+/// for it (`EPERM` at the open, before any read).
+///
+/// It is the same number on both machines (`asm-generic`'s), unlike the
+/// directory and no-follow bits.
+pub const O_NOATIME: u32 = 0o1000000;
+
 /// The `O_APPEND` open flag: every write lands at the end of the file,
 /// whatever the description's cursor says.
 ///
@@ -381,6 +392,15 @@ impl File {
         // from an offset alone.
         let n = self.inode.read_at_client(pos, buf, self.ofd())?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
+        // Linux's `file_accessed`: a read that moved bytes touches the file's
+        // access clock, unless the description said `O_NOATIME`. The flag is
+        // asked *here* rather than inside each `read_at` because it belongs to
+        // the description, and because this is the one door `read`, `pread`,
+        // `readv` and `preadv` all come through. A failed read touches
+        // nothing - the write is after the `?` for the same reason Linux's is.
+        if n > 0 && self.born() & O_NOATIME == 0 {
+            let _ = self.inode.touch_atime(crate::vfs::now_seconds());
+        }
         Ok(n)
     }
 

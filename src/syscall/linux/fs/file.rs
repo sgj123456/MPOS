@@ -367,6 +367,22 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                         }
                     }
                 }
+                // `O_NOATIME` is the one promise a stranger may not ask for:
+                // Linux's `do_dentry_open` refuses it unless the caller owns
+                // the file or holds `CAP_FOWNER`. It is asked after
+                // `may_open`'s shape and access refusals - `open(dir,
+                // O_WRONLY|O_NOATIME)` is `EISDIR`, not `EPERM` - and the
+                // measurement is `.workbuddy/probe_atime.c`: a 65534 child's
+                // open of a root file is `EPERM`, the owner's is 0.
+                if flags & crate::vfs::file::O_NOATIME as usize != 0 {
+                    let inode = file.inode();
+                    if inode.owner().0 != crate::sched::current_fs_owner().0
+                        && !crate::sched::current_credentials().capable(crate::cred::CAP_FOWNER)
+                    {
+                        let _ = crate::sched::current_fds().close(fd);
+                        return err::EPERM;
+                    }
+                }
             }
             // Where this description lives, recorded for the `st_dev` both
             // doors report. The label is the path it was opened by, and the
@@ -3020,7 +3036,7 @@ fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
         return Err(err::EFAULT);
     }
     let (sec, nsec) = unsafe {
-        let at = |offset: usize| (tsp + offset) as *const u64;
+        let at = |offset: usize| (tsp + offset) as *const i64;
         (at(0).read_unaligned(), at(8).read_unaligned())
     };
     // The `tv_nsec < 1s` check and the round-*up* to milliseconds are the
@@ -3708,15 +3724,23 @@ pub(crate) fn notice_modify(fd: i32) {
     }
 }
 
+/// How much of one stream request this kernel carries in a single call.
+///
+/// Linux caps a `read`/`write` at `MAX_RW_COUNT` (~2 GiB) and answers a **short
+/// count**; it never refuses a legal count with `EINVAL`. This kernel's bound is
+/// one [`MAX_IO`] window - the worst-case rule's limit on one kernel copy - and
+/// the shape is the same: clamp what one call carries, and let the caller's own
+/// loop finish the rest (`docs/uapi/` §3).
+fn stream_len(len: usize) -> usize {
+    len.min(MAX_IO)
+}
+
 /// `read(2)` — read up to `buf.len()` bytes from `fd` into `buf`.
 pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (fd, buf, len) = (args[0], args[1], args[2]);
+    let (fd, buf) = (args[0], args[1]);
+    let len = stream_len(args[2]);
     if !buffer_ok(buf, len, true, from_user) {
-        return if len > MAX_IO {
-            err::EINVAL
-        } else {
-            err::EFAULT
-        };
+        return err::EFAULT;
     }
     // A socket descriptor reads like a file to `read(2)` - the same call,
     // routed to the stack. `recvfrom` with null source slots is exactly the
@@ -3782,13 +3806,10 @@ pub(crate) fn raise_sigpipe(_fd: i32, _suppressed: bool) {}
 
 /// `write(2)` — write `buf` to `fd`.
 pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (fd, buf, len) = (args[0], args[1], args[2]);
+    let (fd, buf) = (args[0], args[1]);
+    let len = stream_len(args[2]);
     if !buffer_ok(buf, len, false, from_user) {
-        return if len > MAX_IO {
-            err::EINVAL
-        } else {
-            err::EFAULT
-        };
+        return err::EFAULT;
     }
     // The write half of the socket split: `sendto` with no destination,
     // which for a connected socket is the whole of `write`'s contract.
@@ -4146,8 +4167,8 @@ pub fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// [`MountTable::path_of`]: crate::vfs::mount::MountTable::path_of
 pub fn handle_getcwd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (buf, size) = (args[0], args[1]);
-    if !buffer_ok(buf, size, true, from_user) || size < 2 {
-        return err::EINVAL;
+    if !buffer_ok(buf, size, true, from_user) {
+        return err::EFAULT;
     }
     let path = crate::sched::current_cwd_path();
     if path.len() + 1 > size {
@@ -4228,6 +4249,10 @@ fn writev_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 ((base + 8) as *const usize).read(),
             )
         };
+        // An iovec past the per-call window is a short transfer too: clamp it and
+        // let the caller continue with the next one (Linux's `MAX_RW_COUNT`
+        // shape, not a refusal).
+        let len = stream_len(len);
         if len == 0 {
             continue;
         }
@@ -4308,6 +4333,9 @@ fn readv_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 ((base + 8) as *const usize).read(),
             )
         };
+        // The same short-transfer clamp as `writev`: one iovec larger than the
+        // per-call window is carried in part, not refused.
+        let len = stream_len(len);
         if len == 0 {
             continue;
         }
@@ -4407,18 +4435,15 @@ fn at_position<R>(fd: i32, offset: i64, body: impl FnOnce() -> R) -> R {
 
 /// `pread64(fd, buf, count, offset)` — read at a position without moving it.
 pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (fd, buf, len, offset) = (args[0] as i32, args[1], args[2], args[3] as i64);
+    let (fd, buf, offset) = (args[0] as i32, args[1], args[3] as i64);
     // A negative offset is not a position; `EOVERFLOW`-shaped nonsense is
     // still just `EINVAL` to the caller that wrote it.
     if offset < 0 {
         return err::EINVAL;
     }
+    let len = stream_len(args[2]);
     if !buffer_ok(buf, len, true, from_user) {
-        return if len > MAX_IO {
-            err::EINVAL
-        } else {
-            err::EFAULT
-        };
+        return err::EFAULT;
     }
     if !crate::sched::current_fds().clone_at(fd).is_ok() {
         return err::EBADF;
@@ -4439,16 +4464,13 @@ pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `pwrite64(fd, buf, count, offset)` — write at a position without moving it.
 pub fn handle_pwrite64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (fd, buf, len, offset) = (args[0] as i32, args[1], args[2], args[3] as i64);
+    let (fd, buf, offset) = (args[0] as i32, args[1], args[3] as i64);
     if offset < 0 {
         return err::EINVAL;
     }
+    let len = stream_len(args[2]);
     if !buffer_ok(buf, len, false, from_user) {
-        return if len > MAX_IO {
-            err::EINVAL
-        } else {
-            err::EFAULT
-        };
+        return err::EFAULT;
     }
     if !crate::sched::current_fds().clone_at(fd).is_ok() {
         return err::EBADF;
@@ -4497,7 +4519,7 @@ fn io_at_position(
 pub fn handle_preadv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     io_at_position(
         args[0] as i32,
-        position_offset(args),
+        abi::position_offset(args),
         args,
         from_user,
         false,
@@ -4506,7 +4528,13 @@ pub fn handle_preadv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `pwritev(2)` — vectored write at a position.
 pub fn handle_pwritev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    io_at_position(args[0] as i32, position_offset(args), args, from_user, true)
+    io_at_position(
+        args[0] as i32,
+        abi::position_offset(args),
+        args,
+        from_user,
+        true,
+    )
 }
 
 /// `fsync(fd)` / `fdatasync(fd)` — flush a descriptor to its storage.
@@ -5952,55 +5980,6 @@ pub fn handle_pwritev2(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     vectored_at_position(args, from_user, true)
 }
 
-/// The position and the advice word of a `preadv2`/`pwritev2` call, read the
-/// way *this* machine's ABI spells them.
-///
-/// The two machines do not agree on the shape, and the difference is the
-/// 32-bit `off_t` x86_64 carries for its own historical reasons: there the
-/// position arrives as two halves (`pos_l`, `pos_h`) and the advice word is
-/// the *sixth* argument, while asm-generic - aarch64 - passes the whole
-/// 64-bit position as the fourth and the advice word fifth
-/// (`preadv2(fd, iov, iovcnt, pos, flags)`, which is what musl emits on
-/// arm64). Reading one shape on both machines is wrong on one of them: the
-/// generic read on x86_64 takes the high half of the position for the flags
-/// and truncates the position to its low 32 bits, so a negative position
-/// becomes a huge positive one, the cursor spelling (`-1`) is not
-/// recognised, and every advice bit in the sixth slot is invisible - the
-/// seven claims `t-preadv2` makes about exactly those words.
-#[cfg(target_arch = "x86_64")]
-fn position_and_flags(args: [usize; ARG_COUNT]) -> (i64, usize) {
-    (position_offset(args), args[5])
-}
-
-/// The asm-generic reading: see [`position_and_flags`]'s note on the two
-/// machines.
-#[cfg(not(target_arch = "x86_64"))]
-fn position_and_flags(args: [usize; ARG_COUNT]) -> (i64, usize) {
-    (position_offset(args), args[4])
-}
-
-/// The position a `preadv`/`pwritev`/`preadv2`/`pwritev2` call names, which
-/// is the half of the argument shape the four calls share - only the advice
-/// word on the end differs between the `*v2` pair and the plain one, so the
-/// reading of the position lives here once.
-///
-/// x86_64 splits the 64-bit position across two 32-bit words (`pos_l` then
-/// `pos_h`) and asm-generic passes it whole; `-1` arrives as `0xffff_ffff`
-/// in each half there, and the all-ones pair *is* the offset the cursor
-/// spelling means, so the halves have to be rejoined before anything asks
-/// whether the position is negative.
-#[cfg(target_arch = "x86_64")]
-fn position_offset(args: [usize; ARG_COUNT]) -> i64 {
-    (args[3] as u32 as u64 | (args[4] as u64) << 32) as i64
-}
-
-/// The asm-generic position: one 64-bit argument, with the fourth slot left
-/// to `flags` where the `*v2` calls have one.
-#[cfg(not(target_arch = "x86_64"))]
-fn position_offset(args: [usize; ARG_COUNT]) -> i64 {
-    args[3] as i64
-}
-
 fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> isize {
     const RWF_HIPRI: usize = 0x1;
     const RWF_DSYNC: usize = 0x2;
@@ -6019,7 +5998,7 @@ fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool
         | RWF_ATOMIC
         | RWF_DONTCACHE;
 
-    let (fd, (offset, flags)) = (args[0] as i32, position_and_flags(args));
+    let (fd, (offset, flags)) = (args[0] as i32, abi::position_and_flags(args));
     if flags & !KNOWN != 0 || flags & RWF_ATOMIC != 0 {
         // Unknown advice is the man page's EOPNOTSUPP; ATOMIC is known but
         // asks for a torn-write guarantee no storage here can make.
@@ -6078,11 +6057,29 @@ pub fn handle_openat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user:
     if size < OPEN_HOW_SIZE {
         return err::EINVAL;
     }
-    if size > OPEN_HOW_SIZE {
-        return err::E2BIG;
-    }
     if !buffer_ok(how, OPEN_HOW_SIZE, false, from_user) {
         return err::EFAULT;
+    }
+    // Linux's `copy_struct_from_user`: a `size` past the known struct is
+    // forward-compatible while its extra bytes are zero, and `E2BIG` only when
+    // one carries a field this kernel has never heard of. Measured on Linux
+    // 7.2.11: size 25 with byte 24 zero opens the file; a nonzero byte 24 is
+    // `E2BIG`. The tail is bounded by one `MAX_IO` window (the worst-case rule);
+    // a caller that sent more padding than that is refused as a struct larger
+    // than this kernel will read whole.
+    if size > OPEN_HOW_SIZE {
+        let tail = size - OPEN_HOW_SIZE;
+        if tail > MAX_IO {
+            return err::E2BIG;
+        }
+        if !buffer_ok(how + OPEN_HOW_SIZE, tail, false, from_user) {
+            return err::EFAULT;
+        }
+        for at in 0..tail {
+            if unsafe { *((how + OPEN_HOW_SIZE + at) as *const u8) } != 0 {
+                return err::E2BIG;
+            }
+        }
     }
     // The three words are `__u64`s in the struct; the flag vocabulary
     // below them is the `usize` every other open call here speaks.

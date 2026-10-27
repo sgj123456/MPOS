@@ -204,15 +204,12 @@ fn main() {
     let err = rustix::fs::open(&path, OFlags::RDONLY, Mode::empty()).unwrap_err();
     r.check_errno("open on the socket path is ENXIO", err, Errno::NXIO);
 
-    // An unconnected unix stream has no bytes to read - ENOTCONN, not EOF,
-    // because "nobody is there" and "everybody left" are different facts.
+    // An unconnected unix stream has no bytes to read - EINVAL, measured on
+    // Linux 7.2.11 for a fresh stream socket. The ENOTCONN row belongs to
+    // `send`/`write`, not to `read`.
     let fresh = unix_stream().expect("fresh socket");
     let err = read(&fresh, &mut buf).unwrap_err();
-    r.check_errno(
-        "read on an unconnected socket is ENOTCONN",
-        err,
-        Errno::NOTCONN,
-    );
+    r.check_errno("read on an unconnected socket is EINVAL", err, Errno::INVAL);
     drop(fresh);
 
     // The name goes when it is unlinked; the listener keeps living on its

@@ -660,7 +660,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             rtq: signal::RtQueue::new(),
             blocked: 0,
-            dispositions: signal::Actions::default(),
+            dispositions: signal::SignalHand::new(signal::Actions::default()),
             alt_stack: None,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
@@ -863,7 +863,7 @@ pub fn try_spawn_user(
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             rtq: signal::RtQueue::new(),
             blocked: 0,
-            dispositions: signal::Actions::default(),
+            dispositions: signal::SignalHand::new(signal::Actions::default()),
             alt_stack: None,
             fds,
             // A new program, not a thread: it gets its own handle copied from

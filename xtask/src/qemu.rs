@@ -586,6 +586,7 @@ pub fn run_qemu(
         &firmware,
         &vars,
         &image,
+        image.parent().expect("the image has a directory"),
         &Console::Run(mode),
         &share,
         false,
@@ -711,6 +712,11 @@ pub fn virt_machine_args(
     firmware: &Firmware,
     vars: &Path,
     image: &Path,
+    // Where the machine's *other* two disks live (the SATA backing file and the
+    // block pattern). Kept apart from `image` because a sweep now shares one
+    // boot medium across every lane while each lane still owns the disks its
+    // programs write.
+    images_dir: &Path,
     blk: &Path,
     console: &Console,
     share: &Path,
@@ -778,8 +784,13 @@ pub fn virt_machine_args(
         // `file.locking=off`, for the reason the images below ask for it too.
         "-drive".into(),
         format!(
-            "file={},format=raw,if=none,id=hd0,file.locking=off",
-            image.display()
+            "file={},format=raw,if=none,id=hd0,file.locking=off{}",
+            image.display(),
+            // A sweep shares one medium across every lane, so a lane's writes
+            // must not land in it: `snapshot=on` gives each QEMU a private
+            // overlay and leaves the base byte-identical for the next lane. A
+            // session boots the raw image itself, so its writes persist.
+            if test_machine { ",snapshot=on" } else { "" }
         ),
         "-device".into(),
         "virtio-blk-device,drive=hd0".into(),
@@ -887,7 +898,7 @@ pub fn virt_machine_args(
     // that is not the driver's. The image is laid beside the boot disk
     // (`disk::ensure_sata_image`), so its directory is the one fact both ends
     // already agree on.
-    let sata = crate::disk::sata_image(image.parent().expect("the image has a directory"));
+    let sata = crate::disk::sata_image(images_dir);
     args.extend([
         "-drive".into(),
         format!(
@@ -1027,6 +1038,7 @@ pub fn boot_args(
     firmware: &Firmware,
     vars: &Path,
     image: &Path,
+    images_dir: &Path,
     console: &Console,
     share: &Path,
     test_machine: bool,
@@ -1045,10 +1057,12 @@ pub fn boot_args(
             firmware,
             vars,
             image,
-            // The raw pattern the block check reads by content. It lives beside
-            // the image and is the same fixture for every boot of this machine
-            // (`disk::blk_image`), so a sweep and a session share it.
-            &crate::disk::blk_image(image.parent().expect("the image has a directory"), arch),
+            images_dir,
+            // The raw pattern the block check reads by content. It lives in the
+            // caller's images directory and is the same fixture for every boot
+            // of this machine (`disk::blk_image`), so a sweep's lanes each get
+            // their own and a session uses `build/`'s.
+            &crate::disk::blk_image(images_dir, arch),
             console,
             share,
             test_machine,
@@ -1453,6 +1467,7 @@ mod tests {
             &firmware(),
             Path::new("/build/AAVMF_VARS.fd"),
             Path::new("/build/aarch64-disk.img"),
+            Path::new("/build"),
             Path::new("/build/aarch64-blk.img"),
             &Console::File("/build/aarch64-serial.log".to_string()),
             Path::new("/build/aarch64-9p-share"),

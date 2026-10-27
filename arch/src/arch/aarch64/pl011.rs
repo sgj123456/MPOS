@@ -218,6 +218,11 @@ pub fn read_byte() -> Option<u8> {
 /// half of the console actually reads. Returns whether the probe byte echoed back.
 pub fn loopback_echoes(probe: u8) -> bool {
     let cr = read(CR);
+    // The transmit interrupt must not write a console byte through `DR` while
+    // `LBE` is on: that byte would land in the receive FIFO and be read as the
+    // "echo". Mask it across the whole window (see `inject_via_loopback`).
+    let tx_on = read(IMSC) & IMSC_TXIM != 0;
+    imsc_set(IMSC_TXIM, false);
     write(CR, cr | CR_LBE);
     write_byte(probe);
     // A bounded poll: in loopback the echo is internal and immediate, so an empty
@@ -231,6 +236,7 @@ pub fn loopback_echoes(probe: u8) -> bool {
         core::hint::spin_loop();
     }
     write(CR, cr & !CR_LBE);
+    imsc_set(IMSC_TXIM, tx_on);
     echoed == Some(probe)
 }
 
@@ -244,9 +250,20 @@ pub fn loopback_echoes(probe: u8) -> bool {
 /// then read back through the real RX registers.
 pub fn inject_via_loopback(byte: u8) {
     let cr = read(CR);
+    // Mask the transmit interrupt for the window `LBE` is on. The ring's pump
+    // writes the next console byte to `DR` from that interrupt, and with `LBE`
+    // set that byte lands in the **receive** FIFO - ahead of the one being
+    // injected if the interrupt fires between `LBE` being set and `DR` being
+    // written. Measured 2026-10-27: `console_receive` polled the `m` of an
+    // in-flight `mpos-kunit:` line instead of its injected `0x5a`. One core,
+    // so masking before `LBE` is set closes the window; the bit is restored
+    // afterwards.
+    let tx_on = read(IMSC) & IMSC_TXIM != 0;
+    imsc_set(IMSC_TXIM, false);
     write(CR, cr | CR_LBE);
     write_byte(byte);
     write(CR, cr & !CR_LBE);
+    imsc_set(IMSC_TXIM, tx_on);
 }
 
 /// The PL011 as [`crate::hal::tx_ring`]'s transmitter.

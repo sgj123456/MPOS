@@ -77,7 +77,7 @@ pub trait Kernel: Sync {
     fn resolve_anon_fault(&self, virt: usize, write: bool) -> bool;
 
     /// A push past the mapped end of the stack: extend it, within its bounds.
-    fn resolve_stack_growth(&self, addr: usize, sp: usize) -> bool;
+    fn resolve_stack_growth(&self, addr: usize) -> bool;
 
     /// Whether the kernel may lazily reach `virt` for a write - the question the
     /// page-table walk asks on a fault the kernel itself caused.
@@ -326,8 +326,8 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
 
 /// Extend the stack. See [`Kernel::resolve_stack_growth`].
 #[inline]
-pub fn resolve_stack_growth(addr: usize, sp: usize) -> bool {
-    registered().resolve_stack_growth(addr, sp)
+pub fn resolve_stack_growth(addr: usize) -> bool {
+    registered().resolve_stack_growth(addr)
 }
 
 /// Whether the kernel may lazily reach `virt`. See

@@ -6056,3 +6056,35 @@ the boot slot (this pass). Each became reachable only after the one before it
 stopped moving; every one is fixed with a measured counterfactual; and the
 login prompt is the run that tells them apart, which is what the thread's own
 rule demanded of every explanation it ever named.
+
+**`PTRACE_GET_SYSCALL_INFO` and the `PEEK` family: the raw syscall ABI, measured
+on the host (2026-10-27).** `t-ptrace`'s host run was the probe: its
+`PTRACE_GET_SYSCALL_INFO` checked for `Ok(80)` at every stop, and its
+`PEEKDATA`/`PEEKUSER` passed `data = 0` as every libc wrapper appears to. The
+raw calls say otherwise, measured on Linux 7.2.11:
+
+* `GET_SYSCALL_INFO` returns the size the *stop has*, not the size the caller
+  asked for: **24** at a `NONE` stop (through `arch`), **80** at an entry (through
+  `args`), **33** at an exit (through `is_error`). A caller's smaller buffer is
+  **truncated** - asking with `addr = 1` writes one byte and still returns 80 -
+  and `addr = 0` writes nothing. `mpos` answered 80 at every stop and refused a
+  buffer below 80 with `EINVAL`; both are now Linux's: the record is built in a
+  local, `min(addr, available)` bytes are copied, and the available size is
+  returned.
+* `PEEKTEXT`/`PEEKDATA`/`PEEKUSER` take `data` as a **pointer** to the word and
+  return `0`; `data = 0` is `EFAULT` (`Bad address`). The libc `ptrace` wrappers
+  pass a local and turn the 0 into the word, which is why the man page's
+  "returned as the result" reads true from a libc caller and false from the raw
+  syscall. `mpos` returned the word directly, and the test - written through the
+  raw `SYS_ptrace` door - agreed with it; both now follow the raw ABI.
+  `POKETEXT`/`POKEDATA`/`POKEUSER` keep the value in `data`, unchanged.
+
+The pins are in `t-ptrace`: the three stop sizes, a one-byte truncated prefix that
+still reports 24, and the `PEEK`/`POKE` split. The host run is green on all three
+ptrace programs after the fix, and both gate arms read `pass=211/210 fail=0` with
+`mpos-kunit 34/0` (2026-10-27).
+The test also had three host-only bugs this exposed: its walk loops accepted only
+`80` (an exit before the wanted entry stopped the walk), it had not set
+`PTRACE_O_TRACESYSGOOD` before asking for a call number (so Linux reported `NONE`
+at every boundary), and it read a `-1` word as an error because `errno` was not
+cleared before the call.

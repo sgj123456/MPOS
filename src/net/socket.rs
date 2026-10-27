@@ -4939,6 +4939,13 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
         _ => return err::EAFNOSUPPORT,
     }
     let type_bits = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    // A word that is not a socket type at all is the syscall layer's `EINVAL`,
+    // before the family is asked. Measured on Linux 7.2.11: 99 is `EINVAL`,
+    // `SOCK_RDM` is `ESOCKTNOSUPPORT`, and `SOCK_RAW` is *served* by AF_UNIX -
+    // the last is a gap here, answered honestly below.
+    if type_bits > 0xf {
+        return err::EINVAL;
+    }
     let message_pair = match type_bits {
         t if t == SOCK_STREAM as u32 => false,
         // The two types that carry messages: a pair of these is two ends

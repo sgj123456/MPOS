@@ -207,17 +207,21 @@ fn main() {
             Errno::PROTONOSUPPORT,
         ),
     }
+    // A word that is not a socket type at all is the syscall layer's EINVAL,
+    // before the family is asked. Measured on Linux 7.2.11: 99 is EINVAL;
+    // `SOCK_RDM` is ESOCKTNOSUPPORT and `SOCK_RAW` is served by AF_UNIX (the
+    // last is a gap here, not a shape this claim covers).
     match socketpair(
         AddressFamily::UNIX,
-        SocketType::RAW,
+        SocketType::from_raw(99),
         SocketFlags::empty(),
         None,
     ) {
-        Ok(_) => r.check("a type no Unix socket has is ESOCKTNOSUPPORT", false),
+        Ok(_) => r.check("a word that is not a socket type is EINVAL", false),
         Err(err) => r.check_errno(
-            "a type no Unix socket has is ESOCKTNOSUPPORT",
+            "a word that is not a socket type is EINVAL",
             err,
-            Errno::SOCKTNOSUPPORT,
+            Errno::INVAL,
         ),
     }
 

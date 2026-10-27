@@ -17,7 +17,7 @@
 
 use mpos_user_tests::Report;
 use rustix::fd::BorrowedFd;
-use rustix::fs::{CWD, Mode, OFlags, openat};
+use rustix::fs::{CWD, Mode, OFlags, SeekFrom, openat, seek};
 use rustix::io::{Errno, read};
 use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
 
@@ -79,6 +79,10 @@ fn main() {
             MapFlags::PRIVATE,
         )
     };
+    // Rewind to the start: at EOF Linux returns 0 without touching the buffer, so
+    // a PROT_NONE read there would test EOF rather than the fault path. There
+    // has to be a byte to copy for the claim to be about `EFAULT`.
+    let _ = seek(&file, SeekFrom::Start(0));
     match guard {
         Ok(guard) => {
             // SAFETY: the slice is built over the mapping and never read by
@@ -93,6 +97,41 @@ fn main() {
         }
         Err(_) => r.check("a read into unreadable memory answers EFAULT", false),
     }
+
+    // Linux caps one `read`/`write` at `MAX_RW_COUNT` (~2 GiB) and answers a
+    // **short count**; it never refuses a legal count with `EINVAL`. This
+    // fixture is twice this kernel's per-call window, so both halves are
+    // exercised: `std::fs::write` must finish by looping on the short writes,
+    // and the reads below must drain it. Before the clamp both halves answered
+    // `EINVAL`, and `std::fs::write` failed outright.
+    const BIG: usize = 2 * 1024 * 1024;
+    const BIG_FILE: &str = "/tmp/t-read_big";
+    let big: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+    r.check(
+        "a 2 MiB write above the per-call window completes on short counts",
+        std::fs::write(BIG_FILE, &big).is_ok(),
+    );
+    if let Ok(big_file) = openat(CWD, BIG_FILE, OFlags::RDONLY, Mode::empty()) {
+        let mut out = vec![0u8; BIG];
+        let mut got = 0usize;
+        while got < BIG {
+            match read(&big_file, &mut out[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        r.check(
+            "a 2 MiB read above the per-call window drains on short counts",
+            got == BIG && out == big,
+        );
+    } else {
+        r.check(
+            "a 2 MiB read above the per-call window drains on short counts",
+            false,
+        );
+    }
+    let _ = std::fs::remove_file(BIG_FILE);
 
     let _ = std::fs::remove_file(FILE);
     r.finish()

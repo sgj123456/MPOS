@@ -156,12 +156,19 @@ fn main() {
         if rc >= 0 {
             libc::mq_close(rc);
         }
-        let rc = libc::mq_open(
-            cstring("").as_ptr(),
-            libc::O_CREAT | libc::O_RDWR,
-            0o600,
-            std::ptr::null::<libc::mq_attr>(),
-        );
+        let rc = unsafe {
+            // The libc wrapper validates the spelling itself (it requires a
+            // leading `/` and answers an empty name with EINVAL before the
+            // syscall); the kernel's rule for the bare name the syscall takes is
+            // ENOENT. Raw, so the claim is about the kernel.
+            libc::syscall(
+                libc::SYS_mq_open,
+                cstring("").as_ptr(),
+                libc::O_CREAT | libc::O_RDWR,
+                0o600,
+                std::ptr::null::<libc::mq_attr>(),
+            ) as libc::mqd_t
+        };
         r.check("an empty name is ENOENT", rc < 0 && errno() == libc::ENOENT);
         if rc >= 0 {
             libc::mq_close(rc);

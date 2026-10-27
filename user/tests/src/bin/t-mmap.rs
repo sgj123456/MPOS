@@ -56,7 +56,11 @@ fn mm(hint_off: usize, len: usize, prot: libc::c_int, flags: libc::c_int) -> isi
 }
 
 static mut ARENA_BASE: *mut libc::c_void = core::ptr::null_mut();
-const ARENA_LEN: usize = 2 * 1024 * 1024;
+/// The arena every fixed-offset claim lives in. It must contain the highest
+/// offset the program maps (`0x30_0000`): a `MAP_FIXED` past its end takes
+/// memory the *host* process owns, which is how this test once clobbered libc
+/// and crashed in `exit()` after printing PASS.
+const ARENA_LEN: usize = 4 * 1024 * 1024;
 
 macro_rules! off {
     ($a:expr) => {
@@ -272,23 +276,38 @@ fn main() {
     // and from `MAP_FIXED` (takes the range). And `MAP_HUGETLB` with no
     // huge-page pool is the honest `ENOMEM`, never a silent 4 KiB page that
     // would let the caller believe it had huge pages.
-    let nr_at = unsafe { ARENA_BASE as usize + 0x30_0000 };
-    let nr = mm(
-        off!(nr_at),
-        PAGE,
-        PROT_RW,
-        ANON_PRIVATE | libc::MAP_FIXED_NOREPLACE,
-    );
+    // The free page is a hole this test makes, not an offset above the arena:
+    // the arena is exactly 2 MiB and the old offset was past its end, inside
+    // whatever the host's own layout had already put there.
+    let two = mm(0, 2 * PAGE, PROT_RW, ANON_PRIVATE);
+    r.check("the two pages for the NOREPLACE claim map", two > 0);
+    let nr_at = two as usize + PAGE;
+    let freed = unsafe { libc::munmap(nr_at as *mut _, PAGE) };
+    r.check("and the page above them is freed again", freed == 0);
+    let nr = unsafe {
+        libc::mmap(
+            nr_at as *mut _,
+            PAGE,
+            PROT_RW,
+            ANON_PRIVATE | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) as isize
+    };
     r.check(
         "MAP_FIXED_NOREPLACE on a free range answers the exact address",
         nr == nr_at as isize,
     );
-    let nr2 = mm(
-        off!(nr_at),
-        PAGE,
-        PROT_RW,
-        ANON_PRIVATE | libc::MAP_FIXED_NOREPLACE,
-    );
+    let nr2 = unsafe {
+        libc::mmap(
+            nr_at as *mut _,
+            PAGE,
+            PROT_RW,
+            ANON_PRIVATE | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) as isize
+    };
     r.check(
         "MAP_FIXED_NOREPLACE over a live range is EEXIST, not relocated",
         refused(nr2, libc::EEXIST),

@@ -241,7 +241,10 @@ fn main() {
     let heap_follows = a.page(HEAP) == b.page(HEAP);
     r.check(
         "a fixed-address image keeps its code address - that is what fixed means",
-        code_same,
+        // On a host this program is a PIE, so Linux draws its code address and
+        // the address is not a property of the kernel there. The heap anchor
+        // below is the half that is the same either way.
+        code_same || host_run(),
     );
 
     // The heap anchor, which begins just above the image. Linux *draws* it -

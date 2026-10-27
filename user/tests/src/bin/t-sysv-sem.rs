@@ -85,8 +85,8 @@ const SEM_STAT_ANY: i32 = 20;
 const IPC_PRIVATE: i32 = 0;
 const IPC_CREAT: i32 = 0o1000;
 const IPC_EXCL: i32 = 0o2000;
-const SEM_UNDO: i16 = 0x1000;
-const IPC_NOWAIT: i16 = 0x4000;
+const SEM_UNDO: i16 = 0o10000;
+const IPC_NOWAIT: i16 = 0o4000;
 
 /// `struct sembuf`.
 #[repr(C)]

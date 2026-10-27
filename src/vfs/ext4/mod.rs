@@ -1325,6 +1325,32 @@ impl Inode for Ext4Ino {
         Ok(())
     }
 
+    /// Linux's `relatime_need_update`: move `i_atime` only when the recorded one
+    /// has nothing to say since - it is not newer than the inode's mtime or
+    /// ctime, or it is a day old. The comparison is `<=`, measured on a current
+    /// host (`.workbuddy/probe_atime.c`, Linux 7.2.11): a freshly created file,
+    /// whose three clocks are equal, **does** move its atime on the first read;
+    /// the `atime < ctime` shape this kernel carried did not, and missed the
+    /// mtime half entirely.
+    ///
+    /// The inode's own `A` flag is asked first and it is not the same question
+    /// as a mount's `noatime`: this one is a promise about *this file*, made by
+    /// whoever set it, and it holds wherever the filesystem is mounted.
+    fn touch_atime(&self, now: u64) -> VfsResult<()> {
+        let mut data = self.fs.read_inode(self.ino);
+        const DAY: u32 = 86_400;
+        let stamp = now as u32;
+        if data.flags & crate::vfs::FS_NOATIME_FL == 0
+            && (data.atime <= data.mtime
+                || data.atime <= data.ctime
+                || stamp.saturating_sub(data.atime) >= DAY)
+        {
+            data.atime = stamp;
+            self.fs.write_inode(self.ino, &data);
+        }
+        Ok(())
+    }
+
     /// The file's last write, off the on-disk inode. This is the number apk
     /// judges a cached index by, and the one `make` compares against its
     /// sources.
@@ -1685,28 +1711,10 @@ impl Inode for Ext4Ino {
                 }
             }
         }
-        // `relatime` - Linux's default, and the only shape of "update the
-        // access time on read" that is not a device write per read. The access
-        // time moves only when the recorded one has nothing to say since: it
-        // predates the inode's own change time (so something has happened to
-        // the file since it was last looked at), or it is more than a day old.
-        // A read that is the second look at the same state therefore costs
-        // nothing, which is what keeps this off the hot path §10.5 is about.
-        if done > 0 {
-            let stamp = now();
-            const DAY: u32 = 86_400;
-            // The inode's own `A` flag is asked first and it is not the same
-            // question as the mount's `noatime`: this one is a promise about
-            // *this file*, made by whoever set it, and it holds wherever the
-            // filesystem happens to be mounted. A flag nothing reads would be a
-            // flag that did nothing.
-            if data.flags & crate::vfs::FS_NOATIME_FL == 0
-                && (data.atime < data.ctime || data.atime + DAY < stamp)
-            {
-                data.atime = stamp;
-                self.fs.write_inode(self.ino, &data);
-            }
-        }
+        // The access clock moved out of here: `O_NOATIME` is a fact about the
+        // description, not the file, so the vfs's read door applies
+        // [`Inode::touch_atime`] after a successful read. See that method for
+        // the `relatime` rule this driver spells.
         Ok(done)
     }
 
@@ -2386,43 +2394,61 @@ mod tests {
     }
 
     #[test]
-    fn a_read_bumps_atime_once_and_relatime_leaves_the_rest_alone() {
-        // Linux's default mount is `relatime`: a read moves the access time only
-        // when the recorded one predates the inode's change time, or is a day
-        // old. The rule is not decoration - the access time lives in the inode,
-        // so a read that always updates it is a read that always writes to the
-        // device, which is the read path §10.5 exists to make faster.
+    fn relatime_moves_atime_only_when_something_has_happened() {
+        // Linux's default mount is `relatime`, and the comparison is `<=`: the
+        // access time moves when it is **not newer** than mtime or ctime, or
+        // when it is a day old. Measured on a current host
+        // (`.workbuddy/probe_atime.c`): a freshly created file - three equal
+        // clocks - *does* move its atime on the first read.
+        //
+        // The rule is not decoration: the access time lives in the inode, so a
+        // read that always updates it is a read that always writes to the
+        // device, which is the read path §10.5 exists to make faster. The vfs's
+        // read door calls this; a read on the inode alone does not.
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
         let file = root
             .create("watched", NodeKind::File, None)
             .expect("create");
-        file.write_at(0, b"payload").unwrap();
-        let stale = file.atime();
-        assert!(
-            stale < file.ctime(),
-            "the write moved ctime past an atime nothing has read since"
-        );
+        // On a real clock the three are equal at creation; the host's test
+        // clock advances per call, so the rule is asserted as "nothing newer",
+        // which is what relatime compares.
+        let born = file.atime();
+        assert!(born <= file.mtime());
+        assert!(born <= file.ctime());
 
-        // The first read sees a file that has changed since it was last looked
-        // at, so the stamp moves.
-        assert_eq!(read_all(&*file, 16), b"payload");
+        // First read of a fresh file: equal clocks are "not newer", so it moves.
+        file.touch_atime(born + 10).unwrap();
+        assert_eq!(file.atime(), born + 10, "a fresh file's first read moves");
         let first = file.atime();
-        assert!(first > stale, "a read after a change bumps atime");
 
-        // The second read sees nothing new: same inode, no change in between, so
-        // neither the stamp nor the disk is touched.
-        assert_eq!(read_all(&*file, 16), b"payload");
-        assert_eq!(file.atime(), first, "a second read moves nothing");
+        // A second read with nothing changed since: no move, which is what keeps
+        // this off the device.
+        file.touch_atime(first + 10).unwrap();
+        assert_eq!(file.atime(), first, "nothing changed, so nothing moved");
 
-        // A write re-opens the gap, and the next read answers it again.
-        file.write_at(0, b"PAYLOAD").unwrap();
-        assert_eq!(read_all(&*file, 16), b"PAYLOAD");
+        // A write re-opens the gap (it moves mtime and ctime), and the next read
+        // answers it.
+        file.write_at(0, b"payload").unwrap();
+        file.touch_atime(first + 20).unwrap();
         assert!(
             file.atime() > first,
-            "a read after a fresh write bumps again"
+            "a read after a write moves the clock again"
         );
+
+        // A future atime is not newer than nothing: relatime leaves it alone,
+        // where the ramfs/tmpfs driver (strictatime) pulls it back.
+        file.set_times(first + 3600, first).unwrap();
+        let future = file.atime();
+        file.touch_atime(future - 1).unwrap();
+        assert_eq!(file.atime(), future, "a future atime stands");
+
+        // And a day-old one moves even when mtime/ctime are older still.
+        file.set_times(first, first).unwrap();
+        let old = file.atime();
+        file.touch_atime(old + 86_401).unwrap();
+        assert!(file.atime() > old, "a day-old atime moves");
     }
 
     #[test]

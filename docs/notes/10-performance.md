@@ -1153,6 +1153,24 @@ red-green discrimination is unchanged (a tick-rounded machine fails it in both
 halves). Measured green: aarch64 `pass=207 fail=0` with the fastest samples at
 1 037/1 049 µs, beside the same host that had just measured 26/50.
 
+**The median was not load-independent either, and the same measurement
+(2026-10-27) retired that bound.** A six-lane aarch64 sweep under a busy host
+measured the fifty sleeps as `first 25: min 1063 us, median 3894 us, max 4063 us`
+and `second 25: min 1044 us, median 1132 us` - the one-shot answered in *both*
+halves by their minima, but more than half of the first half was woken by the
+tick, because the vCPU was not scheduled between the 1 ms deadline and the 4 ms
+one. The pin's `median < 2.5 ms` failed at 3468 us on a machine whose wake was
+working. Linux's `nanosleep` promises "not early", not "not late", so the median
+moved with the host and is printed rather than bounded now; the per-half minimum
+remains the discriminator, and a tick-only machine still fails both halves.
+
+**The same sweep's `arch.console_receive` read the `m` of an in-flight console
+line instead of its injected `Z`.** `pl011::inject_via_loopback` turned the
+UART's `LBE` on with the transmit interrupt live, so the TX ring's pump could
+write the next console byte into `DR` inside the window and land that byte in the
+receive FIFO ahead of the probe. The injector (and `loopback_echoes`) now mask
+`IMSC_TXIM` across the `LBE` window and restore it after.
+
 Gate: x86_64 `pass=200 fail=0 (213 built)`, `mpos-kunit 32 passed, 0 failed`,
 exit 0 - twelve consecutive green runs after the two fixture fixes below. The
 second machine compiles the whole change (`cargo build --release --target

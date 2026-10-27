@@ -24,9 +24,11 @@ One-glance status of the whole roadmap.
 **Core (Phases 1–3)**
 
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
-- [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2) — and
-  `kill(-1)` is every process the caller may signal rather than one group, while a
-  signal aimed at a group reaches one copy per process (§2.10, item 106)
+- [x] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2) — with
+  `kill(-1)` every process the caller may signal, one copy per process for a group
+  (§2.10, item 106), `SIGCONT`'s session door (§2.6) and one handler table shared by a
+  thread group under `CLONE_SIGHAND` (§2.7); the named residues are the kernel-spawned
+  program path's `SIG_DFL` start and the alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
@@ -40,9 +42,11 @@ One-glance status of the whole roadmap.
   `MSG_NOSIGNAL` suppresses it, a blocked signal waits pending, and the measured
   exemptions hold: a seqpacket send is `EPIPE` silently, a datagram's dead peer is
   `ECONNREFUSED` once and then `ENOTCONN` (§4.1.13, item 97)
-- [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
-  `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89),
-  each instance now carrying a non-zero `f_fsid` instead of a zero every mount shared (§3.7, item 90)
+- [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — with  
+  `fstatfs` naming the filesystem the descriptor was *opened on* (§3.6, item 89), every instance  
+  carrying a non-zero `f_fsid` (§3.7, item 90), and the access clock moving on read under  
+  `relatime`/`strictatime` with `O_NOATIME` honoured (§3.3, item 108); what stays open is the  
+  `/dev` node's birth mode - `0666` here where devtmpfs births `0600` and udev widens it (§3.4)
 
 **Networking (Phase 4)**
 
@@ -326,9 +330,13 @@ One-glance status of the whole roadmap.
 
 **Architectures (Phase 9)**
 
-- [ ] [~] 9.1 aarch64 complete boot — boots real Alpine to a login prompt, every service ok, consoles reach the wire (§9.1, §13)
+- [ ] [~] 9.1 aarch64 complete boot — boots real Alpine to a login prompt and every service
+  ok (§13.15's `hwclock`/`modules` closed the last two); consoles still reach only the
+  machine's serial line, the `tty1`..`tty4` mux being the remaining named item (§9.1, §13)
 - [ ] 9.2 RISC-V support (§9.2)
-- [ ] [~] 13 Machine-seam purity + aarch64 parity — 13.1 and 13.3–13.31 landed, 13.2 in progress (§13); boot-side half is Phase 15 (§15)
+- [ ] [~] 13 Machine-seam purity + aarch64 parity — 13.1 and 13.3–13.31 landed; 13.2's
+  caller side is complete, and what is left there is ABI-owned tables, machine identity and
+  the port ledger, each with its reason in §13.2 (§13); boot-side half is Phase 15 (§15)
 - [x] the boot is one flow — one `start`, one sequence, probes ask both transports (§15.8)
 - [x] the kernel travels inside the loader — the ESP carries one bootable file (§15.9)
 - [x] the self-test sweep is many machines' — the host half beside the guests, one lane per

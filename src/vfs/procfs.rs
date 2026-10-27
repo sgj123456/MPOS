@@ -429,6 +429,83 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
     })
 }
 
+/// The body of `/proc/cpuinfo`.
+///
+/// Its *shape* is the machine's rather than the kernel's, and the two renderings
+/// do not overlap: Linux on x86 reports `model name`/`vendor_id`, while on ARM64
+/// it reports `CPU implementer`/`CPU part` and leaves the reader to map the part
+/// to a core name. A reader picks its parser from the machine it runs on -
+/// `fastfetch`'s `detectCPUOthers` has no row for `model name` at all, so an
+/// x86-shaped file answers "Unknown CPU" on the second machine. The id fields
+/// are read from `MIDR_EL1` rather than invented, so the name a reader derives
+/// is the core the machine is actually running on.
+#[cfg(target_arch = "aarch64")]
+fn cpuinfo_text() -> String {
+    let midr: u64;
+    let pfr0: u64;
+    let isar0: u64;
+    // SAFETY: the `MIDR_EL1` and `ID_AA64*` identification registers are
+    // readable at EL1 with no side effects, and EL1 is the only level this
+    // kernel runs at.
+    unsafe {
+        core::arch::asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+    }
+    let implementer = (midr >> 24) & 0xff;
+    let variant = (midr >> 20) & 0xf;
+    let part = (midr >> 4) & 0xfff;
+    let revision = midr & 0xf;
+
+    // `Features` is derived from the same registers Linux reads rather than
+    // written out: a core that lacks a block must not be told it has one.
+    let mut features = String::new();
+    if pfr0 & 0xf != 0xf {
+        features.push_str("fp ");
+    }
+    if (pfr0 >> 4) & 0xf != 0xf {
+        features.push_str("asimd ");
+    }
+    let aes = (isar0 >> 4) & 0xf;
+    if aes != 0 {
+        features.push_str("aes ");
+    }
+    if aes >= 0b0010 {
+        features.push_str("pmull ");
+    }
+    if (isar0 >> 8) & 0xf != 0 {
+        features.push_str("sha1 ");
+    }
+    if (isar0 >> 12) & 0xf != 0 {
+        features.push_str("sha2 ");
+    }
+    if (isar0 >> 16) & 0xf != 0 {
+        features.push_str("crc32 ");
+    }
+    let features = features.trim_end();
+
+    alloc::format!(
+        "processor\t: 0\n\
+         Features\t: {features}\n\
+         CPU implementer\t: {implementer:#04x}\n\
+         CPU architecture: 8\n\
+         CPU variant\t: 0x{variant:x}\n\
+         CPU part\t: 0x{part:03x}\n\
+         CPU revision\t: {revision}\n\
+         \n"
+    )
+}
+
+/// `/proc/cpuinfo` on a machine that is not AArch64. See the AArch64 twin above
+/// for why the shape belongs to the machine.
+#[cfg(not(target_arch = "aarch64"))]
+fn cpuinfo_text() -> String {
+    alloc::format!(
+        "processor\t: 0\ncpu family\t: x86_64\nmodel name\t: {} x86_64 processor\n\n",
+        env!("CARGO_PKG_NAME")
+    )
+}
+
 /// A file that reports something which can go away.
 fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
@@ -3456,16 +3533,7 @@ impl ProcFs {
                 )
             }),
         );
-        self.root.add(
-            "cpuinfo",
-            NodeKind::File,
-            file(|| {
-                alloc::format!(
-                    "processor\t: 0\ncpu family\t: x86_64\nmodel name\t: {} x86_64 processor\n\n",
-                    env!("CARGO_PKG_NAME")
-                )
-            }),
-        );
+        self.root.add("cpuinfo", NodeKind::File, file(cpuinfo_text));
         self.root.add(
             "version",
             NodeKind::File,

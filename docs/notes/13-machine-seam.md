@@ -85,6 +85,19 @@ layout went the same way behind `mpos_signal_frame` (`proc.rs` 7 → 3,
 | Stale gates, unpinnable as they stand | 8 | `logging` 6 · `mm/heap.rs` 2 | Both reasons are void (aarch64 has a console and a clock since stages 4a/1c), but `src/` emits **no `tracing` event at all** (measured: no `info!`/`warn!`/`error!`/`debug!`/`trace!` outside `logging.rs`), so deleting the subscriber's gate produces code nothing exercises; the heap prints are on the OOM path no test reaches. A landed behaviour needs a pin (AGENTS §3 rule 6), so each is a finding with a missing prerequisite, not a rename. **The stale-gate class is wider than this row and splits in two.** Nine more have lived in `syscall`'s `ifreq` arms, `fs/mod.rs`'s nonblocking push, the `process_vm_readv`/`writev` pair and `rt_sigtimedwait` - gated as "the first machine's" although nothing in them named it (the first six when `net` was the first machine's alone, the last three merely grouped with `ptrace`, which *is* per-arch) - and all nine *were* drivable, so they were deleted and pinned instead (`user/tests/src/bin/t-ifreq.rs`, `t-process-vm-libc.rs`, `t-rt-sigtimedwait.rs`); what makes the eight here different is that nothing can drive them yet, which is the missing prerequisite, not the gate |
 | Allow-listed by design | `lib.rs` 17 · `main` 9 · `boot/mod.rs` 1 | the target-gating ledger and the per-arch bin arms | — |
 
+**The slice after Stage 4 (2026-10-27)** took three caller-side classes without changing any
+behaviour. `vfs/epoll.rs`'s `struct epoll_event` layout (6 sites) became `hal::Contexts`'s
+`EPOLL_EVENT_BYTES`/`EPOLL_EVENT_DATA` — 12/4 on x86_64, measured on the host
+(`.workbuddy/probe_epoll_event.c`, Linux 7.2.11), and 16/8 on aarch64, pinned on that machine by
+`t-epoll`'s own record — so the event code above the machine no longer names an architecture.
+`clone`'s last two argument slots (Linux's `CLONE_BACKWARDS`) and `preadv2`'s position/advice shape
+moved from `syscall/linux/mod.rs` and `fs/file.rs` into `syscall/linux/abi.rs`, which is the layer
+that is allowed to spell them. `target_arch` outside `src/arch/` went **102 → 97**;
+`src/vfs/epoll.rs` and `src/syscall/linux/fs/file.rs` are **0**, and `mod.rs` keeps only
+`ARCH_PRCTL`'s gate (an x86_64-only syscall number, not a stale one). Measured: x86_64
+`pass=213 fail=0`, aarch64 `pass=212 fail=0`, `mpos-kunit 34 passed, 0 failed` on both; host unit
+suite 640; `test-host` 201/227; fmt clean; `cargo xtask depgraph` unchanged.
+
 **Acceptance** (both threads together): the aarch64 gate is quotable with a summary line and exit
 code; `src/hal` names no architecture; `src/arch/` outside `lib.rs`'s module gates names no
 architecture; `cargo xtask depgraph` stays green with the `arch`-naming allow-list at zero. One

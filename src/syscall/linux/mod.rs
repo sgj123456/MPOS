@@ -383,7 +383,7 @@ pub unsafe fn dispatch(
         // The one part of the *request* that is not arch-neutral is the order of
         // its last two arguments, and `clone_arguments` is where that is
         // reconciled; the handler reads one order only.
-        nr::CLONE => proc::handle_clone(clone_arguments(args), regs_ptr),
+        nr::CLONE => proc::handle_clone(abi::clone_arguments(args), regs_ptr),
         // `fork`/`vfork` have no aarch64 number at all (the table marks them
         // unreachable rather than absent), so the arm compiles there and can
         // never be matched; the handler itself is arch-neutral now.
@@ -703,43 +703,6 @@ pub unsafe fn dispatch(
 }
 
 #[cfg(target_os = "none")]
-/// The order `clone` takes its last two arguments in, reconciled to the one
-/// order the handler reasons in.
-///
-/// Linux's raw `clone` is the syscall whose argument list is *not* the same on
-/// every machine, and the difference has a name in the kernel: `CLONE_BACKWARDS`.
-/// x86-64's `sys_clone` is `(flags, stack, parent_tid, child_tid, tls)`; arm64's
-/// is `(flags, stack, parent_tid, tls, child_tid)`, and glibc's arm64 `__clone`
-/// carries the comment saying so ("X0:flags, x1:newsp, x2:parenttidptr,
-/// x3:newtls, x4:childtid") - it moves `tls` from the C argument's `x5` into the
-/// syscall's `x3`. So a libc on the second machine sends the thread pointer in
-/// the fourth slot, and the handler must be handed the word the other way round.
-///
-/// This is not a wrong number when it is missing, it is a *thread that does not
-/// work*: with the two words swapped, `CLONE_SETTLS` gives the child a thread
-/// pointer that is really the address of its tid word, and
-/// `CLONE_CHILD_SETTID`/`CLEARTID` park the tid at the TLS base. Measured on the
-/// second machine before this existed: `t-clone`'s `CLONE_CHILD_SETTID` claim
-/// was refused `EINVAL` (there was no tid pointer where the handler looked), the
-/// musl thread it then made faulted at `pc 0x3` on its way out - its exit path
-/// walked a TLS block that was never one - and the sweep never reached its end,
-/// because the word `pthread_join` waits on was never woken.
-///
-/// The first machine needs no swap - its order *is* the one the handler speaks -
-/// so the gate is `target_arch = "aarch64"` and not a table of machines.
-fn clone_arguments(args: [usize; 6]) -> [usize; 6] {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut swapped = args;
-        swapped.swap(3, 4);
-        swapped
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        args
-    }
-}
-
 #[cfg(target_os = "none")]
 use super::err;
 #[cfg(target_os = "none")]

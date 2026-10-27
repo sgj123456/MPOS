@@ -1229,10 +1229,17 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // `SIG_IGN` stays ignored. `clone3`'s `CLONE_CLEAR_SIGHAND` asks
             // for the table an `exec` would leave instead - every slot at
             // `SIG_DFL` - and the handle is the same one an `exec` uses.
+            //
+            // `CLONE_SIGHAND` is the other promise: the child gets *the same*
+            // handle (Linux's `sighand_struct` by reference), which is what a
+            // thread always asks for and what `clone(CLONE_VM|CLONE_SIGHAND)`
+            // may ask for without being a thread. A plain `fork` copies it.
             dispositions: if request.flags & crate::abi::CLONE_CLEAR_SIGHAND != 0 {
-                signal::Actions::default()
+                signal::SignalHand::new(signal::Actions::default())
+            } else if request.flags & crate::abi::CLONE_SIGHAND != 0 {
+                Arc::clone(&t.task(parent_id).dispositions)
             } else {
-                t.task(parent_id).dispositions
+                t.task(parent_id).dispositions.copy()
             },
             // The alternate signal stack crosses a `fork`/`clone` too: Linux's
             // child reads the same `ss_sp` and size the parent set, measured
@@ -1597,7 +1604,13 @@ pub fn exec_replace(
         // blocked mask and the pending set cross the image - Linux flushes
         // neither - so only the handler table's caught slots move. The
         // alternate stack belongs to the old image and is dropped.
-        task.dispositions.reset_caught();
+        // `exec` is an unshare: the image is replaced, so the table must stop
+        // being the thread group's and become this task's own before it is
+        // reset (Linux's `unshare_sighand`). A thread's sibling would otherwise
+        // see the new image's dispositions.
+        let reset = task.dispositions.copy();
+        reset.reset_caught();
+        task.dispositions = reset;
         task.alt_stack = None;
 
         // Close O_CLOEXEC file descriptors.
@@ -1790,7 +1803,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let seccomp_strict = parent.seccomp_strict;
         let seccomp_filters = parent.seccomp_filters.clone();
         let priority = parent.priority;
-        let dispositions = parent.dispositions;
+        let dispositions = Arc::clone(&parent.dispositions);
         // The new thread's signal mask is its creator's, copied: POSIX says a
         // thread inherits the creating thread's mask, and musl's `SIGEV_THREAD`
         // helper depends on it - `timer_create` blocks `SIGRTMIN` in the
@@ -1868,10 +1881,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // held, which is what makes `timer_create`'s `SIGEV_THREAD`
             // helper able to wait for `SIGRTMIN` at all.
             blocked,
-            // Linux shares the handler table under `CLONE_SIGHAND`; this
-            // kernel copies it, so a thread that installs a handler does not
-            // install it for its siblings. Nothing in this system's userland
-            // does that yet, and a copy is the honest version of "not shared".
+            // A thread shares the handler table: Linux's `CLONE_THREAD`
+            // requires `CLONE_SIGHAND`, and the measurement above is what makes
+            // that one object rather than equal copies.
             dispositions,
             alt_stack: None,
             fds,

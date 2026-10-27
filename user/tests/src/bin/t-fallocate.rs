@@ -131,18 +131,25 @@ fn main() {
         fallocate(&fd, FallocateFlags::from_bits_retain(NOT_A_MODE_BIT), 0, 1)
             == Err(Errno::OPNOTSUPP),
     );
+    // Linux refuses the missing KEEP_SIZE, but a filesystem that cannot punch
+    // at all may answer EOPNOTSUPP first: `/tmp` is tmpfs on the host, measured
+    // Linux 7.2.11 as EOPNOTSUPP. On mpos `/tmp` is the ramfs and the answer is
+    // the man page's EINVAL.
+    let punch = fallocate(&fd, FallocateFlags::PUNCH_HOLE, 0, 1);
     r.check(
         "a punch without KEEP_SIZE answers EINVAL",
-        fallocate(&fd, FallocateFlags::PUNCH_HOLE, 0, 1) == Err(Errno::INVAL),
+        punch == Err(Errno::INVAL)
+            || (mpos_user_tests::host_run() && punch == Err(Errno::OPNOTSUPP)),
+    );
+    let punched = fallocate(
+        &fd,
+        FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+        0,
+        1,
     );
     r.check(
         "the punch is unsupported here",
-        fallocate(
-            &fd,
-            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
-            0,
-            1,
-        ) == Err(Errno::OPNOTSUPP),
+        punched == Err(Errno::OPNOTSUPP) || (mpos_user_tests::host_run() && punched.is_ok()),
     );
     r.check(
         "collapsing a range is unsupported here",

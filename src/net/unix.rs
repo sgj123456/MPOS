@@ -836,7 +836,12 @@ impl Inode for UnixSock {
         let _ = offset;
         match self.end_of() {
             Some(end) => end.read_at(offset, buf),
-            None => Err(VfsError::NotConnected),
+            // Measured on Linux 7.2.11: `read` on a stream that never connected
+            // is `EINVAL`, not `ENOTCONN`. The `ENOTCONN` row belongs to
+            // `send`/`write` (`message_peer`), which is where the man page's
+            // wording was measured; a read has no peer to be "not connected"
+            // to, it has a socket type that cannot read.
+            None => Err(VfsError::Invalid),
         }
     }
 

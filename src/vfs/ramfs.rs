@@ -65,16 +65,8 @@ fn fresh_ino() -> Ino {
 /// mtimes of `/etc/init.d`, and warned on every boot. On the host there is
 /// no clock, and the tests want one that moves - see the ext2 driver's
 /// equivalent.
-#[cfg(target_os = "none")]
 fn now() -> u64 {
-    crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64
-}
-
-#[cfg(not(target_os = "none"))]
-fn now() -> u64 {
-    use core::sync::atomic::AtomicU32;
-    static HOST_NOW: AtomicU32 = AtomicU32::new(1_700_000_000);
-    HOST_NOW.fetch_add(1, Ordering::Relaxed) as u64
+    crate::vfs::now_seconds()
 }
 
 /// Whether the kernel can take `need` more bytes for a file and still keep the
@@ -370,11 +362,16 @@ struct RamFile {
     /// `chown` writes it, which is what a memory filesystem the kernel built
     /// for itself used to answer for everything.
     owner: Mutex<Cell<(u32, u32)>>,
-    /// The one clock this filesystem keeps, in unix seconds - stamped at
-    /// creation and moved by every write. `stat`'s atime and ctime report it
-    /// too, which is the trait's stated answer for a filesystem with a single
-    /// clock.
+    /// The file's three clocks, in unix seconds, stamped at creation and moved
+    /// by the door each one belongs to: a write moves mtime and ctime, a read
+    /// moves atime under `relatime`, `utimensat` moves the two it names and
+    /// stamps ctime. A *regular file* keeps all three because Linux's tmpfs
+    /// does, and a fresh file's first read is exactly the case that tells it
+    /// from the old one-clock shape (`.workbuddy/probe_atime.c`: the three are
+    /// equal at creation, and a read moves only atime).
+    atime: Mutex<Cell<u64>>,
     mtime: Mutex<Cell<u64>>,
+    ctime: Mutex<Cell<u64>>,
     /// The attribute flags: `lsattr`'s word, and what makes a file immutable
     /// or append-only.
     flags: NodeFlags,
@@ -505,10 +502,40 @@ impl Inode for RamFile {
         critical_section::with(|cs| self.mtime.borrow(cs).get())
     }
 
-    /// `utimensat`: the atime is accepted and dropped - one clock stands for
-    /// all three here - and the mtime is what `stat` will report.
-    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
-        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+    fn atime(&self) -> u64 {
+        critical_section::with(|cs| self.atime.borrow(cs).get())
+    }
+
+    fn ctime(&self) -> u64 {
+        critical_section::with(|cs| self.ctime.borrow(cs).get())
+    }
+
+    /// `utimensat`: both clocks are kept, and the metadata change stamps ctime -
+    /// Linux's `notify_change`. The caller has already resolved
+    /// `UTIME_NOW`/`UTIME_OMIT` against what this node reports.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        let at = now();
+        critical_section::with(|cs| {
+            self.atime.borrow(cs).set(atime);
+            self.mtime.borrow(cs).set(mtime);
+            self.ctime.borrow(cs).set(at);
+        });
+        Ok(())
+    }
+
+    /// The access clock of a read that moved bytes - **every** read, which is
+    /// Linux's `strictatime` and what a tmpfs does. Measured on a current host
+    /// (`.workbuddy/probe_atime.c`, its `/tmp` being a tmpfs): a future atime
+    /// set with `utimensat` is pulled back to "now" by the next read, where an
+    /// ext4 mount (relatime) leaves it standing. The two filesystems answer
+    /// differently, so the driver spells the rule rather than reusing ext4's.
+    ///
+    /// The inode's own `A` flag still wins: `chattr +A` is a promise about this
+    /// file, wherever it is mounted.
+    fn touch_atime(&self, now: u64) -> VfsResult<()> {
+        if self.flags.get() & crate::vfs::FS_NOATIME_FL == 0 {
+            critical_section::with(|cs| self.atime.borrow(cs).set(now));
+        }
         Ok(())
     }
 
@@ -538,6 +565,7 @@ impl Inode for RamFile {
                 .borrow_mut()
                 .write_at(offset as usize, buf);
             self.mtime.borrow(cs).set(at);
+            self.ctime.borrow(cs).set(at);
             Ok(buf.len())
         })
     }
@@ -560,6 +588,7 @@ impl Inode for RamFile {
         critical_section::with(|cs| {
             self.data.borrow(cs).borrow_mut().set_len(len);
             self.mtime.borrow(cs).set(at);
+            self.ctime.borrow(cs).set(at);
         });
         Ok(())
     }
@@ -1039,7 +1068,7 @@ impl Inode for RamDir {
         // answers `ENOTDIR`. A device placeholder is the exception - see
         // `birth_mode`.
         let birth = birth_mode(kind);
-        let owner = crate::sched::current_owner();
+        let owner = crate::sched::current_fs_owner();
         let node: Arc<dyn Inode> = match kind {
             NodeKind::File => Arc::new(RamFile {
                 fs: self.fs.clone(),
@@ -1047,7 +1076,9 @@ impl Inode for RamDir {
                 links: Mutex::new(Cell::new(1)),
                 mode: Mutex::new(Cell::new(birth)),
                 owner: Mutex::new(Cell::new(owner)),
+                atime: Mutex::new(Cell::new(at)),
                 mtime: Mutex::new(Cell::new(at)),
+                ctime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
                 data: Mutex::new(RefCell::new(Chunked::new())),
             }),
@@ -1133,7 +1164,7 @@ impl Inode for RamDir {
             mtime: Mutex::new(Cell::new(at)),
             target: String::from(target),
             mode: Mutex::new(Cell::new(birth_mode(NodeKind::Symlink))),
-            owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+            owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
         });
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
@@ -1261,7 +1292,7 @@ impl RamFs {
                 fs,
                 ino: fresh_ino(),
                 mode: Mutex::new(Cell::new(None)),
-                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
                 mtime: Mutex::new(Cell::new(now())),
                 flags: NodeFlags::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
@@ -1773,7 +1804,10 @@ mod tests {
 
         file.set_times(111, 222).unwrap();
         assert_eq!(file.mtime(), 222, "utimensat takes the caller's value");
-        assert_eq!(file.atime(), 222, "one clock stands for the read clock too");
+        // A regular file keeps the three clocks apart now - the read clock is
+        // the caller's 111, and the metadata change moved ctime past `born`.
+        assert_eq!(file.atime(), 111, "utimensat takes the access clock too");
+        assert_ne!(file.ctime(), born, "and stamps the metadata change");
 
         // A symlink answers with its creation time; it has no write path.
         let link = root.symlink("l", "/f").unwrap();

@@ -82,6 +82,15 @@ impl OpenHow {
     }
 }
 
+/// The 24-byte struct plus the bytes a `size = 25` caller sends past it.
+/// Linux's `copy_struct_from_user` reads that tail: all-zero is
+/// forward-compatible, a nonzero byte is a field the kernel never heard of.
+#[repr(C)]
+struct PaddedHow {
+    how: OpenHow,
+    tail: [u8; 8],
+}
+
 /// `sizeof(struct open_how)`, the size word's one valid value.
 const SIZEOF_OPEN_HOW: usize = 24;
 
@@ -100,17 +109,13 @@ const NOT_A_RESOLVE_BIT: u64 = 0x40;
 /// this program does not vary. See the module comment for why the raw call
 /// rather than `rustix::fs::openat2`.
 fn openat2(path: &CStr, how: &OpenHow, size: usize) -> Result<OwnedFd, Errno> {
+    openat2_ptr(path, how as *const OpenHow, size)
+}
+
+fn openat2_ptr(path: &CStr, how: *const OpenHow, size: usize) -> Result<OwnedFd, Errno> {
     // `syscall` is a libc entry point, so libc's own errno protocol is what
     // applies - read immediately, before anything else can set it.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            how as *const OpenHow,
-            size,
-        )
-    };
+    let r = unsafe { libc::syscall(libc::SYS_openat2, libc::AT_FDCWD, path.as_ptr(), how, size) };
     if r < 0 {
         return Err(Errno::from_raw_os_error(
             io::Error::last_os_error().raw_os_error().unwrap_or(0),
@@ -140,8 +145,10 @@ fn main() {
     let (create, cloexec) = (OFlags::CREATE.bits() as u64, OFlags::CLOEXEC.bits() as u64);
     let mode600 = Mode::from(0o600).bits() as u64;
 
-    // The size word: sizeof(struct open_how) is 24, and the two sides of it are
-    // the two refusals the man page names.
+    // The size word: sizeof(struct open_how) is 24. Below it is EINVAL; above
+    // is Linux's forward-compatible `copy_struct_from_user` - the extra bytes
+    // must be zero, and a nonzero one is E2BIG. Measured on Linux 7.2.11:
+    // size 25 with byte 24 zero opens the file, byte 24 = 1 is E2BIG.
     r.check(
         "a size below struct open_how answers EINVAL",
         matches!(
@@ -149,10 +156,19 @@ fn main() {
             Err(Errno::INVAL)
         ),
     );
+    let mut padded = PaddedHow {
+        how: OpenHow::new(ronly, 0, 0),
+        tail: [0; 8],
+    };
     r.check(
-        "a size above struct open_how answers E2BIG",
+        "a size above struct open_how with a zero tail opens",
+        openat2_ptr(&file, &padded.how as *const OpenHow, SIZEOF_OPEN_HOW + 1).is_ok(),
+    );
+    padded.tail[0] = 1;
+    r.check(
+        "a nonzero byte past struct open_how answers E2BIG",
         matches!(
-            openat2(&file, &OpenHow::new(ronly, 0, 0), SIZEOF_OPEN_HOW + 1),
+            openat2_ptr(&file, &padded.how as *const OpenHow, SIZEOF_OPEN_HOW + 1),
             Err(Errno::TOOBIG)
         ),
     );
@@ -180,16 +196,16 @@ fn main() {
             Err(Errno::INVAL)
         ),
     );
+    let no_xdev = openat2(
+        &file,
+        &OpenHow::new(ronly, 0, ResolveFlags::NO_XDEV.bits()),
+        SIZEOF_OPEN_HOW,
+    );
     r.check(
         "a resolve bit mpos cannot keep answers EOPNOTSUPP",
-        matches!(
-            openat2(
-                &file,
-                &OpenHow::new(ronly, 0, ResolveFlags::NO_XDEV.bits()),
-                SIZEOF_OPEN_HOW
-            ),
-            Err(Errno::OPNOTSUPP)
-        ),
+        matches!(no_xdev, Err(Errno::OPNOTSUPP))
+            || (mpos_user_tests::host_run()
+                && (no_xdev.is_ok() || matches!(no_xdev, Err(Errno::XDEV)))),
     );
     let fd = openat2(
         &file,

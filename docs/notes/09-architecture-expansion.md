@@ -1071,7 +1071,14 @@ Named gaps the port carries rather than hides, each with its home:
   nodes, the same shape as `drivers`'s prep commit), the `cpuinfo` needs a `MIDR_EL1`
   read reached *without* naming `arch` from `vfs` (a per-arch `cpuinfo` inside procfs
   itself, reading `MIDR_EL1` via `core::arch::asm` behind `target_arch`, or a capability
-  that also exists on host). Named, not papered over.
+  that also exists on host). Named, not papered over. **Both halves landed later** -
+  `/proc` was un-gated when the `net`/PCI stages gave the second machine a stack
+  (§13.12), and `cpuinfo_text` is the per-arch rendering this paragraph suggested,
+  reading `MIDR_EL1`/`ID_AA64*` behind `target_arch`. It had no pin until
+  **`t-cpuinfo`** (2026-10-27): the first line, the x86 `model name` on one machine
+  and `CPU implementer`/`CPU part`/`CPU architecture: 8`/`Features` on the other, and
+  the *absent* field each machine must not carry. The aarch64 arm runs in the sweep,
+  so the shape is checked by the machine rather than inferred from the source.
 
 
 

@@ -97,19 +97,22 @@ pub const EPOLL_CTL_MOD: usize = 3;
 /// the one field it uses to tell its descriptors apart: `data` lands four bytes
 /// before the caller reads it, so the caller's low half comes from the middle of
 /// the kernel's `data` and its high half from the *next* record's `events` word.
-/// Measured before this split existed: on aarch64 udev's workers dereferenced
-/// `data.ptr` values whose upper 32 bits were `EPOLLIN`, three forked siblings
-/// dying identically on the first `epoll_wait` after their parent's fork.
-#[cfg(target_arch = "x86_64")]
+/// The machine's `struct epoll_event` is a struct ABI fact, so the numbers come
+/// from `hal` (§13.2) rather than a `cfg(target_arch)` here: 12 packed bytes with
+/// `data` at 4 on x86_64, 16 with `data` at 8 on aarch64. Measured before the
+/// split existed: on aarch64 udev's workers dereferenced `data.ptr` values whose
+/// upper 32 bits were `EPOLLIN`, three forked siblings dying identically on the
+/// first `epoll_wait` after their parent's fork. The host build has no machine
+/// layer, and its own layout is x86_64's, which is the value it has always
+/// tested against.
+#[cfg(target_os = "none")]
+pub const EPOLL_EVENT_SIZE: usize = crate::hal::EPOLL_EVENT_BYTES;
+#[cfg(not(target_os = "none"))]
 pub const EPOLL_EVENT_SIZE: usize = 12;
-#[cfg(target_arch = "aarch64")]
-pub const EPOLL_EVENT_SIZE: usize = 16;
-/// Where `data` sits inside a `struct epoll_event`: byte 4 on the packed x86_64
-/// layout, byte 8 on the machine that aligns it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_os = "none")]
+pub const EPOLL_EVENT_DATA: usize = crate::hal::EPOLL_EVENT_DATA;
+#[cfg(not(target_os = "none"))]
 pub const EPOLL_EVENT_DATA: usize = 4;
-#[cfg(target_arch = "aarch64")]
-pub const EPOLL_EVENT_DATA: usize = 8;
 
 /// How many descriptors one interest list may hold. Linux bounds this with
 /// `/proc/sys/fs/epoll/max_user_watches` and answers ENOSPC when it is hit;
@@ -693,19 +696,13 @@ mod tests {
         assert_eq!(EPOLL_CTL_ADD, 1);
         assert_eq!(EPOLL_CTL_DEL, 2);
         assert_eq!(EPOLL_CTL_MOD, 3);
-        // The record's layout is the *machine's* (see the constants), so these
-        // are the host's own half of the split. The aarch64 half - sixteen
-        // bytes, `data` at 8 - cannot be asserted from an x86_64 host, and is
-        // pinned on that machine by `t-epoll`'s own record.
-        #[cfg(target_arch = "x86_64")]
+        // The host build is x86_64 and has no machine layer, so this is the
+        // one layout it can assert; the aarch64 half - sixteen bytes, `data` at
+        // 8 - is pinned on that machine by `t-epoll`'s own record.
+        #[cfg(not(target_os = "none"))]
         {
             assert_eq!(EPOLL_EVENT_SIZE, 12);
             assert_eq!(EPOLL_EVENT_DATA, 4);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            assert_eq!(EPOLL_EVENT_SIZE, 16);
-            assert_eq!(EPOLL_EVENT_DATA, 8);
         }
         assert_eq!(MAX_WATCHES, 1024);
     }

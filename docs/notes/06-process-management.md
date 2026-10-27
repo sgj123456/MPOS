@@ -2584,6 +2584,15 @@ clippy, and the pin builds for it, with its own `semid64_ds` offsets); its sweep
 could not boot on this host (no DRM render node), so no aarch64 figure is
 claimed.
 
+**The flag value, found by the host run (2026-10-27).** The pin and the kernel
+agreed on a wrong `IPC_NOWAIT`: both spelled it `0x4000`, where `ipc.h`'s octal
+word is `0o4000` (2048, `0x800`). On the guest that was invisible - the test
+wrote `0x4000` and `sysv_sem` looked for `0x4000` - but Linux saw an unknown
+flag, ran the `semop` as blocking and parked (`t-sysv-sem` then spent the whole
+120-second program budget in `semop(-1)` at zero). The constant is now `0o4000`
+on both sides and pinned by `the_semaphore_flags_are_ipc_hs_octal_words`; the
+gate's own says are unchanged because the two were wrong together.
+
 ### 6.15 System V message queues — **LANDED** (2026-10-23, SysV's third and last family)
 
 The fourth door on the IPC namespace's contents: `msgget` (68/186), `msgsnd`

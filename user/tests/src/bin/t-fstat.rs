@@ -50,8 +50,10 @@ use rustix::io::{Errno, read};
 
 /// The file this test owns, in place of the no-std version's `/etc/motd`.
 const FILE: &str = "/tmp/t-fstat_file";
-/// A directory both payloads carry, with no subdirectory in either.
-const DIR: &str = "/bin";
+/// An *empty* directory this test makes, not `/bin`: a merged-/usr host makes
+/// `/bin` a symlink to a directory with hundreds of subdirectories, where
+/// `nlink` is 3+, which is a fact about the host's layout rather than fstat.
+const DIR: &str = "/tmp/t-fstat_dir";
 /// A descriptor number nothing is open on. `BorrowedFd::borrow_raw` refuses a
 /// negative raw fd by contract, and the kernel answers the same EBADF branch.
 const BAD_FD: i32 = 77;
@@ -181,13 +183,16 @@ fn main() {
         matches!(fstat(missing), Err(Errno::BADF)),
     );
 
-    // A directory: S_IFDIR in st_mode, nlink 2 like the man page's example.
+    // A directory: S_IFDIR in st_mode, nlink 2 for an *empty* one.
+    let _ = std::fs::remove_dir_all(DIR);
+    let made = std::fs::create_dir(DIR).is_ok();
+    r.check("the fixture directory is made", made);
     match openat(CWD, DIR, OFlags::RDONLY, Mode::empty()) {
         Ok(fd) => {
-            r.check("/bin opens", true);
+            r.check("the directory opens", true);
             match fstat(&fd) {
                 Ok(st) => {
-                    r.check("fstat(/bin) succeeds", true);
+                    r.check("fstat on the directory succeeds", true);
                     r.check(
                         "st_mode says directory",
                         FileType::from_raw_mode(st.st_mode).is_dir(),
@@ -195,19 +200,20 @@ fn main() {
                     r.check("a directory reports st_nlink 2", st.st_nlink == 2);
                 }
                 Err(_) => {
-                    r.check("fstat(/bin) succeeds", false);
+                    r.check("fstat on the directory succeeds", false);
                     r.check("st_mode says directory", false);
                     r.check("a directory reports st_nlink 2", false);
                 }
             }
         }
         Err(e) => {
-            r.check(&format!("/bin opens (got {e})"), false);
-            r.check("fstat(/bin) succeeds", false);
+            r.check(&format!("the directory opens (got {e})"), false);
+            r.check("fstat on the directory succeeds", false);
             r.check("st_mode says directory", false);
             r.check("a directory reports st_nlink 2", false);
         }
     }
+    let _ = std::fs::remove_dir_all(DIR);
 
     let _ = std::fs::remove_file(FILE);
     r.finish()

@@ -327,12 +327,19 @@ fn run_one(
         );
     }
     let diskstat = diskstat_for_staged(staged.iter().map(|test| test.name.as_str()));
+    // The runner's budgets are this run's answer, selected for this machine -
+    // the same table `test-host` reads, from the same file. They ride the
+    // lane's program list itself, one `<name>:<seconds>` entry each
+    // (`budgeted_program_list` carries why that is the channel and not a table
+    // of its own).
     let guest = match arch {
         Arch::X86_64 => {
             let tar = build_test_initramfs(build_dir, &staged)?;
-            boot_archive_lanes(build_dir, profile, &tar, diskstat, &staged)?
+            boot_archive_lanes(build_dir, profile, &tar, diskstat, &config, &staged)?
         }
-        Arch::Aarch64 => boot_disk_lanes(build_dir, &kernel, &loader, arch, diskstat, &staged)?,
+        Arch::Aarch64 => boot_disk_lanes(
+            build_dir, &kernel, &loader, arch, diskstat, &config, &staged,
+        )?,
     };
 
     // The arm's verdict read off its own wire, and every claim the report
@@ -616,9 +623,9 @@ fn run_captured(cmd: &mut Command, what: &str) -> Result<String> {
 /// One user test program: its name (what appears on a verdict line) and the
 /// built binary.
 #[derive(Clone)]
-struct UserTest {
-    name: String,
-    binary: PathBuf,
+pub(crate) struct UserTest {
+    pub(crate) name: String,
+    pub(crate) binary: PathBuf,
 }
 
 /// This machine stages a *path*: the binary is copied into the test initramfs
@@ -684,7 +691,11 @@ fn build_user_tests(arch: Arch) -> Result<Vec<UserTest>> {
 /// The walk covers subdirectories because the suite used to be split by what
 /// a test needs, and the binary keeps the file's name either way: that is
 /// what a `/bin/t-*` run and the verdict line are keyed on.
-fn collect_user_tests(src_dir: &Path, out_dir: &Path, tests: &mut Vec<UserTest>) -> Result<()> {
+pub(crate) fn collect_user_tests(
+    src_dir: &Path,
+    out_dir: &Path,
+    tests: &mut Vec<UserTest>,
+) -> Result<()> {
     for entry in
         fs::read_dir(src_dir).with_context(|| format!("Failed to read {}", src_dir.display()))?
     {
@@ -1042,42 +1053,86 @@ echo "nameserver 10.0.2.3" > /etc/resolv.conf
 
 pass=0
 fail=0
+# One program's budget, in seconds, rides the program list itself: an entry is
+# `<name>:<seconds>`. The built-in below is the answer for an entry the harness
+# did not budget - a hand boot that edits `mpos.tests`, or a program the list
+# somehow misses. It is the shipped `tests.toml` value, which is why the pin in
+# this file's tests compares it against `config::DEFAULT_TEST_TIMEOUT_SECS`.
+#
+# Why a program needs one at all: a test that blocks on something the machine
+# does not answer used to hold the lane until its 900-second deadline, and every
+# program staged after it never ran. Killing it at its own budget keeps the
+# failure named (`=== FAIL <name> timeout=Ns`) and lets the rest of the lane
+# answer, which is the difference between one red test and a sweep that says
+# nothing.
+#
+# **Why the budget rides the list and not a table of its own** - the shape this
+# had first: a line-at-a-time `read` loop over `<name> <seconds>` lines makes
+# busybox's ash ask the kernel for one `read(2)` per *byte*, and in this guest each of those is a 9P
+# `Tread` whose reply buffer is 128 KiB (`src/vfs/p9.rs`'s `call()`). Measured
+# 2026-10-27 on the x86_64 arm with the code unchanged and only the table's
+# content differing, 215 programs green both runs: **64.2 s of sweep against
+# 9.6 s**, i.e. ~1.5 s added to every program. The list is parsed once per boot
+# already, so the budgets cost no reads at all.
+TEST_TIMEOUT=120
 # t-stdargs is the one test that pins the argument vector itself: it wants
 # argv to be exactly `t-stdargs one two three`, and the bare word is
 # load-bearing - a path there ("/bin/t-stdargs") is a different argv[0]
 # than the PATH lookup a shell hands it. Everything else runs as-is.
-run_one() {
-    if [ "${1##*/}" = "t-stdargs" ]; then
-        (cd /bin && PATH=/bin t-stdargs one two three)
-    else
-        "$1"
-    fi
-}
+#
+# busybox's `timeout` answers 128+signal when it had to kill the program; with
+# `-s KILL` that is 137, which is what tells a timeout apart from a program's
+# own non-zero exit. The process group is not widened: the suite's own forked
+# children are its to wait for, and the sweep's lane deadline still bounds a
+# leak.
 run_test() {
-    echo "=== RUN ${1##*/}"
-    if run_one "$1"; then
-        echo "=== PASS ${1##*/}"
-        pass=$((pass + 1))
+    name=${1##*/}
+    secs=${2:-$TEST_TIMEOUT}
+    # A budget that is not a number must not reach `timeout ''`: the applet then
+    # refuses the number and the program never runs. A list entry without
+    # `:seconds` lands here too - `${entry#*:}` is then the name itself.
+    case "$secs" in
+        ''|*[!0-9]*) secs=$TEST_TIMEOUT ;;
+    esac
+    echo "=== RUN $name"
+    if [ "$name" = "t-stdargs" ]; then
+        (cd /bin && PATH=/bin /bin/busybox timeout -s KILL "$secs" t-stdargs one two three)
     else
-        echo "=== FAIL ${1##*/} exit=$?"
+        /bin/busybox timeout -s KILL "$secs" "$1"
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "=== PASS $name"
+        pass=$((pass + 1))
+    elif [ "$rc" -eq 137 ]; then
+        echo "=== FAIL $name timeout=${secs}s"
+        fail=$((fail + 1))
+    else
+        echo "=== FAIL $name exit=$rc"
         fail=$((fail + 1))
     fi
 }
 
-# Which programs this boot runs. A sweep with more than one lane hands each
-# guest its own subset, and the list travels on one of two channels: the
-# kernel command line (`mpos.tests=t-a,t-b,...`) on the machine whose payload
-# is the boot archive itself, and - below the word, which wins - a
-# `mpos.tests` file on the host share for the machine whose payload is a disk
-# it boots. The file is why the second machine's lane media can be cached at
-# all: the medium carries the *whole* payload, its stamp names nothing about
-# which lane boots it, and the deal - re-dealt from fresh cost measurements
-# on every run - moves only a file the next boot reads. A boot with neither
-# the word nor the file runs everything staged, which is one lane and also
-# what a hand boot of a test image does. The list is read here, in the
+# Which programs this boot runs, and each one's budget. A sweep with more than
+# one lane hands each guest its own subset, and the list travels on one of two
+# channels: the kernel command line (`mpos.tests=t-a:120,t-b:300,...`) on the
+# machine whose payload is the boot archive itself, and - below the word, which
+# wins - a `mpos.tests` file on the host share for the machine whose payload is
+# a disk it boots. The file is why the second machine's lane media can be
+# cached at all: the medium carries the *whole* payload, its stamp names nothing
+# about which lane boots it, and the deal - re-dealt from fresh cost
+# measurements on every run - moves only a file the next boot reads. A boot with
+# neither the word nor the file runs everything staged, which is one lane and
+# also what a hand boot of a test image does. The list is read here, in the
 # runner, and not by the kernel: whether a machine runs tests is the image's
 # to say (`docs/notes/` §15.19), and this only chooses among programs the
 # image already carries.
+#
+# Each entry is `<name>:<seconds>`, and the budget rides the list because the
+# list is the one thing already read once per boot - a separate budget file
+# made the runner re-read and re-scan a table for every program (the `TEST_TIMEOUT`
+# block above carries that measurement). An entry without `:seconds` is still a
+# program to run: `run_test` falls back to the built-in for it.
 want=""
 for word in $(cat /proc/cmdline); do
     case "$word" in
@@ -1088,12 +1143,14 @@ if [ -z "$want" ] && [ -f /mnt/share/mpos.tests ]; then
     want=$(cat /mnt/share/mpos.tests | tr ',' ' ')
 fi
 if [ -n "$want" ]; then
-    for name in $want; do
-        run_test "/bin/$name"
+    for entry in $want; do
+        name=${entry%%:*}
+        secs=${entry#*:}
+        run_test "/bin/$name" "$secs"
     done
 else
     for t in /bin/t-*; do
-        run_test "$t"
+        run_test "$t" "$TEST_TIMEOUT"
     done
 fi
 echo "=== SUMMARY pass=$pass fail=$fail"
@@ -1108,6 +1165,39 @@ echo "=== END"
 /// thing booted - so [`tests::the_diskstat_word_matches_the_kernels_constant`]
 /// pins them against each other instead.
 const DISKSTAT_ON: &str = " mpos.diskstat";
+
+/// The program list one lane's boot reads, each entry carrying its own budget:
+/// `<name>:<seconds>`, comma separated - the shape and the channel [`TEST_INIT`]
+/// already parses (`mpos.tests=` on the kernel command line, or a `mpos.tests`
+/// file on the share, for the machine whose payload is a disk).
+///
+/// **Why the budget rides the list rather than a table of its own**, which is
+/// the shape this had first: the runner looked each program up in a second
+/// share file with a `while read` loop, and busybox's ash asks the kernel for
+/// one `read(2)` per *byte* - 3448 of them per program against a table of one
+/// line per staged program here. In this guest every one of those is a 9P
+/// `Tread` (one virtio round trip, one in flight) whose reply buffer is a fresh
+/// `PROPOSED_MSIZE` - 128 KiB - allocation in `src/vfs/p9.rs`'s `call()`.
+/// Measured 2026-10-27 on the x86_64 arm, same code, only the table's content
+/// differing, 215 programs green in both runs: **64.2 s of sweep against
+/// 9.6 s**, i.e. ~1.5 s added to every program and the gate's lane budget undone.
+/// The list is parsed once per boot already, so budgets on it cost no reads.
+///
+/// Every program a lane was dealt is written by name rather than only the
+/// overrides, so the guest never has to reproduce the precedence rule in
+/// [`crate::config::TestConfig::timeout_secs`]; a name the list somehow misses
+/// (a hand boot that edits it) gets [`TEST_INIT`]'s built-in.
+fn budgeted_program_list(
+    names: &[String],
+    config: &crate::config::TestConfig,
+    machine: crate::config::Machine,
+) -> String {
+    names
+        .iter()
+        .map(|name| format!("{}:{}", name, config.timeout_secs(machine, name)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Where §10.5's ext4 fixture lands inside either machine's payload - the same
 /// path on both machines, which is what lets `t-ext4-mount` open one name here
@@ -1383,30 +1473,16 @@ struct LaneJob {
     log: PathBuf,
 }
 
-/// Boots the test initramfs in QEMU - one machine per lane - and answers the
-/// combined exit status, the whole wire in lane order, and the summary summed
-/// over the lanes.
+/// The lane deal both machines' sweeps share: the measured costs, the split,
+/// and the two lines that explain it.
 ///
-/// The boot disk is QEMU's virtual FAT: the loader and the test initramfs are
-/// served out of a plain directory, so no image needs creating and no privilege
-/// is needed to write it. **Everything a machine writes is that machine's own**:
-/// its ESP directory, its firmware variable store (OVMF writes it at boot), its
-/// SATA image (the path `machine_args` derives from the ESP's directory), its
-/// 9p share and the console socket inside it, and its serial file. The one
-/// shared byte range is the tar, hard-linked and read-only, because a second
-/// copy of tens of megabytes is paid once per lane for nothing.
-fn boot_archive_lanes(
-    build_dir: &Path,
-    profile: &str,
-    tar: &Path,
-    diskstat: &str,
-    staged: &[&UserTest],
-) -> Result<Guest> {
-    println!("User tests (x86_64): booting the test machine");
-
-    let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
-    let costs = read_costs(build_dir, Arch::X86_64);
-    let dealt = deal_lanes(&names, &costs, lane_count(staged.len()));
+/// One function because the question is the machine's only in the costs it
+/// reads; the split itself is `deal_lanes`, which does not know a payload from
+/// an architecture. The two arms used to carry byte-identical copies of this.
+fn plan_lanes(build_dir: &Path, arch: Arch, names: &[&str]) -> Vec<Vec<String>> {
+    println!("User tests ({}): booting the test machine", arch.name());
+    let costs = read_costs(build_dir, arch);
+    let dealt = deal_lanes(names, &costs, lane_count(names.len()));
     println!(
         "User tests: {} programs over {} lane(s)",
         names.len(),
@@ -1430,11 +1506,50 @@ fn boot_archive_lanes(
             loads.join(", ")
         );
     }
+    dealt
+}
+
+/// Spawn one lane's QEMU and hand its command to the poll.
+///
+/// The two arms differ in the *arguments* they build, never in how a lane is
+/// started: one QEMU process, its stderr inherited so a machine that refuses to
+/// start says so, its stdout quiet because the wire is a file.
+fn push_lane(arch: Arch, index: usize, args: Vec<String>, log: PathBuf, jobs: &mut Vec<LaneJob>) {
+    eprintln!("+ lane {index}: {} {}", arch.qemu_binary(), args.join(" "));
+    let mut command = Command::new(arch.qemu_binary());
+    command.args(&args);
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::inherit());
+    jobs.push(LaneJob { command, log });
+}
+
+/// Boots the test initramfs in QEMU - one machine per lane - and answers the
+/// combined exit status, the whole wire in lane order, and the summary summed
+/// over the lanes.
+///
+/// The boot disk is QEMU's virtual FAT: the loader and the test initramfs are
+/// served out of a plain directory, so no image needs creating and no privilege
+/// is needed to write it. **Everything a machine writes is that machine's own**:
+/// its ESP directory, its firmware variable store (OVMF writes it at boot), its
+/// SATA image (the path `machine_args` derives from the ESP's directory), its
+/// 9p share and the console socket inside it, and its serial file. The one
+/// shared byte range is the tar, hard-linked and read-only, because a second
+/// copy of tens of megabytes is paid once per lane for nothing.
+fn boot_archive_lanes(
+    build_dir: &Path,
+    profile: &str,
+    tar: &Path,
+    diskstat: &str,
+    config: &crate::config::TestConfig,
+    staged: &[&UserTest],
+) -> Result<Guest> {
+    let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
+    let dealt = plan_lanes(build_dir, Arch::X86_64, &names);
     let loader = utils::loader_path(profile, Arch::X86_64)?;
 
     let mut jobs: Vec<LaneJob> = Vec::with_capacity(dealt.len());
     for (index, lane_names) in dealt.iter().enumerate() {
-        let dir = build_dir.join(format!("test-lane-{index}"));
+        let dir = build_dir.join(format!("test-lane-x86_64-{index}"));
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
@@ -1446,18 +1561,19 @@ fn boot_archive_lanes(
         // every line the harness reads is the whole of what the machine said -
         // there is no second console to be missing it on.
         //
-        // `mpos.tests=` is the lane's program list. The *runner* reads it out of
-        // `/proc/cmdline`; the kernel does not read it, and the rule that
-        // whether a machine runs tests is the image's to say (§15.19) is
-        // untouched - this word only chooses among programs the image already
+        // `mpos.tests=` is the lane's program list, each entry `<name>:<seconds>`
+        // - the budget rides the list because the list is the one thing the
+        // runner already reads once per boot (`budgeted_program_list` carries the
+        // measurement that made a second table the wrong shape). The *runner*
+        // reads it out of `/proc/cmdline`; the kernel does not read it, and the
+        // rule that whether a machine runs tests is the image's to say (§15.19)
+        // is untouched - this word only chooses among programs the image already
         // carries, which is what makes a lane a second guest of one sweep rather
         // than a second sweep.
+        let entries = budgeted_program_list(lane_names, config, crate::config::Machine::X86_64);
         fs::write(
             esp.join("mpos.cmdline"),
-            format!(
-                "console=ttyS0{diskstat} mpos.tests={}\n",
-                lane_names.join(",")
-            ),
+            format!("console=ttyS0{diskstat} mpos.tests={entries}\n"),
         )?;
 
         // Per lane, in the order the reasons matter:
@@ -1500,11 +1616,7 @@ fn boot_archive_lanes(
         );
         // `isa-debug-exit` - the port the kernel writes its verdict to - comes
         // with every machine `machine_args` builds.
-        eprintln!("+ lane {index}: qemu-system-x86_64 {}", args.join(" "));
-
-        let mut command = Command::new("qemu-system-x86_64");
-        command.args(&args);
-        jobs.push(LaneJob { command, log });
+        push_lane(Arch::X86_64, index, args, log, &mut jobs);
     }
 
     run_lanes(build_dir, Arch::X86_64, names, dealt, jobs)
@@ -1528,32 +1640,11 @@ fn boot_disk_lanes(
     loader: &Path,
     arch: Arch,
     diskstat: &str,
+    config: &crate::config::TestConfig,
     staged: &[&UserTest],
 ) -> Result<Guest> {
-    println!("User tests ({}): booting the test machine", arch.name());
-
     let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
-    let costs = read_costs(build_dir, arch);
-    let dealt = deal_lanes(&names, &costs, lane_count(staged.len()));
-    println!(
-        "User tests: {} programs over {} lane(s)",
-        names.len(),
-        dealt.len()
-    );
-    if !costs.is_empty() {
-        let loads: Vec<String> = dealt
-            .iter()
-            .map(|lane| {
-                let load: u64 = lane.iter().map(|name| cost_of(&costs, name)).sum();
-                format!("{} programs / {load} ms", lane.len())
-            })
-            .collect();
-        println!(
-            "User tests: dealing from {} measured costs: {}",
-            costs.len(),
-            loads.join(", ")
-        );
-    }
+    let dealt = plan_lanes(build_dir, arch, &names);
 
     // The runner is the *shared* one, and it lands at `/sbin/init` because
     // that is the disk's pid-1 chain: the shared initramfs script execs it
@@ -1612,55 +1703,72 @@ fn boot_disk_lanes(
     // writing one file is one lane's boot state in the other's machine.
     let (firmware, vars0) = qemu::write_firmware_vars(build_dir, arch)?;
 
+    // The command line names the boot, not the lane: which of the staged
+    // programs a lane runs rides that lane's own 9p share (`mpos.tests`, read
+    // by the shared runner above the mount it already makes). Baking the list
+    // in would re-deal the deal into every run's image fingerprint.
+    let cmdline = format!(
+        "console={} mpos.selftest root={} rootfstype={}{}\n",
+        rootfs.serial_port, rootfs.root_device, rootfs.filesystem, diskstat
+    );
+    // **One** medium, shared by every lane. What goes into it depends only on
+    // the payload and the command line above, both identical across lanes;
+    // building one per lane was six copies of the same 250 MB image on every
+    // cold gate. Each lane boots it through `snapshot=on` (`qemu`'s test arm),
+    // so the writes a guest makes land in that lane's private overlay and never
+    // in the shared base.
+    let medium = crate::disk::sweep_medium(
+        build_dir,
+        build_dir,
+        arch,
+        &crate::disk::Boot {
+            kernel,
+            loader,
+            entries: &entries,
+            disk_bytes,
+            cmdline: &cmdline,
+        },
+    )?;
+
     let mut jobs: Vec<LaneJob> = Vec::with_capacity(dealt.len());
     for (index, lane_names) in dealt.iter().enumerate() {
         let dir = build_dir.join(format!("test-lane-{}-{index}", arch.name()));
         fs::create_dir_all(&dir)?;
-        // The lane's *medium* lives in this directory under its own stamp, and
-        // `sweep_medium`'s cache decides whether it needs laying again - so the
-        // directory is kept, not wiped, and only the artefacts a boot rewrites
-        // are refreshed here: the serial log (a new run's wire, not the last
-        // one's tail) and the firmware vars (AAVMF writes them at every boot,
-        // which is why they travel as a fresh copy and not a shared file).
-        // Wiping the whole directory was how this arm rebuilt a 250 MB image
-        // with its ext4 root on every gate, where the first machine's lane -
-        // whose payload rides an archive and a per-lane command-line file -
-        // rebuilt nothing.
+        // A tree that ran the previous layout still carries a per-lane copy of
+        // the medium here; it is shared in `build/` now and nothing reads this
+        // one. Drop it (and its staging) instead of paying for six stale
+        // 250 MB images beside the logs.
+        crate::disk::remove_legacy_lane_medium(&dir, arch);
+        // The lane keeps its directory rather than starting clean: the serial log
+        // is refreshed (a new run's wire, not the last one's tail) and the
+        // firmware variables are copied fresh (AAVMF writes them at every boot,
+        // which is why they cannot be one shared file), while the SATA and
+        // block-pattern images below are laid fresh in place. The boot medium
+        // itself is not here at all any more - it is one file in `build/`,
+        // shared by every lane and written through a snapshot.
         let log = dir.join("serial.log");
         let _ = fs::remove_file(&log);
         let vars = dir.join(arch.firmware_vars());
         fs::copy(&vars0, &vars)
             .with_context(|| format!("Failed to stage the firmware vars at {}", vars.display()))?;
-        // The medium's command line names the boot, not the lane: which of
-        // the staged programs this lane runs rides the lane's own 9p share
-        // (`mpos.tests`, read by the shared runner above the mount it already
-        // makes). Baking the list here instead re-dealt the deal into every
-        // run's image fingerprint - and a deal re-dealt from fresh cost
-        // measurements is a deal that changes on every run, which is how this
-        // arm rebuilt every lane's 250 MB medium on every gate. The first
-        // machine's lanes keep the command-line word, because their payload
-        // is an archive no stamp guards.
-        let cmdline = format!(
-            "console={} mpos.selftest root={} rootfstype={}{}\n",
-            rootfs.serial_port, rootfs.root_device, rootfs.filesystem, diskstat
-        );
-        let disk = crate::disk::sweep_medium(
-            build_dir,
-            &dir,
-            arch,
-            &crate::disk::Boot {
-                kernel,
-                loader,
-                entries: &entries,
-                disk_bytes,
-                cmdline: &cmdline,
-            },
-        )?;
+        // This lane's private writable disks. The boot medium is shared (above)
+        // and written through a snapshot; the SATA disk the programs write and
+        // the block pattern a check reads have no snapshot, so they stay beside
+        // this lane and are laid fresh here - `images_dir` below points the
+        // wiring at them.
+        crate::disk::ensure_pattern_image(&dir, arch)?;
+        crate::disk::reset_sata_image(&dir)?;
 
         let share = utils::lay_p9_share(&dir.join("9p-share"))?;
-        // The lane's program list, on the channel the runner reads it from.
-        fs::write(share.join("mpos.tests"), lane_names.join(","))
-            .with_context(|| format!("Failed to stage the lane's program list"))?;
+        // The lane's program list, on the one channel the runner reads it from,
+        // each entry carrying that program's budget (`<name>:<seconds>`; see
+        // `budgeted_program_list` for why the budget rides the list and not a
+        // table of its own). It names this lane's subset - and because a budget
+        // is a property of the program, the number a lane times a program out
+        // at is the same whichever lane dealt it.
+        let list = budgeted_program_list(lane_names, config, crate::config::Machine::from(arch));
+        fs::write(share.join("mpos.tests"), list)
+            .with_context(|| "Failed to stage the lane's program list")?;
         // A test boot never needs the host vsock bus, and every lane claiming
         // the same CID aborts QEMU before its guest starts (`docs/notes/`
         // §13.28) - the same rule the first machine's lanes run under.
@@ -1671,20 +1779,13 @@ fn boot_disk_lanes(
             &config,
             &firmware,
             &vars,
-            &disk,
+            &medium,
+            &dir,
             &qemu::Console::File(log.display().to_string()),
             &share,
             true,
         )?;
-        eprintln!("+ lane {index}: {} {}", arch.qemu_binary(), args.join(" "));
-
-        let mut command = Command::new(arch.qemu_binary());
-        command.args(&args);
-        // QEMU's own stderr is inherited, so a machine that refuses to start
-        // says so there (`qemu::boot`'s rule, on a lane now too).
-        command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::inherit());
-        jobs.push(LaneJob { command, log });
+        push_lane(arch, index, args, log, &mut jobs);
     }
 
     run_lanes(build_dir, arch, names, dealt, jobs)
@@ -2560,6 +2661,81 @@ test result: ok. 130 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fi
         assert!(
             init.contains("for t in /bin/t-*"),
             "a boot with no lane word still runs what it was given"
+        );
+    }
+
+    /// A program that blocks must cost its own budget, not the lane's 900
+    /// seconds and every program behind it. Pinned as text because the runner
+    /// is text: the three parts that make it work are the budget arriving with
+    /// the list entry, the `timeout` wrapping the invocation itself, and the
+    /// verdict that names the timeout instead of a bare non-zero exit.
+    #[test]
+    fn the_runner_times_each_program_out_and_carries_on() {
+        let init = super::TEST_INIT;
+        for needle in [
+            // The budget rides the program list's own entry (`<name>:<secs>`),
+            // which is the list the runner already reads once per boot.
+            "name=${entry%%:*}",
+            "secs=${entry#*:}",
+            "/bin/busybox timeout -s KILL",
+            "=== FAIL $name timeout=",
+        ] {
+            assert!(
+                init.contains(needle),
+                "the runner lost `{needle}`; a stuck program would hold its lane again"
+            );
+        }
+        // The timeout has to wrap both shapes `run_test` invokes - the plain
+        // program and `t-stdargs`' `cd /bin` form - or one of them keeps the
+        // old unbounded behaviour.
+        assert_eq!(
+            init.matches("/bin/busybox timeout -s KILL").count(),
+            2,
+            "the budget must wrap every invocation shape"
+        );
+        // The hand-boot fallback and the harness's built-in must be one number:
+        // a guest booted without a share would otherwise use a different budget
+        // from the same file's answer.
+        assert!(
+            init.contains(&format!(
+                "TEST_TIMEOUT={}",
+                crate::config::DEFAULT_TEST_TIMEOUT_SECS
+            )),
+            "the runner's fallback budget drifted from the harness default"
+        );
+        // A budget that came back empty or unparsed must not reach `timeout ''`:
+        // the applet then refuses the number and the program never runs.
+        assert!(
+            init.contains("''|*[!0-9]*) secs=$TEST_TIMEOUT"),
+            "the runner lost its empty-budget fallback"
+        );
+        // And the budget must not go back to a second file the runner re-reads
+        // per program: `while read` is the shape that cost every program ~1.5 s
+        // (measured 2026-10-27; `budgeted_program_list`'s header carries it).
+        for absent in ["mpos.test-timeouts", "budget_for"] {
+            assert!(
+                !init.contains(absent),
+                "the runner re-reads a budget table per program (`{absent}`); that is the O(programs x bytes) scan again"
+            );
+        }
+    }
+
+    /// The program list carries each program's budget, so the guest never has
+    /// to reproduce `TestConfig`'s precedence rule - and never has to re-read
+    /// and re-scan a table of its own (`budgeted_program_list`'s header carries
+    /// the measurement that made the table the wrong shape).
+    #[test]
+    fn the_program_list_carries_each_programs_budget() {
+        let path = std::env::temp_dir()
+            .join("mpos-selftest-budgets")
+            .join("tests.toml");
+        fs::create_dir_all(path.parent().expect("a config path has a parent")).unwrap();
+        fs::write(&path, "[default]\ntimeout = 90\ntimeouts = [\"t-b=300\"]\n").unwrap();
+        let config = crate::config::TestConfig::load(&path).unwrap();
+        let names = vec!["t-a".to_string(), "t-b".to_string(), "t-c".to_string()];
+        assert_eq!(
+            super::budgeted_program_list(&names, &config, crate::config::Machine::X86_64),
+            "t-a:90,t-b:300,t-c:90"
         );
     }
 

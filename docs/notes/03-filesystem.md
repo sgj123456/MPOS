@@ -110,11 +110,57 @@ change it is; `stat`/`statx` report the three clocks separately (ext4 keeps
 `open`/`write`/`truncate` bump mtime/ctime; a fresh inode is created with all
 three set.
 
-*Remaining:* `atime` is not bumped on read (ext4 carries it but no read path
-updates it). ramfs/tmpfs now keeps one clock - stamped at creation and by
-writes, truncates and directory-entry changes - which is what stopped
-OpenRC's deptree freshness check from reading every `/run` file as 1970.
-The legacy `utime` and `futimesat` now store
+**The access clock landed on 2026-10-27**, closing this section's last named
+"not bumped" gap. It took three facts that a single "update atime on read" would
+have got wrong, and each was measured on a current host first
+(`.workbuddy/probe_atime.c`, Linux 7.2.11; the uid-drop half in a container's
+root):
+
+* **`relatime` compares `<=`, not `<`, and it asks mtime as well as ctime.** A
+  freshly created file - three equal clocks - *does* move its atime on the first
+  read. The old `ext4` body used `atime < ctime` and never asked mtime, so a new
+  file's first read left the clock alone;
+* **`/tmp` is a tmpfs and tmpfs is `strictatime`**, not relatime: even an atime
+  `utimensat` wrote into the *future* is pulled back to the read's moment. An
+  ext4 mount leaves that future value standing. The two filesystems really
+  answer differently, so they spell their own rule;
+* **`O_NOATIME` is a promise a stranger may not ask for.** It suppresses the
+  update, and an open that asks for it without owning the file or holding
+  `CAP_FOWNER` is `EPERM` - at the *open*, after `may_open`'s `EISDIR`/access
+  refusals, which is Linux's `do_dentry_open` order.
+
+**The landing** moved the update out of `ext4::read_at`, where it could not see
+a description, into `File::read` - the one door `read`, `pread`, `readv` and
+`preadv` all come through - behind a new `Inode::touch_atime`. The default is
+`Ok(())` (a virtual node invents no clock); `ext4` spells relatime over its
+on-disk `i_atime`, and `RamFile` spells strictatime over three in-memory clocks.
+The ramfs regular file now keeps atime/mtime/ctime apart; its directory,
+symlink, socket and device nodes still fold atime into mtime, which is named
+below. `O_NOATIME` is a `File`-carried open flag (`O_NOATIME`, the same number
+on both machines) and the owner/`CAP_FOWNER` question is asked once at
+`open_opt`. `vfs::now_seconds` is the one clock both drivers stamp with.
+
+**Pin**: the new **`t-atime`**, 7 claims on both machines (the host's own Linux
+first, `MPOS_ON_HOST=1`): a fresh file's first read moves atime; a read moves
+nothing else; an older atime moves; a *future* one is pulled back (strictatime);
+`O_NOATIME` leaves it; the plain description beside it still moves it; and a
+65534 stranger's `open(O_NOATIME)` is `EPERM`. The relatime half - "a future
+atime stands, a second read moves nothing, a day-old one moves" - is pinned by
+the rewritten `vfs::ext4::tests::relatime_moves_atime_only_when_something_has_happened`,
+because the sweep machine has no disk to read an ext4 file from.
+
+**Counterfactuals, both run**: with `File::read`'s call deleted, x86_64
+`pass=212 fail=1`, exactly the three moving claims red; with the `O_NOATIME`
+flag ignored and the open's authority check deleted, exactly the two
+`O_NOATIME` claims red. The controls (mtime/ctime unchanged) stay green in both.
+
+**Gate**: x86_64 `pass=213 fail=0`, aarch64 `pass=212 fail=0`, `mpos-kunit 34
+passed, 0 failed` on both; host suite 640; `test-host` 201/227.
+
+ramfs/tmpfs's directory, symlink, socket and device nodes still keep one clock -
+stamped at creation and by writes, truncates and directory-entry changes - which
+is what stopped OpenRC's deptree freshness check from reading every `/run` file
+as 1970. The legacy `utime` and `futimesat` now store
 through the same `Inode::set_times` path. devtmpfs's device nodes keep them
 too, both of the kinds it publishes - the node the filesystem makes around a
 driver, and the block node, which was the one a boot's own refusal named -

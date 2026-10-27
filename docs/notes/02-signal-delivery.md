@@ -292,7 +292,7 @@ write with the errnos Linux gives it: the partial count, `EAGAIN` under
 `O_NONBLOCK`, `EINTR` under a signal, and the count is in the writer's own units
 (`input_prefix` maps the wire's bytes back, since `ONLCR` makes one `LF` two).
 
-### 2.6 Who may signal whom — **DONE** (2026-10-21)
+### 2.6 Who may signal whom — **DONE** (2026-10-21; `SIGCONT`'s session door 2026-10-27)
 
 **Why**: the `kill` family delivered whatever it was asked to. There was no
 uid rule and no `CAP_KILL` question anywhere in `src/sched/runtime/`, so a
@@ -368,12 +368,65 @@ signal is refused".
 `pass=192 fail=0` (192 staged, 14 left out by `tests.toml`), `mpos-kunit 32
 passed, 0 failed`. Host unit suite 586, xtask 139.
 
-**Named**: `SIGCONT`'s session half (Linux additionally requires the sender and
-target to share a session for a `SIGCONT` that crosses a thread group; this
-kernel has process groups standing in for sessions). `kill(-1)` used to be
-named here too — the caller's own group rather than "every process the caller
-may signal" — and it landed as §2.10 (2026-10-25), together with the one copy
-per process that a *group* send owes.
+**The `SIGCONT` session door landed on 2026-10-27**, the last named clause of
+this item. Linux's `check_kill_permission` has a third door beside the ids and
+the capability: a caller those both refuse may still send a **continuation** to
+a process of its own **session**, and no other signal crosses that line. The
+old named text said this kernel had "process groups standing in for sessions";
+by the time the door was taken, the session field, `setsid` and
+`become_session_leader` all existed (§13.12's getty is their user), so the
+clause was served rather than deferred again.
+
+**Measured on a current host first** (`.workbuddy/probe_sigcont_session.c`,
+Linux 7.2.11, a container's root so the uid drop is reachable), four shapes
+through `kill`, `tgkill` and `rt_sigqueueinfo`:
+
+| sender → target | `kill(…,0)` | `kill(SIGCONT)` | `tgkill(SIGCONT)` | `rt_sigqueueinfo(SIGCONT)` | `kill(SIGUSR1)` |
+|---|---|---|---|---|---|
+| 65534 child, same session as root parent | `EPERM` | **0** | **0** | **0** | `EPERM` |
+| 65534 child, own session (`setsid`) | `EPERM` | `EPERM` | `EPERM` | `EPERM` | `EPERM` |
+| root child, either session | 0 | 0 | 0 | 0 | 0 |
+
+So the session is not a second authority: it is the one bypass `SIGCONT` has,
+and only when the ids *and* the capability refuse (`kill(…,0)` and `SIGUSR1`
+stay `EPERM` in the same-session row).
+
+**The landing** is `sched::may_signal(sig, target)` — the signal is the
+question now, because every door asks the same rule — with
+`capable || (sig == SIGCONT && caller.session == target.session)` behind the
+uid and capability halves.
+
+**Pin**: `t-signal-permission` grew from 12 to **23 claims**. The old program
+already built the shape the measurement needs (a dropped child and its root
+parent); the SIGCONT claim it carried was **corrected from `EPERM` to `0`** —
+that expectation was itself the divergence, written before the session half
+was measured. Added: the same-session continuation through all three doors,
+the `SIGUSR1` control at the same session, a second child that `setsid`s first
+(both the SIGCONT and the record door `EPERM`), and the `getsid` comparison
+that says which session each child is in.
+
+**Counterfactual** — the session clause removed (`capable` alone), the pins
+kept: x86_64 `pass=210 fail=1`, the one program `t-signal-permission`, exactly
+three claims red — `the same session lets a 65534 child continue its parent`,
+`the record door takes the same session door` and `the tgkill door takes it
+too`; every cross-session claim and the `SIGUSR1` control stay green.
+
+**The pin found its own trap**: on aarch64 the delivered `SIGCONT` woke the
+parent's parking `read` and the collector read an empty answer, so every claim
+taken from `-1` was red while the kernel was right. The read/write helpers
+retry `EINTR` now, and the note is here because a pin that *sends a signal*
+must survive the signal it sends.
+
+**Gate**: x86_64 `pass=211 fail=0`, aarch64 `pass=210 fail=0`, `mpos-kunit 34
+passed, 0 failed` on both; host suite 640.
+
+**Named**: *which* thread runs a handler is still the delivery path's choice
+rather than Linux's `signal_wake_up` scan; the handler **table** itself is one
+object per thread group now (§2.7), so a worker's install is the leader's.
+`kill(-1)`
+used to be named here too — the caller's own group rather than "every process
+the caller may signal" — and it landed as §2.10 (2026-10-25), together with
+the one copy per process that a *group* send owes.
 
 **The door this item anticipated** — `pidfd_send_signal` — landed with the rest of
 the pidfd family as §6.8. It asks this same `may_signal`, and its group scope goes
@@ -439,14 +492,50 @@ aarch64 gate then passed 196/196.
 (197 built, 6 lanes), `mpos-kunit 32 passed, 0 failed`, exit 0; aarch64 196
 staged, `pass=196 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0.
 
-**Named**: a thread's table is still a copy, not Linux's shared
-`CLONE_SIGHAND` table (the thread path says why: nothing in this system's
-userland installs a handler from a thread yet); the kernel-spawned program
-path (`load.rs`, init and the boot's services) still starts at `SIG_DFL`,
-which is what those programs want but is not a user `exec` and is not claimed
-as one; and the post-exec alternate-stack state is not pinned in the Rust pin
-because the hosted runtime installs one of its own at startup - the C probe
-measures the reset and the kernel resets it in `exec`.
+**The thread table became one object on 2026-10-27**, closing this section's
+first named clause. `Task.dispositions` is `Arc<signal::SignalHand>` now - a
+leaf `critical_section::Mutex<RefCell<Actions>>`, the shape `FsStruct` already
+uses - and the doors are the ABI's: `CLONE_SIGHAND` (implied by `CLONE_THREAD`,
+and legal beside `CLONE_VM` without it) hands the child **the same** handle, a
+plain `fork`/`clone` gets `SignalHand::copy`, `CLONE_CLEAR_SIGHAND` gets a fresh
+`SIG_DFL` table, and `exec` **unshares** before it resets (Linux's
+`unshare_sighand`), so a sibling cannot see the new image's table.
+
+**Measured on a current host first** (`.workbuddy/probe_thread_sighand.c`,
+Linux 7.2.11): a `pthread`'s `sigaction(SIGUSR1, handler)` leaves the leader
+reading that same address; a change the leader makes **after** the thread
+exists is what the live thread reads back; and a `fork` child keeps its own
+copy, so the parent's later change does not move it.
+
+**Pin**: the new `t-thread-sighand` (7 claims, default group, both machines,
+green on the host's Linux first): the two sharing directions, the live-thread
+change (a copy made at spawn would already agree, so the thread is running when
+the leader writes), one delivery running the shared handler exactly once, and
+three fork-copy claims. The non-thread `clone(CLONE_SIGHAND)` door is named
+rather than pinned - a raw child needs the per-machine `clone` argument order,
+which this std-side program cannot spell without an architecture split of its
+own.
+
+**Counterfactual** (the thread path made `parent.dispositions.copy()` again),
+the pins kept: x86_64 `pass=211 fail=1`, the one program `t-thread-sighand`,
+exactly two claims red - `a handler installed by a thread is the leader's
+handler` and `a disposition the leader set is what the live thread reads` -
+while the delivery, both fork-copy claims and the parent's own change stay
+green. The first draft of the pin let a wrong table **kill** the program (the
+leader's `SIGUSR1` was still `SIG_DFL`, and the delivery claim fired it), so
+the delivery now installs its own handler first; a pin for a rule must fail,
+not hang or die, when the rule is absent.
+
+**Gate**: x86_64 `pass=212 fail=0`, aarch64 `pass=211 fail=0`, `mpos-kunit 34
+passed, 0 failed` on both; host suite 640; `test-host` 200/226 with the new
+program green there.
+
+**Named**: the kernel-spawned program path (`load.rs`, init and the boot's
+services) still starts at `SIG_DFL`, which is what those programs want but is
+not a user `exec` and is not claimed as one; and the post-exec alternate-stack
+state is not pinned in the Rust pin because the hosted runtime installs one of
+its own at startup - the C probe measures the reset and the kernel resets it in
+`exec`.
 
 
 ### 2.8 The kernel itself generates `SIGPIPE` — **LANDED** (2026-10-21)
@@ -591,8 +680,8 @@ prediction:
 32 passed, 0 failed` on both, host unit suite 1120 tests / 0 failed;
 `t-kill-all`'s four `ok:` lines byte-identical on both machines.
 
-**Named**: `SIGCONT`'s session half (unchanged, §2.6), and the thread table
-being a copy rather than the shared `CLONE_SIGHAND` one — a group send now
-delivers once, but *which* thread runs the handler, and whether a handler
-installed by a worker is the one that runs, still follows the copy rather than
-Linux's shared table.
+**Named**: *which* thread runs the handler is still the delivery path's
+choice rather than Linux's `signal_wake_up` scan. The table itself is the
+thread group's one object now (§2.7), so a handler a worker installed is the
+one that runs. `SIGCONT`'s session half, named beside it since §2.6, landed on
+2026-10-27 there.

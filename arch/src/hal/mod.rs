@@ -1060,6 +1060,21 @@ pub trait Contexts {
     /// [`UserFrameOps::to_user_regs`].
     const ABI_REG_COUNT: usize;
 
+    /// `struct epoll_event`'s width on this machine: 12 bytes packed on x86_64
+    /// (`data` at 4), 16 naturally aligned on aarch64 (`data` at 8).
+    ///
+    /// A struct ABI fact, so it is the machine's for the same reason
+    /// [`Contexts::ABI_REG_COUNT`] is, and it moved here from `vfs::epoll`'s own
+    /// `#[cfg(target_arch)]` pair (§13.2): the event code above the machine
+    /// should not name one. Measured on an x86_64 host
+    /// (`.workbuddy/probe_epoll_event.c`, Linux 7.2.11): `sizeof` is 12 with
+    /// `data` at 4; the aarch64 half (16, data at 8) cannot be read from this
+    /// host and is pinned on that machine by `t-epoll`'s own record (§13).
+    const EPOLL_EVENT_BYTES: usize;
+
+    /// Where `data` sits inside [`Contexts::EPOLL_EVENT_BYTES`].
+    const EPOLL_EVENT_DATA: usize;
+
     /// Point the CPU's privilege-transition stack at `top` (the TSS's ring-0
     /// stack on x86_64), so the next trap from ring 3 lands on this task's.
     fn set_kernel_stack(top: usize);
@@ -1509,6 +1524,12 @@ pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
 /// Words in the ABI's register file - [`Contexts::ABI_REG_COUNT`], named at the
 /// crate level for the same reason as [`FPU_BYTES`]: it is an array length.
 pub const ABI_REG_COUNT: usize = <Current as Contexts>::ABI_REG_COUNT;
+
+/// `struct epoll_event`'s width, and where `data` sits inside it - the machine's
+/// struct ABI fact, named at the crate level so the event code above the machine
+/// does not read the trait directly.
+pub const EPOLL_EVENT_BYTES: usize = <Current as Contexts>::EPOLL_EVENT_BYTES;
+pub const EPOLL_EVENT_DATA: usize = <Current as Contexts>::EPOLL_EVENT_DATA;
 
 /// A register file in the ABI's field order: `user_regs_struct` on x86_64,
 /// `user_pt_regs` on aarch64.

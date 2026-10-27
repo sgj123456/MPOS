@@ -261,6 +261,66 @@ impl Actions {
     }
 }
 
+/// Linux's `sighand_struct`: the handler table a **thread group** shares.
+///
+/// A "disposition is per process" claim and a "per task" implementation look
+/// identical until a thread installs a handler: Linux points every thread of a
+/// group at one `sighand_struct` (`CLONE_SIGHAND`, implied by `CLONE_THREAD`),
+/// so a handler installed by any thread is the handler the leader reads back.
+/// Measured on a current host (`.workbuddy/probe_thread_sighand.c`, Linux
+/// 7.2.11): a `pthread` that installs `SIGUSR1` leaves the main thread reading
+/// that same address, and a `fork` child inherits the table as a copy - the
+/// parent changing one afterwards does not move the child's.
+///
+/// The handle is one `Arc` because that is the ABI's shape rather than four
+/// fields happening to agree: `CLONE_SIGHAND` is the promise that two tasks
+/// share *one object*, and a fork is the promise that the child got its own.
+/// The lock is a leaf `critical_section::Mutex` for the reason
+/// [`crate::sched::FsStruct`]'s is - the table is read from inside a task-table
+/// borrow and from outside it, so it cannot borrow the table for storage. The
+/// critical section is re-entrant by construction (`arch/*/critical.rs` reads
+/// the mask before disabling it), which is what makes a nested read safe.
+pub struct SignalHand {
+    actions: critical_section::Mutex<core::cell::RefCell<Actions>>,
+}
+
+impl SignalHand {
+    /// A table of its own holding `actions` - a fresh process, or a fork that
+    /// copied its parent's.
+    pub fn new(actions: Actions) -> alloc::sync::Arc<SignalHand> {
+        alloc::sync::Arc::new(SignalHand {
+            actions: critical_section::Mutex::new(core::cell::RefCell::new(actions)),
+        })
+    }
+
+    /// A copy of this table in a handle of its own: Linux's `copy_sighand`,
+    /// which is what a plain `fork` does and what `exec` needs to break the
+    /// sharing a thread group had.
+    pub fn copy(&self) -> alloc::sync::Arc<SignalHand> {
+        SignalHand::new(self.snapshot())
+    }
+
+    /// What would happen if `sig` arrived now.
+    pub fn get(&self, sig: u8) -> Action {
+        critical_section::with(|cs| self.actions.borrow(cs).borrow().get(sig))
+    }
+
+    /// Record a disposition. Shared: every task holding this handle sees it.
+    pub fn set(&self, sig: u8, action: Action) {
+        critical_section::with(|cs| self.actions.borrow(cs).borrow_mut().set(sig, action));
+    }
+
+    /// `exec`'s rule, applied to the shared table the caller is leaving.
+    pub fn reset_caught(&self) {
+        critical_section::with(|cs| self.actions.borrow(cs).borrow_mut().reset_caught());
+    }
+
+    /// The table's contents, for a copy that must be one snapshot.
+    pub fn snapshot(&self) -> Actions {
+        critical_section::with(|cs| *self.actions.borrow(cs).borrow())
+    }
+}
+
 /// Whether `sig` names a signal at all: Linux's `valid_signal`, the range
 /// `1..=_NSIG` (64). Signal 0 and the numbers above `_NSIG` are not signals,
 /// and a call naming one is refused whether or not it hands over a
