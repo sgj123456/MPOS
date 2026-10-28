@@ -70,6 +70,9 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
+/// The descriptor `open_tree(2)` hands out: a mount rather than a file, so
+/// `move_mount` can attach it by name later.
+pub mod mountfd;
 pub mod mqueue;
 /// The namespace identities the kernel knows, and the text `/proc/<pid>/ns/<kind>`
 /// reads back as. Home: `vfs`, because the mount namespace and the renderer are
@@ -829,6 +832,14 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// generic file.
     #[cfg(target_os = "none")]
     fn as_io_uring(&self) -> Option<&crate::vfs::io_uring::IoUring> {
+        None
+    }
+
+    /// The mount behind an `open_tree` descriptor, if it is one. `move_mount`
+    /// consumes these; its empty-path source is the descriptor's subject, and
+    /// a descriptor that is not one answers `EINVAL` there.
+    #[cfg(target_os = "none")]
+    fn as_mount_fd(&self) -> Option<&crate::vfs::mountfd::MountFd> {
         None
     }
 

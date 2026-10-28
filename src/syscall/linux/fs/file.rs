@@ -2421,6 +2421,396 @@ pub fn handle_umount2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     }
 }
 
+/// The inode a descriptor holds, for the `AT_EMPTY_PATH` halves of the mount
+/// API. A descriptor is not a path: `EMPTY_PATH` means "the file this
+/// descriptor holds", and a bad number is `EBADF`, not a name to resolve.
+fn fd_inode(dirfd: i32) -> Result<Arc<dyn Inode>, isize> {
+    match crate::sched::current_fds().clone_at(dirfd) {
+        Ok(file) => Ok(file.inode()),
+        Err(error) => Err(err_of(error)),
+    }
+}
+
+/// The directory a path names *as a mountpoint*, and the mount recorded over it
+/// when there is one.
+///
+/// A mount API call attaches mounts by name, so resolving a path all the way
+/// answers the mounted tree - and that inode is not what the mount table
+/// recorded as the mountpoint. The pair matters twice: `open_tree(2)` needs the
+/// mount's root as the descriptor's subject, and `move_mount(2)` must meet the
+/// directory the name stands for so its "already carries a mount" check asks
+/// the right inode.
+fn mountpoint_of_path(
+    dirfd: i32,
+    path: &str,
+    cwd: &Arc<dyn Inode>,
+) -> Result<(Arc<dyn Inode>, Option<Arc<dyn Inode>>), isize> {
+    let start = base_for(dirfd, path, cwd)?;
+    let table = crate::vfs::mount::caller_table();
+    let point = table
+        .mountpoint_at(path, Some(start.clone()))
+        .map_err(err_of)?;
+    if !table.is_mount_point(&point) {
+        return Ok((point, None));
+    }
+    match crate::vfs::mount::resolve_at(path, start) {
+        Ok(root) => Ok((point, Some(root))),
+        Err(error) => Err(err_of(error)),
+    }
+}
+
+/// The mount a descriptor names, unwrapped: a descriptor `open_tree(2)` handed
+/// out answers with the mount's own root inode, and a second `open_tree` of it
+/// must see through that veil rather than stack one.
+fn mount_root_of(
+    inode: &Arc<dyn Inode>,
+) -> Option<(Arc<dyn Inode>, alloc::string::String, bool, bool)> {
+    inode.as_mount_fd().map(|mount| {
+        (
+            mount.root(),
+            alloc::string::String::from(mount.source_path()),
+            mount.read_only(),
+            mount.attachable(),
+        )
+    })
+}
+
+/// `open_tree(2)`: the descriptor a mount is named by — a reference, or a
+/// detached copy when `OPEN_TREE_CLONE` asks for one, which `move_mount(2)` can
+/// then attach somewhere else.
+///
+/// The descriptor is an `O_PATH` subject and behaves like one: `fstat` answers
+/// the mount's own root (a directory), `readlink /proc/self/fd/N` answers `/`
+/// for a detached copy and the mounted path for a reference, and `read(2)`
+/// answers `EBADF` because there is no byte stream behind it. The flags are the
+/// host's measured vocabulary (`build/scratch/mountapi/probe.c`): the clone bit,
+/// `O_CLOEXEC`, `AT_SYMLINK_NOFOLLOW`, `AT_NO_AUTOMOUNT`, `AT_EMPTY_PATH` and
+/// `AT_RECURSIVE` are accepted, anything else is `EINVAL`, and `AT_RECURSIVE`
+/// without `OPEN_TREE_CLONE` is `EINVAL` too.
+pub fn handle_open_tree(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const OPEN_TREE_CLONE: usize = 0x1;
+    const AT_RECURSIVE: usize = 0x8000;
+    let dirfd = args[0] as i32;
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let flags = args[2];
+    let allowed = OPEN_TREE_CLONE
+        | abi::O_CLOEXEC
+        | abi::AT_SYMLINK_NOFOLLOW
+        | abi::AT_NO_AUTOMOUNT
+        | abi::AT_EMPTY_PATH
+        | AT_RECURSIVE;
+    if flags & !allowed != 0 {
+        return err::EINVAL;
+    }
+    let clone = flags & OPEN_TREE_CLONE != 0;
+    if flags & AT_RECURSIVE != 0 && !clone {
+        return err::EINVAL;
+    }
+    let table = crate::vfs::mount::caller_table();
+    let (root, source_path, read_only, attachable) = if path.is_empty() {
+        if flags & abi::AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
+        let inode = match fd_inode(dirfd) {
+            Ok(inode) => inode,
+            Err(error) => return error,
+        };
+        match mount_root_of(&inode) {
+            Some((root, source_path, read_only, attachable)) => {
+                (root, source_path, read_only, attachable)
+            }
+            None => {
+                let source_path = table
+                    .path_of(&inode)
+                    .unwrap_or_else(|| alloc::string::String::from("/"));
+                let read_only = table.read_only_of(&inode);
+                let attachable = clone || table.holds_mount(&inode);
+                (inode, source_path, read_only, attachable)
+            }
+        }
+    } else {
+        // A path names a *mountpoint*, not the tree currently covering it:
+        // resolving all the way answers the mounted root, and "is this name a
+        // mount?" is a question about the directory the name stands for.
+        let (point, mounted) = match mountpoint_of_path(dirfd, &path, cwd) {
+            Ok(pair) => pair,
+            Err(error) => return error,
+        };
+        let source_path = table
+            .path_of(&point)
+            .unwrap_or_else(|| alloc::string::String::from("/"));
+        let read_only = table.read_only_of(&point);
+        let is_mount = mounted.is_some();
+        let root = match mounted {
+            Some(root) => root,
+            None => point,
+        };
+        (root, source_path, read_only, clone || is_mount)
+    };
+    let display = if clone {
+        alloc::string::String::from("/")
+    } else {
+        source_path.clone()
+    };
+    let inode: Arc<dyn Inode> =
+        crate::vfs::mountfd::MountFd::new(root, display, source_path, attachable, read_only);
+    let fd = match crate::vfs::open_inode(inode) {
+        Ok(fd) => fd,
+        Err(error) => return err_of(error),
+    };
+    if flags & abi::O_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    fd as isize
+}
+
+/// `move_mount(2)`: attach a mount somewhere else — the detached copy a clone
+/// descriptor names (a bind, keeping the copy alive), or the mount a path names,
+/// which moves.
+///
+/// The flag word is exactly Linux's six names, measured with the stray bits
+/// (`0x80`, `0x100`, `0x1000`, `0x8000`, `0x80000004`) answering `EINVAL`. A
+/// source that is not a mount point is `EINVAL`; a target that already carries a
+/// mount is `EINVAL`; an empty path needs its `*_EMPTY_PATH` bit or is `ENOENT`.
+pub fn handle_move_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const MOVE_MOUNT_F_SYMLINKS: usize = 0x1;
+    const MOVE_MOUNT_F_AUTOMOUNTS: usize = 0x2;
+    const MOVE_MOUNT_F_EMPTY_PATH: usize = 0x4;
+    const MOVE_MOUNT_T_SYMLINKS: usize = 0x10;
+    const MOVE_MOUNT_T_AUTOMOUNTS: usize = 0x20;
+    const MOVE_MOUNT_T_EMPTY_PATH: usize = 0x40;
+    let from_dfd = args[0] as i32;
+    let to_dfd = args[2] as i32;
+    let flags = args[4];
+    let from_path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let to_path = match cstr_arg(args[3], true) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let allowed = MOVE_MOUNT_F_SYMLINKS
+        | MOVE_MOUNT_F_AUTOMOUNTS
+        | MOVE_MOUNT_F_EMPTY_PATH
+        | MOVE_MOUNT_T_SYMLINKS
+        | MOVE_MOUNT_T_AUTOMOUNTS
+        | MOVE_MOUNT_T_EMPTY_PATH;
+    if flags & !allowed != 0 {
+        return err::EINVAL;
+    }
+    let table = crate::vfs::mount::caller_table();
+    // The source: a path naming a mount, or a descriptor holding one.
+    let (source, source_path, source_read_only, attachable, from_fd) =
+        if flags & MOVE_MOUNT_F_EMPTY_PATH != 0 && from_path.is_empty() {
+            let inode = match fd_inode(from_dfd) {
+                Ok(inode) => inode,
+                Err(error) => return error,
+            };
+            match mount_root_of(&inode) {
+                Some((root, source_path, read_only, attachable)) => {
+                    (root, source_path, read_only, attachable, true)
+                }
+                None => {
+                    let source_path = table
+                        .path_of(&inode)
+                        .unwrap_or_else(|| alloc::string::String::from("/"));
+                    let attachable = table.holds_mount(&inode);
+                    let read_only = table.read_only_of(&inode);
+                    (inode, source_path, read_only, attachable, true)
+                }
+            }
+        } else {
+            let (point, mounted) = match mountpoint_of_path(from_dfd, &from_path, cwd) {
+                Ok(pair) => pair,
+                Err(error) => return error,
+            };
+            let source_path = table
+                .path_of(&point)
+                .unwrap_or_else(|| alloc::string::String::from("/"));
+            let read_only = table.read_only_of(&point);
+            let is_mount = mounted.is_some();
+            // A move relocates the *mount*, and the table files it under the
+            // mounted root - so the move names the root even though `path_of`
+            // and "is this a mount?" were asked of the directory the name
+            // stands for.
+            let source = match mounted {
+                Some(root) => root,
+                None => point,
+            };
+            (source, source_path, read_only, is_mount, false)
+        };
+    if !attachable {
+        return err::EINVAL;
+    }
+    // The target.
+    let at = if !to_path.is_empty() {
+        match mountpoint_of_path(to_dfd, &to_path, cwd) {
+            Ok((point, _)) => point,
+            Err(error) => return error,
+        }
+    } else if flags & MOVE_MOUNT_T_EMPTY_PATH != 0 {
+        match fd_inode(to_dfd) {
+            Ok(inode) => inode,
+            Err(error) => return error,
+        }
+    } else {
+        return err::ENOENT;
+    };
+    let at = match at.as_mount_fd() {
+        Some(mount) => mount.root(),
+        None => at,
+    };
+    let result = if from_fd {
+        table.bind_mount(at.clone(), source.clone(), &source_path, source_read_only)
+    } else {
+        table.move_mount(&source, &at)
+    };
+    match result {
+        Ok(()) => 0,
+        // Measured: `move_mount(2)` answers a target that already carries a
+        // mount with `EINVAL`, where `mount(2)`'s bind says `EBUSY`. The
+        // difference is which call the caller used, so the refusal follows it.
+        Err(crate::vfs::VfsError::Busy) => err::EINVAL,
+        Err(error) => err_of(error),
+    }
+}
+
+/// `mount_setattr(2)`: change a mount's attributes, or everything below it.
+///
+/// The structure's size is checked first (`0`/`24` → `EINVAL`, `40` → `E2BIG`,
+/// all measured), then the two words are applied: the read-only bit through the
+/// table's remount, the attributes this kernel has no per-mount storage for
+/// (`NOSUID`, `NODEV`, `NOEXEC`, `NODIRATIME`, `NOIDMAP`) as `EOPNOTSUPP`
+/// rather than a promise it cannot keep, and the bits Linux itself refuses here
+/// (`NOATIME`, `STRICTATIME`, `IDMAP`, anything unknown) as `EINVAL`.
+pub fn handle_mount_setattr(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+    const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+    const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+    const MOUNT_ATTR_NOATIME: u64 = 0x0000_0010;
+    const MOUNT_ATTR_STRICTATIME: u64 = 0x0000_0020;
+    const MOUNT_ATTR_NODIRATIME: u64 = 0x0000_0080;
+    const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+    const MOUNT_ATTR_NOIDMAP: u64 = 0x0020_0000;
+    const AT_RECURSIVE: usize = 0x8000;
+    // The structure is `__u64 attr_set; __u64 attr_clr; __u64 propagation;
+    // __u32 userns_fd; __u32 pad;` - 32 bytes on both machines.
+    const ATTR_BYTES: usize = 32;
+    let dirfd = args[0] as i32;
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let flags = args[2];
+    let attr_ptr = args[3];
+    let attr_size = args[4];
+    if attr_size < ATTR_BYTES {
+        return err::EINVAL;
+    }
+    if attr_size > ATTR_BYTES {
+        return err::E2BIG;
+    }
+    let allowed =
+        abi::AT_SYMLINK_NOFOLLOW | abi::AT_NO_AUTOMOUNT | abi::AT_EMPTY_PATH | AT_RECURSIVE;
+    if flags & !allowed != 0 {
+        return err::EINVAL;
+    }
+    if !crate::uaccess::buffer_ok(attr_ptr, ATTR_BYTES, true, true) {
+        return err::EFAULT;
+    }
+    let mut attr = [0u8; ATTR_BYTES];
+    if !crate::sched::read_user(attr_ptr, &mut attr) {
+        return err::EFAULT;
+    }
+    let word = |at: usize| u64::from_le_bytes(attr[at..at + 8].try_into().expect("eight bytes"));
+    let (set, clear, propagation) = (word(0), word(8), word(16));
+    let userns_fd = u32::from_le_bytes(attr[24..28].try_into().expect("four bytes"));
+    if propagation != 0 {
+        return err::EOPNOTSUPP;
+    }
+    if userns_fd != 0 {
+        return err::EOPNOTSUPP;
+    }
+    let known = MOUNT_ATTR_RDONLY
+        | MOUNT_ATTR_NOSUID
+        | MOUNT_ATTR_NODEV
+        | MOUNT_ATTR_NOEXEC
+        | MOUNT_ATTR_NOATIME
+        | MOUNT_ATTR_STRICTATIME
+        | MOUNT_ATTR_NODIRATIME
+        | MOUNT_ATTR_IDMAP
+        | MOUNT_ATTR_NOIDMAP;
+    if (set | clear) & !known != 0 {
+        return err::EINVAL;
+    }
+    if (set | clear) & (MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME | MOUNT_ATTR_IDMAP) != 0 {
+        return err::EINVAL;
+    }
+    if (set | clear)
+        & (MOUNT_ATTR_NOSUID
+            | MOUNT_ATTR_NODEV
+            | MOUNT_ATTR_NOEXEC
+            | MOUNT_ATTR_NODIRATIME
+            | MOUNT_ATTR_NOIDMAP)
+        != 0
+    {
+        return err::EOPNOTSUPP;
+    }
+    let target = if path.is_empty() {
+        if flags & abi::AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
+        match fd_inode(dirfd) {
+            Ok(inode) => inode,
+            Err(error) => return error,
+        }
+    } else {
+        match mountpoint_of_path(dirfd, &path, cwd) {
+            Ok((point, _)) => point,
+            Err(error) => return error,
+        }
+    };
+
+    let table = crate::vfs::mount::caller_table();
+    let target = match target.as_mount_fd() {
+        Some(mount) => mount.root(),
+        None => target,
+    };
+    if !table.holds_mount(&target) {
+        return err::EINVAL;
+    }
+    let recursive = flags & AT_RECURSIVE != 0;
+    let mut result = Ok(());
+    for (bit, read_only) in [(MOUNT_ATTR_RDONLY, true), (u64::MAX, false)] {
+        let applies = if bit == u64::MAX {
+            clear & MOUNT_ATTR_RDONLY != 0
+        } else {
+            set & bit != 0
+        };
+        if !applies {
+            continue;
+        }
+        let step = if recursive {
+            table.remount_below(&target, read_only)
+        } else {
+            table.remount(&target, read_only)
+        };
+        if let Err(error) = step {
+            result = Err(error);
+            break;
+        }
+    }
+    match result {
+        Ok(()) => 0,
+        Err(error) => err_of(error),
+    }
+}
+
 /// `pivot_root(new_root, put_old)` - replace the root, parking the old one.
 ///
 /// This is the call an initramfs exists to make: it mounts the real root

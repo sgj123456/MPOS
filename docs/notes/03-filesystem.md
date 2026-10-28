@@ -602,3 +602,80 @@ anything. The same binary passes 16/16 under `MPOS_ON_HOST=1` against Linux -
 the reference direction, which is what says the expectations are Linux's.
 
 Full record: `docs/uapi/` §5.1 item 117.
+
+### 3.11 The mount API's attachment half — **DONE (2026-10-28, partial)**
+
+Linux's `mount(2)` grew a family beside it: `open_tree(2)` (428) hands back a
+descriptor for a tree, `move_mount(2)` (429) attaches one tree somewhere else,
+and `mount_setattr(2)` (442) changes a mounted tree's attributes. This kernel
+answered all three `ENOSYS`, so a program holding a mount *handle* rather than a
+path (a container runtime copying a root, a service adjusting its own mount)
+had no move.
+
+**Measured on Linux 7.2.11 first**, as uid 0 inside a user+mount namespace
+(`build/scratch/mountapi/probe{2,3,4}.c`; musl's headers carry none of these
+constants, so the probe writes them down):
+
+`open_tree`: `0` and `OPEN_TREE_CLONE` both give an fd whose `fstat` says
+`040755` and whose `F_GETFL` is `O_PATH`; `OPEN_TREE_CLOEXEC` marks it;
+`CLONE|AT_RECURSIVE` and `CLONE|AT_NO_AUTOMOUNT` are accepted; `AT_RECURSIVE`
+without the clone bit is `EINVAL`; unknown flags (`0x20000000`, `0x40000000`)
+are `EINVAL`; a missing path is `ENOENT`, a NULL path `EFAULT`; an empty name
+needs `AT_EMPTY_PATH` (else `ENOENT`). The descriptors differ in what
+`/proc/self/fd` shows: a clone's link is `/`, a reference's link is the mounted
+path.
+
+`move_mount`: the flag mask is exactly the six `MOVE_MOUNT_*` bits; `F_EMPTY_PATH`
+with a clone fd attaches it (the target then shows the source's inode), with a
+non-clone fd of a non-mount answers `EINVAL`, with a non-clone fd **of a
+mountpoint** answers 0; a path source moves a real mount and moving it back
+works; a source that is not a mount is `EINVAL`; a target missing is `ENOENT`;
+a target already carrying a mount is `EINVAL`.
+
+`mount_setattr`: the structure size must be 32 (24 is `EINVAL`, 40 is `E2BIG`,
+NULL with 32 is `EFAULT`); on a tmpfs mountpoint `attr_set` of
+`RDO`/`NOSUID`/`NODEV`/`NOEXEC`/`NODIRATIME`/`NOIDMAP` is accepted while
+`NOATIME`/`STRICTATIME`/`IDMAP` and bits outside the vocabulary are `EINVAL`;
+the same bit in both `attr_set` and `attr_clr` is accepted; `AT_RECURSIVE`
+and the four `*_AUTOMOUNTS`-style paths are accepted, unknown flag bits are
+`EINVAL`; the target must be a mountpoint or arrive through `AT_EMPTY_PATH`.
+
+**Served, in that shape.** `src/vfs/mountfd.rs` is the descriptor object
+(`MountFd { root, display, source_path, attachable, read_only }`, an `Inode`
+that answers the mount's own metadata, names itself with the path or `/`,
+and answers `EBADF` to a read/write — an `O_PATH` subject is not a byte
+stream). The three handlers live in `src/syscall/linux/fs/file.rs`
+(`handle_open_tree`, `handle_move_mount`, `handle_mount_setattr`), with
+`mountpoint_of_path` asking the table for the **mountpoint** rather than the
+crossed tree, `mount_root_of` unwrapping a descriptor so a second `open_tree`
+does not stack veils, and `MountTable::{read_only_of, holds_mount,
+remount_below}` carrying the two facts a descriptor cannot: which mount it
+belongs to (a target arrives as the point or as the covered root) and whether
+the span below a mount is recursive.
+
+**The read-only promise is refused rather than recorded**: a mount that says
+`ro` while its filesystem goes on accepting writes is a lie, so
+`mount_at`/`remount`/`bind_mount` now check `fs.read_only()` after asking the
+filesystem to become read-only and answer `EOPNOTSUPP` when it did not.
+`ext4` keeps that promise; `ramfs` (and so `tmpfs`) never had a read-only state
+to keep, which means `mount -o ro` / `remount,ro` on a tmpfs now answers
+`EOPNOTSUPP` where it used to answer 0 and stay writable. That is a behaviour
+change, and it is the honest direction: `mount_setattr`'s `RDO` is the same
+call on the same filesystems.
+
+**Named divergences** (each a refusal, never a wrong answer): the superblock
+quartet `fsopen`/`fsconfig`/`fsmount`/`fspick` (430–433) stays `ENOSYS` — this
+kernel mounts a `FileSystem` object directly and has no `fs_context` or
+superblock for those four to name; `NOSUID`/`NODEV`/`NOEXEC`/`NODIRATIME`/
+`NOIDMAP` answer `EOPNOTSUPP` (Linux serves them; there is no per-mount storage
+for them here); `propagation` and `userns_fd` answer `EOPNOTSUPP` (this kernel
+has no mount propagation and no idmapped mounts).
+
+**Pinned** by `t-mount-api` (new, both machines; the host run skips — an
+ordinary user is refused all three with `EPERM`, which the pin prints). Its
+claims are the measured table above plus this kernel's two refusals. Gates:
+x86_64 `all 228 user tests passed`, aarch64 `all 227` (`mpos-kunit 34 passed`
+both, host suite 687); the counterfactual (the three dispatch arms removed)
+`CF-EXIT=1`, `pass=227 fail=1 (228 built)` with only `t-mount-api` red.
+
+Full record: `docs/uapi/` §5.1 item 122.

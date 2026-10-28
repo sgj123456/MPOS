@@ -6702,3 +6702,59 @@ suite 687. Counterfactual (`nr::FUTEX_REQUEUE` arm removed): `CF-EXIT=1`,
 `pass=226 fail=1 (227 built)`, only `t-futex-requeue` red.
 
 Full record: [`docs/notes/`](../notes/06-process-management.md) §6.36.
+
+## item 122 — the mount API's attachment half: `open_tree(2)`/`move_mount(2)`/`mount_setattr(2)` for a runtime that holds a mount handle
+
+Measured first on Linux 7.2.11 as uid 0 in a user+mount namespace
+(`build/scratch/mountapi/probe{2,3,4}.c`), because an ordinary user is refused
+all three with `EPERM`:
+
+- `open_tree(428)`: `0` and `OPEN_TREE_CLONE` both answer a descriptor whose
+  `F_GETFL` is `O_PATH` and whose `fstat` says `040755`; `OPEN_TREE_CLOEXEC`
+  marks it; `CLONE|AT_RECURSIVE` and `CLONE|AT_NO_AUTOMOUNT` are accepted;
+  `AT_RECURSIVE` alone, unknown high bits, a missing path, a NULL path and an
+  empty name without `AT_EMPTY_PATH` answer `EINVAL`/`EINVAL`/`ENOENT`/
+  `EFAULT`/`ENOENT`. A clone's `/proc/self/fd` link is `/`; a reference's is the
+  mounted path.
+- `move_mount(429)`: the flag mask is exactly `MOVE_MOUNT_F_SYMLINKS|
+  F_AUTOMOUNTS|F_EMPTY_PATH|T_SYMLINKS|T_AUTOMOUNTS|T_EMPTY_PATH`; a clone fd
+  with `F_EMPTY_PATH` attaches (the target then shows the source's inode); a
+  non-clone fd of a non-mount is `EINVAL` while one of a mountpoint attaches; a
+  path source moves a real mount (and moves it back); a non-mount source and a
+  target already carrying a mount are `EINVAL`; a missing target is `ENOENT`.
+- `mount_setattr(442)`: size must be 32 (24 `EINVAL`, 40 `E2BIG`, NULL with
+  32 `EFAULT`); `RDO`/`NOSUID`/`NODEV`/`NOEXEC`/`NODIRATIME`/`NOIDMAP` are served
+  by Linux on a tmpfs mountpoint, `NOATIME`/`STRICTATIME`/`IDMAP` and unknown
+  bits are `EINVAL`; the target must be a mountpoint or arrive via
+  `AT_EMPTY_PATH`; `AT_RECURSIVE` and four `*_AUTOMOUNTS`-shaped flags are
+  accepted.
+
+**Served, in that shape.** `src/vfs/mountfd.rs` is the descriptor (an `Inode`
+answering the mount's metadata, naming itself with the mounted path or `/`, and
+refusing reads/writes with `EBADF`); the three handlers are in
+`src/syscall/linux/fs/file.rs`; `MountTable` gained `read_only_of` (a record's
+point *or* its root — a descriptor's crossed inode), `holds_mount` (the same
+pair, for an `AT_EMPTY_PATH` target) and `remount_below` (a prefix walk over
+`mount_records()`); the numbers are 428/429/442 on **both** machines.
+
+**One behaviour change, deliberately**: `mount_at`/`remount`/`bind_mount` now
+check that a filesystem's `read_only()` agrees with the mount record after
+being asked to become read-only, and answer `EOPNOTSUPP` when it does not — so
+`mount -o ro`/`remount,ro` on a tmpfs (whose `ramfs` has no read-only state)
+now refuses instead of recording a promise it cannot keep. `ext4` keeps it and
+is unaffected.
+
+**Named gaps**: `fsopen`/`fsconfig`/`fsmount`/`fspick` (430–433) answer
+`ENOSYS` (this kernel mounts a `FileSystem` object directly; those four need a
+`fs_context`/superblock object to name); `NOSUID`/`NODEV`/`NOEXEC`/
+`NODIRATIME`/`NOIDMAP` answer `EOPNOTSUPP` (no per-mount storage);
+`propagation`/`userns_fd` answer `EOPNOTSUPP` (no propagation, no idmapped
+mounts).
+
+**Pinned** by `t-mount-api` (new, both machines; the host run prints the
+`EPERM` a plain user gets). Gates: x86_64 `all 228 user tests passed`, aarch64
+`all 227`, `mpos-kunit 34 passed` both, host suite 687; the counterfactual
+(three dispatch arms removed) `CF-EXIT=1`, `pass=227 fail=1 (228 built)`, only
+`t-mount-api` red.
+
+Full record: `docs/notes/03-filesystem.md` §3.11.

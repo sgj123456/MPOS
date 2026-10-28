@@ -557,3 +557,13 @@ pub const FANOTIFY_MARK: u64 = 301;
 /// `close_range(2)`: 436 on both machines - the call landed after the number
 /// tables converged, so unlike `userfaultfd` there is no second number.
 pub const CLOSE_RANGE: u64 = 436;
+
+/// The mount API's attachment half: `open_tree(2)`, `move_mount(2)` and
+/// `mount_setattr(2)`. Same numbers on both machines - these landed after the
+/// number tables converged. The superblock quartet (`fsopen`/`fsconfig`/
+/// `fsmount`/`fspick`, 430-433 on x86_64, 430-433 asm-generic too) stays a
+/// named gap: this kernel mounts a `FileSystem` object directly and has no
+/// `fs_context` for those four to name, so they answer `ENOSYS`.
+pub const OPEN_TREE: u64 = 428;
+pub const MOVE_MOUNT: u64 = 429;
+pub const MOUNT_SETATTR: u64 = 442;

@@ -899,8 +899,15 @@ impl MountTable {
         }
         // The filesystem is told first: a mount that records "read-only" while
         // the filesystem goes on accepting writes would be a promise nobody
-        // keeps.
+        // keeps. A filesystem that does not answer the flag back (ramfs has no
+        // read-only state to honour) is therefore refused rather than recorded
+        // - Linux enforces read-only at the VFS level, this kernel's filesystems
+        // each enforce their own, and the two must agree before the promise is
+        // made.
         fs.set_read_only(read_only);
+        if read_only && !fs.read_only() {
+            return Err(VfsError::Unsupported);
+        }
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
             if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
@@ -1014,6 +1021,60 @@ impl MountTable {
         Ok(())
     }
 
+    /// Whether the mount a descriptor names is read-only: the root slot's own
+    /// flag, or the record attached at - or covering - this inode. `open_tree(2)`
+    /// has only an inode in hand and must carry this into the descriptor, so
+    /// attaching a copy of a read-only mount does not widen it.
+    pub(crate) fn read_only_of(&self, inode: &Arc<dyn Inode>) -> bool {
+        critical_section::with(|cs| {
+            if self
+                .root
+                .borrow(cs)
+                .borrow()
+                .as_ref()
+                .is_some_and(|root| Arc::ptr_eq(root, inode))
+            {
+                return *self.root_read_only.borrow(cs).borrow();
+            }
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .rev()
+                .find(|m| Arc::ptr_eq(&m.at, inode) || Arc::ptr_eq(&m.root, inode))
+                .is_some_and(|m| m.read_only)
+        })
+    }
+
+    /// `mount_setattr(2)`'s `AT_RECURSIVE` half: the mount a descriptor names,
+    /// and every mount attached below it, take the same flag. The walk is the
+    /// recorded paths' prefix - `MountRecord::path` is named from the root, so
+    /// a prefix is exactly "below this one".
+    pub(crate) fn remount_below(&self, at: &Arc<dyn Inode>, read_only: bool) -> VfsResult<()> {
+        self.remount(at, read_only)?;
+        let Some(base) = self.path_of(at) else {
+            return Ok(());
+        };
+        let prefix = if base == "/" {
+            alloc::string::String::from("/")
+        } else {
+            alloc::format!("{base}/")
+        };
+        let below: alloc::vec::Vec<alloc::string::String> = self
+            .mount_records()
+            .into_iter()
+            .map(|record| record.path)
+            .filter(|path| path.starts_with(&prefix))
+            .collect();
+        let root = self.root_inode();
+        for path in below {
+            if let Ok(inode) = self.resolve_caller(&path, root.clone()) {
+                let _ = self.remount(&inode, read_only);
+            }
+        }
+        Ok(())
+    }
+
     /// `mount -o remount,...`: change the flags on a filesystem that is
     /// already mounted, without mounting anything.
     pub fn remount(&self, at: &Arc<dyn Inode>, read_only: bool) -> VfsResult<()> {
@@ -1031,6 +1092,9 @@ impl MountTable {
             let fs = critical_section::with(|cs| self.root_fs.borrow(cs).borrow().clone());
             if let Some(fs) = fs {
                 fs.set_read_only(read_only);
+                if read_only && !fs.read_only() {
+                    return Err(VfsError::Unsupported);
+                }
             }
             critical_section::with(|cs| {
                 *self.root_read_only.borrow(cs).borrow_mut() = read_only;
@@ -1048,6 +1112,9 @@ impl MountTable {
                 .find(|m| Arc::ptr_eq(&m.at, at) || Arc::ptr_eq(&m.root, at))
                 .ok_or(VfsError::NoEntry)?;
             entry.fs.set_read_only(read_only);
+            if read_only && !entry.fs.read_only() {
+                return Err(VfsError::Unsupported);
+            }
             entry.read_only = read_only;
             Ok(())
         })
@@ -2011,6 +2078,20 @@ impl MountTable {
     /// the refusal is `EBUSY` in an alias view too, where the *crossing* does
     /// not happen and the reading doors answer the covered directory
     /// (measured, `.workbuddy/probe_mountpoint_doors.c` §8).
+    /// Whether this inode is a mount's point *or* one: a descriptor's own file
+    /// holds what the name covered, so an `AT_EMPTY_PATH` target arrives as
+    /// the mounted root where the path form arrives as the mountpoint. The two
+    /// are the same mount, and every mount-API question asks this one.
+    pub fn holds_mount(&self, inode: &Arc<dyn Inode>) -> bool {
+        critical_section::with(|cs| {
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .any(|m| Arc::ptr_eq(&m.at, inode) || Arc::ptr_eq(&m.root, inode))
+        })
+    }
+
     pub fn is_mount_point(&self, inode: &Arc<dyn Inode>) -> bool {
         critical_section::with(|cs| {
             self.mounts
@@ -3238,4 +3319,14 @@ mod cwd_tests {
         assert_eq!(cat.metadata().kind, NodeKind::File);
         assert!(vfs.resolve_from("etc", bin).is_err(), "etc is not in /bin");
     }
+}
+
+/// Whether the mount a descriptor names is read-only.
+pub fn read_only_of_inode(inode: &Arc<dyn Inode>) -> bool {
+    caller_table().read_only_of(inode)
+}
+
+/// `mount_setattr(2)` with `AT_RECURSIVE`: the mount and everything under it.
+pub fn remount_below(at: &Arc<dyn Inode>, read_only: bool) -> VfsResult<()> {
+    caller_table().remount_below(at, read_only)
 }

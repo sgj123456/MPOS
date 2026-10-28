@@ -305,6 +305,9 @@ A call absent from those is served as its phase section records.
 | `futex_wake` | 454 | proc | 454 |
 | `futex_wait` | 455 | proc | 455 |
 | `futex_requeue` | 456 | proc | 456 |
+| `open_tree` | 428 | mount | 428 |
+| `move_mount` | 429 | mount | 429 |
+| `mount_setattr` | 442 | mount | 442 |
 | `mseal` | 462 | proc | 462 |
 | `fanotify_init` | 300 | fs | 262 |
 | `fanotify_mark` | 301 | fs | 263 |
@@ -322,12 +325,16 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
+| `fsopen` | 430 | a superblock context is an object this kernel does not have: `mount(2)` builds a `FileSystem` directly | a `fs_context` object with its own lifetime and `fsconfig` command stream |
+| `fsconfig` | 431 | same context | same |
+| `fsmount` | 432 | same context — and it would hand back a mount handle whose attachment is served (`move_mount`), but there is no context to mount | same |
+| `fspick` | 433 | picks an existing superblock for reconfiguration; this kernel's mount records are not superblocks | same |
 | `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page | a per-page direct-map carve-out (remove + restore around a page-table walk), plus the `MFD_*` word and the `SECRETMEM` `/proc/meminfo` line |
 
-> **Every family that was on this table has since moved out of it** - the table
-> is empty on purpose, not by accident: there is no number left whose honest
-> answer is `ENOSYS` except `rseq`, which is pinned by `t-rseq` and described
-> below. `keyctl` (250): the kernel keyring is `keyctl` (250): the kernel keyring is
+> **Every family that was on this table has since moved out of it** — what
+> remains is `memfd_secret` (447) and the four mount-context numbers
+> (430–433), each with its prerequisite written beside it. `keyctl` (250): the
+> kernel keyring is
 > served (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on
 > aarch64), pinned by `t-keyctl`, written up as item 113 with the measured shape in
 > `docs/notes/06-process-management.md` §6.30. `fanotify_init` (300)/`fanotify_mark`

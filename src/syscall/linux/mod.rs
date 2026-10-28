@@ -541,6 +541,9 @@ pub unsafe fn dispatch(
         // system needs - /proc, /sys, /dev, /run - which is init's job, not
         // the kernel's boot code's.
         nr::MOUNT => fs::handle_mount(args, &cwd()),
+        nr::OPEN_TREE => fs::handle_open_tree(args, &cwd()),
+        nr::MOVE_MOUNT => fs::handle_move_mount(args, &cwd()),
+        nr::MOUNT_SETATTR => fs::handle_mount_setattr(args, &cwd()),
         nr::UMOUNT2 => fs::handle_umount2(args, &cwd()),
         nr::FANOTIFY_INIT => fs::handle_fanotify_init(args),
         // A mark names its object either by descriptor or by a name resolved

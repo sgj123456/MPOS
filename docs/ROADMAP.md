@@ -280,6 +280,17 @@ One-glance status of the whole roadmap.
   deadline; the shared spelling (no private flag) is `EOPNOTSUPP` — this kernel's wait
   table is keyed by user address, so two processes' mappings of one shared word cannot be
   matched, and a hang is not an answer (§6.29, item 112)
+- [x] `open_tree(2)` (428) / `move_mount(2)` (429) / `mount_setattr(2)` (442) —
+  the mount API's attachment half: a descriptor that *is* a mount handle (`/` as
+  its name for a copy, the mounted path for a reference, `EBADF` on a read), a
+  move that attaches either a handle or a path mount, and attribute changes
+  limited to what this kernel can keep — `RDO`/`NODIRATIME` where the
+  filesystem honours read-only, `EOPNOTSUPP` where it cannot (and `mount -o ro`
+  on a tmpfs now says so too instead of recording a promise it cannot keep),
+  `NOATIME`/`IDMAP` `EINVAL` as Linux answers them, `fsopen`/`fsconfig`/
+  `fsmount`/`fspick` (430–433) a named `ENOSYS` gap because a superblock
+  context is an object this kernel does not have (§3.11, item 122)
+
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)
 - [x] `io_uring_setup`/`enter`/`register` (425/426/427) — the ring ABI is **served**: setup publishes Linux's measured layout (a 120-byte params struct, the three `IORING_OFF_*` mappings, `2 x sq_entries` CQ, entries rounded up to a power of two) and `enter` runs `NOP`/`READ`/`WRITE`/`READV`/`WRITEV`/`FSYNC`/`CLOSE` synchronously through the syscall handlers, so each CQE's `res` is the number the blocking call would have answered; a served request keeps working while anything outside the subset is refused **per item** with `-EOPNOTSUPP` (and an opcode no Linux has is `-EINVAL`, as measured). Named refusals: every non-zero setup flag (`SQPOLL`/`CQE32`/`SQE128`… would be promises of a poll thread and 32-byte records), `io_uring_register` for every op, and the SQ cap at 1024 entries (Linux 32768, the §8.0 memory bound) (§6.32, item 115)
