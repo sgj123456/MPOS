@@ -1981,28 +1981,47 @@ pub fn take_signal_in_set(
 pub fn take_fatal_signal() -> Option<u8> {
     with_table(|t| {
         let id = t.current;
-        let task = t.task_mut(id);
-        let mut ready = task.signals & !task.blocked;
-        while let Some(sig) = crate::sched::signal::take(&mut ready) {
-            // Read from a copy, so a signal that is skipped stays pending.
-            if task.dispositions.get(sig).is_handler() {
-                continue;
+        let sig = {
+            let task = t.task_mut(id);
+            let mut ready = task.signals & !task.blocked;
+            let mut found = None;
+            while let Some(sig) = crate::sched::signal::take(&mut ready) {
+                // Read from a copy, so a signal that is skipped stays pending.
+                if task.dispositions.get(sig).is_handler() {
+                    continue;
+                }
+                // Of the signals with no handler, only the ones whose default
+                // action is to terminate end a task sitting in a blocking call.
+                // `SIGSTOP` is not one of them - it stops, and stopping a task
+                // that is already asleep changes nothing - and `SIGCONT` is not
+                // one of them either. Before there was a stop state to be in,
+                // "no handler" and "dies of it" really were the same thing.
+                if crate::sched::signal::default_action(sig)
+                    != crate::sched::signal::DefaultAction::Terminate
+                {
+                    continue;
+                }
+                task.signals &= !crate::sched::signal::bit(sig);
+                found = Some(sig);
+                break;
             }
-            // Of the signals with no handler, only the ones whose default
-            // action is to terminate end a task sitting in a blocking call.
-            // `SIGSTOP` is not one of them - it stops, and stopping a task
-            // that is already asleep changes nothing - and `SIGCONT` is not
-            // one of them either. Before there was a stop state to be in,
-            // "no handler" and "dies of it" really were the same thing.
-            if crate::sched::signal::default_action(sig)
-                != crate::sched::signal::DefaultAction::Terminate
-            {
-                continue;
-            }
-            task.signals &= !crate::sched::signal::bit(sig);
-            return Some(sig);
+            found
+        };
+        if sig.is_some() {
+            // A fatal signal ends the whole thread group, not the one thread
+            // that took it: Linux's `complete_signal` sets `SIGNAL_GROUP_EXIT`
+            // for a signal with no handler whose default action terminates,
+            // wherever in the group it was taken. Without it a group keeps a
+            // thread parked in a blocking wait forever - that thread never
+            // reaches a syscall-exit gate that would read its pending set, and
+            // nothing else ever wakes it. Pinned by `t-kill-ends-group`: a
+            // killed process whose second thread is parked in a futex is reaped
+            // within the kill, where before the parent's `wait` parked on a
+            // group that could not die.
+            let tgid = t.task(id).tgid;
+            super::child_exit::end_group_siblings(t, id, tgid);
         }
-        None
+        sig
     })
 }
 

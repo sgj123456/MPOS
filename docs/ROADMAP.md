@@ -26,8 +26,10 @@ One-glance status of the whole roadmap.
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
 - [x] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2) — with
   `kill(-1)` every process the caller may signal, one copy per process for a group
-  (§2.10, item 106), `SIGCONT`'s session door (§2.6) and one handler table shared by a
-  thread group under `CLONE_SIGHAND` (§2.7); the named residues are the kernel-spawned
+  (§2.10, item 106), `SIGCONT`'s session door (§2.6), one handler table shared by a
+  thread group under `CLONE_SIGHAND` (§2.7) and a fatal signal ending the **whole**
+  group - a sibling parked in a futex is retired with it, so `timeout(1)`'s `wait`
+  answers (§6.37, item 123); the named residues are the kernel-spawned
   program path's `SIG_DFL` start and the alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  

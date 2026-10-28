@@ -4427,3 +4427,52 @@ Gates: x86_64 all 227 passed (15 not run), aarch64 all 226 passed (16 not run),
 (227 built)`, only `t-futex-requeue` red through `_ => ENOSYS`.
 
 Full record: `docs/uapi/` §5.1 item 121.
+
+### 6.37 A fatal signal ends the whole thread group — **LANDED (2026-10-29)**
+
+The display work found this one by hanging inside `timeout(1)`: `timeout -s KILL
+15 kmscube` sent its `SIGKILL` and then waited, and the wait never finished. The
+kernel's own park dump said which half was stuck — the killed process's *leader*
+was gone (`released=true retired=false`), while a second thread named
+`kmscube:disk$0` sat in `park 2 (block_until_nanos) syscall 202` (a futex wait)
+and the probe's shell sat in `park 4 (block_until_uninterruptible) syscall 61`
+(a `wait4`). The group could not die because one of its threads was parked where
+a pending signal is never looked at: `take_fatal_signal` is what a blocking call
+checks, and a thread asleep in a futex is not in a blocking call that runs it.
+
+Linux's answer is `complete_signal`: a signal with **no handler whose default
+action terminates** sets `SIGNAL_GROUP_EXIT` on the thread group, wherever in the
+group it was taken, and every thread is ended with it. This kernel had that rule
+for `exit_group(2)` alone (a caller that leaves ends its siblings) and for the
+pid-namespace init's zap, but not for a fatal signal — so `kill(pid, SIGKILL)`
+reached exactly the one task the number named and left the rest of the group
+running, which is a shape Linux never produces.
+
+**Served.** `take_fatal_signal` (`src/sched/runtime/child_signal.rs`) now calls
+`end_group_siblings` (`src/sched/runtime/child_exit.rs`) once it has taken a
+terminating signal. The helper is the loop `exit_group` used, extracted rather
+than copied: a sibling is marked `exited` and retired, so it is in no queue the
+picker can reach and its slot is freed by the release pass, and its children are
+handed to init. The dying task then runs its own `exit`, sees `group_dead`, and
+records the process's death — so the parent's `wait` answers instead of parking.
+A thread parked in an interruptible wait needs no special case: being retired is
+stronger than being woken, and `exit_group`'s own siblings have been ended this
+way since it landed.
+
+One divergence is named rather than papered over: a sibling ended by the group's
+fatal signal never runs its own exit path, so its `CLONE_CHILD_CLEARTID` word is
+not cleared and its `SEM_UNDO` list is dropped with `Arc` count 1 — exactly the
+shape `exit_group`'s siblings already have.
+
+**Pinned** by `t-kill-ends-group` (new, both machines): the child is a re-exec of
+the same binary with one word, so the fixture's parked worker is a real
+`FUTEX_WAIT` on a word nobody wakes; the parent waits 700 ms for that park, sends
+`SIGKILL`, then polls `wait4` with `WNOHANG` for 10 s — a hang is not an answer
+this pin can report. The reference is Linux: `MPOS_ON_HOST=1` runs 4/4 ok and
+`PASS` against 7.2.11. On the machine the whole sweep is `pass=229 fail=0`, and
+the counterfactual — `end_group_siblings` not called — is
+`pass=228 fail=1 (229 built)` with exactly the two new claims red
+(`the process is reaped even though a thread was parked in a futex`,
+`the death is the signal that killed it`); nothing else moved.
+
+Full record: `docs/uapi/` §5.1 item 123.

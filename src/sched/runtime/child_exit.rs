@@ -2075,52 +2075,71 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
 pub fn exit_group(code: isize) -> ! {
     let me = current();
     let tgid = current_tgid();
-    with_table(|t| {
-        let mut ended: Vec<TaskId> = Vec::new();
-        for slot in 0..t.tasks.len() {
-            let id = TaskId(slot);
-            if id == me {
-                continue;
-            }
-            let Some(task) = t.tasks[slot].as_mut() else {
-                continue;
-            };
-            if task.tgid != tgid || task.exited {
-                continue;
-            }
-            // Never scheduled again - and taken out of every queue, including
-            // the sleep queue, so the picker can never reach a task whose slot
-            // the release pass is about to free. Waking it here would queue a
-            // dead pid: the memory it accounted for is released by the pass,
-            // not by a turn it never gets.
-            task.exited = true;
-            // A sibling ended here never runs the exit path, so its hold on the
-            // group's undo list has to go now: the last thread's `exit` applies
-            // the list, and a stale `Arc` would keep it from being the last.
-            task.sem_undo = None;
-            t.sched.retire(id);
-            ended.push(id);
-        }
-        // A sibling ended above never runs the exit path, so this is the only
-        // place its children can be handed on. No task of the group will be
-        // alive when the caller's own `exit` runs, and a child whose parent
-        // slot is gone is collected by no `wait` - the parentage test reads
-        // through that slot - so they go to init, the nearest thing this
-        // kernel has to Linux's child subreaper (scenario E of
-        // `.workbuddy/probe_exit_group_thread.c`, and `t-exit-group`'s
-        // sibling fixture for the case this walk alone covers).
-        let mut adopted = false;
-        for task in t.tasks.iter_mut().flatten() {
-            if task.parent.is_some_and(|parent| ended.contains(&parent)) {
-                task.parent = Some(INIT_PID);
-                adopted = true;
-            }
-        }
-        if adopted {
-            t.sched.wake(INIT_PID);
-        }
-    });
+    with_table(|t| end_group_siblings(t, me, tgid));
     exit(code)
+}
+
+/// End every other thread of one thread group, for a caller that is about to
+/// leave itself.
+///
+/// Split out of [`exit_group`] because a **fatal signal** needs exactly this
+/// and nothing else: Linux's `complete_signal` sets `SIGNAL_GROUP_EXIT` for a
+/// signal with no handler whose default action terminates, wherever in the
+/// group it was taken, so the group's other threads are ended with it. A thread
+/// parked in a blocking wait is the reason the rule cannot be "let each thread
+/// find its own fatal signal": one parked in a futex or a pipe never runs the
+/// syscall-exit gate the pending set is read at, so the group would wait on a
+/// thread nothing wakes. Ending them here takes them out of every queue the
+/// picker can reach (`Task::exited` + [`Scheduler::retire`]), which is the same
+/// shape `exit_group` has used since it landed.
+///
+/// A sibling ended here never runs the exit path, so its hold on the group's
+/// undo list goes now, and its children are handed to init below - the caller's
+/// own `exit` runs no task of the group but itself.
+pub(crate) fn end_group_siblings(t: &mut super::task::Table, me: TaskId, tgid: TaskId) {
+    let mut ended: Vec<TaskId> = Vec::new();
+    for slot in 0..t.tasks.len() {
+        let id = TaskId(slot);
+        if id == me {
+            continue;
+        }
+        let Some(task) = t.tasks[slot].as_mut() else {
+            continue;
+        };
+        if task.tgid != tgid || task.exited {
+            continue;
+        }
+        // Never scheduled again - and taken out of every queue, including
+        // the sleep queue, so the picker can never reach a task whose slot
+        // the release pass is about to free. Waking it here would queue a
+        // dead pid: the memory it accounted for is released by the pass,
+        // not by a turn it never gets.
+        task.exited = true;
+        // A sibling ended here never runs the exit path, so its hold on the
+        // group's undo list has to go now: the last thread's `exit` applies
+        // the list, and a stale `Arc` would keep it from being the last.
+        task.sem_undo = None;
+        t.sched.retire(id);
+        ended.push(id);
+    }
+    // A sibling ended above never runs the exit path, so this is the only
+    // place its children can be handed on. No task of the group will be
+    // alive when the caller's own `exit` runs, and a child whose parent
+    // slot is gone is collected by no `wait` - the parentage test reads
+    // through that slot - so they go to init, the nearest thing this
+    // kernel has to Linux's child subreaper (scenario E of
+    // `.workbuddy/probe_exit_group_thread.c`, and `t-exit-group`'s
+    // sibling fixture for the case this walk alone covers).
+    let mut adopted = false;
+    for task in t.tasks.iter_mut().flatten() {
+        if task.parent.is_some_and(|parent| ended.contains(&parent)) {
+            task.parent = Some(INIT_PID);
+            adopted = true;
+        }
+    }
+    if adopted {
+        t.sched.wake(INIT_PID);
+    }
 }
 
 /// Name where the running task's exit is announced: the address a leaving

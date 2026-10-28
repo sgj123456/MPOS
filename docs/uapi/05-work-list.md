@@ -6765,3 +6765,31 @@ mounts).
 `t-mount-api` red.
 
 Full record: `docs/notes/03-filesystem.md` §3.11.
+
+## item 123 — a fatal signal ends the whole thread group
+
+`timeout(1)` found it: `timeout -s KILL 15 kmscube` sent its `SIGKILL`, and the
+`wait` that followed never returned. The killed process's leader was gone, but a
+second thread was parked in a futex — a place where the pending fatal signal is
+never read, because `take_fatal_signal` is a gate a blocking call passes through
+and a parked thread is not there. The group therefore could not reach
+`group_dead`, and the parent parked in `wait4` forever.
+
+Linux ends the group: `complete_signal` sets `SIGNAL_GROUP_EXIT` for a signal
+with no handler whose default action terminates, wherever in the group it was
+taken. This kernel had the rule for `exit_group` and for a dying pid-namespace
+init only.
+
+Served by `end_group_siblings` (`src/sched/runtime/child_exit.rs`, the loop
+`exit_group` already used, extracted) called from `take_fatal_signal` once it has
+taken a terminating signal: siblings are marked `exited` and retired, so nothing
+the picker holds can reach them, and the group's death is then recorded by the
+dying task's own `exit`. The named divergence is the one `exit_group`'s siblings
+already carry: a sibling ended here does not run its own exit path, so its
+`CLONE_CHILD_CLEARTID` word is not cleared.
+
+Pinned by `t-kill-ends-group` (both machines): a re-exec fixture with a worker in
+`FUTEX_WAIT`, a `SIGKILL`, and a `WNOHANG` poll so a hang reports as a false claim
+instead of a harness timeout. Host Linux is the reference (`MPOS_ON_HOST=1`, 4/4
+ok); the sweep is `pass=229 fail=0`, and without the call
+`pass=228 fail=1` with exactly those claims red (§6.37).
