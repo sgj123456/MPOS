@@ -379,19 +379,32 @@ QEMU line still reads `-device virtio-gpu-pci`, which is the new key's *default*
 boots exactly the machine it booted before - and that is why a machine key written for an
 interactive `run` cannot silently move the gate.
 
-**A named host-suite flake — `rand::tests::a_reseed_re_keys_the_generator`.** The suite is not
-parallel-safe over a module whose tests share a global, and this is the house pattern's one known
-cost (`static X: Mutex<RefCell<…>>`). The test asserts that two `fingerprint()`s with no
-`reseed()` between them are equal — the counterfactual for the re-key — but `fingerprint`, `fill`
-and `reseed` all act on the module's *one* global generator, so a sibling host test that draws
-from it in that window makes the second fingerprint differ. Reachable from `abi`'s `getrandom(2)`
-test as well as from `rand`'s own, which is why a lock inside that module is not enough.
-Measured on this tree: 2 of 3 `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` runs
-fail that single assertion with `511 passed; 1 failed`, and 5 of 5 runs with
-`-- --test-threads=1` pass — 0.28 s against 0.14 s. So a stage-1 red in exactly that test is a
-flake, not the change: re-run before believing it, and quote the run that was green. The fix,
-when someone takes it, is either serialising the suite or making the generator a value with the
-global as one instance.
+**A named host-suite flake — `rand::tests::a_reseed_re_keys_the_generator` — FIXED 2026-10-28.**
+The suite is not parallel-safe over a module whose tests share a global, and this is the house
+pattern's one known cost (`static X: Mutex<RefCell<…>>`). The test asserted that two
+`fingerprint()`s with no `reseed()` between them are equal — the counterfactual for the re-key —
+but `fingerprint`, `fill` and `reseed` all acted on the module's *one* global generator, so a
+sibling host test drawing from it in that window made the second fingerprint differ. Reachable
+from `abi`'s `getrandom(2)` test as well as from `rand`'s own, which is why a lock inside that
+module was not enough. Measured before the fix: 2 of 3 runs failed that single assertion; 5 of 5
+runs with `-- --test-threads=1` passed (0.28 s against 0.14 s). The fix is the second shape this
+note had named: the generator is a **value** (`struct Generator(ChaCha20Rng)`) and the kernel
+keeps one instance behind `RNG`, so the tests make their own with `Generator::from_seed` and the
+re-key equality is a property of the generator rather than of what else the runner did in that
+window; the test-only `rand::fingerprint()` went with it. A stage-1 red in that test is now a
+regression, not a flake.
+
+**The same shape, found while fixing it — `vfs::devpts::tests::a_mount_publishes_the_numbers_its_options_name`.**
+The devpts mount options are one module global (`pty::DEVPTS_OPTIONS`, since `fd18aaa`), and
+three host tests save/`apply_mount_options`/restore them; `cargo test` runs the suite on several
+threads, so a sibling's numbers could be published between one test's assert and its restore.
+Measured on this tree with the shipped tests: **5 of 40 runs red on that one test**, the same
+`build/scratch/flake-*` sampling that showed the rand assertion no longer reproducing. Fixed by a
+module-local test lock held by every test that touches the options, with the refusal test also
+restoring them (it accepts `mode=0620,`, so it publishes numbers too). Measured after: **0 of 40
+runs red**. The rule both cases teach: a test that reads or writes a module global takes that
+module's test lock, and a global reachable from another module needs the owner's lock exposed or
+the assert rephrased against a value.
 
 **A sweep red that a re-run cleared — `t-exit-group` (aarch64, one run).** The aarch64 gate on
 2026-10-21 came back `pass=196 fail=1`: scenario E's "a sibling's forked child was started under

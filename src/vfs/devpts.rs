@@ -146,7 +146,25 @@ pub fn open_count() -> usize {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    /// The lock every test that reads or writes the mount options takes first.
+    ///
+    /// The options are the module's one global (`pty::DEVPTS_OPTIONS`), and
+    /// `cargo test` runs these on several threads: two save/apply/restore
+    /// sequences interleaved make "a mount publishes the numbers its options
+    /// name" false for reasons that have nothing to do with the parser - the
+    /// sibling test's numbers were published between the assert and the
+    /// restore. The lock is module-local because no test outside this module
+    /// touches the options.
+    fn options_lock() -> std::sync::MutexGuard<'static, ()> {
+        static OPTIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        OPTIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn the_tree_lists_dynamic_pairs_and_nothing_else() {
@@ -197,6 +215,7 @@ mod tests {
     /// `0620 root:tty` is the mount's own request.
     #[test]
     fn a_mount_publishes_the_numbers_its_options_name() {
+        let _guard = options_lock();
         let saved = crate::vfs::pty::devpts_options();
         apply_mount_options("mode=0620,gid=5").unwrap();
         let options = crate::vfs::pty::devpts_options();
@@ -222,6 +241,11 @@ mod tests {
 
     #[test]
     fn an_option_this_kernel_cannot_make_true_is_refused() {
+        // `mode=0620,` below is accepted, so this test publishes numbers too:
+        // it takes the lock and puts the old ones back, or it would leave the
+        // options of whichever test ran before it changed.
+        let _guard = options_lock();
+        let saved = crate::vfs::pty::devpts_options();
         // Measured on Linux 7.2.11: an unrecognised option fails the mount
         // with EINVAL rather than being ignored.
         assert_eq!(
@@ -242,12 +266,14 @@ mod tests {
                 "{refused} must be refused, not silently dropped"
             );
         }
+        crate::vfs::pty::set_devpts_options(saved);
     }
 
     /// The pair carries the numbers its mount published - and they survive a
     /// new `PtySlave`, which is what makes a `chown` from `login` stick.
     #[test]
     fn a_dynamic_pair_is_born_with_the_mounts_numbers() {
+        let _guard = options_lock();
         let saved = crate::vfs::pty::devpts_options();
         apply_mount_options("mode=0640,gid=5").unwrap();
         let pty = crate::vfs::pty::allocate_dynamic().unwrap();

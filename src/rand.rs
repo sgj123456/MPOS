@@ -19,10 +19,53 @@ use critical_section::Mutex;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
+/// One ChaCha20 stream, as a value.
+///
+/// The kernel keeps exactly one of these behind [`RNG`]; the host tests make
+/// their own with [`Generator::from_seed`]. That split is what makes the re-key
+/// a property of *the generator* rather than of the test runner: a test that
+/// draws from the one shared stream can have a sibling test re-key it between
+/// two looks, so "a passive read must not advance the key" becomes false for a
+/// reason that has nothing to do with this code. The flake and the fix it
+/// recorded as the way out: `docs/notes/` §12.4a.
+struct Generator(ChaCha20Rng);
+
+impl Generator {
+    fn from_seed(seed: [u8; 32]) -> Self {
+        Self(ChaCha20Rng::from_seed(seed))
+    }
+
+    fn fill(&mut self, out: &mut [u8]) {
+        self.0.fill_bytes(out);
+    }
+
+    /// Re-key from fresh seed material mixed with a draw from the current
+    /// stream; the argument for mixing is on [`reseed`].
+    fn reseed(&mut self) {
+        let mut carried = [0u8; 32];
+        self.0.fill_bytes(&mut carried);
+        let mut fresh = seed();
+        for (byte, old) in fresh.iter_mut().zip(carried) {
+            *byte ^= old;
+        }
+        self.0 = ChaCha20Rng::from_seed(fresh);
+    }
+
+    /// A read of the stream's *future* output that does not consume it: taken
+    /// from a clone, so two calls with no `reseed` between them return the same
+    /// bytes. Test-only: no caller in the kernel has a use for it.
+    #[cfg(all(test, not(target_os = "none")))]
+    fn fingerprint(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.0.clone().fill_bytes(&mut out);
+        out
+    }
+}
+
 /// The generator, behind the usual kernel lock. `None` until the first use:
 /// seeding touches the CPU and the clock, and neither is up as early as this
 /// module is compiled.
-static RNG: Mutex<RefCell<Option<ChaCha20Rng>>> = Mutex::new(RefCell::new(None));
+static RNG: Mutex<RefCell<Option<Generator>>> = Mutex::new(RefCell::new(None));
 
 /// Seed the generator. Idempotent, so a caller may ask at any point in the
 /// boot without having to know whether it is the first to arrive.
@@ -30,7 +73,7 @@ pub fn init() {
     critical_section::with(|cs| {
         let mut slot = RNG.borrow(cs).borrow_mut();
         if slot.is_none() {
-            *slot = Some(ChaCha20Rng::from_seed(seed()));
+            *slot = Some(Generator::from_seed(seed()));
         }
     });
 }
@@ -63,8 +106,8 @@ pub fn set_device_entropy(source: DeviceEntropy) {
 pub fn fill(out: &mut [u8]) {
     critical_section::with(|cs| {
         let mut slot = RNG.borrow(cs).borrow_mut();
-        let rng = slot.get_or_insert_with(|| ChaCha20Rng::from_seed(seed()));
-        rng.fill_bytes(out);
+        let rng = slot.get_or_insert_with(|| Generator::from_seed(seed()));
+        rng.fill(out);
     });
 }
 
@@ -88,18 +131,12 @@ pub fn fill(out: &mut [u8]) {
 pub fn reseed() {
     critical_section::with(|cs| {
         let mut slot = RNG.borrow(cs).borrow_mut();
-        // Draw from the current generator before replacing it. `None` (never
-        // seeded) contributes nothing and the fresh seed stands alone, which
-        // is the same state `init` would have made.
-        let mut carried = [0u8; 32];
-        if let Some(rng) = slot.as_mut() {
-            rng.fill_bytes(&mut carried);
+        // `None` (never seeded) contributes nothing and the fresh seed stands
+        // alone, which is the same state `init` would have made.
+        match slot.as_mut() {
+            Some(rng) => rng.reseed(),
+            None => *slot = Some(Generator::from_seed(seed())),
         }
-        let mut fresh = seed();
-        for (byte, old) in fresh.iter_mut().zip(carried) {
-            *byte ^= old;
-        }
-        *slot = Some(ChaCha20Rng::from_seed(fresh));
     });
 }
 
@@ -165,110 +202,82 @@ fn seed() -> [u8; 32] {
     *b"mpos-host-seed: not a secret, te"
 }
 
-/// A read of the generator's *future* output that does not consume it: the
-/// stream is advanced on a clone, so two calls with no `reseed` between them
-/// return the same bytes. That is what a host test needs to see a re-key
-/// without depending on how many other tests drew from the shared stream in
-/// between. Test-only: no caller in the kernel has a use for it.
-#[cfg(all(test, not(target_os = "none")))]
-pub fn fingerprint() -> [u8; 32] {
-    critical_section::with(|cs| {
-        let mut slot = RNG.borrow(cs).borrow_mut();
-        let rng = slot.get_or_insert_with(|| ChaCha20Rng::from_seed(seed()));
-        let mut out = [0u8; 32];
-        rng.clone().fill_bytes(&mut out);
-        out
-    })
-}
-
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
-    extern crate std;
+    use super::Generator;
 
-    use std::sync::{Mutex, MutexGuard};
-
-    use super::{fill, fingerprint, reseed};
-
-    /// The generator this module tests is a `static`, and `cargo test` runs
-    /// these on several threads at once. Two interleaved makes
-    /// `a_reseed_re_keys_the_generator`'s "a passive read must not advance the
-    /// key" false - the other thread re-keyed in between - which is a property
-    /// of the runner's scheduling and not of the generator. Held for the length
-    /// of every test that draws from it, so what fails is the code.
-    static GENERATOR: Mutex<()> = Mutex::new(());
-
-    /// The lock, taken in a way that survives a neighbour's panic: a test that
-    /// failed while holding it has already said what is wrong, and poisoning
-    /// the rest of the module would replace that report with a second one.
-    fn exclusive() -> MutexGuard<'static, ()> {
-        GENERATOR
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Each test draws from its own generator: the properties below are about
+    /// the generator, and a test that shared the kernel's one stream would fail
+    /// whenever a sibling test re-keyed it between two looks - which is the
+    /// flake this module used to carry (`docs/notes/` §12.4a), not a property
+    /// of the code under test.
+    fn generator() -> Generator {
+        Generator::from_seed(super::seed())
     }
 
     #[test]
     fn two_fills_do_not_repeat() {
-        let _guard = exclusive();
+        let mut rng = generator();
         // The bug this module exists to fix: the old source re-seeded from the
         // tick on every call, so two calls in one tick returned the same bytes.
         let mut first = [0u8; 32];
         let mut second = [0u8; 32];
-        fill(&mut first);
-        fill(&mut second);
+        rng.fill(&mut first);
+        rng.fill(&mut second);
         assert_ne!(first, second);
     }
 
     #[test]
     fn a_fill_actually_changes_the_buffer() {
-        let _guard = exclusive();
+        let mut rng = generator();
         let mut bytes = [0u8; 64];
-        fill(&mut bytes);
+        rng.fill(&mut bytes);
         assert!(bytes.iter().any(|&b| b != 0));
     }
 
     #[test]
     fn a_stream_keeps_going_across_calls() {
-        let _guard = exclusive();
+        let mut rng = generator();
         // Two halves read as one stream must not repeat either: this is what a
         // caller reading `/dev/urandom` in chunks depends on.
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
-        fill(&mut a);
-        fill(&mut b);
+        rng.fill(&mut a);
+        rng.fill(&mut b);
         assert_ne!(a, b);
     }
 
     #[test]
     fn a_reseed_re_keys_the_generator() {
-        let _guard = exclusive();
+        let mut rng = generator();
         // `RNDRESEEDCRNG` has to leave the generator in a state no earlier
         // output predicts. The fingerprint reads from a *clone*, so it does not
         // advance the stream itself, and two fingerprints taken without a
         // reseed between them are equal - which is what makes this a
         // counterfactual for the reseed rather than for the passing of time.
-        let before = fingerprint();
+        let before = rng.fingerprint();
         assert_eq!(
             before,
-            fingerprint(),
+            rng.fingerprint(),
             "a passive read must not advance the key"
         );
-        reseed();
-        let after = fingerprint();
+        rng.reseed();
+        let after = rng.fingerprint();
         assert_ne!(before, after, "a reseed must change the key");
         // And a second reseed from the new state changes it again: the re-key
         // is not a reset to a fixed point.
-        reseed();
-        assert_ne!(after, fingerprint());
+        rng.reseed();
+        assert_ne!(after, rng.fingerprint());
     }
 
     #[test]
     fn a_rekeyed_generator_still_produces_bytes() {
-        let _guard = exclusive();
-        reseed();
+        let mut rng = generator();
+        rng.reseed();
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
-        fill(&mut a);
-        fill(&mut b);
+        rng.fill(&mut a);
+        rng.fill(&mut b);
         assert_ne!(a, b);
         assert!(a.iter().chain(b.iter()).any(|&byte| byte != 0));
     }
