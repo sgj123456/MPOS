@@ -1,10 +1,13 @@
 //! t-enosys - the calls this kernel has no dispatch arm for.
 //!
-//! Pinned here: `rseq`(334/293) answers ENOSYS. Every other number that used to
-//! be on this list has moved out as it was served, each to its own pin:
+//! Pinned here: `memfd_secret`(447/447) answers ENOSYS. Every other number that
+//! used to be on this list has moved out as it was served, each to its own pin:
 //! `keyctl` (250) to `t-keyctl`, `fanotify_init`/`fanotify_mark` (300/301) to
 //! `t-fanotify`, the three `io_uring` numbers (425/426/427) to `t-io-uring`,
-//! and `userfaultfd` (323/282) to `t-userfaultfd`. ENOSYS is the answer a libc
+//! `userfaultfd` (323/282) to `t-userfaultfd`, and `rseq` (334/293) to
+//! `t-rseq`. `memfd_secret` is the one number still falling through: secret
+//! memory wants a direct-map carve-out and a page-table shape this kernel does
+//! not carry. ENOSYS is the answer a libc
 //! reads as "this optional call is not available"; the numbers come from libc's
 //! per-machine table, and the kernel's table has no handler for the one left,
 //! so it falls through the default arm. A call the kernel *does* implement -
@@ -13,30 +16,30 @@
 //!
 //! The point of walking it is the kernel's own note, not the return value. The
 //! first time a number falls through, mpos prints `mpos: syscall <nr> ->
-//! ENOSYS` on the console, once per number for the life of the boot. `rseq` is
-//! therefore asked twice below: both calls answer ENOSYS, but only the first
-//! prints a line. That once-per-number rule is what keeps a startup loop's
+//! ENOSYS` on the console, once per number for the life of the boot.
+//! `memfd_secret` is therefore asked twice below: both calls answer ENOSYS, but
+//! only the first prints a line. That once-per-number rule is what keeps a startup loop's
 //! dozens of probes from becoming dozens of console lines while still telling a
 //! reader what is missing.
 //!
-//! Every claim is `libc::syscall(SYS_*)`, clause (a): the probe's subject is
-//! the number falling through, not a call either library names. `rseq`'s number
-//! is read from libc rather than written down here, because the two machines
-//! differ (334 on x86_64, 293 on aarch64).
+//! Every claim is `libc::syscall(*)`, clause (a): the probe's subject is the
+//! number falling through, not a call either library names. `memfd_secret`'s
+//! number is the same on both machines (447, asm-generic and x86_64 agree); the
+//! literal is written down because libc has no `SYS_memfd_secret` constant.
 
 use mpos_user_tests::Report;
 
+/// `memfd_secret(2)`'s number: 447 on both machines' tables.
+const SYS_MEMFD_SECRET: libc::c_long = 447;
+
 fn probe(nr: libc::c_long) -> bool {
-    // `rseq`'s own argument shape: a `struct rseq *` and a length, with
-    // `RSEQ_FLAG_UNREGISTER` = 1 asking for the opposite of a registration.
-    // The call is refused before either is looked at, so a null block and a
-    // zero length are the honest probe.
-    let r = unsafe { libc::syscall(nr, 0usize, 0usize, 1usize) };
+    // `memfd_secret`'s own argument shape: a flags word. The call is refused
+    // before the argument is looked at, so a zero flag word is the honest probe.
+    let r = unsafe { libc::syscall(nr, 0usize) };
     refused(r as isize, libc::ENOSYS)
-        // On a current host `rseq` is *served* (measured here: the call either
-        // registers or refuses the null block), so under a hosted run any
-        // refusal at all stands in for the ENOSYS this kernel answers; the
-        // payload sweep pins ENOSYS itself.
+        // On a current host `memfd_secret` is *served* (measured: it answers a
+        // descriptor), so under a hosted run any refusal at all stands in for
+        // the ENOSYS this kernel answers; the guest sweep pins ENOSYS itself.
         || mpos_user_tests::host_run() && r == -1
 }
 
@@ -50,13 +53,13 @@ fn main() {
     println!("t-enosys");
     let mut r = Report::new();
 
-    r.check("rseq answers ENOSYS", probe(libc::SYS_rseq));
+    r.check("memfd_secret answers ENOSYS", probe(SYS_MEMFD_SECRET));
 
     // Asked a second time: still ENOSYS, but the console note for the
     // number was printed by the first call and not again.
     r.check(
-        "rseq asked a second time still answers ENOSYS",
-        probe(libc::SYS_rseq),
+        "memfd_secret asked a second time still answers ENOSYS",
+        probe(SYS_MEMFD_SECRET),
     );
 
     // The control: an implemented call does not answer ENOSYS, so the probe

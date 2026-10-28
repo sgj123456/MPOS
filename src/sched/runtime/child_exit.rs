@@ -227,6 +227,7 @@ pub fn exit(code: isize) -> ! {
         // thread: `sched::keys` is process state, so its teardown sits here
         // with the other scheduler tables rather than behind an exit hook.
         crate::sched::keys::exit_cleanup(id, tgid, group_dead);
+        crate::sched::rseq::exit_cleanup(id);
 
         // The dying process's `SEM_UNDO` adjustments - Linux's `exit_sem`,
         // applied when the list's last holder leaves. Taken here rather than
@@ -768,6 +769,7 @@ pub fn fork(state: &UserFrame) -> isize {
         },
     );
     hand_down_keyrings(parent_tgid, child, false);
+    hand_down_rseq(parent_tgid, child, false);
     child
 }
 
@@ -792,6 +794,7 @@ pub fn vfork(state: &UserFrame) -> isize {
         },
     );
     hand_down_keyrings(parent_tgid, child, false);
+    hand_down_rseq(parent_tgid, child, false);
     child
 }
 
@@ -807,6 +810,16 @@ fn hand_down_keyrings(parent_tgid: TaskId, child: isize, shares_group: bool) {
     let child_id = TaskId(child as usize);
     let child_tgid = if shares_group { parent_tgid } else { child_id };
     crate::sched::keys::clone_cleanup(parent_tgid, child_tgid, child_id, shares_group);
+}
+
+/// Hand a new task the `rseq` registration it inherits: a `fork`/`vfork` child
+/// keeps its parent's area (measured: the child can unregister with the parent's
+/// own area/length/signature), a `CLONE_VM` thread starts with none.
+fn hand_down_rseq(parent_tgid: TaskId, child: isize, shares_group: bool) {
+    if child <= 0 {
+        return;
+    }
+    crate::sched::rseq::clone_cleanup(parent_tgid, TaskId(child as usize), shares_group);
 }
 
 /// What a `clone` asks for beyond "a copy of me": which flags, where the child's
@@ -1532,8 +1545,11 @@ pub fn exec_replace(
         }
         // The task is about to be a *new* program: it is no longer a fork child
         // waiting to resume its parent's call, and a fresh image starts with no
-        // TLS and no tid to record.
+        // TLS and no tid to record. Its `rseq` registration named an address in
+        // the address space being thrown away, so `exec` clears it (measured: a
+        // registration does not survive `exec`).
         task.user_resume = None;
+        crate::sched::rseq::exec_clear(id);
         task.child_tid = 0;
         task.tls = 0;
         hal::set_thread_pointer(0);
@@ -1716,10 +1732,12 @@ pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
     if request.flags & crate::abi::CLONE_THREAD != 0 {
         let child = spawn_thread(state, request);
         hand_down_keyrings(parent_tgid, child, true);
+        hand_down_rseq(parent_tgid, child, true);
         return child;
     }
     let child = spawn_copy(state, request);
     hand_down_keyrings(parent_tgid, child, false);
+    hand_down_rseq(parent_tgid, child, false);
     child
 }
 

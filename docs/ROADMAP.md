@@ -240,9 +240,14 @@ One-glance status of the whole roadmap.
   `WRITEPROTECT`/`CONTINUE`/`MOVE`/`POISON` are `EOPNOTSUPP`, and the registry is the
   machine's rather than the `mm`'s (a forked child's fault is delivered, not `SIGBUS`)
   (§6.33, item 116)
-- [ ] `tid/tgid_add_object` (rseq) — niche; the one number left answering `ENOSYS`,
-  pinned by `t-rseq`, and serving it needs a per-thread registration maintained across
-  preemption (§12.1 A6)
+- [x] `rseq(2)` (334/293) — the legacy 32-byte registration, served: the id words
+  name the running cpu, re-registering the same area is `EBUSY`, a different one
+  `EINVAL`, a wrong signature `EPERM`, unregistering is the registered triple and
+  resets the ids, a `fork` child inherits it while a thread starts with none, and
+  the clock **does not preempt a task inside an armed critical section** (the tick
+  is spent; a span still armed on the next tick ends the task with `SIGSEGV`, since
+  this machine cannot rewind the trap frame's resume address the way Linux does).
+  Linux's v2 area (`len > 32`) is `EOPNOTSUPP` — named (§6.35, item 120)
 - [x] `close_range(2)` (436) — a span of descriptors, closed or marked: measured on
   Linux 7.2.11, a span closes exactly the numbers it covers (neighbours untouched),
   `first > last` and a flag bit outside the two are `EINVAL`, `~0` means "to the end
@@ -567,7 +572,7 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-rseq side-objects stay `ENOSYS` (the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs validate then `EOPNOTSUPP`;  
+`memfd_secret` is the one number left whose honest answer is `ENOSYS` (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs validate then `EOPNOTSUPP`;  
 the semantics still incomplete are the datagram line itself, which is the ring's rather than  
 Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
 sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  

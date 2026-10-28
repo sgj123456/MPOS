@@ -143,12 +143,21 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // its behalf (`stime`). Charged before the EOI and the preempt, so the tick
     // lands on the task that actually held the core.
     let in_user = frame.code_segment == super::gdt::user_selectors().0;
+    let user_ip = frame.instruction_pointer.as_u64() as usize;
     crate::hal::kernel::charge_cpu(in_user);
     // EOI before preempting: once the scheduler switches away this handler does
     // not return until the task is resumed, and an unacknowledged PIC would
     // block every interrupt until then.
     pic::end_of_interrupt(0);
-    crate::hal::kernel::preempt();
+    // Where the tick landed is what lets the scheduler keep a restartable
+    // sequence unbroken: a task in ring 3 inside an armed span is not switched
+    // away from (`crate::sched::rseq`). A tick in kernel mode has no user
+    // address to offer, and uses the address-less call.
+    if in_user {
+        crate::hal::kernel::preempt_at(user_ip);
+    } else {
+        crate::hal::kernel::preempt();
+    }
 }
 
 /// The local APIC's one-shot: a wait shorter than a tick is due now.
@@ -164,13 +173,17 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 /// in service, and the LAPIC wants no EOI for it.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
-extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn apic_timer(frame: InterruptStackFrame) {
     // The APIC, not the PIC, raised this one: the 8259's EOI port knows nothing
     // about it, and a vector left in service would block this one and every
     // lower-priority delivery. EOI before preempting for the same reason the PIT
     // handler does it - a preempted handler does not return until it is resumed.
     super::lapic::eoi();
-    crate::hal::kernel::preempt();
+    if frame.code_segment == super::gdt::user_selectors().0 {
+        crate::hal::kernel::preempt_at(frame.instruction_pointer.as_u64() as usize);
+    } else {
+        crate::hal::kernel::preempt();
+    }
 }
 
 /// The console's input and the console's queued output.

@@ -10,6 +10,7 @@ pub mod fs;
 pub mod futex;
 pub mod keys;
 pub mod policy;
+pub mod rseq;
 pub mod signal;
 /// System V message queues: the queue table, the receive's selection rules,
 /// and the two waits a queue can hold a task in (full on a send, empty on a
@@ -82,8 +83,8 @@ pub use runtime::{
     page_present_in, parent_group_of, parent_of, park_site, parks_of, pause, pgid_of, pid_chain_of,
     pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation, pidfd_group_alive,
     pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive, poll_any_child_event,
-    poll_child_event, populate_user_page_at, preempt, prev_syscall, process_members, protect_user,
-    protect_user_range, raise_sigpipe, range_is_mapped, read_user, read_user_of,
+    poll_child_event, populate_user_page_at, preempt, preempt_at, prev_syscall, process_members,
+    protect_user, protect_user_range, raise_sigpipe, range_is_mapped, read_user, read_user_of,
     record_eager_range, register_membarrier, release_controlling_tty, release_pid,
     release_user_frames, reset_disposition, resident_pages, resolve_anon_fault, resolve_cow_fault,
     resolve_pid, resolve_script, resolve_stack_growth, resume_traced, rlimits_of, robust_head,

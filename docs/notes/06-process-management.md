@@ -4246,3 +4246,85 @@ both round trips, and — on this kernel only — the `EOPNOTSUPP` NUMA word
 `_ => ENOSYS`, nothing else.
 
 Full record: `docs/uapi/` §5.1 item 119.
+
+### 6.35 `rseq(2)` — a restartable sequence, and the tick that must not break it — **LANDED (2026-10-28)**
+
+`rseq(2)` (334 on x86_64, 293 on aarch64) is how a libc says "this thread has a
+block at this address; write the CPU it is running on into it, and never
+interrupt the sequence I arm through it". glibc registers one before `main`
+runs, and the table of deliberate refusals (§12.1 A6) had carried the number as
+`ENOSYS` for exactly why a user-space program cannot do it for itself: the
+kernel is what knows the CPU and what can avoid the interruption.
+
+**Measured as real root** (Linux 7.2.11; `build/scratch/rseq/` — every probe a
+fresh `musl-gcc -static` task, because a glibc binary's own startup registers a
+33-byte area and every later call in that thread then answers `EINVAL`; the
+`mini`/`probe` binaries that directory already held were stale and were not
+used). The auxv says `AT_RSEQ_FEATURE_SIZE = 33`, `AT_RSEQ_ALIGN = 64`; `struct
+rseq` is `cpu_id_start` at 0, `cpu_id` at 4, `rseq_cs` at 8, `flags` at 16,
+`node_id` at 20, `mm_cid` at 24. What the call answers:
+
+| shape | Linux 7.2.11 |
+|---|---|
+| `rseq(area, 32, 0, sig)`, 32-aligned | `0`; `rseq_cs = 0`; ids = the running cpu |
+| the same again | `EBUSY` |
+| a different area, or a different length | `EINVAL` |
+| the same area, a different `sig` | `EPERM` |
+| a misaligned area; `len` 0 or 31 | `EINVAL` |
+| `len` 33/34/40/64/65, 64-aligned | `0` (the v2 area; writes `flags = 0x10`) |
+| `len > 32` at a 32-aligned area | `EINVAL` |
+| `flags` 2 | `0`; `flags` 1, 3, `0x80000000` → `EINVAL` |
+| unregister with the registered triple | `0`; `cpu_id_start = 0`, `cpu_id = -1`, `node_id = mm_cid = 0` |
+| unregister with a wrong `sig` | `EPERM` |
+| unregister with a wrong area or length | `EINVAL` |
+| unregister with `flags = 1 \| 2`, or with nothing registered | `EINVAL` |
+| `fork` | the child inherits the registration (it can unregister the parent's triple) |
+| `CLONE_VM` thread | starts with none (registers its own area) |
+| `exec` | clears it |
+
+The critical-section half was measured with a hand-written assembly blob whose
+`.long 0x53053053` signature word sits four bytes before its abort label: a
+syscall made *inside* the section commits (Linux clears its event flags on the
+syscall-exit path), a task **preempted** inside it is rewound in every one of six
+cases (`rseq_cs` cleared, resume address = `abort_ip`), and a signature word four
+bytes off kills the task with `SIGSEGV` — but only when the rewinding runs.
+
+**Served, in that shape.** `src/sched/rseq.rs` holds the per-task registration
+(area, length, signature, and the tick-deferral bound), `src/syscall/linux/proc.rs`'s
+`handle_rseq` is the argument door, and `nr::RSEQ` gained a dispatch arm in
+`src/syscall/linux/mod.rs` where the "deliberately has no arm" comment used to
+be. Registration writes `rseq_cs = 0`, `flags = 0`, both ids = the running cpu
+(0 — this machine has one) and `node_id = mm_cid = 0`; unregistration writes the
+measured *different* four words (`cpu_id_start = 0`, `cpu_id = -1`); a `fork`
+child inherits the registration in `hand_down_rseq` beside the keyring's hook, a
+thread does not, and `exec`/exit clear it.
+
+**The promise, kept a different way.** Linux keeps a restartable sequence
+unbroken by rewinding the resume address out of the span. This kernel cannot do
+that: the trap frame the clock returns to is the machine's own and its user
+register file is not reachable from the interrupt path (the syscall gate's frame
+is, the clock's is not — measured by reading both machines' entries). So the
+scheduler is told *where the tick landed* (`Kernel::preempt_at` on the service
+table, filled in by `src/kernel_services.rs`, called from the x86_64 PIT/APIC
+handlers and the aarch64 `irq` stub) and a tick that lands inside an armed span
+is **spent, not switched**: the task keeps the core until the sequence commits
+or leaves its span. A task still inside its span on the following tick is ended
+with `SIGSEGV`, because a span is a handful of instructions and never a
+millisecond — a broken sequence must not hold the only core.
+
+**Nine claims on `t-rseq`**, plus the armed-section claim (guest-only: the host
+prints that it rewinds instead), the v2 refusal (guest-only: the host serves
+it), and the fork/thread inheritance. Host run: **PASS, 20/20** — the armed
+child exits `7`, i.e. Linux's own fixup ran, which is the reference direction.
+Gates: x86_64 `pass=225 fail=0`, aarch64 `pass=224 fail=0`, `mpos-kunit 34 passed`
+both, host suite 685.
+
+**Named divergences**: the v2 area (`len > 32` — `node_id`/`mm_cid`/`slice_ctrl`)
+is `EOPNOTSUPP`; a preempted section is deferred then killed rather than rewound
+to `abort_ip`; and an unregistration over an unmapped area answers `EFAULT` where
+Linux delivers `SIGSEGV`.
+
+**Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=224 fail=1
+(225 built)`, only `t-rseq` red, every call falling through `_ => ENOSYS`.
+
+Full record: `docs/uapi/` §5.1 item 120.

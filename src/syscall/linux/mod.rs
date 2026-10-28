@@ -484,17 +484,15 @@ pub unsafe fn dispatch(
         nr::SCHED_SETAFFINITY => abi::handle_sched_setaffinity(args),
         nr::SCHED_GETAFFINITY => abi::handle_sched_getaffinity(args),
         nr::SET_ROBUST_LIST => abi::handle_set_robust_list(args),
-        // `RSEQ` deliberately has no arm: it falls through to the `_ => ENOSYS`
-        // below. The kernel does not carry the per-thread registration that
-        // maintaining `cpu_id`/`node_id`/`mm_cid` (and honouring
-        // `RSEQ_FLAG_UNREGISTER`) requires, so the honest answer is "not
-        // available" - which is exactly the fallback a libc that probes `rseq`
-        // and finds none is written to take. A former arm returned `0` for a
-        // well-formed registration without writing any field the ABI contract
-        // puts in the caller's block; §4.2 forbids that, and the caller it was
-        // written for (glibc) registers at length 33/alignment 64 on a current
-        // kernel, a shape that arm rejected anyway, so it honoured neither.
-        // Doing `rseq` for real is a named gap. See `docs/notes/` §12.1 A6.
+        // `rseq` is served for the legacy 32-byte area: the registration and its
+        // measured errors, the id writes, fork/thread/exec inheritance, and the
+        // one promise that matters - the clock does not preempt a task inside an
+        // armed restartable sequence (`crate::sched::rseq`). The v2 area
+        // (`node_id`/`mm_cid`/`slice_ctrl`, `len > 32`) is refused with
+        // `EOPNOTSUPP`, a named gap: this kernel carries none of those facts, and
+        // answering 0 would leave fields a caller reads stale. See
+        // `docs/notes/` §6.35 (and §12.1 A6, whose `ENOSYS` this replaces).
+        nr::RSEQ => proc::handle_rseq(args),
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         // --- the calls an ordinary libc reaches for ---

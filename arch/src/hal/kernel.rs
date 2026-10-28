@@ -96,6 +96,16 @@ pub trait Kernel: Sync {
     /// Let the scheduler take the CPU at the end of an interrupt.
     fn preempt(&self);
 
+    /// Let the scheduler take the CPU at an interrupt that landed on a user
+    /// address, given the address it landed on.
+    ///
+    /// The one thing that differs from [`preempt`](Self::preempt) is a task
+    /// inside a restartable sequence's span: on a uniprocessor the clock is the
+    /// only thing that can break the span, so the scheduler is told where the
+    /// interrupt landed and defers the switch instead of breaking it. Every
+    /// other trap path keeps the address-less call.
+    fn preempt_at(&self, ip: usize);
+
     /// Account one tick to whatever was running when the interrupt landed.
     fn charge_cpu(&self, in_user: bool);
 
@@ -360,6 +370,13 @@ pub fn exit(code: isize) -> ! {
 #[inline]
 pub fn preempt() {
     registered().preempt()
+}
+
+/// Let the scheduler take the CPU, telling it the interrupted user address.
+/// See [`Kernel::preempt_at`].
+#[inline]
+pub fn preempt_at(ip: usize) {
+    registered().preempt_at(ip)
 }
 
 /// Account a tick. See [`Kernel::charge_cpu`].

@@ -415,6 +415,15 @@ pub(crate) fn pid_task(pid: isize) -> Option<TaskId> {
 /// (`CLONE_CHILD_CLEARTID` and `set_tid_address` are the same promise made two
 /// ways, which is why a libc uses one for the threads it creates and the other
 /// for the thread it started as).
+/// `rseq(area, len, flags, sig)` - a thread's restartable-sequence registration.
+///
+/// The measured shape, the one promise this kernel keeps (a tick that lands
+/// inside an armed span does not preempt the task) and the named divergences
+/// live in `crate::sched::rseq`; the handler is the argument door only.
+pub(super) fn handle_rseq(args: [usize; ARG_COUNT]) -> isize {
+    crate::sched::rseq::syscall(args[0], args[1], args[2], args[3])
+}
+
 pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
     if args[0] != 0 {
         crate::sched::set_clear_tid(args[0]);

@@ -6612,3 +6612,56 @@ NUMA refusal guest-only). Gate `pass=226 fail=0` on x86_64; counterfactual
 `t-futex2` red.
 
 Full record: [`docs/notes/`](../notes/06-process-management.md) §6.34.
+
+## item 120 — `rseq(2)`: a restartable sequence, and the tick that must not break it
+
+The number a libc registers before `main` runs (334 on x86_64, 293 on
+aarch64), previously answered `ENOSYS` because this kernel kept no per-thread
+registration and could not say which cpu a thread was on. Both halves are now
+served: the block is written and maintained, and the kernel keeps the one
+promise the call exists to make — it does not interrupt an armed sequence.
+
+**Measured first, as real root** (`build/scratch/rseq/`, Linux 7.2.11, every
+probe a fresh `musl-gcc -static` task because a glibc binary's own startup
+registers a 33-byte area and every later call in that thread is `EINVAL`):
+
+* `rseq(area, 32, 0, sig)` on a 32-byte-aligned area answers `0`; the block
+  reads `rseq_cs = 0`, both ids = the running cpu, `node_id = mm_cid = 0`.
+* re-registering the same area and length is `EBUSY`; a different area or
+  length `EINVAL`; a different `sig` `EPERM`; a misaligned area and `len` 0/31
+  are `EINVAL`; a flags word outside `RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` is
+  `EINVAL` (2 itself is accepted).
+* unregistration is `rseq(area, len, RSEQ_FLAG_UNREGISTER, sig)` with the
+  **registered** triple (a null block is not the shape), and writes a
+  different set of four words: `cpu_id_start = 0`, `cpu_id = -1`,
+  `node_id = mm_cid = 0`. A wrong signature is `EPERM`; a wrong area or length
+  `EINVAL`; a widened flag word `EINVAL`; unregistering nothing `EINVAL`.
+* a `fork` child inherits the registration; a `CLONE_VM` thread starts with
+  none; `exec` clears it.
+* Linux serves the newer v2 area (`len > 32`, 64-byte aligned, `flags = 0x10`);
+  this kernel refuses it with `EOPNOTSUPP` because it carries none of the
+  `node_id`/`mm_cid`/`slice_ctrl` facts.
+* a hand-written critical section (signature `.long 0x53053053` before the
+  abort label) shows the promise's shape on Linux: a syscall inside it commits,
+  a preemption inside it is rewound to `abort_ip`, and a wrong signature word
+  kills with `SIGSEGV` only when the rewinding runs.
+
+**Served, in that shape.** `src/sched/rseq.rs` holds the registration (and the
+tick-deferral bound); `src/syscall/linux/proc.rs`'s `handle_rseq` is the
+argument door; `nr::RSEQ` has a dispatch arm where the deliberate-absence
+comment used to be. The promise is kept by *deferring* the tick: the scheduler
+is handed the interrupted user address (`Kernel::preempt_at`, called from both
+machines' clock paths), a tick inside an armed span is spent instead of
+switching, and a task still inside it on the next tick is ended with `SIGSEGV`
+— a named divergence from Linux's rewind, chosen because this machine's clock
+return path cannot rewrite the interrupted resume address.
+
+**Pinned** by `t-rseq` (the measured error table, the id words, fork/thread
+inheritance, the armed-section death, and the guest-only v2 refusal). The same
+binary under `MPOS_ON_HOST=1` passes **20/20** against Linux, where its armed
+child exits `7` — Linux's own fixup — the reference direction.
+
+**Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=224 fail=1
+(225 built)`, only `t-rseq` red through `_ => ENOSYS`.
+
+Full record: [`docs/notes/`](../notes/06-process-management.md) §6.35.

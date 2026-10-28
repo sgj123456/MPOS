@@ -690,9 +690,13 @@ pub fn table() -> u64 {
 extern "C" fn irq() {
     let intid = gic::acknowledge();
     let mut ticked = false;
+    // The interrupted state is in `SPSR_EL1` and the interrupted address in
+    // `ELR_EL1` until this handler returns, so both facts are read once here
+    // and used where they matter.
+    let in_user = system_register("spsr") & 0b1111 == 0;
+    let user_ip = system_register("elr") as usize;
     if intid == gic::TIMER_INTID {
         timer::tick();
-        let in_user = system_register("spsr") & 0b1111 == 0;
         crate::hal::kernel::charge_cpu(in_user);
         ticked = true;
     } else if intid == gic::VTIMER_INTID {
@@ -729,7 +733,14 @@ extern "C" fn irq() {
     // task is resumed, and a controller line left un-acknowledged would block
     // every interrupt until then.
     if ticked {
-        crate::hal::kernel::preempt();
+        // An interrupt that landed on a program inside an armed restartable
+        // sequence's span is the one thing the switch must not do; the address
+        // is what lets the scheduler tell the two apart (`crate::sched::rseq`).
+        if in_user {
+            crate::hal::kernel::preempt_at(user_ip);
+        } else {
+            crate::hal::kernel::preempt();
+        }
     }
 }
 

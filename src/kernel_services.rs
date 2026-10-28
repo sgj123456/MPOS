@@ -84,6 +84,10 @@ impl Kernel for Services {
         sched::preempt()
     }
 
+    fn preempt_at(&self, ip: usize) {
+        sched::preempt_at(ip)
+    }
+
     fn charge_cpu(&self, in_user: bool) {
         sched::charge_cpu(in_user)
     }

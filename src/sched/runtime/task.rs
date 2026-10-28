@@ -3290,6 +3290,32 @@ pub fn preempt() {
     if !STARTED.load(Ordering::Relaxed) || current() == SCHED_ID {
         return;
     }
+    preempt_now();
+}
+
+/// The clock if it caught a task in ring 3, where an armed restartable sequence
+/// is the one thing the switch must not do.
+///
+/// The interrupted address is the machine's to read (the trap frame on one
+/// machine, `ELR_EL1` on the other) and this is the only caller that knows it
+/// was a *user* address. A task inside its armed span keeps the core for this
+/// tick - the tick is spent, not the promise - and a task that is still inside
+/// it on the next tick is ended, because a span is instructions and never a
+/// millisecond (`crate::sched::rseq`'s header carries both measured readings).
+pub fn preempt_at(ip: usize) {
+    if !STARTED.load(Ordering::Relaxed) || current() == SCHED_ID {
+        return;
+    }
+    match crate::sched::rseq::tick(ip) {
+        crate::sched::rseq::Tick::Preempt => {}
+        crate::sched::rseq::Tick::Defer => return,
+        crate::sched::rseq::Tick::Kill => exit(-11),
+    }
+    preempt_now()
+}
+
+/// The switch itself, after the callers above have had their look.
+fn preempt_now() {
     // An interval timer that came due while the task spun in ring 3 fires
     // here, on the clock that is guaranteed to run - which also wakes a task
     // parked in a blocking wait past its deadline.

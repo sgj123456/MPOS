@@ -292,6 +292,7 @@ A call absent from those is served as its phase section records.
 | `preadv2` | 327 | fs | 286 |
 | `pwritev2` | 328 | fs | 287 |
 | `statx` | 332 | fs | 291 |
+| `rseq` | 334 | sched | 293 |
 | `pidfd_send_signal` | 424 | proc | 424 |
 | `pidfd_open` | 434 | proc | 434 |
 | `clone3` | 435 | proc | 435 |
@@ -320,7 +321,7 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| _(none)_ | | | |
+| `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page | a per-page direct-map carve-out (remove + restore around a page-table walk), plus the `MFD_*` word and the `SECRETMEM` `/proc/meminfo` line |
 
 > **Every family that was on this table has since moved out of it** - the table
 > is empty on purpose, not by accident: there is no number left whose honest
@@ -337,17 +338,15 @@ note printed once per number (`note_enosys`):
 > the same way: the fault-to-a-message shape is served for its measured subset
 > (`UFFDIO_API`/`REGISTER` in `MODE_MISSING`/`COPY`/`ZEROPAGE`/`WAKE`/
 > `UNREGISTER` and one record per `read`), pinned by `t-userfaultfd`, written up
-> as item 116 and `docs/notes/06-process-management.md` §6.33. What stays refused
-> here is `rseq` alone — and the `fanotify` call
-> itself now refuses only the shapes it does not serve (the content classes and the
-> mount/filesystem scopes), each by name.
-
-`rseq` (334) is the last one left: like the five above it has no dispatch arm, but unlike them it
-*once had* one that returned `0` without writing any of the fields the ABI contract puts in
-the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
-named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration
-whose `cpu_id`/`node_id`/`mm_cid` are maintained across preemption, plus
-`RSEQ_FLAG_UNREGISTER` — a scheduler feature (`docs/notes/` §12.1 A6).
+> as item 116 and `docs/notes/06-process-management.md` §6.33. `rseq` (334/293)
+> moved out the same way: the legacy 32-byte registration is served (ids,
+> register/unregister/re-register with the measured errors, fork inheritance,
+> thread/exec clearing) and the clock does not preempt a task inside an armed
+> critical section, pinned by `t-rseq`, written up as item 120 and
+> `docs/notes/06-process-management.md` §6.35. What stays refused in the
+> `fanotify` family now is only the shapes it does not serve (the content classes
+> and the mount/filesystem scopes), each by name; `memfd_secret` (447) is the one
+> number left whose honest answer is `ENOSYS`, pinned by `t-enosys`.
 
 ### 1.2 Served with a named sub-gap
 
