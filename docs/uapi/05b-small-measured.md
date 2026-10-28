@@ -1526,3 +1526,17 @@ Section numbers are unchanged from the original `UAPI.md`.
   `write_quiet_moves_bytes_without_reporting_modify`; item 61 carries the gates and the
   counterfactual. The module's other two departures — `IN_UNMOUNT`, and a watched directory's
   `IN_MOVE_SELF` — are unchanged.
+
+- **A datagram socket's `SO_RCVBUF` sizes its receive queue — served (item 58's boundary).**
+  The number was Linux's and nothing read it: the receive ring was a fixed 16 KiB, so a
+  small ask did not shrink the queue and a large one did not grow it. Measured on the host
+  first (`build/scratch/udprcv/probe.c`, Linux 7.2.11, 1400-byte datagrams on loopback,
+  non-blocking receive counted until `EAGAIN`): the stored figure *is* the queue's budget —
+  ask 1024 stored 2304 queued 1; 4096/8192/3; 16384/32768/14; 65536/131072/56; the 212992
+  default queued 92, i.e. about 2.3 KiB charged per full-size datagram (its skb's truesize).
+  Here the ring is built from the stored figure (`net::udp_rx_bytes`, slots
+  `udp_rx_slots`), capped at 64 KiB per socket (§8.0: allocated eagerly, allocator panics)
+  and charged the payload rather than the truesize: 1 / 5 / 23 / 46, with the cap named.
+  Pinned by `t-sockbuf` sections 8 and 9; counterfactual (`udp_rx_bytes` pinned to the old
+  ring) reddens the two comparison claims by name. Record: `docs/notes/` §4.3.3.1,
+  `docs/uapi/` §5.1 item 58's addendum.

@@ -920,7 +920,7 @@ ways, the client's *half*-close read as end-of-stream while the other direction
 still carries, a second sequential connection (which is what fails if the pool
 never refills), and every refusal in the table above.
 
-#### 4.3.3 The options — **SERVED** (a stream's receive buffer is its window; a datagram's is still a report)
+#### 4.3.3 The options — **SERVED** (a stream's receive buffer is its window; a datagram's is its queue, measured 2026-10-28)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
@@ -1043,9 +1043,7 @@ Gate: x86_64 198 programs, `pass=198 fail=0`; aarch64 197 staged,
 boot (`cargo xtask run --mode terminal`) reaches `mpos login:` with every
 OpenRC service `[ ok ]`, `udhcpc`'s lease included.
 
-*Remaining, named:* a **datagram** socket's receive ring is still fixed (16 KiB),
-so `SO_RCVBUF` there is the number and not a window - item 58's boundary
-unchanged; a **connected** stream's own `setsockopt(SO_RCVBUF)` still changes the
+*Remaining, named:* a **connected** stream's own `setsockopt(SO_RCVBUF)` still changes the
 number without resizing the live ring, because smoltcp's buffers are fixed at
 construction and it has no setter (Linux applies it to the advertised window);
 a handshake already in `SynReceived` when the option changes keeps the ring it
@@ -1060,8 +1058,9 @@ a 16 KiB client queue where the host's carry the 8 KiB the ask bought.
 Two more boundaries ride with the buffer number rather than the option. The
 datagram-too-big line is still the ring's rather than Linux's 65507 — this stack
 has no IP fragmentation, so a wider datagram could not leave the machine — and a
-floor-sized buffer admits three 1400-byte datagrams here against Linux's two,
-because this kernel charges the payload where Linux charges each skb's truesize.
+floor-sized buffer admits one 1400-byte datagram, as Linux does: the ring is now
+the number (below), and the charge is the payload where Linux charges each skb's
+truesize, which makes a mid-sized ask queue *more* datagrams here, not fewer.
 
 Two named gaps ride with the rule rather than the option. The predicate lives in
 `net/mod.rs`, which is gated `target_os = "none"` (`src/lib.rs:48`), so it has no
@@ -1070,6 +1069,57 @@ parsers are in (§4.5). And **smoltcp's `TIME-WAIT` is ten seconds**
 (`CLOSE_DELAY`) where Linux's is sixty (`TCP_TIMEWAIT_LEN`), so this machine
 gives a name back six times sooner. The rule about *who* may take it is
 identical; only the wait is short.
+
+#### 4.3.3.1 A datagram's receive buffer is its queue — **DONE** (2026-10-28)
+
+The number was already Linux's; it was not yet about the queue. A datagram
+socket's `SO_RCVBUF` is the memory its receive queue is allowed to spend, and
+Linux spends it per datagram on the skb's truesize (payload plus its own
+overhead). Measured on the host (`build/scratch/udprcv/probe.c`, 7.2.11,
+1400-byte datagrams on loopback, a non-blocking receive counted until `EAGAIN`):
+
+| `SO_RCVBUF` ask | stored | Linux queued | here |
+|---|---|---|---|
+| 1024 | 2304 | 1 | 1 |
+| 2048 | 4096 | 1 | 2 |
+| 4096 | 8192 | 3 | 5 |
+| 16384 | 32768 | 14 | 23 |
+| 65536 | 131072 | 56 | 46 |
+| (default) | 212992 | 92 | 46 |
+
+The ring is now built from the stored figure (`net::udp_rx_bytes`) when the
+socket is allocated, and the slot count is derived from it
+(`udp_rx_slots`, one slot per 1 KiB, because a queue of *small* datagrams is
+bounded by slots and a queue of full ones by bytes). Two boundaries ride with
+it, and they are the ones the table's right column is not matching Linux's on:
+
+* **The charge is the payload, not the skb.** Linux queues 14 datagrams in a
+  32 KiB ring because each 1400-byte datagram costs it about 2.3 KiB; here the
+  ring holds 23 because it costs 1.4 KiB. This stack has no skb, so the number
+  that bounds its memory is the one the payload spends - and it does bound it.
+* **The ring is capped at 64 KiB per socket** (`UDP_RX_MAX`). The default's
+  212992 bytes would be an eighth of a mebibyte allocated eagerly for every
+  datagram socket, and the global allocator panics on failure (§8.0). A larger
+  ask still **reads back** its Linux number; only what it buys is capped, and
+  the cap is named here rather than silently believed.
+
+The option arrives before the queue does in every real sequence - a socket that
+has received nothing is unbound - so `SO_RCVBUF` rebuilds the ring at the
+`setsockopt` when the socket is unbound and unconnected, and the next `bind`
+applies a number that arrived earlier. Past the first received datagram the
+storee is the number and the ring it already has: smoltcp sizes the buffer at
+construction, so resizing would drop what arrived.
+
+**Pinned** by `t-sockbuf` (both machines), sections 8 and 9: a 2304-byte ring
+queues at most four 1400-byte datagrams (measured: one), a 32 KiB ring queues
+more than the floor (23 against 1), the default queues at least the 32 KiB ask
+(46), and five one-byte datagrams leave in arrival order. The counterfactual:
+with `udp_rx_bytes` pinned back to the fixed 16 KiB ring, the first and third
+claims fail, and they are the ones the pinned names quote: "a 2304-byte datagram
+ring queues few datagrams (11)" and "a larger SO_RCVBUF queues more datagrams
+(11 -> 11)".
+
+Full record: `docs/uapi/` §5.2, item 58's boundary.
 
 #### 4.3.4 `close(2)`, and the teardown the descriptor could not wait for — **DONE**
 

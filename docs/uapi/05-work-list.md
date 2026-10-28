@@ -2590,13 +2590,25 @@ the commit bodies), and each moved its pin in the same commit.
     `FAIL t-sockbuf` and `FAIL t-udpblock` - the doubling claims, the floors and the fill's
     stop point all red by name.
 
-    Still named, and measured: `SO_RCVBUF` is the number a caller reads and not a window
-    this kernel resizes (the receive ring is a fixed 16 KiB, so a smaller ask does not
-    shrink it - a stream's became its window in item 98; a datagram's ring is still fixed);
-    the datagram-too-big line remains the ring's rather than Linux's 65507,
-    because this stack has no IP fragmentation and a wider datagram could not leave the
-    machine; and a floor buffer admits three datagrams here against Linux's two, this
-    kernel charging the payload where Linux charges each skb's truesize.
+    **A datagram's `SO_RCVBUF` is now its queue too (2026-10-28).** The remaining half
+    above was measured on the host (`build/scratch/udprcv/probe.c`, 7.2.11: ask 1024
+    stored 2304 queued 1; 16384/32768/14; 65536/131072/56; default 212992 queued 92,
+    1400-byte datagrams) and the ring is now built from the stored figure
+    (`net::udp_rx_bytes`, slot count `udp_rx_slots`), applied at the `setsockopt` while
+    the socket has no queue and at the next `bind` otherwise. Here: 1 / 23 / 46 / 46 -
+    more full-size datagrams for a mid ask because this stack charges the payload
+    (1.4 KiB) where Linux charges each skb's truesize (about 2.3 KiB), and fewer at the
+    top because the ring is capped at 64 KiB per socket (§8.0: assigned eagerly, and the
+    global allocator panics). A larger ask still reads back its Linux number. Pinned by
+    `t-sockbuf` sections 8 and 9; counterfactual (`udp_rx_bytes` pinned to the old fixed
+    16 KiB ring) reddens exactly "a 2304-byte datagram ring queues few datagrams (11)"
+    and "a larger SO_RCVBUF queues more datagrams (11 -> 11)". Record:
+    `docs/notes/` §4.3.3.1.
+
+    Still named, and measured: the datagram-too-big line remains the ring's rather than
+    Linux's 65507, because this stack has no IP fragmentation and a wider datagram could
+    not leave the machine; a floor buffer now admits one 1400-byte datagram, as Linux
+    does; and a stream's `SO_SNDBUF` still does not size its send ring.
 
 ## item 59 — a `clone` child's own exit signal is what its death reports (item 50's other half)
 

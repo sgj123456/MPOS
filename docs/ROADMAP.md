@@ -539,10 +539,12 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
 `userfaultfd`, the three `io_uring` numbers and rseq side-objects stay `ENOSYS` (the `fanotify` notification class and the kernel keyring are served); xattrs validate then `EOPNOTSUPP`;  
-the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
-shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
-and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
-fragments IP. The namespace ladder has no rung left - all eight kinds of
+the semantics still incomplete are the datagram line itself, which is the ring's rather than  
+Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
+sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  
+§4.3.3.1: the payload is what the queue is charged here where Linux charges each skb's  
+truesize, the ring is capped at 64 KiB per socket, and the number still reads back its Linux  
+figure). The namespace ladder has no rung left - all eight kinds of
 `namespaces(7)` are served, cgroup's last (§6.25) - and `clone3`'s struct has no
 unserved word left either: `CLONE_INTO_CGROUP` names a group now that the tree
 exists to name (§6.26, item 105).

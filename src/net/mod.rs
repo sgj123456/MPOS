@@ -142,6 +142,41 @@ pub(crate) fn tcp_rx_bytes(stored: u32) -> usize {
     ((stored as usize) / 2).clamp(1, TCP_RX_MAX)
 }
 
+/// The receive ring a datagram socket's stored `SO_RCVBUF` buys.
+///
+/// The measured shape (`build/scratch/udprcv/probe.c`, Linux 7.2.11, 1400-byte
+/// datagrams on loopback): the depth a socket queues before a non-blocking
+/// receive answers `EAGAIN` is the *stored memory figure*, charged per datagram
+/// at about its size plus an `skb`'s overhead — `SO_RCVBUF` asked 1024 stored
+/// 2304 and queued 1, asked 4096 stored 8192 queued 3, asked 16384 stored 32768
+/// queued 14, asked 65536 stored 131072 queued 56, and the 212992 default
+/// queued 92. So the number is the queue's budget, not only a number to read
+/// back.
+///
+/// This kernel builds the ring when the socket is made (allocation happens at
+/// the option, where the socket's own memory is charged eagerly), so the stored
+/// figure is the payload budget **capped** at [`UDP_RX_MAX`]: 212992 would be a
+/// third of a mebibyte of eager buffer per datagram socket, and the allocator
+/// panics on failure (§8.0). A larger ask still reads back its Linux number and
+/// the cap is named in `docs/notes/` §4.3.3 rather than silently believed.
+pub(crate) const UDP_RX_MAX: usize = 64 * 1024;
+
+/// The ring bytes a datagram socket's stored `SO_RCVBUF` buys: the stored
+/// figure itself, floored at the smallest ring a datagram fits in and capped at
+/// [`UDP_RX_MAX`].
+pub(crate) fn udp_rx_bytes(stored: u32) -> usize {
+    (stored as usize).clamp(1024, UDP_RX_MAX)
+}
+
+/// Metadata slots for a ring of `bytes`. One slot per 1 KiB of budget, so a
+/// queue of small datagrams is bounded by slots and a queue of full ones by
+/// bytes - Linux's own bound is memory, and the per-slot figure here is the
+/// order its `skb` overhead lands at (a 1400-byte datagram is charged about
+/// 2.3 KiB there, or one slot plus its bytes here).
+fn udp_rx_slots(bytes: usize) -> usize {
+    (bytes / 1024).clamp(1, 256)
+}
+
 /// The wildcard raw door's receive queue (`Channel::Raw`'s field, and the type
 /// `socket::echo_to_raw_doors` fills): complete IPv4 packets, oldest first,
 /// each at the length it arrived with. Named here because both this module's
@@ -210,6 +245,10 @@ pub(crate) enum Channel {
         /// What was actually bound - port and all - so `getsockname` answers
         /// from the record rather than from the socket.
         local: Option<IpEndpoint>,
+        /// The receive ring the current smoltcp socket was built with, so a
+        /// stored `SO_RCVBUF` that names a different ring can be recognised and
+        /// applied while the socket has no queue to lose ([`Stack::resize_udp`]).
+        rx_bytes: usize,
     },
     /// An `AF_INET6` socket with no machinery behind it. The stack speaks
     /// IPv4 only, but Linux always lets `socket(AF_INET6)` open - the failure
@@ -1124,13 +1163,35 @@ impl Stack {
         self.sockets_mut(home).add(tcp::Socket::new(rx, tx))
     }
 
-    /// The same for a datagram socket.
+    /// A datagram socket with the default-sized ring.
     pub(crate) fn add_udp(&mut self, home: Home) -> SocketHandle {
-        let rx_meta = alloc::vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS];
+        self.add_udp_sized(home, UDP_PAYLOAD_BYTES)
+    }
+
+    /// The same, with a receive ring of `rx_bytes` — what the socket's stored
+    /// `SO_RCVBUF` buys (see [`udp_rx_bytes`]). The send ring keeps the
+    /// default size: this kernel's `SO_SNDBUF` for a datagram socket already
+    /// gates the queue by its memory figure in `socket::udp_room_for`, and the
+    /// ring behind it is not what that number is about.
+    pub(crate) fn add_udp_sized(&mut self, home: Home, rx_bytes: usize) -> SocketHandle {
+        let rx_meta = alloc::vec![udp::PacketMetadata::EMPTY; udp_rx_slots(rx_bytes)];
         let tx_meta = alloc::vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS];
-        let rx = udp::PacketBuffer::new(rx_meta, alloc::vec![0u8; UDP_PAYLOAD_BYTES]);
+        let rx = udp::PacketBuffer::new(rx_meta, alloc::vec![0u8; rx_bytes]);
         let tx = udp::PacketBuffer::new(tx_meta, alloc::vec![0u8; UDP_PAYLOAD_BYTES]);
         self.sockets_mut(home).add(udp::Socket::new(rx, tx))
+    }
+
+    /// Re-make a datagram socket with a new receive ring.
+    ///
+    /// Only safe while the socket cannot be holding a datagram: unbound and
+    /// unconnected (an unbound datagram socket has received nothing). A bound
+    /// socket's queue is where a datagram would be and smoltcp sizes the buffer
+    /// at construction, so a resize past that point is recorded as the number
+    /// (as Linux's `sk_rcvbuf` would be) and named in `docs/notes/` §4.3.3
+    /// rather than answered by dropping what the socket already holds.
+    pub(crate) fn resize_udp(&mut self, home: Home, h: &mut SocketHandle, rx_bytes: usize) {
+        self.sockets_mut(home).remove(*h);
+        *h = self.add_udp_sized(home, rx_bytes);
     }
 
     /// A raw IP socket bound to the given protocol number. The buffers are
@@ -1203,12 +1264,18 @@ impl Stack {
     /// one, spelled in the registry rather than the socket: `!bound &&
     /// peer.is_none()`, checked *before* `sock.bind` runs - smoltcp keeps a
     /// bound UDP socket's name, and a new socket would lose it silently.
-    pub(crate) fn settle_udp(&mut self, home: &mut Home, h: &mut SocketHandle, want: Home) {
+    pub(crate) fn settle_udp(
+        &mut self,
+        home: &mut Home,
+        h: &mut SocketHandle,
+        want: Home,
+        rx_bytes: usize,
+    ) {
         if *home == want {
             return;
         }
         self.sockets_mut(*home).remove(*h);
-        *h = self.add_udp(want);
+        *h = self.add_udp_sized(want, rx_bytes);
         *home = want;
     }
 }
@@ -1521,13 +1588,17 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
                 local: None,
                 connected: false,
             },
-            (socket::AF_INET, socket::SOCK_DGRAM) => Channel::Udp {
-                home: Home::Eth,
-                handle: stack.add_udp(Home::Eth),
-                peer: None,
-                bound: false,
-                local: None,
-            },
+            (socket::AF_INET, socket::SOCK_DGRAM) => {
+                let rx_bytes = udp_rx_bytes(SockOpts::new(typ).rcvbuf);
+                Channel::Udp {
+                    home: Home::Eth,
+                    handle: stack.add_udp_sized(Home::Eth, rx_bytes),
+                    peer: None,
+                    bound: false,
+                    local: None,
+                    rx_bytes,
+                }
+            }
             (socket::AF_INET, socket::SOCK_RAW) => Channel::Raw {
                 // The one channel that never moves: a raw socket's destination
                 // is per call, so it cannot be tied to one interface's set.

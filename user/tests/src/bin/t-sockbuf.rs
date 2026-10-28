@@ -127,6 +127,56 @@ fn push_until_full(client: &OwnedFd) -> usize {
     total
 }
 
+/// Queue a burst of `width`-byte datagrams on the loopback and count what a
+/// non-blocking receive can drain before `EAGAIN` - the receive ring's depth,
+/// which is what a datagram socket's stored `SO_RCVBUF` has to buy.
+///
+/// The pair is made fresh per measurement (`ask` None keeps the default), and
+/// the read side gives the stack a moment: a datagram sent on the loopback is
+/// queued by the poll the send itself triggers, but the loop tolerates one that
+/// arrives a tick later rather than calling that an empty ring.
+fn datagram_depth(ask: Option<usize>, width: usize) -> (usize, usize, usize) {
+    let Ok(rx) = socket(AddressFamily::INET, SocketType::DGRAM, None) else {
+        return (0, 0, 0);
+    };
+    if let Some(a) = ask {
+        if set_socket_recv_buffer_size(&rx, a).is_err() {
+            return (0, 0, 0);
+        }
+    }
+    let stored = socket_recv_buffer_size(&rx).unwrap_or(0);
+    if bind(&rx, &SocketAddrV4::new(LOOPBACK, 0)).is_err() {
+        return (0, 0, 0);
+    }
+    let Ok(local) = getsockname(&rx) else {
+        return (0, 0, 0);
+    };
+    let Ok(tx) = socket(AddressFamily::INET, SocketType::DGRAM, None) else {
+        return (0, 0, 0);
+    };
+    if connect(&tx, &local).is_err() {
+        return (0, 0, stored);
+    }
+    let payload = vec![b'x'; width];
+    let mut sent = 0usize;
+    for _ in 0..64 {
+        if send(&tx, &payload, SendFlags::DONTWAIT).is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    let mut depth = 0usize;
+    let mut buf = vec![0u8; width.max(1) + 64];
+    for _ in 0..100 {
+        match rustix::net::recv(&rx, &mut buf[..], rustix::net::RecvFlags::DONTWAIT) {
+            Ok(_) => depth += 1,
+            Err(_) if depth == 0 => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(_) => break,
+        }
+    }
+    (sent, depth, stored)
+}
+
 fn main() {
     println!("t-sockbuf");
     let mut r = Report::new();
@@ -291,6 +341,87 @@ fn main() {
         &format!("a larger ask still buys a larger window (large={large}, beyond={beyond})"),
         beyond > large,
     );
+
+    // 8. A datagram socket's stored `SO_RCVBUF` is the *receive queue's*
+    //    budget. Linux measures out at about the stored memory figure per
+    //    datagram (probe: ask 1024 stored 2304 queued 1, ask 16384 stored 32768
+    //    queued 14, default 212992 queued 92 at 1400 bytes); this kernel builds
+    //    the ring from the stored number, capped at 64 KiB so a datagram socket
+    //    cannot cost a third of a mebibyte (§8.0). The claims are relative: the
+    //    small ring must be small, the larger must hold more, and the default
+    //    must not be the smallest of the three.
+    let (fsent, small, small_stored) = datagram_depth(Some(1024), 1400);
+    let (msent, medium, medium_stored) = datagram_depth(Some(16384), 1400);
+    let (dsent, default, default_stored) = datagram_depth(None, 1400);
+    println!(
+        "note: datagram queue ask 1024 stored={small_stored} sent={fsent} queued={small}; \
+         ask 16384 stored={medium_stored} sent={msent} queued={medium}; \
+         default stored={default_stored} sent={dsent} queued={default}"
+    );
+    r.check(
+        &format!("a datagram ring holds at least one datagram ({small})"),
+        small >= 1,
+    );
+    r.check(
+        &format!("a 2304-byte datagram ring queues few datagrams ({small})"),
+        small <= 4,
+    );
+    r.check(
+        &format!("a larger SO_RCVBUF queues more datagrams ({small} -> {medium})"),
+        medium > small,
+    );
+    r.check(
+        &format!("the default rcvbuf queues at least the 32 KiB ask ({default} vs {medium})"),
+        default >= medium,
+    );
+
+    // 9. A sized datagram ring is still a queue: datagrams leave in the order
+    //    they arrived. Tiny datagrams are bounded by the slot count there (the
+    //    ring is 32 KiB, so five one-byte ones fit even though their bytes do).
+    let order = match socket(AddressFamily::INET, SocketType::DGRAM, None) {
+        Ok(rx) if set_socket_recv_buffer_size(&rx, 16384).is_ok() => {
+            match bind(&rx, &SocketAddrV4::new(LOOPBACK, 0))
+                .ok()
+                .and_then(|()| getsockname(&rx).ok())
+                .and_then(|local| {
+                    let tx = socket(AddressFamily::INET, SocketType::DGRAM, None).ok()?;
+                    connect(&tx, &local).ok()?;
+                    let mut ok = true;
+                    for i in 0u8..5 {
+                        ok &= send(&tx, &[i], SendFlags::DONTWAIT).is_ok();
+                    }
+                    Some(ok)
+                }) {
+                Some(true) => {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 8];
+                    for _ in 0..100 {
+                        match rustix::net::recv(&rx, &mut buf[..], rustix::net::RecvFlags::DONTWAIT)
+                        {
+                            Ok((n, _)) if n > 0 => seen.push(buf[0]),
+                            _ if seen.is_empty() => {
+                                std::thread::sleep(std::time::Duration::from_millis(1))
+                            }
+                            _ => break,
+                        }
+                    }
+                    Some(seen)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match &order {
+        Some(seen) => {
+            let want: Vec<u8> = (0u8..5).collect();
+            r.check(
+                &format!("a datagram queue leaves in arrival order (got {seen:?})"),
+                seen == &want,
+            );
+        }
+        None => r.check("a datagram queue leaves in arrival order", false),
+    }
 
     r.finish();
 }

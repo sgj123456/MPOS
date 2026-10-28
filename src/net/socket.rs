@@ -2431,6 +2431,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                 peer,
                 bound,
                 local,
+                rx_bytes,
             } = &mut entry.channel
             else {
                 return Err(err::ENOTSOCK);
@@ -2443,8 +2444,18 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                 // never bound - the implicit bind on first send is the first
                 // address it is given, so it settles here exactly as a real
                 // `bind` would.
+                //
+                // A stored `SO_RCVBUF` is applied here rather than at the
+                // `setsockopt`, because this is the last moment the socket has
+                // no queue to lose: one datagram makes the ring a fact, and
+                // rebuilding it would drop what arrived.
                 let want = super::home_of(target.addr);
-                stack.settle_udp(home, sock_handle, want);
+                let ring = super::udp_rx_bytes(entry.opts.rcvbuf);
+                if ring != *rx_bytes {
+                    stack.resize_udp(*home, sock_handle, ring);
+                    *rx_bytes = ring;
+                }
+                stack.settle_udp(home, sock_handle, want, *rx_bytes);
                 let port = stack.ephemeral();
                 let sock = stack
                     .sockets_mut(*home)
@@ -4351,6 +4362,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 handle: sock_handle,
                 bound,
                 local,
+                rx_bytes,
                 ..
             } => {
                 if *bound {
@@ -4365,7 +4377,12 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 // because that is the call that gives this socket state a new
                 // one could not carry.
                 let want = super::home_of(endpoint.addr);
-                stack.settle_udp(home, sock_handle, want);
+                let ring = super::udp_rx_bytes(entry.opts.rcvbuf);
+                if ring != *rx_bytes {
+                    stack.resize_udp(*home, sock_handle, ring);
+                    *rx_bytes = ring;
+                }
+                stack.settle_udp(home, sock_handle, want, *rx_bytes);
                 let port = if endpoint.port == 0 {
                     stack.ephemeral()
                 } else {
@@ -5547,6 +5564,25 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                     // accept, and `set_listener_rx` re-makes the waiting pool.
                     Channel::TcpListen { id, .. } => {
                         stack.set_listener_rx(*id, super::tcp_rx_bytes(stored));
+                    }
+                    // A datagram socket's ring is the queue's budget, so the
+                    // number has to reach the ring while the ring is empty.
+                    // An unbound, unconnected socket has received nothing; past
+                    // that the queue is a fact and the number is recorded for
+                    // the next bind (`docs/notes/` §4.3.3).
+                    Channel::Udp {
+                        home,
+                        handle: h,
+                        peer,
+                        bound,
+                        rx_bytes,
+                        ..
+                    } => {
+                        let ring = super::udp_rx_bytes(stored);
+                        if !*bound && peer.is_none() && ring != *rx_bytes {
+                            stack.resize_udp(*home, h, ring);
+                            *rx_bytes = ring;
+                        }
                     }
                     _ => {}
                 }
