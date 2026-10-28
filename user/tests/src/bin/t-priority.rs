@@ -144,6 +144,17 @@ fn main() {
     println!("t-priority");
     let mut r = Report::new();
 
+    // The group claim below sets the **whole process group's** nice, and the
+    // runner that spawns this program is in that group: restoring only
+    // `PRIO_PROCESS` at the end leaves the runner - and so every later program
+    // in the lane, which inherits the nice across `fork`/`exec` - at the value
+    // this program set. That is the recorded `t-posix` "getpriority answers 20"
+    // flake (`docs/notes/` §6.31): the test that reproduced it ran this
+    // program and then `t-posix` in one process tree, and the next program read
+    // the group set as its own fresh nice. So the group's encoding is read
+    // first and put back, by group, as the last thing this program does.
+    let group_nice = getpriority(PRIO_PGRP, 0);
+
     // A fresh process is at nice 0, which the raw call reports as 20.
     r.check(
         "a fresh process reads back nice 0 (raw 20)",
@@ -268,7 +279,15 @@ fn main() {
         sched_getattr(&mut attr, 40) == Err(Errno::INVAL),
     );
 
-    // Leaving the caller back at nice 0 does not affect the rest of the suite.
-    let _ = setpriority(PRIO_PROCESS, 0, 0);
+    // Leave the whole group at the nice it started with. `getpriority`'s raw
+    // answer is the kernel encoding (20 - nice), and `setpriority` takes the
+    // nice itself, so the restore is the encoding's mirror image. A group set
+    // covers this process too, so there is no separate `PRIO_PROCESS` step -
+    // the old one was the bug: it named the process and left the group behind.
+    r.check(
+        "the process group is left at the nice it started with",
+        setpriority(PRIO_PGRP, 0, (20 - group_nice) as i32) == Ok(())
+            && getpriority(PRIO_PGRP, 0) == group_nice,
+    );
     r.finish()
 }

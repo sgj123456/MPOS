@@ -3018,6 +3018,9 @@ the immediate re-run was `pass=205 fail=0`. The mechanism is not established
 (the claim reads the caller's own nice through the raw door, and nothing here
 touches a priority), so it is written down as an observation with its two
 readings rather than as a mechanism - and the re-run is the one quoted.
+**Closed 2026-10-28 by §6.31**: the pollution was `t-priority`'s
+`setpriority(PRIO_PGRP, …)` left in the runner's process group, and the
+program now restores by group.
 
 **Gate**: x86_64 `pass=205 fail=0` (the re-run), stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
@@ -3941,3 +3944,56 @@ green.
 once-per-number rule now rides on `userfaultfd`), `docs/uapi/01-syscall-table.md`
 moved the number out of §1.1 into the served table, and `item 113` records the
 full write-up.
+
+### 6.31 The `t-posix` "getpriority answers 20" flake is `t-priority`'s group set left in the runner — **diagnosed (2026-10-28)**
+
+`t-posix`'s first priority claim - *"getpriority answers 20 (nice 0, kernel
+encoding)"* - reddened runs that touched no priority path: once on 2026-10-23
+(recorded at §6.18's close), then repeatedly on aarch64 arms in the days after.
+It was written down as a flake with its two readings and re-run, because the
+mechanism was not established.
+
+**The mechanism.** `t-priority` sets `PRIO_PGRP, 0, -2`. That is the **whole
+process group's** nice, and the runner shell that spawns the program is in that
+group, so the shell's nice becomes `-2`. The program's final restore named
+`PRIO_PROCESS`, not the group - so the set survived it, the runner carried `-2`
+for the rest of the lane, and every later program in that lane inherited it:
+Linux's rule is that the nice is inherited across `fork` and kept across `exec`,
+which is exactly what a shell does to run the next `t-*` program. `t-posix`
+then asks a *fresh* process to read the raw encoding, which is `20 - nice`; with
+the inherited `-2` the answer is `22`, and the claim fails. This is the test's
+own side effect rather than a kernel bug - Linux would answer the same way - and
+the "flake" name was the cost of not following the process group.
+
+**Demonstrated**, not inferred: a temporary carrier program ran
+`/bin/t-priority` and then `/bin/t-posix` from one process tree, in one lane.
+Before the fix, that lane's log read
+
+```
+carry: t-priority Ok(Some(0))
+FAIL:  getpriority answers 20 (nice 0, kernel encoding)
+carry: t-posix Ok(Some(1))
+```
+
+and after the fix the same lines read `carry: t-priority Ok(Some(0))` /
+`carry: t-posix Ok(Some(0))` with no `FAIL:`. (The carrier was deleted after the
+measurement - it proved the mechanism, and the pin below is what keeps it
+closed.)
+
+**Why it looked random**: the sweep deals programs to lanes by cost (LPT), so
+whether `t-priority` lands in the same lane *before* `t-posix` depends on the
+cost table's current shape. The two arms have their own tables, which is why
+one arm reddened and its sibling did not on the same commit.
+
+**The fix**: `t-priority` reads the group's raw encoding first
+(`getpriority(PRIO_PGRP, 0)`) and, as its last act, restores it *by group*
+(`setpriority(PRIO_PGRP, 0, 20 - encoding)`), with a claim naming the restore:
+*"the process group is left at the nice it started with"*. A group set covers
+the program's own process too, so the separate `PRIO_PROCESS` restore - which
+was the bug - is gone.
+
+**Pin**: that restore claim. Against the old shape it fails (`getpriority
+(PRIO_PGRP, 0)` reads `22` after the program's own run); with it, the next
+program in the lane reads the fresh `20` that `t-posix` asks for. `t-posix`'s
+claim stays as it was: it is the correct expectation and the pollution, not the
+expectation, was wrong.
