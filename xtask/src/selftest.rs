@@ -584,6 +584,26 @@ fn run_unit_tests() -> Result<String> {
     cmd.current_dir(&root);
     text.push_str(&run_captured(&mut cmd, "the kernel's host doctests")?);
 
+    // The user suite's *host* (glibc) build: the same programs the sweeps build
+    // for musl, compiled a second time against a different `libc`. The two
+    // disagree about types - `pthread_t` is a pointer on musl and a `u64` on
+    // glibc - so a `t-*` program can compile for the machine and not for the
+    // `test-host` command's target. That happened twice (`t-close-range`,
+    // `t-userfaultfd`) and both gates stayed green, because nothing built the
+    // glibc half: `cargo xtask test-host` is where the break surfaced, and it is
+    // not the gate. This makes the gate pay the one build that can see it.
+    text.push_str("Build: the user suite for the host (glibc)\n");
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "-p",
+        "mpos-user-tests",
+    ])
+    .current_dir(&root);
+    text.push_str(&run_captured(&mut cmd, "the host user suite's build")?);
+
     text.push_str("Unit tests: xtask\n");
     let mut cmd = Command::new("cargo");
     cmd.args([

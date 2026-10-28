@@ -151,7 +151,9 @@ fn main() {
         // A sibling shares this table; without UNSHARE its close would take
         // the parent's number with it.
         unsafe { SHARED = fd };
-        let mut thread: libc::pthread_t = std::ptr::null_mut();
+        // `pthread_t` is a pointer on musl and a `u64` on glibc; zero is the
+        // empty value in both, which a `null_mut()` or a `0` would not be.
+        let mut thread: libc::pthread_t = unsafe { std::mem::zeroed() };
         let started = unsafe {
             libc::pthread_create(
                 &mut thread,

@@ -287,7 +287,9 @@ fn start_fault(area: *mut u8, write: bool) -> (libc::pthread_t, Box<FaultArg>) {
         value: 0,
         write,
     });
-    let mut thread: libc::pthread_t = ptr::null_mut();
+    // `pthread_t` is a pointer on musl and a `u64` on glibc; zero is the empty
+    // value in both, which a `null_mut()` or a `0` would not be.
+    let mut thread: libc::pthread_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::pthread_create(
             &mut thread,
