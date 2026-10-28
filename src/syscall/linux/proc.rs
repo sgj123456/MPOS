@@ -4884,6 +4884,86 @@ pub(super) fn handle_futex_waitv(args: [usize; ARG_COUNT]) -> isize {
     crate::sched::futex::wait_multiple(&waits, deadline)
 }
 
+/// `futex_wake(2)` (454) - the futex2 spelling: wake up to `nr` waiters whose
+/// bitset intersects `mask`, on one thirty-two-bit word, answering how many it
+/// woke.
+///
+/// The call's own flag word names the word's shape (only `SIZE_U32`, measured)
+/// and the private-table bit; a NUMA or policy word is `EOPNOTSUPP` because
+/// this kernel has no node to name (`super::abi::futex2_word_flags`). The
+/// private bit is *not* part of this kernel's key, exactly as `futex(2)`'s
+/// `FUTEX_PRIVATE_FLAG` is not - one table keyed by user address - so a shared
+/// wake reaches a private waiter here where Linux keeps two key spaces. That
+/// divergence predates this call and is named in `docs/notes/` §6.34.
+pub(super) fn handle_futex2_wake(args: [usize; ARG_COUNT]) -> isize {
+    let (uaddr, mask, nr, flags) = (args[0], args[1], args[2], args[3]);
+    if let Err(e) = super::abi::futex2_word_flags(flags) {
+        return e;
+    }
+    let Ok(bitset) = super::abi::futex2_bitset(mask) else {
+        return err::EINVAL;
+    };
+    if uaddr & 3 != 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(uaddr, 4, false, true) {
+        return err::EFAULT;
+    }
+    // `nr` is an `int` in the ABI and measured answers `0` for zero *and* for a
+    // negative count - Linux's walk simply runs no iterations.
+    let nr = nr as i32;
+    if nr <= 0 {
+        return 0;
+    }
+    crate::sched::futex::wake_bitset(uaddr, nr as usize, bitset) as isize
+}
+
+/// `futex_wait(2)` (455) - park until a wake whose mask intersects this
+/// waiter's bitset, the word stops matching `val`, or the deadline passes.
+///
+/// `val` and `mask` are thirty-two bits each for a `SIZE_U32` word: a `val`
+/// above `u32::MAX` is `EINVAL` (measured) rather than truncated, and `mask` is
+/// the bitset the wake has to intersect. The deadline is absolute and its
+/// `clockid` is only read when a deadline is given, both measured - the same
+/// rule `futex_waitv(2)` follows here, which is why the parse is the same
+/// `futex_deadline` call (`false` = absolute).
+pub(super) fn handle_futex2_wait(args: [usize; ARG_COUNT]) -> isize {
+    const CLOCK_REALTIME_ID: usize = 0;
+    const CLOCK_MONOTONIC_ID: usize = 1;
+
+    let (uaddr, val, mask, flags, timeout_ptr, clockid) =
+        (args[0], args[1], args[2], args[3], args[4], args[5]);
+    if let Err(e) = super::abi::futex2_word_flags(flags) {
+        return e;
+    }
+    if val > u32::MAX as usize {
+        return err::EINVAL;
+    }
+    let Ok(bitset) = super::abi::futex2_bitset(mask) else {
+        return err::EINVAL;
+    };
+    if uaddr & 3 != 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(uaddr, 4, false, true) {
+        return err::EFAULT;
+    }
+    let deadline = if timeout_ptr != 0 {
+        let realtime = match clockid {
+            CLOCK_REALTIME_ID => true,
+            CLOCK_MONOTONIC_ID => false,
+            _ => return err::EINVAL,
+        };
+        match futex_deadline(timeout_ptr, false, realtime) {
+            Ok(deadline) => deadline,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    crate::sched::futex::wait_bitset(uaddr, val as u32, bitset, deadline)
+}
+
 /// Turn a futex `struct timespec *` into the nanosecond deadline
 /// [`handle_futex`]'s wait keeps. `relative` (FUTEX_WAIT's spelling) counts
 /// from now - on whichever clock the flags name, since a duration is a

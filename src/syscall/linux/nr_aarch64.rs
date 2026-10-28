@@ -307,6 +307,10 @@ pub const FUTEX_PRIVATE_FLAG: usize = 128;
 /// `futex_waitv(2)` (449): the multi-word wait, on the same number as the
 /// first machine because it landed after the two tables converged.
 pub const FUTEX_WAITV: u64 = 449;
+/// `futex_wake(2)` (454): the futex2 wake - one word, a bitset, a count.
+pub const FUTEX2_WAKE: u64 = 454;
+/// `futex_wait(2)` (455): the futex2 wait - one word, a value, a bitset.
+pub const FUTEX2_WAIT: u64 = 455;
 pub const FUTEX_CLOCK_REALTIME: usize = 256;
 
 /// `add_key(2)`, `request_key(2)` and `keyctl(2)`, on the asm-generic

@@ -262,6 +262,7 @@ One-glance status of the whole roadmap.
   program image and stack have), because sealing the text is the call's flagship
   use; a sealed stack simply does not grow (§5.5, item 118)
 - [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
+- [x] `futex_wake(2)`/`futex_wait(2)` (454/455) — the futex2 pair: one 32-bit word, a bitset in `mask`, an absolute deadline per wait; the flag word requires `SIZE_U32`, a wide mask or wide `val` are `EINVAL`, `futex_wake`'s `int` `nr` caps the answer, and the node/policy words Linux serves are `EOPNOTSUPP` here (§6.34, item 119)
   the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
   with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is
   the index of the word a wake named, and a moved word answers `EAGAIN` before a passed

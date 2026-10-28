@@ -4179,3 +4179,70 @@ two-threads-one-record case, and `t-enosys`'s move from `userfaultfd` to `rseq`
 (the only number still falling through).
 
 Full record: `docs/uapi/` §5.1 item 116.
+
+### 6.34 `futex_wake(2)`/`futex_wait(2)` — the futex2 pair — **DONE** (2026-10-28)
+
+The futex family had three spellings before this: the operation-word
+`futex(2)` (`FUTEX_WAIT`/`FUTEX_WAKE`), its bitset pair, and the
+multi-word `futex_waitv(2)` (`§6.29`). The two remaining numbers are the
+syscall-numbered single-word pair: `futex_wake(2)` (454, x86_64 and
+aarch64) and `futex_wait(2)` (455, the same on both) — one thirty-two-bit
+word, a **bitset** as the wake's mask, and on the wait side an absolute
+deadline plus an explicit `clockid`.
+
+Measured first, on the host (`build/scratch/futex2/probe*.c`, Linux
+7.2.11), because the argument words are not what the names suggest:
+
+| question | answer |
+|---|---|
+| `flags` word | `FUTEX2_SIZE_U32` (`0x02`) **required**, `FUTEX2_PRIVATE` (`0x80`) may be added; `SIZE_U8`/`U16`/`U64` and a missing size bit are `EINVAL` on both calls |
+| `mask` width | a bitset over the word: wider than 32 bits is `EINVAL`, zero is `EINVAL` |
+| `val` width (wait) | thirty-two bits: above `u32::MAX` is `EINVAL`, not truncated |
+| word address | unaligned is `EINVAL` on both; aligned and unreadable is `EFAULT` on both |
+| `nr` (wake) | an `int`: `0` and a negative count both answer `0`; the answer is the count actually woken, never more than `nr` |
+| value mismatch | `EAGAIN`, before any deadline is considered |
+| deadline | absolute; `clockid` read only when a deadline is given (`0` realtime, `1` monotonic, else `EINVAL`); with NULL it is ignored; a past deadline is `ETIMEDOUT` |
+| `FUTEX2_NUMA` / `FUTEX2_MPOL` | served by Linux 7.2 |
+
+The measurement's own trap: a `mask` of `~0UL` is the *64-bit* spelling and
+is refused, while `~0u` waits — the same 32-bit ceiling on the bitset that
+`val` has. A probe that passed `~0UL` read the refusal as "NUMA is not
+supported", which is what made the node/policy flags look refused until
+the mask was narrowed.
+
+**Served, in that shape.** `handle_futex2_wake` and `handle_futex2_wait`
+sit beside `handle_futex_waitv` in `src/syscall/linux/proc.rs`; the two
+word-level checks (the flag word and the bitset) are host-compiled facts in
+`src/syscall/linux/abi.rs` (`futex2_word_flags`, `futex2_bitset`) with host
+tests, so the refusals are pinned off the machine. The wait reuses
+`sched::futex::wait_bitset` (the same table `FUTEX_WAIT_BITSET` uses) and
+the parse `futex_waitv` uses for its deadline, and the wake reuses
+`wake_bitset`, which is where the `nr` cap and the bitset match already
+live.
+
+**Two divergences, named.**
+
+* `FUTEX2_NUMA` and `FUTEX2_MPOL` are `EOPNOTSUPP`. Linux 7.2 serves both;
+  a NUMA futex is *two* words (the value and a node), and this kernel has
+  no node or policy to name — answering from the first word would be a
+  half-truth the caller cannot branch on.
+* The private bit is **not part of this kernel's key**. One wait table per
+  user address, exactly as the operation-word call's `FUTEX_PRIVATE_FLAG`
+  already is, so a shared wake reaches a private waiter here where Linux
+  keeps two key spaces. The same divergence `futex(2)` carries, not a new
+  one; the pin therefore claims the shared spelling round-trips, which it
+  does because both spellings land in the one table.
+
+**Pinned** by `t-futex2` (29 claims): every refusal above, the deadline's
+own firing time, the bitset's selectivity (a mask of bit 1 does not reach
+a waiter that asked for bit 2, and the wake's `0` says so), two waiters
+and `nr = 1`, a wake larger than the set capping at the waiters present,
+both round trips, and — on this kernel only — the `EOPNOTSUPP` NUMA word
+(the host prints that it serves it instead). The same binary under
+`MPOS_ON_HOST=1` passes 29/29 against Linux: the reference direction.
+
+**Counterfactual** — the two dispatch arms removed: `CF-EXIT=1`,
+`pass=225 fail=1 (226 built)`, `t-futex2` red on every claim through
+`_ => ENOSYS`, nothing else.
+
+Full record: `docs/uapi/` §5.1 item 119.

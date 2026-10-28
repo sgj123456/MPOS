@@ -6560,3 +6560,55 @@ Gate: `cargo xtask test` x86_64 `pass=225 fail=0 (225 built)`, aarch64
 `pass=224 fail=1 (225 built)`, only `t-mseal` red.
 
 Full record: [`docs/notes/`](../notes/05-memory-management.md) §5.5.
+
+## item 119 — `futex_wake(2)`/`futex_wait(2)`: the futex2 pair
+
+The futex family's last two unserved numbers, 454 (`futex_wake`) and 455
+(`futex_wait`), on both machines. They are the syscall-numbered
+single-word pair: one thirty-two-bit word, a **bitset** carried in `mask`,
+and on the wait side an absolute deadline and an explicit `clockid`.
+
+**Measured first, on the host** (`build/scratch/futex2/probe*.c`, Linux
+7.2.11), because the argument widths are not what the names suggest:
+
+* `flags` must carry `FUTEX2_SIZE_U32` (`0x02`); `FUTEX2_PRIVATE` (`0x80`)
+  may be added; `SIZE_U8`/`U16`/`U64` and a missing size bit are `EINVAL`
+  on both calls.
+* `mask` is a bitset over the word: wider than 32 bits is `EINVAL`, and
+  zero is `EINVAL` on both calls. (A probe that passed the 64-bit spelling
+  `~0UL` read that refusal as "NUMA is refused", which is how the trap was
+  found: `~0u` is the right spelling and NUMA is served by Linux.)
+* `val` is thirty-two bits: above `u32::MAX` is `EINVAL`, not truncated; a
+  word that no longer holds it is `EAGAIN` before any deadline is
+  considered.
+* an unaligned word is `EINVAL` on both calls; an aligned but unreadable
+  one is `EFAULT` on both (the wake half validates the word too).
+* `futex_wake`'s `nr` is an `int`: `0` and a negative count answer `0`;
+  the answer is the count woken, never more than `nr` and never more than
+  the waiters whose bitset intersects `mask`.
+* the deadline is absolute; `clockid` is read only when it is given (`0`
+  realtime, `1` monotonic, else `EINVAL`); with NULL it is ignored; a past
+  deadline is `ETIMEDOUT`.
+
+**Served, in that shape.** `handle_futex2_wake`/`handle_futex2_wait` in
+`src/syscall/linux/proc.rs`, with the flag-word and bitset checks as
+host-compiled facts beside their tests in `src/syscall/linux/abi.rs`
+(`futex2_word_flags`, `futex2_bitset`); the wait reuses
+`sched::futex::wait_bitset` and the wake reuses `wake_bitset`, so the `nr`
+cap and the bitset match are the ones `FUTEX_WAIT_BITSET` already uses.
+Numbers `454`/`455` are in both tables; both dispatch arms sit after
+`nr::FUTEX_WAITV`.
+
+**Two divergences, named.** `FUTEX2_NUMA` (`0x04`) and `FUTEX2_MPOL`
+(`0x08`) are `EOPNOTSUPP`: Linux 7.2 serves them, a NUMA word is two
+words, and this kernel has no node or policy to name. And the private bit
+is not part of this kernel's key — one table per user address, as the
+operation-word call already is — so a shared wake reaches a private
+waiter here where Linux keeps two key spaces.
+
+**Pinned** by `t-futex2` (29 claims, host run 29/29 against Linux and the
+NUMA refusal guest-only). Gate `pass=226 fail=0` on x86_64; counterfactual
+(the two arms removed) `CF-EXIT=1`, `pass=225 fail=1 (226 built)`, only
+`t-futex2` red.
+
+Full record: [`docs/notes/`](../notes/06-process-management.md) §6.34.

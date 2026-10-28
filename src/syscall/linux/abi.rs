@@ -3459,6 +3459,58 @@ pub(crate) fn mark_missing_futex_op(op: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The futex2 pair's words (`futex_wake(2)`, `futex_wait(2)`)
+// ---------------------------------------------------------------------------
+
+/// `futex_wake(2)`/`futex_wait(2)` share one flag word: the futex word's size in
+/// its low two bits and the private-table bit above them. Only a `u32` word is
+/// served - and Linux 7.2 serves only that too, measured: `SIZE_U16`, `SIZE_U64`
+/// and a size-bit combination all answer `EINVAL` for these two calls (where
+/// `futex_waitv(2)` accepts `SIZE_U32` alone).
+pub(super) const FUTEX2_SIZE_MASK: usize = 0x03;
+pub(super) const FUTEX2_SIZE_U32: usize = 0x02;
+pub(super) const FUTEX2_PRIVATE: usize = 0x80;
+/// The bits that name NUMA's doubled word and the memory-policy word after it.
+/// Measured: Linux 7.2 serves both spellings. This kernel has no node or policy
+/// to name - its wait table is keyed by user address, and the second word of a
+/// NUMA futex names a node - so they are refused with `EOPNOTSUPP` rather than
+/// answered from the first word alone (a named divergence, `docs/notes/` §6.34).
+pub(super) const FUTEX2_NUMA: usize = 0x04;
+pub(super) const FUTEX2_MPOL: usize = 0x08;
+
+/// The flag word both futex2 calls carry, checked in the order the measurement
+/// separates: an unknown bit is a malformed call (`EINVAL`), a size this kernel
+/// cannot slice is Linux's own `EINVAL`, and a node or policy word is a shape
+/// this kernel cannot make true (`EOPNOTSUPP`).
+pub(super) fn futex2_word_flags(flags: usize) -> Result<(), isize> {
+    if flags & !(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE | FUTEX2_NUMA | FUTEX2_MPOL) != 0 {
+        return Err(crate::err::EINVAL);
+    }
+    if flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 {
+        return Err(crate::err::EINVAL);
+    }
+    if flags & (FUTEX2_NUMA | FUTEX2_MPOL) != 0 {
+        return Err(crate::err::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// The `mask` argument both futex2 calls carry: it is a bitset over the futex
+/// word, so wider than thirty-two bits is `EINVAL` and empty is `EINVAL` -
+/// measured for both calls, and the reason `futex_wake(2)` of `~0UL` (as a
+/// 64-bit mask) is refused where `~0u` is the "every bit" spelling.
+pub(super) fn futex2_bitset(mask: usize) -> Result<u32, isize> {
+    if mask > u32::MAX as usize {
+        return Err(crate::err::EINVAL);
+    }
+    let bits = mask as u32;
+    if bits == 0 {
+        return Err(crate::err::EINVAL);
+    }
+    Ok(bits)
+}
+
+// ---------------------------------------------------------------------------
 // The entropy-pool family (`'R'`-typed requests), for `/dev/random` and
 // `/dev/urandom`
 // ---------------------------------------------------------------------------
@@ -6537,5 +6589,37 @@ mod diskstat_tests {
             version.contains("dstat-da:1:0,"),
             "the live count renders into the row: {version}"
         );
+    }
+
+    /// `futex_wake(2)`/`futex_wait(2)`'s flag word: measured on Linux 7.2.11,
+    /// only `SIZE_U32` (alone or with `PRIVATE`) waits and every other size
+    /// spelling is `EINVAL`; the node and policy words Linux serves are a shape
+    /// this kernel cannot make true, so they are refused as unsupported rather
+    /// than folded into the first word.
+    #[test]
+    fn a_futex2_word_is_thirty_two_bits_and_private_or_nothing_else() {
+        assert!(futex2_word_flags(FUTEX2_SIZE_U32).is_ok());
+        assert!(futex2_word_flags(FUTEX2_SIZE_U32 | FUTEX2_PRIVATE).is_ok());
+        // No size bit at all, a sixteen- or sixty-four-bit word, and a size-bit
+        // combination: Linux's own EINVAL for these two calls.
+        assert_eq!(futex2_word_flags(0), Err(-22));
+        assert_eq!(futex2_word_flags(0x01), Err(-22));
+        assert_eq!(futex2_word_flags(0x03), Err(-22));
+        // A bit this kernel does not know is a malformed call.
+        assert_eq!(futex2_word_flags(FUTEX2_SIZE_U32 | 0x100), Err(-22));
+        // Words Linux serves and this kernel cannot.
+        assert_eq!(futex2_word_flags(FUTEX2_SIZE_U32 | FUTEX2_NUMA), Err(-95));
+        assert_eq!(futex2_word_flags(FUTEX2_SIZE_U32 | FUTEX2_MPOL), Err(-95));
+    }
+
+    /// The bitset: thirty-two bits wide and never empty - measured on both
+    /// calls (`mask` of `~0UL` is `EINVAL`, `~0u` is "every bit").
+    #[test]
+    fn a_futex2_bitset_is_a_u32_and_never_empty() {
+        assert_eq!(futex2_bitset(0x2), Ok(0x2));
+        assert_eq!(futex2_bitset(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(futex2_bitset(0), Err(-22));
+        assert_eq!(futex2_bitset(u32::MAX as usize + 1), Err(-22));
+        assert_eq!(futex2_bitset(usize::MAX), Err(-22));
     }
 }
