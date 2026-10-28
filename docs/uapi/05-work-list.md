@@ -6464,3 +6464,42 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     **Pinned** by `t-userfaultfd`, which the same binary also runs under
     `MPOS_ON_HOST=1` against Linux (the reference direction, where the one claim
     a host can make is that an unprivileged process is refused `EPERM`).
+
+## item 117 — `close_range(2)`: a span of descriptors, closed or marked close-on-exec
+
+    **Measured first, on Linux 7.2.11** (`build/scratch/closerange/probe.c`,
+    `probe2.c` - no root needed, unlike the two items before this one):
+    `close_range(3, 4, 0)` with both open answers `0` and closes exactly those
+    two, leaving 2 and 5 alone; `close_range(10, 5, 0)` is `EINVAL`; `~0` as the
+    last number means "to the end of the table" and closes every number above
+    the standard three; `CLOSE_RANGE_CLOEXEC` answers `0`, leaves both
+    descriptors **open** and sets `FD_CLOEXEC` on exactly the span; a span over
+    numbers nothing holds is `0` and creates nothing; a flag bit outside the two
+    is `EINVAL`; and a sibling thread's `close_range` without
+    `CLOSE_RANGE_UNSHARE` closes the *process's* number, while a forked child's
+    `close_range(…, CLOSE_RANGE_UNSHARE)` leaves the parent's copy open -
+    because the unshare hands the caller a descriptor table of its own first.
+
+    **Served, in that shape.** `handle_close_range` in
+    `src/syscall/linux/fs/file.rs` validates the two flag bits and `first <=
+    last`, unshares with `crate::sched::unshare_files()` (the same copy
+    `unshare(CLONE_FILES)` makes) when asked, marks with `FdTable::cloexec_span`
+    or closes each number through `close_one` - the body `handle_close` was
+    split into, so a span close owes every teardown a single close does: a
+    socket's port, an inotify instance, a fanotify group, a DRM master, an
+    evdev grab and the description's own locks. `FdTable` gained `slot_count`,
+    `close_span` and `cloexec_span`; the span is clamped to the table's slots
+    first, because the ABI's `last` is a `u32` and `~0` walked literally is four
+    billion iterations for a process holding twenty descriptors.
+
+    **One divergence, named**: Linux's own `close_range` walks the numbers and
+    the flag word's ordering against `first > last` is not something the
+    measurement separates (`close_range(10, 5, 8)` is `EINVAL` for two reasons
+    at once); this kernel checks the flags first. Both answers are `EINVAL`, so
+    no caller can tell.
+
+    **Pinned** by `t-close-range`, whose thread and fork claims are the reason
+    it uses threads at all: without a sibling there is nothing to share with and
+    `UNSHARE` would look like a no-op whether or not it did anything. The same
+    binary runs under `MPOS_ON_HOST=1` against Linux and passes 16/16 there -
+    the reference direction.

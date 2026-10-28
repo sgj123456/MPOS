@@ -28,6 +28,7 @@ A call absent from those is served as its phase section records.
 | `write` | 1 | fs | 64 |
 | `open` | 2 | fs | 64000 |
 | `close` | 3 | fs | 57 |
+| `close_range` | 436 | fs | 436 |
 | `stat` | 4 | fs | 64001 |
 | `fstat` | 5 | fs | 80 |
 | `lstat` | 6 | fs | 64002 |

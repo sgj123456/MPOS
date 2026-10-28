@@ -225,6 +225,7 @@ pub unsafe fn dispatch(
         nr::OPEN => fs::open(args, &cwd()),
         nr::OPENAT => fs::openat(args, &cwd()),
         nr::CLOSE => fs::handle_close(args),
+        nr::CLOSE_RANGE => fs::handle_close_range(args),
         nr::FSTAT => fs::fstat(args),
         // The legacy stat pair. musl reaches for these before the `*at` forms,
         // and busybox asks about a command's file before it will exec it - so

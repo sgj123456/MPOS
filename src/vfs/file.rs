@@ -788,6 +788,71 @@ impl FdTable {
         Ok(())
     }
 
+    /// How many slots the table has ever grown to - the bound a
+    /// `close_range(2)` walk needs.
+    ///
+    /// A caller passes `last` as a `u32` and may say `~0`, which is four
+    /// billion numbers; the table holds at most `RLIMIT_NOFILE` of them, and
+    /// walking the range without this bound is four billion critical sections
+    /// for a machine that has twenty descriptors open.
+    pub fn slot_count(&self) -> usize {
+        critical_section::with(|cs| self.slots.borrow(cs).borrow().len())
+    }
+
+    /// Lift every description in `first..=last` out of the table, returning
+    /// them so the caller can drop them where a wake is safe.
+    ///
+    /// This is `close_range(2)`'s bulk half. The numbers are *removed* rather
+    /// than dropped here for the reason [`take_all`](Self::take_all) gives: a
+    /// description's death can wake a task that a critical section must not
+    /// re-enter, and one of the descriptions in a closed span is very often a
+    /// pipe end or a socket somebody is parked on.
+    ///
+    /// `last` is the caller's, which may be `u32::MAX` ("to the end of the
+    /// table"); the span is clamped to what the table actually holds, because
+    /// the slots past the highest open number are not part of it.
+    pub fn close_span(&self, first: usize, last: usize) -> alloc::vec::Vec<Arc<File>> {
+        critical_section::with(|cs| {
+            let mut slots = self.slots.borrow(cs).borrow_mut();
+            let mut flags = self.fd_flags.borrow(cs).borrow_mut();
+            let end = last.min(slots.len().saturating_sub(1));
+            if first > end {
+                return alloc::vec::Vec::new();
+            }
+            let mut files = alloc::vec::Vec::new();
+            for slot in first..=end {
+                if let Some(file) = slots[slot].take() {
+                    files.push(file);
+                }
+                flags[slot] = 0;
+            }
+            files
+        })
+    }
+
+    /// Set the descriptor flag on every open slot in `first..=last`.
+    ///
+    /// `CLOSE_RANGE_CLOEXEC` marks a span rather than closing it - what a
+    /// program does before an `execve` when it wants the descriptors gone in
+    /// the program it is becoming but still usable in the call that sets them
+    /// up. Setting the flag on a free slot is not an error and creates no
+    /// descriptor, which is why this does not go through `fd_flags_set`.
+    pub fn cloexec_span(&self, first: usize, last: usize, flags_word: u32) {
+        critical_section::with(|cs| {
+            let slots = self.slots.borrow(cs).borrow();
+            let mut flags = self.fd_flags.borrow(cs).borrow_mut();
+            let end = last.min(slots.len().saturating_sub(1));
+            if first > end {
+                return;
+            }
+            for slot in first..=end {
+                if slots[slot].is_some() {
+                    flags[slot] = flags_word;
+                }
+            }
+        });
+    }
+
     /// The description `fd` names, for handing to another table.
     pub fn clone_at(&self, fd: RawFd) -> VfsResult<Arc<File>> {
         self.get(fd)
@@ -1404,5 +1469,70 @@ mod tests {
         );
         odd.set_born(0x0080_0000);
         assert_eq!(odd.open_flags(), super::ACC_RDWR | 0x0080_0000);
+    }
+
+    #[test]
+    fn a_span_close_lifts_every_number_it_covers_and_no_other() {
+        let table = FdTable::new();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
+        let mut fds = alloc::vec::Vec::new();
+        for _ in 0..6 {
+            fds.push(table.install(Arc::new(File::new(inode.clone()))).unwrap());
+        }
+
+        // 3..=4 is lifted; 5 and 2 are not - a range is not "everything below".
+        let lifted = table.close_span(fds[2] as usize, fds[3] as usize);
+        assert_eq!(lifted.len(), 2, "both numbers in the span are lifted");
+        assert_eq!(table.get(fds[2]).is_err(), true, "the first is gone");
+        assert_eq!(table.get(fds[3]).is_err(), true, "the last is gone");
+        assert!(table.get(fds[1]).is_ok(), "one below the span stays");
+        assert!(table.get(fds[4]).is_ok(), "one above the span stays");
+
+        // A span over free slots lifts nothing and is not an error.
+        assert!(table.close_span(200, 210).is_empty());
+        // An empty or inverted span lifts nothing.
+        assert!(table.close_span(9, 8).is_empty());
+    }
+
+    #[test]
+    fn a_span_marked_close_on_exec_keeps_its_descriptors_open() {
+        let table = FdTable::new();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
+        let a = table.install(Arc::new(File::new(inode.clone()))).unwrap();
+        let b = table.install(Arc::new(File::new(inode.clone()))).unwrap();
+        let c = table.install(Arc::new(File::new(inode.clone()))).unwrap();
+
+        table.cloexec_span(a as usize, b as usize, 1);
+        assert_eq!(table.fd_flags_get(a).unwrap(), 1, "marked");
+        assert_eq!(table.fd_flags_get(b).unwrap(), 1, "marked");
+        assert_eq!(table.fd_flags_get(c).unwrap(), 0, "outside the span");
+        // Marking does not close: the measurement's whole point.
+        assert!(table.get(a).is_ok() && table.get(b).is_ok());
+
+        // A free slot inside the span is skipped, not created.
+        table.cloexec_span(200, 210, 1);
+        assert!(table.get(200).is_err(), "marking created no descriptor");
+    }
+
+    #[test]
+    fn the_slot_count_bounds_a_span_the_caller_spelled_as_the_whole_table() {
+        let table = FdTable::new();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
+        for _ in 0..4 {
+            table.install(Arc::new(File::new(inode.clone()))).unwrap();
+        }
+        // The table has four slots, so a span ending at `u32::MAX` lifts four.
+        let lifted = table.close_span(0, u32::MAX as usize);
+        assert_eq!(lifted.len(), 4);
+        assert_eq!(table.slot_count(), 4);
     }
 }

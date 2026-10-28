@@ -3874,7 +3874,18 @@ pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// description is lifted out of the table first, and only a sole surviving
 /// reference - this close being the last one - tears the channel down.
 pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
-    let fd = args[0] as i32;
+    close_one(args[0] as i32)
+}
+
+/// Release one descriptor, with every teardown a close owes.
+///
+/// Split out of `handle_close` so `close_range(2)` closes a span through
+/// exactly this path rather than through a second, thinner one: a socket, an
+/// inotify instance, a fanotify group, a DRM master, an evdev grab and the
+/// description's own locks all die at their last descriptor, and a range close
+/// that skipped them would leave a socket's port bound and a compositor's
+/// screen claimed by a process that had closed the number.
+fn close_one(fd: i32) -> isize {
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(file) => file,
         Err(e) => return err_of(e),
@@ -3969,6 +3980,75 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
             file.metadata().ino,
             file.ofd(),
         );
+    }
+    0
+}
+
+/// `close_range(2)` — close, or mark close-on-exec, a span of descriptors.
+///
+/// Measured on Linux 7.2.11 (`build/scratch/closerange/probe.c`, `probe2.c`):
+///
+/// | call | Linux |
+/// |---|---|
+/// | `close_range(3, 4, 0)` with 3 and 4 open | `0`, both closed, 5 untouched |
+/// | `close_range(10, 5, 0)` | `EINVAL` (first past last) |
+/// | `close_range(3, ~0, 0)` | `0`, every descriptor from 3 up closed |
+/// | `close_range(e, f, CLOSE_RANGE_CLOEXEC)` | `0`, both still open and both `FD_CLOEXEC` |
+/// | `close_range(g, g, CLOSE_RANGE_UNSHARE)` | `0`, `g` closed, and the parent's own copy stays open after a `fork` |
+/// | `close_range(900, 910, CLOEXEC)` on free slots | `0` - a free slot is not an error and creates nothing |
+/// | `close_range(3, 4, 8)` | `EINVAL` (a flag bit that is not one of the two) |
+/// | `close_range(10, 5, 8)` | `EINVAL` (both are wrong; the measurement cannot say which is checked first) |
+///
+/// The two flags are both served, and the reason is that each is a real
+/// behaviour rather than a spelling: `CLOSE_RANGE_CLOEXEC` is how a program
+/// marks a span before `execve` without losing it in the call that sets it up,
+/// and `CLOSE_RANGE_UNSHARE` is what makes the range close *this* process's
+/// descriptors without closing a sibling thread's - this kernel shares one
+/// `FdTable` across a thread group exactly as Linux does, so the unshare is
+/// `crate::sched::unshare_files()`, the same copy `unshare(CLONE_FILES)` makes.
+///
+/// A closed descriptor goes through [`close_one`], not through a bare table
+/// `close`: the teardown a close owes (a socket's port, an inotify instance, a
+/// fanotify group, a DRM master, a description's locks) is the same teardown
+/// whether the number was named by `close(2)` or by a span.
+pub fn handle_close_range(args: [usize; ARG_COUNT]) -> isize {
+    let first = args[0];
+    let last = args[1];
+    let flags = args[2];
+    const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return err::EINVAL;
+    }
+    if first > last {
+        return err::EINVAL;
+    }
+    // `last` is a `u32` in the ABI and is very often `UINT_MAX` - "everything
+    // from here up". Walking that literally is four billion iterations for a
+    // process holding twenty descriptors, so the span is clamped to the slots
+    // the table actually has (and to `u32::MAX` first, so a wider `usize` from
+    // a caller cannot make the clamp itself meaningless).
+    let table = crate::sched::current_fds();
+    let last = last
+        .min(u32::MAX as usize)
+        .min(table.slot_count().saturating_sub(1));
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        crate::sched::unshare_files();
+    }
+    if first > last {
+        return 0; // an empty span: nothing to mark and nothing to close
+    }
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        table.cloexec_span(first, last, abi::FD_CLOEXEC);
+        return 0;
+    }
+    // Each number is closed through the ordinary path, one at a time: the
+    // teardown is per description, and a range close that skipped it would
+    // leave a socket's port bound. A free slot in the span is not an error -
+    // the argument is a range, not a list of descriptors that must exist - so
+    // `close_one`'s `EBADF` is the one answer this loop swallows.
+    for fd in first..=last {
+        let _ = close_one(fd as i32);
     }
     0
 }

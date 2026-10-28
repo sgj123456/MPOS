@@ -536,3 +536,69 @@ only `t-fanotify` red (it panics because `fanotify_init` answers `ENOSYS`);
 every other program stays green.
 
 Full record: `docs/uapi/` §5.1 item 114.
+
+### 3.10 `close_range(2)` — a span of descriptors, closed or marked — **DONE (2026-10-28)**
+
+**Why**: a program that starts a child with exactly three descriptors - a
+shell, a supervisor, anything that has inherited a dozen fds it does not want
+to pass on - has two options: `close` every number in a loop (which is what
+`busybox` and glibc's `posix_spawn` fall back to), or `close_range(2)`, which
+does the loop in the kernel where the range can be validated once and the
+teardown can happen under one walk. The call had no dispatch arm, so it fell
+to `_ => ENOSYS` and every caller took the fallback loop.
+
+**Measured first**, on Linux 7.2.11 (`build/scratch/closerange/probe.c`,
+`probe2.c`; no root needed - unlike `fanotify_init` and `userfaultfd`, this
+call asks no capability):
+
+| call | Linux |
+|---|---|
+| `close_range(3, 4, 0)` with 3 and 4 open | `0`; 3 and 4 closed, 2 and 5 untouched |
+| `close_range(10, 5, 0)` | `EINVAL` |
+| `close_range(3, ~0, 0)` | `0`; every number from 3 up closed |
+| `close_range(e, f, CLOSE_RANGE_CLOEXEC)` | `0`; both still **open**, both `FD_CLOEXEC`, and a descriptor outside the span unflagged |
+| `close_range(900, 910, CLOEXEC)` over free slots | `0` - a free slot is not an error and creates nothing |
+| `close_range(g, g, CLOSE_RANGE_UNSHARE)` | `0`; `g` closed |
+| a **sibling thread**'s `close_range(fd, fd, 0)` | the process's number is closed - a thread group shares one table |
+| a **forked child**'s `close_range(k, k, UNSHARE)` | `0` in the child, and the **parent's** `k` stays open |
+| `close_range(3, 4, 8)` | `EINVAL` (a flag bit that is neither) |
+| `close_range(10, 5, 8)` | `EINVAL` - two reasons at once, so the measurement does not say which is checked first |
+
+**Landed shape.** `handle_close_range` in `src/syscall/linux/fs/file.rs`:
+
+- the two flag bits are the only ones accepted (`EINVAL` otherwise), then
+  `first <= last` (`EINVAL`), then the span is clamped to
+  `FdTable::slot_count()` - the ABI's `last` is a `u32` and `~0` walked
+  literally is four billion iterations for a process holding twenty
+  descriptors;
+- `CLOSE_RANGE_UNSHARE` calls `crate::sched::unshare_files()`, which is the
+  same `FdTable::duplicate()` `unshare(CLONE_FILES)` makes - so the numbering
+  becomes the caller's while the open file *descriptions* stay shared, which is
+  the distinction that makes the flag worth having;
+- `CLOSE_RANGE_CLOEXEC` goes through the new `FdTable::cloexec_span`, which
+  marks only the slots that hold a descriptor;
+- otherwise each number is closed through **`close_one`** - the body
+  `handle_close` was split into, so a span close owes exactly what a single
+  close owes: a socket's last descriptor takes its port down, an inotify
+  instance and a fanotify group and a DRM master and an evdev grab and the
+  description's own `flock`/`OFD` locks all die at their last reference. A
+  second, thinner close path for ranges is the shape that would leave a port
+  bound and a screen claimed by a process that had closed the number.
+
+`FdTable` gained three methods (`slot_count`, `close_span`, `cloexec_span`),
+pinned by three host tests: a span lifts every number it covers and no other,
+a marked span keeps its descriptors open and creates none, and a span spelled
+`u32::MAX` lifts exactly the table's slots.
+
+**Named divergence.** Linux's own check order between the flag word and
+`first > last` is not separated by the measurement (both are wrong in the same
+call), and this kernel checks the flags first. Both answers are `EINVAL`, so no
+caller can tell them apart - named rather than silently assumed.
+
+**Pinned** by `t-close-range` (16 claims on both machines), whose thread and
+fork claims are why it uses threads at all: without a sibling there is nothing
+to share with, and `UNSHARE` would look like a no-op whether or not it did
+anything. The same binary passes 16/16 under `MPOS_ON_HOST=1` against Linux -
+the reference direction, which is what says the expectations are Linux's.
+
+Full record: `docs/uapi/` §5.1 item 117.

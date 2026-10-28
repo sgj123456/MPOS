@@ -328,3 +328,7 @@ pub const IO_URING_REGISTER: u64 = 427;
 /// `userfaultfd(2)`: asm-generic's number, which differs from x86_64's 323 -
 /// measured off both machines' headers, not assumed from one.
 pub const USERFAULTFD: u64 = 282;
+
+/// `close_range(2)`: 436 on both machines - the call landed after the number
+/// tables converged, so unlike `userfaultfd` there is no second number.
+pub const CLOSE_RANGE: u64 = 436;

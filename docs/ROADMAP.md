@@ -243,6 +243,15 @@ One-glance status of the whole roadmap.
 - [ ] `tid/tgid_add_object` (rseq) — niche; the one number left answering `ENOSYS`,
   pinned by `t-rseq`, and serving it needs a per-thread registration maintained across
   preemption (§12.1 A6)
+- [x] `close_range(2)` (436) — a span of descriptors, closed or marked: measured on
+  Linux 7.2.11, a span closes exactly the numbers it covers (neighbours untouched),
+  `first > last` and a flag bit outside the two are `EINVAL`, `~0` means "to the end
+  of the table", `CLOSE_RANGE_CLOEXEC` marks the span **without** closing it, and
+  `CLOSE_RANGE_UNSHARE` hands the caller a table of its own first - so a sibling
+  thread's number survives and a forked child's range leaves the parent's open. Every
+  number in the span closes through `close_one`, the body `handle_close` was split
+  into, so a socket's port and a DRM master die there as they do at `close(2)`
+  (§3.10, item 117)
 - [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
   the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
   with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is

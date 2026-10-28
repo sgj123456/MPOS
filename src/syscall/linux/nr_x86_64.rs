@@ -547,3 +547,7 @@ pub const KEYCTL: u64 = 250;
 /// numbers, on the numbers this machine uses.
 pub const FANOTIFY_INIT: u64 = 300;
 pub const FANOTIFY_MARK: u64 = 301;
+
+/// `close_range(2)`: 436 on both machines - the call landed after the number
+/// tables converged, so unlike `userfaultfd` there is no second number.
+pub const CLOSE_RANGE: u64 = 436;
