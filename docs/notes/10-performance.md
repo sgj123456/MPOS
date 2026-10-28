@@ -36,8 +36,12 @@ subsystem below names the same shape of fix: make the event end the wait.
   poll; smoltcp's clock reads the TSC instead of the tick counter; `xtask`
   builds release by default (the loader gained the `wcslen` its release
   codegen calls for).
-- Measured by `t-netlat` (20 ICMP echo rounds to 127.0.0.1): 7.5 ms → 0.3 ms
-  average, 74 µs floor - the remainder is slirp's own path through the host.
+- Measured by `t-netlat` (20 ICMP echo rounds through slirp): 7.5 ms → 0.3 ms
+  average, 74 µs floor - the remainder is slirp's own path through the host. The
+  instrument's peer is the slirp gateway (`10.0.2.2`) since 2026-10-28: this
+  host's libslirp answers the gateway (260 µs first round, 85-97 µs after) and
+  returns nothing for `127.0.0.1`, which the probe now says in two seconds
+  instead of sitting on the lane's budget (`docs/notes/` §4.5).
 
 ### 10.2 Context-Switch and Fork Cost — **PARTIAL** (three of four landed, measured)
 

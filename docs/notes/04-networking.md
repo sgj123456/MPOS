@@ -854,8 +854,12 @@ for UDP) and always before the call that would consume it.
 
 Two boundaries, recorded rather than hidden. A **raw socket never moves**: its
 destination is a per-call argument, so one socket cannot serve two sets - which
-is what keeps `ping 127.0.0.1` behaving exactly as it did, travelling the virtual
-wire where slirp answers it, as `t-netlat` measures. And a **wildcard listener**
+is what keeps the echo on the virtual wire, where slirp answers it. Measured
+2026-10-28: this host's libslirp answers an echo to the **gateway** (`10.0.2.2`:
+first round 260 µs, then 85-97 µs) and returns nothing for `127.0.0.1`, so
+`t-netlat` peers with the gateway; the wire-only design means a loopback echo
+has no local answer to fall back on (`docs/notes/` §10's latency numbers were
+taken through slirp's path either way). And a **wildcard listener**
 lives on eth0's fabric, so a loopback client does not reach it; the bound
 `127.0.0.1` case is the supported one.
 

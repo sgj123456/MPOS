@@ -31,13 +31,24 @@
 //! One design fact moves with the program and is worth its sentence: a raw
 //! socket on this kernel lives on eth0, never on the loopback interface - one
 //! socket cannot serve two socket sets, and a raw socket's destination is a
-//! per-call argument (`src/net/mod.rs`'s two-fabrics note). So `ping
-//! 127.0.0.1` travels the virtual wire and comes back through slirp, which is
-//! exactly what the no-std version measured and what the host cannot reproduce:
-//! a host Linux answers 127.0.0.1 from its own loopback device, not through any
-//! slirp. Not run on the host for that reason *and* the privilege one (a raw
-//! socket wants CAP_NET_RAW, absent here); the pin is the two sweeps, where the
-//! same slirp answers either machine's guest identically.
+//! per-call argument (`src/net/mod.rs`'s two-fabrics note). So the echo travels
+//! the virtual wire and comes back through slirp, which is what the no-std
+//! version measured and what the host cannot reproduce: a host Linux answers a
+//! local address from its own loopback device, not through any slirp. Not run on
+//! the host for that reason *and* the privilege one (a raw socket wants
+//! `CAP_NET_RAW`, absent here); the pin is the two sweeps, where the same slirp
+//! answers either machine's guest identically.
+//!
+//! The peer is the **gateway** (`10.0.2.2`), not `127.0.0.1`, and that is
+//! measured rather than preferred: with this host's libslirp, an echo to the
+//! gateway comes back (`rtt=260us` on the first round, `85us` after - the arm is
+//! in-process, so the wire is the cost), while an echo to `127.0.0.1` is
+//! answered by nobody. The loopback destination used to be how this program was
+//! written; measured 2026-10-28, every round to it sat in `recvfrom` and the
+//! lane paid the whole per-program budget for the silence (`t-netlat
+//! timeout=120s`). The `poll` below bounds that: a round that waits two seconds
+//! has no answer, says so, and the run ends in two seconds rather than two
+//! minutes.
 
 use std::net::Ipv4Addr;
 
@@ -50,7 +61,7 @@ use rustix::time::{ClockId, clock_gettime};
 
 /// The loopback address: the leg whose latency is this kernel's own
 /// architecture, not the network beyond the host.
-const PEER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 
 /// How many echo requests one run measures. Twenty is enough for a stable
 /// minimum and average while the whole suite still spends well under a second
@@ -137,7 +148,27 @@ fn main() {
         }
 
         // The blocking read is the shape being measured: this is where the
-        // reply's arrival waits to be noticed.
+        // reply's arrival waits to be noticed. It is bounded, though - a
+        // `recvfrom` that never returns would sit on the lane's whole budget
+        // (an observed hang: the raw ping's answer did not come back in one
+        // harness run, and the lane paid its 120 s per-program timeout for it).
+        // Two seconds is two orders above the number this instrument reports,
+        // so a round that needs more than that is a round with no answer.
+        let mut pfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        if ready <= 0 {
+            r.check(
+                &format!("round {seq} gets an echo answer (nothing arrived within 2000 ms)"),
+                false,
+            );
+            println!("note: round {seq} waited 2000 ms with no answer; the wire is silent");
+            // Every later round would wait just as long for the same silence.
+            break;
+        }
         let mut buf = [0u8; 96];
         let got = recvfrom(&fd, &mut buf, RecvFlags::empty());
         let rtt = now_us().saturating_sub(t0);
