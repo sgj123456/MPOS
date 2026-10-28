@@ -335,9 +335,11 @@ One-glance status of the whole roadmap.
 
 **Architectures (Phase 9)**
 
-- [ ] [~] 9.1 aarch64 complete boot — boots real Alpine to a login prompt and every service
-  ok (§13.15's `hwclock`/`modules` closed the last two); consoles still reach only the
-  machine's serial line, the `tty1`..`tty4` mux being the remaining named item (§9.1, §13)
+- [x] 9.1 aarch64 complete boot — boots real Alpine to a login prompt and every service
+  ok (§13.15's `hwclock`/`modules` closed the last two), and the `tty1`..`tty4` mux — the
+  last named item here — landed as the `vcmux` port (§13.16: the display half became four
+  `console` seams, so the mux is both machines', and `t-vt` pins it on both arms of the gate
+  rather than on the wire alone) (§9.1, §13)
 - [ ] 9.2 RISC-V support (§9.2)
 - [ ] [~] 13 Machine-seam purity + aarch64 parity — 13.1 and 13.3–13.31 landed; 13.2's
   caller side is complete, and what is left there is ABI-owned tables, machine identity and
