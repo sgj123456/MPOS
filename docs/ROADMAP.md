@@ -247,7 +247,12 @@ One-glance status of the whole roadmap.
   the clock **does not preempt a task inside an armed critical section** (the tick
   is spent; a span still armed on the next tick ends the task with `SIGSEGV`, since
   this machine cannot rewind the trap frame's resume address the way Linux does).
-  Linux's v2 area (`len > 32`) is `EOPNOTSUPP` — named (§6.35, item 120)
+  The v2 area (`len > 32`) is served too, with its extra words answered honestly
+  rather than copied: 64-byte aligned lengths 33+ are accepted, `node_id` is 0
+  (one node), `mm_cid` is 0 (one CPU — valid under a contract that only needs
+  *running* threads distinct), `slice_ctrl` is 0, and `flags` is 0 because the
+  time-slice extension is not implemented where Linux's read-only bits would say
+  it is available (§6.35, item 120)
 - [x] `close_range(2)` (436) — a span of descriptors, closed or marked: measured on
   Linux 7.2.11, a span closes exactly the numbers it covers (neighbours untouched),
   `first > last` and a flag bit outside the two are `EINVAL`, `~0` means "to the end

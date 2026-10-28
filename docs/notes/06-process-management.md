@@ -4312,17 +4312,37 @@ or leaves its span. A task still inside its span on the following tick is ended
 with `SIGSEGV`, because a span is a handful of instructions and never a
 millisecond — a broken sequence must not hold the only core.
 
-**Nine claims on `t-rseq`**, plus the armed-section claim (guest-only: the host
-prints that it rewinds instead), the v2 refusal (guest-only: the host serves
-it), and the fork/thread inheritance. Host run: **PASS, 20/20** — the armed
+**The claims on `t-rseq`**, plus the armed-section claim (guest-only: the
+host prints that it rewinds instead), the v2 shape (both arms, with one
+runtime-dependent expectation: the host's `flags` word is `0x10`, this kernel's
+is 0), and the fork/thread inheritance. Host run: **PASS** — the armed
 child exits `7`, i.e. Linux's own fixup ran, which is the reference direction.
 Gates: x86_64 `pass=225 fail=0`, aarch64 `pass=224 fail=0`, `mpos-kunit 34 passed`
 both, host suite 685.
 
-**Named divergences**: the v2 area (`len > 32` — `node_id`/`mm_cid`/`slice_ctrl`)
-is `EOPNOTSUPP`; a preempted section is deferred then killed rather than rewound
-to `abort_ip`; and an unregistration over an unmapped area answers `EFAULT` where
-Linux delivers `SIGSEGV`.
+**The v2 area is served, with its facts answered honestly.** Measured on Linux
+7.2.11 first (`build/scratch/rseq2/probe.c`): lengths 33, 34, 40, 63, 64, 65 and
+96 are accepted on a 64-byte aligned area, each writing `flags = 0x10`
+(Linux's read-only feature bits for the time-slice extension; `0x30` when
+`RSEQ_FLAG_SLICE_EXT_DEFAULT_ON` is asked), `node_id = 0`, `slice_ctrl = 0`, and
+`mm_cid` = 0 for the first registering thread, then 1, 2, 3 for three more. Here
+the extra words are real answers rather than copies: `flags` is 0 because the
+slice extension is not implemented and advertising it would promise a behaviour
+this scheduler does not have; `node_id` is 0 because the machine has one node;
+`mm_cid` is 0 because only one thread of a process runs at a time on one CPU,
+and the concurrency-id contract only asks that *concurrently running* threads
+have distinct ids; `slice_ctrl` is 0 and never written again.
+
+**Named divergences**: the v2 `flags` word is 0 rather than Linux's `0x10`/`0x30`
+(above); `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN` are not put in the `auxv`, so a
+libc that reads them still asks for the legacy 32-byte area and the v2 path is
+reached by programs that know the shape — advertising the pair would make every
+glibc program register 33 bytes, which needs the id words refreshed on every
+return to user, and that is the next half of this item; the concurrency id is
+not refreshed after a `fork` (no migration exists on one CPU); a preempted
+section is deferred then killed rather than rewound to `abort_ip`; and an
+unregistration over an unmapped area answers `EFAULT` where Linux delivers
+`SIGSEGV`.
 
 **Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=224 fail=1
 (225 built)`, only `t-rseq` red, every call falling through `_ => ENOSYS`.

@@ -78,9 +78,21 @@ use critical_section::Mutex;
 use crate::err;
 use crate::sched::TaskId;
 
-/// The legacy v1 area: the only registration shape this kernel carries.
+/// The legacy v1 area: the shape every libc asks for unless its `auxv` names a
+/// larger feature size.
 #[cfg(any(test, target_os = "none"))]
 pub(crate) const AREA_LEN: usize = 32;
+
+/// The v2 area's minimum length: `offsetof(struct rseq, end)` from the uapi
+/// header. Measured on Linux 7.2.11 (`build/scratch/rseq2/probe.c`): lengths
+/// 33, 34, 40, 63, 64, 65 and 96 are accepted with a 64-byte aligned area, and
+/// a length between 32 and 33 names neither shape (`EINVAL`).
+#[cfg(any(test, target_os = "none"))]
+pub(crate) const FEATURE_LEN: usize = 33;
+
+/// The v2 area's alignment (measured: 64; the legacy area is 32).
+#[cfg(any(test, target_os = "none"))]
+pub(crate) const FEATURE_ALIGN: usize = 64;
 
 /// `RSEQ_FLAG_UNREGISTER`.
 #[cfg(any(test, target_os = "none"))]
@@ -109,6 +121,11 @@ const OFF_FLAGS: usize = 16;
 const OFF_NODE_ID: usize = 20;
 #[cfg(any(test, target_os = "none"))]
 const OFF_MM_CID: usize = 24;
+
+/// The v2 area's time-slice control word: this kernel offers no extension, so
+/// the word is zeroed at registration and never written again.
+#[cfg(any(test, target_os = "none"))]
+const OFF_SLICE_CTRL: usize = 28;
 
 /// The armed section's descriptor, `struct rseq_cs`: version, flags, then the
 /// three addresses the kernel needs to decide whether a resume point is inside
@@ -213,14 +230,17 @@ pub fn syscall(area: usize, len: usize, flags: usize, sig: usize) -> isize {
     if len < AREA_LEN {
         return err::EINVAL;
     }
-    if len > AREA_LEN {
-        // The v2 area: `node_id`, `mm_cid`, `slice_ctrl` and the 64-byte
-        // alignment. This kernel carries none of those facts, and answering 0
-        // for a shape whose fields it would then leave stale is the success a
-        // caller cannot recover from.
-        return err::EOPNOTSUPP;
+    if len > AREA_LEN && len < FEATURE_LEN {
+        // A length between the two shapes names neither: the legacy area is
+        // exactly 32 bytes and the v2 area is at least the feature size.
+        return err::EINVAL;
     }
-    if !area.is_multiple_of(AREA_LEN) {
+    let align = if len > AREA_LEN {
+        FEATURE_ALIGN
+    } else {
+        AREA_LEN
+    };
+    if !area.is_multiple_of(align) {
         return err::EINVAL;
     }
     if let Some(registered) = registration(task) {
@@ -246,6 +266,9 @@ pub fn syscall(area: usize, len: usize, flags: usize, sig: usize) -> isize {
         || !crate::sched::write_user(area + OFF_NODE_ID, &zero4)
         || !crate::sched::write_user(area + OFF_MM_CID, &zero4)
     {
+        return err::EFAULT;
+    }
+    if len > AREA_LEN && !crate::sched::write_user(area + OFF_SLICE_CTRL, &zero4) {
         return err::EFAULT;
     }
     if !write_ids(area, 0) {

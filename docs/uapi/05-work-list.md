@@ -6638,9 +6638,13 @@ registers a 33-byte area and every later call in that thread is `EINVAL`):
   `EINVAL`; a widened flag word `EINVAL`; unregistering nothing `EINVAL`.
 * a `fork` child inherits the registration; a `CLONE_VM` thread starts with
   none; `exec` clears it.
-* Linux serves the newer v2 area (`len > 32`, 64-byte aligned, `flags = 0x10`);
-  this kernel refuses it with `EOPNOTSUPP` because it carries none of the
-  `node_id`/`mm_cid`/`slice_ctrl` facts.
+* the newer v2 area (`len > 32`): 33/34/40/63/64/65/96 accepted on a 64-byte
+  aligned area, writing `flags = 0x10` (0x30 when the slice-extension default-on
+  flag is asked), `node_id = 0`, `slice_ctrl = 0`, and `mm_cid` the registering
+  thread's concurrency id (0, then 1/2/3 for three more). This kernel serves it
+  too, and answers the words honestly: `flags` 0 (no slice extension offered),
+  `node_id` 0 (one node), `mm_cid` 0 (one CPU — a valid index, since the
+  contract only needs *running* threads distinct), `slice_ctrl` 0.
 * a hand-written critical section (signature `.long 0x53053053` before the
   abort label) shows the promise's shape on Linux: a syscall inside it commits,
   a preemption inside it is rewound to `abort_ip`, and a wrong signature word

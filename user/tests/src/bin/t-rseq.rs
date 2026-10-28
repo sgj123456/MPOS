@@ -327,22 +327,54 @@ fn main() {
         );
     }
 
-    if host_run() {
-        println!(
-            "note: the host serves Linux's v2 area (len 33); this kernel refuses it, so that claim is guest-only"
-        );
-    } else {
-        // Linux's newer area: `len > 32` is refused because this kernel carries
-        // none of the facts the extra words name.
-        // The area is cleared first so the answer is about the length and not
-        // about a live registration.
-        let _ = register(second);
-        let _ = unregister(second, 32, RSEQ_SIG);
-        r.check(
-            "the v2 area (len 33) is refused with EOPNOTSUPP",
-            rseq(second, 33, 0, RSEQ_SIG) == Err(libc::EOPNOTSUPP),
-        );
-    }
-
+    // The v2 area: `len > 32` names the feature-sized shape, whose extra words
+    // are the feature flags, the NUMA node id, the concurrency id and the
+    // time-slice control. Both kernels accept it; what each writes into
+    // `flags` is the feature bits it *offers* - Linux's slice extension is
+    // available (0x10, and 0x30 when the default-on flag is asked), and this
+    // kernel offers none (0), because answering otherwise would promise a
+    // rewind/slice behaviour it does not have.
+    let _ = register(second);
+    let _ = unregister(second, 32, RSEQ_SIG);
+    let v2 = rseq(second, 33, 0, RSEQ_SIG);
+    r.check(
+        &format!("the v2 area (len 33) is accepted (is {v2:?})"),
+        v2 == Ok(0),
+    );
+    let flags = unsafe { field(second, 16) };
+    let offered: u32 = if host_run() { 0x10 } else { 0 };
+    r.check(
+        &format!("its flags word names the feature bits the kernel offers (is {flags:#x})"),
+        flags == offered,
+    );
+    let node = unsafe { field(second, 20) };
+    r.check(
+        &format!("the node id is 0 on a machine with one node (is {node})"),
+        node == 0,
+    );
+    // One CPU: only one thread of this process ever runs at a time, so every
+    // concurrency id is a valid index - this kernel answers 0.
+    let cid = unsafe { field(second, 24) };
+    r.check(
+        &format!("the concurrency id is 0 on this machine (is {cid})"),
+        cid == 0,
+    );
+    let slice = unsafe { field(second, 28) };
+    r.check(
+        &format!("the slice control word is 0, no extension is promised (is {slice:#x})"),
+        slice == 0,
+    );
+    r.check(
+        "a length between the two shapes (len 40 is a v2 length, len 20 is not) is EINVAL",
+        rseq(second, 20, 0, RSEQ_SIG) == Err(libc::EINVAL),
+    );
+    r.check(
+        "a v2 length on an area that is not 64-byte aligned is EINVAL",
+        rseq(second + 8, 33, 0, RSEQ_SIG) == Err(libc::EINVAL),
+    );
+    r.check(
+        "the v2 area unregisters with its own length",
+        unregister(second, 33, RSEQ_SIG) == Ok(0),
+    );
     r.finish()
 }
