@@ -1062,8 +1062,23 @@ Section numbers are unchanged from the original `UAPI.md`.
   (the console tty, `tty0`, `ttyS0`, DRM, evdev, `uinput`, `rtc0`, block devices). The
   image's own eudev does the widening, measured on a real boot; the tty class's group
   ownership is the half its rules do not reach. Pinned by `t-dev-birth` on both machines
-  (`docs/notes/` §3.4, item 110). A pty slave's devpts `mode=`/`gid=` mount options are still
-  not applied - the named remainder.
+  (`docs/notes/` §3.4, item 110). A pty slave's devpts `mode=`/`gid=` mount options are
+  served by item 111 (below).
+- **A pty slave is born with its devpts mount's `mode=`/`gid=` — served (item 111).** Measured
+  on Linux 7.2.11 (`build/scratch/devpts-probe/probe{,2,3,4}.py` under `unshare -Urm`): an
+  option-less mount births the slave `0600 0:0` (not the `0620` a comment here used to claim —
+  that is the init script's own request), `mode=`/`gid=` set the slave's bits and group,
+  `uid=` overrides the minting euid (which is otherwise the owner, and the minting process's
+  *group* is ignored because the mount's `gid=` wins), and an unknown option fails the mount
+  with `EINVAL`. The kernel's own defaults, the pair's storage (`Pty::perm`, because a
+  `PtySlave` is made per lookup) and the owner hand-over are in `docs/notes/` §3.8.
+  `newinstance`, `ptmxmode=` and `max=` answer `EOPNOTSUPP` rather than being ignored: there
+  is one machine-wide `/dev/ptmx` and no `/dev/pts/ptmx` node, so each mount's options are
+  the machine's minting defaults from then on and a pair's numbers are fixed at mint —
+  unlike Linux, whose default is one instance per mount. Options for every other filesystem
+  type are still ignored (named, unchanged), and `MS_REMOUNT` still carries read-only only.
+  Pinned by `t-devpts` on both machines plus three host tests; counterfactual red on exactly
+  five claims, each `(is 0666 …)` (item 111).
 - **The console tty is published under the machine's own serial name.** `/dev/ttyS0` on
   x86_64, `/dev/ttyAMA0` on aarch64 - one node (the console tty, where the kernel log goes
   and which the kernel's standard descriptors are) under the name the psABI gives that

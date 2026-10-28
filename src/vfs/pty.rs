@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use critical_section::Mutex;
 
+use super::devfs::NodePerms;
 use super::tty::{Tty, TtyOutput};
 use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
@@ -70,6 +71,18 @@ pub struct Pty {
     /// The slave's terminal: its line discipline, its termios, its editing.
     /// The master has no line discipline of its own here - it is the wire.
     slave: Arc<Tty>,
+    /// The numbers `stat` reports for the slave's `/dev/pts/N` name, and the
+    /// ones the permission check reads.
+    ///
+    /// It lives on the pair rather than on [`PtySlave`] because that node is
+    /// built fresh on every lookup by the devpts root - per-inode storage
+    /// there would lose a `chmod`/`chown` between two `stat`s, and `login`
+    /// hands a logged-in user their terminal by exactly that `chown`. A
+    /// dynamic pair is born with the numbers its devpts mount published at
+    /// mint time (see [`DevPtsOptions`]); a virtual console's slave is never
+    /// served by this wrapper - it has a `/dev/ttyN` name of its own - so its
+    /// pair carries the devtmpfs birth number for completeness.
+    perm: NodePerms,
 }
 
 struct State {
@@ -98,16 +111,18 @@ struct State {
 }
 
 impl Pty {
-    fn new(number: u32, slave_dev_id: (u32, u32), slave_mode: u32) -> Arc<Pty> {
+    fn new(number: u32, slave_dev_id: (u32, u32), slave_mode: u32, perm: NodePerms) -> Arc<Pty> {
         Arc::new(Pty {
             number,
             slave_dev_id,
-            // The slave is a `/dev` node of its own, so its birth mode is the
-            // caller's to name: a virtual console's slave is born the way
-            // devtmpfs births `/dev/tty0`-`/dev/ttyN` (`0600`), while a
-            // dynamic pair's slave is a devpts entry whose mode is a mount
-            // option's business (see `allocate_dynamic`).
+            // The `Tty`'s own mode is the birth mode of the `/dev` node that
+            // fronts it: a virtual console's slave is born the way devtmpfs
+            // births `/dev/tty0`-`/dev/ttyN` (`0600`), while a dynamic pair's
+            // `/dev/pts/N` numbers are the devpts mount's (`perm`, see
+            // `allocate_dynamic`) and this field is only the terminal's own
+            // leftover.
             slave: Arc::new(Tty::new(slave_dev_id, TtyOutput::Pty(number), slave_mode)),
+            perm,
             state: Mutex::new(RefCell::new(State {
                 to_master: VecDeque::new(),
                 locked: true,
@@ -413,6 +428,64 @@ impl Pty {
 static PAIRS: Mutex<RefCell<BTreeMap<u32, Arc<Pty>>>> = Mutex::new(RefCell::new(BTreeMap::new()));
 static NEXT_NUMBER: AtomicU32 = AtomicU32::new(1);
 
+/// The numbers a devpts mount publishes for the pairs minted after it.
+///
+/// One set for the machine, not one per mount: this kernel has a single
+/// `/dev/ptmx` and one pair registry, so a mount's options are the defaults
+/// `posix_openpt` uses from then on. A pair's numbers are fixed when it is
+/// minted - a later mount does not repaint the pairs that already exist.
+///
+/// Linux 7.2.11 measured 2026-10-28 gives each devpts *mount* its own
+/// instance (two mounts publishing `0600` and `0640` in one namespace, each
+/// mount's own `ptmx` handing out its own numbers). It can do that because
+/// `/dev/pts/ptmx` exists per instance and a caller opens the one under the
+/// mount it means; this kernel's one `/dev/ptmx` has no mount to ask, so the
+/// honest shape is machine-wide minting defaults, named as the divergence in
+/// `docs/notes/03-filesystem.md` §3.8.
+#[derive(Clone, Copy)]
+pub(crate) struct DevPtsOptions {
+    pub mode: u32,
+    /// The owner the mount names, or `None` for "the process that mints it".
+    pub uid: Option<u32>,
+    pub gid: u32,
+}
+
+impl DevPtsOptions {
+    /// Measured on Linux 7.2.11 with no options
+    /// (`build/scratch/devpts-probe/probe.py`): a slave is born `0600`, owned
+    /// by the minting euid, group 0. The `0620 root:tty` an init script's
+    /// `/etc/fstab` names is the *mount's* `mode=`/`gid=`, not the default.
+    pub(crate) const DEFAULT: DevPtsOptions = DevPtsOptions {
+        mode: 0o600,
+        uid: None,
+        gid: 0,
+    };
+}
+
+static DEVPTS_OPTIONS: Mutex<RefCell<DevPtsOptions>> =
+    Mutex::new(RefCell::new(DevPtsOptions::DEFAULT));
+
+/// Apply a devpts mount's options as the machine's minting defaults.
+pub(crate) fn set_devpts_options(options: DevPtsOptions) {
+    critical_section::with(|cs| *DEVPTS_OPTIONS.borrow(cs).borrow_mut() = options);
+}
+
+/// The numbers the next dynamic pair is born with.
+pub(crate) fn devpts_options() -> DevPtsOptions {
+    critical_section::with(|cs| *DEVPTS_OPTIONS.borrow(cs).borrow())
+}
+
+/// The uid a pair is born with when its devpts mount named none: the id the
+/// minting process creates files as, which is what Linux measured
+/// (`build/scratch/devpts-probe/probe3.py`: a uid-1 creator's slave is
+/// `uid=1`, and its own gid is ignored because the mount's `gid=` wins). This
+/// is the filesystem uid the VFS already judges the process's writes by - the
+/// same id every other node it creates is stamped with - rather than a second
+/// notion of "who is calling" kept for ptys alone.
+fn minting_uid() -> u32 {
+    crate::sched::current_fs_owner().0
+}
+
 /// Mint the virtual consoles. Called once, from `tty::init`, before `/dev` is
 /// built - the `ttyN` names have to have pairs behind them by the time a
 /// getty looks.
@@ -435,7 +508,14 @@ pub(crate) fn allocate(number: u32, slave_dev_id: (u32, u32), slave_mode: u32) -
         let mut pairs = PAIRS.borrow(cs).borrow_mut();
         pairs
             .entry(number)
-            .or_insert_with(|| Pty::new(number, slave_dev_id, slave_mode))
+            .or_insert_with(|| {
+                Pty::new(
+                    number,
+                    slave_dev_id,
+                    slave_mode,
+                    NodePerms::new(slave_mode, 0, 0),
+                )
+            })
             .clone()
     })
 }
@@ -449,6 +529,12 @@ pub fn vc(index: u32) -> Arc<Pty> {
 /// the same error Linux answers, and the one `posix_openpt` is specified to
 /// hand back rather than a panic or a wraparound onto a live pair.
 pub fn allocate_dynamic() -> VfsResult<Arc<Pty>> {
+    // The numbers every pair minted from here is born with: the devpts mount
+    // published them (`mode=`, `uid=`, `gid=`), and the owner is the minting
+    // process's euid when the mount named none. Both are measured, not
+    // invented (`build/scratch/devpts-probe/probe{3,4}.py`, Linux 7.2.11).
+    let options = devpts_options();
+    let uid = options.uid.unwrap_or_else(minting_uid);
     // A plain increment, retried on collision: two opens in a row on one CPU
     // cannot interleave inside the critical section, but a number that a
     // boot-time mint already took is not one to hand out twice.
@@ -462,14 +548,11 @@ pub fn allocate_dynamic() -> VfsResult<Arc<Pty>> {
             if pairs.contains_key(&number) {
                 return false;
             }
-            // A dynamic pair's slave is listed under `/dev/pts`, where the
-            // mode is devpts's mount option (Linux's default `mode=0620`) and
-            // this kernel does not implement devpts options yet - a named gap
-            // in `docs/ROADMAP.md`. So the slave keeps `0666`, the mode `stat`
-            // has always reported: this field answers the devpts question, not
-            // a devtmpfs birth, which is why it is not the measured table's
-            // number.
-            pairs.insert(number, Pty::new(number, (PTS_MAJOR, number), 0o666));
+            let perm = NodePerms::new(options.mode, uid, options.gid);
+            pairs.insert(
+                number,
+                Pty::new(number, (PTS_MAJOR, number), options.mode, perm),
+            );
             true
         }) {
             let pty = critical_section::with(|cs| PAIRS.borrow(cs).borrow()[&number].clone());
@@ -746,6 +829,31 @@ impl Inode for PtySlave {
 
     fn rdev(&self) -> Option<(u32, u32)> {
         Some(self.pty.slave_dev_id())
+    }
+
+    /// The numbers this name advertises are the pair's: what the devpts mount
+    /// published when the pair was minted, and whatever `chmod`/`chown` has
+    /// written since. `login` hands a terminal to the user who logged in on it
+    /// with exactly that `fchown`, so the write side has to land somewhere the
+    /// next lookup will find - the pair, not this short-lived node.
+    fn keeps_modes(&self) -> bool {
+        self.pty.perm.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.pty.perm.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.pty.perm.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.pty.perm.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.pty.perm.set_owner(uid, gid);
     }
 
     fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {

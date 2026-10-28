@@ -22,9 +22,9 @@
 //! render node included (a rule widens it; devtmpfs does not birth it wide).
 //!
 //! Two deliberate silences. `/dev/pts/N` is not claimed: that is devpts's
-//! number, which comes from devpts's mount options (Linux's default
-//! `mode=0620`) and not from devtmpfs's birth - this kernel does not implement
-//! devpts options yet, and folding that gap into a birth claim would hide it.
+//! number, which comes from devpts's mount options and the minting process,
+//! not from devtmpfs's birth - `t-devpts` pins that answer, and folding it into
+//! a birth claim would hide which of the two produced the number.
 //! And a node the machine does not have is not a claim either: `dri`,
 //! `fb0`, `input`, `uinput`, `hwrng`, `hvc`, `dsp` and the disks exist only on
 //! the machines whose drivers came up, so each is claimed when present and

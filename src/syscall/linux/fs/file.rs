@@ -2174,6 +2174,18 @@ pub fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Err(e) => return e,
     };
     let fstype = cstr_arg(args[2], true).unwrap_or_default();
+    // `mount(2)`'s fifth word is the option string, and each filesystem type
+    // decides what it means. A NULL pointer is Linux's "no options", not the
+    // `EFAULT` every other string argument answers, so it is tested before the
+    // bounded read rather than through it.
+    let data = if args[4] == 0 {
+        alloc::string::String::new()
+    } else {
+        match cstr_arg(args[4], true) {
+            Ok(data) => data,
+            Err(e) => return e,
+        }
+    };
 
     // Read-only is honoured, not recorded and ignored: the filesystem is told,
     // and refuses writes from then on. This is what an initramfs relies on
@@ -2250,7 +2262,7 @@ pub fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => err_of(e),
         }
     } else {
-        mount_new(&source, &target, &fstype, read_only, cwd)
+        mount_new(&source, &target, &fstype, read_only, &data, cwd)
     }
 }
 
@@ -2261,6 +2273,7 @@ fn mount_new(
     target: &str,
     fstype: &str,
     read_only: bool,
+    data: &str,
     cwd: &Arc<dyn Inode>,
 ) -> isize {
     // MS_NOSUID, MS_NODEV, MS_NOEXEC and MS_NOATIME are accepted and mean
@@ -2340,7 +2353,16 @@ fn mount_new(
             Err(e) => return err_of(e),
         },
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
-        "devpts" => crate::vfs::devpts::DevPts::new(),
+        // The only type whose option string this kernel reads today. Every
+        // other arm ignores it - a named gap rather than a silent claim, and
+        // the reason the word is threaded through here instead of parsed in
+        // `handle_mount`: a filesystem's options are its own to interpret.
+        "devpts" => {
+            if let Err(e) = crate::vfs::devpts::apply_mount_options(data) {
+                return err_of(e);
+            }
+            crate::vfs::devpts::DevPts::new()
+        }
         "tmpfs" | "ramfs" => {
             let fs = crate::vfs::ramfs::RamFs::new();
             // A tmpfs root starts out `S_IRWXUGO | S_ISVTX` - 01777 - and that

@@ -6070,3 +6070,73 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     kernel never sets. The tty class's group ownership is not applied by this
     image's udev (above); the kernel does no group-name resolution, and that stays
     udev's half.
+
+## item 111 — a pty slave is born with its devpts mount's `mode=`/`gid=`, and its owner from the minting process
+
+    §5.2 carried this as §3.4's "named remainder" — "devpts `mode=`/`gid=` mount
+    options are not applied here" — after item 110 had put every `/dev` birth
+    number on devtmpfs's measured table. The remainder was not cosmetic: an
+    image's init mounts `-o mode=0620,gid=5`, and the kernel ignored the option
+    string, so `/dev/pts/N` reported `0666 0:0` (the char-device kind default,
+    because `PtySlave` implemented no mode or owner) and `login`'s `chown` on
+    the slave had no narrowing to preserve.
+
+    **Measured first**: Linux 7.2.11 under `unshare -Urm`, two ids mapped
+    (`build/scratch/devpts-probe/probe{,2,3,4}.py`). An option-less mount births
+    the slave `0600 0:0` — the kernel's own default, not the `0620` a comment
+    here once claimed; `mode=` sets the permission bits, `gid=` the group,
+    `uid=` overrides the minting euid (the default owner), the minting process's
+    *group* is ignored because the mount's `gid=` wins, an unknown option fails
+    the mount with `EINVAL` (measured with `nonsense=1`), and each mount is its
+    own instance by default (two mounts in one namespace, `0600` and `0640`,
+    each `ptmx` handing out its own numbers). The host's own `/dev/pts/0` is
+    `600 mp:tty`, its `mountinfo` line `gid=5,mode=600,ptmxmode=000`.
+
+    **Landed**: `src/vfs/pty.rs` publishes one machine-wide `DevPtsOptions`
+    (`mode`, `uid: Option<u32>`, `gid`; measured `DEFAULT { 0o600, None, 0 }`);
+    `allocate_dynamic` mints each pair with the mount's `mode` and
+    `NodePerms::new(options.mode, options.uid.unwrap_or_else(minting_uid),
+    options.gid)`, where `minting_uid()` is `sched::current_fs_owner().0` — the
+    id every node the process creates is stamped with. The permission store sits
+    on the **pair** (`Pty::perm`), because a `PtySlave` is constructed per lookup
+    and a per-node store would lose `chmod`/`chown` between two `stat`s;
+    `PtySlave` forwards `keeps_modes/mode/set_mode/owner/set_owner` to it, which
+    is also what makes `stat` answer the mount's number instead of the kind
+    default. `src/vfs/devpts.rs` gains `apply_mount_options(data)`: `mode=`
+    octal (masked `0o7777`), `uid=`/`gid=` decimal, `newinstance`/`ptmxmode=`/
+    `max=` → `EOPNOTSUPP`, anything else → `EINVAL`, each mount starting from
+    `DEFAULT`. `handle_mount` in `src/syscall/linux/fs/file.rs` now reads its
+    fifth argument (NULL is "no options", not `EFAULT`) and `mount_new` hands it
+    to the filesystem that owns it — only `"devpts"` interprets it today.
+
+    **Named divergences**, refused rather than faked: Linux gives each mount its
+    own devpts instance because `/dev/pts/ptmx` exists under each mount; this
+    kernel has one `/dev/ptmx` and one registry, so a mount's options are the
+    machine's minting defaults from then on and a pair's numbers are fixed at
+    mint. `newinstance` (already the effective behaviour), `ptmxmode=` (no node
+    to apply it to) and `max=` (nothing to bound) answer `EOPNOTSUPP`. Options
+    for every other filesystem type are still ignored — a named pre-existing
+    gap, unchanged. Remount options stay unapplied as well: `MS_REMOUNT` still
+    carries only read-only, and that gap keeps its own name.
+
+    **Pin**: the new `t-devpts`, both machines — an option-less mount births
+    `0600 0:0`; `mode=0640,gid=5` births `0640 0:5`; `mode=0620` births
+    `0620 0:0`; the mount's own root view agrees; a pair born under the first
+    mount keeps its numbers after two later mounts; a `chown` moves the owner and
+    leaves the mode; `nonsense=1` and `mode=zz` are `EINVAL`; `newinstance`,
+    `ptmxmode=0666` and `max=2` are `EOPNOTSUPP`; a mount on a regular file is
+    `ENOTDIR`. Host tests `a_mount_publishes_the_numbers_its_options_name`,
+    `an_option_this_kernel_cannot_make_true_is_refused`,
+    `a_dynamic_pair_is_born_with_the_mounts_numbers` pin the parse table, the
+    refusals and the pair's ownership; the devpts listing test now judges the
+    console's absence by device (major 4), since the first dynamic pair
+    legitimately holds number 1.
+
+    **Counterfactual**: the pre-item pair body — minted `0o666`, no mount
+    numbers — x86_64 `pass=217 fail=1 (218 built)`, `t-devpts` red on exactly
+    five claims, each `(is 0666 …)`: the option-less default, `mode=0640,gid=5`,
+    `mode=0620`, "the first pair, after two later mounts", and the mode half of
+    the chown claim. Restored: x86_64 `pass=218 fail=0`, aarch64 `pass=217
+    fail=0`, `mpos-kunit 34 passed` on both, host suite 647 passed.
+
+    Full record: `docs/notes/03-filesystem.md` §3.8.

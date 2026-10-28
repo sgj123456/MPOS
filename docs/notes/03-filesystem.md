@@ -232,7 +232,8 @@ call (docs/uapi/ §5.1 item 13, §15.32, §15.35).
   `hwrng`, `hvc`/`hvc0`, `dsp`/`rtc`, and the block node — each claim skipped,
   not failed, on a machine without the device. No claim is made for `/dev/pts/N`:
   devpts `mode=`/`gid=` mount options are not applied here (a named remainder,
-  not folded into this item). `t-dsp`'s chmod cases now widen deliberately to
+  not folded into this item) - devpts's `mode=`/`gid=` options and the minting
+  owner are §3.8's question (item 111). `t-dsp`'s chmod cases now widen deliberately to
   `0666` and restore `0600` — chmod still stores, and the birth number is
   separate from it.
 - Host-tested: `a_triad_decides_who_may_do_what` (incl. supplementary groups), `root_passes_everything_but_execute_on_a_file_nobody_made_runnable`, `may_as_answers_for_the_node_and_the_identity_it_is_given`, `the_birth_table_is_the_measured_one`, `a_node_is_born_with_devtmpfs_s_mode_for_its_class`.
@@ -347,4 +348,89 @@ Full record: `docs/uapi/` §5.1 item 90.
 
 ---
 
+### 3.8 A pty slave is born with its devpts mount's numbers — **DONE** (2026-10-28)
 
+**Why**. An Alpine image's init mounts devpts with `-o mode=0620,gid=5`, and
+`login` hands the terminal over with a `chown` on the slave. This kernel's
+`mount(2)` never read its fifth argument at all, so every `/dev/pts/N` reported
+`0666 0:0`: `PtySlave` implemented neither `mode()` nor `keeps_modes()`, and
+`reported_mode` therefore fell through to the char-device kind default
+(`0o020_666`). The number a terminal program reads in `stat` was a lie with a
+plausible face, and the hand-over could not narrow it.
+
+**Measured first** — Linux 7.2.11, probes under `unshare -Urm` with two ids
+mapped (`build/scratch/devpts-probe/probe{,2,3,4}.py`):
+
+| mount | slave `stat` |
+|---|---|
+| no options | `0600 0:0` — the kernel's own default, *not* `0620` |
+| `mode=0620,ptmxmode=0666` | `ptmx 0666`, slave `0620 0:0` |
+| `mode=0640,gid=1`, creator uid 1 gid 1 | `0640 1:1` |
+| the same mount, creator uid 1 gid **0** | `0640 1:1` — the creator's gid is ignored, `gid=` wins |
+| `uid=1`, creator root | `uid=1` — `uid=` overrides the minting euid, whose value is otherwise the default |
+| `nonsense=1` | the mount fails, rc 32 (`EINVAL`) |
+
+Two more readings shaped the design. **Each mount is its own instance by
+default**: two mounts in one namespace with `0600` and `0640` handed out those
+numbers from their own `ptmx`, without `newinstance`. And the host's own
+`/dev/pts/0` is `600 mp:tty` — its `mountinfo` line is
+`devpts devpts rw,gid=5,mode=600,ptmxmode=000`, the uid being whoever minted.
+
+**The divergence, named rather than hidden.** Linux can give each mount its own
+instance because `/dev/pts/ptmx` exists under each mount and a caller opens the
+one it means. This kernel has **one** `/dev/ptmx` and one pair registry, so a
+mount's options are the machine's minting defaults from then on, and a pair's
+numbers are fixed when it is minted — a later mount does not repaint the pairs
+that already exist. `newinstance` (already the effective behaviour), `ptmxmode=`
+(no `/dev/pts/ptmx` node to apply it to) and `max=` (no accounting to bound) are
+therefore refused `EOPNOTSUPP` rather than accepted and dropped; an option the
+kernel does not know is `EINVAL`, as Linux measured. Options handed to any other
+filesystem type are still ignored — a named, pre-existing gap, unchanged here.
+
+**Landed.** `src/vfs/pty.rs` carries `DevPtsOptions { mode, uid: Option<u32>,
+gid }` with the measured `DEFAULT { 0o600, None, 0 }`, one machine-wide
+`DEVPTS_OPTIONS` behind it, and `minting_uid()` = `sched::current_fs_owner().0`
+— the filesystem uid every node the process creates is stamped with, which is
+the id the measurement says a slave takes. The permission store lives on the
+**pair** (`Pty::perm`), not on a slave node: `PtySlave` is constructed fresh per
+lookup, so a mode or owner kept there would be lost between two `stat`s, while
+`login`'s `chown` has to stick. `PtySlave` forwards
+`keeps_modes/mode/set_mode/owner/set_owner` to `Pty::perm`, which is also what
+makes `stat` report the mount's number instead of the kind default.
+`allocate_dynamic` mints each new pair with `options.mode` and
+`NodePerms::new(options.mode, options.uid.unwrap_or_else(minting_uid), options.gid)`.
+
+`src/vfs/devpts.rs` gains `apply_mount_options(data)`: comma-split fields,
+`mode=` parsed octal and masked `0o7777`, `uid=`/`gid=` decimal,
+`newinstance`/`ptmxmode=`/`max=` → `Unsupported`, anything else → `Invalid`, and
+the result published as the machine's minting defaults (starting from `DEFAULT`
+each mount, so a no-option mount resets them). `handle_mount` in
+`src/syscall/linux/fs/file.rs` now reads its fifth argument — a NULL pointer is
+Linux's "no options", not the `EFAULT` every other string argument answers — and
+`mount_new` takes it; only the `"devpts"` arm interprets it, because a
+filesystem's options are its own to interpret.
+
+**Pinned** by `t-devpts` (new, both machines): an option-less mount births
+`0600 0:0`; `mode=0640,gid=5` births `0640 0:5`; `mode=0620` births `0620 0:0`;
+the mount's own root view agrees; a pair born under the first mount still reads
+its own numbers after two later mounts; a `chown` moves the owner and leaves the
+mode; `nonsense=1` and `mode=zz` are `EINVAL`; `newinstance`, `ptmxmode=0666`
+and `max=2` are `EOPNOTSUPP`; mounting devpts on a regular file is `ENOTDIR`.
+Host tests `a_mount_publishes_the_numbers_its_options_name`,
+`an_option_this_kernel_cannot_make_true_is_refused` and
+`a_dynamic_pair_is_born_with_the_mounts_numbers` pin the parse table, the
+refusals and the pair's ownership. The listing test now judges the console's
+absence by *device* (major 4) rather than by the name `1`: the first
+dynamically minted pair legitimately holds that number, and the old assertion
+would redden on a test-order accident rather than on a regression.
+
+**Counterfactual** — the pre-item pair body (minted `0o666` with no mount
+numbers, `// TEMP-CF`): x86_64 `pass=217 fail=1 (218 built)`,
+`self-test: 1 test(s) did not pass`, and `t-devpts` red on exactly five claims,
+each `(is 0666 …)` — the option-less default, `mode=0640,gid=5`, `mode=0620`,
+"the first pair, after two later mounts", and the mode half of the chown claim.
+Restored: **x86_64 `pass=218 fail=0`** (8.64 s stage 2, `mpos-kunit 34 passed`),
+**aarch64 `pass=217 fail=0`** (22.71 s, `mpos-kunit 34 passed`), host suite
+647 passed.
+
+Full record: `docs/uapi/` §5.1 item 111.

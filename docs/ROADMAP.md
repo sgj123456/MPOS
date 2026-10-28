@@ -42,12 +42,13 @@ One-glance status of the whole roadmap.
   `MSG_NOSIGNAL` suppresses it, a blocked signal waits pending, and the measured
   exemptions hold: a seqpacket send is `EPIPE` silently, a datagram's dead peer is
   `ECONNREFUSED` once and then `ENOTCONN` (§4.1.13, item 97)
-- [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — with  
+- [x] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — with  
   `fstatfs` naming the filesystem the descriptor was *opened on* (§3.6, item 89), every instance  
   carrying a non-zero `f_fsid` (§3.7, item 90), and the access clock moving on read under  
   `relatime`/`strictatime` with `O_NOATIME` honoured (§3.3, item 108), and a `/dev` node born  
-  with devtmpfs's own number while the image's udev does the widening (§3.4, item 110); what  
-  stays open is a pty slave's devpts `mode=`/`gid=` mount options (§3.4's named remainder)
+  with devtmpfs's own number while the image's udev does the widening (§3.4, item 110), and a  
+  pty slave born with its devpts mount's `mode=`/`gid=` and owned by the minting process  
+  (§3.8, item 111)
 
 **Networking (Phase 4)**
 
