@@ -331,10 +331,15 @@ One-glance status of the whole roadmap.
 - [x] weston's EL0 write fault above its stack — resolved by `resolve_stack_growth` on the aarch64 EL0 data-abort path; the desktop comes up whole (R.7, §15.36)
 - [ ] [~] the cursor plane drives a host pointer: the card, the queue, the transfer, the read-back and the aliasing are all cleared by weston-free probes, and the image's emptiness is now **measured at its source** — an interposer logging `gbm_bo_write`'s own input reads `buf=00000000…`: weston writes 16384 zero bytes and the write faithfully copies them. `gbm_bo_write` also only fires when the sprite changes, so a session where desktop-shell never comes up shows no write at all. Controls: a magenta block bound by a weston-free probe reaches the host (`nz=3072`); write-only mappings (`PROT_WRITE` alone, which is what weston asks for) alias across processes; every handle slot works; a plain process's `gbm_bo_write` lands. Remaining: weston's own cursor image, which it writes as 16 KiB of zeros into an object Mesa does not make the plane's backing — the epoll report fix that completed desktop-shell's startup does not touch it (§7.4, R.7)
 - [x] epoll reports `revents & interest`: `EPOLLRDNORM` used to be set beside every `EPOLLIN`, so `weston-desktop-shell` — which registers its timerfd for `EPOLLIN` alone — printed `unexpected timerfd events 41` (hex) for every expiry, never read its timer and never finished starting up. Fixed in `vfs::epoll::report`; pinned by a timerfd case in `t-epoll` and by three host tests whose expectations were themselves the bug (§1.1)
-- [ ] [~] 3D / virgl / venus (`DRM_VIRTGPU_*`) — served and pinned, and *negotiated* on a  
-  `virtio-gpu-gl-pci` boot (`virgl=1 capsets=2`); the renderer is still `llvmpipe`, because  
-  Mesa cannot identify the node its devpath names, and the GL card is not the gate's default  
-  yet (QEMU returns no clean exit) (§7.4, R.15)
+- [ ] [~] 3D / virgl / venus (`DRM_VIRTGPU_*`) — served and pinned, and *negotiated* on a
+  `virtio-gpu-gl-pci` boot (`virgl=1 context_init=1 capsets=2 mask=0x6`). **The renderer is
+  virgl now** — `eglinfo` on the GBM/device platforms and `kmscube` both report `virgl (AMD
+  Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...))`, EGL 1.5, Mesa 26.2.5, GLES 3.2, and
+  udev/`ID_PATH` under the PCI function are in place — so the llvmpipe reading this row used
+  to carry, and the devpath lead it named, were both stale. What is *not* there is
+  presentation: a client's frame never reaches the scanout (four QMP screendumps
+  pixel-identical to the boot console; 82 `RESOURCE_CREATE` on the wire, no scanout switch)
+  (§7.4)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 
@@ -383,8 +388,10 @@ One-glance status of the whole roadmap.
   (§7.4)
 - [ ] [~] the property families a compositor finds by name — four built, three deliberately absent (§7.4, `t-drm-props`)
 - [ ] [~] the DRM surface a wlroots pixman compositor needs — in place, never booted (§7.4)
-- [ ] the renderer Mesa would have to pick: `is_software()` stays true until its loader can  
-  identify the card, which the node's `virtual/…` devpath is the standing lead for (§7.4)
+- [x] the renderer Mesa picks: **virgl**, measured on the current tree (Mesa 26.2.5, GLES
+  3.2; `eglinfo -B -p gbm` rc=0 and `kmscube` agree) — the loader identifies the card through
+  the node's sysfs identity (`ID_PATH` under the PCI function), not the `virtual/…` devpath
+  the old lead pointed at (§7.4)
 
 **Security (Phase 8)**
 

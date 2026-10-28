@@ -6088,3 +6088,70 @@ The test also had three host-only bugs this exposed: its walk loops accepted onl
 `PTRACE_O_TRACESYSGOOD` before asking for a call number (so Linux reported `NONE`
 at every boundary), and it read a `-1` word as an error because `errno` was not
 cleared before the call.
+
+## The renderer the GL card actually picks — measured 2026-10-29 — and the frame that does not reach the scanout
+
+The record this file ended on (and the ROADMAP rows it fed) said the renderer on a
+`virtio-gpu-gl-pci` boot was still **llvmpipe**, because Mesa could not identify the
+node its devpath named, and that the devpath under `virtual/` was the standing lead.
+Both halves of that sentence are now measured false on the current tree, and the
+remaining gap is a different one: a client renders with the GL card and its frame
+still does not reach the scanout.
+
+The instrument is the one the record names — the desktop image booted under QEMU with
+a temporary `/etc/local.d/zz-probe.start` and the mirror console (`console=ttyS0
+console=tty0`), so the kernel's own output and the probe's are both on the serial.
+The image was rebuilt from the current tree (`cargo xtask build --arch x86_64`, then
+the boot files refreshed through `MPOS_XTASK_MODE=mirror`), so nothing below is a
+reading of a stale image. The probe's findings were read back from the root
+partition's `/root/probe.txt` after the boot.
+
+**The card, on this tree.** `/dev/fb0` is `1280x800, 4000 KiB`, and the 3D half is
+negotiated:
+
+    virtio-gpu: 1280x800, 4000 KiB at /dev/fb0
+    virtio-gpu: virgl=1 context_init=1 cursorq=1 capsets=2 cached=2 mask=0x6
+
+**The node's identity is real, and it is under the PCI function.**
+`readlink -f /sys/class/drm/card0` → `/sys/devices/pci0000:00/0000:00:04.0/drm/card0`;
+`class/card0/device` and `dev/char/226:0/device` both → `../..`; the function's
+`subsystem` → `/sys/bus/pci`. udev runs and its database has walked the path:
+`/run/udev/data/c226:0` carries `E:ID_PATH=pci-0000:00:04.0`,
+`E:ID_PATH_TAG=pci-0000_00_04_0`, `S:dri/by-path/pci-0000:00:04.0-card`, and
+`udevadm test /sys/class/drm/card0` ends with `DEVLINKS=/dev/dri/by-path/pci-0000:00:04.0-card`.
+
+The "no `ID_PATH`" reading an earlier probe reported was an artifact of the query
+form, not a defect: `udevadm info -q all -n /dev/dri/card0` prints the `P:`/`N:`/`S:`
+and `E:` lines it derives, but not the database's own `E:ID_PATH` variables; asking
+the database (`/run/udev/data/…`) or running the rule (`udevadm test`) shows them.
+Both defects the earlier record named — udev never started, the node said it was
+virtual — are closed.
+
+**The renderer is virgl.** `eglinfo -B -p gbm` exits 0 and reports on the GBM,
+surfaceless and device platforms:
+
+    OpenGL core profile renderer: virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...))
+    OpenGL ES profile version: OpenGL ES 3.2 Mesa 26.2.5
+    EGL version: 1.5
+
+`kmscube` agrees and runs a frame loop on this renderer — EGL 1.5 with the GBM and
+`dma_buf`-import extension set, `OpenGL ES 3.2 Mesa 26.2.5`, GLSL ES 3.20, `renderer:
+"virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...)"`, and no error line
+in its 5.5 KiB of output. It is killed only because it loops forever: with
+`timeout -s KILL 12` it dies at the budget (`rc=137`), which is the group-death fix
+(`06-process-management.md` §6.37) doing its job.
+
+**The frame does not reach the scanout.** Four QMP `screendump`s taken 6 s apart
+while `kmscube` was running are **pixel-identical**: 1280×800, 15 790 non-black
+pixels (1.54 %), top colours `(0,0,0)` ×1 008 210, `(7,7,7)` ×7 760 — the static
+boot-console text on `fb0`, not a cube and not even a black client frame. On the
+wire the same boot carries **82 `mpos-dbg: RESOURCE_CREATE` lines** — `handle 1
+(target 2, 1280x800)` plus the cursor's `864x1` and `8x1` — and nothing else from
+the command set: no scanout switch, no backing attach, no transfer, no 3D submit.
+The client's per-frame buffer creates reach the kernel; its presentation does not.
+
+So the next lead is the presentation half and not the renderer: what a client's
+`drmModeSetCrtc`/atomic commit does on this driver, whether it reaches
+`SET_SCANOUT` at all, and whether the resource it names is the one the 3D context
+rendered into. That is a question for the DRM door's own logging and for a probe
+that asks the kernel what it last scanned out, not for another Mesa-side interposer.
