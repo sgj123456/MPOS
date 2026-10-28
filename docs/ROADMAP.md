@@ -211,7 +211,14 @@ One-glance status of the whole roadmap.
   rather than a filter, and a session ring inherited across `fork`; quota and the
   named gaps (no `request_key` upcall, possession walk without the link's `SEARCH`,
   no delayed GC of orphaned keys) are §6.30, item 113
-- [ ] `fanotify_init`/`fanotify_mark`
+- [x] `fanotify_init`/`fanotify_mark` (300/301; 262/263 aarch64) — the
+  notification class with records on a group descriptor and one mark per inode:
+  `EPERM` for a non-uid-0 caller, the content classes and every `FAN_REPORT_*`
+  / `FAN_UNLIMITED_*` / `FAN_ENABLE_AUDIT` shape refused `EOPNOTSUPP` by name,
+  mount/filesystem marks refused for want of inode-to-mount ancestry, and the
+  24-byte record's `pid` the causing task — all measured as real root on Linux
+  7.2.11 because the call needs `CAP_SYS_ADMIN` in the initial namespace (§3.9,
+  item 114)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
   one call; `CLONE_DETACHED` refused as Linux's own `clone3` refuses it, the
@@ -531,7 +538,7 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-`fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;  
+`userfaultfd`, the three `io_uring` numbers and rseq side-objects stay `ENOSYS` (the `fanotify` notification class and the kernel keyring are served); xattrs validate then `EOPNOTSUPP`;  
 the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
 shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
 and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  

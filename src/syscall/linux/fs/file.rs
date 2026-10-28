@@ -423,6 +423,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // reopening a direction that was refused.
                 file.set_access((flags & O_ACCMODE) as u32);
                 crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
+                crate::vfs::fanotify::notice_open(&file.inode());
                 // An evdev client's read position starts here, at the
                 // description that will do the reading: Linux hands a client
                 // its own event buffer at `open`, so an event that arrives
@@ -714,6 +715,7 @@ pub fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
             // both directions of `ftruncate` on a `4755` file store `0755`).
             crate::vfs::remove_privs(&file.inode());
             crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_MODIFY, "");
+            crate::vfs::fanotify::notice_modify(&file.inode());
             0
         }
         Err(e) => err_of(e),
@@ -772,6 +774,7 @@ pub fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             // descriptor: the resize costs the file its set-id bits.
             crate::vfs::remove_privs(&inode);
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_MODIFY, "");
+            crate::vfs::fanotify::notice_modify(&inode);
             0
         }
         Err(e) => err_of(e),
@@ -1377,6 +1380,7 @@ fn store_times(inode: &Arc<dyn Inode>, atime: u64, mtime: u64, shape: TimesShape
     match inode.set_times(atime, mtime) {
         Ok(()) => {
             crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_ATTRIB, "");
+            crate::vfs::fanotify::notice_attrib(inode);
             0
         }
         Err(e) => err_of(e),
@@ -3730,6 +3734,7 @@ fn socket_write(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 pub(crate) fn notice_access(fd: i32) {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         crate::vfs::inotify::emit_access(&file.inode());
+        crate::vfs::fanotify::notice_access(&file.inode());
     }
 }
 
@@ -3743,6 +3748,7 @@ pub(crate) fn notice_access(fd: i32) {
 pub(crate) fn notice_modify(fd: i32) {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         crate::vfs::inotify::emit_write(&file.inode());
+        crate::vfs::fanotify::notice_modify(&file.inode());
     }
 }
 
@@ -3905,6 +3911,7 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
     // answered EADDRINUSE on a machine that had just booted.
     crate::net::socket::close_last_socket(&file);
     crate::vfs::inotify::close_last(&file);
+    crate::vfs::fanotify::close_last(&file);
     // The evdev client's read position dies with the description too - and it
     // is asked *after* the close, where "last" is knowable: a `dup` is the same
     // reader and has to keep its place, so only the descriptor that took the
@@ -4658,6 +4665,7 @@ pub fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Ok(mode) => {
                 inode.set_mode(mode);
                 crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                crate::vfs::fanotify::notice_attrib(&inode);
                 0
             }
             Err(e) => e,
@@ -4675,6 +4683,7 @@ pub fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
                 Ok(mode) => {
                     inode.set_mode(mode);
                     crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                    crate::vfs::fanotify::notice_attrib(&inode);
                     0
                 }
                 Err(e) => e,
@@ -4795,6 +4804,7 @@ fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
     };
     inode.set_owner(uid, gid);
     crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_ATTRIB, "");
+    crate::vfs::fanotify::notice_attrib(inode);
     // What the chown takes away - see the function's table. Nothing here asks
     // the caller's ids or its capabilities, because the measurement says no
     // caller's does: the two bits go for root holding the whole set as they do
@@ -5449,6 +5459,145 @@ pub fn handle_inotify_init1(args: [usize; ARG_COUNT]) -> isize {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
     fd as isize
+}
+
+/// `fanotify_init(flags, event_f_flags)` — a fresh notification group.
+///
+/// Linux asks `CAP_SYS_ADMIN` for this call, and the measurement is what makes
+/// the shape non-negotiable: an ordinary user is refused `EPERM` before a flag
+/// word is looked at, and so is a process that is uid 0 inside a user
+/// namespace - the capability in the *initial* namespace is what the call
+/// wants. This kernel has one authority class that stands for it, uid 0, the
+/// same spelling the keyring's privileged test takes (`sched::keys`).
+///
+/// The order after the privilege test is Linux's, measured on a real-root
+/// Linux 7.2.11 (`build/scratch/fanokey/fanotify_probe.c`): a bit outside the
+/// uapi's words is `EINVAL`; the content classes, the `FAN_REPORT_*` shapes,
+/// `FAN_ENABLE_AUDIT` and the two `FAN_UNLIMITED_*` limits are shapes this
+/// kernel does not serve, and each is refused `EOPNOTSUPP` by name rather than
+/// answered as if it were the notification class.
+pub fn handle_fanotify_init(args: [usize; ARG_COUNT]) -> isize {
+    if crate::sched::current_fs_owner().0 != 0 {
+        return err::EPERM;
+    }
+    let flags = args[0] as u32;
+    let event_f_flags = args[1] as u32;
+    let nonblock = match crate::vfs::fanotify::init_accepts(flags) {
+        Ok(nonblock) => nonblock,
+        Err(crate::vfs::VfsError::Unsupported) => return err::EOPNOTSUPP,
+        Err(_) => return err::EINVAL,
+    };
+    if crate::vfs::fanotify::event_flags_accepts(event_f_flags).is_err() {
+        return err::EINVAL;
+    }
+    let event_cloexec = event_f_flags & abi::O_CLOEXEC as u32 != 0;
+    let Some(group) = crate::vfs::fanotify::group_new(nonblock, event_cloexec) else {
+        // The system-wide group cap, answered with the descriptor-table's own
+        // refusal - the shape `inotify_init1` uses for its cap.
+        return err::EMFILE;
+    };
+    let inode: alloc::sync::Arc<dyn crate::vfs::Inode> = group;
+    let fd = match crate::vfs::open_inode(inode) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    // Measured: `fcntl(F_GETFL)` on a fanotify group answers `O_RDWR` (2),
+    // where an inotify queue answers `O_RDONLY` - the group fd is both the
+    // reader and, for the content classes, the responder. This kernel serves
+    // the reading half, and still reports the word Linux reports.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        file.set_access(crate::vfs::file::ACC_RDWR);
+    }
+    if flags & crate::vfs::fanotify::FAN_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    fd as isize
+}
+
+/// `fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)` — put one mark in
+/// a group, or take one out.
+///
+/// The object is either the `dirfd` descriptor itself (a NULL name is Linux's
+/// "that descriptor is the object", measured: a NULL name beside `dirfd = -1`
+/// is `EBADF`) or the name resolved from it. `FAN_MARK_INODE` is the only mark
+/// type this kernel serves; the mount and filesystem scopes are refused
+/// `EOPNOTSUPP` by name, because the tree here has no inode-to-mount ancestry
+/// to answer "is this object in that mount" without guessing.
+pub fn handle_fanotify_mark(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let fd = args[0] as i32;
+    let flags = args[1] as u32;
+    let mask = args[2] as u64;
+    let dirfd = args[3] as i32;
+    let name = args[4];
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(group) = inode.as_fanotify() else {
+        return err::EBADF;
+    };
+    if mask > u32::MAX as u64 {
+        return err::EINVAL;
+    }
+    let mask = mask as u32;
+    match crate::vfs::fanotify::mark_flags_accepts(flags) {
+        Ok(()) => {}
+        Err(crate::vfs::VfsError::Unsupported) => return err::EOPNOTSUPP,
+        Err(_) => return err::EINVAL,
+    }
+    if flags & crate::vfs::fanotify::FAN_MARK_FLUSH != 0 {
+        crate::vfs::fanotify::mark_flush(group);
+        return 0;
+    }
+    let target = if name == 0 {
+        let file = match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => file,
+            Err(e) => return err_of(e),
+        };
+        file.inode()
+    } else {
+        let path = match cstr_arg(name, true) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+        let base = match base_for(dirfd, &path, cwd) {
+            Ok(base) => base,
+            Err(e) => return e,
+        };
+        match crate::vfs::resolve_at(&path, base) {
+            Ok(inode) => inode,
+            Err(e) => return err_of(e),
+        }
+    };
+    match crate::vfs::fanotify::mark_mask_accepts(mask) {
+        Ok(()) => {}
+        Err(crate::vfs::VfsError::Unsupported) => return err::EOPNOTSUPP,
+        Err(_) => return err::EINVAL,
+    }
+    if flags & crate::vfs::fanotify::FAN_MARK_ONLYDIR != 0
+        && target.metadata().kind != crate::vfs::NodeKind::Dir
+    {
+        return err::ENOTDIR;
+    }
+    let key = crate::vfs::inotify::key_of(&target);
+    if flags & crate::vfs::fanotify::FAN_MARK_ADD != 0 {
+        match crate::vfs::fanotify::mark_add(group, key, mask) {
+            Ok(()) => 0,
+            Err(e) => err_of(e),
+        }
+    } else {
+        // `FAN_MARK_REMOVE`: an object with no mark is `ENOENT` (the shape
+        // `fanotify_mark`'s man page names, and the one the inotify sibling's
+        // refusal in this file answers the same way).
+        match crate::vfs::fanotify::mark_remove(group, key, mask) {
+            Some(()) => 0,
+            None => err::ENOENT,
+        }
+    }
 }
 
 /// `inotify_add_watch(fd, pathname, mask)` — watch one inode.
@@ -6215,6 +6364,7 @@ pub fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
             Ok(mode) => {
                 inode.set_mode(mode);
                 crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                crate::vfs::fanotify::notice_attrib(&inode);
                 0
             }
             Err(e) => e,
@@ -6260,6 +6410,7 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
             Ok(mode) => {
                 inode.set_mode(mode);
                 crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                crate::vfs::fanotify::notice_attrib(&inode);
                 0
             }
             Err(e) => e,
@@ -6287,6 +6438,7 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(mode) => {
             inode.set_mode(mode);
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+            crate::vfs::fanotify::notice_attrib(&inode);
             0
         }
         Err(e) => e,

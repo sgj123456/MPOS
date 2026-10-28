@@ -227,8 +227,8 @@ graph LR
 
 `src/syscall/linux/nr.rs` 命名了 **256 个 Linux x86_64 系统调用号**；每一个都由
 `src/syscall/linux/mod.rs` 中的分发表路由，其中约 238 个真正工作——剩下的少数几个回答
-`ENOSYS`，由 `docs/notes/` 作为剩余 ABI 缺口追踪记录（`fanotify`、`keyctl`、`userfaultfd`、
-实时信号 33–64、`io_uring`）。POSIX 间隔定时器（`timer_create` 222 … `timer_delete` 226）
+`ENOSYS`，由 `docs/notes/` 作为剩余 ABI 缺口追踪记录（`userfaultfd`、实时信号 33–64、
+`io_uring`、rseq）。POSIX 间隔定时器（`timer_create` 222 … `timer_delete` 226）
 以它们本来的五个调用号加入了真正工作的集合；`SIGRTMIN`（32）可以被排队、屏蔽和等待——
 那是 musl 的 `SIGEV_THREAD` 辅助函数唯一需要的实时信号号——而针对它的*处置方式*及其上方的
 整个范围仍然被拒绝。

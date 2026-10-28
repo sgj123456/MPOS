@@ -300,6 +300,8 @@ A call absent from those is served as its phase section records.
 | `process_madvise` | 440 | proc | 440 |
 | `epoll_pwait2` | 441 | fs | 441 |
 | `futex_waitv` | 449 | proc | 449 |
+| `fanotify_init` | 300 | fs | 262 |
+| `fanotify_mark` | 301 | fs | 263 |
 | `fchmodat2` | 452 | fs | 452 |
 | `cleanup_after_kthread` | 999 | kernel | 999 | (the kernel's own kthread-cleanup hook, named by number so the ABI stays Linux-shaped; there is no Linux syscall at 999 on either machine's table)
 
@@ -310,24 +312,22 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| `fanotify_init` | 300 | Filesystem-wide event notification | A fanotify watch/mark engine and permission events |
-| `fanotify_mark` | 301 | " | " |
 | `userfaultfd` | 323 | Userspace page-fault handling | Fault forwarding to a user task + `UFFDIO_*` |
 | `io_uring_setup` | 425 | Async I/O rings | A ring ABI, SQ/CQ, registration — deferred by design (§1.3) |
 | `io_uring_enter` | 426 | " | " |
 | `io_uring_register` | 427 | " | " |
 
-> The numbers for `fanotify` above are the header's (`300`/`301`), and `docs/notes/`'s board
-> entry that says `302`/`303` is a typo for them — `t-enosys` pins `300`/`301`, which is
-> what a caller sends.
->
-> `keyctl` (250) has since moved out of this table: the kernel keyring is served
-> (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on aarch64),
-> pinned by `t-keyctl` and written up as item 113 with the measured shape in
-> `docs/notes/06-process-management.md` §6.30. What stays refused here is the
-> `fanotify` pair, `userfaultfd`, the three `io_uring` numbers and `rseq`.
+> Two families have since moved out of this table. `keyctl` (250): the kernel keyring is
+> served (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on
+> aarch64), pinned by `t-keyctl`, written up as item 113 with the measured shape in
+> `docs/notes/06-process-management.md` §6.30. `fanotify_init` (300)/`fanotify_mark`
+> (301): the notification class is served (262/263 on aarch64), pinned by `t-fanotify`,
+> written up as item 114 and `docs/notes/03-filesystem.md` §3.9. What stays refused here
+> is `userfaultfd`, the three `io_uring` numbers and `rseq` — and the `fanotify` call
+> itself now refuses only the shapes it does not serve (the content classes and the
+> mount/filesystem scopes), each by name.
 
-`rseq` (334) is the seventh: like the six above it has no dispatch arm, but unlike them it
+`rseq` (334) is the fifth: like the four above it has no dispatch arm, but unlike them it
 *once had* one that returned `0` without writing any of the fields the ABI contract puts in
 the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
 named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration

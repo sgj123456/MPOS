@@ -538,6 +538,7 @@ impl File {
             crate::vfs::remove_privs(&self.inode);
             if report {
                 crate::vfs::inotify::emit_write(&self.inode);
+                crate::vfs::fanotify::notice_modify(&self.inode);
             }
         }
         Ok(n)

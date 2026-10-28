@@ -1,9 +1,10 @@
 //! t-enosys - the calls this kernel has no dispatch arm for.
 //!
-//! Pinned here: fanotify_init(300), fanotify_mark(301), userfaultfd(323),
-//! io_uring_setup(425), io_uring_enter(426) and io_uring_register(427) all
-//! answer ENOSYS. (`keyctl` used to be on this list; it is served now, so the
-//! family's pin is `t-keyctl` rather than a refusal here.) That is the answer a libc reads
+//! Pinned here: userfaultfd(323), io_uring_setup(425), io_uring_enter(426)
+//! and io_uring_register(427) all answer ENOSYS. (`keyctl` used to be on this
+//! list; it is served now, so the family's pin is `t-keyctl` rather than a
+//! refusal here. `fanotify_init`/`fanotify_mark` left the same way: their pin
+//! is `t-fanotify`.) That is the answer a libc reads
 //! as "this optional call is not available"; the numbers come from libc's
 //! per-machine table, and the kernel's table has no constant or handler for
 //! any of them, so each one falls through the default arm. A call the kernel
@@ -20,11 +21,10 @@
 //!
 //! Every claim is `libc::syscall(SYS_*)`, clause (a): none of these calls is
 //! something either library would name - the program's subject is the number
-//! falling through. On the second machine four of the seven carry different
-//! numbers (fanotify 262/263, userfaultfd 282); the two io_uring pairs and
-//! the x86_64 fanotify/userfaultfd numbers match Linux's tables,
-//! which is exactly why the numbers are read from libc rather than written
-//! down here.
+//! falling through. On the second machine one of the four carries a different
+//! number (userfaultfd 282); the io_uring pair matches Linux's tables, which
+//! is exactly why the numbers are read from libc rather than written down
+//! here.
 
 use mpos_user_tests::Report;
 
@@ -32,7 +32,7 @@ fn probe(nr: libc::c_long) -> bool {
     let r = unsafe { libc::syscall(nr, 0usize, 0usize, 0usize) };
     refused(r as isize, libc::ENOSYS)
         // On a current host these calls are *served* (keyctl EPERM,
-        // fanotify EINVAL, userfaultfd EINVAL/EAGAIN, io_uring EINVAL -
+        // userfaultfd EINVAL/EAGAIN, io_uring EINVAL -
         // measured here), so under a hosted run any refusal at all stands
         // in for the ENOSYS this kernel answers; the payload sweep pins
         // ENOSYS itself.
@@ -49,14 +49,6 @@ fn main() {
     println!("t-enosys");
     let mut r = Report::new();
 
-    r.check(
-        "fanotify_init answers ENOSYS",
-        probe(libc::SYS_fanotify_init),
-    );
-    r.check(
-        "fanotify_mark answers ENOSYS",
-        probe(libc::SYS_fanotify_mark),
-    );
     r.check("userfaultfd answers ENOSYS", probe(libc::SYS_userfaultfd));
     r.check(
         "io_uring_setup answers ENOSYS",

@@ -1782,6 +1782,10 @@ pub(super) fn handle_execve(
     if let Err(e) = crate::vfs::may_access(&inode, crate::vfs::X_OK) {
         return err_of(e);
     }
+    // An executable being opened for execution is `FAN_OPEN_EXEC`, not the
+    // plain open's event; the news lands before a byte of the image is read,
+    // which is where Linux's `fsnotify_open_exec` sits too.
+    crate::vfs::fanotify::notice_open_exec(&inode);
     let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
         Ok(bytes) => bytes,
         Err(e) => return err_of(e),

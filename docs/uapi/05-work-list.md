@@ -6278,3 +6278,72 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `keyctl` claims (served now; its twice-asked rule moved to `userfaultfd`),
     and §1.1's `keyctl` row moved into the served table. `fanotify_init`/
     `fanotify_mark` remain the refused pair, handled next and separately.
+
+## item 114 — fanotify_init(2)/fanotify_mark(2): the notification class, measured as real root
+
+    **The measurement needed a real-root Linux**, because `fanotify_init` asks
+    `CAP_SYS_ADMIN` in the *initial* user namespace: an ordinary user is `EPERM`
+    before a flag word is read, and so is uid 0 inside `unshare -Ur` (both
+    attempted and measured; neither can take the served shape). So the host
+    kernel was booted in QEMU with a throwaway initramfs whose `/init` was the
+    probe — real-root Linux 7.2.11, PID 1 — and the same probe then booted on
+    the MPOS image, where every call answered `ENOSYS`: the baseline this item
+    replaced.
+
+    **What the probe fixed** (full table in `docs/notes/03-filesystem.md` §3.9):
+    `init(0,0)` answers a descriptor whose `F_GETFL` is `O_RDWR`, where an
+    inotify queue's is `O_RDONLY`; `FAN_CLOEXEC`/`FAN_NONBLOCK` are the
+    descriptor words; every `event_f_flags` shape tried (0, `O_RDWR`,
+    `O_WRONLY`, `O_APPEND`, `O_CLOEXEC`, `O_NOATIME`, `O_CLOEXEC|O_NONBLOCK`)
+    was accepted; `FAN_REPORT_NAME` is `EINVAL` while `FAN_REPORT_TID`,
+    `FAN_ENABLE_AUDIT` and `FAN_UNLIMITED_*` are accepted; the content classes
+    are accepted; a mask of 0, an unknown mask bit, `ADD|REMOVE` together and a
+    permission mask on a notification group are each `EINVAL`; a NULL name
+    beside a bad `dirfd` is `EBADF`; a record is 24 bytes (`event_len`,
+    `vers=3`, `metadata_len`, `mask`, `fd`, `pid`); a child's open delivers
+    `mask=0x20` with the **child's** pid; a sub-24-byte buffer and
+    `read(NULL,0)` are `EINVAL` and the event survives the short read; and a
+    `REMOVE` by path after an fd-based add is `ENOENT`.
+
+    **Served**: the notification class — `src/vfs/fanotify.rs` (one group per
+    descriptor, its record queue, its mark table, the 24-byte record, the
+    `Inode` read that packs records and parks or answers `EAGAIN`), hooks
+    beside inotify's (open, `FAN_OPEN_EXEC` at `execve`, the read/write/attrib
+    doors, `close`, the exit hook registered in `src/board/steps.rs`),
+    `handle_fanotify_init`/`handle_fanotify_mark` in
+    `src/syscall/linux/fs/file.rs`, numbers 300/301 (x86_64) and 262/263
+    (aarch64) with their dispatch arms. Privilege is uid 0, the same authority
+    proxy the keyring takes.
+
+    **Named divergences**, each a refusal rather than an approximation: the
+    content/pre-content classes (`EOPNOTSUPP`; with them every `*_PERM` event
+    and the reply record); every `FAN_REPORT_*` shape and `FAN_ENABLE_AUDIT`
+    (`EOPNOTSUPP`); `FAN_UNLIMITED_QUEUE`/`_MARKS` (`EOPNOTSUPP` — the queue is
+    capped at 16 384 records and the mark table at 4 096, and a full queue
+    reports one `FAN_Q_OVERFLOW` record instead of dropping silently);
+    `FAN_MARK_MOUNT`/`FAN_MARK_FILESYSTEM`/`IGNORED_*` (`EOPNOTSUPP` — no
+    inode-to-mount ancestry to match a mount mark against);
+    `event_f_flags`' open-status bits accepted but not applied (a notification
+    event's descriptor is this kernel's own read-only open);
+    `FAN_MARK_ONLYDIR` on a non-directory is `ENOTDIR` (man page's answer, not
+    measured); the mark's object must be an inode, so the content classes'
+    "no reply means allow" fallback is absent because the classes are refused.
+
+    **Pin**: `t-fanotify`, default group, both machines — the init descriptors'
+    `F_GETFL`/`F_GETFD` words, the two descriptor flags, the accepted
+    `event_f_flags`, the `EINVAL`/`EOPNOTSUPP` flag and mask tables, marks by
+    path and by `dirfd`, `EBADF` cases, a child's open record, the short-read
+    `EINVAL`s with the record surviving, no event after `REMOVE`, the five
+    served event bits (`OPEN`, `MODIFY`, `ACCESS`, `ATTRIB`, `OPEN_EXEC`) and
+    the two close bits, plus `EPERM` for a plain host user (the host run's one
+    measurable half — the gate runs as root). Host tests in
+    `src/vfs/fanotify.rs` pin the flag/mask tables, the record layout and the
+    queue cap. `t-enosys` dropped its two fanotify claims (served now), leaving
+    `userfaultfd`, the three `io_uring` numbers and `rseq` there.
+
+    **Gate**: x86_64 `pass=221 fail=0`, aarch64 `pass=220 fail=0` (after the
+    documented `t-posix getpriority` flake was re-run), `mpos-kunit 34 passed`
+    both, host suite 665 passed. **Counterfactual** (both dispatch arms
+    removed): `CF-EXIT=1`, `pass=220 fail=1`, only `t-fanotify` red — it panics
+    because `fanotify_init` answers `ENOSYS` — and every other program stays
+    green.

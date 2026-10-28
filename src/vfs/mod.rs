@@ -50,6 +50,7 @@ pub mod dmabuf;
 pub mod epoll;
 pub mod eventfd;
 pub mod ext4;
+pub mod fanotify;
 pub mod file;
 pub mod inotify;
 /// The filesystem layer's suite for a test build: the bootstrap ramfs, a mounted
@@ -704,6 +705,16 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// descriptor number, and the queue behind it is reachable only here -
     /// the same shape as [`Self::as_timerfd`].
     fn as_inotify(&self) -> Option<&crate::vfs::inotify::InotifyInstance> {
+        None
+    }
+
+    /// The fanotify group this node is, if it is one.
+    ///
+    /// `fanotify_mark(2)` arrives with a descriptor number and asks that
+    /// group to take a mark; `as_fanotify` is how the syscall layer turns the
+    /// number back into the queue and the mark table behind it, the same shape
+    /// as [`Self::as_inotify`].
+    fn as_fanotify(&self) -> Option<&crate::vfs::fanotify::FanotifyGroup> {
         None
     }
 
@@ -1989,6 +2000,7 @@ pub fn remove_privs_as(inode: &Arc<dyn Inode>, caller: Caller) {
     if next != mode {
         inode.set_mode(next);
         inotify::emit(inode, inotify::IN_ATTRIB, "");
+        fanotify::notice_attrib(inode);
     }
 }
 

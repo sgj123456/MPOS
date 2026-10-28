@@ -434,3 +434,105 @@ Restored: **x86_64 `pass=218 fail=0`** (8.64 s stage 2, `mpos-kunit 34 passed`),
 647 passed.
 
 Full record: `docs/uapi/` §5.1 item 111.
+
+### 3.9 `fanotify_init`/`fanotify_mark` — the notification class — **DONE** (2026-10-28)
+
+**Why**: the second file-event family a Linux userland reaches for. inotify
+answers "what happened on this inode" per process; fanotify answers the same
+question for a whole group descriptor, and its content classes add an
+antivirus-shaped "may I?" round trip that needs a reply record. The
+notification class is the half the tree can serve honestly now: records on a
+group descriptor, marks on one object each, the measured wire shape and the
+measured flag tables. The content/pre-content classes and their permission
+events are refused `EOPNOTSUPP` by name — a permission handler that cannot
+answer must not pretend the file was allowed.
+
+**The measurement had to be taken as real root.** `fanotify_init` asks
+`CAP_SYS_ADMIN` in the *initial* user namespace: an ordinary user is `EPERM`
+before a flag word is read, and so is uid 0 inside `unshare -Ur` (both
+measured). So the host kernel was booted in QEMU with a throwaway initramfs
+whose `/init` is the probe (a real-root Linux 7.2.11, PID 1), and the same
+probe then booted on the MPOS image to record the baseline — every call there
+`ENOSYS`, which is what this item replaces.
+
+| Question | Linux 7.2.11, real root |
+|---|---|
+| `init(0,0)` | fd 3; `F_GETFD=0`, `F_GETFL=0x2` (`O_RDWR`) |
+| `FAN_CLOEXEC` / `FAN_NONBLOCK` | accepted; the descriptor carries both |
+| `FAN_CLASS_CONTENT` / `PRE_CONTENT` | accepted |
+| `FAN_REPORT_TID` (0x100) | accepted |
+| `FAN_REPORT_NAME` (0x800) | `EINVAL` |
+| `FAN_ENABLE_AUDIT` (0x40), `FAN_UNLIMITED_*` (0x30) | accepted |
+| `event_f_flags` = 0, `O_RDWR`, `O_WRONLY`, `O_APPEND`, `O_CLOEXEC`, `O_NOATIME`, `O_CLOEXEC\|O_NONBLOCK` | all accepted |
+| `ADD\|INODE` of `FAN_OPEN` by path | 0, and the same again 0 |
+| mask 0, unknown mask bit, `ADD\|REMOVE`, permission mask on a notification group | `EINVAL` |
+| `ADD\|MOUNT`, `ADD\|FILESYSTEM`, `FLUSH` | `0` |
+| `ADD\|INODE` with `dirfd=-1` and a NULL name | `EBADF` |
+| a record | 24 bytes: `event_len` 24, `vers` 3, `metadata_len` 24, `mask`, `fd`, `pid` |
+| a child opening the marked file | `mask=0x20` (`FAN_OPEN`), `fd` a fresh description, `pid` = the **child's** pid |
+| a 4-byte buffer / `read(NULL,0)` | `EINVAL`, and the record survives the short read |
+| `REMOVE` by path after an fd-based add | `ENOENT` (no mark for that path's object) |
+
+**What landed** — `src/vfs/fanotify.rs` (the uapi vocabulary, one
+`FanotifyGroup` per descriptor with its queue, marks and waiters, the flag/mask
+validators, the 24-byte record writer, the emit path over live groups, and the
+`Inode` implementation whose read packs whole records and parks for news);
+hooks beside the inotify ones (`open`, `exec`'s `FAN_OPEN_EXEC`, the three
+read/write/attrib doors, the close path and the exit hook, registered in
+`src/board/steps.rs`); `handle_fanotify_init`/`handle_fanotify_mark` in
+`src/syscall/linux/fs/file.rs`; numbers `300`/`301` x86_64 and `262`/`263`
+aarch64 with the two dispatch arms. The privilege test is uid 0, the same
+authority proxy the keyring uses.
+
+**Named divergences**, each a refusal rather than an approximation:
+
+- The content and pre-content classes (and with them every `*_PERM` event and
+  the reply record a caller writes back) are `EOPNOTSUPP`; Linux serves them.
+- Every `FAN_REPORT_*` shape and `FAN_ENABLE_AUDIT` are `EOPNOTSUPP` — Linux
+  accepts `FAN_REPORT_TID`/`FAN_REPORT_NAME`-less shapes, and answers `EINVAL`
+  for some combinations. This kernel has one record shape; naming the refusal
+  is the honest half.
+- `FAN_UNLIMITED_QUEUE`/`FAN_UNLIMITED_MARKS` are `EOPNOTSUPP`: the queue is
+  capped at 16 384 records and the mark table at 4 096 per group, so accepting
+  "never drop, never cap" would promise more than the bound keeps (a full
+  queue reports one `FAN_Q_OVERFLOW` record instead of dropping silently).
+- `FAN_MARK_MOUNT`/`FAN_MARK_FILESYSTEM` marks and the `IGNORED_*` shapes are
+  `EOPNOTSUPP`: this tree has no inode-to-mount ancestry to match a mount mark
+  against, and inventing one would mis-answer "is this object in that mount".
+- `event_f_flags`' open-status bits are accepted as measured but not applied:
+  a notification event's descriptor is this kernel's own read-only open of the
+  object, so `O_WRONLY` there does not make it write-open.
+- Removing a mark answers `ENOENT` when the object has none — the measured
+  answer; `FAN_MARK_ONLYDIR` on a non-directory is `ENOTDIR` (the man page's
+  answer; not measured, named here as such).
+- The content classes' "no reply means allow" fallback is absent because the
+  classes themselves are refused; a `write` on a group descriptor is `EINVAL`
+  (the notification class has no response record to carry).
+
+**Pinned** by `t-fanotify` (both machines; the gate's programs run as root,
+which is what makes the served shapes reachable): the init descriptor's
+`F_GETFL`/`F_GETFD` words, `FAN_CLOEXEC`/`FAN_NONBLOCK`, the accepted
+`event_f_flags` set, the `EINVAL`/`EOPNOTSUPP` flag and mask tables, a
+mark by path and by `dirfd`, `EBADF` for a non-group descriptor and a bad
+`dirfd`, a child's open record (24 bytes, `mask=0x20`, `pid` = the child),
+the short-buffer and `read(NULL,0)` `EINVAL`s with the record surviving the
+short read, no event after `REMOVE` (`ENOENT` for the second removal),
+`FAN_MODIFY`/`FAN_CLOSE_WRITE` from a write, `FAN_ACCESS`/`FAN_CLOSE_NOWRITE`
+from a read-open, `FAN_ATTRIB` from a chmod, `FAN_OPEN_EXEC` from an exec, and
+`EPERM` for a plain host user (the host run's one measurable half). Host tests
+in `src/vfs/fanotify.rs` pin the flag/mask tables, the record layout and the
+queue cap.
+
+**Gate**: x86_64 `pass=221 fail=0`, aarch64 `pass=220 fail=0` (after the
+documented `t-posix getpriority` flake re-run), `mpos-kunit 34 passed` both,
+host suite 665 passed. `t-enosys` no longer probes the pair — its pin is
+`t-fanotify` now — and the syscall table's refused block keeps only
+`userfaultfd`, the three `io_uring` numbers and `rseq`.
+
+Full record: `docs/uapi/` §5.1 item 114.
+
+**Counterfactual** — both dispatch arms removed: x86_64 `pass=220 fail=1`,
+only `t-fanotify` red (it panics because `fanotify_init` answers `ENOSYS`);
+every other program stays green.
+
+Full record: `docs/uapi/` §5.1 item 114.

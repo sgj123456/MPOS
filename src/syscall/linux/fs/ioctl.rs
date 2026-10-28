@@ -1427,6 +1427,7 @@ fn fs_flags_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
                     // The flags are metadata, so the watcher that asked to hear
                     // about `chmod` hears about this too.
                     crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                    crate::vfs::fanotify::notice_attrib(&inode);
                     0
                 }
                 Err(e) => err_of(e),

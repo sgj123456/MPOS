@@ -182,6 +182,7 @@ pub fn register_exit_hooks() {
     sched::exit::register(mpos::vfs::locks::release_on_process_exit);
     sched::exit::register(mpos::net::socket::close_sockets_at_exit);
     sched::exit::register(mpos::vfs::inotify::close_at_exit);
+    sched::exit::register(mpos::vfs::fanotify::close_at_exit);
     // The card's per-description state - the master, the client-capability set,
     // the framebuffers - is released by the `close(2)` hook, which a process
     // that simply returns never runs. Without this the DRM state outlives the

@@ -533,3 +533,9 @@ pub const RECVMMSG: u64 = 299;
 pub const ADD_KEY: u64 = 248;
 pub const REQUEST_KEY: u64 = 249;
 pub const KEYCTL: u64 = 250;
+
+/// `fanotify_init(2)` and `fanotify_mark(2)`: the notification class's two
+/// calls. The queue and the mark table are `vfs::fanotify`'s; these are the
+/// numbers, on the numbers this machine uses.
+pub const FANOTIFY_INIT: u64 = 300;
+pub const FANOTIFY_MARK: u64 = 301;

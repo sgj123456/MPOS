@@ -528,6 +528,10 @@ pub unsafe fn dispatch(
         // the kernel's boot code's.
         nr::MOUNT => fs::handle_mount(args, &cwd()),
         nr::UMOUNT2 => fs::handle_umount2(args, &cwd()),
+        nr::FANOTIFY_INIT => fs::handle_fanotify_init(args),
+        // A mark names its object either by descriptor or by a name resolved
+        // from one, which is why this sits beside the path-taking calls.
+        nr::FANOTIFY_MARK => fs::handle_fanotify_mark(args, &cwd()),
         nr::PIVOT_ROOT => fs::handle_pivot_root(args, &cwd()),
         nr::CHROOT => fs::handle_chroot(args, &cwd()),
         nr::SIGNALFD => fs::handle_signalfd(args, 0, from_user),

@@ -522,7 +522,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ### 12.5 Deliberately not in this phase
 
-- Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
+- Anything already honestly refused. `userfaultfd`/`io_uring`/rseq and the
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
 - `SO_SNDBUF`/`SO_RCVBUF` (`record-only`) — already tracked in §3.3 / the ABI board;
   this phase does not duplicate it.

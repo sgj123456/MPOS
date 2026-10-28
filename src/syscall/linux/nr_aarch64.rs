@@ -313,3 +313,8 @@ pub const FUTEX_CLOCK_REALTIME: usize = 256;
 pub const ADD_KEY: u64 = 217;
 pub const REQUEST_KEY: u64 = 218;
 pub const KEYCTL: u64 = 219;
+
+/// `fanotify_init(2)` and `fanotify_mark(2)`, on the asm-generic numbers this
+/// machine uses.
+pub const FANOTIFY_INIT: u64 = 262;
+pub const FANOTIFY_MARK: u64 = 263;
