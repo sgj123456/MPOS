@@ -333,6 +333,23 @@ mod device {
         /// The next fid. Fid zero is the root's and is skipped.
         next_fid: Mutex<RefCell<u32>>,
         root: Mutex<RefCell<Option<Arc<P9Inode>>>>,
+        /// The one answer buffer every round trip borrows.
+        ///
+        /// A `call` used to allocate a fresh `msize`-sized (128 KiB) zeroed
+        /// buffer and hand it back with the answer: that is one 128 KiB
+        /// `alloc_zeroed` per message, paid by a 39-byte `Tread` as surely as
+        /// by a full one, and the wire is the same size either way. The buffer
+        /// is claimed for the duration of a call and returned after the answer
+        /// is parsed, so the next message reuses it instead of zeroing a new
+        /// one. A second claim that arrives while one is out (it cannot today -
+        /// the transport spins under a critical section, so nothing else runs
+        /// between claim and return) allocates rather than waiting on a lock it
+        /// would never see released.
+        ///
+        /// `Vec` rather than a fixed array because the length in force is the
+        /// *host's* answer to our `msize` ask, which is read at handshake time;
+        /// the buffer is grown to cover it and never shrunk.
+        reply: Mutex<RefCell<Option<Vec<u8>>>>,
     }
 
     impl P9fs {
@@ -353,6 +370,7 @@ mod device {
                 next_tag: Mutex::new(RefCell::new(0)),
                 next_fid: Mutex::new(RefCell::new(1)),
                 root: Mutex::new(RefCell::new(None)),
+                reply: Mutex::new(RefCell::new(None)),
             });
 
             fs.version()?;
@@ -378,10 +396,25 @@ mod device {
             critical_section::with(|cs| *self.msize.borrow(cs).borrow())
         }
 
-        /// One round trip: build the message around `body`, send it, and
-        /// return the answer's bytes whole - header included, so the
-        /// readers can pull fields at the offsets the protocol spells.
-        fn call(&self, typ: u8, body: &[u8], expect: u8) -> VfsResult<Vec<u8>> {
+        /// One round trip: build the message around `body`, send it, and hand
+        /// the answer's bytes - header included, so the reader can pull fields
+        /// at the offsets the protocol spells - to `parse`, which returns what
+        /// the caller needed instead of the buffer itself.
+        ///
+        /// Taking a parser rather than returning the answer is what lets the
+        /// answer buffer be **the client's**, not each message's: the buffer
+        /// is claimed from [`P9fs::reply`], handed to the device, parsed in
+        /// place, and returned to the slot. That removes the one
+        /// `alloc_zeroed` of `msize` (128 KiB) per message the old shape paid:
+        /// the cost a 39-byte `Tread` paid exactly as a full one, measured in
+        /// `docs/notes/10-performance.md` §10.10.
+        fn call<T>(
+            &self,
+            typ: u8,
+            body: &[u8],
+            expect: u8,
+            parse: impl FnOnce(&[u8]) -> VfsResult<T>,
+        ) -> VfsResult<T> {
             // A tag is a number to match an answer by. There is exactly one
             // request in flight at a time - the transport posts and waits -
             // so uniqueness would not matter; but the answer is still
@@ -401,36 +434,74 @@ mod device {
             req.extend_from_slice(&tag.to_le_bytes());
             req.extend_from_slice(body);
 
-            let mut resp = alloc::vec![0u8; self.msize() as usize];
-            if !self.dev.request(&req, &mut resp) {
-                return Err(VfsError::Corrupt);
-            }
+            let mut resp = self.claim_reply(self.msize() as usize);
+            let outcome = (|| {
+                if !self.dev.request(&req, resp.as_mut_slice()) {
+                    return Err(VfsError::Corrupt);
+                }
 
-            if resp.len() < HEADER {
-                return Err(VfsError::Corrupt);
-            }
-            let size = take_u32(&resp, &mut 0).ok_or(VfsError::Corrupt)? as usize;
-            if size < HEADER || size > resp.len() {
-                return Err(VfsError::Corrupt);
-            }
-            if resp[4] == R_ERROR {
-                let mut at = HEADER;
-                let ename = take_str(&resp[..size], &mut at).unwrap_or_default();
-                return Err(error_of(&ename));
-            }
-            if resp[4] != expect {
-                return Err(VfsError::Corrupt);
-            }
-            let answered = take_u16(&resp, &mut { HEADER - 2 });
-            if answered != Some(tag) {
-                // A well-formed reply about someone else's request. The
-                // transport waits for the answer before returning, so this
-                // cannot happen against an honest server - and a dishonest
-                // one gets no bytes honoured.
-                return Err(VfsError::Corrupt);
-            }
-            resp.truncate(size);
-            Ok(resp)
+                if resp.len() < HEADER {
+                    return Err(VfsError::Corrupt);
+                }
+                let size = take_u32(resp.as_slice(), &mut 0).ok_or(VfsError::Corrupt)? as usize;
+                if size < HEADER || size > resp.len() {
+                    return Err(VfsError::Corrupt);
+                }
+                if resp[4] == R_ERROR {
+                    let mut at = HEADER;
+                    let ename = take_str(&resp[..size], &mut at).unwrap_or_default();
+                    return Err(error_of(&ename));
+                }
+                if resp[4] != expect {
+                    return Err(VfsError::Corrupt);
+                }
+                let answered = take_u16(resp.as_slice(), &mut { HEADER - 2 });
+                if answered != Some(tag) {
+                    // A well-formed reply about someone else's request. The
+                    // transport waits for the answer before returning, so this
+                    // cannot happen against an honest server - and a dishonest
+                    // one gets no bytes honoured.
+                    return Err(VfsError::Corrupt);
+                }
+                parse(&resp[..size])
+            })();
+            self.return_reply(resp);
+            outcome
+        }
+
+        /// Take the answer buffer out of its slot, at least `len` bytes long.
+        ///
+        /// Called from [`P9fs::call`], which puts it back when the answer has
+        /// been parsed: the claim is a move, not a borrow, so the buffer is
+        /// nobody's while the device is posting - the shape that lets the
+        /// transport spin under its own critical section without this client
+        /// holding a borrow into it. A buffer already long enough is reused as
+        /// it is; the bytes are never cleaned, because the caller reads only
+        /// the `size` the new answer's header names.
+        fn claim_reply(&self, len: usize) -> Vec<u8> {
+            critical_section::with(|cs| {
+                let mut slot = self.reply.borrow(cs).borrow_mut();
+                match slot.take() {
+                    Some(mut buffer) => {
+                        if buffer.len() < len {
+                            buffer.resize(len, 0);
+                        }
+                        buffer
+                    }
+                    None => alloc::vec![0u8; len],
+                }
+            })
+        }
+
+        /// Park the answer buffer back in its slot, or drop it if another
+        /// claimant has already put one there.
+        fn return_reply(&self, buffer: Vec<u8>) {
+            critical_section::with(|cs| {
+                let mut slot = self.reply.borrow(cs).borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(buffer);
+                }
+            });
         }
 
         /// `Tversion`: agree the dialect and the message size. The host is
@@ -444,19 +515,20 @@ mod device {
             let mut body = Vec::new();
             put_u32(&mut body, PROPOSED_MSIZE);
             put_str(&mut body, DIALECT.as_bytes());
-            let answer = self.call(T_VERSION, &body, R_VERSION)?;
-            let mut at = HEADER;
-            let msize = take_u32(&answer, &mut at).ok_or(VfsError::Corrupt)?;
-            let dialect = take_str(&answer, &mut at).ok_or(VfsError::Corrupt)?;
-            if dialect != DIALECT {
-                // Plain `9P2000`, or `.L` - whose message set is a different
-                // protocol this client did not ask for and does not parse.
-                return Err(VfsError::Unsupported);
-            }
-            critical_section::with(|cs| {
-                *self.msize.borrow(cs).borrow_mut() = msize;
-            });
-            Ok(())
+            self.call(T_VERSION, &body, R_VERSION, |answer| {
+                let mut at = HEADER;
+                let msize = take_u32(answer, &mut at).ok_or(VfsError::Corrupt)?;
+                let dialect = take_str(answer, &mut at).ok_or(VfsError::Corrupt)?;
+                if dialect != DIALECT {
+                    // Plain `9P2000`, or `.L` - whose message set is a different
+                    // protocol this client did not ask for and does not parse.
+                    return Err(VfsError::Unsupported);
+                }
+                critical_section::with(|cs| {
+                    *self.msize.borrow(cs).borrow_mut() = msize;
+                });
+                Ok(())
+            })
         }
 
         /// `Tattach` on fid zero, as the root of the share. The `uname` is
@@ -475,8 +547,7 @@ mod device {
             put_str(&mut body, b"root");
             put_str(&mut body, self.dev.mount_tag().as_bytes());
             put_u32(&mut body, 0); // n_uname: the numeric half of uname
-            self.call(T_ATTACH, &body, R_ATTACH)?;
-            Ok(())
+            self.call(T_ATTACH, &body, R_ATTACH, |_| Ok(()))
         }
 
         /// Mint the next fid. Fid zero belongs to the root and is never
@@ -509,21 +580,23 @@ mod device {
             for name in names {
                 put_str(&mut body, name.as_bytes());
             }
-            let answer = self.call(T_WALK, &body, R_WALK)?;
-            let mut at = HEADER;
-            let walked = take_u16(&answer, &mut at).ok_or(VfsError::Corrupt)?;
+            let (walked, qid_type) = self.call(T_WALK, &body, R_WALK, |answer| {
+                let mut at = HEADER;
+                let walked = take_u16(answer, &mut at).ok_or(VfsError::Corrupt)?;
+                // The last qid's type byte is the kind of thing arrived at.
+                let mut qid_type = 0u8;
+                for _ in 0..walked {
+                    qid_type = *answer.get(at).ok_or(VfsError::Corrupt)?;
+                    at += 13;
+                }
+                Ok((walked, qid_type))
+            })?;
             if walked as usize != names.len() {
                 // A partial walk: the server moved partway and stopped. It
                 // has also clunked the newfid in that case, so there is
                 // nothing to give back - and the answer is "no such file",
                 // which is what every caller of a failed walk means.
                 return Err(VfsError::NoEntry);
-            }
-            // The last qid's type byte is the kind of thing arrived at.
-            let mut qid_type = 0u8;
-            for _ in 0..walked {
-                qid_type = *answer.get(at).ok_or(VfsError::Corrupt)?;
-                at += 13;
             }
             Ok((newfid, qid_type))
         }
@@ -534,7 +607,7 @@ mod device {
         fn clunk(&self, fid: u32) {
             let mut body = Vec::new();
             put_u32(&mut body, fid);
-            let _ = self.call(T_CLUNK, &body, R_CLUNK);
+            let _ = self.call(T_CLUNK, &body, R_CLUNK, |_| Ok(()));
         }
 
         /// `Topen` a fid in `mode`, answering the iounit the server
@@ -543,9 +616,10 @@ mod device {
             let mut body = Vec::new();
             put_u32(&mut body, fid);
             body.push(mode);
-            let answer = self.call(T_OPEN, &body, R_OPEN)?;
-            let mut at = HEADER + 13; // the qid the answer leads with
-            take_u32(&answer, &mut at).ok_or(VfsError::Corrupt)
+            self.call(T_OPEN, &body, R_OPEN, |answer| {
+                let mut at = HEADER + 13; // the qid the answer leads with
+                take_u32(answer, &mut at).ok_or(VfsError::Corrupt)
+            })
         }
 
         /// `Tread` at an absolute offset. One round trip's worth at most,
@@ -557,13 +631,14 @@ mod device {
             put_u32(&mut body, fid);
             body.extend_from_slice(&offset.to_le_bytes());
             put_u32(&mut body, room as u32);
-            let answer = self.call(T_READ, &body, R_READ)?;
-            let mut at = HEADER;
-            let count = take_u32(&answer, &mut at).ok_or(VfsError::Corrupt)? as usize;
-            let end = at.checked_add(count).ok_or(VfsError::Corrupt)?;
-            let data = answer.get(at..end).ok_or(VfsError::Corrupt)?;
-            out[..count].copy_from_slice(data);
-            Ok(count)
+            self.call(T_READ, &body, R_READ, |answer| {
+                let mut at = HEADER;
+                let count = take_u32(answer, &mut at).ok_or(VfsError::Corrupt)? as usize;
+                let end = at.checked_add(count).ok_or(VfsError::Corrupt)?;
+                let data = answer.get(at..end).ok_or(VfsError::Corrupt)?;
+                out[..count].copy_from_slice(data);
+                Ok(count)
+            })
         }
 
         /// `Twrite` at an absolute offset, chunked to the message size.
@@ -581,9 +656,12 @@ mod device {
                 body.extend_from_slice(&(offset + done as u64).to_le_bytes());
                 put_u32(&mut body, piece.len() as u32);
                 body.extend_from_slice(piece);
-                let answer = self.call(T_WRITE, &body, R_WRITE)?;
-                let mut at = HEADER;
-                let count = take_u32(&answer, &mut at).ok_or(VfsError::Corrupt)? as usize;
+                let count = self.call(T_WRITE, &body, R_WRITE, |answer| {
+                    let mut at = HEADER;
+                    take_u32(answer, &mut at)
+                        .ok_or(VfsError::Corrupt)
+                        .map(|count| count as usize)
+                })?;
                 done += count;
                 if count < piece.len() || done == data.len() {
                     return Ok(done);
@@ -595,12 +673,14 @@ mod device {
         fn stat(&self, fid: u32) -> VfsResult<Stat> {
             let mut body = Vec::new();
             put_u32(&mut body, fid);
-            let answer = self.call(T_STAT, &body, R_STAT)?;
-            // Rstat leads with a u16 count and then the stat itself.
-            let mut at = HEADER;
-            let _count = take_u16(&answer, &mut at).ok_or(VfsError::Corrupt)?;
-            let (stat, _) = parse_stat(&answer[at..]).ok_or(VfsError::Corrupt)?;
-            Ok(stat)
+            self.call(T_STAT, &body, R_STAT, |answer| {
+                // Rstat leads with a u16 count and then the stat itself.
+                let mut at = HEADER;
+                let _count = take_u16(answer, &mut at).ok_or(VfsError::Corrupt)?;
+                parse_stat(&answer[at..])
+                    .map(|(stat, _)| stat)
+                    .ok_or(VfsError::Corrupt)
+            })
         }
 
         /// `Twstat`: change what a caller asked to change and mark the rest
@@ -644,8 +724,7 @@ mod device {
             put_u32(&mut body, fid);
             body.extend_from_slice(&(record.len() as u16).to_le_bytes());
             body.extend_from_slice(&record);
-            self.call(T_WSTAT, &body, R_WSTAT)?;
-            Ok(())
+            self.call(T_WSTAT, &body, R_WSTAT, |_| Ok(()))
         }
 
         /// `Tcreate` in a directory reached by `dir_fid`: the fid - which
@@ -655,10 +734,11 @@ mod device {
         /// wire.
         fn create(&self, dir_fid: u32, name: &str, perm: u32, mode: u8) -> VfsResult<(u8, u32)> {
             let body = create_body(dir_fid, name, perm, mode);
-            let answer = self.call(T_CREATE, &body, R_CREATE)?;
-            let qid_type = *answer.get(HEADER).ok_or(VfsError::Corrupt)?;
-            let iounit = take_u32(&answer, &mut { HEADER + 13 }).ok_or(VfsError::Corrupt)?;
-            Ok((qid_type, iounit))
+            self.call(T_CREATE, &body, R_CREATE, |answer| {
+                let qid_type = *answer.get(HEADER).ok_or(VfsError::Corrupt)?;
+                let iounit = take_u32(answer, &mut { HEADER + 13 }).ok_or(VfsError::Corrupt)?;
+                Ok((qid_type, iounit))
+            })
         }
 
         /// `Tremove`: unlink by fid. The server retires the fid whether or
@@ -667,8 +747,7 @@ mod device {
         fn remove(&self, fid: u32) -> VfsResult<()> {
             let mut body = Vec::new();
             put_u32(&mut body, fid);
-            self.call(T_REMOVE, &body, R_REMOVE)?;
-            Ok(())
+            self.call(T_REMOVE, &body, R_REMOVE, |_| Ok(()))
         }
 
         /// `Tread` a directory's entries, by a throwaway fid. One `Topen`
@@ -681,22 +760,43 @@ mod device {
                 let mut entries = Vec::new();
                 let mut offset = 0u64;
                 loop {
-                    let mut chunk = alloc::vec![0u8; self.msize() as usize - HEADER];
-                    let got = self.read_once(fid, offset, &mut chunk)?;
+                    // Parse the answer in place rather than copying it into a
+                    // chunk of our own first: the records are read straight out
+                    // of the round trip's buffer, so a listing costs neither the
+                    // old per-iteration `msize` allocation nor its copy. What
+                    // the outer loop needs is just the count (to stop at an
+                    // empty answer and to advance the offset) and the entries
+                    // it placed.
+                    let mut body = Vec::new();
+                    put_u32(&mut body, fid);
+                    body.extend_from_slice(&offset.to_le_bytes());
+                    put_u32(&mut body, self.msize() - 11);
+                    let (got, batch, damaged) = self.call(T_READ, &body, R_READ, |answer| {
+                        let mut at = HEADER;
+                        let count = take_u32(answer, &mut at).ok_or(VfsError::Corrupt)? as usize;
+                        let end = at.checked_add(count).ok_or(VfsError::Corrupt)?;
+                        let data = answer.get(at..end).ok_or(VfsError::Corrupt)?;
+                        let mut batch = Vec::new();
+                        let mut used = 0usize;
+                        while used < data.len() {
+                            let Some((stat, record)) = parse_stat(&data[used..]) else {
+                                // A record the parser cannot place is damage:
+                                // report the entries that parsed rather than
+                                // pretending the listing was whole.
+                                break;
+                            };
+                            batch.push((stat.name, stat.kind));
+                            used += record;
+                        }
+                        Ok((count, batch, used < data.len()))
+                    })?;
                     if got == 0 {
                         return Ok(entries);
                     }
                     offset += got as u64;
-                    let mut at = 0;
-                    while at < got {
-                        let Some((stat, used)) = parse_stat(&chunk[at..got]) else {
-                            // A record the parser cannot place is damage:
-                            // report the entries that parsed rather than
-                            // pretending the listing was whole.
-                            return Ok(entries);
-                        };
-                        entries.push((stat.name, stat.kind));
-                        at += used;
+                    entries.extend(batch);
+                    if damaged {
+                        return Ok(entries);
                     }
                 }
             })();

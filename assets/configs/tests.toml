@@ -93,9 +93,10 @@ timeouts = ["t-fill-ramfs=600"]
 external = ["t-dhcp", "t-dns", "t-rawicmp", "t-raw-recvmsg", "t-stdresolve", "t-tcp-close", "t-udp"]
 
 # Slow, or a measurement rather than an assertion. `t-fill-ramfs` writes up to
-# 1024 MiB a chunk at a time; the other three are instruments whose numbers are
+# 1024 MiB a chunk at a time; the other four are instruments whose numbers are
 # the point and whose verdict can depend on how busy the host is (§10.2, §10.4
-# carry their figures).
+# carry their figures; `t-p9read` is §10.10's 9P round-trip instrument, one
+# message per iteration over the boot's share mount).
 #
 # The two §10.5 programs stay in the **default** sweep rather than here, and
 # that is a decision with a reason: their claims are exact device-read counts,
@@ -114,7 +115,7 @@ external = ["t-dhcp", "t-dns", "t-rawicmp", "t-raw-recvmsg", "t-stdresolve", "t-
 # prints is §10.4's before/after number and follows t-pipecost's "reported,
 # not asserted" rule. The harness likewise refuses a sweep that staged it but
 # saw no `NETSTAT` line.
-slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
+slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-p9read", "t-pipecost"]
 
 # Not a check at all. `t-sh` execs an interactive busybox ash onto the console
 # and prints what it observes about where the shell stopped; it is here to be

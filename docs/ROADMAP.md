@@ -333,6 +333,9 @@ One-glance status of the whole roadmap.
 - [x] the gate reports itself — a live lane dashboard and an end-of-run report (stage times,
   every lane's programs/verdict/heaviest, the ten slowest programs, and the delta against the
   last green run), with the plain linesbyte-for-byte unchanged when stdout is not a terminal (§15.95)
+- [x] 10.10 the 9p client's reply buffer — a mount claims one buffer instead of zeroing a
+  128 KiB one per message; 20 000 reads of a 39-byte line went 249.2 µs → 239.1 µs each
+  (−4.1 %, and 2 500 MiB of zeroing removed), with the round trip the wall at ≈240 µs (§10.10)
 
 **Architectures (Phase 9)**
 

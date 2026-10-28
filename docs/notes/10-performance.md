@@ -1288,7 +1288,8 @@ server is not the limit at 128 KiB.
 `Tversion` and as the starting value of the per-mount `msize`; the server's
 answer still overwrites it, as the protocol allows. The per-request buffer is
 allocated at this size, which bounds the cost by the constant and not by
-anything a user steers.
+anything a user steers — one per message (§10.10 is where that was made one
+per mount).
 
 **A measurement worth keeping about QEMU**: its fsdev has **no `msize` option**
 in 11.1.2 — `qemu-system-x86_64 -fsdev local,id=x,path=/tmp,security_model=none,help`
@@ -1303,3 +1304,54 @@ reason, and the giveaway was a serial log that had not been rewritten.
 a constant, so the test is the only place a regression can be caught without a
 boot; the negotiation and the throughput are this measurement's. Counterfactual:
 with `PROPOSED_MSIZE` back at 8192 the test is red and the warning returns.
+
+### 10.10 The 9p client's reply buffer — **LANDED** (measured; the round trip dominates)
+
+**Why**: every 9p message built its answer in a fresh buffer as large as the
+mount's negotiated `msize` — 128 KiB of `alloc_zeroed` per round trip, paid
+identically by a 39-byte `Tread` and by a full read. `read_dir` paid a second
+one per *iteration*: it allocated `msize - HEADER` bytes and copied the answer
+into it before parsing entries. The constant bounded the size (nothing a user
+steers), but on a machine whose global allocator still panics on failure (§8.0)
+an allocation per message is also a failure path per message — and listing a
+directory paid the zeroing again for every reply chunk.
+
+**Shape**: the mount now owns one reply buffer, `P9fs::reply:
+Mutex<RefCell<Option<Vec<u8>>>>`. `call` claims it for the round trip (a *move*,
+so the transport — one request in flight with interrupts off — never holds a
+borrow into it), runs the reply through a caller-supplied `FnOnce(&[u8])`
+parser, and returns the buffer to the slot. It grows to cover the host's
+answer and is never shrunk, so a mount's first messages pay the ask's size and
+later ones the granted size. `read_dir` builds its own `Tread` and parses the
+entries in place, so listing a directory allocates no per-reply chunk and
+copies no answer.
+
+**Measured** — `user/tests/src/bin/t-p9read.rs`, the `slow` group's 9P
+round-trip instrument (20 000 `read`s of one 39-byte line through the boot's
+share mount, timed with `rustix::time::clock_gettime(CLOCK_MONOTONIC)`, one
+sample per run, the kernel rebuilt between shapes):
+
+| shape | samples (ns/read) | mean | 20 000 reads |
+|---|---|---|---|
+| one `alloc_zeroed` per message | 244 723 · 253 742 | 249 233 | 4.894 s · 5.074 s |
+| one claimed buffer | 235 835 · 238 968 · 242 519 | 239 107 | 4.716 s · 4.779 s · 4.850 s |
+
+⇒ **−10 126 ns per read (−4.1 %)** by the means, and **−2 500 MiB of zeroing**
+removed per 20 000 messages (128 KiB × 20 000).
+
+**The honest reading**: the round trip is the wall — ≈240 µs per 39-byte
+request on this wiring (QEMU 11.1.2 under KVM: virtio + the host's v9fs
+syscalls), so the zeroing the change removes is ≈6 µs of that (128 KiB at
+≈22 GB/s), and the instrument's own scatter is of the same order (the old shape
+read 244.7 and 253.7 in its two samples). What is exact is the work removed:
+2 500 MiB of zeroing, one allocation per message (and its failure path), and
+`read_dir`'s per-iteration chunk and copy. A larger win would need fewer round
+trips, and §10.9 already spent the one knob that changes that — QEMU's fsdev
+accepts no server-side `msize`.
+
+**Pin**: the assertion lives on the machine, not the host: `P9fs` cannot be
+constructed off a device (its transport is the virtio device), so the parser is
+exercised through the share mount by `t-9p` and the programs that read the
+share, and `t-p9read` carries the measurement (a reported figure, not a claim —
+the `slow` group's rule). Counterfactual: the old-shape column is the same tree
+with `call`'s fresh `alloc_zeroed` restored and the same instrument re-run.
