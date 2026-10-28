@@ -1,10 +1,10 @@
 //! t-enosys - the calls this kernel has no dispatch arm for.
 //!
-//! Pinned here: userfaultfd(323), io_uring_setup(425), io_uring_enter(426)
-//! and io_uring_register(427) all answer ENOSYS. (`keyctl` used to be on this
-//! list; it is served now, so the family's pin is `t-keyctl` rather than a
-//! refusal here. `fanotify_init`/`fanotify_mark` left the same way: their pin
-//! is `t-fanotify`.) That is the answer a libc reads
+//! Pinned here: userfaultfd(323) answers ENOSYS. (`keyctl` used to be on this
+//! list; it is served now, so the family's pin is `t-keyctl`. `fanotify_init`/
+//! `fanotify_mark` left the same way, their pin is `t-fanotify`. `io_uring_setup`/
+//! `enter`/`register` (425/426/427) left the same way too: the ring is served,
+//! pinned by `t-io-uring`.) That is the answer a libc reads
 //! as "this optional call is not available"; the numbers come from libc's
 //! per-machine table, and the kernel's table has no constant or handler for
 //! any of them, so each one falls through the default arm. A call the kernel
@@ -19,12 +19,10 @@
 //! rule is what keeps a startup loop's dozens of probes from becoming dozens
 //! of console lines while still telling a reader what is missing.
 //!
-//! Every claim is `libc::syscall(SYS_*)`, clause (a): none of these calls is
-//! something either library would name - the program's subject is the number
-//! falling through. On the second machine one of the four carries a different
-//! number (userfaultfd 282); the io_uring pair matches Linux's tables, which
-//! is exactly why the numbers are read from libc rather than written down
-//! here.
+//! Every claim is `libc::syscall(SYS_*)`, clause (a): the probe's subject is
+//! the number falling through, not a call either library names. On the second
+//! machine the one number that differs (userfaultfd 282) is read from libc
+//! rather than written down here.
 
 use mpos_user_tests::Report;
 
@@ -50,29 +48,6 @@ fn main() {
     let mut r = Report::new();
 
     r.check("userfaultfd answers ENOSYS", probe(libc::SYS_userfaultfd));
-    r.check(
-        "io_uring_setup answers ENOSYS",
-        probe(libc::SYS_io_uring_setup),
-    );
-    let enter = unsafe {
-        libc::syscall(
-            libc::SYS_io_uring_enter,
-            0usize,
-            0usize,
-            0usize,
-            0usize,
-            0usize,
-            0usize,
-        )
-    };
-    r.check(
-        "io_uring_enter answers ENOSYS",
-        refused(enter as isize, libc::ENOSYS) || mpos_user_tests::host_run() && enter == -1,
-    );
-    r.check(
-        "io_uring_register answers ENOSYS",
-        probe(libc::SYS_io_uring_register),
-    );
 
     // Asked a second time: still ENOSYS, but the console note for the
     // number was printed by the first call and not again.

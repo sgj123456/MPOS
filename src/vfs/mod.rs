@@ -53,6 +53,13 @@ pub mod ext4;
 pub mod fanotify;
 pub mod file;
 pub mod inotify;
+/// The `io_uring` ring: frames, Linux's header layout, and the three mmap
+/// regions. Bare metal only - the ring hands out physical pages.
+#[cfg(target_os = "none")]
+pub mod io_uring;
+/// The `io_uring` ring's layout: Linux's offsets, the params words, and the
+/// entry rounding. Host-compiled because it is pure ABI, and pinned here.
+pub mod io_uring_abi;
 /// The filesystem layer's suite for a test build: the bootstrap ramfs, a mounted
 /// tree and two tasks sharing one file, with the syscall gate's cases beside them
 /// until they follow the tty-and-signals half to `mpos::syscall::kunit`
@@ -771,6 +778,15 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Check a mapping request against the object's own regions before any
+    /// frame is handed out. A frame-backed node with more than one region - an
+    /// `io_uring` ring's SQ/CQ/SQE areas - answers which offsets it serves and
+    /// how much of each; the default accepts every request, which is the
+    /// single-region objects' answer (`memfd`, a dma-buf, the framebuffer).
+    fn mmap_validate(&self, _offset: u64, _len: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     /// The `memfd` this node is, if it is one - how `fcntl`'s sealing
     /// (`F_ADD_SEALS`/`F_GET_SEALS`) reaches the seal state of an anonymous
     /// shared buffer. Gated with the `memfd` module, which the host has no
@@ -788,6 +804,14 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// the `dmabuf` module.
     #[cfg(target_os = "none")]
     fn as_dmabuf(&self) -> Option<&crate::vfs::dmabuf::DmaBuf> {
+        None
+    }
+
+    /// The ring behind an `io_uring` descriptor, the same shape as
+    /// [`Self::as_dmabuf`]: `io_uring_enter`/`register` need the object, not a
+    /// generic file.
+    #[cfg(target_os = "none")]
+    fn as_io_uring(&self) -> Option<&crate::vfs::io_uring::IoUring> {
         None
     }
 

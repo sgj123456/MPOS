@@ -60,7 +60,7 @@ fn sync_nonblocking_device(file: &crate::vfs::File, on: bool) {
 #[cfg(not(target_os = "none"))]
 fn sync_nonblocking_device(_file: &crate::vfs::File, _on: bool) {}
 
-mod file;
+pub(crate) mod file;
 mod ioctl;
 
 pub(super) use file::*;

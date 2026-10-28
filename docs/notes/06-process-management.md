@@ -3997,3 +3997,86 @@ was the bug - is gone.
 program in the lane reads the fresh `20` that `t-posix` asks for. `t-posix`'s
 claim stays as it was: it is the correct expectation and the pollution, not the
 expectation, was wrong.
+
+### 6.32 `io_uring(7)` — the ring is a mapping, and a completion carries the blocking call's answer (LANDED 2026-10-28)
+
+**Why**: three numbers (`io_uring_setup` 425, `io_uring_enter` 426,
+`io_uring_register` 427) had no dispatch arm, so the honest answer was
+`ENOSYS` and a probing application fell back to its synchronous path. That
+fallback exists because the *setup* call has no cheap emulation: a program that
+sees a ring descriptor then submits SQEs and turns CQEs into results, and a
+ring that only accepts the descriptor turns every later promise into a wrong
+answer. So the shape that had to be measured first is the ring's own ABI - the
+mapping offsets, the SQ/CQ words, and what each opcode puts in `cqe.res`.
+
+**Measured on Linux 7.2.11** (real root: `build/scratch/iouring/probe4.c`,
+`probe5.c` - `io_uring_setup` needs no capability here, but the probe was run
+in a hand-built ring, no liburing):
+
+| Question | Linux's answer |
+|---|---|
+| `entries` 0 | `EINVAL` |
+| `entries` 1 / 2 / 3 / 5 / 8 / 9 / 1024 / 8192 | `sq=1,cq=2` / `2,4` / `4,8` / `8,16` / `8,16` / `16,32` / `1024,2048` / `8192,16384` |
+| `entries` 32768 / 32769 | ok / `EINVAL` |
+| published layout, `entries=8` | `sq_off: head 0, tail 4, mask 16, entries 24, flags 36, dropped 32, array 320`; `cq_off: head 8, tail 12, mask 20, entries 28, overflow 44, cqes 64, flags 40`; `features=0x3ffff` |
+| the three mmaps | `IORING_OFF_SQ_RING=0`, `CQ_RING=0x8000000`, `SQES=0x10000000` all map; a **zero-length** mmap is `EINVAL` |
+| `io_uring_enter` | returns the count of SQEs it consumed (bounded by the SQ entries/CQ room: 20 offered on an 8-entry ring returned 8), `EBADF` for a bad fd, **`EOPNOTSUPP` for a valid fd that is not a ring** |
+| `GETEVENTS` with an empty CQ | blocks until a completion arrives; a signal ends it with `EINTR` |
+| `NOP` | `res=0`, `user_data` preserved |
+| `READ` / `WRITE` / `READV` / `WRITEV` | the byte count (`16` / `2` / `16` / `16` in the probe), scattered across iovecs for the vectored forms |
+| `FSYNC` / `CLOSE` | `0` / `0`, and after `CLOSE` the descriptor is really closed (`fstat` -> `EBADF`) |
+| an opcode no Linux has (250) / a bad SQE fd | `-EINVAL` / `-EBADF` |
+| register `FILES` with two real fds / `FILES NULL` / op 4095 / a non-ring fd | `0` / `EFAULT` / `EINVAL` / `EOPNOTSUPP` |
+
+**Landed shape.** `src/vfs/io_uring_abi.rs` is the host-compiled half: the
+layout constants, `sq_entries_for` (round up to a power of two, cap 1024),
+`params_words` (the exact 120 bytes Linux writes back), `array_offset`, and
+four host tests pinning the measured words. `src/vfs/io_uring.rs` is the ring
+object: two frame ranges (the SQ/CQ page range and the SQEs range), allocated,
+zeroed and published with Linux's own offsets, mapped through the generic
+`frame_backed`/`mmap_frame` path with a per-region `mmap_validate` (the three
+`IORING_OFF_*` indices are decoded by index range, and any other offset is
+`EINVAL`). `src/syscall/linux/io_uring.rs` is the ABI surface: `setup` builds
+the ring, reads the caller's `params.flags` word (2, not an argument - Linux's
+call takes exactly two), validates the flag mask and publishes the layout;
+`enter` executes each SQE **synchronously through the very handler the
+blocking syscall uses** (`handle_read`/`handle_pread64`/`handle_write`/
+`handle_pwrite64`/`handle_readv`/`handle_preadv`/`handle_writev`/
+`handle_pwritev`/`handle_fsync`/`handle_close`), posts the completion and then
+parks once if `GETEVENTS` asked to wait; `register` answers `EOPNOTSUPP` for
+every op.
+
+**Named divergences** (each refused rather than faked, and pinned as such):
+
+1. **Every non-zero setup flag is `EOPNOTSUPP`** - `SQPOLL`, `CQE32`, `SQE128`,
+   `COOP_TASKRUN`, `CQSIZE`: the measured kernel accepts them, but this ring
+   has no poll thread, no 32-byte CQEs and no 32-byte SQEs. A bit outside
+   Linux's known mask is `EINVAL`, as measured.
+2. **`io_uring_register` is refused for every op** (`EOPNOTSUPP`): the fixed
+   buffer/file/index shapes are what registration exists for, and this ring
+   resolves its arguments per SQE.
+3. **The SQ ring is capped at 1024 entries** (Linux allows 32768) and the CQ is
+   always `2 x sq_entries` (`CQSIZE` is refused under 1). The cap is the
+   §8.0 memory bound: one ring is up to two frame ranges of four pages each.
+4. **An opcode at or beyond `IORING_OP_LAST` (65, the header this was measured
+   against) is `-EINVAL`**, matching Linux for a number no Linux has; an
+   opcode below it that this kernel does not serve completes `-EOPNOTSUPP`,
+   so a ring running a served opcode keeps working while a new Linux's opcode
+   is refused per item rather than per ring.
+
+**Pinned** by `t-io-uring` (guest run; the same binary under
+`MPOS_ON_HOST=1` asserts Linux's answers and passes 22/22 there, which is the
+reference direction): the hand-built ring reads its three mappings, checks the
+published words, runs `NOP`/`READ`/`WRITE`/`READV`/`WRITEV`/`FSYNC`/`CLOSE`,
+checks `EINVAL` for `entries=0`, `EINVAL` for an unknown bit, `EBADF`/`EOPNOTSUPP`
+on `enter`, `EINTR` from the `GETEVENTS` park (via a one-second `SIGALRM`), and
+the three divergences above on the guest only.
+
+**Counterfactual**: the three dispatch arms removed (`// TEMP-CF` in
+`src/syscall/linux/mod.rs`, backup `build/scratch/mod-io_uring.bak`, restored in
+the same job): `CF-EXIT=1`, `pass=221 fail=1 (222 built)`, and only
+`t-io-uring` red - it panics at its own `Ring::setup(8)` with
+`a ring of eight entries can be built: -38`, because `io_uring_setup` then
+falls to the default arm and answers `ENOSYS`. Every other program stays
+green, `t-enosys` included (it no longer probes the three numbers). After the
+restore, `grep -c 'nr::IO_URING_' src/syscall/linux/mod.rs` is 3.

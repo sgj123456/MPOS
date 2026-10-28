@@ -242,7 +242,7 @@ One-glance status of the whole roadmap.
   matched, and a hang is not an answer (§6.29, item 112)
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)
-- [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
+- [x] `io_uring_setup`/`enter`/`register` (425/426/427) — the ring ABI is **served**: setup publishes Linux's measured layout (a 120-byte params struct, the three `IORING_OFF_*` mappings, `2 x sq_entries` CQ, entries rounded up to a power of two) and `enter` runs `NOP`/`READ`/`WRITE`/`READV`/`WRITEV`/`FSYNC`/`CLOSE` synchronously through the syscall handlers, so each CQE's `res` is the number the blocking call would have answered; a served request keeps working while anything outside the subset is refused **per item** with `-EOPNOTSUPP` (and an opcode no Linux has is `-EINVAL`, as measured). Named refusals: every non-zero setup flag (`SQPOLL`/`CQE32`/`SQE128`… would be promises of a poll thread and 32-byte records), `io_uring_register` for every op, and the SQ cap at 1024 entries (Linux 32768, the §8.0 memory bound) (§6.32, item 115)
 
 **Drivers (Phase 7)**
 
@@ -538,7 +538,7 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-`userfaultfd`, the three `io_uring` numbers and rseq side-objects stay `ENOSYS` (the `fanotify` notification class and the kernel keyring are served); xattrs validate then `EOPNOTSUPP`;  
+`userfaultfd` and rseq side-objects stay `ENOSYS` (the `fanotify` notification class, the kernel keyring and the `io_uring` ring are served); xattrs validate then `EOPNOTSUPP`;  
 the semantics still incomplete are the datagram line itself, which is the ring's rather than  
 Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
 sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  

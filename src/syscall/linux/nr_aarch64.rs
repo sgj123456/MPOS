@@ -318,3 +318,9 @@ pub const KEYCTL: u64 = 219;
 /// machine uses.
 pub const FANOTIFY_INIT: u64 = 262;
 pub const FANOTIFY_MARK: u64 = 263;
+
+/// The `io_uring` family: the same three numbers on both machines (asm-generic
+/// and x86_64 agree for this family).
+pub const IO_URING_SETUP: u64 = 425;
+pub const IO_URING_ENTER: u64 = 426;
+pub const IO_URING_REGISTER: u64 = 427;

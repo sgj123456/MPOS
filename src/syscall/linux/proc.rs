@@ -3652,6 +3652,13 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         // framebuffer and a dma-buf - and, since a wl_shm pool and a scanout
         // both live or die by aliasing, the only shape those can be.
         Some(file) if file.inode().frame_backed() => {
+            // The node gets to refuse the request before a frame is spent: an
+            // `io_uring` ring serves three magic file offsets, and an offset
+            // outside them (or a length past a region) is `EINVAL` here - the
+            // answer Linux gives - rather than a fault on first touch.
+            if let Err(e) = file.inode().mmap_validate(offset as u64, len as u64) {
+                return err_of(e);
+            }
             // The name the mapping reports, taken from the descriptor now
             // because taking it later means searching the filesystem tree for
             // the inode (see `File::display_name`). A descriptor that was never

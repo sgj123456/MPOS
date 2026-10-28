@@ -1540,3 +1540,17 @@ Section numbers are unchanged from the original `UAPI.md`.
   Pinned by `t-sockbuf` sections 8 and 9; counterfactual (`udp_rx_bytes` pinned to the old
   ring) reddens the two comparison claims by name. Record: `docs/notes/` §4.3.3.1,
   `docs/uapi/` §5.1 item 58's addendum.
+
+- **`io_uring_setup`/`enter` — served for the measured synchronous subset (item 115).**
+  The ring ABI was measured on a real-root Linux 7.2.11 with a hand-built ring: a
+  120-byte params struct whose offsets are Linux's own, three mmaps at
+  `0`/`0x8000000`/`0x10000000`, `cq = 2 x sq`, entries rounded up to a power of two,
+  `enter` answering the SQEs it consumed, and per-opcode completions
+  (`NOP` 0, `READ`/`WRITE`/`READV`/`WRITEV` the byte count, `FSYNC`/`CLOSE` 0,
+  unknown opcode `-EINVAL`, bad SQE fd `-EBADF`, `GETEVENTS` parking until `EINTR`).
+  Served in that shape; a served opcode keeps working while anything outside the subset
+  completes `-EOPNOTSUPP` per item. Named refusals: every non-zero setup flag, every
+  `io_uring_register` op, and the SQ cap at 1024 entries (Linux 32768, §8.0's bound).
+  Pinned by `t-io-uring` (22/22 on the host, Linux being the reference, and the guest
+  claims including the three divergences); counterfactual reddens the pin with `-38`.
+  Record: `docs/notes/` §6.32, item 115.

@@ -82,7 +82,7 @@ until re-arm.
 | `vhangup` | — | Done | dispatched, both cases honest. With no controlling terminal it answers `ENOTTY` (Linux's answer, gated by the corrected `t-posix`); with a controlling terminal it answers `EOPNOTSUPP` — the hang-up itself (tty re-init + `EIO` on open fds) is `docs/notes/` §12.2 B4, a tty-layer feature the kernel does not perform, so it refuses rather than fakes the success. The nice round-trip that used to sit on this row (`getpriority`/`setpriority`) landed in Phase 12 §12.2 B5 and moved back to `Done`. `src/syscall/linux/posix.rs` |
 | `accept4`, `sendmmsg`, `recvmmsg` | 288/307/299 | Done | `src/net/socket.rs` |
 | `rt_sigpending` | 127 | Done | `src/syscall/linux/posix.rs`; reads `current_pending()` |
-| `io_uring_setup/enter/register` | 425-427 | Deferred | per the original phase's own call |
+| `io_uring_setup/enter/register` | 425-427 | Served (measured subset) | the ring ABI was measured and the synchronous subset served - `docs/notes/06-process-management.md` §6.32, item 115 |
 
 
 ---

@@ -6359,3 +6359,54 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     removed): `CF-EXIT=1`, `pass=220 fail=1`, only `t-fanotify` red — it panics
     because `fanotify_init` answers `ENOSYS` — and every other program stays
     green.
+
+## item 115 — io_uring_setup(2)/io_uring_enter(2): the ring is a mapping, and each completion is the blocking call's answer
+
+    **Measured first, on Linux 7.2.11, with a hand-built ring** (no liburing:
+    `build/scratch/iouring/probe4.c`, `probe5.c`) — because the thing an
+    application branches on is not the descriptor, it is the layout and each
+    SQE's completion. The table that came back: `entries=8` publishes
+    `sq_entries=8`, `cq_entries=16`, `sq_off.array=320`, `cq_off.cqes=64`,
+    `features=0x3ffff`; entries round up to a power of two and `cq = 2 x sq`
+    (`entries=0` is `EINVAL`); `io_uring_enter` answers the SQEs it consumed;
+    `NOP` completes `res=0` with `user_data` intact; `READ`/`WRITE`/`READV`/
+    `WRITEV` complete the byte count; `FSYNC`/`CLOSE` complete 0 (and the close
+    really closes); an opcode no Linux has completes `-EINVAL`; a bad SQE
+    descriptor completes `-EBADF`; `GETEVENTS` with an empty CQ blocks and a
+    signal ends it with `EINTR`.
+
+    **Served, in that measured shape.** `src/vfs/io_uring_abi.rs` is the
+    host-compiled layout (constants, `sq_entries_for`, `params_words`, with four
+    host tests pinning the measured words); `src/vfs/io_uring.rs` is the ring
+    object over two frame ranges, mapped through the generic
+    `frame_backed`/`mmap_frame` path with a per-region `mmap_validate`;
+    `src/syscall/linux/io_uring.rs` is the surface. `enter` executes each SQE
+    **synchronously through the syscall's own handler** (`handle_read`,
+    `handle_pread64`, `handle_write`, `handle_pwrite64`, `handle_readv`,
+    `handle_preadv`, `handle_writev`, `handle_pwritev`, `handle_fsync`,
+    `handle_close`), so a completion's `res` is exactly what the blocking call
+    would have answered — including its errno and its inotify/fanotify reports.
+
+    **Named refusals, per item rather than per ring**: an opcode below
+    `IORING_OP_LAST` that this kernel does not serve completes
+    `-EOPNOTSUPP` (the ring's other requests keep running; a new Linux's opcode
+    is refused honestly instead of mis-executed); `io_uring_register` is
+    `EOPNOTSUPP` for every op (fixed buffers/files/indices are what it exists
+    for, and this ring resolves per SQE); every non-zero setup flag is
+    `EOPNOTSUPP` (`SQPOLL`/`CQE32`/`SQE128`/`COOP_TASKRUN`/`CQSIZE` are promises
+    this implementation cannot keep); the SQ cap is 1024 entries (Linux 32768,
+    the §8.0 memory bound).
+
+    **Pinned** by `t-io-uring`, which builds the ring by hand: the same binary
+    run under `MPOS_ON_HOST=1` asserts Linux's answers and passes 22/22 there
+    (the reference direction); on the guest it checks the layout, the seven
+    served opcodes, the `EINTR` park, the three divergences above, and the
+    refusals (`EBADF`, `EOPNOTSUPP`, `EINVAL`).
+
+    **Gates**: `cargo xtask test` EXIT=0 — x86_64 `pass=222 fail=0`, aarch64
+    `pass=221 fail=0`, `mpos-kunit 34 passed` both; host suite 669 passed.
+    **Counterfactual** (the three dispatch arms removed): `CF-EXIT=1`,
+    `pass=221 fail=1`, only `t-io-uring` red — its first `Ring::setup(8)`
+    panics with `-38`, the `ENOSYS` the default arm gives; every other program
+    stays green.
+    Full record: `docs/notes/06-process-management.md` §6.32.

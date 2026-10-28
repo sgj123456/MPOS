@@ -303,6 +303,9 @@ A call absent from those is served as its phase section records.
 | `fanotify_init` | 300 | fs | 262 |
 | `fanotify_mark` | 301 | fs | 263 |
 | `fchmodat2` | 452 | fs | 452 |
+| `io_uring_setup` | 425 | io_uring | 425 |
+| `io_uring_enter` | 426 | " | " |
+| `io_uring_register` | 427 | " | " |
 | `cleanup_after_kthread` | 999 | kernel | 999 | (the kernel's own kthread-cleanup hook, named by number so the ABI stays Linux-shaped; there is no Linux syscall at 999 on either machine's table)
 
 ### 1.1 Deliberately `ENOSYS` — refused, pinned
@@ -313,17 +316,17 @@ note printed once per number (`note_enosys`):
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
 | `userfaultfd` | 323 | Userspace page-fault handling | Fault forwarding to a user task + `UFFDIO_*` |
-| `io_uring_setup` | 425 | Async I/O rings | A ring ABI, SQ/CQ, registration — deferred by design (§1.3) |
-| `io_uring_enter` | 426 | " | " |
-| `io_uring_register` | 427 | " | " |
 
 > Two families have since moved out of this table. `keyctl` (250): the kernel keyring is
 > served (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on
 > aarch64), pinned by `t-keyctl`, written up as item 113 with the measured shape in
 > `docs/notes/06-process-management.md` §6.30. `fanotify_init` (300)/`fanotify_mark`
 > (301): the notification class is served (262/263 on aarch64), pinned by `t-fanotify`,
-> written up as item 114 and `docs/notes/03-filesystem.md` §3.9. What stays refused here
-> is `userfaultfd`, the three `io_uring` numbers and `rseq` — and the `fanotify` call
+> written up as item 114 and `docs/notes/03-filesystem.md` §3.9. The three `io_uring`
+> numbers (425/426/427) moved out the same way: the ring is served for its measured
+> synchronous subset, pinned by `t-io-uring`, written up as item 115 and
+> `docs/notes/06-process-management.md` §6.32. What stays refused here
+> is `userfaultfd` and `rseq` — and the `fanotify` call
 > itself now refuses only the shapes it does not serve (the content classes and the
 > mount/filesystem scopes), each by name.
 

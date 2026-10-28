@@ -27,6 +27,9 @@ pub mod fs;
 #[cfg(target_os = "none")]
 pub(crate) mod proc;
 
+/// The `io_uring` syscalls: the ABI surface over `crate::vfs::io_uring`'s ring.
+#[cfg(target_os = "none")]
+pub(crate) mod io_uring;
 /// The keyring's three calls: `add_key`, `request_key`, `keyctl`. The model
 /// (keys, keyrings, permission classes, quota) is `sched::keys`'s; this is the
 /// ABI face that copies user memory and maps errnos.
@@ -462,6 +465,11 @@ pub unsafe fn dispatch(
         nr::PRLIMIT64 => abi::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
         nr::FUTEX_WAITV => proc::handle_futex_waitv(args),
+        // The ring family: setup builds and publishes the region layout, enter
+        // runs the SQEs synchronously, register is refused per the module's doc.
+        nr::IO_URING_SETUP => io_uring::handle_io_uring_setup(args),
+        nr::IO_URING_ENTER => io_uring::handle_io_uring_enter(args),
+        nr::IO_URING_REGISTER => io_uring::handle_io_uring_register(args),
         nr::ADD_KEY => keys::handle_add_key(args),
         nr::REQUEST_KEY => keys::handle_request_key(args),
         nr::KEYCTL => keys::handle_keyctl(args),

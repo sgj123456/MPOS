@@ -366,6 +366,10 @@ pub const EPOLL_WAIT: u64 = 232;
 pub const EPOLL_PWAIT: u64 = 281;
 /// `epoll_pwait2(2)`: the pwait pair's nanosecond-timeout spelling.
 pub const EPOLL_PWAIT2: u64 = 441;
+/// The `io_uring` family, three consecutive numbers on both machines.
+pub const IO_URING_SETUP: u64 = 425;
+pub const IO_URING_ENTER: u64 = 426;
+pub const IO_URING_REGISTER: u64 = 427;
 /// `timerfd_create(2)`: a timer that reports its expirations through a
 /// descriptor - the wait `systemd`'s timer units and every poll loop with
 /// a deadline are built on.
