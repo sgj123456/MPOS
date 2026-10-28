@@ -16,6 +16,7 @@ pub const MMAP: u64 = 9;
 pub const MPROTECT: u64 = 10;
 pub const MREMAP: u64 = 25;
 pub const MUNMAP: u64 = 11;
+pub const MSEAL: u64 = 462;
 pub const BRK: u64 = 12;
 pub const RT_SIGACTION: u64 = 13;
 pub const RT_SIGPROCMASK: u64 = 14;

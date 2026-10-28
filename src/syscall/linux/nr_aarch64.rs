@@ -25,6 +25,7 @@ pub const MMAP: u64 = 222; // 9 on x86_64
 pub const MPROTECT: u64 = 226; // 10 on x86_64
 pub const MREMAP: u64 = 216; // 25 on x86_64
 pub const MUNMAP: u64 = 215; // 11 on x86_64
+pub const MSEAL: u64 = 462; // 462 on x86_64
 pub const BRK: u64 = 214; // 12 on x86_64
 pub const RT_SIGACTION: u64 = 134; // 13 on x86_64
 pub const RT_SIGPROCMASK: u64 = 135; // 14 on x86_64

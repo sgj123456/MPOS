@@ -2735,13 +2735,17 @@ pub(super) fn handle_process_madvise(args: [usize; ARG_COUNT], from_user: bool) 
                     // the mapped page before it finds the next one missing and
                     // still answers ENOMEM.
                     if advice == abi::MADV_DONTNEED && hole > base {
-                        crate::sched::madvise_dontneed(base, hole - base);
+                        if let Err(e) = crate::sched::madvise_dontneed(base, hole - base) {
+                            return advised_or_error(advised, e);
+                        }
                     }
                     return advised_or_error(advised, err::ENOMEM);
                 }
                 None => {
                     if advice == abi::MADV_DONTNEED {
-                        crate::sched::madvise_dontneed(base, len);
+                        if let Err(e) = crate::sched::madvise_dontneed(base, len) {
+                            return advised_or_error(advised, e);
+                        }
                     }
                     // Every other known advice is the best-effort hint
                     // `madvise` already answers without work - the shared
@@ -3402,16 +3406,79 @@ pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
     if !super::abi::madvise_advice_is_known(advice) {
         return err::EINVAL;
     }
-    if advice == super::abi::MADV_DONTNEED && len != 0 {
-        // A range that runs past the address space is clamped rather than
-        // allowed to take the machine down: the pages beyond it do not exist,
-        // and there is nothing there to drop.
-        let end = addr.saturating_add(len).min(USER_LIMIT);
-        if end > addr {
-            crate::sched::madvise_dontneed(addr, end - addr);
+    // A range that runs past the address space is clamped rather than allowed
+    // to take the machine down: the pages beyond it do not exist, and there is
+    // nothing there to drop.
+    let end = addr.saturating_add(len).min(USER_LIMIT);
+    if advice == super::abi::MADV_DONTNEED && len != 0 && end > addr {
+        if let Err(e) = crate::sched::madvise_dontneed(addr, end - addr) {
+            return e;
+        }
+    }
+    // `MADV_FREE` is a no-op here (§5.2), but on a sealed read-only anonymous
+    // page Linux refuses it with `EPERM` (measured) - and that refusal is not a
+    // hint: it is the promise `mseal` made, so a caller that sees it knows the
+    // pages it is about to let go of are the ones it sealed.
+    if advice == super::abi::MADV_FREE && len != 0 && end > addr {
+        if crate::sched::destructive_advice_refused(addr, end) {
+            return err::EPERM;
         }
     }
     0
+}
+
+/// `mseal(addr, len, flags)` — seal a span so it cannot be unmapped, resized
+/// or have its protections rewritten.
+///
+/// The shape is Linux's, measured on 7.2.11 (`build/scratch/mseal/probe*.c`):
+/// `flags` must be zero (`EINVAL` otherwise), the start must be page-aligned
+/// (`EINVAL`), a length that rounds up past the address space is `EINVAL`
+/// (`end < start`), and an empty span is a success that seals nothing. The
+/// span itself must be **fully mapped** - a hole anywhere inside it is
+/// `ENOMEM`, which is the answer for an unmapped address too, and the same
+/// error covers both because a span with a hole in it is a span the caller did
+/// not describe.
+///
+/// Sealing is idempotent: a sealed span may be sealed again and answers 0.
+/// What the seal *does* is in `crate::sched::seal_user_range`, and what it
+/// refuses afterwards is in the scheduler's mapping operations - `munmap`,
+/// `mprotect`, `mremap` and a destructive `madvise` against a sealed read-only
+/// anonymous page all answer `EPERM`, while a `munmap` that only *abuts* a
+/// sealed span still works (measured: a four-page mapping whose first page is
+/// sealed gives up pages 1..4 for free).
+pub(super) fn handle_mseal(args: [usize; ARG_COUNT]) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+    let (addr, len, flags) = (args[0], args[1], args[2]);
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return err::EINVAL;
+    }
+    // `PAGE_ALIGN(len)` in Linux is `(len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)`;
+    // the checked add is where a length that would wrap is refused, which is
+    // Linux's `if (len && !len_aligned) return -EINVAL`.
+    let Some(aligned) = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|len| len & !(PAGE_SIZE - 1))
+    else {
+        return err::EINVAL;
+    };
+    if aligned == 0 {
+        // `mseal(start, 0, 0)`: Linux answers 0 and seals no page.
+        return 0;
+    }
+    if addr.checked_add(aligned).is_none() {
+        // Linux's `end = start + len_aligned; if (end < start) return -EINVAL`.
+        return err::EINVAL;
+    }
+    // `seal_user_range` takes a length, not an end: passing `end` here would
+    // add the address twice and seal a span nobody named (the first gate run
+    // caught exactly that - every valid seal answered `ENOMEM`).
+    match crate::sched::seal_user_range(addr, aligned) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// `brk(addr)` — change the program break (heap end).
@@ -3547,7 +3614,11 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     let base = match (fixed, want) {
         // Linux: a fixed request *takes* the range, replacing what is there.
         (true, Some(addr)) => {
-            crate::sched::munmap_user(addr, len);
+            // `mseal`'s promise covers replacement too: measured, `MAP_FIXED`
+            // over a sealed page is `EPERM` and the mapping stays.
+            if let Err(e) = crate::sched::munmap_user(addr, len) {
+                return e;
+            }
             addr
         }
         // A fixed request for an address that cannot be honoured is an error,
@@ -3759,6 +3830,13 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     {
         return err::EINVAL;
     }
+    // A sealed range cannot be resized or moved - measured: `mremap` with
+    // `MREMAP_MAYMOVE` on a sealed page is `EPERM`, and nothing moves. Asked
+    // once here rather than per branch: shrinking, growing in place and moving
+    // are all a change to the same promise.
+    if crate::sched::user_range_sealed(old_addr, old) {
+        return err::EPERM;
+    }
     let may_move = flags & MREMAP_MAYMOVE != 0;
     let to_fixed = flags & MREMAP_FIXED != 0;
     // Linux: asking for a destination is asking to move there.
@@ -3793,7 +3871,9 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     if !to_fixed {
         // A shrink, or a grow into the pages just above.
         if new <= old {
-            crate::sched::munmap_user(old_addr + new, old - new);
+            if let Err(e) = crate::sched::munmap_user(old_addr + new, old - new) {
+                return e;
+            }
             return old_addr as isize;
         }
         // Linux grows only into pages its VMA says are free; the same
@@ -3830,7 +3910,9 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
         {
             return err::EINVAL;
         }
-        crate::sched::munmap_user(new_addr, new);
+        if let Err(e) = crate::sched::munmap_user(new_addr, new) {
+            return e;
+        }
         new_addr
     } else {
         match free_range(new, crate::sched::get_mmap_cursor()) {
@@ -3941,7 +4023,9 @@ pub(super) fn handle_munmap(args: [usize; ARG_COUNT]) -> isize {
     if !addr.is_multiple_of(crate::mm::pframe::PAGE_SIZE) || length == 0 {
         return err::EINVAL;
     }
-    crate::sched::munmap_user(addr, length);
+    if let Err(e) = crate::sched::munmap_user(addr, length) {
+        return e;
+    }
     0
 }
 
@@ -3973,7 +4057,9 @@ pub(super) fn handle_mprotect(args: [usize; ARG_COUNT]) -> isize {
     if prot != 0 {
         mf |= MapFlags::USER;
     }
-    crate::sched::protect_user_range(addr, len, mf);
+    if let Err(e) = crate::sched::protect_user_range(addr, len, mf) {
+        return e;
+    }
     0
 }
 

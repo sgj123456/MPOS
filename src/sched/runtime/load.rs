@@ -457,6 +457,7 @@ pub(crate) fn load_user(
         end: layout.stack_top,
         prot: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
         name: Some(Arc::from("[stack]")),
+        sealed: false,
     });
 
     // Control goes to the interpreter when there is one, and to the program
@@ -515,6 +516,7 @@ fn segment_ranges(
             // (there is no path it was run by), and a maps line with an empty
             // column is not the shape a reader parses.
             name: name.filter(|name| !name.is_empty()).map(Arc::from),
+            sealed: false,
         });
     }
 }

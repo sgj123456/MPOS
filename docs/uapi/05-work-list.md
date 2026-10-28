@@ -6503,3 +6503,60 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `UNSHARE` would look like a no-op whether or not it did anything. The same
     binary runs under `MPOS_ON_HOST=1` against Linux and passes 16/16 there -
     the reference direction.
+
+## item 118 — `mseal(2)`: a span sealed against unmapping, resizing and reprotection
+
+`mseal(2)` (462 on both machines) is how a program promises its own address
+space will not change under it: seal the text so no one unmaps it, seal a
+generation of JIT code, seal a framebuffer. The number was unserved here.
+
+**Measured first**, on Linux 7.2.11 (`build/scratch/mseal/probe.c`, `probe4.c`,
+`probe5.c`, `probe6.c`, `probe7.c`), because the edge answers are not the ones
+a reader guesses:
+
+- `flags` must be zero, the start page-aligned (`EINVAL`); `len = 0` answers
+  `0` and seals nothing; sealing a sealed span again is also `0`;
+- the span must be **fully mapped**: a hole inside it is `ENOMEM` for the whole
+  call, and so is an address nothing owns or `start = NULL`;
+- after a seal, `munmap` and `mprotect` over a sealed page are `EPERM`, and so
+  is `mremap` of it (in place or `MAYMOVE`) and a `MAP_FIXED` mapping placed
+  over it;
+- a `munmap` that only *abuts* the seal still works: sealing page 0 of a
+  four-page mapping leaves pages 1..4 free to be given back;
+- a destructive `madvise` is refused (`EPERM`) **only** where the sealed pages
+  are anonymous **and** not writable - a sealed writable anonymous page and a
+  sealed file-backed private page both answer `0`, because each has an answer
+  for what comes back;
+- a `fork` inherits the seal; `exec` replaces the address space and the seal
+  goes with it.
+
+**Served, in that shape.** The seal is a bit on **both** descriptions a mapping
+can have here - `Vma.sealed` and `MappedRange.sealed` - because the program
+image and the stack are eagerly mapped and carry no VMA, and sealing a program's
+text is the call's flagship use. `handle_mseal` in
+`src/syscall/linux/proc.rs` checks flags, alignment, the `PAGE_ALIGN(len)`
+rounding and the overflow, then asks the scheduler. `crate::sched::seal_user_range`
+takes the "is every byte mapped" decision over both descriptions
+(`Mm::vma_gaps`, which already answers the union), then `VmaTable::seal_present`
+splits and marks the VMA half and `Mm::seal_ranges` splits and marks the eager
+half. The refusals live in the scheduler's mapping operations, not in the
+handler: `munmap_user`, `protect_user_range`, `mremap`'s source guard and
+`madvise`'s destructive advice all answer `EPERM` **before** changing
+anything, so the refusal is atomic from the caller's side.
+
+**One behaviour is named rather than served**: a sealed stack does not grow -
+this kernel's stack grows by extending its eager `[stack]` range, and
+`resolve_stack_growth` refuses when that range is sealed, which is Linux's
+`SIGSEGV` answer. The pin does not claim it (it seals heap mappings), and the
+notes record it.
+
+**Pinned** by `t-mseal`, 27 claims, whose host run is the counterfactual
+direction: `mseal` is unprivileged, so the very same binary runs against Linux
+7.2.11 and answers 27/27 `ok` before it ever meets this kernel.
+
+Gate: `cargo xtask test` x86_64 `pass=225 fail=0 (225 built)`, aarch64
+`pass=224 fail=0 (224 built)`, `mpos-kunit 34 passed, 0 failed` both, host
+**682 passed**. Counterfactual (the dispatch arm removed): `CF-EXIT=1`,
+`pass=224 fail=1 (225 built)`, only `t-mseal` red.
+
+Full record: [`docs/notes/`](../notes/05-memory-management.md) §5.5.

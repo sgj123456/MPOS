@@ -827,8 +827,11 @@ pub fn handle_shmat(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
         }
         if remap {
             // Take the range over: whatever describes it goes, which is what
-            // lets a caller replace a mapping at a fixed address.
-            crate::sched::munmap_user(addr, len);
+            // lets a caller replace a mapping at a fixed address. A sealed
+            // range refuses, the same way `MAP_FIXED` does.
+            if let Err(e) = crate::sched::munmap_user(addr, len) {
+                return e;
+            }
         } else if !crate::sched::vma_range_free(addr, len) {
             // A busy address is refused, not relocated: measured, Linux answers
             // `EINVAL` here where a plain `mmap` hint would move.
@@ -876,7 +879,9 @@ pub fn handle_shmdt(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
         // table invariant, not a caller's mistake.
         return err::EINVAL;
     };
-    crate::sched::munmap_user(addr, segment.mapped_len());
+    if let Err(e) = crate::sched::munmap_user(addr, segment.mapped_len()) {
+        return e;
+    }
     segment.touch_detach(crate::sched::current_pid_number(), now_secs());
     reap_dead();
     0

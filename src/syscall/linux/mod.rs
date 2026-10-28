@@ -407,6 +407,7 @@ pub unsafe fn dispatch(
         nr::MUNMAP => proc::handle_munmap(args),
         nr::MPROTECT => proc::handle_mprotect(args),
         nr::MREMAP => proc::handle_mremap(args),
+        nr::MSEAL => proc::handle_mseal(args),
         nr::MADVISE => proc::handle_madvise(args),
 
         // --- stubs ---

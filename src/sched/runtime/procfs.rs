@@ -407,6 +407,7 @@ pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option
         end,
         prot,
         name,
+        sealed: false,
     });
 }
 

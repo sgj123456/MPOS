@@ -252,6 +252,15 @@ One-glance status of the whole roadmap.
   number in the span closes through `close_one`, the body `handle_close` was split
   into, so a socket's port and a DRM master die there as they do at `close(2)`
   (§3.10, item 117)
+- [x] `mseal(2)` (462) — a span sealed against unmapping, resizing and
+  reprotection: measured on Linux 7.2.11, `flags`/alignment are `EINVAL`, a span
+  with a hole is `ENOMEM` for the whole call, sealing twice is `0`, after a seal
+  `munmap`/`mprotect`/`mremap` of it and a `MAP_FIXED` over it are `EPERM` while
+  a `munmap` that only abuts it still works, a destructive `madvise` is `EPERM`
+  only over sealed read-only anonymous pages, and a `fork` inherits the seal. The
+  bit lives on both descriptions of a mapping (VMAs *and* the eager ranges the
+  program image and stack have), because sealing the text is the call's flagship
+  use; a sealed stack simply does not grow (§5.5, item 118)
 - [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
   the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
   with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is

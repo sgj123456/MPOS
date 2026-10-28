@@ -282,6 +282,11 @@ pub(super) const MREMAP_FIXED: usize = 0x2;
 /// object behind it. Both are now answerable, because a mapping is an address
 /// space and the next touch refills it.
 pub(super) const MADV_DONTNEED: usize = 4;
+/// `MADV_FREE` (`8`) — "the pages may be reclaimed, the contents stay". This
+/// kernel answers it as a hint (§5.2) except for one refusal `mseal(2)` added:
+/// on a sealed, read-only anonymous page Linux answers `EPERM`, measured
+/// (`build/scratch/mseal/probe4.c`, `probe6.c`).
+pub(super) const MADV_FREE: usize = 8;
 
 /// Whether `advice` is one of the values `madvise(2)`'s vocabulary knows, and
 /// so one the handler may answer at all. Linux's `madvise` rejects an advice

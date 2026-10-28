@@ -163,13 +163,26 @@ pub struct MappedRange {
     pub end: usize,
     pub prot: MapFlags,
     pub name: Option<Arc<str>>,
+    /// `mseal(2)`'s bit, for the ranges that have no VMA - the program image,
+    /// the loader's shared objects, the stack and a `MAP_PRIVATE` mapping of an
+    /// ordinary file.
+    ///
+    /// Two descriptions can carry a mapping in this kernel and a seal has to
+    /// live on whichever one of them describes the range, which is why the bit
+    /// is on both [`Vma`] and [`MappedRange`] rather than on one: `mseal` over a
+    /// program's text is the flagship use of the call, and in this kernel that
+    /// text is an eager range.
+    pub sealed: bool,
 }
 
 impl MappedRange {
     /// Whether `next` continues this range, so a segment list can be reported
     /// as the runs a reader expects rather than one line per ELF segment.
     fn abuts(&self, next: &MappedRange) -> bool {
-        self.end == next.start && self.prot == next.prot && same_name(&self.name, &next.name)
+        self.end == next.start
+            && self.prot == next.prot
+            && self.sealed == next.sealed
+            && same_name(&self.name, &next.name)
     }
 }
 
@@ -185,16 +198,16 @@ impl MappedRange {
 /// let rw = MapFlags::READ | MapFlags::WRITE;
 /// // Out of order, and the second continues the first: sorted, then folded.
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None },
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false },
 /// ]);
 /// assert_eq!(merged.len(), 1);
 /// assert_eq!((merged[0].start, merged[0].end), (0x1000, 0x3000));
 /// // A permission change ends the run even when the addresses abut.
 /// let rx = MapFlags::READ | MapFlags::EXEC;
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None },
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None, sealed: false },
 /// ]);
 /// assert_eq!(merged.len(), 2);
 /// ```
@@ -231,6 +244,18 @@ pub struct Vma {
     /// line. `Arc<str>` and not `String` so that `Clone`, which every split
     /// does, copies a pointer.
     pub name: Option<Arc<str>>,
+    /// `mseal(2)`'s bit: the range may not be unmapped, re-mapped, shrunk,
+    /// re-protected or replaced, and a destructive `madvise` on it is refused
+    /// unless the pages are writable or file-backed.
+    ///
+    /// It lives on the VMA rather than in a side table because every one of
+    /// those operations already asks the VMA table what is there; a second
+    /// structure would have to be kept in step with every `mmap`/`munmap`/
+    /// `mremap`/`mprotect`, which is the kind of parallel record this
+    /// repository has paid for before. It travels through `sliced`, so a seal
+    /// over one page of a four-page mapping leaves the other three unsealed
+    /// and a later split cannot lose the bit.
+    pub sealed: bool,
 }
 
 impl Vma {
@@ -242,6 +267,7 @@ impl Vma {
             prot,
             kind,
             name: None,
+            sealed: false,
         }
     }
 
@@ -289,14 +315,23 @@ impl Vma {
             prot: self.prot,
             kind,
             name: self.name.clone(),
+            sealed: self.sealed,
         })
     }
 
     /// Whether `next` continues this VMA with nothing in between: same
     /// permissions, same object, and - for a frame-backed one - the offset
     /// where this range's own arithmetic puts it.
+    ///
+    /// The seal is part of the identity: folding a sealed piece into an
+    /// unsealed neighbour would either lose the seal or spread it over pages
+    /// nobody sealed, so two pieces that disagree about it stay two lines.
     fn abuts(&self, next: &Vma) -> bool {
-        if self.end != next.start || self.prot != next.prot || !same_name(&self.name, &next.name) {
+        if self.end != next.start
+            || self.prot != next.prot
+            || self.sealed != next.sealed
+            || !same_name(&self.name, &next.name)
+        {
             return false;
         }
         if !self.kind.same_object(&next.kind) {
@@ -438,6 +473,82 @@ impl VmaTable {
     /// the range: what `mremap` needs to carry a mapping's backing with it.
     pub fn take_range(&mut self, start: usize, end: usize) -> Vec<Vma> {
         self.split_out(start, end)
+    }
+
+    /// `mseal(2)`: mark everything inside `[start, end)` sealed.
+    ///
+    /// Measured on Linux 7.2.11 (`build/scratch/mseal/probe4.c`), because the
+    /// two edge answers are not the ones a reader guesses:
+    ///
+    /// * a span that is **not fully mapped** is `ENOMEM` - `mseal` refuses to
+    ///   seal a hole, since a hole can be mapped later and the seal would then
+    ///   have promised something it could not keep;
+    /// * sealing an already-sealed range is `0`, not an error, so a caller may
+    ///   repeat itself.
+    ///
+    /// The range is split at its ends exactly like `mprotect`'s, which is what
+    /// makes "seal one page of four" leave three pages usable.
+    pub fn seal_range(&mut self, start: usize, end: usize) -> Result<(), isize> {
+        if start >= end {
+            return Ok(());
+        }
+        // Every byte of the span has to be somebody's address. `gaps` answers
+        // the holes, and the check is on the span as given - a hole *inside* it
+        // refuses the whole call, which is the measured answer.
+        if !self.gaps(start, end).is_empty() {
+            return Err(crate::err::ENOMEM);
+        }
+        let mut inside = self.split_out(start, end);
+        for vma in &mut inside {
+            vma.sealed = true;
+        }
+        self.vmas.append(&mut inside);
+        self.tidy();
+        Ok(())
+    }
+
+    /// Mark whatever the table covers inside `[start, end)` sealed, splitting at
+    /// the ends and **without** the "the whole span must be mapped" refusal.
+    ///
+    /// That refusal belongs to the caller that can see every description of a
+    /// mapping: a span over the program image is fully mapped yet names no VMA,
+    /// so the table alone cannot tell "nothing is there" from "it is another
+    /// description's". [`VmaTable::seal_range`] is the whole-call form a table
+    /// with no eager ranges beside it can answer; this is the half that marks.
+    pub fn seal_present(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let mut inside = self.split_out(start, end);
+        for vma in &mut inside {
+            vma.sealed = true;
+        }
+        self.vmas.append(&mut inside);
+        self.tidy();
+    }
+
+    /// Whether any part of `[start, end)` is sealed. Every operation `mseal`
+    /// protects asks this *before* it changes anything, and the answer refuses
+    /// the whole call rather than the sealed slice of it: a `munmap` that
+    /// covers a sealed page and three unsealed ones is `EPERM` in full, which
+    /// is what the host measured.
+    pub fn sealed_within(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            // An empty span covers no byte, so no byte of it is sealed. The
+            // `mseal`-protected operations all treat an empty range as "change
+            // nothing", and a guard that answered `true` here would refuse a
+            // `munmap(addr, 0)` that Linux accepts.
+            return false;
+        }
+        self.vmas
+            .iter()
+            .any(|v| v.sealed && v.end > start && v.start < end)
+    }
+
+    /// Whether the VMA covering `virt` is sealed. `madvise` asks per range
+    /// because its rule is about the pages an advice would destroy.
+    pub fn sealed_at(&self, virt: usize) -> bool {
+        self.lookup(virt).is_some_and(|v| v.sealed)
     }
 
     /// Rewrite the permissions of everything already inside `[start, end)`.
@@ -986,5 +1097,85 @@ mod tests {
             Some(arena - 2 * page),
             "the next placement goes just below the previous one"
         );
+    }
+    /// `mseal(2)` on a span that is fully mapped: the covered pages become
+    /// sealed and the mapping splits so the pages outside stay usable -
+    /// measured on Linux 7.2.11 (`build/scratch/mseal/probe7.c`): a four-page
+    /// mapping whose first page is sealed still gives up pages 1..4 to
+    /// `munmap`, and a `munmap` that touches the sealed page is `EPERM`.
+    #[test]
+    fn a_seal_splits_the_area_at_its_ends_and_marks_only_what_it_covers() {
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x5000, RW));
+
+        assert_eq!(table.seal_range(0x2000, 0x4000), Ok(()));
+        assert_eq!(table.len(), 3, "the two unsealed ends are their own areas");
+        assert!(table.sealed_at(0x2000));
+        assert!(table.sealed_at(0x3fff));
+        assert!(!table.sealed_at(0x1000), "the head was not asked for");
+        assert!(!table.sealed_at(0x4000), "the tail was not asked for");
+        assert!(table.sealed_within(0x3fff, 0x4000));
+        assert!(!table.sealed_within(0x4000, 0x5000));
+        assert!(
+            !table.sealed_within(0x3000, 0x3000),
+            "an empty span names no sealed page"
+        );
+    }
+
+    /// A span with a hole in it is refused in full: `mseal` may not promise
+    /// anything about an address nothing owns, because a later `mmap` there
+    /// would inherit a seal nobody asked for. The measured answer is `ENOMEM`
+    /// (`build/scratch/mseal/probe4.c`), the same one an unmapped address gives.
+    #[test]
+    fn a_seal_over_a_hole_is_enomem_and_changes_nothing() {
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x3000, RW));
+
+        assert_eq!(
+            table.seal_range(0x1000, 0x4000),
+            Err(crate::err::ENOMEM),
+            "the hole at 0x3000..0x4000 refuses the whole call"
+        );
+        assert_eq!(table.len(), 1, "a refused seal does not split anything");
+        assert!(!table.sealed_at(0x1000));
+        assert_eq!(table.seal_range(0x1000, 0x3000), Ok(()));
+        assert!(table.sealed_at(0x1fff));
+    }
+
+    /// Sealing twice is not an error: a caller that seals its whole image and
+    /// then seals one page again gets `0` both times (measured).
+    #[test]
+    fn sealing_a_sealed_page_again_answers_ok() {
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x3000, RW));
+        assert_eq!(table.seal_range(0x1000, 0x3000), Ok(()));
+        assert_eq!(table.seal_range(0x1000, 0x3000), Ok(()));
+        assert_eq!(table.seal_range(0x2000, 0x3000), Ok(()));
+        assert!(table.sealed_at(0x1000));
+        assert!(table.sealed_at(0x2000));
+    }
+
+    /// A sealed piece stays a piece: it must not fold back into an unsealed
+    /// neighbour, or the seal would either vanish or spread over pages nobody
+    /// sealed. That is why `abuts` compares the bit.
+    #[test]
+    fn a_sealed_piece_does_not_fold_into_an_unsealed_neighbour() {
+        let mut table = VmaTable::new();
+        // Two insertions that would merge without the seal.
+        table.insert(anon(0x1000, 0x2000, RW));
+        table.insert(anon(0x2000, 0x3000, RW));
+        assert_eq!(table.len(), 1, "the unsealed pair is one area");
+
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x2000, RW));
+        table.insert(anon(0x2000, 0x3000, RW));
+        assert_eq!(table.seal_range(0x1000, 0x2000), Ok(()));
+        assert_eq!(
+            table.len(),
+            2,
+            "the sealed page and its neighbour are two areas"
+        );
+        assert!(table.sealed_at(0x1000));
+        assert!(!table.sealed_at(0x2000));
     }
 }

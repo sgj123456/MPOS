@@ -148,3 +148,73 @@ x86_64 `=== SUMMARY pass=170 fail=0` (one more than before — the new program),
 `mpos-kunit 30 passed, 0 failed`, exit 33.
 
 ---
+
+### 5.5 `mseal(2)` — a span that may not be unmapped, resized or reprotected — **DONE** (2026-10-28)
+
+`mseal(2)` is the call that lets a program promise its own address space will
+not change: seal the text, seal a JIT's code, seal a framebuffer nobody may
+unmap. This kernel had no arm for it (the number `462` was unserved), which is
+one of the cheap shapes to add *if* the answers are Linux's - and the two edge
+answers are not the ones a reader guesses.
+
+**Measured first**, on Linux 7.2.11 (`build/scratch/mseal/probe.c`, `probe4.c`,
+`probe5.c`, `probe6.c`, `probe7.c`):
+
+| question | answer |
+|---|---|
+| `mseal(addr, len, 0)` on a mapped span | `0` |
+| sealing an already-sealed span | `0` (idempotent) |
+| `flags = 1` | `EINVAL` |
+| unaligned start | `EINVAL` |
+| `len = 0` | `0`, seals nothing |
+| unmapped address, or `start = NULL` | `ENOMEM` |
+| a hole anywhere inside the span | `ENOMEM` for the whole call |
+| after a seal: `munmap` overlapping it | `EPERM` |
+| after a seal: `mprotect` of it | `EPERM` |
+| after a seal: `mremap` in place / `MREMAP_MAYMOVE` | `EPERM` |
+| after a seal: `MAP_FIXED` over a sealed page | `EPERM` (the mapping is not placed) |
+| a `munmap` that only *abuts* a sealed page | `0` - sealing page 0 of 4 leaves pages 1..4 free |
+| `madvise(DONTNEED)` on sealed **writable anon** | `0` |
+| `madvise(DONTNEED)`/`madvise(FREE)` on sealed **read-only anon** | `EPERM` |
+| `madvise(DONTNEED)` on a sealed file-backed private mapping | `0` |
+| `fork` | the seal is inherited |
+| `exec` | the seal is gone with the address space |
+
+The `.text` case is why the file-backed row matters: a program seals its image
+(a file-backed private mapping, which in this kernel is an *eager* range with no
+VMA at all) and the seal has to land there, not only on `mmap`-described ranges.
+That is why the seal is a bit on **both** descriptions - `Vma.sealed` and
+`MappedRange.sealed` - rather than a side table: the two descriptions are what a
+mapping can be, and a seal that lived in one of them would not cover the image.
+
+**The refusal is on the whole call**, not the sealed slice of it, and the entry
+points that ask are the scheduler's mapping operations, not the handler:
+`munmap_user`, `protect_user_range`, `mremap`'s source guard and `madvise`'s
+destructive advice all answer `EPERM` before changing anything - which is what
+makes the operation atomic from the caller's side. `seal_range` splits the VMA at
+the seal's ends (so the unsealed neighbours stay usable), refuses a span with a
+hole (`ENOMEM`, before splitting anything), and `abuts` compares the seal so a
+sealed piece never folds back into an unsealed neighbour. `madvise`'s rule is the
+man page's sentence, reconstructed from the measurements: a destructive advice is
+refused only where the pages are anonymous **and** not writable, because a
+sealed writable page and a file-backed page both have an answer for what comes
+back.
+
+**Pinned** by `t-mseal` (new, both machines, 27 claims) - and because `mseal` is
+unprivileged, the same binary ran against the host first: **27/27 ok, `PASS`,
+exit 0**. That is the counterfactual direction: every claim in the program is
+Linux's answer, not this kernel's expectation.
+
+**Gates** - `cargo xtask test` after the pin: x86_64 `pass=225 fail=0 (225
+built)`, aarch64 `pass=224 fail=0 (224 built)`, `mpos-kunit 34 passed, 0 failed`
+both, host suite **682 passed**. The counterfactual - the dispatch arm removed -
+answers `CF-EXIT=1`, `pass=224 fail=1 (225 built)`, and only `t-mseal` red (every
+call falls to `_ => ENOSYS`, so the program panics at its first claim).
+
+One divergence is named rather than served: a sealed range cannot be *grown* by
+a stack fault (this kernel's stack grows by extending its eager `[stack]` range,
+and a sealed stack makes that growth fail, which is Linux's `SIGSEGV` answer);
+the guard is in `resolve_stack_growth` and is measured by the pin only indirectly
+(the pin seals heap mappings, not the stack).
+
+Full record: [`docs/uapi/`](../uapi/05-work-list.md) §5.1 item 118.

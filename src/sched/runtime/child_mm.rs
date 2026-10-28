@@ -488,27 +488,72 @@ pub fn map_frames(
 /// The order matters. The table goes first, so that a page released here is not
 /// also reachable through a stale VMA - which is what `release_user_frames`
 /// relies on when it asks the group to forget the frame.
-pub fn munmap_user(virt: usize, len: usize) {
+pub fn munmap_user(virt: usize, len: usize) -> Result<(), isize> {
     if len == 0 {
-        return;
+        return Ok(());
     }
     let end = virt.saturating_add(len);
+    // `mseal(2)`'s whole point: a sealed span may not be unmapped. The refusal
+    // is for the call as a whole, not the sealed slice of it - measured: a
+    // `munmap` covering one sealed page and three unsealed ones is `EPERM` in
+    // full, and nothing is unmapped.
+    if current_mm().sealed_within(virt, end) {
+        return Err(crate::err::EPERM);
+    }
     current_mm().vma_remove_range(virt, end);
     current_mm().forget_ranges(virt, end);
     release_user_frames(unmap_user(virt, len));
+    Ok(())
+}
+
+/// Whether any part of `virt..virt + len` is sealed. The guard every resize,
+/// re-protect and unmap asks; `mremap` asks it once for the source span, while
+/// `munmap` and `mprotect` ask it through their own entry points.
+pub fn user_range_sealed(virt: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    current_mm().sealed_within(virt, virt.saturating_add(len))
+}
+
+/// `mseal(start, len)`: seal the span, or `ENOMEM` when any byte of it is not
+/// mapped (measured: a hole inside the span, an address nothing owns, and a
+/// NULL start all answer `ENOMEM`; the length is rounded up to a page and a
+/// zero length is `0`, which the handler has already checked).
+pub fn seal_user_range(virt: usize, len: usize) -> Result<(), isize> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = virt.checked_add(len).ok_or(crate::err::ENOMEM)?;
+    let mm = current_mm();
+    // Both descriptions count as "mapped": a span over the program image is
+    // sealable because the image is an eager range even though no VMA names it.
+    if !mm.vma_gaps(virt, end).is_empty() {
+        return Err(crate::err::ENOMEM);
+    }
+    critical_section::with(|cs| mm.vmas.borrow(cs).borrow_mut().seal_present(virt, end));
+    mm.seal_ranges(virt, end);
+    Ok(())
 }
 
 /// `mprotect`'s two halves: the VMAs get the new permissions so that a page
 /// faulted in later comes up with them, and the pages already present are
 /// re-flagged where they lie.
-pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) {
+pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) -> Result<(), isize> {
     if len == 0 {
-        return;
+        return Ok(());
     }
     let end = virt.saturating_add(len);
+    // A sealed range's permissions are a promise no one may rewrite - measured:
+    // `mprotect` on a sealed mapping is `EPERM`, whether the mapping is
+    // anonymous or a file's.
+    if current_mm().sealed_within(virt, end) {
+        return Err(crate::err::EPERM);
+    }
     current_mm().vma_set_prot(virt, end, flags);
     current_mm().reprot_ranges(virt, end, flags);
     protect_user(virt, len, flags);
+    Ok(())
 }
 
 /// `PR_SET_VMA_ANON_NAME`: name (or unname) the anonymous mappings in
@@ -544,6 +589,43 @@ pub fn name_user_range(
     })
 }
 
+/// Whether a destructive `madvise` over `virt..end` hits a sealed page that is
+/// anonymous and not writable - the one shape Linux refuses (measured; see
+/// [`madvise_dontneed`]).
+///
+/// A page can be described by a VMA or by an eager range, so both are asked. A
+/// bracketed name (`[stack]`, `[heap]`) is this kernel's spelling of an
+/// anonymous range in that second list; anything else there is a file's.
+pub fn destructive_advice_refused(virt: usize, end: usize) -> bool {
+    let mm = current_mm();
+    let mut page = virt;
+    while page < end {
+        if let Some(vma) = mm.vma_at(page) {
+            if vma.sealed
+                && matches!(vma.kind, VmaKind::Anon)
+                && !vma.prot.contains(MapFlags::WRITE)
+            {
+                return true;
+            }
+        } else {
+            for range in mm.eager_ranges() {
+                if page >= range.start && page < range.end {
+                    let anon = range
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with('['));
+                    if range.sealed && anon && !range.prot.contains(MapFlags::WRITE) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        page += PAGE_SIZE;
+    }
+    false
+}
+
 /// `madvise(MADV_DONTNEED)` over `virt..virt + len`: give the range's pages
 /// back, leaving the mapping itself in place.
 ///
@@ -561,11 +643,22 @@ pub fn name_user_range(
 /// Only pages a VMA covers are touched. That is not a nicety: the program
 /// image and the stack are mapped but have no VMA, and dropping one of those
 /// would leave an address that no rule says how to refill.
-pub fn madvise_dontneed(virt: usize, len: usize) {
+pub fn madvise_dontneed(virt: usize, len: usize) -> Result<(), isize> {
     if len == 0 {
-        return;
+        return Ok(());
     }
     let end = virt.saturating_add(len);
+    // `mseal(2)`'s madvise half, measured on Linux 7.2.11
+    // (`build/scratch/mseal/probe4.c`, `probe6.c`): a destructive advice on a
+    // sealed mapping is refused **only** when the pages are anonymous and not
+    // writable - `EPERM` for a sealed read-only anonymous page, `0` for a
+    // sealed writable one and for any file-backed mapping (shared or private,
+    // because a file still holds the answer the pages came from). The rule is
+    // the same sentence the man page writes, and the two permissive halves are
+    // what a compositor's sealed-but-mapped framebuffer needs.
+    if destructive_advice_refused(virt, end) {
+        return Err(crate::err::EPERM);
+    }
     with_table(|t| {
         let owner = t.space_owner(t.current);
         let Some(task) = t.tasks[owner.0].as_mut() else {
@@ -601,6 +694,7 @@ pub fn madvise_dontneed(virt: usize, len: usize) {
             crate::mm::free_frames(frame, 0);
         }
     });
+    Ok(())
 }
 
 /// Whether an address is the current process's: a page is there, or a VMA says
@@ -1254,6 +1348,13 @@ pub fn resolve_stack_growth(addr: usize) -> bool {
         if page < floor.saturating_sub(STACK_GROWTH_SLACK) {
             return false;
         }
+        // A sealed stack does not grow: `mseal` promises the range cannot be
+        // resized, and growing it downwards is exactly that. Linux answers the
+        // fault with `SIGSEGV`. (`false` here is the same answer - the fault
+        // has no resolver and the program is killed.)
+        if t.task(id).mm.eager_sealed_within(page, stack_top) {
+            return false;
+        }
         // The group's space, for the same reason a copy-on-write fault looks
         // there: a thread's stack is a mapping the group shares, and only the
         // leader's slot holds the tables that describe it.
@@ -1479,6 +1580,7 @@ impl Mm {
                         end: start,
                         prot: range.prot,
                         name: range.name.clone(),
+                        sealed: range.sealed,
                     });
                 }
                 if range.end > end {
@@ -1487,11 +1589,85 @@ impl Mm {
                         end: range.end,
                         prot: range.prot,
                         name: range.name.clone(),
+                        sealed: range.sealed,
                     });
                 }
             }
             *ranges = kept;
         });
+    }
+
+    /// `mseal(2)` over the ranges that have no VMA: the program image, the
+    /// loader's shared objects, the stack, and a `MAP_PRIVATE` copy of an
+    /// ordinary file. The pieces inside `start..end` are split out and marked,
+    /// so sealing the text of an image leaves its data neighbour unsealed and
+    /// `/proc/<pid>/maps` still prints the runs it printed before - the seal is
+    /// a fact about what may happen to a range, not a line of its own.
+    pub(crate) fn seal_ranges(&self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        critical_section::with(|cs| {
+            let mut ranges = self.eager.borrow(cs).borrow_mut();
+            let mut rebuilt: Vec<MappedRange> = Vec::with_capacity(ranges.len() + 2);
+            for range in ranges.drain(..) {
+                if range.end <= start || range.start >= end {
+                    rebuilt.push(range);
+                    continue;
+                }
+                // Left piece, untouched.
+                if range.start < start {
+                    rebuilt.push(MappedRange {
+                        start: range.start,
+                        end: start,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                        sealed: range.sealed,
+                    });
+                }
+                // The piece inside the seal.
+                let lo = range.start.max(start);
+                let hi = range.end.min(end);
+                rebuilt.push(MappedRange {
+                    start: lo,
+                    end: hi,
+                    prot: range.prot,
+                    name: range.name.clone(),
+                    sealed: true,
+                });
+                // Right piece, untouched.
+                if range.end > end {
+                    rebuilt.push(MappedRange {
+                        start: end,
+                        end: range.end,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                        sealed: range.sealed,
+                    });
+                }
+            }
+            *ranges = rebuilt;
+        });
+    }
+
+    /// Whether any eagerly-mapped range inside `start..end` is sealed.
+    pub(crate) fn eager_sealed_within(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.eager_ranges()
+            .iter()
+            .any(|range| range.sealed && range.end > start && range.start < end)
+    }
+
+    /// Whether the range `start..end` is sealed by either description: a VMA or
+    /// an eager range. The two descriptions are what a mapping can be, so a
+    /// seal lives on whichever one describes it and every guard asks both.
+    pub(crate) fn sealed_within(&self, start: usize, end: usize) -> bool {
+        if self.eager_sealed_within(start, end) {
+            return true;
+        }
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().sealed_within(start, end))
     }
 
     /// Give the eagerly-mapped ranges inside `start..end` these permissions.
