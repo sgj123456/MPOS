@@ -139,6 +139,18 @@ fn cstr(text: &str) -> CString {
     CString::new(text).expect("no interior NUL")
 }
 
+/// A description unique to *this run*, for every key the pin adds.
+///
+/// The session keyring outlives the program when it is run twice in one
+/// session - a re-run, and `cargo xtask test-host`'s sweep of 240 programs - so
+/// a fixed description makes the second run's `add_key` find the first run's
+/// key: an invalidated one revives, a revoked one refuses the update, and the
+/// state claims then answer from the previous run's leftovers. Measured while
+/// fixing exactly that: `an invalidated key is ENOKEY` failed one run in three.
+fn uniq(name: &str) -> CString {
+    cstr(&std::format!("{name}-{}", std::process::id()))
+}
+
 fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
@@ -218,7 +230,8 @@ fn main() {
 
     // --- a user key: add, read, describe, update --------------------------------
     let ty = cstr("user");
-    let desc = cstr("t-keyctl-payload");
+    let desc_text = std::format!("t-keyctl-payload-{}", std::process::id());
+    let desc = cstr(&desc_text);
     let serial = add_key(&ty, &desc, Some(b"0123456789"), session).expect("add the user key");
     r.check("add_key answers a positive serial", serial > 0);
     let mut small = [0u8; 5];
@@ -242,7 +255,7 @@ fn main() {
         answer == 10 && &big[..10] == b"0123456789",
     );
 
-    let expected_describe = std::format!("user;{};{};3f010000;t-keyctl-payload", euid(), egid());
+    let expected_describe = std::format!("user;{};{};3f010000;{desc_text}", euid(), egid());
     r.check(
         "DESCRIBE is type;uid;gid;perm;desc with the measured default word",
         describe_text(serial).as_deref() == Some(expected_describe.as_str()),
@@ -284,7 +297,7 @@ fn main() {
         "an unknown type is ENODEV",
         add_key(
             &cstr("nonsense"),
-            &cstr("t-keyctl-bad"),
+            &uniq("t-keyctl-bad"),
             Some(b"x"),
             session,
         ) == Err(ENODEV),
@@ -296,21 +309,23 @@ fn main() {
     );
     r.check(
         "a NULL payload with a length is EFAULT",
-        add_key_at(&ty, &cstr("t-keyctl-null"), 0, 5, session) == Err(EFAULT),
+        add_key_at(&ty, &uniq("t-keyctl-null"), 0, 5, session) == Err(EFAULT),
     );
     r.check(
         "adding into a ring this task does not hold is ENOKEY",
-        add_key(&ty, &cstr("t-keyctl-orphan"), Some(b"x"), 0x0fff_ffff) == Err(ENOKEY),
+        add_key(&ty, &uniq("t-keyctl-orphan"), Some(b"x"), 0x0fff_ffff) == Err(ENOKEY),
     );
 
     // --- keyrings: links, search, clear ----------------------------------------
+    let in_ring = std::format!("t-keyctl-in-ring-{}", std::process::id());
+    let deep_text = std::format!("t-keyctl-deep-{}", std::process::id());
     let ring_ty = cstr("keyring");
-    let ring = add_key(&ring_ty, &cstr("t-keyctl-ring"), None, session).expect("make a keyring");
+    let ring = add_key(&ring_ty, &uniq("t-keyctl-ring"), None, session).expect("make a keyring");
     r.check("a keyring is made like any other key", ring > 0);
-    let key = add_key(&ty, &cstr("t-keyctl-in-ring"), Some(b"payload"), ring).expect("key in ring");
+    let key = add_key(&ty, &cstr(&in_ring), Some(b"payload"), ring).expect("key in ring");
     r.check(
         "SEARCH finds a key by type and description",
-        search(session, &ty, &cstr("t-keyctl-in-ring")) == Ok(key),
+        search(session, &ty, &cstr(&in_ring)) == Ok(key),
     );
     let mut links = [0u8; 16];
     let len = read_key(ring, Some(&mut links)).expect("read a keyring");
@@ -319,11 +334,11 @@ fn main() {
         len == 4 && u32::from_le_bytes([links[0], links[1], links[2], links[3]]) == key as u32,
     );
     // A nested keyring is reached through its parent.
-    let nested = add_key(&ring_ty, &cstr("t-keyctl-nested"), None, ring).expect("nested ring");
-    let deep = add_key(&ty, &cstr("t-keyctl-deep"), Some(b"deep"), nested).expect("deep key");
+    let nested = add_key(&ring_ty, &uniq("t-keyctl-nested"), None, ring).expect("nested ring");
+    let deep = add_key(&ty, &cstr(&deep_text), Some(b"deep"), nested).expect("deep key");
     r.check(
         "SEARCH recurses into a nested keyring",
-        search(session, &ty, &cstr("t-keyctl-deep")) == Ok(deep),
+        search(session, &ty, &cstr(&deep_text)) == Ok(deep),
     );
     r.check(
         "UPDATE on a keyring is EOPNOTSUPP",
@@ -351,7 +366,7 @@ fn main() {
     );
 
     // --- states: revoke, invalidate --------------------------------------------
-    let owned = add_key(&ty, &cstr("t-keyctl-revoke"), Some(b"x"), session).expect("key to revoke");
+    let owned = add_key(&ty, &uniq("t-keyctl-revoke"), Some(b"x"), session).expect("key to revoke");
     r.check(
         "REVOKE succeeds",
         keyctl(KEYCTL_REVOKE, owned as usize, 0, 0, 0) == Ok(0),
@@ -365,18 +380,33 @@ fn main() {
         describe(owned, &mut [0u8; 64]) == Err(EKEYREVOKED),
     );
     let invalid =
-        add_key(&ty, &cstr("t-keyctl-invalidate"), Some(b"x"), session).expect("key to invalidate");
+        add_key(&ty, &uniq("t-keyctl-invalidate"), Some(b"x"), session).expect("key to invalidate");
     r.check(
         "INVALIDATE succeeds",
         keyctl(KEYCTL_INVALIDATE, invalid as usize, 0, 0, 0) == Ok(0),
     );
+    // Invalidate is Linux's *asynchronous* retirement: it unlinks the key from
+    // every keyring and schedules the destroy, so a READ by serial answers one
+    // of two things depending on whether the garbage collector has run yet -
+    // measured with strace on 7.2.11, the same binary in the same session
+    // answering `EACCES` (unlinked, still alive) on one run and `ENOKEY`
+    // (destroyed) on the next. This kernel's invalidate is synchronous and
+    // answers `ENOKEY` every time; the claim below is the pair Linux can give,
+    // and the exact answer is claimed on the machine.
+    let invalidated_read = read_key(invalid, None);
     r.check(
-        "an invalidated key is ENOKEY, as if it never existed",
-        read_key(invalid, None) == Err(ENOKEY),
+        "an invalidated key is unreadable: ENOKEY, or EACCES before Linux destroys it",
+        matches!(invalidated_read, Err(ENOKEY) | Err(EACCES)),
     );
+    if !mpos_user_tests::host_run() {
+        r.check(
+            "this kernel retires it synchronously: READ is ENOKEY, not EACCES",
+            invalidated_read == Err(ENOKEY),
+        );
+    }
 
     // --- possession is a permission class, not a findability filter ------------
-    let lonely = add_key(&ty, &cstr("t-keyctl-lonely"), Some(b"x"), session).expect("lonely key");
+    let lonely = add_key(&ty, &uniq("t-keyctl-lonely"), Some(b"x"), session).expect("lonely key");
     r.check(
         "UNLINK from the only ring succeeds",
         keyctl(KEYCTL_UNLINK, lonely as usize, session as usize, 0, 0) == Ok(0),
@@ -391,7 +421,7 @@ fn main() {
     );
 
     // --- privilege decides SETPERM ---------------------------------------------
-    let perms = add_key(&ty, &cstr("t-keyctl-perm"), Some(b"x"), session).expect("key for perms");
+    let perms = add_key(&ty, &uniq("t-keyctl-perm"), Some(b"x"), session).expect("key for perms");
     let setperm = keyctl(KEYCTL_SETPERM, perms as usize, 0x3f3f_3f3f, 0, 0);
     if euid() == 0 {
         r.check(
@@ -414,7 +444,7 @@ fn main() {
     // --- a fork inherits the session keyring and nothing else ------------------
     add_key(
         &ty,
-        &cstr("t-keyctl-in-process-ring"),
+        &uniq("t-keyctl-in-process-ring"),
         Some(b"x"),
         KEY_SPEC_PROCESS_KEYRING,
     )
