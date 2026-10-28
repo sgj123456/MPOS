@@ -4328,3 +4328,74 @@ Linux delivers `SIGSEGV`.
 (225 built)`, only `t-rseq` red, every call falling through `_ => ENOSYS`.
 
 Full record: `docs/uapi/` §5.1 item 120.
+
+### 6.36 `futex_requeue(2)` — move sleepers from one word to another — **LANDED (2026-10-28)**
+
+`futex_requeue` is the futex family's last unserved number (456 on both
+machines), and its shape is the whole of `FUTEX_WAITV`'s descriptor pair plus
+two counts: `futex_requeue(waiters /*two struct futex_waitv*/, flags,
+nr_wake, nr_requeue)`. Everything was measured first, on host Linux 7.2.11
+(`build/scratch/futex-req/probe.c`, musl static, so no library had registered
+a block of its own):
+
+* `flags` must be 0; a NULL descriptor array, either negative count, a second
+  descriptor whose flag word differs from the first, `__reserved` set, a
+  missing size bit, a `val` wider than 32 bits, or the NUMA/policy bits on one
+  descriptor only are all `EINVAL`.
+* the source word is checked against `waiters[0].val`: a moved word is
+  `EAGAIN`, an unreadable source `EFAULT`. The **destination word is never
+  read** — only its key is derived, which is why an unmapped destination with
+  waiters to move answers `1` and those sleepers are simply unreachable.
+* the return value is `woken + requeued`; `nr_wake = nr_requeue = 0` leaves the
+  waiters asleep and answers `0`; `a == b` is accepted and behaves like a wake.
+* two sleepers on A(7), requeue(wake 1, requeue 1) → `2`, then `futex_wake(B)`
+  → `1`: the moved sleeper answers a wake on the destination even though it
+  submitted its wait against A.
+
+**The bug this measurement found, and the fix.** The first version of the pin
+hung the x86_64 gate for nine minutes: a task parked in `futex_wait` polls a
+condition, and that condition named the address it submitted. A requeue
+rewrites the waiter's *place* to the destination, so the sleeper was parked on
+a poll that could never come true — `futex_wake(B)` marked the moved place and
+nudged the task, the task woke, re-checked a condition about A, and went back
+to sleep. The table now keeps both addresses: `Waiter.address` is where the
+place sits now (a requeue moves it), `Waiter.asked` is what the caller
+submitted, the wait condition is "any place this task holds has been marked
+woken" (`is_woken_for`), every wait releases its places task-wide
+(`unregister_task`), and `FUTEX_WAITV`'s answer index is recovered by matching
+a woken place's `asked` against the caller's array — the array still names the
+original words after a requeue.
+
+**Served, in that shape.** `src/sched/futex.rs` gained `requeue_places` (walk
+the queue in place order: the first `nr_wake` places marked woken, the next
+`nr_requeue` moved to the destination, the rest untouched) and `requeue` (word
+check before touching anything, then the moves, then the wakes outside the
+critical section); `src/syscall/linux/proc.rs`'s `handle_futex_requeue` is the
+argument door (both descriptors validated, both flag words required to match,
+the source word required readable); `nr::FUTEX_REQUEUE` is 456 in both tables
+and has a dispatch arm after `FUTEX2_WAIT`.
+
+**Named divergences**: the NUMA/policy flag bits and the shared spelling (no
+private bit) are `EOPNOTSUPP` here — this kernel has one table keyed by user
+address, so a cross-process shared waiter cannot be reached; requeued places
+keep their queue order rather than Linux's priority order (this scheduler's
+places have no priority sort in the first place, and the measured answer
+depends only on which are first); and the source-word check happens before the
+places are looked at rather than under the hash-bucket lock — on one core
+those two orders produce the same answers for every shape the pin can build.
+
+**Pinned** by `t-futex-requeue`, which runs its whole reference table under
+`MPOS_ON_HOST=1` as well: it passes on Linux there (the answers are Linux's),
+and only the guest adds the `EOPNOTSUPP` claims for the shapes this kernel
+refuses. Host tests
+`a_requeue_wakes_the_first_places_and_moves_the_rest_to_its_other_word` and
+`a_requeue_with_no_count_on_one_side_leaves_that_half_alone` pin the table
+mechanics; the host suite is 687.
+
+Gates: x86_64 all 227 passed (15 not run), aarch64 all 226 passed (16 not run),
+`mpos-kunit 34 passed` both, host suite 687.
+
+**Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=226 fail=1
+(227 built)`, only `t-futex-requeue` red through `_ => ENOSYS`.
+
+Full record: `docs/uapi/` §5.1 item 121.

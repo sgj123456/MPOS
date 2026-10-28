@@ -161,6 +161,7 @@ pub const FUTEX_WAITV: u64 = 449;
 pub const FUTEX2_WAKE: u64 = 454;
 /// `futex_wait(2)` (455): the futex2 wait - one word, a value, a bitset.
 pub const FUTEX2_WAIT: u64 = 455;
+pub const FUTEX_REQUEUE: u64 = 456;
 pub const SCHED_SETAFFINITY: u64 = 203;
 pub const SCHED_GETAFFINITY: u64 = 204;
 pub const SET_TID_ADDRESS: u64 = 218;

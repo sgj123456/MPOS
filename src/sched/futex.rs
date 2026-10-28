@@ -24,7 +24,15 @@ use super::TaskId;
 
 /// One task asleep on one address.
 struct Waiter {
+    /// The address this place sits on *now*. A requeue moves it without the
+    /// waiter's knowledge - that is the call's whole point - so this field can
+    /// differ from the word the caller submitted.
     address: usize,
+    /// The address the caller submitted. A requeue rewrites `address` and
+    /// leaves this alone, so a sleeper that was moved can still be named by the
+    /// wait that asked for it: the `FUTEX_WAITV` answer is an index into the
+    /// caller's array, and that array still names the original words.
+    asked: usize,
     task: TaskId,
     /// Set by a wake. The task itself is asleep in `block_until`, so this is
     /// the condition it polls - a wake does not have to find it anywhere else.
@@ -42,6 +50,7 @@ fn register(address: usize, task: TaskId, bitset: u32) {
     critical_section::with(|cs| {
         WAITERS.borrow(cs).borrow_mut().push(Waiter {
             address,
+            asked: address,
             task,
             woken: false,
             bitset,
@@ -49,7 +58,9 @@ fn register(address: usize, task: TaskId, bitset: u32) {
     });
 }
 
-/// Leave the queue, woken or not.
+/// Leave the queue, woken or not. Test-only: the wait paths release their
+/// places with `unregister_task`, because a requeue may have moved them.
+#[cfg(test)]
 fn unregister(address: usize, task: TaskId) {
     critical_section::with(|cs| {
         WAITERS
@@ -59,7 +70,9 @@ fn unregister(address: usize, task: TaskId) {
     });
 }
 
-/// Whether this task's place has been marked woken.
+/// Whether this task's place on one address has been marked woken. Test-only:
+/// a wait polls [`is_woken_for`], because a requeue can move its place.
+#[cfg(test)]
 fn is_woken(address: usize, task: TaskId) -> bool {
     critical_section::with(|cs| {
         WAITERS
@@ -68,6 +81,34 @@ fn is_woken(address: usize, task: TaskId) -> bool {
             .iter()
             .any(|waiter| waiter.address == address && waiter.task == task && waiter.woken)
     })
+}
+
+/// Whether *any* of this task's places has been marked woken.
+///
+/// A waiter that a `FUTEX_REQUEUE` moved holds its place under the
+/// destination word, so a condition that names the source address would poll
+/// a place that no longer exists and sleep forever - measured: the requeued
+/// sleeper was never released by a wake on the destination. The wait belongs
+/// to the task, not to one address, which is also the rule `FUTEX_WAITV`
+/// needs for a word that was requeued out from under it.
+fn is_woken_for(task: TaskId) -> bool {
+    critical_section::with(|cs| {
+        WAITERS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .any(|waiter| waiter.task == task && waiter.woken)
+    })
+}
+
+/// Give back every place this task holds, whatever addresses they now sit on.
+fn unregister_task(task: TaskId) {
+    critical_section::with(|cs| {
+        WAITERS
+            .borrow(cs)
+            .borrow_mut()
+            .retain(|waiter| waiter.task != task);
+    });
 }
 
 /// The bitset that answers every wake: what a plain `FUTEX_WAIT` sleeps
@@ -174,7 +215,7 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
     register(address, current, bitset);
 
     if word_at(address) != expected {
-        unregister(address, current);
+        unregister_task(current);
         // The errno constants are already negative: negating one here would
         // hand the caller +11 and turn "look again" into a nonsense success.
         return crate::err::EAGAIN;
@@ -192,14 +233,81 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
     // waitpid blocks on a futex and relies on its SIGCHLD handler to change
     // the word - and musl's __wait retries an EINTR against the
     // handler-updated word, which then answers EAGAIN.
-    let woken =
-        super::block_until_nanos(|| is_woken(address, current), deadline.unwrap_or(u64::MAX));
-    unregister(address, current);
+    let woken = super::block_until_nanos(|| is_woken_for(current), deadline.unwrap_or(u64::MAX));
+    unregister_task(current);
     match woken {
         super::WaitEnd::Condition => 0,
         super::WaitEnd::Deadline => crate::err::ETIMEDOUT,
         super::WaitEnd::Interrupted => crate::err::EINTR,
     }
+}
+
+/// Waking up to `nr_wake` sleepers on `source` and moving up to `nr_requeue`
+/// of the rest to `target`, without waking them - the two halves of
+/// `futex_requeue(2)`, and the places it touched (woken first, then moved).
+///
+/// The table is one list, so "moving" is rewriting the address a place names,
+/// and a later `FUTEX_WAKE` on `target` finds it: that is what makes this
+/// different from a wake (which the caller could do with `futex_wake(2)`), and
+/// the whole reason the condvar's `broadcast` can hand a waiter to another
+/// word without a lost-wakeup window.
+///
+/// Measured on Linux 7.2.11: the first `nr_wake` matching sleepers are woken,
+/// the next `nr_requeue` are moved, in wait order, and the return value counts
+/// both. The destination word is **never read** - an unmapped destination is
+/// accepted and the moved sleepers are unreachable forever, which is Linux's
+/// answer too (a requeue to a word nobody will ever wake).
+#[cfg(any(test, target_os = "none"))]
+fn requeue_places(
+    source: usize,
+    target: usize,
+    nr_wake: usize,
+    nr_requeue: usize,
+) -> (alloc::vec::Vec<TaskId>, usize) {
+    let mut woken = alloc::vec::Vec::new();
+    let mut moved = 0usize;
+    critical_section::with(|cs| {
+        let mut table = WAITERS.borrow(cs).borrow_mut();
+        for waiter in table.iter_mut() {
+            if waiter.address != source || waiter.woken {
+                continue;
+            }
+            if woken.len() < nr_wake {
+                waiter.woken = true;
+                woken.push(waiter.task);
+            } else if moved < nr_requeue {
+                waiter.address = target;
+                moved += 1;
+            } else {
+                break;
+            }
+        }
+    });
+    (woken, moved)
+}
+
+/// `futex_requeue(2)` under Linux's comparison: the source word must still hold
+/// `expected`, or `EAGAIN` - the caller's own signal to look again rather than
+/// to have its waiters moved under a word that changed. `EAGAIN` is answered
+/// before any place is touched.
+#[cfg(target_os = "none")]
+pub fn requeue(
+    source: usize,
+    expected: u32,
+    target: usize,
+    nr_wake: usize,
+    nr_requeue: usize,
+) -> isize {
+    if word_at(source) != expected {
+        return crate::err::EAGAIN;
+    }
+    let (woken, moved) = requeue_places(source, target, nr_wake, nr_requeue);
+    // Waking outside the critical section: `super::wake` schedules, and the
+    // places are already marked, so the sleepers' own condition sees it.
+    for task in &woken {
+        super::wake(*task);
+    }
+    (woken.len() + moved) as isize
 }
 
 /// `FUTEX_WAKE`: wake up to `count` tasks sleeping on `address`.
@@ -247,10 +355,14 @@ fn register_all(waits: &[Wait], task: TaskId) {
 
 #[cfg(any(test, target_os = "none"))]
 /// Give every place back, woken or not.
-fn unregister_all(waits: &[Wait], task: TaskId) {
-    for wait in waits {
-        unregister(wait.address, task);
-    }
+///
+/// Task-wide rather than word-by-word: a requeue can move any of the places
+/// between the registration and the answer, and a cleanup that named the
+/// original addresses would leave the moved ones behind - a place no wake can
+/// ever be observed taking, and a word it would answer on for the rest of the
+/// task's life.
+fn unregister_all(_waits: &[Wait], task: TaskId) {
+    unregister_task(task);
 }
 
 #[cfg(any(test, target_os = "none"))]
@@ -258,7 +370,14 @@ fn unregister_all(waits: &[Wait], task: TaskId) {
 /// first. `FUTEX_WAITV` answers with an index into the caller's array, so the
 /// order the caller wrote is the order the answer is spelled in.
 fn first_woken(waits: &[Wait], task: TaskId) -> Option<usize> {
-    waits.iter().position(|wait| is_woken(wait.address, task))
+    critical_section::with(|cs| {
+        let table = WAITERS.borrow(cs).borrow();
+        waits.iter().position(|wait| {
+            table
+                .iter()
+                .any(|waiter| waiter.task == task && waiter.asked == wait.address && waiter.woken)
+        })
+    })
 }
 
 /// `FUTEX_WAITV`: sleep while every named word still holds what the caller
@@ -449,5 +568,60 @@ mod tests {
         assert_eq!(mark_woken(a, 1), 1);
         assert_eq!(first_woken(&waits, me), Some(0));
         unregister_all(&waits, me);
+    }
+
+    #[test]
+    fn a_requeue_wakes_the_first_places_and_moves_the_rest_to_its_other_word() {
+        let (a, b) = (0x7000usize, 0x8000usize);
+        register(a, task(1), BITSET_ANY);
+        register(a, task(2), BITSET_ANY);
+        register(a, task(3), BITSET_ANY);
+
+        let (woken, moved) = requeue_places(a, b, 1, 2);
+        assert_eq!(woken.len(), 1, "one sleeper is woken");
+        assert_eq!(woken[0], task(1), "the one that waited first");
+        assert_eq!(moved, 2, "the other two are moved");
+        assert_eq!(waiting_on(b), 2, "a wake on the destination finds them");
+        assert_eq!(
+            mark_woken(b, 2),
+            2,
+            "and that wake is the only one they answer"
+        );
+
+        unregister(a, task(1));
+        unregister(b, task(2));
+        unregister(b, task(3));
+        assert_eq!(waiting_on(a), 0);
+        assert_eq!(waiting_on(b), 0);
+    }
+
+    #[test]
+    fn a_requeue_with_no_count_on_one_side_leaves_that_half_alone() {
+        let (a, b) = (0xa000usize, 0xb000usize);
+        register(a, task(1), BITSET_ANY);
+        register(a, task(2), BITSET_ANY);
+
+        // Requeue nothing, wake both: the destination never hears of them.
+        let (woken, moved) = requeue_places(a, b, 2, 0);
+        assert_eq!(woken.len(), 2);
+        assert_eq!(moved, 0);
+        assert_eq!(waiting_on(b), 0);
+
+        unregister(a, task(1));
+        unregister(a, task(2));
+
+        // Wake nothing, move both: they are asleep on the other word, and a
+        // wake there is what ends them.
+        register(a, task(3), BITSET_ANY);
+        register(a, task(4), BITSET_ANY);
+        let (woken, moved) = requeue_places(a, b, 0, 2);
+        assert!(woken.is_empty(), "nobody is woken by a move");
+        assert_eq!(moved, 2);
+        assert_eq!(waiting_on(a), 0, "the source is empty");
+        assert!(!is_woken(b, task(3)), "moved places are not woken");
+        assert_eq!(mark_woken(b, usize::MAX), 2);
+
+        unregister(b, task(3));
+        unregister(b, task(4));
     }
 }

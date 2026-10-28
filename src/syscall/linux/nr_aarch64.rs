@@ -311,6 +311,7 @@ pub const FUTEX_WAITV: u64 = 449;
 pub const FUTEX2_WAKE: u64 = 454;
 /// `futex_wait(2)` (455): the futex2 wait - one word, a value, a bitset.
 pub const FUTEX2_WAIT: u64 = 455;
+pub const FUTEX_REQUEUE: u64 = 456;
 pub const FUTEX_CLOCK_REALTIME: usize = 256;
 
 /// `add_key(2)`, `request_key(2)` and `keyctl(2)`, on the asm-generic

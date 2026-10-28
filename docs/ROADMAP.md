@@ -268,6 +268,12 @@ One-glance status of the whole roadmap.
   use; a sealed stack simply does not grow (§5.5, item 118)
 - [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
 - [x] `futex_wake(2)`/`futex_wait(2)` (454/455) — the futex2 pair: one 32-bit word, a bitset in `mask`, an absolute deadline per wait; the flag word requires `SIZE_U32`, a wide mask or wide `val` are `EINVAL`, `futex_wake`'s `int` `nr` caps the answer, and the node/policy words Linux serves are `EOPNOTSUPP` here (§6.34, item 119)
+- [x] `futex_requeue(2)` (456) — move sleepers from one word to another: the same
+  `waitv` descriptor pair, both flag words required to match, `WRITE` and
+  requeue counts, the source word checked under the same ordering as
+  `futex_wait`, and the destination never read (Linux's own shape: a moved
+  sleeper whose destination is unmapped simply never wakes). The node/policy
+  bits and the shared spelling are `EOPNOTSUPP` (§6.36, item 121)
   the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
   with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is
   the index of the word a wake named, and a moved word answers `EAGAIN` before a passed

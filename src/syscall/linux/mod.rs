@@ -471,6 +471,7 @@ pub unsafe fn dispatch(
         nr::FUTEX_WAITV => proc::handle_futex_waitv(args),
         nr::FUTEX2_WAKE => proc::handle_futex2_wake(args),
         nr::FUTEX2_WAIT => proc::handle_futex2_wait(args),
+        nr::FUTEX_REQUEUE => proc::handle_futex_requeue(args),
         // The ring family: setup builds and publishes the region layout, enter
         // runs the SQEs synchronously, register is refused per the module's doc.
         nr::IO_URING_SETUP => io_uring::handle_io_uring_setup(args),

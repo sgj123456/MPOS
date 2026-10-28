@@ -4788,6 +4788,92 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
+/// `futex_requeue(2)`: `futex_requeue(struct futex_waitv waiters[2], flags,
+/// nr_wake, nr_requeue)`.
+///
+/// Measured on Linux 7.2.11 with a `musl-gcc -static` probe
+/// (`build/scratch/futex-req/probe.c`): the call's own `flags` word must be
+/// zero, the two descriptors must be identical in their flag word, a negative
+/// count is `EINVAL`, and the source's `val` is the comparison value - a word
+/// that moved answers `EAGAIN` before any place is touched. The answer counts
+/// the sleepers woken plus the ones moved; the destination word is never read,
+/// so an unmapped destination is accepted and the moved sleepers are then
+/// unreachable until someone wakes that address (Linux's own answer).
+pub(super) fn handle_futex_requeue(args: [usize; ARG_COUNT]) -> isize {
+    /// `struct futex_waitv` is fixed by the ABI: two u64s and two u32s.
+    const WAITV_BYTES: usize = 24;
+    const PAIR_BYTES: usize = WAITV_BYTES * 2;
+    /// `FUTEX_32`, the per-waiter "the word is thirty-two bits" bit.
+    const FUTEX_32: u32 = 0x02;
+    /// The two bits that name a word size.
+    const SIZE_MASK: u32 = 0x03;
+    /// `FUTEX2_NUMA` / `FUTEX2_MPOL`: structurally valid (Linux serves both).
+    const NUMA_MPOL: u32 = 0x04 | 0x08;
+
+    let (waiters, flags, nr_wake, nr_requeue) = (args[0], args[1], args[2] as i32, args[3] as i32);
+    if flags != 0 || waiters == 0 {
+        return err::EINVAL;
+    }
+    if nr_wake < 0 || nr_requeue < 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(waiters, PAIR_BYTES, false, true) {
+        return err::EFAULT;
+    }
+
+    let private = nr::FUTEX_PRIVATE_FLAG as u32;
+    let structural = FUTEX_32 | private | NUMA_MPOL;
+    // `(uaddr, val, flags)` for the source (index 0) and the destination (1).
+    let mut pair = [(0usize, 0u32, 0u32); 2];
+    for index in 0..2 {
+        let at = waiters + index * WAITV_BYTES;
+        // The array is the caller's memory: the page check proved 24 readable
+        // bytes, and the fields are read unaligned for the same reason the
+        // `futex_waitv` array is.
+        let val = unsafe { (at as *const u64).read_unaligned() };
+        let uaddr = unsafe { ((at + 8) as *const u64).read_unaligned() } as usize;
+        let word_flags = unsafe { ((at + 16) as *const u32).read_unaligned() };
+        let reserved = unsafe { ((at + 20) as *const u32).read_unaligned() };
+        if reserved != 0 || word_flags & !structural != 0 {
+            return err::EINVAL;
+        }
+        if word_flags & SIZE_MASK != FUTEX_32 {
+            return err::EINVAL;
+        }
+        if val > u32::MAX as u64 {
+            return err::EINVAL;
+        }
+        if uaddr & 3 != 0 {
+            return err::EINVAL;
+        }
+        pair[index] = (uaddr, val as u32, word_flags);
+    }
+
+    // "For now mandate both flags are identical" - measured: a private/shared
+    // or size mismatch is EINVAL before any word is looked at.
+    if pair[0].2 != pair[1].2 {
+        return err::EINVAL;
+    }
+    if pair[0].2 & private == 0 {
+        return err::EOPNOTSUPP;
+    }
+    if pair[0].2 & NUMA_MPOL != 0 {
+        return err::EOPNOTSUPP;
+    }
+    // The source word: Linux reads it for the comparison value and answers
+    // EFAULT when it cannot. The destination is never read.
+    if !buffer_ok(pair[0].0, 4, false, true) {
+        return err::EFAULT;
+    }
+    crate::sched::futex::requeue(
+        pair[0].0,
+        pair[0].1,
+        pair[1].0,
+        nr_wake as usize,
+        nr_requeue as usize,
+    )
+}
+
 /// `futex_waitv(2)` (449): sleep on several futex words at once, and be
 /// woken by whichever one a waker names.
 ///

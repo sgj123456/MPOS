@@ -6665,3 +6665,40 @@ child exits `7` — Linux's own fixup — the reference direction.
 (225 built)`, only `t-rseq` red through `_ => ENOSYS`.
 
 Full record: [`docs/notes/`](../notes/06-process-management.md) §6.35.
+
+## item 121 — `futex_requeue(2)` moves sleepers from one word to another, and the
+## destination is never read
+
+The futex family's last unserved number (456 on both machines). Measured on
+host Linux 7.2.11 first (`build/scratch/futex-req/probe.c`, musl static):
+
+* the call takes the same two-descriptor `waitv` array as `futex_waitv`, plus
+  `flags` (must be 0), `nr_wake` and `nr_requeue`; both per-waiter flag words
+  must be identical, a negative count is `EINVAL`, `__reserved` set or a
+  missing size bit `EINVAL`, a `val` wider than 32 bits `EINVAL`.
+* the source word is compared with `waiters[0].val` (`EAGAIN` if moved,
+  `EFAULT` if unreadable); the destination word is never read, so an unmapped
+  destination with waiters to move answers `1` and those sleepers are
+  unreachable — Linux's own shape, reproduced rather than improved on.
+* the answer is `woken + requeued`; a requeued sleeper answers a wake on the
+  destination, though it submitted its wait against the source.
+
+**What this turn's own bug taught**: the waiter table held one address, so a
+moved place left its task parked on a poll about the old word forever (nine
+minutes of hung gate). The table now carries `asked` beside `address`, the wait
+condition is per task rather than per address, cleanup is task-wide, and the
+`FUTEX_WAITV` answer index is recovered through `asked`.
+
+**Served**: `src/sched/futex.rs` (`requeue_places`, `requeue`),
+`src/syscall/linux/proc.rs` (`handle_futex_requeue`), `nr::FUTEX_REQUEUE = 456`
+in both tables with a dispatch arm. The NUMA/policy bits and the shared
+spelling are `EOPNOTSUPP` (one table keyed by user address cannot reach a
+cross-process shared waiter); queue order stands in for Linux's priority order.
+
+**Pinned** by `t-futex-requeue`, whose reference table also passes under
+`MPOS_ON_HOST=1` on Linux; the guest adds the refusal claims. Gates: x86_64
+`pass=227 fail=0`, aarch64 `pass=226 fail=0`, `mpos-kunit 34 passed` both, host
+suite 687. Counterfactual (`nr::FUTEX_REQUEUE` arm removed): `CF-EXIT=1`,
+`pass=226 fail=1 (227 built)`, only `t-futex-requeue` red.
+
+Full record: [`docs/notes/`](../notes/06-process-management.md) §6.36.

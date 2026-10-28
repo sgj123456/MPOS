@@ -304,6 +304,7 @@ A call absent from those is served as its phase section records.
 | `futex_waitv` | 449 | proc | 449 |
 | `futex_wake` | 454 | proc | 454 |
 | `futex_wait` | 455 | proc | 455 |
+| `futex_requeue` | 456 | proc | 456 |
 | `mseal` | 462 | proc | 462 |
 | `fanotify_init` | 300 | fs | 262 |
 | `fanotify_mark` | 301 | fs | 263 |
