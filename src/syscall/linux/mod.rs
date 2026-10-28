@@ -455,6 +455,7 @@ pub unsafe fn dispatch(
         nr::GETRANDOM => abi::handle_getrandom(args, true),
         nr::PRLIMIT64 => abi::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
+        nr::FUTEX_WAITV => proc::handle_futex_waitv(args),
         nr::SET_TID_ADDRESS => proc::handle_set_tid_address(args),
         nr::SCHED_SETAFFINITY => abi::handle_sched_setaffinity(args),
         nr::SCHED_GETAFFINITY => abi::handle_sched_getaffinity(args),

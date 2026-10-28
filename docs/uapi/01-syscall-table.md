@@ -296,6 +296,7 @@ A call absent from those is served as its phase section records.
 | `faccessat2` | 439 | fs | 439 |
 | `process_madvise` | 440 | proc | 440 |
 | `epoll_pwait2` | 441 | fs | 441 |
+| `futex_waitv` | 449 | proc | 449 |
 | `fchmodat2` | 452 | fs | 452 |
 | `cleanup_after_kthread` | 999 | kernel | 999 | (the kernel's own kthread-cleanup hook, named by number so the ABI stays Linux-shaped; there is no Linux syscall at 999 on either machine's table)
 

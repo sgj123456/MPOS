@@ -219,6 +219,13 @@ One-glance status of the whole roadmap.
   what it met (§6.28, item 109); the open/getfd/send/wait doors are served
   (§6.8/§6.9, items 92–93)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
+- [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
+  the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
+  with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is
+  the index of the word a wake named, and a moved word answers `EAGAIN` before a passed
+  deadline; the shared spelling (no private flag) is `EOPNOTSUPP` — this kernel's wait
+  table is keyed by user address, so two processes' mappings of one shared word cannot be
+  matched, and a hang is not an answer (§6.29, item 112)
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)
 - [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)

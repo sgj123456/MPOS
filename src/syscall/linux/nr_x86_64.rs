@@ -152,6 +152,10 @@ pub const FUTEX_PRIVATE_FLAG: usize = 128;
 /// only the *spelling* of the deadline - see `futex_deadline` - never the
 /// table it waits in.
 pub const FUTEX_CLOCK_REALTIME: usize = 256;
+/// `futex_waitv(2)` (449): wait on several futex words at once and be
+/// woken by whichever one a waker names. Added after the number tables
+/// converged, so it is 449 on both machines.
+pub const FUTEX_WAITV: u64 = 449;
 pub const SCHED_SETAFFINITY: u64 = 203;
 pub const SCHED_GETAFFINITY: u64 = 204;
 pub const SET_TID_ADDRESS: u64 = 218;

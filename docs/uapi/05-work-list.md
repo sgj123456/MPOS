@@ -6140,3 +6140,71 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     fail=0`, `mpos-kunit 34 passed` on both, host suite 647 passed.
 
     Full record: `docs/notes/03-filesystem.md` §3.8.
+
+## item 112 — `futex_waitv(2)` waits on several words at once, and names the one that woke it
+
+    §5.2's futex rows had one member left that a thread runtime reaches for and
+    this kernel answered `ENOSYS`: `futex_waitv` (449), the multi-word spelling
+    of `FUTEX_WAIT`. It is what a runtime parks on when the event it waits for
+    is "whichever of these happens first" — a single-address wait cannot say
+    that, and polling one word at a time is a different program.
+
+    **Measured first** (Linux 7.2.11, `build/scratch/futex-waitv/`): the call's
+    own `flags` word must be **zero** — `EINVAL` otherwise, because the private
+    and size flags live on each waiter. (The probe's first shape put
+    `FUTEX_PRIVATE_FLAG` in the call's word and every positive case answered
+    `EINVAL`; Linux 6.12's `SYSCALL_DEFINE5` says so in one line — *"This
+    syscall supports no flags for now"*.) `nr` is `1..=128`, a NULL array is
+    `EINVAL`. Each waiter is 24 bytes, `{ val, uaddr, flags, __reserved }`; the
+    waiter's `flags` accepts exactly `FUTEX_32` (`0x02`) and
+    `FUTEX_PRIVATE_FLAG` (`0x80`), a size bit is required (`0x80` alone is
+    `EINVAL`), anything else is `EINVAL`, and `__reserved` must be zero. A word
+    that has already moved answers `EAGAIN` *before* a passed deadline is
+    considered (measured: past deadline + mismatched word = `EAGAIN`). An
+    unaligned word is `EINVAL`, an unreadable array or word is `EFAULT`. The
+    timeout is absolute; `clockid` is examined only when one is passed —
+    `CLOCK_MONOTONIC`/`CLOCK_REALTIME` accepted, others `EINVAL`, and a NULL
+    timeout leaves the argument ignored (measured with clockid 99). The answer
+    is the **index** of a woken word: waking the second of two answers 1.
+
+    **Landed**: `src/sched/futex.rs` gained `Wait { address, expected }`,
+    `register_all`/`unregister_all`/`first_woken`, and `wait_multiple(waits,
+    deadline) -> isize` — every place taken before any word is re-read (the
+    same lost-wake ordering `wait_bitset` rests on), a value check before the
+    deadline, one park whose condition is "any of my places is marked", then
+    the earliest marked index as the answer. `handle_futex_waitv` in
+    `src/syscall/linux/proc.rs` parses the array (24 bytes per waiter, read
+    unaligned like `futex_deadline`'s timespec, bounded by `WAITV_MAX` for the
+    worst-case rule), and the number 449 is in both per-arch tables. The
+    handler's doc comment carries the measured shape above, clause by clause.
+
+    **The one divergence, named**: the shared spelling (a waiter without
+    `FUTEX_PRIVATE_FLAG`) is `EOPNOTSUPP`. This kernel's wait table is one per
+    *user address*, so two processes mapping the same shared word cannot be
+    matched — serving it would be a sleeper no waker can reach, and a hang is
+    the answer the caller cannot branch on. (`FUTEX_WAIT`'s older arm has the
+    same keying divergence recorded rather than fixed; the difference here is
+    that the new call refuses instead of approximating.) The probe measured the
+    shape working on Linux, cross-process included.
+
+    **Pin**: `t-futex-waitv`, both machines (default group — it is a check, not
+    an instrument). Claims: index 0 for one woken word; 1 and 0 for the two
+    words; `EAGAIN` on a moved word; `ETIMEDOUT` for a 60 ms monotonic deadline
+    (and the measured elapsed inside 40–400 ms) and for a realtime one;
+    `EINVAL` for a call-level flag, `nr=0`/`nr=129`, a NULL array, a waiter
+    without a size bit, an undefined waiter flag, a non-zero `__reserved`, an
+    unaligned word, an invalid `clockid` with a timeout; the ignored clockid
+    with no timeout; `EFAULT` for the array and for the word; `EAGAIN`-before-
+    deadline ordering; and, on a guest only, `EOPNOTSUPP` for the shared
+    spelling. Host tests `a_multi_wait_holds_a_place_on_every_word_and_names_
+    the_one_that_fired` and `a_multi_wait_names_the_earliest_word_when_several_
+    fire` pin the table half. Run on the host first: the same binary with
+    `MPOS_ON_HOST=1` passes every claim against Linux — the counterfactual
+    direction of the "measure before designing" rule.
+
+    **Gate**: x86_64 `pass=219 fail=0` (219 built), aarch64 `pass=218 fail=0`
+    (218 built), `mpos-kunit 34 passed` on both. **Counterfactual**: with the
+    dispatch arm removed the same sweep is `pass=218 fail=1 (219 built)` —
+    `t-futex-waitv` red on every claim (each call `ENOSYS`).
+
+    Full record: `docs/notes/06-process-management.md` §6.29.

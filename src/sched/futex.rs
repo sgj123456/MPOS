@@ -226,6 +226,84 @@ pub fn wake_bitset(address: usize, count: usize, bitset: u32) -> usize {
     woken
 }
 
+/// One word a `FUTEX_WAITV` wait names: where it is, and what it expected.
+///
+/// The pair is all the table needs - a multi-word wait registers the same
+/// `(address, task)` place once per word, because the wake side has no notion
+/// of a group. What makes the wait one sleep and one answer is the order
+/// [`wait_multiple`] uses the places in, not the places themselves.
+pub struct Wait {
+    pub address: usize,
+    pub expected: u32,
+}
+
+#[cfg(any(test, target_os = "none"))]
+/// Take a place for `task` on every address the wait names.
+fn register_all(waits: &[Wait], task: TaskId) {
+    for wait in waits {
+        register(wait.address, task, BITSET_ANY);
+    }
+}
+
+#[cfg(any(test, target_os = "none"))]
+/// Give every place back, woken or not.
+fn unregister_all(waits: &[Wait], task: TaskId) {
+    for wait in waits {
+        unregister(wait.address, task);
+    }
+}
+
+#[cfg(any(test, target_os = "none"))]
+/// Which of the named words has this task been marked woken on, earliest
+/// first. `FUTEX_WAITV` answers with an index into the caller's array, so the
+/// order the caller wrote is the order the answer is spelled in.
+fn first_woken(waits: &[Wait], task: TaskId) -> Option<usize> {
+    waits.iter().position(|wait| is_woken(wait.address, task))
+}
+
+/// `FUTEX_WAITV`: sleep while every named word still holds what the caller
+/// expected, and wake on whichever one a waker names.
+///
+/// Returns the index of a woken word, `EAGAIN` when one of the words had
+/// already moved (which is the caller's "look again", exactly as `FUTEX_WAIT`'s
+/// answer is), `ETIMEDOUT` when the deadline passed first, and `EINTR` when a
+/// pending signal ended the sleep.
+///
+/// The order of the two halves is the contract: every place is taken before
+/// any word is re-read, so a wake landing between the read and the sleep is
+/// not lost; and the value check comes before the deadline, so a wait whose
+/// word moved answers `EAGAIN` even if its deadline has already passed (the
+/// measured Linux order, not an accident of this implementation).
+#[cfg(target_os = "none")]
+pub fn wait_multiple(waits: &[Wait], deadline: Option<u64>) -> isize {
+    let current = super::current();
+    register_all(waits, current);
+    for wait in waits {
+        if word_at(wait.address) != wait.expected {
+            unregister_all(waits, current);
+            return crate::err::EAGAIN;
+        }
+    }
+    let ended = super::block_until_nanos(
+        || first_woken(waits, current).is_some(),
+        deadline.unwrap_or(u64::MAX),
+    );
+    let fired = first_woken(waits, current);
+    unregister_all(waits, current);
+    match ended {
+        super::WaitEnd::Condition => match fired {
+            Some(index) => index as isize,
+            // A wake marks the place and then nudges the task; nothing can
+            // clear the mark between those two steps on one core, so this arm
+            // is unreachable. Answering index 0 rather than an errno keeps a
+            // lost mark from becoming an error the caller cannot act on.
+            None => 0,
+        },
+        super::WaitEnd::Deadline => crate::err::ETIMEDOUT,
+        super::WaitEnd::Interrupted => crate::err::EINTR,
+    }
+}
+
 /// Wake everyone asleep on `address` - what a thread's exit does for whoever
 /// is joining it.
 pub fn wake_all(address: usize) -> usize {
@@ -317,5 +395,59 @@ mod tests {
         let address = 0x4000usize;
         assert_eq!(mark_woken(address, 1), 0);
         assert!(!is_woken(address, task(9)));
+    }
+
+    #[test]
+    fn a_multi_wait_holds_a_place_on_every_word_and_names_the_one_that_fired() {
+        let (a, b) = (0x8000usize, 0x9000usize);
+        let waits = [
+            Wait {
+                address: a,
+                expected: 1,
+            },
+            Wait {
+                address: b,
+                expected: 2,
+            },
+        ];
+        let me = task(11);
+        register_all(&waits, me);
+        assert_eq!(waiting_on(a), 1, "one place on the first word");
+        assert_eq!(waiting_on(b), 1, "and one on the second");
+        assert_eq!(first_woken(&waits, me), None, "nothing has fired yet");
+
+        assert_eq!(mark_woken(b, 1), 1);
+        assert_eq!(
+            first_woken(&waits, me),
+            Some(1),
+            "the answer is the index of the word the wake named"
+        );
+
+        unregister_all(&waits, me);
+        assert_eq!(waiting_on(a), 0);
+        assert_eq!(waiting_on(b), 0);
+    }
+
+    #[test]
+    fn a_multi_wait_names_the_earliest_word_when_several_fire() {
+        let (a, b) = (0xa000usize, 0xb000usize);
+        let waits = [
+            Wait {
+                address: a,
+                expected: 1,
+            },
+            Wait {
+                address: b,
+                expected: 2,
+            },
+        ];
+        let me = task(12);
+        register_all(&waits, me);
+        // Both words fire before the sleeper looks; the caller's array order
+        // decides which index is named, not the order the wakes landed in.
+        assert_eq!(mark_woken(b, 1), 1);
+        assert_eq!(mark_woken(a, 1), 1);
+        assert_eq!(first_woken(&waits, me), Some(0));
+        unregister_all(&waits, me);
     }
 }

@@ -4682,6 +4682,111 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
+/// `futex_waitv(2)` (449): sleep on several futex words at once, and be
+/// woken by whichever one a waker names.
+///
+/// Linux's shape, measured on a 7.2.11 host before this arm was written: the
+/// call's own `flags` word must be **zero** (`EINVAL` otherwise - the private
+/// and size flags live on each waiter, not on the call); `nr` is `1..=128`
+/// with a non-NULL array; each waiter is 24 bytes, `{ val, uaddr, flags,
+/// __reserved }`; a waiter's `flags` carries exactly `FUTEX_32` (`0x02`) and
+/// `FUTEX_PRIVATE_FLAG` (`0x80`), a size bit is required, and `__reserved`
+/// must be zero; a word that has already moved answers `EAGAIN` *before* a
+/// passed deadline is considered; an unaligned word is `EINVAL`; an
+/// unreadable array or word is `EFAULT`; and the timeout is an absolute
+/// timespec whose `clockid` is only examined when one is given
+/// (`CLOCK_MONOTONIC` or `CLOCK_REALTIME`, anything else `EINVAL` - with a
+/// NULL timeout the word is ignored, measured).
+///
+/// The **shared** spelling (a waiter without `FUTEX_PRIVATE_FLAG`) is refused
+/// with `EOPNOTSUPP`. This kernel's wait table is one per user address, so two
+/// processes' mappings of the same shared word cannot be matched - serving it
+/// would be a sleeper no waker can reach, and a hang is the one answer the
+/// caller cannot branch on. The refusal is named in `docs/uapi/` and pinned;
+/// `FUTEX_WAIT`'s older arm has the same divergence recorded rather than
+/// fixed.
+pub(super) fn handle_futex_waitv(args: [usize; ARG_COUNT]) -> isize {
+    /// Linux's `FUTEX_WAITV_MAX`: at most this many words in one wait.
+    const WAITV_MAX: usize = 128;
+    /// `struct futex_waitv` is fixed by the ABI: two u64s and two u32s.
+    const WAITV_BYTES: usize = 24;
+    /// `FUTEX_32`, the per-waiter "the word is thirty-two bits" bit. Linux
+    /// spells it `FUTEX2_SIZE_U32`, and measured it is the *only* size
+    /// `futex_waitv` accepts.
+    const FUTEX_32: u32 = 0x02;
+    const CLOCK_REALTIME_ID: usize = 0;
+    const CLOCK_MONOTONIC_ID: usize = 1;
+
+    let (waiters, nr, flags, timeout_ptr, clockid) = (args[0], args[1], args[2], args[3], args[4]);
+    // "This syscall supports no flags for now" - Linux's own words, and the
+    // reason a call carrying FUTEX_PRIVATE_FLAG here is EINVAL rather than a
+    // private multi-wait.
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    if nr == 0 || nr > WAITV_MAX || waiters == 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(waiters, nr * WAITV_BYTES, false, true) {
+        return err::EFAULT;
+    }
+    let deadline = if timeout_ptr != 0 {
+        let realtime = match clockid {
+            CLOCK_REALTIME_ID => true,
+            CLOCK_MONOTONIC_ID => false,
+            _ => return err::EINVAL,
+        };
+        match futex_deadline(timeout_ptr, false, realtime) {
+            Ok(deadline) => deadline,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+
+    let private = nr::FUTEX_PRIVATE_FLAG as u32;
+    let valid = FUTEX_32 | private;
+    // Bounded by WAITV_MAX, so this is the worst-case rule's cap (AGENTS §5).
+    let mut waits = alloc::vec::Vec::with_capacity(nr);
+    for index in 0..nr {
+        let at = waiters + index * WAITV_BYTES;
+        // The array is the caller's memory at the caller's alignment; the
+        // page check above proved 24 readable bytes, and the fields are read
+        // unaligned for the same reason `futex_deadline` reads its timespec
+        // that way.
+        let val = unsafe { (at as *const u64).read_unaligned() };
+        let uaddr = unsafe { ((at + 8) as *const u64).read_unaligned() } as usize;
+        let waiter_flags = unsafe { ((at + 16) as *const u32).read_unaligned() };
+        let reserved = unsafe { ((at + 20) as *const u32).read_unaligned() };
+        if reserved != 0 {
+            return err::EINVAL;
+        }
+        if waiter_flags & !valid != 0 || waiter_flags & FUTEX_32 == 0 {
+            return err::EINVAL;
+        }
+        if waiter_flags & private == 0 {
+            // Named at the top: a shared word this kernel cannot key.
+            return err::EOPNOTSUPP;
+        }
+        if !buffer_ok(uaddr, 4, false, true) {
+            return err::EFAULT;
+        }
+        if uaddr & 3 != 0 {
+            return err::EINVAL;
+        }
+        // `futex_validate_input`'s window: a thirty-two-bit word cannot be
+        // asked for a value outside thirty-two bits.
+        if val > u32::MAX as u64 {
+            return err::EINVAL;
+        }
+        waits.push(crate::sched::futex::Wait {
+            address: uaddr,
+            expected: val as u32,
+        });
+    }
+    crate::sched::futex::wait_multiple(&waits, deadline)
+}
+
 /// Turn a futex `struct timespec *` into the nanosecond deadline
 /// [`handle_futex`]'s wait keeps. `relative` (FUTEX_WAIT's spelling) counts
 /// from now - on whichever clock the flags name, since a duration is a

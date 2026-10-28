@@ -303,4 +303,7 @@ pub const FUTEX_WAKE: usize = 1;
 pub const FUTEX_WAIT_BITSET: usize = 9;
 pub const FUTEX_WAKE_BITSET: usize = 10;
 pub const FUTEX_PRIVATE_FLAG: usize = 128;
+/// `futex_waitv(2)` (449): the multi-word wait, on the same number as the
+/// first machine because it landed after the two tables converged.
+pub const FUTEX_WAITV: u64 = 449;
 pub const FUTEX_CLOCK_REALTIME: usize = 256;

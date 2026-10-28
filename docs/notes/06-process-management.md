@@ -3772,3 +3772,83 @@ unmapped range answers `0` here where Linux answers `ENOMEM` (§5.2, `t-madvise`
 A cross-process hint's *effect* is likewise the no-op Linux's hints are on this
 kernel: there is no page cache to warm and no reclaim to steer, which §5.2
 already records for `madvise`.
+
+### 6.29 `futex_waitv(2)` — several words, one sleep, and the index that woke it (LANDED 2026-10-28)
+
+**Why**: `FUTEX_WAIT` sleeps on one address. A runtime whose park condition is
+"whichever of these events happens first" cannot express that with a
+single-address wait, so it polls — and `futex_waitv` (449) is the call that
+exists for exactly that gap. It was the futex family's last `ENOSYS` that a
+real thread runtime reaches for (`docs/uapi/01-syscall-table.md`).
+
+**Measured first**, on a Linux 7.2.11 host, before any kernel code:
+`build/scratch/futex-waitv/probe_waitv.c`, `probe_flags.c` and
+`probe_shared.c` (all three kept in the tree's scratch dir). The probe's first
+shape put `FUTEX_PRIVATE_FLAG` in the call's own `flags` word and every
+positive case answered `EINVAL`; a ctypes script and `strace` showed the
+argument, and Linux 6.12's `SYSCALL_DEFINE5(futex_waitv, …)` states the rule in
+one line: *"This syscall supports no flags for now"*. With the call's flags
+zero the whole shape is answerable:
+
+| shape | Linux's answer |
+|---|---|
+| one waiter `FUTEX_32 \| FUTEX_PRIVATE`, woken by `FUTEX_WAKE` | `0` (the index) |
+| two words, second woken | `1`; first woken | `0` |
+| word already moved | `EAGAIN` (11) |
+| moved word **and** a past deadline | `EAGAIN` — the value check runs first |
+| `nr = 0` / `nr = 129` / NULL array | `EINVAL` |
+| call-level flags `0x80`, `0x2`, `0x100`, … | `EINVAL` |
+| waiter flags: `0x2`, `0x82` accepted; `0x1`, `0x4`, `0x8`, `0x80` alone, `0x84`, `0x1000`, `0x1000000` | `EINVAL` (only `FUTEX_32` and `FUTEX_PRIVATE_FLAG`) |
+| `__reserved = 1` | `EINVAL` |
+| word at offset 1 | `EINVAL` |
+| unreadable array, unreadable word | `EFAULT` |
+| 60 ms absolute deadline, monotonic or realtime | `ETIMEDOUT` |
+| invalid `clockid` with a timeout | `EINVAL`; with a NULL timeout | ignored (the value's own answer) |
+| shared waiter (`0x2` without `0x80`), same process and cross-process | served by Linux |
+
+The per-waiter flag table came from `probe_flags.c` measuring, for a 32-bit
+word holding `0xdeadbeef`, which candidate flag words block (`ETIMEDOUT`,
+meaning the width's read matched), mismatch (`EAGAIN`) or are refused
+(`EINVAL`): exactly `0x2` and `0x82` blocked. `probe_shared.c` also measured
+that a *private* waiter is not reached by a shared wake (`0` woken,
+`ETIMEDOUT`) — the two tables are genuinely different keys.
+
+**Landed**: `src/sched/futex.rs` — `Wait { address, expected }`,
+`register_all`, `unregister_all`, `first_woken`, and
+`wait_multiple(waits, deadline) -> isize`: register every place, *then* check
+every word (`EAGAIN` on the first that moved, after unregistering all — the
+same lost-wake ordering `wait_bitset` rests on), then one
+`block_until_nanos(|| first_woken(...).is_some(), deadline)`, then the earliest
+marked index, `ETIMEDOUT` or `EINTR`. `src/syscall/linux/proc.rs` —
+`handle_futex_waitv` parses the 24-byte waiters (read unaligned, like
+`futex_deadline`'s timespec), enforces the table above, and caps the array at
+`WAITV_MAX = 128` for the worst-case rule. `nr_x86_64.rs`/`nr_aarch64.rs`: 449
+on both (the call landed after the number tables converged).
+
+**The divergence named**: a shared waiter (`FUTEX_PRIVATE_FLAG` absent) is
+`EOPNOTSUPP`. The wait table is keyed by *user address*, so two processes'
+mappings of one shared word cannot be matched; serving it would park a caller
+no waker can reach. Linux serves it (measured above, cross-process too), so the
+refusal is a named gap rather than a claim about Linux; `FUTEX_WAIT`'s older arm
+keeps its own keying divergence recorded and unchanged.
+
+**Pin**: new `t-futex-waitv`, default group, both machines: 20 claims — the two
+index answers, `EAGAIN`, monotonic and realtime deadlines (with the elapsed
+time inside 40–400 ms), the whole `EINVAL` list, `EFAULT` for both pointers,
+the `EAGAIN`-before-deadline order, and (guest only) the shared refusal. The
+host tests `a_multi_wait_holds_a_place_on_every_word_and_names_the_one_that_fired`
+and `a_multi_wait_names_the_earliest_word_when_several_fire` pin the table half.
+The same binary run on the host with `MPOS_ON_HOST=1` passes every claim against
+Linux: 20 of 20, so the test is Linux's answers and not this kernel's
+expectations written down.
+
+**Gate**: x86_64 `pass=219 fail=0 (219 built)`, aarch64 `pass=218 fail=0 (218
+built)`, `mpos-kunit 34 passed, 0 failed` on both; host suite 649 passed (647 +
+the two new table tests). **Counterfactual**: dispatch arm removed →
+`pass=218 fail=1 (219 built)`, `t-futex-waitv` red on every claim (each call
+falling to `_ => ENOSYS`), no other program red. Restored, green.
+
+**Named**: the shared spelling above; and `FUTEX2_SIZE_U64`/`FUTEX2_NUMA`
+shapes do not exist in this kernel's answer set at all — Linux 6.12 itself
+accepts neither on this probe (`0x4`/`0x8`/`0x10` all `EINVAL`), so there is no
+gap to name there yet.
