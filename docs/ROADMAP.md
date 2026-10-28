@@ -252,7 +252,8 @@ One-glance status of the whole roadmap.
   (one node), `mm_cid` is 0 (one CPU — valid under a contract that only needs
   *running* threads distinct), `slice_ctrl` is 0, and `flags` is 0 because the
   time-slice extension is not implemented where Linux's read-only bits would say
-  it is available (§6.35, item 120)
+  it is available, and the `auxv` pair (`AT_RSEQ_FEATURE_SIZE` 33 /
+  `AT_RSEQ_ALIGN` 64) is advertised so a libc registers the shape (§6.35, item 120)
 - [x] `close_range(2)` (436) — a span of descriptors, closed or marked: measured on
   Linux 7.2.11, a span closes exactly the numbers it covers (neighbours untouched),
   `first > last` and a flag bit outside the two are `EINVAL`, `~0` means "to the end

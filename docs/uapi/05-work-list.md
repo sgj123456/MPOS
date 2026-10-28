@@ -6644,7 +6644,10 @@ registers a 33-byte area and every later call in that thread is `EINVAL`):
   thread's concurrency id (0, then 1/2/3 for three more). This kernel serves it
   too, and answers the words honestly: `flags` 0 (no slice extension offered),
   `node_id` 0 (one node), `mm_cid` 0 (one CPU — a valid index, since the
-  contract only needs *running* threads distinct), `slice_ctrl` 0.
+  contract only needs *running* threads distinct), `slice_ctrl` 0. The
+  `auxv` pair is advertised so a libc finds the shape (`AT_RSEQ_FEATURE_SIZE`
+  27 = 33, `AT_RSEQ_ALIGN` 28 = 64); glibc then registers it, and the id words
+  need no per-return refresh here because one CPU means `cpu_id` is always 0.
 * a hand-written critical section (signature `.long 0x53053053` before the
   abort label) shows the promise's shape on Linux: a syscall inside it commits,
   a preemption inside it is rewound to `abort_ip`, and a wrong signature word

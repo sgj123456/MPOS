@@ -4333,16 +4333,24 @@ this scheduler does not have; `node_id` is 0 because the machine has one node;
 and the concurrency-id contract only asks that *concurrently running* threads
 have distinct ids; `slice_ctrl` is 0 and never written again.
 
+**The `auxv` pair is advertised**, which is what makes a libc find the v2
+shape at all: `AT_RSEQ_FEATURE_SIZE` (27) answers 33 and `AT_RSEQ_ALIGN` (28)
+answers 64 (`src/sched/runtime/load.rs`'s `auxv`, both numbers from Linux
+7.2.11's own pair; the initial-stack block's word count grew with the two
+entries, because a block that is one entry short is an exec writing past its
+own stack). glibc reads them and registers 33 bytes here; musl ignores them.
+Linux fills the id words on **every return to user** because the cpu id and
+the concurrency id can change under a task; on this machine they cannot -
+there is one CPU, so `cpu_id` is always 0, and `mm_cid` is 0 for the same
+reason - so the registration's write is the last write those words need, and
+no return-to-user hook is carried.
+
 **Named divergences**: the v2 `flags` word is 0 rather than Linux's `0x10`/`0x30`
-(above); `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN` are not put in the `auxv`, so a
-libc that reads them still asks for the legacy 32-byte area and the v2 path is
-reached by programs that know the shape — advertising the pair would make every
-glibc program register 33 bytes, which needs the id words refreshed on every
-return to user, and that is the next half of this item; the concurrency id is
-not refreshed after a `fork` (no migration exists on one CPU); a preempted
-section is deferred then killed rather than rewound to `abort_ip`; and an
-unregistration over an unmapped area answers `EFAULT` where Linux delivers
-`SIGSEGV`.
+(above); the id words are written at registration rather than refreshed on each
+return to user (unobservable here, because neither id can change on one CPU);
+the concurrency id is not refreshed after a `fork`; a preempted section is
+deferred then killed rather than rewound to `abort_ip`; and an unregistration
+over an unmapped area answers `EFAULT` where Linux delivers `SIGSEGV`.
 
 **Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=224 fail=1
 (225 built)`, only `t-rseq` red, every call falling through `_ => ENOSYS`.

@@ -28,7 +28,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-const AUXV_WORDS: usize = 32; // 16 (type, value) pairs, AT_NULL included.
+/// Twenty (type, value) pairs, `AT_NULL` included. Sixteen was the count before
+/// `rseq`'s feature pair (`AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN`) joined the
+/// block - and the block must hold every entry [`auxv`] writes, or an exec
+/// scribbles past the initial stack it reserved.
+const AUXV_WORDS: usize = 40;
 
 pub(crate) fn initial_stack_rsp(
     argv: &[String],
@@ -226,6 +230,14 @@ fn auxv(buf: &mut [u8], loaded: &Loaded, random_vaddr: usize, execfn: usize) {
     entry!(14, id.egid); // AT_EGID
     entry!(16, 0usize); // AT_HWCAP
     entry!(17, 100usize); // AT_CLKTCK
+    // The `rseq` feature shape this kernel serves: a libc reads these two and
+    // registers an area of this size and alignment (`getauxval(27)`/`(28)` on
+    // Linux). Advertising the pair is what makes glibc's own registration
+    // land on the v2 area rather than the legacy one; the values match
+    // `crate::sched::rseq::{FEATURE_LEN, FEATURE_ALIGN}` and Linux 7.2.11's
+    // measured `auxv` (`build/scratch/rseq2/probe.c`).
+    entry!(27, 33usize); // AT_RSEQ_FEATURE_SIZE
+    entry!(28, 64usize); // AT_RSEQ_ALIGN
     // AT_SECURE: the exec raised an effective id, so libc has to take its
     // hardened path - no `LD_PRELOAD`, no `LD_LIBRARY_PATH`, sanitised locale.
     // Linux computes it the same way, as "did the ids come out different".

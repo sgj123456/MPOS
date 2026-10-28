@@ -327,6 +327,20 @@ fn main() {
         );
     }
 
+    // The `auxv` pair a libc reads before it registers: the feature size and
+    // alignment. Both kernels answer the same numbers, which is the reference
+    // direction - the host's `getauxval` is where these values came from.
+    let feature = unsafe { libc::getauxval(27) };
+    let alignment = unsafe { libc::getauxval(28) };
+    r.check(
+        &format!("the auxv names the feature size (is {feature})"),
+        feature == 33,
+    );
+    r.check(
+        &format!("and the feature alignment (is {alignment})"),
+        alignment == 64,
+    );
+
     // The v2 area: `len > 32` names the feature-sized shape, whose extra words
     // are the feature flags, the NUMA node id, the concurrency id and the
     // time-slice control. Both kernels accept it; what each writes into
