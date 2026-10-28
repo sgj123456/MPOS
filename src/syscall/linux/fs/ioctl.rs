@@ -1190,6 +1190,13 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // The inode attribute word: `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`,
         // the two requests `lsattr` and `chattr` are made of. The `'f'` family,
         // which is Linux's own for exactly these.
+        // `userfaultfd`'s `UFFDIO_*` family: the `'X'`... no, `0xAA` - the
+        // request words carry Linux's own type magic, so the family is
+        // recognised by it exactly as the others are.
+        #[cfg(target_os = "none")]
+        request if crate::vfs::userfaultfd::is_userfaultfd_request(request) => {
+            userfaultfd_ioctl(fd, request, buf, from_user)
+        }
         request if family_nr(request, b'f').is_some() => {
             fs_flags_ioctl(fd, request, buf, from_user)
         }
@@ -1568,4 +1575,43 @@ fn ifreq_flags(index: u32) -> Option<u16> {
         flags |= 0x1 | 0x40;
     }
     Some(flags)
+}
+
+/// The `userfaultfd` request family: one descriptor, six served requests.
+///
+/// The family is recognised by its type magic (`0xAA`), and every request word
+/// it has is answered - the four this kernel does not serve with
+/// `EOPNOTSUPP`, which is the honest answer for a request the ABI has and this
+/// kernel has no machinery for. `ENOTTY` would say the request does not exist.
+#[cfg(target_os = "none")]
+fn userfaultfd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    use crate::vfs::userfaultfd_abi::*;
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(uffd) = inode.as_userfaultfd() else {
+        // A `0xAA` request on a descriptor that is not a userfaultfd: Linux
+        // answers ENOTTY, which is what an unknown request gets.
+        return err::ENOTTY;
+    };
+    match request {
+        UFFDIO_API_REQUEST => super::super::userfaultfd::api_ioctl(uffd, buf, from_user),
+        UFFDIO_REGISTER_REQUEST => super::super::userfaultfd::register_ioctl(uffd, buf, from_user),
+        UFFDIO_UNREGISTER_REQUEST => {
+            super::super::userfaultfd::unregister_ioctl(uffd, buf, from_user)
+        }
+        UFFDIO_WAKE_REQUEST => super::super::userfaultfd::wake_ioctl(uffd, buf, from_user),
+        UFFDIO_COPY_REQUEST => super::super::userfaultfd::copy_ioctl(uffd, buf, from_user),
+        UFFDIO_ZEROPAGE_REQUEST => super::super::userfaultfd::zeropage_ioctl(uffd, buf, from_user),
+        // Real requests this kernel does not serve: write-protect tracking,
+        // minor faults, poisoning and moving a page. Each is a promise the
+        // machinery here cannot keep.
+        UFFDIO_WRITEPROTECT_REQUEST
+        | UFFDIO_CONTINUE_REQUEST
+        | UFFDIO_MOVE_REQUEST
+        | UFFDIO_POISON_REQUEST => err::EOPNOTSUPP,
+        _ => err::ENOTTY,
+    }
 }

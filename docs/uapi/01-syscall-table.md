@@ -303,6 +303,7 @@ A call absent from those is served as its phase section records.
 | `fanotify_init` | 300 | fs | 262 |
 | `fanotify_mark` | 301 | fs | 263 |
 | `fchmodat2` | 452 | fs | 452 |
+| `userfaultfd` | 323 | userfaultfd | 282 |
 | `io_uring_setup` | 425 | io_uring | 425 |
 | `io_uring_enter` | 426 | " | " |
 | `io_uring_register` | 427 | " | " |
@@ -315,9 +316,12 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| `userfaultfd` | 323 | Userspace page-fault handling | Fault forwarding to a user task + `UFFDIO_*` |
+| _(none)_ | | | |
 
-> Two families have since moved out of this table. `keyctl` (250): the kernel keyring is
+> **Every family that was on this table has since moved out of it** - the table
+> is empty on purpose, not by accident: there is no number left whose honest
+> answer is `ENOSYS` except `rseq`, which is pinned by `t-rseq` and described
+> below. `keyctl` (250): the kernel keyring is `keyctl` (250): the kernel keyring is
 > served (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on
 > aarch64), pinned by `t-keyctl`, written up as item 113 with the measured shape in
 > `docs/notes/06-process-management.md` §6.30. `fanotify_init` (300)/`fanotify_mark`
@@ -325,12 +329,16 @@ note printed once per number (`note_enosys`):
 > written up as item 114 and `docs/notes/03-filesystem.md` §3.9. The three `io_uring`
 > numbers (425/426/427) moved out the same way: the ring is served for its measured
 > synchronous subset, pinned by `t-io-uring`, written up as item 115 and
-> `docs/notes/06-process-management.md` §6.32. What stays refused here
-> is `userfaultfd` and `rseq` — and the `fanotify` call
+> `docs/notes/06-process-management.md` §6.32. `userfaultfd` (323/282) moved out
+> the same way: the fault-to-a-message shape is served for its measured subset
+> (`UFFDIO_API`/`REGISTER` in `MODE_MISSING`/`COPY`/`ZEROPAGE`/`WAKE`/
+> `UNREGISTER` and one record per `read`), pinned by `t-userfaultfd`, written up
+> as item 116 and `docs/notes/06-process-management.md` §6.33. What stays refused
+> here is `rseq` alone — and the `fanotify` call
 > itself now refuses only the shapes it does not serve (the content classes and the
 > mount/filesystem scopes), each by name.
 
-`rseq` (334) is the fifth: like the four above it has no dispatch arm, but unlike them it
+`rseq` (334) is the last one left: like the five above it has no dispatch arm, but unlike them it
 *once had* one that returned `0` without writing any of the fields the ABI contract puts in
 the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
 named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration

@@ -4080,3 +4080,102 @@ the same job): `CF-EXIT=1`, `pass=221 fail=1 (222 built)`, and only
 falls to the default arm and answers `ENOSYS`. Every other program stays
 green, `t-enosys` included (it no longer probes the three numbers). After the
 restore, `grep -c 'nr::IO_URING_' src/syscall/linux/mod.rs` is 3.
+
+### 6.33 `userfaultfd(2)` — the fault becomes a message, and the answer is the page — **LANDED (2026-10-28)**
+
+**Why**: a live-migration or lazy-restore program maps memory it has no
+contents for yet and wants to be *told* about each page it touches, so it can
+supply the bytes itself. That is `userfaultfd`: a descriptor carrying a queue of
+32-byte pagefault records, a set of registered ranges, and a fault on a
+registered page that parks the faulting task until the program answers. The
+call had no dispatch arm at all - a probing libc read `ENOSYS` and took its
+fallback - so this is new ABI rather than a gap being closed.
+
+**Measured first, as real root.** `userfaultfd` is `EPERM` for an unprivileged
+user on this host (`/proc/sys/vm/unprivileged_userfaultfd` is `0`), and `uid 0`
+inside `unshare -Ur` is `EPERM` too, because the call asks `CAP_SYS_ADMIN` in
+the **initial** user namespace. So the shape was measured on Linux 7.2.11 as
+real root: the host kernel booted in QEMU with an initramfs whose `/init` *is*
+the probe (`build/scratch/uffd/probe.c`, `probe3.c`, packed by
+`build/scratch/uffd/mkcpio.py`; the recipe and its one trap - a newc cpio's
+magic is the six characters `070701`, not a zero-padded hex field - are in the
+probe's own directory). A faulting task must be a **thread** of the group that
+holds the descriptor: a `fork` gives the child no uffd context without
+`UFFD_FEATURE_EVENT_FORK`, so its touch is `SIGBUS`.
+
+| Question | Linux's answer |
+|---|---|
+| `sizeof` the shapes | `uffd_msg` 32, `uffdio_api` 24, `uffdio_register` 32, `uffdio_copy` 40; `UFFD_API` = `0xaa` |
+| open's flags | `O_CLOEXEC` and `O_NONBLOCK` honoured (`F_GETFD` 1 / `F_GETFL` `O_RDWR`); `UFFD_USER_MODE_ONLY` (`0x1`) accepted; `0x2` and `0x40000000` are `EINVAL` |
+| `UFFDIO_API` | `api = 0xaa` answers 0 with `features = 0x1ffff`, `ioctls = 0x8000000000000003`; a wrong api number, an unknown feature bit and a **second** handshake are all `EINVAL` |
+| `UFFDIO_REGISTER`, `MODE_MISSING`, anon | 0 with `ioctls = 0x13c`; the same span twice is 0; `mode = 0`, an unaligned start, `len = 1`, `len = 0` and an unmapped span are all `EINVAL` |
+| a read fault | one 32-byte record: `event = 0x12`, `flags = 0`, `address` page-aligned, `ptid = 0`; a buffer shorter than 32 is `EINVAL`; a non-blocking read with nothing queued is `EAGAIN` |
+| `UFFDIO_COPY` | 0 with `copy = 4096` and the page really installed; over a **present** page `EEXIST`; an unmapped source `EFAULT`; an unregistered destination `ENOENT`; `len` of 0 or 1 `EINVAL`; an unknown mode bit `EINVAL`; an **unaligned source is accepted** |
+| `UFFDIO_ZEROPAGE` | 0 with `zeropage = 4096`, the page reads zero; over a present page `EEXIST` |
+| `UFFDIO_WAKE` / `UFFDIO_UNREGISTER` | 0 both, on registered *and* unregistered spans, and unregistering twice is 0 |
+| not served by this measurement | `MODE_WP` (needs the write-protect feature), `MODE_MINOR` on anon, `UFFDIO_CONTINUE`, `UFFDIO_MOVE` — each refused by Linux itself in these shapes |
+| two threads, one page | **one** record, and one `UFFDIO_COPY` releases both |
+| a fork, no `EVENT_FORK` | the child's touch is `SIGBUS` |
+
+**Served, in that measured shape.** The split is `sysv_msg`'s: the machinery is
+process state, the descriptor is the file. `src/sched/userfault.rs` holds the
+registered ranges, the queue of unanswered pagefaults, the list of tasks parked
+on a page, and the fault-path entry point; `src/vfs/userfaultfd.rs` is the
+`Inode` face (one record per `read(2)`, `EAGAIN` when non-blocking, `EBADF` for
+`write`); `src/vfs/userfaultfd_abi.rs` is the host-compiled shape (the request
+words, the mode/flag vocabulary, `pagefault_record`, six host tests);
+`src/syscall/linux/userfaultfd.rs` is the syscall and the six ioctls, routed
+from `handle_ioctl` by the `0xaa` type byte every `_UFFDIO_*` word carries.
+
+The fault path's involvement is one line in `resolve_anon_fault`: before it
+takes the task table it calls `userfault::deliver(page, write)`, which finds the
+descriptor that registered the page, queues a record, wakes whoever is in
+`read(2)`, parks the faulting task, and answers "somebody else's to resolve" so
+no frame is allocated. It has to be there rather than in `populate_in` for a
+mechanical reason: parking switches tasks and `populate_in` runs with the table
+borrowed. The observable shape is Linux's - the faulting instruction does not
+return until the page is there.
+
+**The one bug the gate found, and why it mattered.** The first version parked
+the faulting task on the *readable queue*: `read(2)` removes a record when it
+hands it to the program, so by the time the program answered with
+`UFFDIO_COPY` there was nothing left to wake, and the faulting thread waited
+forever (the gate hung, the lane's heartbeat naming
+`name=/bin/t-userfaultfd park 2 syscall 202` - futex - and `syscall 14`).
+The fix separates the two lists: `State::pending` is the program's mail,
+`State::parked` is who to wake when the page arrives. One `UFFDIO_COPY`
+releases every task waiting on that page, which is also the measured
+two-threads-one-record shape.
+
+**Named divergences, each visible from userland**:
+
+* `features` answers **0** where Linux answers `0x1ffff`. Every
+  `UFFD_FEATURE_*` bit is a promise of machinery this kernel does not have, and
+  a program that checked the bit and got it back would believe in faults it
+  will never receive.
+* `MODE_WP`, `MODE_MINOR`, `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`,
+  `UFFDIO_MOVE` and `UFFDIO_POISON` are `EOPNOTSUPP` - present in Linux, and
+  not buildable here without a write-protect fault path this kernel does not
+  have.
+* `ptid` is always 0, the `THREAD_ID` feature not being offered (Linux reports
+  0 for it when it was not asked for).
+* **The registry is the machine's, not the task's.** Linux scopes uffd context
+  per `mm` and gives a forked child none without `EVENT_FORK`; here a forked
+  child's fault on a registered page is delivered to the same descriptor and
+  parks the child rather than killing it. A program that forked and then
+  relied on `SIGBUS` would be relying on a shape this kernel does not have.
+* The queue is bounded at `MAX_PENDING = 4096` records and descriptors at
+  `MAX_DESCRIPTORS = 64`: a record is an allocation a user steers and the global
+  allocator still panics on failure (`docs/notes/` §8.0). A page whose record
+  cannot be queued resolves the ordinary way rather than hanging.
+
+**Pinned** by `t-userfaultfd` (guest run; the same binary under
+`MPOS_ON_HOST=1` asserts the one claim a host can make - an unprivileged host
+refuses the call with `EPERM` - and passes there): the descriptor's flags, the
+API handshake and its refusals, registration's five `EINVAL`s, a read fault's
+record and its `UFFDIO_COPY` answer, the zero page, the three `EOPNOTSUPP`
+refusals, `read`'s short-buffer and `EAGAIN` rules, `WAKE`/`UNREGISTER`, the
+two-threads-one-record case, and `t-enosys`'s move from `userfaultfd` to `rseq`
+(the only number still falling through).
+
+Full record: `docs/uapi/` §5.1 item 116.

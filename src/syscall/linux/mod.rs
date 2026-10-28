@@ -35,6 +35,8 @@ pub(crate) mod io_uring;
 /// ABI face that copies user memory and maps errnos.
 #[cfg(target_os = "none")]
 pub(crate) mod keys;
+#[cfg(target_os = "none")]
+pub(crate) mod userfaultfd;
 
 /// The POSIX completion set's process half: identity, capabilities,
 /// scheduling, memory advice, the wall clock's setters, and the signals a
@@ -470,6 +472,7 @@ pub unsafe fn dispatch(
         nr::IO_URING_SETUP => io_uring::handle_io_uring_setup(args),
         nr::IO_URING_ENTER => io_uring::handle_io_uring_enter(args),
         nr::IO_URING_REGISTER => io_uring::handle_io_uring_register(args),
+        nr::USERFAULTFD => userfaultfd::handle_userfaultfd(args),
         nr::ADD_KEY => keys::handle_add_key(args),
         nr::REQUEST_KEY => keys::handle_request_key(args),
         nr::KEYCTL => keys::handle_keyctl(args),

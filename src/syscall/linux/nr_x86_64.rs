@@ -370,6 +370,10 @@ pub const EPOLL_PWAIT2: u64 = 441;
 pub const IO_URING_SETUP: u64 = 425;
 pub const IO_URING_ENTER: u64 = 426;
 pub const IO_URING_REGISTER: u64 = 427;
+/// `userfaultfd(2)`: a process's own page faults, forwarded to it through a
+/// descriptor. The number differs from the second machine's (asm-generic puts
+/// it at 282), so it is one of the family's two-number cases.
+pub const USERFAULTFD: u64 = 323;
 /// `timerfd_create(2)`: a timer that reports its expirations through a
 /// descriptor - the wait `systemd`'s timer units and every poll loop with
 /// a deadline are built on.

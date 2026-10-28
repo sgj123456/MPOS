@@ -6410,3 +6410,57 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     panics with `-38`, the `ENOSYS` the default arm gives; every other program
     stays green.
     Full record: `docs/notes/06-process-management.md` §6.32.
+
+## item 116 — `userfaultfd(2)`: the fault becomes a message, and the answer is the page
+
+    **Measured first, on Linux 7.2.11 as real root** — the call is `EPERM` for
+    an unprivileged user (`vm.unprivileged_userfaultfd` is 0) and `EPERM` for
+    `uid 0` inside `unshare -Ur` too, so the only source is a real root: the
+    host kernel booted in QEMU with an initramfs whose `/init` is the probe
+    (`build/scratch/uffd/probe.c`, `probe3.c`). The table that came back:
+    `UFFD_API` `0xaa` with the shapes 32/24/32/40 bytes; `UFFDIO_API` answers
+    `features = 0x1ffff`, `ioctls = 0x8000000000000003`, and refuses a wrong
+    number, an unknown feature bit and a second handshake with `EINVAL`;
+    `UFFDIO_REGISTER` in `MODE_MISSING` on anon answers `ioctls = 0x13c` and
+    refuses `mode = 0`, an unaligned start, `len` 0 or 1 and an unmapped span;
+    a read fault is one 32-byte record with `event = 0x12`, `flags = 0`,
+    `address` page-aligned and `ptid = 0`; `UFFDIO_COPY` answers the page length
+    and is `EEXIST` over a present page, `EFAULT` for an unmapped source,
+    `ENOENT` for an unregistered destination; `UFFDIO_ZEROPAGE` installs a zero
+    page; `UFFDIO_WAKE`/`UFFDIO_UNREGISTER` answer 0 on registered and
+    unregistered spans alike; two threads on one page produce **one** record and
+    one `UFFDIO_COPY` releases both; a forked child's touch is `SIGBUS`, because
+    no `UFFD_FEATURE_EVENT_FORK` was negotiated.
+
+    **Served, in that measured shape.** `src/sched/userfault.rs` is the
+    machinery (registered ranges, the queue of unanswered pagefaults, the list
+    of tasks parked on a page, the fault-path entry point), because the fault
+    path is `sched`'s and a module may not call up into `vfs`
+    (`docs/ARCHITECTURE.md` §3); `src/vfs/userfaultfd.rs` is the descriptor's
+    `Inode` face; `src/vfs/userfaultfd_abi.rs` is the host-compiled shape with
+    six host tests; `src/syscall/linux/userfaultfd.rs` is the syscall and the
+    six ioctls, routed from `handle_ioctl` by the `0xaa` type byte every
+    `_UFFDIO_*` word carries. The fault path's whole involvement is one call in
+    `resolve_anon_fault`, *before* it borrows the task table (parking switches
+    tasks): the page's owner queues a record, wakes the reader, parks the
+    faulting task, and no frame is allocated. The faulting instruction returns
+    only once the program has supplied the page.
+
+    **Named refusals, per item rather than per call**: every `UFFD_FEATURE_*`
+    bit (so `features` answers `0` where Linux answers `0x1ffff`), `MODE_WP`,
+    `MODE_MINOR`, `UFFDIO_WRITEPROTECT`, `UFFDIO_CONTINUE`, `UFFDIO_MOVE` and
+    `UFFDIO_POISON` are `EOPNOTSUPP` - real Linux shapes this kernel has no
+    write-protect fault path or minor-fault machinery for. `ptid` is always 0
+    (the `THREAD_ID` feature is not offered). The queue is bounded at 4096
+    records and 64 descriptors, the §8.0 memory bound.
+
+    **The divergence a program could notice**: Linux scopes uffd context per
+    `mm` and gives a forked child none without `EVENT_FORK` (its touch is
+    `SIGBUS`, measured); here the registry is the machine's, so a forked child's
+    fault on a registered page is delivered to the same descriptor and parks the
+    child instead of killing it. Named in `docs/notes/06-process-management.md`
+    §6.33, not asserted by the pin.
+
+    **Pinned** by `t-userfaultfd`, which the same binary also runs under
+    `MPOS_ON_HOST=1` against Linux (the reference direction, where the one claim
+    a host can make is that an unprivileged process is refused `EPERM`).

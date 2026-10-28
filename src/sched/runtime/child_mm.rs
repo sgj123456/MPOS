@@ -331,6 +331,15 @@ pub(crate) fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) 
 /// fault came through are the ones that decide what the address means.
 pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
     let root = hal::active_root();
+    // A page a `userfaultfd` registered is not this kernel's to resolve: the
+    // fault becomes a record on that descriptor and the faulting task parks
+    // until the process answers with the page. This runs **before** the table
+    // is borrowed because the park switches tasks, and `with_table`'s own rule
+    // is that its closure must not (`docs/ARCHITECTURE.md` §7). `deliver`
+    // answers `true` only when a descriptor really owns the page.
+    if super::super::userfault::deliver(pframe::align_down(virt, PAGE_SIZE), write) {
+        return true;
+    }
     with_table(|t| populate_in(t, root, virt, write))
 }
 
@@ -365,6 +374,56 @@ pub fn kernel_lazy_accessible(virt: usize, write: bool) -> bool {
             Some(vma) => matches!(&vma.kind, VmaKind::Anon) && vma.permits(write),
             None => false,
         }
+    })
+}
+
+/// Whether `page` is present in the address space `root` names.
+///
+/// The question a `userfaultfd` answer turns on: the parked task waits for the
+/// page to appear, and the answering thread's `UFFDIO_COPY` is what makes it
+/// appear. Asked through the same walk the fault handler uses.
+pub fn page_present_in(root: usize, page: usize) -> bool {
+    with_table(|t| {
+        let Some(owner) = owner_of_root(t, root) else {
+            return false;
+        };
+        let owner = t.space_owner(owner);
+        t.task(owner)
+            .space
+            .as_ref()
+            .and_then(|space| space.phys_for_virt(page))
+            .is_some()
+    })
+}
+
+/// Whether every page of `start..end` lies in a VMA - the question
+/// `UFFDIO_REGISTER` asks before it accepts a range (measured: a range with no
+/// mapping behind it is `EINVAL`).
+pub fn range_is_mapped(start: usize, end: usize) -> bool {
+    if end <= start {
+        return false;
+    }
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        let mm = Arc::clone(&t.task(owner).mm);
+        let mut page = pframe::align_down(start, PAGE_SIZE);
+        while page < end {
+            if !mm.vma_covers(page) {
+                return false;
+            }
+            page += PAGE_SIZE;
+        }
+        true
+    })
+}
+
+/// The permissions the VMA covering `page` grants, or `None` when no VMA does.
+/// `UFFDIO_COPY` installs the page with these, so a page filled into a
+/// `PROT_READ` range does not arrive writable.
+pub(crate) fn prot_of_page(page: usize) -> Option<MapFlags> {
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        t.task(owner).mm.vma_at(page).map(|vma| vma.prot)
     })
 }
 

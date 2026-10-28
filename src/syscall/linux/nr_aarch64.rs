@@ -324,3 +324,7 @@ pub const FANOTIFY_MARK: u64 = 263;
 pub const IO_URING_SETUP: u64 = 425;
 pub const IO_URING_ENTER: u64 = 426;
 pub const IO_URING_REGISTER: u64 = 427;
+
+/// `userfaultfd(2)`: asm-generic's number, which differs from x86_64's 323 -
+/// measured off both machines' headers, not assumed from one.
+pub const USERFAULTFD: u64 = 282;

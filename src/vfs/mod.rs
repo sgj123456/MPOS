@@ -113,6 +113,14 @@ pub mod tar;
 pub mod termios;
 pub mod timerfd;
 pub mod tty;
+#[cfg(target_os = "none")]
+pub mod userfaultfd;
+/// `userfaultfd`'s published shape (the struct layouts, the request words and
+/// the validation rules), host-compiled so its tests hold it to Linux's
+/// measured answers without booting anything. The half that needs frames and
+/// parked tasks is [`userfaultfd`], bare-metal only - its machinery lives in
+/// [`crate::sched::userfault`] because the fault path calls it.
+pub mod userfaultfd_abi;
 /// The console multiplexer: one serial wire, six terminals, and the switch a seat
 /// manager drives between them.
 ///
@@ -804,6 +812,15 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// the `dmabuf` module.
     #[cfg(target_os = "none")]
     fn as_dmabuf(&self) -> Option<&crate::vfs::dmabuf::DmaBuf> {
+        None
+    }
+
+    /// The descriptor behind a `userfaultfd`, the same shape as
+    /// [`Self::as_io_uring`]: the `UFFDIO_*` requests drive the object, and
+    /// the fault path finds the registered ranges through
+    /// [`crate::sched::userfault`].
+    #[cfg(target_os = "none")]
+    fn as_userfaultfd(&self) -> Option<&crate::vfs::userfaultfd::UserfaultFd> {
         None
     }
 

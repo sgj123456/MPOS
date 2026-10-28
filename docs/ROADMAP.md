@@ -232,7 +232,17 @@ One-glance status of the whole roadmap.
   asked); a hole in the caller's own range is `ENOMEM` after the walk has dropped
   what it met (§6.28, item 109); the open/getfd/send/wait doors are served
   (§6.8/§6.9, items 92–93)
-- [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
+- [x] `userfaultfd(2)` (323/282) — the fault becomes a message and the answer is the
+  page: measured as **real root** (the call is `EPERM` for an unprivileged user), so
+  `UFFDIO_API`, `REGISTER` in `MODE_MISSING`, `COPY`, `ZEROPAGE`, `WAKE`,
+  `UNREGISTER` and one 32-byte record per `read(2)` are served, the faulting task
+  parked until the page arrives; every `UFFD_FEATURE_*` bit, `MODE_WP`/`MODE_MINOR`,
+  `WRITEPROTECT`/`CONTINUE`/`MOVE`/`POISON` are `EOPNOTSUPP`, and the registry is the
+  machine's rather than the `mm`'s (a forked child's fault is delivered, not `SIGBUS`)
+  (§6.33, item 116)
+- [ ] `tid/tgid_add_object` (rseq) — niche; the one number left answering `ENOSYS`,
+  pinned by `t-rseq`, and serving it needs a per-thread registration maintained across
+  preemption (§12.1 A6)
 - [x] `futex_waitv(2)` (449) — several futex words, one sleep: up to 128 waiters,
   the call's own flags word must be zero, a waiter is `{ val, uaddr, flags, __reserved }`
   with `FUTEX_32`/`FUTEX_PRIVATE_FLAG` (measured; a size bit is required), the answer is
@@ -538,7 +548,7 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-`userfaultfd` and rseq side-objects stay `ENOSYS` (the `fanotify` notification class, the kernel keyring and the `io_uring` ring are served); xattrs validate then `EOPNOTSUPP`;  
+rseq side-objects stay `ENOSYS` (the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs validate then `EOPNOTSUPP`;  
 the semantics still incomplete are the datagram line itself, which is the ring's rather than  
 Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
 sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  
