@@ -223,6 +223,10 @@ pub fn exit(code: isize) -> ! {
             .iter()
             .flatten()
             .any(|other| other.tgid == tgid && !other.exited);
+        // The task's keyrings go with it, and the thread group's with its last
+        // thread: `sched::keys` is process state, so its teardown sits here
+        // with the other scheduler tables rather than behind an exit hook.
+        crate::sched::keys::exit_cleanup(id, tgid, group_dead);
 
         // The dying process's `SEM_UNDO` adjustments - Linux's `exit_sem`,
         // applied when the list's last holder leaves. Taken here rather than
@@ -755,13 +759,16 @@ pub fn fork(state: &UserFrame) -> isize {
     // the byte it is born to report is what makes it a "non-clone" child on the
     // other end (`ChildKind`). A default request carries no byte - a bare
     // `clone(0)` - which is a *different* call and a different kind.
-    spawn_copy(
+    let parent_tgid = current_tgid();
+    let child = spawn_copy(
         state,
         CloneRequest {
             exit_signal: signal::SIGCHLD,
             ..CloneRequest::default()
         },
-    )
+    );
+    hand_down_keyrings(parent_tgid, child, false);
+    child
 }
 
 /// `vfork(2)`: the same copy of the calling process, labelled for the tracer.
@@ -773,7 +780,8 @@ pub fn fork(state: &UserFrame) -> isize {
 /// contract better here than a share would - but which of the two events a
 /// tracer is waiting for is not something it can recover for itself.
 pub fn vfork(state: &UserFrame) -> isize {
-    spawn_copy(
+    let parent_tgid = current_tgid();
+    let child = spawn_copy(
         state,
         CloneRequest {
             flags: crate::abi::CLONE_VFORK,
@@ -782,7 +790,23 @@ pub fn vfork(state: &UserFrame) -> isize {
             exit_signal: signal::SIGCHLD,
             ..CloneRequest::default()
         },
-    )
+    );
+    hand_down_keyrings(parent_tgid, child, false);
+    child
+}
+
+/// Hand a new task the keyrings it inherits: the session keyring and nothing
+/// else, which is what `sched::keys` measured on a current host (a forked
+/// child's session serial is its parent's; its process and thread keyrings
+/// start empty). A `CLONE_THREAD` child shares its thread group, so there is
+/// nothing to inherit.
+fn hand_down_keyrings(parent_tgid: TaskId, child: isize, shares_group: bool) {
+    if child <= 0 {
+        return;
+    }
+    let child_id = TaskId(child as usize);
+    let child_tgid = if shares_group { parent_tgid } else { child_id };
+    crate::sched::keys::clone_cleanup(parent_tgid, child_tgid, child_id, shares_group);
 }
 
 /// What a `clone` asks for beyond "a copy of me": which flags, where the child's
@@ -1688,10 +1712,15 @@ pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
     if let Err(e) = crate::abi::clone_namespace_verdict(request.flags, privileged) {
         return e;
     }
+    let parent_tgid = current_tgid();
     if request.flags & crate::abi::CLONE_THREAD != 0 {
-        return spawn_thread(state, request);
+        let child = spawn_thread(state, request);
+        hand_down_keyrings(parent_tgid, child, true);
+        return child;
     }
-    spawn_copy(state, request)
+    let child = spawn_copy(state, request);
+    hand_down_keyrings(parent_tgid, child, false);
+    child
 }
 
 /// Create a thread: a task that runs on the calling task's memory, with the

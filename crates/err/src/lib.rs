@@ -141,6 +141,19 @@ pub const ENETUNREACH: isize = -101;
 /// later retry the way Linux's async neighbour path does (`docs/notes/`
 /// §4.5).
 pub const EHOSTUNREACH: isize = -113;
+/// EDQUOT: the caller's key quota is spent. Measured on the host as the
+/// answer to an `add_key` that would push a user past 20 000 bytes.
+pub const EDQUOT: isize = -122;
+/// ENOKEY: the key named does not exist, or it was invalidated - Linux
+/// answers this for a serial that never existed and for one it has killed
+/// (both measured, `docs/notes/` §6.30).
+pub const ENOKEY: isize = -126;
+/// EKEYEXPIRED: the key existed and its lifetime ran out - the clock side of
+/// a key store, named as a gap because this kernel has no key lifetime.
+pub const EKEYEXPIRED: isize = -127;
+/// EKEYREVOKED: the key exists but was revoked; measured as the answer to
+/// `read`, `describe`, `search` and `update` on a revoked key.
+pub const EKEYREVOKED: isize = -128;
 /// ENOTCONN: the socket is not connected, and the call needs it to be.
 pub const ENOTCONN: isize = -107;
 /// EISCONN: the socket is already connected, and `connect` was asked again.

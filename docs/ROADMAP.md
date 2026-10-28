@@ -204,7 +204,14 @@ One-glance status of the whole roadmap.
   namespace's whole state is the view-root a `/proc/<pid>/cgroup` path renders from,
   and `t-ns-cgroup` walks the move, the fork, the ns identity and the `setns` back
   (§6.25)
-- [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
+- [x] the kernel keyring — `add_key` (248), `request_key` (249) and `keyctl` (250)
+  served on a host measurement: a serial handle over a key store, a permission word
+  with four classes, keyrings that hold serials, recursive `SEARCH`, the
+  `REVOKED`/`INVALIDATED` states checked before permission, possession as a class
+  rather than a filter, and a session ring inherited across `fork`; quota and the
+  named gaps (no `request_key` upcall, possession walk without the link's `SEARCH`,
+  no delayed GC of orphaned keys) are §6.30, item 113
+- [ ] `fanotify_init`/`fanotify_mark`
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
   one call; `CLONE_DETACHED` refused as Linux's own `clone3` refuses it, the

@@ -8,6 +8,7 @@
 pub mod exit;
 pub mod fs;
 pub mod futex;
+pub mod keys;
 pub mod policy;
 pub mod signal;
 /// System V message queues: the queue table, the receive's selection rules,

@@ -527,3 +527,9 @@ pub const RECVMMSG: u64 = 299;
 // table (in `crates/abi`) is shared rather than copied. The values and the
 // `CLONE_NEWTIME`-is-not-high-half subtlety are documented and pinned at their
 // source.
+
+/// `add_key(2)`, `request_key(2)` and `keyctl(2)`: the kernel keyring's three
+/// calls. The store is `sched::keys`'s; these are the numbers.
+pub const ADD_KEY: u64 = 248;
+pub const REQUEST_KEY: u64 = 249;
+pub const KEYCTL: u64 = 250;

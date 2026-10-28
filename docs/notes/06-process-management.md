@@ -3852,3 +3852,92 @@ falling to `_ => ENOSYS`), no other program red. Restored, green.
 shapes do not exist in this kernel's answer set at all — Linux 6.12 itself
 accepts neither on this probe (`0x4`/`0x8`/`0x10` all `EINVAL`), so there is no
 gap to name there yet.
+
+### 6.30 The kernel keyring — `add_key(2)`, `request_key(2)`, `keyctl(2)` — **LANDED (2026-10-28)**
+
+**Why**: the three calls were a blank `ENOSYS` — `t-enosys` walked `keyctl` and
+nothing else — and they are not optional for the programs this kernel exists to
+run: `keyutils`, PAM's session keyring, and the TLS/session stores several
+stacks keep there. Their shape is small, closed, and (unlike a notification
+engine) entirely synchronous, which is what made them a done-in-one-pass item
+rather than a subsystem.
+
+**Measured first** (Linux 7.2.11, `build/scratch/fanokey/`; the probes are
+`probe_keyctl*.c`, `probe_keyperm.c`, `probe_keyfork.c`, and the caller was an
+ordinary user, uid 1000, no `CAP_SYS_ADMIN`):
+
+| Question | Measured answer |
+|---|---|
+| `add_key` answer | a positive serial; the *second* add of the same type+description in the same ring updates the payload **in place** and answers the **same** serial |
+| `keyctl(READ)` copy rule | answers the whole payload length and copies **only** when the buffer can hold it all (5 into a 10-byte key: answered 10, copied nothing; NULL/0: answered 10) |
+| a keyring's `READ` | its link list as `u32` little-endian serials, 4 bytes per link, `0` when cleared |
+| `DESCRIBE` | `"type;uid;gid;perm%08x;desc"`, NUL-terminated, **length counts the NUL** (30 for a 29-byte string); default perm word `0x3f010000` |
+| perm ladder | `VIEW 0x01`, `READ 0x02`, `WRITE 0x04`, `SEARCH 0x08`, `LINK 0x10`, `SETATTR 0x20`; possessor/owner/group/other nibbles |
+| `UPDATE` | `0`; on a keyring `EOPNOTSUPP` |
+| `SEARCH` | the serial, **recursing into nested keyrings**; `UNLINK` of a key not in the ring `ENOENT` |
+| possession | a permission *class*, not a filter: a key unlinked from every ring is still found by serial, `READ` on it is `EACCES`, `DESCRIBE` still works |
+| states | `REVOKE` → every operation `EKEYREVOKED` (state checked before permission); `INVALIDATE` → `ENOKEY` everywhere |
+| `SETPERM`/`CHOWN` | an ordinary owner is refused `EACCES` even while possessing the key — only privilege rewrites the word |
+| `add_key` refusals | unknown type `ENODEV`; 4 096-byte description `EINVAL`; user payload 32 768+ `EINVAL`; NULL payload with a length `EFAULT`; a ring not possessed `ENOKEY`; **zero-length payload `EINVAL`** (user), while `"keyring"` takes exactly zero bytes and `EINVAL`s three |
+| quota | per-user 200 keys / 20 000 bytes as an ordinary user, over → `EDQUOT` |
+| rings | thread ring absent until asked for; `GET_KEYRING_ID` create=0/1; `JOIN_SESSION_KEYRING(name)` answers a serial that `GET_KEYRING_ID` then reports |
+| fork | the child inherits the **session** ring (same serial); its process and thread rings are fresh |
+| `request_key` | a miss is `ENOKEY` (with or without callout information); a destination ring the task no longer holds is `EACCES`, not `ENOKEY` |
+| unknown `keyctl` command | `999` answers `EOPNOTSUPP` |
+
+**Landed**: `src/sched/keys.rs` is the store — `Key` objects (`type`, description,
+owner pair, permission word, `State`, `Payload`), a `BTreeMap<Serial, Arc<Key>>`,
+per-task thread rings, per-group process/session rings, per-user user rings, a
+usage table for the quota, the possession walk, and the fourteen
+`keyctl`-command functions. `src/syscall/linux/keys.rs` is the argument layer —
+three handlers plus `payload_arg` (whose rules are the *type's*: `"user"`
+requires at least one byte, `"keyring"` exactly none), `copy_out` (answer the
+length, copy only when the buffer fits, NUL-terminated for `DESCRIBE`), and the
+command table. Numbers 248/249/250 on x86_64 and 217/218/219 on aarch64 are in
+the per-arch tables; the dispatch arms sit after `FUTEX_WAITV`. Lifetime lives in
+the scheduler where the state does: `hand_down_keyrings` from `fork`/`vfork`/
+`clone` (session inherited, process and thread rings fresh) and
+`exit_cleanup` from `child_exit::exit` (thread ring at task death, group rings on
+the last thread). The four new errnos (`EDQUOT`, `ENOKEY`, `EKEYEXPIRED`,
+`EKEYREVOKED`) sit in `crates/err` beside their measured answers.
+
+**Named divergences** (each a refusal or a recorded difference, not a silent
+approximation):
+
+1. `request_key` has **no upcall**: a miss is `ENOKEY` even when callout
+   information is passed, where Linux forks `/sbin/request-key`. Serving the
+   shape without the helper would be the "nearly right" failure §3 ranks worst.
+2. Privilege is `uid == 0`, there being no capability model — that is the
+   `CAP_SYS_ADMIN` spelling for `SETPERM`/`CHOWN` and the root quota
+   (1 000 000 keys / 25 MB) is that spelling too.
+3. The possession walk traverses keyring links without consulting the link's
+   own `SEARCH` bit; Linux's `keyring_search` asks it at each hop. The permission
+   *classes* on the key itself are enforced, so this can only widen possession.
+4. Keys are not garbage-collected when the last possessor exits: the serial
+   stays findable (with `EACCES` on `READ`), and the quota it took stays charged,
+   where Linux runs a GC pass after a delay.
+5. `CHOWN` to a *different* owner as an unprivileged caller is `EACCES`; the
+   host measured `EINVAL` for that shape (asking for the ids it already had).
+   The refusal direction is kept.
+
+**Pins**: `user/tests/src/bin/t-keyctl.rs`, default group, both machines — 43
+claims: the ring/join rules, add/read/describe/update copy rules, the whole
+refusal list above, links and nested search and clear, both states, possession
+after unlink, `SETPERM` split by privilege, unknown command, fork inheritance,
+and the destination-ring `EACCES`. Run on the host first: the same binary with
+`MPOS_ON_HOST=1` passes **43 of 43** against Linux, so the test asserts Linux's
+answers rather than this kernel's expectations. Ten host tests in
+`src/sched/keys.rs` pin the table half, including the quota refusal
+(`the_unprivileged_byte_quota_answers_edquot`).
+
+**Gate**: x86_64 `pass=220 fail=0 (220 built)`, aarch64 `pass=219 fail=0 (219
+built)`, `mpos-kunit 34 passed, 0 failed` both; host suite 659 passed.
+**Counterfactual**: the three dispatch arms removed → `pass=219 fail=1 (220
+built)`, only `t-keyctl` red (every call falls through to `_ => ENOSYS`), and
+`t-enosys` stays green because it no longer probes a served call. Restored,
+green.
+
+**Moved with it**: `t-enosys` lost its two `keyctl` claims (the twice-asked
+once-per-number rule now rides on `userfaultfd`), `docs/uapi/01-syscall-table.md`
+moved the number out of §1.1 into the served table, and `item 113` records the
+full write-up.

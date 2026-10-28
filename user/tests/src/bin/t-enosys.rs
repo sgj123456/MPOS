@@ -1,8 +1,9 @@
 //! t-enosys - the calls this kernel has no dispatch arm for.
 //!
-//! Pinned here: keyctl(250), fanotify_init(300), fanotify_mark(301),
-//! userfaultfd(323), io_uring_setup(425), io_uring_enter(426) and
-//! io_uring_register(427) all answer ENOSYS. That is the answer a libc reads
+//! Pinned here: fanotify_init(300), fanotify_mark(301), userfaultfd(323),
+//! io_uring_setup(425), io_uring_enter(426) and io_uring_register(427) all
+//! answer ENOSYS. (`keyctl` used to be on this list; it is served now, so the
+//! family's pin is `t-keyctl` rather than a refusal here.) That is the answer a libc reads
 //! as "this optional call is not available"; the numbers come from libc's
 //! per-machine table, and the kernel's table has no constant or handler for
 //! any of them, so each one falls through the default arm. A call the kernel
@@ -12,7 +13,7 @@
 //! The point of walking these is the kernel's own note, not the return
 //! value. The first time a number falls through, mpos prints
 //! `mpos: syscall <nr> -> ENOSYS` on the console, once per number for the
-//! life of the boot. `keyctl` is therefore asked twice below: both calls
+//! life of the boot. `userfaultfd` is therefore asked twice below: both calls
 //! answer ENOSYS, but only the first prints a line. That once-per-number
 //! rule is what keeps a startup loop's dozens of probes from becoming dozens
 //! of console lines while still telling a reader what is missing.
@@ -20,8 +21,8 @@
 //! Every claim is `libc::syscall(SYS_*)`, clause (a): none of these calls is
 //! something either library would name - the program's subject is the number
 //! falling through. On the second machine four of the seven carry different
-//! numbers (fanotify 262/263, keyctl 219, userfaultfd 282); the two io_uring
-//! pairs and the x86_64 keyctl/fanotify/userfaultfd match Linux's tables,
+//! numbers (fanotify 262/263, userfaultfd 282); the two io_uring pairs and
+//! the x86_64 fanotify/userfaultfd numbers match Linux's tables,
 //! which is exactly why the numbers are read from libc rather than written
 //! down here.
 
@@ -48,7 +49,6 @@ fn main() {
     println!("t-enosys");
     let mut r = Report::new();
 
-    r.check("keyctl answers ENOSYS", probe(libc::SYS_keyctl));
     r.check(
         "fanotify_init answers ENOSYS",
         probe(libc::SYS_fanotify_init),
@@ -85,8 +85,8 @@ fn main() {
     // Asked a second time: still ENOSYS, but the console note for the
     // number was printed by the first call and not again.
     r.check(
-        "keyctl asked a second time still answers ENOSYS",
-        probe(libc::SYS_keyctl),
+        "userfaultfd asked a second time still answers ENOSYS",
+        probe(libc::SYS_userfaultfd),
     );
 
     // The control: an implemented call does not answer ENOSYS, so the probe

@@ -307,3 +307,9 @@ pub const FUTEX_PRIVATE_FLAG: usize = 128;
 /// first machine because it landed after the two tables converged.
 pub const FUTEX_WAITV: u64 = 449;
 pub const FUTEX_CLOCK_REALTIME: usize = 256;
+
+/// `add_key(2)`, `request_key(2)` and `keyctl(2)`, on the asm-generic
+/// numbers this machine uses.
+pub const ADD_KEY: u64 = 217;
+pub const REQUEST_KEY: u64 = 218;
+pub const KEYCTL: u64 = 219;

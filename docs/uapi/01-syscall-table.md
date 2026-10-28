@@ -231,6 +231,9 @@ A call absent from those is served as its phase section records.
 | `tgkill` | 234 | posix | 131 |
 | `utimes` | 235 | fs | 64019 |
 | `waitid` | 247 | proc | 95 |
+| `add_key` | 248 | keys | 217 |
+| `request_key` | 249 | keys | 218 |
+| `keyctl` | 250 | keys | 219 |
 | `inotify_add_watch` | 254 | fs | 27 |
 | `inotify_rm_watch` | 255 | fs | 28 |
 | `openat` | 257 | fs | 56 |
@@ -307,7 +310,6 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| `keyctl` | 250 | Kernel keyring | A key store and the `KEYCTL_*` command set |
 | `fanotify_init` | 300 | Filesystem-wide event notification | A fanotify watch/mark engine and permission events |
 | `fanotify_mark` | 301 | " | " |
 | `userfaultfd` | 323 | Userspace page-fault handling | Fault forwarding to a user task + `UFFDIO_*` |
@@ -318,8 +320,14 @@ note printed once per number (`note_enosys`):
 > The numbers for `fanotify` above are the header's (`300`/`301`), and `docs/notes/`'s board
 > entry that says `302`/`303` is a typo for them — `t-enosys` pins `300`/`301`, which is
 > what a caller sends.
+>
+> `keyctl` (250) has since moved out of this table: the kernel keyring is served
+> (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on aarch64),
+> pinned by `t-keyctl` and written up as item 113 with the measured shape in
+> `docs/notes/06-process-management.md` §6.30. What stays refused here is the
+> `fanotify` pair, `userfaultfd`, the three `io_uring` numbers and `rseq`.
 
-`rseq` (334) is the eighth: like the seven above it has no dispatch arm, but unlike them it
+`rseq` (334) is the seventh: like the six above it has no dispatch arm, but unlike them it
 *once had* one that returned `0` without writing any of the fields the ABI contract puts in
 the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
 named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration

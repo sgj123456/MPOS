@@ -27,6 +27,12 @@ pub mod fs;
 #[cfg(target_os = "none")]
 pub(crate) mod proc;
 
+/// The keyring's three calls: `add_key`, `request_key`, `keyctl`. The model
+/// (keys, keyrings, permission classes, quota) is `sched::keys`'s; this is the
+/// ABI face that copies user memory and maps errnos.
+#[cfg(target_os = "none")]
+pub(crate) mod keys;
+
 /// The POSIX completion set's process half: identity, capabilities,
 /// scheduling, memory advice, the wall clock's setters, and the signals a
 /// process aims at itself. Kept beside `fs` and `proc` rather than inside
@@ -456,6 +462,9 @@ pub unsafe fn dispatch(
         nr::PRLIMIT64 => abi::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
         nr::FUTEX_WAITV => proc::handle_futex_waitv(args),
+        nr::ADD_KEY => keys::handle_add_key(args),
+        nr::REQUEST_KEY => keys::handle_request_key(args),
+        nr::KEYCTL => keys::handle_keyctl(args),
         nr::SET_TID_ADDRESS => proc::handle_set_tid_address(args),
         nr::SCHED_SETAFFINITY => abi::handle_sched_setaffinity(args),
         nr::SCHED_GETAFFINITY => abi::handle_sched_getaffinity(args),
