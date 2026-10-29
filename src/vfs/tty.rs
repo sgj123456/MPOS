@@ -1785,6 +1785,16 @@ impl Tty {
     /// a new prompt.
     #[cfg(target_os = "none")]
     pub fn set_foreground(&self, pgid: Option<TaskId>) {
+        // A session taking this console over is Linux's `vc_allocate` on open:
+        // the console now has an allocation `VT_DISALLOCATE` may later give
+        // back. Giving the foreground up (`TIOCNOTTY`) does not free it - the
+        // allocation outlives the session, which is what makes the second
+        // `VT_DISALLOCATE` `EBUSY` (measured, `build/scratch/vt3/init7.c`).
+        if pgid.is_some() {
+            if let Some(vc) = self.vc_number() {
+                crate::vfs::vcmux::mark_allocated(vc);
+            }
+        }
         critical_section::with(|cs| {
             *self.foreground.borrow(cs).borrow_mut() = pgid;
         });
@@ -2161,7 +2171,44 @@ impl Tty {
                 crate::vfs::vcmux::wait_active(want);
                 0
             }
-            0x08 => 0, // VT_DISALLOCATE: nothing to free.
+            // VT_DISALLOCATE: give a console back. The arm used to answer 0 for
+            // every argument - a success for a command that freed nothing, which
+            // is exactly the lie this kernel must not tell. Measured on Linux
+            // 7.2.11 (`build/scratch/vt3/init{6,7,8}.c`): 0 is a no-op that
+            // answers 0 and leaves the state mask alone; a number above
+            // `MAX_NR_CONSOLES` is `ENXIO`; a legal number with no console behind
+            // it, a console nothing ever opened, the console on the screen and a
+            // console a session still holds are all `EBUSY`; and a console whose
+            // session has left answers 0 the first time and `EBUSY` the second.
+            // `vcmux::disallocate` keeps the allocation bit that last pair needs
+            // even though this machine's consoles have no screen memory to free.
+            0x08 => {
+                if !owns_it() {
+                    return err::EPERM;
+                }
+                let vc = buf as u32;
+                if vc == 0 {
+                    // Measured twice: a no-op, not `ENXIO` like the other arms'
+                    // zero, and not a state change (the state mask read back the
+                    // same before and after).
+                    return 0;
+                }
+                if vc > crate::term::vtmode::MAX_NR_CONSOLES {
+                    return err::ENXIO;
+                }
+                if vc > VC_COUNT {
+                    // A legal console number this machine does not have: Linux
+                    // answers `EBUSY` for the same shape (`VT_DISALLOCATE(63)`
+                    // with no console 63), not the `ENXIO` it reserves for a
+                    // number outside the vocabulary.
+                    return err::EBUSY;
+                }
+                if crate::vfs::vcmux::disallocate(vc) {
+                    0
+                } else {
+                    err::EBUSY
+                }
+            }
             0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
             0x0a => 0, // VT_RESIZEX: same.
             // VT_LOCKSWITCH / VT_UNLOCKSWITCH: Linux's `vt_dont_switch`, the

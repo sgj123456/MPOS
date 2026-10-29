@@ -847,6 +847,92 @@ command had to be measured before being removed.
   shape (`MAX_NR_CONSOLES` is 63 there and consoles can be allocated only up to
   it, but its callback never completes for an unallocated one either).
 
+### 7.1f `VT_OPENQRY`/`VT_DISALLOCATE`: allocation has answers — LANDED (2026-10-29)
+
+The `'V'` family's last hole was not a wrong answer but a *made-up* one:
+`VT_DISALLOCATE` (`0x5608`) was `0x08 => 0, // VT_DISALLOCATE: nothing to free.`
+Every argument, every console, every state: success. A seat manager that handed
+a console back got the same answer whether it had one to give or not, which is
+the shape this repository treats as the worst thing it can do (§3's rule 2).
+
+The measurement was on Linux 7.2.11, run as the host's own kernel in QEMU with a
+static `/init` (`build/scratch/vt3/init{6,7,8}.c`, serials `serial{6,7,8}.log`;
+the instrument is §7.1e's). Six consoles, tty2 and tty4 opened and closed by the
+probe, its own tty1 the screen:
+
+| call | argument | measured answer |
+|---|---|---|
+| `VT_GETSTATE` | — | `v_active` 1; `v_state` `0x3` at boot (bit 0 plus console 1), `0x7` with tty2 open, `0x13` with tty4 open; the in-use bit **clears on close**, and `v_signal` is never written |
+| `VT_OPENQRY` | — | rc 0 and an `int`: the **lowest console not in use** — `2` at boot (console 1 in use), `3` after tty2 was opened, `2` again after it closed; `ENXIO` when every console is taken (not reached in six) |
+| `VT_DISALLOCATE` | 0 | rc 0, **no state change** (the state mask reads back the same, twice measured) |
+| | 1000, `-1` | `ENXIO` (6) |
+| | 63 (legal, no console) | `EBUSY` (16) |
+| | 5, 6, 3 (never opened) | `EBUSY` |
+| | tty2 / tty4 with the fd still held | `EBUSY` |
+| | 1 (the screen) | `EBUSY` |
+| | tty2/3/4/5 opened then closed | **0 the first time, `EBUSY` the second** |
+
+The last row is the state machine: opening a console allocates its `vc_data`,
+closing drops the in-use bit but leaves the allocation, and only
+`VT_DISALLOCATE` gives it back — once. This machine's consoles are pty pairs
+whose grid lives in the terminal, so there is no screen memory to allocate or
+free, but the *bookkeeping* is what the call answers about, and it is the only
+way the second call can be `EBUSY`.
+
+**What landed.** `src/vfs/vcmux.rs` keeps an `ALLOCATED: AtomicU32` bit per
+console — set by `mark_allocated`, called from `Tty::set_foreground(Some(..))`
+(a session taking the console over is Linux's `vc_allocate` on open) and from
+`complete_switch(to)` (a switch landing on a console allocates it, Linux's
+`vc_allocate` on activate) — and `disallocate(vc)` answers `true` only for an
+allocated console that is not on the screen and holds no session, clearing the
+bit. `src/vfs/tty.rs`'s `0x08` arm now answers Linux's order: `0` is the
+measured no-op, `> MAX_NR_CONSOLES` (63) is `ENXIO`, a console number this
+machine does not have is `EBUSY`, the screen is `EBUSY`, a held console is
+`EBUSY`, an unallocated one is `EBUSY`, and an allocated idle one is `0` once.
+
+**Named divergences** (all in `docs/uapi/` item 130):
+
+* There is no screen memory to free; the call releases the allocation record
+  only. A future per-console buffer would make "free" mean Linux's thing.
+* Linux allocates on **open** of the console's device; this machine allocates
+  when a session takes it (`TIOCSCTTY`). A process that holds `/dev/ttyN` open
+  without taking it as its session has allocated nothing here, so
+  `VT_DISALLOCATE` can give that console back where Linux answers `EBUSY`. The
+  pin therefore does **not** claim that shape.
+* `ENXIO` for "every console in use" is how this kernel answers `VT_OPENQRY`
+  ([`vcmux::free_console`] `None`); Linux's own six-console run never reached it,
+  so that arm is this kernel's honest reading of the row above, not a measured
+  one.
+
+**Pin** `user/tests/src/bin/t-seat.rs`: `VT_OPENQRY` names a console of the
+machine and the state mask leaves it free; `VT_DISALLOCATE(0)` is a no-op that
+changes no console's state; the screen is `EBUSY`; console 63 is `EBUSY`; 600 is
+`ENXIO`; then a forked child takes a console that is neither active nor in use
+(`setsid`, `TIOCSCTTY`, 400 ms, `TIOCNOTTY`, exit) and the claims measure the
+sequence — a session holding it is `EBUSY`, the in-use bit clears when the
+session leaves, the console is given back with 0, and the second call is `EBUSY`.
+The "a console nothing ever opened is `EBUSY`" row is measured on Linux but not
+claimed: the allocation bit is machine-wide, and a sibling program in the same
+boot that switched a console (`t-vt` does) has already allocated it — the claim
+failed on exactly that twice before it was dropped, which is the sort of
+cross-program coupling a pin has to be written against.
+
+**Gates and counterfactual.** `cargo xtask test --arch x86_64` →
+`all 230 user tests passed` (15 not run), `mpos-kunit 34 passed, 0 failed`,
+stage 1 1185 tests, `EXIT=0` (`build/scratch/vtalloc-gate3.log`);
+`--arch aarch64` → `all 229 user tests passed` (16 not run), kunit 34,
+`EXIT=0` (`build/scratch/vtalloc-gate-a3.log`). Counterfactual
+(`build/scratch/vtalloc-cf.log`, the three kernel edits reverted from
+`build/scratch/vtalloc-kernel.diff` (130 lines), pin kept): `CF-EXIT=1`,
+`pass=229 fail=1 (230 built)`, the one red program `t-seat`, five claims:
+`FAIL:  VT_DISALLOCATE on the console on the screen is EBUSY (got 0, want -16)`,
+`FAIL:  VT_DISALLOCATE on a console this machine does not have is EBUSY (got 0, want -16)`,
+`FAIL:  VT_DISALLOCATE above MAX_NR_CONSOLES is ENXIO (got 0, want -6)`,
+`FAIL:  a console a session holds is EBUSY (got 0, want -16)`,
+`FAIL:  and giving it back twice is EBUSY (got 0, want -16)`. The diff was
+re-applied in the same job (`grep -c "pub fn disallocate" src/vfs/vcmux.rs` → 1).
+`Full record: docs/uapi/ §5.1 item 130`.
+
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 
 `src/drivers/virtio/input.rs` is a real evdev provider, and this is what makes

@@ -346,6 +346,7 @@ One-glance status of the whole roadmap.
 - [x] the screen has an owner — `VT_SETMODE` negotiation, revocable DRM master (§7.1, `t-seat`)
 - [x] the VT mode struct is Linux's, and the private dialect that hid a seat manager's promise (plain `0x5601`/`0x5602`, `__s16` signals, `VT_AUTO`/`VT_PROCESS` the right way round; §7.1d, item 126, `t-seat`)
 - [x] the switch lock and the acquire ack — `VT_LOCKSWITCH`/`VT_UNLOCKSWITCH` (machine-wide, `CAP_SYS_TTY_CONFIG`), `VT_RELDISP(VT_ACKACQ)`, and `VT_WAITUNTIL` removed from `0x0c` where Linux has `VT_UNLOCKSWITCH` (§7.1e, item 127, `t-seat`)
+- [x] `VT_OPENQRY`/`VT_DISALLOCATE` — a console's allocation answers Linux's state machine (`0` no-op, `EBUSY` for the screen/a held/an unallocated console, `ENXIO` above `MAX_NR_CONSOLES`, `0` once for an allocated idle one; §7.1f, item 130, `t-seat`)
 - [x] seatd survives a re-run; Mesa GBM+EGL+GLES in software; parked evdev readers woken by the service task; `EVIOCGRAB` per-owner (§7.1, §7.2, R.7)
 - [x] the aarch64 GL path's EL0 traps answered — `t-el0-sysreg` (§15.36)
 - [x] the session environment — `XDG_RUNTIME_DIR` ships in the shared `core/` overlay, so both machines' login shells have it (R.7's gap, closed by §15.36/§15.37)

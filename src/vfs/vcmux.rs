@@ -542,6 +542,9 @@ fn complete_switch(to: u32) {
     if slot(to).is_none() {
         return;
     }
+    // The screen has landed on this console, which on Linux is the moment its
+    // `vc_data` is allocated (`vt_ioctl.c`'s `vc_allocate` on activate).
+    mark_allocated(to);
     switch(to);
     // Move the pure table's notion of the on-screen console in step with the
     // `ACTIVE` atomic. `request_switch` asks "is `to` the console already on the
@@ -651,6 +654,48 @@ fn begin_activate(to: u32) {
 /// `/dev/tty3` and is waiting on it has claimed that console for a session, and
 /// one nobody has read from is still free for a seat manager to point a second
 /// session at.
+/// Linux's `vc_data`: the screen memory a console gets when something opens it,
+/// and gives back with `VT_DISALLOCATE`. This machine's consoles are pty pairs
+/// whose grid lives in the terminal, so there is no screen memory to allocate or
+/// free - but the *bookkeeping* is what the call answers about, and it is kept
+/// here because the answers depend on it: measured on Linux 7.2.11
+/// (`build/scratch/vt3/init{6,7,8}.c`), a console that was opened and then closed
+/// answers 0 the first time and `EBUSY` the second, while a console nothing ever
+/// opened is `EBUSY` at once. Bit `vc` says console `vc` has held a session (or
+/// had a switch land on it); it stays set after the session leaves until the
+/// console is given back.
+static ALLOCATED: AtomicU32 = AtomicU32::new(0);
+
+/// Record that `vc` has been allocated: a session took it over, or a switch
+/// landed on it. Linux does this in `vc_allocate` on open and on activate.
+pub fn mark_allocated(vc: u32) {
+    if (1..=VC_COUNT).contains(&vc) {
+        ALLOCATED.fetch_or(1 << vc, Ordering::Relaxed);
+    }
+}
+
+/// Whether `vc` has ever been allocated.
+fn allocated(vc: u32) -> bool {
+    ALLOCATED.load(Ordering::Relaxed) & (1 << vc) != 0
+}
+
+/// `VT_DISALLOCATE`: give a console back. Answers `true` when this was the call
+/// that freed an idle allocated console, `false` when it is `EBUSY`.
+///
+/// The measured rules, in Linux's own order (`build/scratch/vt3/init{6,7,8}.c`):
+/// the console on the screen is busy (it is being drawn on), a console a session
+/// holds is busy, and one nothing ever opened is busy too - freeing what was
+/// never allocated is not the same request, and Linux answers `EBUSY` rather
+/// than inventing a success. Only an allocated console whose session has left
+/// can be given back, and only once.
+pub fn disallocate(vc: u32) -> bool {
+    if !(1..=VC_COUNT).contains(&vc) || vc == active() || in_use(vc) || !allocated(vc) {
+        return false;
+    }
+    ALLOCATED.fetch_and(!(1 << vc), Ordering::Relaxed);
+    true
+}
+
 pub fn free_console() -> Option<u32> {
     (1..=VC_COUNT).find(|vc| !in_use(*vc))
 }

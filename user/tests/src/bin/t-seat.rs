@@ -70,8 +70,8 @@ const DRM: u8 = b'd';
 
 /// `<linux/vt.h>`, whose requests are `_IO(VT, n)` and so start at zero:
 /// OPENQRY 0x00, GETMODE 0x01, SETMODE 0x02, GETSTATE 0x03, SENDSIG 0x04,
-/// RELDISP 0x05, ACTIVATE 0x06, WAITACTIVE 0x07, LOCKSWITCH 0x0b,
-/// UNLOCKSWITCH 0x0c.
+/// RELDISP 0x05, ACTIVATE 0x06, WAITACTIVE 0x07, DISALLOCATE 0x08,
+/// LOCKSWITCH 0x0b, UNLOCKSWITCH 0x0c.
 const NR_VT_OPENQRY: u64 = 0x00;
 const NR_VT_GETMODE: u64 = 0x01;
 const NR_VT_SETMODE: u64 = 0x02;
@@ -79,6 +79,9 @@ const NR_VT_GETSTATE: u64 = 0x03;
 const NR_VT_RELDISP: u64 = 0x05;
 const NR_VT_ACTIVATE: u64 = 0x06;
 const NR_VT_WAITACTIVE: u64 = 0x07;
+/// `VT_DISALLOCATE`: give a console back. The arm used to answer 0 for every
+/// argument; the measured answers are claimed below (`docs/uapi/` item 130).
+const NR_VT_DISALLOCATE: u64 = 0x08;
 /// `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH`: Linux's `vt_dont_switch`, the
 /// machine-wide "hold the screen still" flag. `0x0c` is the number this test
 /// used to send an invented `VT_WAITUNTIL` to - a command no Linux has, on the
@@ -111,6 +114,9 @@ const K_OFF: usize = 0x04;
 
 /// The refusals, as the negative values the raw door hands back.
 const ENXIO: isize = -6;
+/// `VT_DISALLOCATE`'s answer for a console that cannot be given back: one a
+/// session holds, one on the screen, and one nothing ever opened.
+const EBUSY: isize = -16;
 /// `VT_ACTIVATE`/`VT_WAITACTIVE` on a console number the machine cannot have is
 /// Linux's `ENXIO` (`vt_ioctl.c`: `arg == 0 || arg > MAX_NR_CONSOLES`), not the
 /// `EINVAL` an unusable *mode* gets.
@@ -485,6 +491,183 @@ fn main() {
     let mut qry = [0u8; 4];
     let r0 = unsafe { ioctl(tty, io(VT, NR_VT_OPENQRY), qry.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_OPENQRY succeeds", r0, 0);
+
+    // ...and the number is a console the state mask says nobody has taken.
+    let free = i32::from_ne_bytes(qry) as u32;
+    let mask_now = |fd: i32| {
+        let mut buf = [0xAAu8; 6];
+        let rc = unsafe {
+            ioctl(
+                fd,
+                ior(VT, NR_VT_GETSTATE, 6),
+                buf.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if rc < 0 {
+            -1
+        } else {
+            stat_shorts(&buf, 2) as isize
+        }
+    };
+    check_true(
+        &mut r,
+        "VT_OPENQRY names a console of this machine",
+        (1..=6).contains(&free),
+    );
+    check_eq(
+        &mut r,
+        "and the state mask leaves that console free",
+        mask_now(tty) & (1isize << free),
+        0,
+    );
+
+    // The console the allocation claims use has to be one *nobody* is on: the
+    // console on the screen answers `EBUSY` to `VT_DISALLOCATE` by construction
+    // (Linux's `fg_console` check), so a claim about "idle but allocated" must
+    // not be pointed at it - the first gate run phrased this on `free`, which
+    // OPENQRY may well name (it is the lowest console with no session, and the
+    // sweep's console has none), and the claim then measured the screen rule.
+    let spare =
+        (1..=6u32).find(|vc| *vc != u32::from(active) && mask_now(tty) & (1isize << vc) == 0);
+
+    // VT_DISALLOCATE: measured on Linux 7.2.11 (`build/scratch/vt3/init{6,7,8}.c`).
+    // 0 is a no-op that leaves the mask alone; a legal number with no console
+    // behind it and the console on the screen are `EBUSY`; a number above
+    // `MAX_NR_CONSOLES` is `ENXIO`. The arm used to answer 0 to every one of them.
+    //
+    // Linux's "a console nothing ever opened is EBUSY" is measured there but not
+    // claimed here: this machine's allocation bit is machine-wide, and any earlier
+    // program in the same boot that switched a console (`t-vt` does) has already
+    // allocated it - the second run of this claim failed exactly that way, on a
+    // console a sibling program had activated. What is claimed is the pair that
+    // needs no history: a console a session holds now, and one that was allocated
+    // by this test's own child.
+    let before = mask_now(tty);
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_DISALLOCATE), 0 as *mut c_void) };
+    check_eq(&mut r, "VT_DISALLOCATE 0 is a no-op", r0, 0);
+    check_eq(
+        &mut r,
+        "and it changes no console's state",
+        mask_now(tty),
+        before,
+    );
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            io(VT, NR_VT_DISALLOCATE),
+            active as usize as *mut c_void,
+        )
+    };
+    check_eq(
+        &mut r,
+        "VT_DISALLOCATE on the console on the screen is EBUSY",
+        r0,
+        EBUSY,
+    );
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_DISALLOCATE), 63 as *mut c_void) };
+    check_eq(
+        &mut r,
+        "VT_DISALLOCATE on a console this machine does not have is EBUSY",
+        r0,
+        EBUSY,
+    );
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_DISALLOCATE), 600 as *mut c_void) };
+    check_eq(
+        &mut r,
+        "VT_DISALLOCATE above MAX_NR_CONSOLES is ENXIO",
+        r0,
+        ENXIO,
+    );
+
+    // A console whose session leaves is allocated-but-idle: it answers 0 the
+    // first time and `EBUSY` the second, because the allocation is gone. The
+    // fixture is a child that takes the free console as its own session
+    // (`TIOCSCTTY`), gives it up (`TIOCNOTTY`) and exits - the close Linux
+    // measures as "opened then closed".
+    let mask_of = |fd: i32, vc: u32| {
+        let m = mask_now(fd);
+        m >= 0 && (m & (1isize << vc)) != 0
+    };
+    if let Some(spare) = spare {
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+            }
+            let path = format!("/dev/tty{spare}");
+            match rustix::fs::open(&path, OFlags::RDWR, Mode::empty()) {
+                Ok(fd) => {
+                    let raw = fd.as_raw_fd();
+                    let claimed = unsafe { ioctl(raw, io(b'T', 0x0e), core::ptr::null_mut()) };
+                    if claimed < 0 {
+                        unsafe { libc::_exit(2) };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    unsafe {
+                        ioctl(raw, io(b'T', 0x22), core::ptr::null_mut());
+                        libc::_exit(0);
+                    }
+                }
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+        let mut claimed = false;
+        for _ in 0..200 {
+            if mask_of(tty, spare) {
+                claimed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        check_true(
+            &mut r,
+            "a second session can take the free console",
+            claimed,
+        );
+        let r0 = unsafe {
+            ioctl(
+                tty,
+                io(VT, NR_VT_DISALLOCATE),
+                spare as usize as *mut c_void,
+            )
+        };
+        check_eq(&mut r, "a console a session holds is EBUSY", r0, EBUSY);
+        let status = {
+            let mut st = 0i32;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+            st
+        };
+        check_true(&mut r, "the session's process is reaped", status >= 0);
+        let mut idle = false;
+        for _ in 0..200 {
+            if !mask_of(tty, spare) {
+                idle = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        check_true(
+            &mut r,
+            "the console's in-use bit clears when its session leaves",
+            idle,
+        );
+        let r0 = unsafe {
+            ioctl(
+                tty,
+                io(VT, NR_VT_DISALLOCATE),
+                spare as usize as *mut c_void,
+            )
+        };
+        check_eq(&mut r, "a console whose session left is given back", r0, 0);
+        let r0 = unsafe {
+            ioctl(
+                tty,
+                io(VT, NR_VT_DISALLOCATE),
+                spare as usize as *mut c_void,
+            )
+        };
+        check_eq(&mut r, "and giving it back twice is EBUSY", r0, EBUSY);
+    }
 
     // Taking the console that is already active is what `VT_ACTIVATE` means for
     // a session opened on its own console. The call does not wait for anything:

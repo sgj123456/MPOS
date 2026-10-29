@@ -6988,3 +6988,39 @@ these calls are `EPERM`). x86_64 `pass=230 fail=0`, aarch64 `pass=229 fail=0`,
 `mpos-kunit 34 passed` both; counterfactual (both dispatch arms removed) leaves
 only `t-statmount` red. `docs/notes/` §3.14 carries the measured table and the
 reasoning.
+
+## item 130 — `VT_OPENQRY` and `VT_DISALLOCATE`: a console's allocation has answers
+
+`VT_DISALLOCATE` (`0x5608`) answered `0` for every argument — "nothing to free" —
+so a seat manager got the same success for giving back a console it had and one
+it never had. On Linux 7.2.11 (§7.1f's table) the answers are a state machine:
+`0` is a no-op; above `MAX_NR_CONSOLES` (63) is `ENXIO`; a legal console number
+this machine does not have, a console nothing ever opened, a console a session
+holds and the console on the screen are all `EBUSY`; and a console that was
+opened and then closed answers `0` the first time and `EBUSY` the second. The
+in-use bits `VT_GETSTATE` reports clear on close, so "in use" and "allocated"
+are different facts — the second is what `VT_DISALLOCATE` gives back.
+
+Served now: `vcmux::ALLOCATED` (a bit per console, set when a session takes the
+console over and when a switch lands on it) and `vcmux::disallocate`;
+`VT_OPENQRY` still names the lowest console with no session and answers `ENXIO`
+when every one is taken (Linux's own run never reached that row).
+
+**Named divergences.** This machine's consoles are pty pairs with no screen
+memory to free, so the call releases the allocation record only; Linux allocates
+on **open** of the console's device where this kernel allocates when a session
+takes it (`TIOCSCTTY`), so a process holding `/dev/ttyN` open without taking it
+can have that console given back where Linux answers `EBUSY` (the pin does not
+claim that shape); and `VT_OPENQRY`'s `ENXIO` on an exhausted machine is this
+kernel's reading of Linux's row rather than a measured one.
+
+**Pin**: `user/tests/src/bin/t-seat.rs` — `OPENQRY` names a free console; `0` is
+a no-op; the screen is `EBUSY`; 63 is `EBUSY`; 600 is `ENXIO`; and a forked child
+taking a console (`setsid`, `TIOCSCTTY`, `TIOCNOTTY`, exit) is `EBUSY` while it
+holds it, then `0` once it has left, then `EBUSY` again. The "nothing ever
+opened is `EBUSY`" row is measured on Linux but not claimed here: the allocation
+bit is machine-wide and a sibling program that switched a console in the same
+boot has already allocated it. x86_64 `pass=230 fail=0`, aarch64 `pass=229
+fail=0`, `mpos-kunit 34 passed` both; counterfactual (the kernel edits reverted)
+leaves five claims of `t-seat` red. `docs/notes/` §7.1f carries the measured
+table and the reasoning.
