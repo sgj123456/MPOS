@@ -141,6 +141,10 @@ pub mod userfaultfd_abi;
 #[cfg(target_os = "none")]
 pub mod vcmux;
 
+/// Extended attributes: the store a memory filesystem keeps, and the name
+/// vocabulary's rules. Host-tested here, wired to the syscall layer there.
+pub mod xattr;
+
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write, write_quiet};
 pub use mount::{
     fs_serving_inode_of, global, is_mount_point, mount, mount_root, pivot_root, resolve,
@@ -1177,6 +1181,25 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// filesystem owns is a refusal, not a silent no-op.
     fn set_flags(&self, _flags: u32) -> VfsResult<()> {
         Err(VfsError::Unsupported)
+    }
+
+    /// This node's extended-attribute store, if its filesystem keeps one.
+    ///
+    /// `None` is a filesystem that does not do attributes at all - what the
+    /// syscall layer answers `EOPNOTSUPP` for, which is the same thing this
+    /// kernel said to the whole family before a store existed. `Some` hands
+    /// back the store and nothing else: which *names* are legal
+    /// (`crate::vfs::xattr::classify`) and which inode *kinds* may carry them
+    /// are the generic layer's rules and live beside the store, so a filesystem
+    /// only has to say where its attributes go (`docs/notes/` §3.15).
+    ///
+    /// A `None` from a filesystem that keeps some node kinds without a store
+    /// is not a claim about all of them: `RamFs` answers `Some` from the kinds
+    /// Linux allows `user.*` on (a file, a directory, a socket) and `None` from
+    /// the rest, which the caller turns into Linux's per-kind answer rather
+    /// than into "unsupported".
+    fn xattr_vault(&self) -> Option<&crate::vfs::xattr::Vault> {
+        None
     }
 
     /// Set the node's access and modification clocks - what `utimensat`/`futimens`

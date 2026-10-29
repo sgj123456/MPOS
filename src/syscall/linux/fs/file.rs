@@ -1137,11 +1137,18 @@ pub fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 }
 
 // ---------------------------------------------------------------------------
-// extended attributes: validated, then reported as unsupported
+// extended attributes
 // ---------------------------------------------------------------------------
 
 /// The inode a descriptor names, for the `f*` xattr spellings. The descriptor
-/// only has to be open; the attribute's target is then the file it holds.
+/// only has to be open; the attribute's target is then the file it holds, and an
+/// `O_RDONLY` descriptor is as good as a writable one (measured: the fd forms
+/// answer on both, because the call names the file rather than its contents).
+///
+/// Linux answers `EBADF` for these three calls over an `O_PATH` descriptor. This
+/// kernel's `open` does not make one - it carries the bit through `F_GETFL` like
+/// every other flag it was handed - so the rule has nothing to catch here yet;
+/// the divergence is named in `docs/notes/` 3.15 rather than pretended away.
 fn xattr_inode_of_fd(fd: i32) -> Result<Arc<dyn Inode>, isize> {
     crate::sched::current_fds()
         .clone_at(fd)
@@ -1149,43 +1156,57 @@ fn xattr_inode_of_fd(fd: i32) -> Result<Arc<dyn Inode>, isize> {
         .map_err(err_of)
 }
 
-/// The filesystem a name resolves to, checked the way the xattr layer would
-/// check it before reaching a handler: the path (and the attribute name, when
-/// the operation takes one) must be readable strings, and the target must
-/// exist. `follow` tells the `l`-forms, which act on a final symlink rather
-/// than its target, to resolve without following.
-///
-/// This kernel stores no extended attributes on any of its filesystems, so once
-/// the target is confirmed the answer is `EOPNOTSUPP` - the "this filesystem
-/// does not do xattrs" report Linux gives a filesystem with no xattr support,
-/// and the reason the call is wired to a handler at all. Before it was, the
-/// syscall number fell through to `ENOSYS`, which a caller reads as "this
-/// kernel has no such call" and may handle far more bluntly than a single
-/// unsupported filesystem.
-fn xattr_target(path: &str, cwd: &Arc<dyn Inode>, follow: bool) -> isize {
+/// The node a path names, checked the way the xattr layer reaches it: the
+/// `l`-forms act on a final symlink rather than its target, so they resolve
+/// without following. Whether the caller follows is the only difference.
+fn xattr_lookup(path: &str, cwd: &Arc<dyn Inode>, follow: bool) -> Result<Arc<dyn Inode>, isize> {
     let resolved = if follow {
         crate::vfs::resolve_opt(path, Some(cwd.clone()))
     } else {
         crate::vfs::resolve_no_follow_at(path, cwd.clone())
     };
-    match resolved {
-        Ok(_) => err::EOPNOTSUPP,
-        Err(e) => err_of(e),
-    }
+    resolved.map_err(err_of)
 }
 
-/// Which of the three shapes an `*xattr` call is, for the arguments that only
-/// some of them carry.
+/// An attribute name, read with the budget Linux's xattr layer gives it: 255
+/// bytes, and anything longer is `ERANGE` rather than the `ENAMETOOLONG` a
+/// *path* gets.
 ///
-/// The family shares one handler because it shares one verdict: nothing here
-/// stores an attribute, so every well-formed request ends as `EOPNOTSUPP`. What
-/// the shapes do *not* share is their argument list - `setxattr` is the one with
-/// a value and a flags word - and the checks that have to run before the verdict
-/// are the ones those arguments exist for.
+/// The difference is measured, not guessed: a 256-byte name answered `ERANGE`
+/// on Linux, and the name is checked before the path is walked, so the read has
+/// to succeed far enough to be judged (a plain [`cstr_arg`] would stop the
+/// answer at its own 255-byte path limit and report the wrong errno).
+fn xattr_name(ptr: usize) -> Result<alloc::string::String, isize> {
+    crate::syscall::cstr_limit(ptr, true, crate::vfs::xattr::NAME_MAX).map_err(|e| {
+        if e == err::ENAMETOOLONG {
+            err::ERANGE
+        } else {
+            e
+        }
+    })
+}
+
+/// Whether a node of this kind keeps `user.*` attributes at all.
+///
+/// Measured: a regular file, a directory and a unix socket take them, while a
+/// FIFO, a device node and a symlink answer `EPERM` on `set` and `ENODATA`/`0`
+/// on `get`/`list`. The rule is the generic layer's - it is the same on every
+/// filesystem - so it is decided here, before the filesystem is asked. That is
+/// also why a ramfs FIFO, which keeps no store at all, still answers `EPERM`
+/// rather than `EOPNOTSUPP`.
+fn kind_takes_user_xattrs(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::File | NodeKind::Dir | NodeKind::Socket)
+}
+
+/// Which of the three name-taking shapes an `*xattr` call is, for the arguments
+/// that only some of them carry.
+///
+/// The three forms of one call differ only in how the target is reached - by
+/// path, by path without following a final link, or by descriptor - so they
+/// answer the same shape and share one handler per form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Xattr {
-    /// `getxattr` and its `l`/`f` forms: a name, then a buffer the store would
-    /// have filled.
+    /// `getxattr` and its `l`/`f` forms: a name, then a buffer the store fills.
     Get,
     /// `setxattr` and its `l`/`f` forms: a value of `size` bytes, and the flags
     /// word saying how it may land.
@@ -1195,9 +1216,6 @@ enum Xattr {
 }
 
 impl Xattr {
-    /// The shape a syscall number is. The three forms of one call differ only in
-    /// how the target is reached - by path, by path without following a final
-    /// link, or by descriptor - so they answer the same shape.
     fn of(nr: u64) -> Xattr {
         use crate::syscall::linux::nr;
         match nr {
@@ -1208,65 +1226,210 @@ impl Xattr {
     }
 }
 
-/// The checks on the two arguments only a `setxattr` carries, in Linux's order:
-/// the flags word, then the value the call names.
-///
-/// `XATTR_CREATE` and `XATTR_REPLACE` are the two bits Linux defines - "make it,
-/// or fail if it is already there" and its converse - so any other bit is
-/// `EINVAL`, and both together are `EINVAL` too, because they contradict each
-/// other rather than combine. The value is then *copied before the filesystem is
-/// asked*, which is why a set whose value this kernel cannot read is `EFAULT`
-/// even though the answer would have been `EOPNOTSUPP`: the refusal is about the
-/// bytes, and a caller that got "unsupported" for a bad pointer would go looking
-/// for the wrong bug.
-fn setxattr_args(value: usize, size: usize, flags: usize) -> Option<isize> {
-    const XATTR_CREATE: usize = 0x1;
-    const XATTR_REPLACE: usize = 0x2;
-    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
-        return Some(err::EINVAL);
+/// The errno a name or store refusal is answered with. The vocabulary lives in
+/// `vfs::xattr` so the store and the handlers refuse in the same words.
+fn xattr_errno(e: crate::vfs::xattr::Error) -> isize {
+    use crate::vfs::xattr::Error;
+    match e {
+        Error::Range => err::ERANGE,
+        Error::Invalid => err::EINVAL,
+        Error::Unsupported => err::EOPNOTSUPP,
+        Error::NotPermitted => err::EPERM,
+        Error::NoData => err::ENODATA,
+        Error::Exists => err::EEXIST,
+        Error::TooBig => err::E2BIG,
     }
-    if size != 0 && !buffer_ok(value, size, false, true) {
-        return Some(err::EFAULT);
-    }
-    None
 }
 
-/// `getxattr`/`setxattr`/`removexattr` and their `l`-prefixed forms. All three
-/// take a path then an attribute name in the first two slots, and all three
-/// reach the same verdict here, so they share it - the call's shape deciding
-/// only what else is read before it.
+/// The checks that need neither the target nor its store: the flags word, the
+/// value's size, and the name's place in the vocabulary. The name's namespace
+/// comes back, because it decides what the target is asked for next.
+///
+/// The order is the measured one: an undefined flags bit answered `EINVAL` for
+/// a path that would have answered `ENOENT`, the 64 KiB value cap answered
+/// `E2BIG` before the pointer was looked at, and the empty name answered
+/// `ERANGE` before the walk (`getxattr("/nope", "")` was `ERANGE`, not
+/// `ENOENT`). `XATTR_CREATE` and `XATTR_REPLACE` together are *not* an error
+/// in Linux - they combine into "must exist and must not exist", so the answer
+/// follows the attribute's existence (`EEXIST` when it is there, `ENODATA`
+/// when it is not), which is why the store, not this check, applies them.
+fn xattr_checks(
+    op: Xattr,
+    name: &str,
+    args: &[usize; ARG_COUNT],
+) -> Result<crate::vfs::xattr::Namespace, isize> {
+    use crate::vfs::xattr;
+    if op == Xattr::Set {
+        if let Err(e) = xattr::check_flags(args[4] as u32) {
+            return Err(xattr_errno(e));
+        }
+        // The value's cap is the store's, not the filesystem's: one fixed
+        // Linux number, and it is decided before the pointer is read.
+        if args[3] > xattr::VALUE_MAX {
+            return Err(err::E2BIG);
+        }
+    }
+    xattr::classify(name).map_err(xattr_errno)
+}
+
+/// The refusals a resolved target is asked for, in the order the measured
+/// answers put them: the namespace first, then the kind, then whether the
+/// node's filesystem keeps a store at all.
+fn xattr_answer(
+    op: Xattr,
+    ns: crate::vfs::xattr::Namespace,
+    inode: &Arc<dyn Inode>,
+    name: &str,
+    args: [usize; ARG_COUNT],
+) -> isize {
+    use crate::vfs::xattr::Namespace;
+    if ns != Namespace::User {
+        // `system.*` is what Linux answers `EOPNOTSUPP` for when no filesystem
+        // has a handler for it, and this kernel keeps no namespace but
+        // `user.*`. `security.*` and `trusted.*` are refused with the same
+        // errno because the properties they carry - an LSM's labels, an
+        // attribute only root can see - have nothing here to keep them
+        // honest; the divergence is named in `docs/notes/` §3.15.
+        return err::EOPNOTSUPP;
+    }
+    if !kind_takes_user_xattrs(inode.metadata().kind) {
+        return match op {
+            Xattr::Get => err::ENODATA,
+            Xattr::Set | Xattr::Remove => err::EPERM,
+        };
+    }
+    let Some(vault) = inode.xattr_vault() else {
+        // The filesystem keeps no store: Linux's answer for a filesystem with
+        // no xattr support, and the reason the call is wired to a handler at
+        // all. Before it was, the number fell through to `ENOSYS`, which a
+        // caller reads as "this kernel has no such call" and may handle far
+        // more bluntly than one unsupported filesystem.
+        return err::EOPNOTSUPP;
+    };
+    match op {
+        Xattr::Get => xattr_get(vault, name, args[2], args[3]),
+        Xattr::Set => xattr_set(vault, name, args[2], args[3], args[4]),
+        Xattr::Remove => match vault.remove(name) {
+            Ok(()) => 0,
+            Err(e) => xattr_errno(e),
+        },
+    }
+}
+
+/// `getxattr`'s body: the size-probe protocol and the buffer.
+///
+/// A zero size asks how long the value is and touches no buffer (measured: the
+/// pointer may be anything, `(void*)1` included); a positive one must fit the
+/// value or be `ERANGE`, and a pointer this kernel cannot write is `EFAULT`.
+/// The store's own answers come first, which is Linux's order too: a missing
+/// attribute is `ENODATA` whatever the buffer, and there is no cap on the size
+/// this direction may name (`getxattr` with a 70000-byte buffer is not
+/// `E2BIG`; only `setxattr`'s value is capped).
+fn xattr_get(vault: &crate::vfs::xattr::Vault, name: &str, buf: usize, size: usize) -> isize {
+    let mut slot: Option<&mut [u8]> = None;
+    if size != 0 {
+        if !buffer_ok(buf, size, true, true) {
+            return err::EFAULT;
+        }
+        slot = Some(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size) });
+    }
+    match vault.get(name, slot) {
+        Ok(n) => n as isize,
+        Err(e) => xattr_errno(e),
+    }
+}
+
+/// `setxattr`'s body: copy the value, then hand it to the store with its flags
+/// word. Empty is a value (measured: a zero-length attribute reads back as
+/// length 0), so only a non-zero size reads the pointer.
+fn xattr_set(
+    vault: &crate::vfs::xattr::Vault,
+    name: &str,
+    value: usize,
+    size: usize,
+    flags: usize,
+) -> isize {
+    let bytes: &[u8] = if size == 0 {
+        &[]
+    } else {
+        if !buffer_ok(value, size, false, true) {
+            return err::EFAULT;
+        }
+        unsafe { core::slice::from_raw_parts(value as *const u8, size) }
+    };
+    match vault.set(name, bytes, flags as u32) {
+        Ok(()) => 0,
+        Err(e) => xattr_errno(e),
+    }
+}
+
+/// `listxattr`'s body. The names are NUL-terminated and laid end to end, with
+/// no trailing separator; the size-probe protocol is the get call's (a zero
+/// size returns the total and ignores the pointer). A node that keeps no names
+/// lists nothing and writes nothing, so a FIFO answers 0 and leaves the buffer
+/// alone - unlike `get`, which answers `ENODATA` there.
+fn xattr_list(inode: &Arc<dyn Inode>, buf: usize, size: usize) -> isize {
+    if !kind_takes_user_xattrs(inode.metadata().kind) {
+        return 0;
+    }
+    let Some(vault) = inode.xattr_vault() else {
+        return err::EOPNOTSUPP;
+    };
+    let mut slot: Option<&mut [u8]> = None;
+    if size != 0 {
+        if !buffer_ok(buf, size, true, true) {
+            return err::EFAULT;
+        }
+        slot = Some(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size) });
+    }
+    match vault.list(slot) {
+        Ok(n) => n as isize,
+        Err(e) => xattr_errno(e),
+    }
+}
+
+/// `getxattr`/`setxattr`/`removexattr` and their `l`-prefixed forms. The three
+/// take a path then an attribute name in the first two slots; `follow` is the
+/// difference between a call and its `l` form.
 pub fn xattr_path(nr: u64, args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, follow: bool) -> isize {
+    let op = Xattr::of(nr);
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    if let Err(e) = cstr_arg(args[1], true) {
-        return e;
-    }
-    if Xattr::of(nr) == Xattr::Set
-        && let Some(e) = setxattr_args(args[2], args[3], args[4])
-    {
-        return e;
-    }
-    xattr_target(&path, cwd, follow)
+    let name = match xattr_name(args[1]) {
+        Ok(name) => name,
+        Err(e) => return e,
+    };
+    let ns = match xattr_checks(op, &name, &args) {
+        Ok(ns) => ns,
+        Err(e) => return e,
+    };
+    let inode = match xattr_lookup(&path, cwd, follow) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    xattr_answer(op, ns, &inode, &name, args)
 }
 
 /// `fgetxattr`/`fsetxattr`/`fremovexattr`: the descriptor form. A bad descriptor
 /// is `EBADF` before the name is even looked at, as the descriptor table check
 /// happens first.
 pub fn xattr_fd(nr: u64, args: [usize; ARG_COUNT]) -> isize {
-    if let Err(e) = xattr_inode_of_fd(args[0] as i32) {
-        return e;
-    }
-    if let Err(e) = cstr_arg(args[1], true) {
-        return e;
-    }
-    if Xattr::of(nr) == Xattr::Set
-        && let Some(e) = setxattr_args(args[2], args[3], args[4])
-    {
-        return e;
-    }
-    err::EOPNOTSUPP
+    let op = Xattr::of(nr);
+    let inode = match xattr_inode_of_fd(args[0] as i32) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    let name = match xattr_name(args[1]) {
+        Ok(name) => name,
+        Err(e) => return e,
+    };
+    let ns = match xattr_checks(op, &name, &args) {
+        Ok(ns) => ns,
+        Err(e) => return e,
+    };
+    xattr_answer(op, ns, &inode, &name, args)
 }
 
 /// `listxattr`/`llistxattr`: path, then a buffer to fill - no name argument.
@@ -1275,17 +1438,21 @@ pub fn xattr_list_path(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, follow: b
         Ok(path) => path,
         Err(e) => return e,
     };
-    xattr_target(&path, cwd, follow)
+    let inode = match xattr_lookup(&path, cwd, follow) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    xattr_list(&inode, args[1], args[2])
 }
 
 /// `flistxattr`: the descriptor form of the list call.
 pub fn xattr_list_fd(args: [usize; ARG_COUNT]) -> isize {
-    match xattr_inode_of_fd(args[0] as i32) {
-        Ok(_) => err::EOPNOTSUPP,
-        Err(e) => e,
-    }
+    let inode = match xattr_inode_of_fd(args[0] as i32) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    xattr_list(&inode, args[1], args[2])
 }
-
 /// Wall-clock seconds, the value `UTIME_NOW` resolves to - the same sum
 /// `gettimeofday` reports (the boot epoch plus elapsed ticks).
 fn wall_now() -> u64 {

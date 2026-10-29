@@ -7060,3 +7060,54 @@ passed`, aarch64 `all 230`, `mpos-kunit 34 passed` both; counterfactual (a
 `447 => 0` stub) is `pass=229 fail=2`: `t-enosys`'s two claims and the new pin's
 shape claims, since a `0` return reads as "descriptor 0" (stdin). `docs/notes/` §8.4 carries the table and
 the reasoning.
+
+### 132. The extended-attribute family — `user.*` stored on the memory filesystems
+
+The twelve doors (188–199) were wired, validated, then answered `EOPNOTSUPP`
+because no filesystem kept an attribute. That was Linux's answer for an ext4 or
+a procfs; it was the wrong answer for `ramfs`/`tmpfs`, which is exactly the
+place Linux keeps `user.*`. The shape was measured on Linux 7.2.11 first (uid
+1000, a tmpfs file under `/dev/shm`, an ext4 file beside it — the full table is
+`docs/notes/` §3.15):
+
+- the store's probes: a zero-size `getxattr`/`listxattr` names the length and
+  never reads its buffer; a short buffer is `ERANGE`; a missing name is
+  `ENODATA` (61); `XATTR_CREATE` on an existing attribute is `EEXIST`,
+  `XATTR_REPLACE` on a missing one `ENODATA`, and **both bits together are not
+  `EINVAL`** (the existence rules decide, which is why the store applies them
+  rather than the flags check); a bit outside the vocabulary is `EINVAL` and is
+  decided before the path is walked;
+- the limits: a value is at most 65536 bytes (`E2BIG` above that, decided
+  before the pointer is read), while `getxattr`/`listxattr` have no cap in their
+  direction; a name is at most 255 bytes (`ERANGE`), empty is `ERANGE`, and a
+  bare namespace prefix is `EINVAL` — all before the walk; the empty value is a
+  value;
+- the list encoding: names end to end, **each NUL-terminated** (so a six-byte
+  name lists as seven) with no further trailing separator, in an order no
+  caller may rely on;
+- the kinds: `user.*` lives on regular files, directories and unix sockets; a
+  FIFO, a device node and a symlink refuse a set with `EPERM` and answer
+  `ENODATA`/`0` to get/list; the following form reaches a symlink's target
+  while the `l` forms do not; the `f` forms answer over `O_RDONLY` descriptors;
+- the namespaces: `system.*` and any name with no known prefix are
+  `EOPNOTSUPP` — Linux's "nothing handles this namespace" answer. `security.*`
+  and `trusted.*` are kept by Linux's tmpfs (an LSM's labels; an attribute only
+  root sees), and this kernel has neither an LSM nor per-caller visibility, so
+  both answer `EOPNOTSUPP` — a named divergence, not an omission.
+
+**Served**: `src/vfs/xattr.rs` is the store (`Vault`, one per inode, with
+`classify`/`check_flags`/the errno vocabulary) and it is host-compiled with
+eleven host tests; `Inode` grew `fn xattr_vault(&self) -> Option<&Vault>`
+(default `None`) which `RamFile`, `RamDir` and `RamSocket` answer. The handlers
+apply the measured precedence (flags → value size → name → path → namespace →
+kind → store → pointer), so an argument refusal never pays for a walk and a
+filesystem with no store keeps the old `EOPNOTSUPP` for a sound request. Two
+more divergences are named in §3.15: `open(O_PATH)` is not a descriptor shape
+this kernel makes (so Linux's `EBADF`-over-`O_PATH` rule catches nothing), and
+attributes are uncharged to a mount's usage, like `RamFs`'s directory entries.
+
+**Pin**: `user/tests/src/bin/t-xattr.rs`, rewritten from the refusal pin it used
+to be (44 claims), with the same claims run against real Linux on the host
+where the three named divergences are accepted. x86_64 `all 231 user tests passed`, aarch64 `all 230`, `mpos-kunit 34 passed` both;
+counterfactual (`xattr_vault` answering `None` for every inode) is `pass=230
+fail=1`: `t-xattr` alone, 15 claims red, every refusal green.

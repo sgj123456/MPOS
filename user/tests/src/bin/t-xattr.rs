@@ -1,315 +1,517 @@
-//! t-xattr - the extended-attribute family (188..199): the arguments are
-//! validated, and only then does the store's refusal come back.
+//! t-xattr - the extended-attribute family has a store on the in-memory
+//! filesystems, and its answers are Linux's.
 //!
-//! mpos keeps no extended attributes on any of its filesystems, so every one
-//! of the twelve calls answers `EOPNOTSUPP` on a request whose target and
-//! name are sound - the "this filesystem does not do xattrs" report Linux
-//! gives a filesystem without xattr support, not the `ENOSYS` of a syscall a
-//! kernel never wired up. Both halves are pinned here, because the refusal
-//! is only meaningful if it comes *after* the ordinary argument checks: a
-//! missing path must still be `ENOENT` and a bad descriptor still `EBADF`,
-//! or a caller would read "unsupported" for a file it simply mistyped. The
-//! plain form, the `l`-form (which acts on a final symlink) and the `f`-form
-//! (a descriptor) are all exercised on the path/fd that resolves.
+//! The contract this replaced was the family's first shape: every well-formed
+//! request was validated and then refused with `EOPNOTSUPP` - honest for a
+//! filesystem with no xattr support, but wrong for the ramfs/tmpfs this kernel
+//! *does* keep, where Linux's tmpfs stores `user.*` attributes. A caller told
+//! "not supported" goes looking for a different medium; a caller told
+//! `ENODATA` knows the medium is fine and the name is not set. So the refusal
+//! moved to the filesystems that really keep no store (ext4, procfs, devfs),
+//! and the in-memory ones answer Linux's way.
 //!
-//! Divergence worth recording: the store is still the whole of the answer -
-//! nothing here keeps an attribute - so the refusal happens with or without
-//! a well-formed request behind it. What *is* checked is the arguments a
-//! `setxattr` carries and the other forms do not: the flags word (`EINVAL`
-//! for a bit Linux does not define, and for `XATTR_CREATE|XATTR_REPLACE`
-//! together, which contradict each other rather than combine) and the value
-//! (`EFAULT` when the size is non-zero and the pointer is one the kernel
-//! cannot read). The value and list buffers of the *other* forms are still
-//! never consulted, which is why a zero-length `getxattr` value stays
-//! `EOPNOTSUPP`: Linux reads a `getxattr` buffer inside the filesystem's own
-//! handler, so a filesystem without one never looks at it either.
+//! Measured on a current host (Linux 7.2.11, `/dev/shm`, uid 1000; the
+//! instruments are the `.workbuddy/probe_xattr*.c` sketches, the table is
+//! `docs/notes/` section 3.15):
 //!
-//! # The raw door carries the unreadable-value claim
+//!  * `setxattr`/`getxattr`/`removexattr` answer on a regular file, a directory
+//!    and a unix socket; `user.*` is the namespace temp filesystems keep;
+//!  * a zero-length buffer is the *length probe*: the answer is the value's
+//!    length and the buffer pointer is never touched (`(void*)1` included);
+//!  * a short buffer is `ERANGE`, a missing attribute `ENODATA`, an unreadable
+//!    value pointer `EFAULT`, a value past 64 KiB `E2BIG`;
+//!  * `XATTR_CREATE` on an existing attribute is `EEXIST`, `XATTR_REPLACE` on a
+//!    missing one `ENODATA` - and **both bits together are not `EINVAL`**: they
+//!    combine into "must exist and must not exist", so the answer follows the
+//!    attribute's existence (the old pin asserted the opposite; the measurement
+//!    is why the assertion changed);
+//!  * an empty name is `ERANGE` and a bare namespace prefix (`"user."`) is
+//!    `EINVAL`, and both are decided before the path is walked;
+//!  * `listxattr` lays the names end to end, each NUL-terminated, so the total
+//!    carries one separator per name - the last one included - and the probe
+//!    answers the same way for a zero-length or a short buffer;
+//!  * a FIFO, a device node and a symlink answer `EPERM` on set and
+//!    `ENODATA`/`0` on get/list, because the rule is the generic layer's and
+//!    those kinds keep no attributes at all;
+//!  * the `f*` forms work over an `O_RDONLY` descriptor and over a directory
+//!    descriptor; an `O_PATH` one is `EBADF` on Linux, which this kernel cannot
+//!    claim because its `open` does not make one (a divergence named in the
+//!    notes, not pinned here).
 //!
-//! Every wrapper in sight (`libc::setxattr`, rustix's xattr module where it
-//! exists) takes the value as a readable slice, so the EFAULT probe needs
-//! `libc::syscall(SYS_setxattr, ..)` with an address this process has mapped
-//! PROT_NONE - batch 14's arena rule replacing the no-std suite's
-//! never-mapped `GUARD_PAGE`. On a real Linux tmpfs/ext4 *does* keep
-//! attributes, so the hosted run accepts Linux's own success-or-refusal and
-//! says so; the payload sweep pins EOPNOTSUPP for the twelve.
+//! # Divergences this pin records
+//!
+//! Linux's tmpfs also keeps `security.*` (world-readable) and `trusted.*`
+//! (root-only) because it has LSM hooks and per-caller visibility to judge
+//! them. This kernel has neither, so every namespace but `user.*` answers
+//! `EOPNOTSUPP` - Linux's own answer for a namespace no filesystem handles.
+//! On a host run those two claims accept Linux's measured `EPERM` for a
+//! non-root caller, and the procfs set claim accepts the `EACCES` procfs
+//! answers before it looks at attributes; the guest run pins this kernel.
+//!
+//! # Why every claim is `libc`
+//!
+//! The crate's rule allows `libc` only where the crate cannot express the
+//! claim, and here that is the whole family: `rustix` has no xattr wrapper at
+//! all - not the names, not the flags word, not the length-probe spelling - so
+//! these are the clause's unbound call and go through `libc`'s named wrappers
+//! rather than a raw `syscall(2)`. The old pin used the raw door because a
+//! wrapper takes the value as a readable slice; the `EFAULT` claim here passes
+//! address 1 through the wrapper instead, which is an address no process can
+//! read on either machine.
+
+use std::ffi::CString;
+use std::io::Error;
 
 use mpos_user_tests::Report;
-use rustix::fd::AsRawFd;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, unlinkat};
-use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous, munmap};
 
-const PATH: &str = "/tmp/t-xattr";
-const MISSING: &str = "/tmp/t-xattr-missing";
-const NAME: &[u8] = b"user.abitest\0";
-const VALUE: &[u8] = b"v";
+const FILE: &str = "/tmp/t-xattr.file";
+const DIR: &str = "/tmp/t-xattr.d";
+const FIFO: &str = "/tmp/t-xattr.fifo";
+const LINK: &str = "/tmp/t-xattr.link";
+const SOCK: &str = "/tmp/t-xattr.sock";
+const MNT: &str = "/tmp/t-xattr.mnt";
+const PROCFS: &str = "/proc/self/status";
 
-/// The door returns `-1` and leaves the refusal in `errno` (batch 12's
-/// measurement); the claim is about what the kernel answered.
-fn refused(ret: isize, want: i32) -> bool {
-    ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(want)
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+
+fn cs(text: &str) -> CString {
+    CString::new(text).expect("no interior NUL")
 }
 
-/// The store's-answer claims: mpos answers EOPNOTSUPP for all twelve; a real
-/// Linux tmpfs *does* keep attributes and answers success or ENODATA (both
-/// measured here), so under a hosted run any non-crashing answer stands in
-/// and says which machine answered. The payload sweep pins EOPNOTSUPP.
-fn store_answer(ret: isize, want: i32) -> bool {
-    refused(ret, want) || (mpos_user_tests::host_run() && (ret >= 0 || ret == -1))
+/// The errno of a call that answered `-1`, or `None` when it did not fail.
+fn errno_of(ret: i64) -> Option<i32> {
+    if ret == -1 {
+        Error::last_os_error().raw_os_error()
+    } else {
+        None
+    }
 }
 
-/// One of the twelve xattr doors, called through the raw shape every claim
-/// here shares: (path|fd, name, value, size, flags).
-fn x(nr: libc::c_long, p: usize, name: *const u8, val: usize, len: usize, flags: u64) -> isize {
-    unsafe { libc::syscall(nr, p, name as usize, val, len, flags) as isize }
+fn failed(ret: i64, want: i32) -> bool {
+    errno_of(ret) == Some(want)
 }
 
-/// The three-word list forms: (path|fd, list, size).
-fn xl(nr: libc::c_long, p: usize, list: usize, size: usize) -> isize {
-    unsafe { libc::syscall(nr, p, list, size) as isize }
+/// This kernel's answer, or - on a host run - the answer real Linux gives for
+/// the same claim where the two are known to diverge. The guest run pins ours.
+fn ours_or_linux(mine: bool, linux: bool) -> bool {
+    mine || (mpos_user_tests::host_run() && linux)
+}
+
+fn setxattr(path: &str, name: &str, value: &[u8], flags: i32) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe {
+        libc::setxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags,
+        ) as i64
+    }
+}
+
+/// `setxattr` whose value pointer is address 1 - the `EFAULT` claim.
+fn setxattr_bad_pointer(path: &str, name: &str, size: usize) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), 1 as *const libc::c_void, size, 0) as i64 }
+}
+
+fn getxattr(path: &str, name: &str, buf: &mut [u8]) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+/// `getxattr`'s length probe: a zero size and a pointer no-one could read.
+fn getxattr_probe(path: &str, name: &str) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), 1 as *mut libc::c_void, 0) as i64 }
+}
+
+fn lgetxattr_probe(path: &str, name: &str) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe { libc::lgetxattr(p.as_ptr(), n.as_ptr(), 1 as *mut libc::c_void, 0) as i64 }
+}
+
+fn lsetxattr(path: &str, name: &str, value: &[u8]) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe {
+        libc::lsetxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        ) as i64
+    }
+}
+
+fn listxattr(path: &str, buf: &mut [u8]) -> i64 {
+    let p = cs(path);
+    unsafe { libc::listxattr(p.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+fn listxattr_probe(path: &str) -> i64 {
+    let p = cs(path);
+    unsafe { libc::listxattr(p.as_ptr(), 1 as *mut libc::c_char, 0) as i64 }
+}
+
+fn llistxattr_probe(path: &str) -> i64 {
+    let p = cs(path);
+    unsafe { libc::llistxattr(p.as_ptr(), 1 as *mut libc::c_char, 0) as i64 }
+}
+
+fn removexattr(path: &str, name: &str) -> i64 {
+    let (p, n) = (cs(path), cs(name));
+    unsafe { libc::removexattr(p.as_ptr(), n.as_ptr()) as i64 }
+}
+
+fn fsetxattr(fd: i32, name: &str, value: &[u8]) -> i64 {
+    let n = cs(name);
+    unsafe { libc::fsetxattr(fd, n.as_ptr(), value.as_ptr().cast(), value.len(), 0) as i64 }
+}
+
+fn fgetxattr(fd: i32, name: &str, buf: &mut [u8]) -> i64 {
+    let n = cs(name);
+    unsafe { libc::fgetxattr(fd, n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+fn flistxattr(fd: i32, buf: &mut [u8]) -> i64 {
+    unsafe { libc::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len()) as i64 }
+}
+
+fn fremovexattr(fd: i32, name: &str) -> i64 {
+    let n = cs(name);
+    unsafe { libc::fremovexattr(fd, n.as_ptr()) as i64 }
+}
+
+/// The long name: 256 bytes, one past the limit.
+fn long_name() -> String {
+    let mut name = String::from("user.");
+    name.push_str(&"a".repeat(251));
+    name
 }
 
 fn main() {
-    println!("t-xattr");
     let mut r = Report::new();
 
-    let _ = std::fs::remove_file(PATH);
-    let fd = match openat(
-        CWD,
-        PATH,
-        OFlags::CREATE | OFlags::RDWR,
-        Mode::from_bits_retain(0o644),
-    ) {
-        Ok(fd) => {
-            r.check("a file to hang attributes off is created", true);
-            fd
-        }
-        Err(_) => {
-            r.check("a file to hang attributes off is created", false);
-            r.finish();
-        }
-    };
-    let raw = fd.as_raw_fd();
-    let cpath = std::ffi::CString::new(PATH).unwrap();
-    let cmissing = std::ffi::CString::new(MISSING).unwrap();
-    let pathp = cpath.as_ptr() as usize;
-    let missingp = cmissing.as_ptr() as usize;
-    let namep = NAME.as_ptr();
-    let valp = VALUE.as_ptr() as usize;
+    std::fs::create_dir_all(DIR).expect("fixture directory");
+    std::fs::write(FILE, b"payload").expect("fixture file");
 
-    // An unreadable value page: mapped PROT_NONE, exactly once unmapped at
-    // the end, so the EFAULT probes name a real address nobody may read.
-    let nowhere = match unsafe {
-        mmap_anonymous(
-            core::ptr::null_mut(),
-            4096,
-            ProtFlags::empty(),
-            MapFlags::PRIVATE,
-        )
-    } {
-        Ok(p) => p as usize,
-        Err(_) => 0,
-    };
+    // ---------------------------------------------------------------- store
+    r.check(
+        "a set on a fresh file answers 0",
+        setxattr(FILE, "user.a", b"v1", 0) == 0,
+    );
+    r.check(
+        "the length probe answers the value's length and never reads the pointer",
+        getxattr_probe(FILE, "user.a") == 2,
+    );
+    let mut buf = [0u8; 2];
+    r.check(
+        "the value reads back",
+        getxattr(FILE, "user.a", &mut buf) == 2 && &buf == b"v1",
+    );
+    let mut short = [0u8; 1];
+    r.check(
+        "a buffer one byte short is ERANGE",
+        failed(getxattr(FILE, "user.a", &mut short), libc::ERANGE),
+    );
+    r.check(
+        "an attribute that was never set is ENODATA",
+        failed(getxattr(FILE, "user.absent", &mut buf), libc::ENODATA),
+    );
+    r.check(
+        "a value pointer this kernel cannot read is EFAULT",
+        failed(setxattr_bad_pointer(FILE, "user.a", 1), libc::EFAULT),
+    );
+    r.check(
+        "a directory keeps user.* too",
+        setxattr(DIR, "user.a", b"v", 0) == 0 && getxattr_probe(DIR, "user.a") == 1,
+    );
 
-    // The path forms: the path resolves and the name is a readable string,
-    // so the call reaches the store - which has no xattrs and says so.
-    let eop = libc::EOPNOTSUPP;
-    let store_answers = [
-        ("setxattr", x(libc::SYS_setxattr, pathp, namep, valp, 0, 0)),
-        (
-            "lsetxattr",
-            x(libc::SYS_lsetxattr, pathp, namep, valp, 0, 0),
-        ),
-        ("getxattr", x(libc::SYS_getxattr, pathp, namep, 0, 16, 0)),
-        ("lgetxattr", x(libc::SYS_lgetxattr, pathp, namep, 0, 16, 0)),
-        ("listxattr", xl(libc::SYS_listxattr, pathp, 0, 64)),
-        ("llistxattr", xl(libc::SYS_llistxattr, pathp, 0, 64)),
-        (
-            "removexattr",
-            x(libc::SYS_removexattr, pathp, namep, 0, 0, 0),
-        ),
-        (
-            "lremovexattr",
-            x(libc::SYS_lremovexattr, pathp, namep, 0, 0, 0),
-        ),
-    ];
-    for (name, ret) in store_answers {
-        r.check(
-            &format!("{name} on a real file: EOPNOTSUPP"),
-            store_answer(ret, eop),
-        );
-    }
-
-    // The descriptor forms, on the descriptor this test opened.
-    let fd_forms = [
-        (
-            "fsetxattr",
-            x(libc::SYS_fsetxattr, raw as usize, namep, valp, 0, 0),
-        ),
-        (
-            "fgetxattr",
-            x(libc::SYS_fgetxattr, raw as usize, namep, 0, 16, 0),
-        ),
-        ("flistxattr", xl(libc::SYS_flistxattr, raw as usize, 0, 64)),
-        (
-            "fremovexattr",
-            x(libc::SYS_fremovexattr, raw as usize, namep, 0, 0, 0),
-        ),
-    ];
-    for (name, ret) in fd_forms {
-        r.check(
-            &format!("{name} on an open descriptor: EOPNOTSUPP"),
-            store_answer(ret, eop),
-        );
-    }
-
-    // The flags word is validated before the store is reached. Either bit on
-    // its own is a legitimate request and gets the store's answer; both
-    // together contradict, and any other bit is not a flag Linux defines.
-    const XATTR_CREATE: u64 = 1;
-    const XATTR_REPLACE: u64 = 2;
+    // --------------------------------------------------------------- flags
     r.check(
-        "XATTR_CREATE alone is not what refuses the set",
-        store_answer(
-            x(libc::SYS_setxattr, pathp, namep, valp, 0, XATTR_CREATE),
-            eop,
+        "XATTR_CREATE on an attribute that exists is EEXIST",
+        failed(setxattr(FILE, "user.a", b"v2", XATTR_CREATE), libc::EEXIST),
+    );
+    r.check(
+        "XATTR_REPLACE on an attribute that exists answers 0 and replaces it",
+        setxattr(FILE, "user.a", b"v2", XATTR_REPLACE) == 0 && getxattr_probe(FILE, "user.a") == 2,
+    );
+    r.check(
+        "XATTR_REPLACE on an attribute that does not exist is ENODATA",
+        failed(
+            setxattr(FILE, "user.absent", b"v", XATTR_REPLACE),
+            libc::ENODATA,
         ),
     );
     r.check(
-        "XATTR_REPLACE alone is not what refuses the set",
-        store_answer(
-            x(libc::SYS_setxattr, pathp, namep, valp, 0, XATTR_REPLACE),
-            eop,
-        ),
+        "an undefined flags bit is EINVAL",
+        failed(setxattr(FILE, "user.a", b"v", 0x4), libc::EINVAL),
     );
-    // mpos rejects the contradictory pair before anything else; Linux checks
-    // each bit against the store instead (measured here: ENODATA/EEXIST out
-    // of the filesystem). The payload sweep pins EINVAL.
-    let pair = x(
-        libc::SYS_setxattr,
-        pathp,
-        namep,
-        valp,
-        0,
-        XATTR_CREATE | XATTR_REPLACE,
-    );
-    r.check(
-        "CREATE and REPLACE together contradict: EINVAL",
-        refused(pair, libc::EINVAL) || (mpos_user_tests::host_run() && pair == -1),
-    );
-    let fdpair = x(
-        libc::SYS_fsetxattr,
-        raw as usize,
-        namep,
-        valp,
-        0,
-        XATTR_CREATE | XATTR_REPLACE,
-    );
-    r.check(
-        "the descriptor form takes the same pair the same way",
-        refused(fdpair, libc::EINVAL) || (mpos_user_tests::host_run() && fdpair == -1),
-    );
-    r.check(
-        "a flag bit Linux does not define is EINVAL",
-        refused(
-            x(libc::SYS_setxattr, pathp, namep, valp, 0, 0x4),
-            libc::EINVAL,
-        ),
-    );
-    // The flags win over the target, as they do in Linux: the word is
-    // checked before the path is even resolved.
     r.check(
         "a bad flags word is EINVAL even on a missing path",
-        refused(
-            x(libc::SYS_setxattr, missingp, namep, valp, 0, 0x4),
+        failed(
+            setxattr("/tmp/definitely-absent", "user.a", b"v", 0x4),
             libc::EINVAL,
         ),
     );
+    // Measured: the two bits are not contradictory, so both together follow the
+    // attribute's existence like either bit alone. The old pin asserted EINVAL.
+    r.check(
+        "CREATE|REPLACE on an existing attribute is EEXIST, not EINVAL",
+        failed(
+            setxattr(FILE, "user.a", b"v", XATTR_CREATE | XATTR_REPLACE),
+            libc::EEXIST,
+        ),
+    );
+    r.check(
+        "CREATE|REPLACE on a missing one is ENODATA, not EINVAL",
+        failed(
+            setxattr(FILE, "user.absent", b"v", XATTR_CREATE | XATTR_REPLACE),
+            libc::ENODATA,
+        ),
+    );
 
-    // The value is copied before the filesystem is asked, so one this kernel
-    // cannot read is EFAULT even though a readable one would have been
-    // EOPNOTSUPP.
-    if nowhere != 0 {
+    // ---------------------------------------------------------------- limits
+    let big = vec![b'v'; 65536];
+    r.check(
+        "a 64 KiB value lands and reads back",
+        setxattr(FILE, "user.big", &big, 0) == 0 && getxattr_probe(FILE, "user.big") == 65536,
+    );
+    r.check(
+        "one byte past 64 KiB is E2BIG",
+        failed(
+            setxattr(FILE, "user.big", &vec![b'v'; 65537], 0),
+            libc::E2BIG,
+        ),
+    );
+    r.check(
+        "the empty value is a value: set answers 0, the probe answers 0",
+        setxattr(FILE, "user.empty", b"", 0) == 0 && getxattr_probe(FILE, "user.empty") == 0,
+    );
+    r.check(
+        "a name past 255 bytes is ERANGE",
+        failed(setxattr(FILE, &long_name(), b"v", 0), libc::ERANGE),
+    );
+    r.check(
+        "an empty name is ERANGE before the path is walked",
+        failed(
+            setxattr("/tmp/definitely-absent", "", b"v", 0),
+            libc::ERANGE,
+        ),
+    );
+    r.check(
+        "a bare namespace prefix is EINVAL",
+        failed(setxattr(FILE, "user.", b"v", 0), libc::EINVAL),
+    );
+
+    // ------------------------------------------------------- namespaces
+    // The kernel keeps `user.*` only. `system.*` and an unprefixed name are
+    // Linux's own "no handler" answer; `security.*`/`trusted.*` are refused the
+    // same way because this kernel has no LSM and no per-caller visibility.
+    fn namespace_refused(path: &str, name: &str) -> bool {
+        let mut probe = [0u8; 8];
+        failed(setxattr(path, name, b"v", 0), libc::EOPNOTSUPP)
+            && failed(getxattr(path, name, &mut probe), libc::EOPNOTSUPP)
+    }
+    r.check(
+        "system.* is EOPNOTSUPP to set and to get",
+        namespace_refused(FILE, "system.foo"),
+    );
+    r.check(
+        "a name with no namespace is EOPNOTSUPP too",
+        namespace_refused(FILE, "foo.bar"),
+    );
+    for name in ["security.foo", "trusted.foo"] {
         r.check(
-            "a setxattr value the kernel cannot read is EFAULT",
-            refused(
-                x(libc::SYS_setxattr, pathp, namep, nowhere, 1, 0),
-                libc::EFAULT,
+            format!("{name} is refused (a named divergence: EOPNOTSUPP on a kernel with no LSM)")
+                .as_str(),
+            ours_or_linux(
+                namespace_refused(FILE, name),
+                failed(setxattr(FILE, name, b"v", 0), libc::EPERM),
             ),
         );
-        // A zero size is the "no value" set and carries no pointer to read,
-        // so it stays the store's answer rather than EFAULT.
-        r.check(
-            "a zero-length value is not read at all: EOPNOTSUPP",
-            store_answer(x(libc::SYS_setxattr, pathp, namep, nowhere, 0, 0), eop),
-        );
-    } else {
-        r.check("a setxattr value the kernel cannot read is EFAULT", false);
-        r.check("a zero-length value is not read at all: EOPNOTSUPP", false);
     }
 
-    // A missing path is resolved before any store is reached, so it is the
-    // resolver's answer and not the store's.
+    // ------------------------------------------------------------- listing
+    let expected = ("user.a".len() + 1 + "user.big".len() + 1 + "user.empty".len() + 1) as i64;
+    r.check(
+        "the list probe counts every name and its separator",
+        listxattr_probe(FILE) == expected,
+    );
+    let mut names = vec![0u8; listxattr_probe(FILE) as usize];
+    // Each name is NUL-terminated (so the total carries one separator per name,
+    // the last one included - measured: one attribute of six bytes lists as
+    // seven). The order is not a promise, so the claim is about the encoding and
+    // the set, not the sequence.
+    let listed = |names: &[u8], want: &[&[u8]]| {
+        let mut got: Vec<&[u8]> = names
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut want: Vec<&[u8]> = want.to_vec();
+        got.sort();
+        want.sort();
+        got == want
+    };
+    r.check(
+        "the exact-size buffer holds every name NUL-terminated",
+        listxattr(FILE, &mut names) == names.len() as i64
+            && names.last() == Some(&0)
+            && listed(&names, &[b"user.a", b"user.big", b"user.empty"]),
+    );
+    let mut small = vec![0u8; names.len() - 1];
+    r.check(
+        "a short list buffer is ERANGE",
+        failed(listxattr(FILE, &mut small), libc::ERANGE),
+    );
+
+    // ------------------------------------------------------------- removal
+    r.check(
+        "removexattr answers 0 and the attribute is gone",
+        removexattr(FILE, "user.a") == 0 && getxattr_probe(FILE, "user.a") == -1,
+    );
+    r.check(
+        "removing an attribute that is not there is ENODATA",
+        failed(removexattr(FILE, "user.a"), libc::ENODATA),
+    );
+
+    // -------------------------------------------------------------- kinds
+    let fifo = cs(FIFO);
+    unsafe {
+        libc::unlink(fifo.as_ptr());
+        libc::mkfifo(fifo.as_ptr(), 0o600);
+    }
+    r.check(
+        "a FIFO refuses user.* with EPERM",
+        failed(setxattr(FIFO, "user.a", b"v", 0), libc::EPERM),
+    );
+    r.check(
+        "a FIFO answers ENODATA to a get and lists nothing",
+        failed(getxattr_probe(FIFO, "user.a"), libc::ENODATA) && listxattr_probe(FIFO) == 0,
+    );
+
+    let _ = std::fs::remove_file(LINK);
+    std::os::unix::fs::symlink(FILE, LINK).expect("fixture symlink");
+    r.check(
+        "the l-form refuses a symlink's own user.* with EPERM",
+        failed(lsetxattr(LINK, "user.a", b"v"), libc::EPERM),
+    );
+    r.check(
+        "the l-form answers ENODATA and lists nothing on a symlink",
+        lgetxattr_probe(LINK, "user.a") == -1 && llistxattr_probe(LINK) == 0,
+    );
+    r.check(
+        "the following form reaches the symlink's target",
+        setxattr(LINK, "user.b", b"v", 0) == 0,
+    );
+
+    let _ = std::fs::remove_file(SOCK);
+    let listener = std::os::unix::net::UnixListener::bind(SOCK).expect("fixture socket");
+    r.check(
+        "a unix socket keeps user.* (the generic rule lets it)",
+        setxattr(SOCK, "user.a", b"v", 0) == 0 && getxattr_probe(SOCK, "user.a") == 1,
+    );
+    drop(listener);
+
+    // ------------------------------------------------------------- descriptors
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(FILE).expect("fixture file");
+    let fd = file.as_raw_fd();
+    let mut one = [0u8; 1];
+    r.check(
+        "the f-forms work over an O_RDONLY descriptor",
+        fsetxattr(fd, "user.fd", b"v") == 0 && fgetxattr(fd, "user.fd", &mut one) == 1,
+    );
+    let mut fd_names = vec![0u8; flistxattr(fd, &mut []) as usize];
+    r.check(
+        "flistxattr lists the descriptor's file",
+        flistxattr(fd, &mut fd_names) == fd_names.len() as i64,
+    );
+    r.check(
+        "fremovexattr removes it",
+        fremovexattr(fd, "user.fd") == 0 && fgetxattr(fd, "user.fd", &mut one) == -1,
+    );
+    r.check(
+        "fsetxattr on a closed descriptor is EBADF",
+        failed(fsetxattr(9999, "user.a", b"v"), libc::EBADF),
+    );
+    r.check(
+        "flistxattr on a closed descriptor is EBADF",
+        failed(flistxattr(9999, &mut one), libc::EBADF),
+    );
+
+    // ------------------------------------- a filesystem with no store at all
+    // procfs keeps no attributes. On this kernel the answer is the family's
+    // refusal for every door; Linux refuses a non-root set with EACCES before it
+    // looks at attributes, which is the divergence a host run accepts.
+    r.check(
+        "a filesystem with no store answers EOPNOTSUPP, not ENOSYS",
+        ours_or_linux(
+            failed(setxattr(PROCFS, "user.a", b"v", 0), libc::EOPNOTSUPP)
+                && failed(getxattr_probe(PROCFS, "user.a"), libc::EOPNOTSUPP),
+            failed(setxattr(PROCFS, "user.a", b"v", 0), libc::EACCES)
+                && failed(getxattr_probe(PROCFS, "user.a"), libc::EOPNOTSUPP),
+        ),
+    );
+    // A missing path is the resolver's answer, never the store's: the refusal is
+    // only meaningful after the ordinary argument checks ran.
     r.check(
         "setxattr on a missing path is ENOENT",
-        refused(
-            x(libc::SYS_setxattr, missingp, namep, valp, 0, 0),
+        failed(
+            setxattr("/tmp/definitely-absent", "user.a", b"v", 0),
             libc::ENOENT,
         ),
     );
     r.check(
         "getxattr on a missing path is ENOENT",
-        refused(
-            x(libc::SYS_getxattr, missingp, namep, 0, 16, 0),
-            libc::ENOENT,
-        ),
-    );
-    r.check(
-        "listxattr on a missing path is ENOENT",
-        refused(xl(libc::SYS_listxattr, missingp, 0, 64), libc::ENOENT),
-    );
-    r.check(
-        "removexattr on a missing path is ENOENT",
-        refused(
-            x(libc::SYS_removexattr, missingp, namep, 0, 0, 0),
+        failed(
+            getxattr_probe("/tmp/definitely-absent", "user.a"),
             libc::ENOENT,
         ),
     );
 
-    // A descriptor that names nothing is refused before the name is read:
-    // the EBADF is about the descriptor, not the attribute.
+    // ------------------------------------------------------------- tmpfs mount
+    std::fs::create_dir_all(MNT).expect("mount point");
+    let (source, target, fstype) = (cs("tmpfs"), cs(MNT), cs("tmpfs"));
+    let mounted = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        ) == 0
+    };
+    // Mounting needs privilege, which the payload run has and a host reference
+    // run may not; the guest run pins the mount, the host run records that it
+    // could not try.
     r.check(
-        "fsetxattr on a closed descriptor is EBADF",
-        refused(x(libc::SYS_fsetxattr, 9999, namep, valp, 0, 0), libc::EBADF),
+        "a tmpfs can be mounted over the fixture directory",
+        mounted || mpos_user_tests::host_run(),
     );
-    r.check(
-        "fgetxattr on a closed descriptor is EBADF",
-        refused(x(libc::SYS_fgetxattr, 9999, namep, 0, 16, 0), libc::EBADF),
-    );
-    r.check(
-        "flistxattr on a closed descriptor is EBADF",
-        refused(xl(libc::SYS_flistxattr, 9999, 0, 64), libc::EBADF),
-    );
-    r.check(
-        "fremovexattr on a closed descriptor is EBADF",
-        refused(x(libc::SYS_fremovexattr, 9999, namep, 0, 0, 0), libc::EBADF),
-    );
-
-    // A zero-length buffer is a legitimate "how big is it" query, not an
-    // argument error: the store's answer stands.
-    r.check(
-        "getxattr with a zero-length value is EOPNOTSUPP, not EINVAL",
-        store_answer(x(libc::SYS_getxattr, pathp, namep, 0, 0, 0), eop),
-    );
-    r.check(
-        "listxattr with a zero-length list is EOPNOTSUPP, not EINVAL",
-        store_answer(xl(libc::SYS_listxattr, pathp, 0, 0), eop),
-    );
-
-    if nowhere != 0 {
-        let _ = unsafe { munmap(nowhere as *mut _, 4096) };
+    if mounted {
+        let inside = format!("{MNT}/value");
+        std::fs::write(&inside, b"payload").expect("file inside the mount");
+        r.check(
+            "a tmpfs mount keeps user.* like the ramfs root does",
+            setxattr(&inside, "user.a", b"v", 0) == 0 && getxattr_probe(&inside, "user.a") == 1,
+        );
+        unsafe {
+            libc::umount2(target.as_ptr(), 0);
+        }
     }
-    drop(fd);
-    let _ = unlinkat(CWD, PATH, AtFlags::empty());
+
+    // --------------------------------------------------------------- cleanup
+    drop(file);
+    let _ = std::fs::remove_dir_all(DIR);
+    let _ = std::fs::remove_file(FILE);
+    let _ = std::fs::remove_file(FIFO);
+    let _ = std::fs::remove_file(LINK);
+    let _ = std::fs::remove_file(SOCK);
+    let _ = std::fs::remove_dir(MNT);
+
     r.finish()
 }

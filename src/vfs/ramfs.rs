@@ -50,6 +50,7 @@ fn birth_mode(kind: NodeKind) -> Option<u32> {
 
 use critical_section::Mutex;
 
+use super::xattr::Vault;
 use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
@@ -375,6 +376,9 @@ struct RamFile {
     /// The attribute flags: `lsattr`'s word, and what makes a file immutable
     /// or append-only.
     flags: NodeFlags,
+    /// The extended attributes, on the `user.*` shape Linux allows a regular
+    /// file (see `crate::vfs::xattr` for the measured family).
+    xattrs: Vault,
     data: Mutex<RefCell<Chunked>>,
 }
 
@@ -464,6 +468,10 @@ impl Inode for RamFile {
 
     fn set_flags(&self, flags: u32) -> VfsResult<()> {
         self.flags.set(flags)
+    }
+
+    fn xattr_vault(&self) -> Option<&Vault> {
+        Some(&self.xattrs)
     }
 
     fn metadata(&self) -> Metadata {
@@ -802,6 +810,10 @@ struct RamSocket {
     mode: Mutex<Cell<Option<u32>>>,
     owner: Mutex<Cell<(u32, u32)>>,
     flags: NodeFlags,
+    /// Extended attributes. Measured: a unix socket on a tmpfs takes `user.*`
+    /// where a FIFO and a device node answer `EPERM`
+    /// (`.workbuddy/probe_xattr4.c`).
+    xattrs: Vault,
 }
 
 impl Inode for RamSocket {
@@ -811,6 +823,10 @@ impl Inode for RamSocket {
 
     fn set_flags(&self, flags: u32) -> VfsResult<()> {
         self.flags.set(flags)
+    }
+
+    fn xattr_vault(&self) -> Option<&Vault> {
+        Some(&self.xattrs)
     }
 
     fn metadata(&self) -> Metadata {
@@ -984,6 +1000,9 @@ struct RamDir {
     /// append-only directory takes new names and gives none up, and an
     /// immutable one takes nothing at all.
     flags: NodeFlags,
+    /// Extended attributes. Linux's tmpfs lets a directory carry `user.*` the
+    /// same way it lets a file - measured, `.workbuddy/probe_xattr3.c`.
+    xattrs: Vault,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
 }
 
@@ -994,6 +1013,10 @@ impl Inode for RamDir {
 
     fn set_flags(&self, flags: u32) -> VfsResult<()> {
         self.flags.set(flags)
+    }
+
+    fn xattr_vault(&self) -> Option<&Vault> {
+        Some(&self.xattrs)
     }
 
     fn metadata(&self) -> Metadata {
@@ -1080,6 +1103,7 @@ impl Inode for RamDir {
                 mtime: Mutex::new(Cell::new(at)),
                 ctime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
+                xattrs: Vault::new(),
                 data: Mutex::new(RefCell::new(Chunked::new())),
             }),
             NodeKind::Dir => Arc::new(RamDir {
@@ -1089,6 +1113,7 @@ impl Inode for RamDir {
                 owner: Mutex::new(Cell::new(owner)),
                 mtime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
+                xattrs: Vault::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node `mknod` made. The number is the whole of why this
@@ -1117,6 +1142,7 @@ impl Inode for RamDir {
                 mode: Mutex::new(Cell::new(birth)),
                 owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
+                xattrs: Vault::new(),
             }),
             // A FIFO: a name whose channel a `mknod(S_IFIFO)` made. The channel
             // is born with the node and outlives every open of it; the birth
@@ -1295,6 +1321,7 @@ impl RamFs {
                 owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
                 mtime: Mutex::new(Cell::new(now())),
                 flags: NodeFlags::new(),
+                xattrs: Vault::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
         })

@@ -186,7 +186,7 @@ One-glance status of the whole roadmap.
 
 **ABI gaps → `ENOSYS` (remaining)**
 
-- [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
+- [x] inotify · [x] `memfd_create` (§7 Stage 3) · [x] xattrs — `user.*` is stored on the memory filesystems (`ramfs`/`tmpfs`), every other namespace and every filesystem with no store refused by name (item 132, §3.15)
 - [x] POSIX message queues — `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/
   `mq_notify`/`mq_getsetattr`, priority-ordered and bounded by `RLIMIT_MSGQUEUE`;
   `t-mqueue` pins 41 claims measured on the host first (§6.12) — and **System V
@@ -647,7 +647,7 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-`memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs validate then `EOPNOTSUPP`;  
+`memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs keep `user.*` on the memory filesystems and refuse the other namespaces by name (item 132, §3.15);  
 the semantics still incomplete are the datagram line itself, which is the ring's rather than  
 Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
 sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  

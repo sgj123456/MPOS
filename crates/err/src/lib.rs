@@ -73,6 +73,15 @@ pub const ENOBUFS: isize = -105;
 /// seeking, so a kernel that answers "fine" instead makes the caller drop
 /// them.
 pub const ESPIPE: isize = -29;
+/// ENODATA: the object is there, the thing asked of it is not. The extended
+/// attribute calls are its only user here - `getxattr` on a name nobody set,
+/// and the `XATTR_REPLACE` half of `setxattr` - and they are also why it is
+/// *not* `EEXIST`'s twin: Linux answers a caller that probes an attribute
+/// with ENODATA, which is the number `tar` and `rsync` branch on to mean "no
+/// attributes to carry". Some architectures spell the same fact `ENOATTR`
+/// (the two share a value); the x86_64 and aarch64 ABIs this kernel serves
+/// both say 61.
+pub const ENODATA: isize = -61;
 pub const ERANGE: isize = -34;
 pub const EPIPE: isize = -32;
 pub const ENOSYS: isize = -38;

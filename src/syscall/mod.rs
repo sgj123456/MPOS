@@ -150,7 +150,11 @@ pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::Str
 /// with `posix_spawn: Filename too long` before it ever runs a subprocess.
 pub(crate) const MAX_ARG_STR: usize = crate::sched::ARGS_BYTES_MAX;
 
-fn cstr_limit(ptr: usize, from_user: bool, limit: usize) -> Result<alloc::string::String, isize> {
+pub(crate) fn cstr_limit(
+    ptr: usize,
+    from_user: bool,
+    limit: usize,
+) -> Result<alloc::string::String, isize> {
     if ptr == 0 {
         return Err(err::EFAULT);
     }

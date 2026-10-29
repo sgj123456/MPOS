@@ -852,3 +852,93 @@ Gate: `cargo xtask test` - x86_64 `pass=230 fail=0 (230 built)`, aarch64
 counterfactual with the two dispatch arms removed: only `t-statmount` red.
 
 Full record: `docs/uapi/` §5.1 item 129.
+
+### 3.15 The extended-attribute family keeps a store on the memory filesystems — **DONE (2026-10-30)**
+
+The family (188–199: `setxattr`/`getxattr`/`listxattr`/`removexattr` and their
+`l`/`f` forms) was wired to the argument checks and then answered
+`EOPNOTSUPP` — the honest report for a filesystem with no xattr support, and
+the reason `fastfetch`-style probing callers stopped seeing `ENOSYS`. But it
+was the *whole* answer, and it is the wrong one for the filesystems this kernel
+actually keeps in memory: `ramfs`/`tmpfs` are where Linux stores `user.*`
+attributes, so a caller asking a tmpfs for an attribute must be told whether the
+name is set, not that the medium cannot hold one.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/xattr/probe*.c`, copied to
+`.workbuddy/probe_xattr*.c`; uid 1000, a tmpfs file under `/dev/shm`, with an
+ext4 file beside it for the comparison):
+
+| question | measured answer |
+|---|---|
+| `setxattr("user.a", "v1", 2, 0)` on a tmpfs file, dir, unix socket | `0` on all three |
+| `getxattr(name, ptr, 0)` | the value's length; the pointer is never read (a `(void*)1` probe answers the same) |
+| a buffer one byte short | `ERANGE` |
+| an attribute nobody set | `ENODATA` (61) |
+| `XATTR_CREATE` on an existing attribute | `EEXIST` (17) |
+| `XATTR_REPLACE` on a missing one | `ENODATA` |
+| **both bits together** | **not `EINVAL`** — the existence rules apply, so `EEXIST` when it is there and `ENODATA` when it is not (the man page's "contradictory pair is `EINVAL`" is wrong) |
+| a bit outside the vocabulary (`0x4`, `0x8`) | `EINVAL`, decided **before** the path is walked |
+| value 65536 bytes / 65537 / 70000 | `0` / `E2BIG` (7) / `E2BIG` — and `E2BIG` is decided before the pointer is looked at |
+| value pointer this kernel cannot read | `EFAULT` |
+| empty value (size 0) | a value: set `0`, the length probe `0` |
+| name 256 bytes / empty name / a bare prefix (`"user."`) | `ERANGE` / `ERANGE` / `EINVAL`, all before the path is walked |
+| `listxattr` | names end to end, **each NUL-terminated** (one attribute of six bytes lists as seven), no trailing separator beyond that; probe = exact size, one byte short = `ERANGE`, size 0 ignores the pointer |
+| `getxattr`/`listxattr` with a 70000-byte buffer | served — there is no size cap in this direction; only `setxattr`'s value is capped |
+| `user.*` on a FIFO, a device node, a symlink via `l` | set `EPERM` (1); get `ENODATA`; list `0` |
+| `user.*` on a directory, regular file, unix socket | set `0`; get/list carry the names |
+| the following form through a symlink | reaches the target |
+| `f*` forms over `O_RDONLY` and directory descriptors | served; an `O_PATH` descriptor is `EBADF` |
+| `system.foo`, `foo.bar` | `EOPNOTSUPP` (95) — Linux's "no handler for this namespace" answer |
+| `security.foo`, `trusted.foo` | stored by root, `EPERM` for uid 1000 (tmpfs keeps both, because it has LSM hooks and per-caller visibility) |
+| ext4, `user.*` | same answers as the tmpfs for `user.*`; `security.`/`trusted.` `EPERM` for uid 1000 |
+
+**Served, in that shape.** `src/vfs/xattr.rs` is the store and it is
+host-compiled: `Vault` is one `critical_section::Mutex<RefCell<Vec<Entry>>>` per
+inode, `classify` is the name/namespace check, `check_flags` the flags word, and
+the module's eleven host tests pin the round trip, both probes, `ERANGE`,
+`ENODATA`, the two flags bits, the 64 KiB edge and the empty value. `Inode`
+grew one door, `fn xattr_vault(&self) -> Option<&Vault>` (default `None`), which
+`RamFile`, `RamDir` and `RamSocket` answer with their own store; `RamFifo`,
+`RamDev` and `RamSymlink` keep the default because the generic layer's per-kind
+rule refuses them before any store is asked.
+
+The handlers in `src/syscall/linux/fs/file.rs` were rewritten to the measured
+precedence: `setxattr`'s flags word, then the value's size, then the name
+(`ERANGE`/`EINVAL`), then the path, then the namespace, then the kind, then
+whether the filesystem keeps a store, then the pointer. Three savings fall out
+of that order: a bad flags word or name never pays for a walk (measured: the
+same calls answer `EINVAL`/`ERANGE` on a path that does not exist), and a
+filesystem with no store (`ext4`, `procfs`, `devfs`) preserves the old
+`EOPNOTSUPP` for a request whose arguments are sound — so the two contracts
+compose instead of one replacing the other.
+
+**Named divergences.** (1) Only `user.*` is kept: Linux's tmpfs stores
+`security.*` (world-readable) and `trusted.*` (root-only), and this kernel has
+neither an LSM nor per-caller visibility to keep those properties honest, so
+both answer `EOPNOTSUPP` — Linux's own answer for a namespace with no handler.
+(2) `open(O_PATH)` is not a descriptor shape this kernel makes (the flag is
+carried through `F_GETFL` like any other), so Linux's `EBADF`-over-`O_PATH` rule
+has nothing to catch; the pin therefore does not claim it. (3) A *negative*
+value pointer with a size of 0 is not read — the empty value is stored, so a
+`setxattr` with `(void*)1, 0` succeeds where a filesystem without a store
+answered its own refusal. (4) Nothing here charges an attribute to a mount's
+usage: the precedent is `RamFs`'s directory entries, which are uncharged too.
+
+**Pin**: `user/tests/src/bin/t-xattr.rs`, rewritten from the refusal pin to the
+new contract (44 claims): the store and its probes, both flags bits and their
+measured non-`EINVAL` combination, the 64 KiB edge, every name refusal and its
+precedence over the walk, the list encoding, the per-kind refusals, the fd
+forms, procfs's `EOPNOTSUPP`, and a `mount -t tmpfs` whose file stores
+`user.*` too. Its host branch carries the same claims against real Linux with
+the three named divergences accepted there (`ours_or_linux`), so the program
+measures Linux's shape rather than this kernel's special case.
+x86_64 `all 231 user tests passed` (29.32 s, `mpos-kunit 34 passed`), aarch64
+`all 230 user tests passed` (25.41 s, `mpos-kunit 34 passed`).
+Counterfactual — `xattr_vault` answering `None` for every inode — is
+`pass=230 fail=1` (231 built): `t-xattr` alone, 15 of its 44 claims red — every
+one of them a store claim — while the flags, name and namespace refusals stayed
+green, which is the shape the old pin had.
+
+Files: `crates/err` (`ENODATA`), `src/vfs/xattr.rs` (new), `src/vfs/mod.rs`
+(`xattr_vault`), `src/vfs/ramfs.rs` (three stores), `src/syscall/linux/fs/file.rs`
+(the handlers), `user/tests/src/bin/t-xattr.rs`, and the uapi/roadmap rows.
