@@ -350,7 +350,9 @@ One-glance status of the whole roadmap.
   of 1 024 000 (black); `-display dbus,gl=on` boots but sends nothing without a listener
   (`dbus_registered_listener` 0); and the arithmetic says a 1 Hz sample misses the ≈47 ms
   client frames ~93 % of the time, which is why the identical shots do not prove absence.
-  Next: write the D-Bus listener, or record the X root at ≥20 fps for the whole run (§7.4)
+  Next: write the D-Bus listener, or record the niri output at ≥20 fps for the whole run —
+  note the earlier "window capture" read the X root of a *rootless Xwayland* and could never
+  have shown a composited window; `grim` + `niri msg` is the instrument that can (§7.4)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 
