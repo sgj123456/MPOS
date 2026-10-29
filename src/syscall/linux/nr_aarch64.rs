@@ -348,3 +348,8 @@ pub const CLOSE_RANGE: u64 = 436;
 pub const OPEN_TREE: u64 = 428;
 pub const MOVE_MOUNT: u64 = 429;
 pub const MOUNT_SETATTR: u64 = 442;
+
+// See `nr_x86_64.rs`: the mount introspection pair, same numbers on both
+// machines.
+pub const STATMOUNT: u64 = 457;
+pub const LISTMOUNT: u64 = 458;

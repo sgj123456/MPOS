@@ -87,6 +87,12 @@ pub const EIDRM: isize = -43;
 /// caller that asked `IPC_NOWAIT` reads when the queue holds nothing its
 /// selection rule accepts (measured on a current host, `docs/notes/` §6.15).
 pub const ENOMSG: isize = -42;
+/// EOVERFLOW: an answer that does not fit the room the caller gave. It is
+/// `statmount(2)`'s own refusal for a mount whose *string* fields do not fit
+/// the area after the fixed struct - measured on Linux 7.2.11, where the same
+/// call with a bigger buffer answers instead - and the one signal a caller
+/// has that it should re-ask with more space.
+pub const EOVERFLOW: isize = -75;
 pub const EOPNOTSUPP: isize = -95;
 pub const EROFS: isize = -30;
 /// EXDEV: a hard link across two filesystems. The one request `link(2)`

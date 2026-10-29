@@ -308,6 +308,8 @@ A call absent from those is served as its phase section records.
 | `open_tree` | 428 | mount | 428 |
 | `move_mount` | 429 | mount | 429 |
 | `mount_setattr` | 442 | mount | 442 |
+| `statmount` | 457 | mount | 457 |
+| `listmount` | 458 | mount | 458 |
 | `mseal` | 462 | proc | 462 |
 | `fanotify_init` | 300 | fs | 262 |
 | `fanotify_mark` | 301 | fs | 263 |

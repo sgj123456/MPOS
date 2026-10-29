@@ -106,6 +106,7 @@ fn mountpoint_covers(mountpoint: &str, path: &str) -> bool {
 /// are here rather than in a second accessor: `mounts` wants only four of them,
 /// while `mountinfo` wants the ids and the device as well, and the walk that
 /// names each mountpoint is the expensive part.
+#[derive(Clone)]
 pub struct MountRecord {
     /// This mount's own id, unique per attachment and never reused - mountinfo's
     /// first field. It is *not* [`Mount::id`]: that names the serving instance,
@@ -1873,6 +1874,31 @@ impl MountTable {
             record.parent_id = parent;
         }
         records
+    }
+
+    /// The record for one attachment id, as `statmount(2)` asks for it.
+    ///
+    /// `mount_id` is the table's own unique number, which is what
+    /// `listmount(2)` hands out and what `statmount(2)` takes - the 32-bit id
+    /// `/proc/*/fdinfo` prints is a reuse, not an identity.
+    pub fn record_of_id(&self, id: u64) -> Option<MountRecord> {
+        self.mount_records()
+            .into_iter()
+            .find(|record| record.mount_id == id)
+    }
+
+    /// The record of the mount an inode lives on: the deepest mountpoint that
+    /// covers its path, which is the mount a descriptor on that inode is "on".
+    ///
+    /// This is the question behind `statmount(2)`'s `STATMOUNT_BY_FD` form and
+    /// also behind any future `fstatfs`-by-fd; nothing walks the filesystem, it
+    /// reads the same records `/proc/self/mountinfo` prints and picks by prefix.
+    pub(crate) fn record_containing(&self, inode: &Arc<dyn Inode>) -> Option<MountRecord> {
+        let path = self.path_of(inode)?;
+        self.mount_records()
+            .into_iter()
+            .filter(|record| mountpoint_covers(&record.path, &path))
+            .max_by_key(|record| record.path.len())
     }
 
     /// The directory that names `target`, found by walking down from the root.

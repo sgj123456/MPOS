@@ -2811,6 +2811,163 @@ pub fn handle_mount_setattr(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
     }
 }
 
+/// Read a `struct mnt_id_req` the caller named, in the version it named.
+///
+/// The struct is versioned by its own first word: a caller says how many bytes
+/// it is passing (24 or 32, the two versions Linux 7.2.11 accepts - 20 and 40
+/// were `EINVAL`, measured), and the rest is read only as far as that word
+/// says. So the size comes back before anything else is trusted: a 40-byte
+/// struct sent by a caller that thinks this kernel knows version 2 must not
+/// have bytes read out of it.
+fn mount_id_req(ptr: usize) -> Result<crate::vfs::mountstat::MntIdReq, isize> {
+    use crate::vfs::mountstat;
+    if !buffer_ok(ptr, 4, false, true) {
+        return Err(crate::err::EFAULT);
+    }
+    let mut head = [0u8; 4];
+    if !crate::sched::read_user(ptr, &mut head) {
+        return Err(crate::err::EFAULT);
+    }
+    let size = u32::from_le_bytes(head);
+    if size != mountstat::MNT_ID_REQ_VER0 && size != mountstat::MNT_ID_REQ_VER1 {
+        return Err(crate::err::EINVAL);
+    }
+    let mut bytes = [0u8; mountstat::MNT_ID_REQ_VER1 as usize];
+    let size = size as usize;
+    if !buffer_ok(ptr, size, false, true) || !crate::sched::read_user(ptr, &mut bytes[..size]) {
+        return Err(crate::err::EFAULT);
+    }
+    mountstat::MntIdReq::parse(&bytes).ok_or(crate::err::EINVAL)
+}
+
+/// `statmount(2)` - what one mount is, in Linux's `struct statmount`.
+///
+/// The measurement behind the shape is in [`crate::vfs::mountstat`]'s header;
+/// the parts this handler owns are the pointer rules, which Linux pinned:
+/// `bufsize=0` answers 0 having written nothing, a short buffer is truncated
+/// with `size` saying how much *was* written, and only a requested **string**
+/// field that does not fit turns the call into `EOVERFLOW`.
+pub fn handle_statmount(args: [usize; ARG_COUNT], _cwd: &Arc<dyn Inode>) -> isize {
+    use crate::vfs::mountstat;
+    let (req_ptr, buf, buf_size, flags) = (args[0], args[1], args[2], args[3] as u64);
+    if flags & !mountstat::STATMOUNT_BY_FD != 0 {
+        return crate::err::EINVAL;
+    }
+    let req = match mount_id_req(req_ptr) {
+        Ok(req) => req,
+        Err(error) => return error,
+    };
+    let table = crate::vfs::mount::caller_table();
+    let record = if req.by_fd(flags) {
+        // The descriptor form: the request names the mount by an fd on it, and
+        // everything else in the struct must be zero (bad combinations were
+        // `EINVAL` on Linux).
+        if req.mnt_id != 0 || req.mnt_ns_id != 0 || req.fd == 0 {
+            return crate::err::EINVAL;
+        }
+        let inode = match fd_inode(req.fd as i32) {
+            Ok(inode) => inode,
+            Err(error) => return error,
+        };
+        match table.record_containing(&inode) {
+            Some(record) => record,
+            None => return crate::err::EINVAL,
+        }
+    } else {
+        if req.mnt_ns_id != 0 {
+            // A foreign namespace: this kernel has one table per namespace but
+            // no way for a caller to name another one here, so the honest
+            // answer is "present, not supported" rather than the id of the
+            // caller's own table.
+            return crate::err::EOPNOTSUPP;
+        }
+        if req.mnt_id == 0 {
+            return crate::err::EINVAL;
+        }
+        match table.record_of_id(req.mnt_id) {
+            Some(record) => record,
+            None => return crate::err::EINVAL,
+        }
+    };
+    let rendered = mountstat::statmount(&record, table.ns_id(), req.param);
+    if buf_size == 0 {
+        return 0;
+    }
+    let total = rendered.bytes.len();
+    // Measured on Linux: the fixed part is truncated when it does not fit
+    // (`bufsize = 16` with only `SB_BASIC` asked answered 0 and `size = 16`),
+    // but a *string* that was asked for and no longer fits is `EOVERFLOW`
+    // (`bufsize = sizeof` with `MNT_POINT` asked). A fixed part too small to
+    // hold a requested string is the same refusal, not a silent short read.
+    let wants_string = req.param
+        & (mountstat::MNT_ROOT
+            | mountstat::MNT_POINT
+            | mountstat::FS_TYPE
+            | mountstat::SB_SOURCE
+            | mountstat::FS_SUBTYPE
+            | mountstat::MNT_OPTS)
+        != 0;
+    let copy_len = if buf_size >= total {
+        total
+    } else if wants_string {
+        return crate::err::EOVERFLOW;
+    } else {
+        buf_size
+    };
+    let mut bytes = rendered.bytes;
+    // `size` is what was written, so a truncated answer says so (Linux answered
+    // `size=16` to `bufsize=16`).
+    bytes[..4].copy_from_slice(&(copy_len as u32).to_le_bytes());
+    if !buffer_ok(buf, copy_len, true, true) || !crate::sched::write_user(buf, &bytes[..copy_len]) {
+        return crate::err::EFAULT;
+    }
+    0
+}
+
+/// `listmount(2)` - the mounts of this namespace, in tree order.
+///
+/// `param` is where a previous call stopped: Linux resumed *after* the id it
+/// named (measured: `param=ids[2]` answered `ids[3]`), and a small `nr` is a
+/// short answer rather than an error. Order is the record's own tree walk; see
+/// [`crate::vfs::mountstat::order`].
+pub fn handle_listmount(args: [usize; ARG_COUNT], _cwd: &Arc<dyn Inode>) -> isize {
+    use crate::vfs::mountstat;
+    let (req_ptr, ids_ptr, room, flags) = (args[0], args[1], args[2], args[3] as u64);
+    if flags & !mountstat::LISTMOUNT_REVERSE != 0 {
+        return crate::err::EINVAL;
+    }
+    let req = match mount_id_req(req_ptr) {
+        Ok(req) => req,
+        Err(error) => return error,
+    };
+    // Listing one mount's subtree is not a request Linux serves either: the
+    // table's answer is the namespace's mounts in tree order (measured).
+    if req.mnt_id != mountstat::LSMT_ROOT {
+        return crate::err::EINVAL;
+    }
+    if req.mnt_ns_id != 0 {
+        return crate::err::EOPNOTSUPP;
+    }
+    if room == 0 {
+        return 0;
+    }
+    let table = crate::vfs::mount::caller_table();
+    let walk = mountstat::order(&table.mount_records());
+    let reverse = flags & mountstat::LISTMOUNT_REVERSE != 0;
+    let Some(start) = mountstat::resume(&walk, req.param, reverse) else {
+        return crate::err::EINVAL;
+    };
+    let ids = mountstat::slice(&walk, start, room, reverse);
+    let mut bytes = alloc::vec::Vec::with_capacity(ids.len() * 8);
+    for id in &ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    if !buffer_ok(ids_ptr, bytes.len(), true, true) || !crate::sched::write_user(ids_ptr, &bytes) {
+        return crate::err::EFAULT;
+    }
+    ids.len() as isize
+}
+
 /// `pivot_root(new_root, put_old)` - replace the root, parking the old one.
 ///
 /// This is the call an initramfs exists to make: it mounts the real root

@@ -73,6 +73,7 @@ pub mod mount;
 /// The descriptor `open_tree(2)` hands out: a mount rather than a file, so
 /// `move_mount` can attach it by name later.
 pub mod mountfd;
+pub mod mountstat;
 pub mod mqueue;
 /// The namespace identities the kernel knows, and the text `/proc/<pid>/ns/<kind>`
 /// reads back as. Home: `vfs`, because the mount namespace and the renderer are

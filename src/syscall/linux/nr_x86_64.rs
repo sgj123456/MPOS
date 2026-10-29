@@ -567,3 +567,10 @@ pub const CLOSE_RANGE: u64 = 436;
 pub const OPEN_TREE: u64 = 428;
 pub const MOVE_MOUNT: u64 = 429;
 pub const MOUNT_SETATTR: u64 = 442;
+
+// The mount introspection pair (`statmount(2)`/`listmount(2)`): what the table
+// can say about a mount *after* the attachment half (`open_tree` and friends).
+// Measured on Linux 7.2.11 - the numbers are the same on both machines, as the
+// whole modern mount family is.
+pub const STATMOUNT: u64 = 457;
+pub const LISTMOUNT: u64 = 458;

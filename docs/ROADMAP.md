@@ -309,6 +309,14 @@ One-glance status of the whole roadmap.
   `NOATIME`/`IDMAP` `EINVAL` as Linux answers them, `fsopen`/`fsconfig`/
   `fsmount`/`fspick` (430–433) a named `ENOSYS` gap because a superblock
   context is an object this kernel does not have (§3.11, item 122)
+- [x] `statmount(2)` (457) / `listmount(2)` (458) — the mount table reading
+  itself out: Linux's 512-byte struct with its string area (offset 0 = the empty
+  string), the unique mount id `listmount` walked, `STATMOUNT_BY_FD`, the mask
+  reporting what was written (an unknown bit answered, not refused), truncation
+  for a short fixed part vs `EOVERFLOW` for a requested string with no room,
+  and `listmount`'s tree order / resume-after-id / reverse / short answers;
+  the fields this kernel cannot produce stay out of `mask`/`supported_mask` and
+  a foreign namespace is `EOPNOTSUPP` (§3.14, item 129)
 
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works; the table is the **thread group's** now, so a worker's timer outlives its maker, any thread may arm/delete it, a process-directed expiry lands on the process, a `fork` child inherits none of it, and a zombie leader's group keeps them (§2.11, item 128)

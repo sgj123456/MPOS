@@ -770,3 +770,85 @@ second` (it returned at its 2000 ms timeout), the fixed kernel passes the whole
 section.
 
 Full record: `docs/uapi/` §5.1 item 125.
+
+### 3.14 `statmount(2)` and `listmount(2)` — the mount table describing itself — **DONE (2026-10-29)**
+
+`open_tree`/`move_mount` (§3.11) give a program a mount *handle*; these two give
+it the namespace's *inventory*. `statmount(2)` (457) answers one mount's
+identity and settings into a 512-byte struct plus a string area, and
+`listmount(2)` (458) walks the namespace's mounts as ids. Both answered `ENOSYS`
+here, so `findmnt`-style tools and every container runtime that maps a mount set
+had no way to read this kernel's table - the very table the mount family was
+already reading through paths.
+
+**Measured on Linux 7.2.11 first**, as uid 0 inside a user+mount namespace
+(`build/scratch/mountstat/probe.c`, `probe2.c`; both calls want `CAP_SYS_ADMIN`,
+an ordinary user gets `EPERM`):
+
+`listmount`: `LSMT_ROOT` (`u64::MAX`) walks the namespace in tree order, root
+first then depth-first; `param` resumes **after** the id given (`param = ids[2]`
+answered `ids[3]`, `param = last` answered 0); `LISTMOUNT_REVERSE` walks
+backwards; a small `nr` is a short answer of exactly that many ids, `nr = 0`
+writes nothing and answers 0, `nr` past the end answers the rest; any flag
+outside the vocabulary, `mnt_id != LSMT_ROOT`, and `req.size = 20` are `EINVAL`;
+a null id buffer is `EFAULT`; 36 mounts in that namespace.
+
+`statmount`: `struct statmount` is 512 bytes followed by the string area, and a
+string field is an **offset into that area**, offset 0 being the empty string -
+a mount whose root is the filesystem's root reports `mnt_root` as `""` that way.
+`mnt_id` must be the **unique** id (`statx`'s `STATX_MNT_ID_UNIQUE`,
+`listmount`'s output): the reused 32-bit `/proc/*/fdinfo` number was `EINVAL`.
+The fd form (`flags = STATMOUNT_BY_FD`) names a mount by a descriptor *on* it
+and then the struct's `mnt_id`/`mnt_ns_id` must be zero; without the flag the
+same struct is `EINVAL`. `mask` reports the fields **written**, not the fields
+asked: bit 31 and `0xffffffff` both answered 0 with the mask carrying nothing
+unknown, and `supported_mask` said what the kernel could produce. A full answer
+on a tmpfs was 581 bytes, `mask 0x12fb`, `supported_mask 0x7fff`, `sb_magic
+0x1021994`, `mnt_propagation 0x40000` (private), point at offset 1 (`"/tmp\0"`).
+`bufsize` shorter than the fixed part is **truncated**, not refused
+(`bufsize = 16` answered 0 with `size = 16` and `mask = SB_BASIC`), while a
+requested *string* with no room in the area after the struct is `EOVERFLOW`
+(`bufsize = sizeof` with `MNT_POINT` asked, 75); `bufsize = 0` answers 0 having
+written nothing.
+
+**Served, in that shape.** `src/vfs/mountstat.rs` is host-compiled and pure: the
+two request versions (24 and 32 bytes, by their own first word, 20 and 40
+refused), the mask vocabulary, `sb_magic` for the filesystems this kernel
+mounts, and the renderer that writes Linux's exact offsets and one NUL-first
+string area. `MountTable::record_of_id` answers a record by the table's own
+attachment id (which **is** the unique id here - the table never reuses one, so
+the id `statmount` names is the id `listmount` walked), and
+`MountTable::record_containing` answers the mount a descriptor is on (the
+longest `mountpoint_covers` prefix of its path), which is the fd form's answer.
+The handlers in `src/syscall/linux/fs/file.rs` (`handle_statmount`,
+`handle_listmount`) fill the struct, apply the two measured refusals
+(`EOVERFLOW` only for a requested string that no longer fits, truncation
+otherwise), and write the id array.
+
+**Named divergences.** The mask is honest about what this kernel does not have:
+`MNT_OPTS`, the option arrays, `mnt_root` for a bind, and the uid/gid maps are
+never set (Linux answered `mask = 0` for the maps too), and `supported_mask`
+names the six fields that are always renderable (`MNT_BASIC`, `MNT_POINT`,
+`FS_TYPE`, `MNT_NS_ID`, `SB_SOURCE`, `SUPPORTED_MASK`). The old numbering
+(`mnt_id_old`/`mnt_parent_id_old`) is left zero because this kernel has no
+reused, fdinfo-visible id space. `mnt_attr` reports `MOUNT_ATTR_RDONLY` exactly
+when the mount records read-only and 0 otherwise (§3.11's promise: a mount that
+records read-only is one its filesystem honours), propagation is always
+`MS_PRIVATE` (this kernel has one mount namespace per process and no shared
+peer group), and a foreign `mnt_ns_id` is `EOPNOTSUPP` - a namespace id this
+caller cannot name rather than a lie about the caller's own table.
+
+**Pin**: `user/tests/src/bin/t-statmount.rs` - the request versions, the mask
+the kernel writes, the string offsets (including the empty root), the unique id
+and its parent, the tmpfs magic, the stable nonzero namespace id, the
+unknown-bit answer, truncation vs `EOVERFLOW` vs zero-length, the id/flags
+refusals, the descriptor form, and `listmount`'s tree order / resume / reverse /
+short answers / `EINVAL`s / `EFAULT`, ending with the unmount taking the mount
+out of both calls. It skips on the host (an ordinary user is `EPERM`) and runs
+on both machines.
+
+Gate: `cargo xtask test` - x86_64 `pass=230 fail=0 (230 built)`, aarch64
+`pass=229 fail=0 (229 built)`, `mpos-kunit 34 passed, 0 failed` on every lane;
+counterfactual with the two dispatch arms removed: only `t-statmount` red.
+
+Full record: `docs/uapi/` §5.1 item 129.

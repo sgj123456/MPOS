@@ -6956,3 +6956,35 @@ names no live task of the group is `EINVAL`, all as Linux's own gates measured.
 **Pin**: `user/tests/src/bin/t-timer-create.rs`'s "a timer belongs to the thread
 group" family — 14 claims, run first against a real host
 (`MPOS_ON_HOST=1`, 14/14 `ok`) and then on both machines.
+
+## item 129 — `statmount(2)` and `listmount(2)`: the mount table reads itself out
+
+Served: `statmount`(457), `listmount`(458). Measured on Linux 7.2.11 in
+`build/scratch/mountstat/probe{,2}.c` (uid 0 in a user+mount namespace; an
+ordinary user is `EPERM`): `struct statmount` is a 512-byte struct plus a string
+area whose fields are offsets into it (offset 0 the empty string, which is how a
+mount whose root is the filesystem's root reports `mnt_root`); `mnt_id` is the
+**unique** id (`statx`'s `STATX_MNT_ID_UNIQUE`, `listmount`'s output) - the
+reused fdinfo number was `EINVAL`; `STATMOUNT_BY_FD` names a mount by a
+descriptor on it and then the struct's ids must be zero; `mask` reports fields
+**written** (an unknown bit is answered, not refused) and `supported_mask` says
+what the kernel could produce; a short `bufsize` truncates the fixed part
+(`bufsize = 16` answered 0 with `size = 16`) while a requested *string* with no
+room after the struct is `EOVERFLOW` (75). `listmount(LSMT_ROOT)` walks in tree
+order, `param` resumes after the id given, `LISTMOUNT_REVERSE` walks backwards,
+a small `nr` is a short answer, `nr = 0` answers 0, a stray flag or a `mnt_id`
+other than `LSMT_ROOT` is `EINVAL`, a null buffer is `EFAULT`.
+
+**Named divergences.** The mask is the kernel's honest subset: `MNT_OPTS`, the
+option arrays and the uid/gid maps are never set (`supported_mask` names
+`MNT_BASIC|MNT_POINT|FS_TYPE|MNT_NS_ID|SB_SOURCE|SUPPORTED_MASK`), the old
+fdinfo numbering fields stay zero (this table never reuses an id), propagation
+is always private, `mnt_attr` carries `MOUNT_ATTR_RDONLY` only when the mount
+records it, and a foreign `mnt_ns_id` is `EOPNOTSUPP` instead of the caller's own
+table's id.
+
+**Pin**: `user/tests/src/bin/t-statmount.rs` (~40 claims; skips on the host where
+these calls are `EPERM`). x86_64 `pass=230 fail=0`, aarch64 `pass=229 fail=0`,
+`mpos-kunit 34 passed` both; counterfactual (both dispatch arms removed) leaves
+only `t-statmount` red. `docs/notes/` §3.14 carries the measured table and the
+reasoning.
