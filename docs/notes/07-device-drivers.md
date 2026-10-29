@@ -3259,6 +3259,23 @@ So the last step is *niri's* side of the device rather than this kernel's, and t
 
 What is left is device-side: the driver's `SET_SCANOUT`/`RESOURCE_FLUSH` encoding (scanout id, rect, resource id) against what QEMU's virtio-gpu does with a virgl resource, read with a host-side instrument (QEMU's own trace for `virtio_gpu_cmd_set_scanout`), because the guest's side says the card was told twice per frame and the card's output says the console is what it is drawing.
 
+**Then the device side was read, and the "pixel-identical screendump" reading turned out to be the instrument's own limit.** Booting the same image with QEMU's virtio-gpu command trace on (`-trace enable=virtio_gpu_cmd_set_scanout -trace enable=virtio_gpu_cmd_res_flush -trace enable=virtio_gpu_cmd_res_create_3d -trace enable=virtio_gpu_cmd_res_xfer_toh_3d -trace enable=virtio_gpu_cmd_ctx_res_attach -trace enable=virtio_gpu_cmd_ctx_create -trace file=…`) makes the wire one number per side, and the numbers say the guest sent exactly what it meant to:
+
+| on the wire | count |
+|---|---|
+| `set_scanout` to the client's frame (`res 0x4`) | 20 |
+| `set_scanout` to the driver's own framebuffer (`res 0x40000004`, `abi::RESOURCE_FB` in `crates/gpu/src/abi.rs:226`) | 40 |
+| `res_flush` of the client's frame | 20 |
+| `res_flush` of the driver's own framebuffer, whole screen | 257 |
+| `res_create_3d` | 212 (ids 1, 2, 4 … plus the context's own) |
+| `ctx_res_attach` | ctx 0x1 ← res 1, 2, 4 |
+
+So `RESOURCE_FB = 0x40000004` and the seesaw is exact: 20 client frames, 40 switches back to the console, 257 console flushes between them — the console is painting at ~21 Hz while kmscube runs, and the reason is the render loop's own frame rule, not the device's answer. Every `set_scanout` names scanout id 0, the mode's own rect (1280x800, x 0 y 0) and a resource id the trace shows the card accepting.
+
+**What that does to the earlier claim is a lesson about instruments, not about the driver.** A QMP `screendump` on a `virtio-gpu-gl-pci` console reads the 2D display surface; the frames this card presents are GL scanouts, which are not that surface. So 2 736 `screendump`s taken as fast as QMP answered (0.35 s apart and then back-to-back for 14 s inside kmscube's run) are *all* the same image because they are all the same — the console's own last 2D surface — and they never could have shown a client's GL frame. The "pixel-identical" number (15790 non-black pixels, 65 colours, md5 `249feddd`) is a measurement of the console surface and of nothing else. A host-side instrument for a GL scanout has to be the display itself: `egl-headless` has no surface to read, so the next attempt is a window (`-display gtk,gl=on` on this host's `:0`) captured with `ffmpeg -f x11grab` — tried once and the window did not appear (the X root stayed one colour, 4818-byte PNGs), so that instrument itself is the next thing to establish rather than a conclusion to draw.
+
+What is therefore still open, and now stated as open: whether the 20 client `set_scanout`s are what the host's display shows is **not measured** — the guest side and the command wire both say yes, and no instrument yet in this repo can see the other end.
+
 **One thing this work paid for that is not about the picture: the console's own input.** Every measurement above was driven by typing one short line into the guest's serial console, and *two of those lines arrived as their first seven characters* - `sh /mnt/share/pin.sh` became `sh /mnt` twice, and the run then did nothing at all while the harness waited for a marker that could not come. What was measured on the way is the shape of it: the same line sent **in one write** arrives whole and runs, while the same line sent two characters at a time with a pause between (a pace *slower* than a person's) is truncated at the same place. A console that drops bytes for being typed slowly is a console bug rather than a probe bug, and it is not this section's: it belongs to the serial line's receive path (§7.1's console work) and is recorded here because this is where it was found, with both logs (`.workbuddy/pin-*-session.log`) as the measurement.
 
 What is *not* measured here is still the picture itself: that is the window's, and it is the one step a headless run cannot take. What a headless run *can* say - and now does - is that the device holds a drawn frame for the client, that the scanout names that client's own resource, and that no batch is dropped on the way.
