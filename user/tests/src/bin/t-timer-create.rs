@@ -189,6 +189,11 @@ impl Itimerspec {
     fn remaining_ms(&self) -> i64 {
         self.value.tv_sec * 1000 + self.value.tv_nsec / 1_000_000
     }
+
+    /// The interval in whole milliseconds.
+    fn interval_ms(&self) -> i64 {
+        self.interval.tv_sec * 1000 + self.interval.tv_nsec / 1_000_000
+    }
 }
 
 /// The uapi's `siginfo_t`: three `int`s, four bytes of padding, then the
@@ -856,6 +861,166 @@ fn main() {
         "SIGRTMIN is unblocked again",
         unblocked == Ok(0),
         unblocked,
+    );
+
+    // === a timer belongs to the thread group ===============================
+    //
+    // Measured on Linux 7.2.11 (`build/scratch/timerown/probe.c`): a worker
+    // thread creates a periodic `SIGEV_SIGNAL` timer and exits; the process
+    // keeps it (`timer_gettime` answers 0 with the interval still there), every
+    // thread of the group may arm/read/delete it, the expiry is queued for the
+    // process (`si_code == SI_TIMER`) rather than for the thread that made it,
+    // and a `fork` child has none of it (`EINVAL` to both read and delete).
+    // Linux bounds the count per process by its own resource limit where this
+    // kernel keeps `TIMER_SLOTS` per group - a named divergence (§2.11), not a
+    // claim here.
+    const USR1_BIT: u64 = 1u64 << (libc::SIGUSR1 - 1);
+    static GROUP_ID: AtomicI32 = AtomicI32::new(-1);
+    static GROUP_CREATED: AtomicI32 = AtomicI32::new(-2);
+
+    ok_is(
+        &mut r,
+        "SIGUSR1 is blocked so an expiry can be taken, not defaulted",
+        sigmask(libc::SIG_BLOCK, USR1_BIT),
+        0,
+    );
+
+    let maker = std::thread::spawn(|| {
+        let event = SigEvent::signal(libc::SIGUSR1);
+        let mut id: i32 = -1;
+        let created = timer_create(libc::CLOCK_MONOTONIC, &event, &mut id);
+        if created.is_ok() {
+            let periodic = Itimerspec {
+                interval: TimeSpec::ms(50),
+                value: TimeSpec::ms(50),
+            };
+            let _ = timer_settime(id, 0, &periodic);
+        }
+        GROUP_CREATED.store(created.map_or(-1, |v| v as i32), Ordering::SeqCst);
+        GROUP_ID.store(id, Ordering::SeqCst);
+    });
+    let _ = maker.join();
+
+    let id = GROUP_ID.load(Ordering::SeqCst);
+    let created_code = GROUP_CREATED.load(Ordering::SeqCst);
+    check_with(
+        &mut r,
+        "a thread of the group makes a timer for the group",
+        created_code == 0,
+        created_code,
+    );
+
+    let mut now = Itimerspec {
+        interval: TimeSpec::zero(),
+        value: TimeSpec::zero(),
+    };
+    ok_is(
+        &mut r,
+        "the timer outlives the thread that made it",
+        timer_gettime(id, &mut now),
+        0,
+    );
+    check_with(
+        &mut r,
+        "and it still carries the interval that thread armed",
+        now.interval_ms() > 0,
+        now.interval_ms(),
+    );
+    ok_is(
+        &mut r,
+        "another thread of the group may re-arm it",
+        timer_settime(id, 0, &Itimerspec::one_shot(30)),
+        0,
+    );
+
+    // Polled with a zero timeout, not parked with a null one: a kernel that
+    // kept the timer on its maker's record answers `EINVAL` above, and a
+    // claim that then parked for a record that cannot come would turn this
+    // pin into a timeout instead of a failed claim.
+    let mut info = Siginfo::zeroed();
+    let mut expiry = Err(Errno::AGAIN);
+    let mut waited_ms = 0;
+    while waited_ms < 2000 {
+        expiry = sigtimedwait_poll(USR1_BIT, &mut info);
+        if expiry.is_ok() {
+            break;
+        }
+        sleep_ms(5);
+        waited_ms += 5;
+    }
+    ok_is(
+        &mut r,
+        "the expiry lands on the process once its maker is gone",
+        expiry,
+        libc::SIGUSR1 as isize,
+    );
+    check_with(
+        &mut r,
+        "and it is the timer's own record (SI_TIMER)",
+        info.code == -2,
+        info.code,
+    );
+    ok_is(
+        &mut r,
+        "any thread of the group may delete it",
+        timer_delete(id),
+        0,
+    );
+
+    // A group's table is not inherited across `fork`: a child is a new process,
+    // and its timer numbers name nothing (Linux measured: EINVAL for both).
+    let mut forked: i32 = -1;
+    ok_is(
+        &mut r,
+        "the parent makes a timer to test inheritance with",
+        timer_create(
+            libc::CLOCK_MONOTONIC,
+            &SigEvent::signal(libc::SIGUSR1),
+            &mut forked,
+        ),
+        0,
+    );
+    let _ = timer_settime(forked, 0, &Itimerspec::one_shot(10_000));
+
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let mut child_now = Itimerspec {
+            interval: TimeSpec::zero(),
+            value: TimeSpec::zero(),
+        };
+        let child_read = timer_gettime(forked, &mut child_now);
+        let child_delete = timer_delete(forked);
+        let both_refused = matches!(child_read, Err(e) if e == Errno::INVAL)
+            && matches!(child_delete, Err(e) if e == Errno::INVAL);
+        unsafe { libc::_exit(if both_refused { 0 } else { 1 }) };
+    }
+    check_with(&mut r, "the parent forks", pid > 0, pid);
+
+    let mut status: i32 = -1;
+    let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    check_with(
+        &mut r,
+        "the fork's child is refused both calls (EINVAL)",
+        waited == pid && status == 0,
+        (waited, status),
+    );
+    ok_is(
+        &mut r,
+        "the parent's own timer still answers",
+        timer_gettime(forked, &mut now),
+        0,
+    );
+    ok_is(
+        &mut r,
+        "and the parent may still delete it",
+        timer_delete(forked),
+        0,
+    );
+    ok_is(
+        &mut r,
+        "SIGUSR1 is unblocked again",
+        sigmask(libc::SIG_UNBLOCK, USR1_BIT),
+        0,
     );
 
     r.finish()

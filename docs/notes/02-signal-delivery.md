@@ -685,3 +685,83 @@ choice rather than Linux's `signal_wake_up` scan. The table itself is the
 thread group's one object now (§2.7), so a handler a worker installed is the
 one that runs. `SIGCONT`'s session half, named beside it since §2.6, landed on
 2026-10-27 there.
+
+### 2.11 A POSIX timer belongs to the thread group (LANDED 2026-10-29)
+
+The timer table lived on the **task**, and that one fact answered three
+questions wrong. A timer a worker thread created died with the worker; its
+expiry was queued on the task that created it rather than the process; and a
+`fork`'s child could not have inherited one because there was nothing of the
+group's to inherit. Linux keeps the object on the thread group - the timer is
+the process's, addressable by any of its threads, and its signal is
+process-directed.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/timerown/probe.c` and
+`fork.c`, musl-static, raw `SYS_timer_*`; the probe children flush before
+`_exit`):
+
+| what the probe did | Linux 7.2.11 |
+|---|---|
+| a worker thread creates a periodic `SIGEV_SIGNAL`/`SIGUSR1` timer (100 ms), arms it, **exits** | `after-exit gettime rc=0`, `remaining=0.099987546s interval=0.100000000s` - the process kept it |
+| the main thread's blocked `rt_sigtimedwait(SIGUSR1)` | two expiries, `sig=10`, `si_code = -2` (`SI_TIMER`) - the record is the process's |
+| a *different* thread (the main one) calls `timer_settime`/`timer_gettime`/`timer_delete` | each answers 0 - the id is the process's, not its maker's |
+| the process `fork`s after creating a timer | child: `gettime rc=-1 errno=22 (EINVAL)`, `delete rc=-1 errno=22`; parent: `gettime rc=0`, still armed (`remaining≈29 s`) |
+| sixteen `timer_create`s in one process | `many created=16` - the bound is the process's own resource limit, not a fixed table |
+
+**The landing** (`src/sched/runtime/task.rs`, uncommitted parent `d43790a`):
+
+* `timer_alloc`, `timer_arm`, `timer_state`, `timer_overrun` and
+  `timer_remove` resolve `let leader = t.task(t.current).tgid;` and act on that
+  record. The leader is the one that holds `timers` (`Task::timers`,
+  `TIMER_SLOTS`); a worker's own array is never filled, so its exit takes
+  nothing with it. A `fork` child is a fresh leader with an empty table, which
+  is what makes the `EINVAL` half of the measurement fall out.
+* `check_posix_timers` walks **leaders only**: `let leader = task.tgid ==
+  owner; if !leader { continue; }`. It does **not** skip a zombie leader (a
+  group can outlive the thread that made the timer), and it requires
+  `group_live` - at least one live member of the leader's group - before any
+  delivery. The expiry's reload still happens before the target is chosen, so a
+  `SIGEV_NONE` timer, or one whose group is already gone, keeps counting.
+* A process-directed expiry (`TimerNotify::Signal`) picks a live member that
+  does **not** block `signo`: leader first, then any unblocked member, then any
+  live member (Linux's `signal_wake_up` chooses the same way among unblocked
+  threads). `SIGEV_THREAD_ID` still needs the target's `tgid == owner` and
+  skips a target that has exited.
+
+**Pin** `user/tests/src/bin/t-timer-create.rs`, the "a timer belongs to the
+thread group" family - 14 claims composed from the probe's own calls: block
+`SIGUSR1` in the main thread so an expiry can be *taken*; a worker makes and
+arms a 50 ms periodic timer and exits; the main thread reads it (`0`, interval
+still there), re-arms it one-shot 30 ms, **polls** a zero-timeout
+`rt_sigtimedwait` until the record arrives (2000 ms budget - a claim that
+parked would turn the pin into a harness timeout, not a failed claim, and the
+first version did exactly that: under the counterfactual it hit its 120 s
+program budget), checks `si_code == -2` and deletes it; then a `fork` whose
+child is refused both calls (`EINVAL`) while the parent's copy still answers 0.
+Host reference first: `MPOS_ON_HOST=1 ./target/x86_64-unknown-linux-musl/debug/t-timer-create`
+→ all fourteen `ok:`, `PASS`.
+
+**Counterfactual** (`build/scratch/timerown-cf2.log`, `src/sched/runtime/task.rs`
+reverted to the per-task table, the pin kept): `CF-EXIT=1`, `pass=228 fail=1
+(229 built)`, the one red program `t-timer-create` failing exactly six claims -
+`FAIL: the timer outlives the thread that made it (got EINVAL)`, `FAIL: and it
+still carries the interval that thread armed (got 0)`, `FAIL: another thread of
+the group may re-arm it (got EINVAL)`, `FAIL: the expiry lands on the process
+once its maker is gone (got EAGAIN)`, `FAIL: and it is the timer's own record
+(SI_TIMER) (got 0)`, `FAIL: any thread of the group may delete it (got
+EINVAL)`. The fix was restored and `grep -c "let leader = t.task(t.current).tgid"`
+answers 5.
+
+**Gate** `build/scratch/timerown-gate2.log`: `EXIT=0` - x86_64 `pass=229
+fail=0`, aarch64 `pass=228 fail=0`, `mpos-kunit 34 passed, 0 failed` on both
+arms, stage 1 `1178 tests, 0 failed 24.51 s`.
+
+**Named divergences.** The count is `TIMER_SLOTS = 8` per group: Linux's
+sixteenth `timer_create` succeeds where this kernel's ninth is `EAGAIN`
+(`timer_alloc`'s `find` over the leader's table), deliberately bounded rather
+than approximated. The pending set is per task (§2.7) - a process-directed
+expiry sits on the task the scan chose, so if every thread blocks the signal
+it waits there, whereas Linux's shared group set lets the first thread that
+unblocks take it. `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` stay
+`EOPNOTSUPP` (no per-task accounting) and `TIMER_ABSTIME` stays `EINVAL` (one
+clock, no absolute domain), both as before, both in `docs/uapi/` item 128.

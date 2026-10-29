@@ -6896,3 +6896,33 @@ Linux first (which consoles `VT_LOCKSWITCH`/`VT_UNLOCKSWITCH` cover, what a
 `VT_ACKACQ` handshake on acquire), then the arms, then the pin — `t-seat`'s
 `VT_WAITUNTIL` claims are the ones to replace, and the probe in
 `docs/notes/` §7.1d is the instrument that found this family's last defect.
+
+## item 128 — a POSIX timer is the thread group's, and a worker's timer outlives it
+
+Served: `timer_create`(222), `timer_settime`(223), `timer_gettime`(224),
+`timer_getoverrun`(225), `timer_delete`(226) at the group level — measured on
+Linux 7.2.11 in `build/scratch/timerown/probe.c` before the change: a worker
+thread's periodic `SIGEV_SIGNAL` timer keeps running after that thread exits,
+any thread of the group may arm/read/delete it, the expiry arrives with
+`si_code == SI_TIMER` wherever a thread is ready for it, and a `fork` child
+holds none of it (`EINVAL` to both `timer_gettime` and `timer_delete`, while the
+parent's copy still answers). The table is the **leader's** now, resolved from
+`tgid` the same way `pidfd` and `kill(-pgid)` reach a process; the tick scan
+walks leaders, keeps a zombie leader's timers alive while any member of its
+group lives, and hands a process-directed expiry to a live member that does not
+block the signal (leader first, then any unblocked member, then any live member).
+
+**Named divergences.** The count is `TIMER_SLOTS = 8` per group, where Linux
+bounds it by the process's own resource limit — sixteen creates in one process
+all succeed there, the ninth here is `EAGAIN` (`docs/notes/` §2.11,
+`TIMER_SLOTS`). A process-directed expiry is queued on **one task** (this
+kernel's pending set is per task, `docs/notes/` §2.7); Linux's shared group set
+lets any thread that later unblocks take it, so if every thread blocks the
+signal the record waits on the one it chose. `CLOCK_PROCESS_CPUTIME_ID` and
+`CLOCK_THREAD_CPUTIME_ID` are `EOPNOTSUPP` (no per-task accounting), `TIMER_ABSTIME`
+is `EINVAL` (one clock, no absolute domain), and a `SIGEV_THREAD_ID` number that
+names no live task of the group is `EINVAL`, all as Linux's own gates measured.
+
+**Pin**: `user/tests/src/bin/t-timer-create.rs`'s "a timer belongs to the thread
+group" family — 14 claims, run first against a real host
+(`MPOS_ON_HOST=1`, 14/14 `ok`) and then on both machines.

@@ -311,7 +311,7 @@ One-glance status of the whole roadmap.
   context is an object this kernel does not have (§3.11, item 122)
 
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
-- [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)
+- [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works; the table is the **thread group's** now, so a worker's timer outlives its maker, any thread may arm/delete it, a process-directed expiry lands on the process, a `fork` child inherits none of it, and a zombie leader's group keeps them (§2.11, item 128)
 - [x] `io_uring_setup`/`enter`/`register` (425/426/427) — the ring ABI is **served**: setup publishes Linux's measured layout (a 120-byte params struct, the three `IORING_OFF_*` mappings, `2 x sq_entries` CQ, entries rounded up to a power of two) and `enter` runs `NOP`/`READ`/`WRITE`/`READV`/`WRITEV`/`FSYNC`/`CLOSE` synchronously through the syscall handlers, so each CQE's `res` is the number the blocking call would have answered; a served request keeps working while anything outside the subset is refused **per item** with `-EOPNOTSUPP` (and an opcode no Linux has is `-EINVAL`, as measured). Named refusals: every non-zero setup flag (`SQPOLL`/`CQE32`/`SQE128`… would be promises of a poll thread and 32-byte records), `io_uring_register` for every op, and the SQ cap at 1024 entries (Linux 32768, the §8.0 memory bound) (§6.32, item 115)
 
 **Drivers (Phase 7)**

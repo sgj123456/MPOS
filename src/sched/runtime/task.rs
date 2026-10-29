@@ -757,12 +757,15 @@ pub struct ItimerSnapshot {
     pub remaining_ticks: u64,
 }
 
-/// How many POSIX interval timers (`timer_create`) one task may hold. Linux
-/// bounds them by `RLIMIT_SIGPENDING` — thousands — and grows them on the
+/// How many POSIX interval timers (`timer_create`) one **process** may hold.
+/// Linux bounds them by `RLIMIT_SIGPENDING` — thousands — and grows them on the
 /// heap; a fixed slot count bounds the same surface by construction, and the
 /// programs that real: vim keeps one. A create past the last slot answers
 /// `EAGAIN`, which is the errno a caller that probes reads as "out of
-/// resources" — and the message musl hands back through `timer_create`.
+/// resources" — and the message musl hands back through `timer_create`. The
+/// count is the process's, not a thread's: Linux keeps the timer list on
+/// `signal_struct`, so `docs/notes/` §2.11's measurement has sixteen creates in
+/// one process answer 0 and this table names the fixed figure as its divergence.
 pub const TIMER_SLOTS: usize = 8;
 
 /// The `sigev_notify` values `timer_create` accepts, as the ABI numbers them.
@@ -1253,8 +1256,10 @@ pub(crate) struct Task {
     /// want of per-task CPU accounting.
     pub(crate) itimers: [Option<ItimerState>; 3],
     /// The POSIX interval timers `timer_create` made, indexed by the id the
-    /// call answered with. A timer belongs to the task that created it, not
-    /// to its thread group - the divergence `handle_timer_create` records.
+    /// call answered with. The table is the **thread group's**: Linux keeps
+    /// its timers on `signal_struct`, so the leader's table is the one every
+    /// thread of the group reaches and the one an expiry fires from
+    /// (`docs/notes/` §2.11), while a non-leader's table is never written.
     pub(crate) timers: [Option<PosixTimer>; TIMER_SLOTS],
     /// What a tracer has made of this task, if anything.
     pub(crate) trace: Tracing,
@@ -1873,8 +1878,20 @@ impl Table {
     /// its expiry may queue a signal on a task other than the one that owns
     /// it, and writing that cross-task queueing inline in one pass would hold
     /// two `&mut` tasks at once. So the pass runs in three steps: read the
-    /// table to see what each target is (its group, its pending set), walk
-    /// the timers and decide, then deliver - one `&mut` borrow at a time.
+    /// table to see what each target is (its group, its pending set, its
+    /// blocked mask), walk the timers and decide, then deliver - one `&mut`
+    /// borrow at a time.
+    ///
+    /// What is walked is the **leaders'** tables, because the timer list is
+    /// the thread group's (`§2.11`): a timer a worker created survives the
+    /// worker, and a leader that has become a zombie still fires its group's
+    /// timers while a thread of that group is alive - Linux's own shape, where
+    /// the list hangs off `signal_struct` and not off the task. A process-directed
+    /// expiry (`SIGEV_SIGNAL`) lands on a live thread that does not block the
+    /// signal, the leader first, which is as close as a per-task pending set
+    /// gets to Linux's group-shared one; a `SIGEV_THREAD_ID` expiry still aims
+    /// at its named thread and is silent when that thread is gone.
+    ///
     /// The armed flags are separate from the itimer's, so a machine with one
     /// kind of timer and not the other never scans for the other.
     pub(crate) fn check_posix_timers(&mut self) {
@@ -1885,12 +1902,20 @@ impl Table {
         // Step 1: what the scan needs about every task, without holding any
         // of them mutably. A signal queued in this pass is also tracked in
         // `fresh` below, so a second timer aiming at the same thread in the
-        // same pass still counts an overrun rather than double-queueing.
-        let mut targets: alloc::vec::Vec<(TaskId, TaskId, bool, signal::Pending)> =
+        // same pass still counts an overrun rather than double-queueing. The
+        // blocked mask rides along because a process-directed expiry has to
+        // find a thread that will actually take the signal.
+        let mut targets: alloc::vec::Vec<(TaskId, TaskId, bool, signal::Pending, signal::Pending)> =
             alloc::vec::Vec::with_capacity(MAX_TASKS);
         for (i, slot) in self.tasks.iter().enumerate() {
             if let Some(task) = slot {
-                targets.push((TaskId(i), task.tgid, task.exited, task.signals));
+                targets.push((
+                    TaskId(i),
+                    task.tgid,
+                    task.exited,
+                    task.signals,
+                    task.blocked,
+                ));
             }
         }
         // Step 2: walk the timers and decide what each expiry does.
@@ -1901,11 +1926,17 @@ impl Table {
             let Some(task) = slot.as_mut() else {
                 continue;
             };
-            if task.exited {
+            let owner = TaskId(i);
+            // Only the leader's table is a group's timers. A zombie leader's
+            // is still the group's while a thread of the group is alive - the
+            // case a worker-created timer outliving its group's leader shows.
+            let leader = task.tgid == owner;
+            if !leader {
                 continue;
             }
-            let owner = TaskId(i);
-            let owner_tgid = task.tgid;
+            let group_live = targets
+                .iter()
+                .any(|(_, tgid, exited, _, _)| *tgid == owner && !*exited);
             for timer in task.timers.iter_mut().flatten() {
                 if !timer.expired(now) {
                     if timer.deadline.is_some() {
@@ -1928,19 +1959,50 @@ impl Table {
                     }
                     _ => timer.deadline = None,
                 }
-                // Who the expiry targets: nowhere, the creating task, or the
+                // Who the expiry targets: nowhere, a live thread of the
+                // group (Linux's process-directed `SIGEV_SIGNAL`), or the
                 // named thread - resolved here, because a `SIGEV_THREAD_ID`
                 // thread can have left the group since the timer was made. A
                 // timer whose thread is gone stays armed and silent, which is
                 // what Linux's does; only the delivery is skipped.
+                //
+                // The process-directed choice prefers a thread that does not
+                // block the signal, the leader first: Linux leaves the signal
+                // on the group's shared set where any unblocked thread takes
+                // it, and this kernel's pending set is per task, so it picks
+                // the thread Linux would have found - naming the divergence
+                // when every thread blocks it (the record then waits on one
+                // task instead of on the group).
                 let target = match timer.notify {
                     TimerNotify::None => continue,
-                    TimerNotify::Signal => Some(owner),
+                    TimerNotify::Signal => {
+                        if !group_live {
+                            continue;
+                        }
+                        let takes =
+                            |blocked: signal::Pending| blocked & signal::bit(timer.signo) == 0;
+                        targets
+                            .iter()
+                            .find(|(id, tgid, exited, _, blocked)| {
+                                *tgid == owner && !*exited && *id == owner && takes(*blocked)
+                            })
+                            .or_else(|| {
+                                targets.iter().find(|(_, tgid, exited, _, blocked)| {
+                                    *tgid == owner && !*exited && takes(*blocked)
+                                })
+                            })
+                            .or_else(|| {
+                                targets
+                                    .iter()
+                                    .find(|(_, tgid, exited, _, _)| *tgid == owner && !*exited)
+                            })
+                            .map(|(id, _, _, _, _)| *id)
+                    }
                     TimerNotify::Thread(t) => targets
                         .iter()
-                        .find(|(id, _, _, _)| *id == t)
-                        .filter(|(_, tgid, exited, _)| !*exited && *tgid == owner_tgid)
-                        .map(|(id, _, _, _)| *id),
+                        .find(|(id, _, _, _, _)| *id == t)
+                        .filter(|(_, tgid, exited, _, _)| !*exited && *tgid == owner)
+                        .map(|(id, _, _, _, _)| *id),
                 };
                 let Some(target_id) = target else {
                     continue;
@@ -1950,8 +2012,8 @@ impl Table {
                 // overrun count - Linux's own semantics for this class.
                 let pending_there = targets
                     .iter()
-                    .find(|(id, _, _, _)| *id == target_id)
-                    .is_some_and(|(_, _, _, signals)| *signals & signal::bit(timer.signo) != 0)
+                    .find(|(id, _, _, _, _)| *id == target_id)
+                    .is_some_and(|(_, _, _, signals, _)| *signals & signal::bit(timer.signo) != 0)
                     || fresh.contains(&(target_id, timer.signo));
                 if pending_there {
                     timer.overrun += 1;
@@ -3197,7 +3259,10 @@ pub fn timer_alloc(signo: u8, value: u64, notify: TimerNotify) -> Result<usize, 
                 return Err(crate::err::EINVAL);
             }
         }
-        let task = t.task_mut(t.current);
+        // The group's table: `timer_create` by any thread, `timer_gettime`
+        // from any thread, and an expiry fires the same table (`§2.11`).
+        let leader = t.task(t.current).tgid;
+        let task = t.task_mut(leader);
         let slot = (0..TIMER_SLOTS).find(|&s| task.timers[s].is_none());
         let Some(slot) = slot else {
             return Err(crate::err::EAGAIN);
@@ -3236,7 +3301,8 @@ pub fn timer_arm(slot: usize, interval_ticks: u64, deadline: Option<u64>) -> Opt
         POSIX_TIMERS_ARMED.store(true, Ordering::Relaxed);
     }
     with_table(|t| {
-        let task = t.task_mut(t.current);
+        let leader = t.task(t.current).tgid;
+        let task = t.task_mut(leader);
         let timer = task.timers.get_mut(slot)?.as_mut()?;
         let old = (
             timer.interval_ticks,
@@ -3253,7 +3319,8 @@ pub fn timer_arm(slot: usize, interval_ticks: u64, deadline: Option<u64>) -> Opt
 /// answers zero remaining, exactly as Linux's does.
 pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
     with_table(|t| {
-        let timer = t.task(t.current).timers.get(slot)?.as_ref()?;
+        let leader = t.task(t.current).tgid;
+        let timer = t.task(leader).timers.get(slot)?.as_ref()?;
         Some((
             timer.interval_ticks,
             timer.deadline.map_or(0, |d| d.saturating_sub(hal::ticks())),
@@ -3264,7 +3331,10 @@ pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
 /// The overrun count `timer_getoverrun` reports, or `None` for an id that
 /// names no timer of this task's.
 pub fn timer_overrun(slot: usize) -> Option<u32> {
-    with_table(|t| Some(t.task(t.current).timers.get(slot)?.as_ref()?.overrun))
+    with_table(|t| {
+        let leader = t.task(t.current).tgid;
+        Some(t.task(leader).timers.get(slot)?.as_ref()?.overrun)
+    })
 }
 
 /// Free a timer's slot. The id dies with it: a later use of the same number
@@ -3272,7 +3342,8 @@ pub fn timer_overrun(slot: usize) -> Option<u32> {
 /// timer that was deleted is not a timer whatever occupies its slot now.
 pub fn timer_remove(slot: usize) -> bool {
     with_table(|t| {
-        let task = t.task_mut(t.current);
+        let leader = t.task(t.current).tgid;
+        let task = t.task_mut(leader);
         match task.timers.get_mut(slot) {
             Some(slot @ Some(_)) => slot.take().is_some(),
             _ => false,
