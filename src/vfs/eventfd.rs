@@ -142,6 +142,32 @@ impl Inode for EventFd {
             write: true,
         }
     }
+
+    /// An eventfd is ready for writing always, so a writer never waits here -
+    /// but a *reader's* wait is this node's event to deliver, and it is not
+    /// only `read(2)` that waits: `poll`/`select`/`epoll_wait` park a task on
+    /// the same question and subscribe through this door. A node that keeps
+    /// its own parker list and does not also register the pollers leaves them
+    /// asleep until their own timeout - measured on a probe boot: a thread
+    /// writing an eventfd after 300 ms woke an `epoll_wait(-1)`-style park
+    /// only at its 3000 ms timeout, while the same shape on a pipe and on a
+    /// socketpair woke in 0-1 ms. That is the shape `async-io`/`zbus` use for
+    /// every cross-thread wake, and a compositor whose event loop is parked on
+    /// one looks frozen until a signal happens to interrupt the wait.
+    fn poll_subscribe(&self, id: crate::sched::policy::TaskId) {
+        critical_section::with(|cs| {
+            let mut waiters = self.waiters.borrow(cs).borrow_mut();
+            if !waiters.contains(&id) {
+                waiters.push(id);
+            }
+        });
+    }
+
+    fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
+        critical_section::with(|cs| {
+            self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
+        });
+    }
 }
 
 impl EventFd {

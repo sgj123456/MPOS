@@ -6793,3 +6793,28 @@ Pinned by `t-kill-ends-group` (both machines): a re-exec fixture with a worker i
 instead of a harness timeout. Host Linux is the reference (`MPOS_ON_HOST=1`, 4/4
 ok); the sweep is `pass=229 fail=0`, and without the call
 `pass=228 fail=1` with exactly those claims red (§6.37).
+
+## item 124 — an eventfd's write wakes the pollers parked on it
+
+`epoll_wait`/`poll`/`select` park a task on a node's readiness, and the node that
+produces the event must wake it. `pipe` does that (`waiting_readers`/
+`waiting_writers`); `eventfd` kept its waiters for the blocking `read_at` only, so
+a thread parked in `epoll_wait` on an eventfd was on no list and woke only at its
+own timeout — measured in the guest at 3000 ms where a pipe answered in 0 ms and a
+socketpair in 1 ms. `src/vfs/eventfd.rs` now implements `poll_subscribe`/
+`poll_unsubscribe` over the same list its write already wakes.
+
+This is the call `async-io`/`zbus` use to wake a compositor's event loop; without
+it `niri` parked for thirteen seconds and its entire startup appeared at once when
+`SIGINT` interrupted the wait (the "Ctrl-C 时界面先正常出现" report). With it the
+compositor creates its output during startup, presents its frames, and exits
+cleanly on `SIGINT`.
+
+Pinned by `t-eventfd` (both machines; host Linux is the reference): the write must
+wake the park well inside a 1500 ms budget, so a lost wake fails rather than passes
+slowly. The counterfactual is the probe-image pair — `FAIL` on the unfixed kernel,
+`PASS` on the fixed one (§3.12).
+
+Named beside it (code read, unmeasured): `timerfd` and `signalfd` also do not
+implement `poll_subscribe`, so the same park has no door there; a delivered signal
+covers `signalfd` in practice through `EINTR`, `timerfd` has no such accident.

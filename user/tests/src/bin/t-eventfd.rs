@@ -24,9 +24,60 @@
 //! has never heard of - so that one probe is the raw call (`SYS_eventfd2`:
 //! 290 / 19).
 
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+
 use mpos_user_tests::Report;
 use rustix::event::{EventfdFlags, eventfd};
 use rustix::io::{Errno, FdFlags, fcntl_getfd, read, write};
+
+/// The machine's `struct epoll_event` (packed on x86_64 only), copied from
+/// `t-epoll`'s own measurement of the uapi's `EPOLL_PACKED` guard.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
+
+/// `epoll_wait`, on each machine's own spelling (arm64 has `epoll_pwait` only).
+fn epoll_wait_raw(epfd: i32, events: &mut [Ev], timeout: i32) -> isize {
+    #[cfg(target_arch = "x86_64")]
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_epoll_wait,
+            epfd as libc::c_long,
+            events.as_mut_ptr() as libc::c_long,
+            1 as libc::c_long,
+            timeout as libc::c_long,
+        )
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_epoll_pwait,
+            epfd as libc::c_long,
+            events.as_mut_ptr() as libc::c_long,
+            1 as libc::c_long,
+            timeout as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
+    }
+}
 
 /// The door returns `-1` and leaves the refusal in `errno` (batch 12's
 /// measurement); the claim is about what the kernel answered.
@@ -149,6 +200,66 @@ fn main() {
         }
         Err(_) => {
             r.check("eventfd(0, EFD_CLOEXEC) hands back a descriptor", false);
+        }
+    }
+
+    // A cross-thread wake through an epoll: one thread writes the eventfd a
+    // little after another has parked in `epoll_wait`. This is the shape every
+    // async runtime uses (`async-io`'s reactor, `zbus`'s executor) - and it is
+    // the one that was measured broken here: the park woke only at its own
+    // timeout (3000 ms) because the node kept a parker list for `read(2)` and
+    // never registered the pollers on it, while a pipe and a socketpair woke
+    // in 0-1 ms. The claim is the *elapsed* time, not the return code: a wake
+    // lost until the timeout still reports ready.
+    match eventfd(0, EventfdFlags::empty()) {
+        Ok(signal) => {
+            let epfd = unsafe { libc::syscall(libc::SYS_epoll_create1, 0 as libc::c_long) };
+            r.check("an epoll instance is made for the wake claim", epfd >= 0);
+            if epfd >= 0 {
+                let epfd = epfd as i32;
+                let mut ev = Ev {
+                    events: 1, // EPOLLIN
+                    data: 0x5a5a_5a5a,
+                };
+                let added = unsafe {
+                    libc::syscall(
+                        libc::SYS_epoll_ctl,
+                        epfd as libc::c_long,
+                        1 as libc::c_long, // EPOLL_CTL_ADD
+                        signal.as_raw_fd() as libc::c_long,
+                        &mut ev as *mut Ev as libc::c_long,
+                    )
+                };
+                r.check("the eventfd is watched by the epoll", added == 0);
+                let writer = std::thread::spawn({
+                    let fd = signal.as_raw_fd();
+                    move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        let one = 1u64.to_ne_bytes();
+                        unsafe { libc::write(fd, one.as_ptr() as *const libc::c_void, 8) }
+                    }
+                });
+                let started = Instant::now();
+                let mut back = [Ev { events: 0, data: 0 }; 1];
+                let n = epoll_wait_raw(epfd, &mut back, 1500);
+                let elapsed = started.elapsed();
+                r.check("the epoll reports the write", n == 1);
+                r.check(
+                    "an eventfd write wakes an epoll park at once, not at its timeout",
+                    elapsed < Duration::from_millis(1000),
+                );
+                r.check(
+                    "the wake carried the caller's data word",
+                    n == 1 && back[0].data == 0x5a5a_5a5a,
+                );
+                let _ = writer.join();
+                let mut drain = [0u8; 8];
+                let _ = read(&signal, &mut drain);
+                unsafe { libc::close(epfd) };
+            }
+        }
+        Err(_) => {
+            r.check("a blocking eventfd is made for the wake claim", false);
         }
     }
 

@@ -679,3 +679,55 @@ both, host suite 687); the counterfactual (the three dispatch arms removed)
 `CF-EXIT=1`, `pass=227 fail=1 (228 built)` with only `t-mount-api` red.
 
 Full record: `docs/uapi/` §5.1 item 122.
+
+### 3.12 An eventfd's pollers are woken by its write — **DONE (2026-10-29)**
+
+The display frontier found this one sideways: a compositor that looked frozen
+for thirteen seconds after it started, and whose whole startup appeared at once
+when a signal interrupted its wait (the user's "Ctrl-C 时界面先正常出现"). The
+kernel's own presentation path had been measured correct; the missing piece was
+that a wake never reached the parked task.
+
+**Measured in the guest first** (`build/scratch/gpu/wakeup.c`, a musl-static
+probe, two threads): one thread writes `1` to an `eventfd` after 300 ms while the
+main thread sits in an `epoll_wait` with no timeout of its own; the wait returned
+at its **3000 ms timeout**, not at the write. The same shape on a pipe answered
+in **0 ms** and on a `socketpair` in **1 ms**. A second round on the same
+descriptor answered at once, because the counter was already above zero — the
+lost wake is only visible on the first cross-thread event.
+
+**The cause**: an `Inode` that is not always ready must register a poller in
+`poll_subscribe` (the door `epoll_wait`/`poll`/`select` come through), and
+`src/vfs/pipe.rs` does (`waiting_readers`/`waiting_writers`). `EventFd` kept its
+own `waiters` list for the blocking `read_at`→`wait_nonzero` path only, and its
+write woke that list — so a thread parked in `epoll_wait` was on no list at all
+and only woke at its timeout. `src/vfs/eventfd.rs` now implements
+`poll_subscribe`/`poll_unsubscribe` over the same list, so the existing write
+wake reaches every waiter, blocking reader and poller alike.
+
+**Why it mattered beyond one call**: `async-io` and `zbus` wake their event loop
+with an eventfd, so a compositor's main thread parked in `epoll_pwait` looked
+frozen while its other threads finished work nobody could act on. On the same
+image after the fix, `niri` creates its `wl_output` during startup, presents two
+client frames (resources `0x4` and `0x11`) and exits cleanly on `SIGINT`
+(`N31-RC 0`); on the unfixed kernel it never exited (no `RC`, no `quitting due
+to receiving signal SIGINT`, seatd never saw a disconnect).
+
+**Pinned** by `t-eventfd` (both machines): an eventfd watched by an `epoll`, a
+thread writing after 100 ms, and the wait required to report the event **before
+its own 1500 ms budget** — so a lost wake fails the claim instead of passing
+slowly. Host Linux is the reference (`MPOS_ON_HOST=1` 4 claims ok). The
+counterfactual was measured in both directions on probe images: the new claim on
+the unfixed kernel `FAIL: an eventfd write wakes an epoll park at once, not at
+its timeout`, and on the fixed kernel `PASS`. Gates on the fixed tree: x86_64
+`all 229 user tests passed`, aarch64 `all 228` (`mpos-kunit 34 passed` both,
+stage 1 `1178 tests, 0 failed`).
+
+**Named gap from the same survey** (code read, not a measurement): the other
+nodes whose readiness is produced asynchronously — `timerfd`/`signalfd` — also
+do not implement `poll_subscribe`, so a task parked in `epoll_wait` on one of
+them has no registered door either. A `signalfd` is partly covered in practice
+because a delivered signal interrupts the wait (`EINTR`), which is how the
+compositor still saw `SIGINT`; a `timerfd` has no such accident, and nothing
+here has measured it. It is recorded as the next item of this shape rather than
+folded into this fix.

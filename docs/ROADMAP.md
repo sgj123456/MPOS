@@ -120,6 +120,12 @@ One-glance status of the whole roadmap.
   `anon_inode:[…]` name (`anon_inode:inotify` being the unbracketed one), and a
   zero-length read answers Linux's errno, `inotify` consulting its queue first
   (§6.11, item 99)
+- [x] an eventfd's write wakes the pollers parked on it — `epoll_wait`/`poll`/
+  `select` register through `poll_subscribe`, which `EventFd` did not implement, so
+  a cross-thread wake through the call `async-io`/`zbus` wake their loop with was
+  lost and the task woke only at its timeout (measured 3000 ms against 0-1 ms for a
+  pipe/socketpair); the compositor's thirteen-second park and the frame that
+  appeared at `SIGINT` were downstream of it (§3.12, item 124)
 - [x] 6.3 Namespaces — **all eight of `namespaces(7)`'s kinds served** — UTS, MNT, **PID**, **NET**, **TIME**, **USER**, **IPC** and **CGROUP** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`, `t-ns-ipc`, `t-ns-cgroup`): the numbers a process  
   sees are the  
