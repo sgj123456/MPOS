@@ -398,10 +398,15 @@ One-glance status of the whole roadmap.
   the GL card** (watched, 2026-10-14) — a client that renders into a client resource and has the  
   kernel scan it out, and a compositor whose pixels are the guest's, each through its own present  
   path (`docs/notes/` §7.4)
-- [ ] niri's own frame: it commits a framebuffer it never draws into (device pixels 0 of 4096000),  
-  with the kernel scanning out exactly that resource — two named leads, its renderer built on  
-  `card0` rather than the render node it resolved, and its submissions naming other resources  
-  (§7.4)
+- [ ] [~] niri's own picture: both named leads are **measured and closed** — the buffer chain is
+  consistent (`PRIME export <- handle 4 (ino=37632)`, `PRIME import -> handle 4 (… reused=true)`,
+  `execbuffer #3 resources=[4, 1, 11, 8]`, `scanning out the compositor's resource 4`) and niri
+  builds its primary renderer on `card0` at `/dev/dri/renderD128` as a compositor does on Linux,
+  so the resource the scanout names is the one the draw names. What is left is niri's own GL work:
+  its startup logs three `GL_OUT_OF_MEMORY in glBufferData` in the buffer path (`target 0`
+  resources of 1 048 576 bytes), and a run with no client flushes its resource **once** and idles
+  — the desktop never draws a second frame. Next: that upload, and a client that makes a window
+  (`weston-terminal` wrote an empty log; the probe shell needs `NIRI_SOCKET`) (§7.4)
 - [ ] [~] the property families a compositor finds by name — four built, three deliberately absent (§7.4, `t-drm-props`)
 - [ ] [~] the DRM surface a wlroots pixman compositor needs — in place, never booted (§7.4)
 - [x] the renderer Mesa picks: **virgl**, measured on the current tree (Mesa 26.2.5, GLES

@@ -109,6 +109,8 @@ static RE_PRESENT: AtomicBool = AtomicBool::new(false);
 static LAST_SCANOUT: AtomicU32 = AtomicU32::new(0);
 /// The console paint gate's last answer, so a change is said once.
 static LAST_PAINTED: AtomicBool = AtomicBool::new(false);
+/// The mux's answer at the last frame, so a change is said once.
+static LAST_MUX: AtomicBool = AtomicBool::new(true);
 
 /// Ask the render task to re-present the compositor's framebuffer and flush.
 /// Called from the mux's VT-switch path; wakes the task so it happens now.
@@ -765,6 +767,22 @@ fn task() {
         // console is what is on the screen". Said once per change, with its
         // inputs, so that is a measurement and not an inference.
         let console_may_paint = sink && (claimed || mux_painted);
+        // The gate that actually decides is `painted` below; when its inputs
+        // move, say so with all of them - a gate that changes its answer
+        // silently is exactly what made "the console keeps the screen" and
+        // "the compositor does" indistinguishable in a boot log.
+        if LAST_MUX.swap(mux_painted, Ordering::Relaxed) != mux_painted {
+            let vc = crate::term::vc::active();
+            crate::print!(
+                "mpos-dbg: mux gate mux_painted={} sink={} claimed={} active={} master_vc={:?} kd_mode={}\n",
+                mux_painted,
+                sink,
+                claimed,
+                vc,
+                crate::vfs::vcmux::master_vc(),
+                crate::vfs::vcmux::kd_mode(vc)
+            );
+        }
         if LAST_PAINTED.swap(console_may_paint, Ordering::Relaxed) != console_may_paint {
             crate::print!(
                 "mpos-dbg: console paint gate sink={} claimed={} mux_painted={}\n",

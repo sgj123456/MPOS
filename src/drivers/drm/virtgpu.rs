@@ -623,6 +623,16 @@ pub(crate) fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
     // `Illegal resource <n>` for, and it drops the whole batch over that one
     // unknown number - every command in it, half a megabyte of them if that is
     // what the caller sent.
+    // Measurement scaffold for the display frontier: this list is the only
+    // place the kernel sees *which* buffers a submit names, and comparing it
+    // with the resource the scanout shows tells "the frame was never drawn into
+    // the buffer we show" apart from "the frame was drawn into another one".
+    // First few submissions only - a compositor submits thousands.
+    static SEEN_SUBMITS: AtomicU32 = AtomicU32::new(0);
+    let seen = SEEN_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    if seen < 6 {
+        crate::print!("mpos-dbg: execbuffer #{seen} ofd={ofd} bytes={size} resources={named:?}\n");
+    }
     let attached = attach_resources(ofd, &named);
     if attached != 0 {
         return attached;

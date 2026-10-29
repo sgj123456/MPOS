@@ -6181,17 +6181,62 @@ in its 5.5 KiB of output. It is killed only because it loops forever: with
 `timeout -s KILL 12` it dies at the budget (`rc=137`), which is the group-death fix
 (`06-process-management.md` §6.37) doing its job.
 
-**The frame does not reach the scanout.** Four QMP `screendump`s taken 6 s apart
-while `kmscube` was running are **pixel-identical**: 1280×800, 15 790 non-black
-pixels (1.54 %), top colours `(0,0,0)` ×1 008 210, `(7,7,7)` ×7 760 — the static
-boot-console text on `fb0`, not a cube and not even a black client frame. On the
-wire the same boot carries **82 `mpos-dbg: RESOURCE_CREATE` lines** — `handle 1
-(target 2, 1280x800)` plus the cursor's `864x1` and `8x1` — and nothing else from
-the command set: no scanout switch, no backing attach, no transfer, no 3D submit.
-The client's per-frame buffer creates reach the kernel; its presentation does not.
+**The presentation was there all along — the instrument was blind to it.** What
+the *kernel's own* log printed before this boot was the four `RESOURCE_CREATE`
+lines and no switch, which read as "the presentation never happens". QEMU's
+virtio-gpu trace answers the question directly, and the answer is the opposite: on
+one 12 s `kmscube` run the device sees `virtio_gpu_cmd_set_scanout` naming the
+client's resource `0x4` **20 times** and the console's `RESOURCE_FB`
+(`0x40000004`, `crates/gpu/src/abi.rs`) **40 times**, `res_flush` 20 client / 257
+console, `res_create_3d` 212 and `ctx_res_attach` 16, every switch `id 0, w 1280,
+h 800, x 0, y 0`. The client's frames are presented; the console is presented
+between them, because a bare DRM program takes master but never puts its VT in
+`KD_GRAPHICS` (the yield is measured in §7.4's VT-handshake paragraph: the same
+probe with that one ioctl shows 7 switches, all at boot).
 
-So the next lead is the presentation half and not the renderer: what a client's
-`drmModeSetCrtc`/atomic commit does on this driver, whether it reaches
-`SET_SCANOUT` at all, and whether the resource it names is the one the 3D context
-rendered into. That is a question for the DRM door's own logging and for a probe
-that asks the kernel what it last scanned out, not for another Mesa-side interposer.
+The QMP `screendump` that earlier looked decisive cannot see either one. On a
+`virtio-gpu-gl-pci` console it reads the device's **2D display surface**, so it
+returns the console's own `RESOURCE_FB` content whatever the scanout is — 2 736
+back-to-back shots during a `kmscube` run are all `('…249feddd', 15 790 non-black
+px)`, the boot-console text. That is a property of the instrument, not of the
+driver, and it is why four instruments were tried before the wire was
+(`docs/notes/` commits `3c1fab1`, `5a0fb15`, `37c46d0`).
+
+**The buffer identity chain is consistent, measured while niri ran.** The
+question the PRIME path was asked to answer is whether a compositor draws into one
+buffer and the scanout shows another. It does not, in this boot:
+
+    RESOURCE_CREATE -> handle 4 (target 2, 1280x800)
+    PRIME export <- handle 4 (ofd=…, ino=37632)
+    PRIME import -> handle 4 (… ino=37632, 1280x800, reused=true)
+    execbuffer #3 bytes=5364 resources=[4, 1, 11, 8]
+    virtio-gpu: scanning out the compositor's resource 4
+
+i.e. the framebuffer niri commits is exported by its own file, imported back into
+the renderer's file with the same `ino` and `reused=true`, is **named by a draw
+submission**, and is the resource `SET_SCANOUT` names. `ctx_submit` 16, `res_flush
+res 0x4` 9 and `set_scanout` 7 in that boot; the console's `RESOURCE_FB` returns
+only when niri disables its CRTC on the way out. So "the frame was drawn into
+somewhere else" is ruled out; the picture's content is what is left.
+
+**And the content is niri's own: it draws a first frame and idles.** The three
+`ERROR smithay::backend::renderer::gles: [GL] GL_OUT_OF_MEMORY in glBufferData`
+lines in niri's startup log (`niri7.log`, three in the same millisecond before
+the DRM compositor is created) are the first suspicious thing on that side: an
+upload the host refused, in the buffer path (`target 0` resources: `handle 6
+(target 0, 1048576x1)`, `handle 11 (target 0, 1048576x1)`), not in the picture
+path. niri then retries the compositor with an invalid modifier — the measured
+`Testing color format: XR24` / `Remaining intersected modifiers: {Invalid}` /
+`Testing Formats: [DrmFormat { code: DrmFourcc(XR24), modifier: Invalid }]` — and
+**succeeds** (`Creating new wl_output output="Virtual-1"`, `Mapping output at
+Point {x:0,y:0}`, the Wayland/IPC/X11 sockets up), so the plane-format WARN is
+not the failure: a compositor with no client and no config draws one black frame
+and sleeps. `RUST_LOG=niri=trace,smithay=debug` in a 30 s run logs no frame,
+present or vblank line at all; the device sees `res_flush res 0x4` once.
+
+So the next lead is niri's **buffer upload**, not the presentation: why
+`glBufferData` answers `GL_OUT_OF_MEMORY` on a `PIPE_BUFFER` resource this card
+created, and whether the desktop of a compositor with a config and a client draws
+at all. The client fixture must also be fixed first — the probe's
+`weston-terminal` wrote an empty log and never made a window, and the probe shell
+needs `NIRI_SOCKET` exported to ask niri anything.

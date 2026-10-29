@@ -101,7 +101,14 @@ fn slot(vc: u32) -> Option<usize> {
 pub fn set_kd_mode(vc: u32, mode: u32) -> bool {
     match slot(vc) {
         Some(at) => {
+            let was = KD_MODE[at].load(Ordering::Relaxed);
             KD_MODE[at].store(mode, Ordering::Relaxed);
+            if was != mode {
+                crate::print!(
+                    "mpos-dbg: KD mode vc={vc} {was} -> {mode} (active={})\n",
+                    active()
+                );
+            }
             // Taking the screen back is a change the render task has to notice
             // even though no console was switched: the framebuffer holds
             // whatever the compositor last drew, so the whole grid goes stale.
@@ -192,6 +199,11 @@ static MASTER_VC: AtomicU32 = AtomicU32::new(0);
 /// Record, or clear with 0, the console the DRM master is on.
 pub fn set_master_vc(vc: u32) {
     MASTER_VC.store(vc, Ordering::Relaxed);
+    crate::print!(
+        "mpos-dbg: DRM master bound to console {vc} (active={}, kd_mode={})\n",
+        active(),
+        kd_mode(if vc == 0 { active() } else { vc })
+    );
 }
 
 /// The console the DRM master session is on, or `None`.
