@@ -352,7 +352,10 @@ One-glance status of the whole roadmap.
   client frames ~93 % of the time, which is why the identical shots do not prove absence.
   Next: write the D-Bus listener, or record the niri output at ≥20 fps for the whole run —
   note the earlier "window capture" read the X root of a *rootless Xwayland* and could never
-  have shown a composited window; `grim` + `niri msg` is the instrument that can (§7.4)
+  have shown a composited window; `grim` + `niri msg` is the instrument that can. What *is*
+  measured is that the console yields when the session declares graphics mode: with
+  `KDSETMODE(KD_GRAPHICS)` first, a 14 s kmscube run shows 7 switches (all at boot) against
+  the bare run's 49 alternating ones, so the seesaw was the fixture's, not the driver's (§7.4)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 
