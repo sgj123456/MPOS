@@ -114,9 +114,13 @@ const EACCES: isize = -13;
 const EINVAL: isize = -22;
 const ENOTTY: isize = -25;
 
-/// `struct vt_mode`'s `mode` field.
-const VT_AUTO: u8 = 1;
-const VT_PROCESS: u8 = 0;
+/// `struct vt_mode`'s `mode` field, from `<linux/vt.h>`: `VT_AUTO` is zero and
+/// `VT_PROCESS` is one. The two numbers are not interchangeable bookkeeping -
+/// writing Linux's `VT_PROCESS` against a kernel that thinks `1` is automatic
+/// asks for *no* promise, which is exactly the shape that made a second
+/// compositor on another console fail with `os error 38`.
+const VT_AUTO: u8 = 0;
+const VT_PROCESS: u8 = 1;
 /// The seat manager's `relsig`/`acqsig`: `SIGUSR1` and `SIGUSR2`.
 const SIGUSR1: u8 = 10;
 const SIGUSR2: u8 = 12;
@@ -124,10 +128,12 @@ const SIGUSR2: u8 = 12;
 /// Linux ignores, and so the one the kernel must not read back.
 const SIGIO: u8 = 29;
 
-/// `struct vt_mode` in the shape the ioctl layer expects: eight bytes, the
-/// padding the caller's struct has.
+/// `struct vt_mode` in Linux's own layout (`<linux/vt.h>`): `__u8 mode`,
+/// `__u8 waitv`, then three `__s16` fields - `relsig` at bytes 2-3, `acqsig` at
+/// 4-5, `frsig` at 6-7, little-endian. All three signals in the vocabulary are
+/// below 256, so the high byte of each pair is zero.
 fn vt_mode_bytes(mode: u8, waitv: u8, rel: u8, acq: u8, fr: u8) -> [u8; 8] {
-    [mode, waitv, rel, acq, fr, 0, 0, 0]
+    [mode, waitv, rel, 0, acq, 0, fr, 0]
 }
 
 /// `struct vt_stat`'s `v_active`, `v_signal`, `v_state` - three shorts, indexed
@@ -276,15 +282,13 @@ fn main() {
 
     // VT_GETMODE -> struct vt_mode: a console nobody has claimed is automatic,
     // which is what tells a manager it can put its session here without asking
-    // permission first.
+    // permission first. Both requests in this pair are `_IO(VT, n)` in
+    // `<linux/vt.h>` - plain 0x5601/0x5602, with *no* size in bits 16-31 - and
+    // the kernel reads exactly `sizeof(struct vt_mode)` bytes regardless; this
+    // test used to encode the size itself, which is the private dialect the
+    // kernel answered to and Linux's `ioctl` callers never send.
     let mut vm = [0u8; 8];
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            ior(VT, NR_VT_GETMODE, 8),
-            vm.as_mut_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_GETMODE), vm.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_GETMODE succeeds", r0, 0);
     check_eq(
         &mut r,
@@ -299,15 +303,9 @@ fn main() {
     // forgot is a mode that cannot be relied on, and the whole `relsig` dance
     // depends on the console on the screen knowing it was asked to be asked.
     let want = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, 0);
-    let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), want.as_ptr() as *mut c_void) };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_SETMODE), want.as_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_SETMODE(VT_PROCESS) succeeds", r0, 0);
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            ior(VT, NR_VT_GETMODE, 8),
-            vm.as_mut_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_GETMODE), vm.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_GETMODE after SETMODE succeeds", r0, 0);
     check_true(
         &mut r,
@@ -322,32 +320,20 @@ fn main() {
     // `VT_GETSTATE`. seatd names `SIGIO` there, so a kernel that stored it would be
     // reading back a number that owes the caller nothing.
     let with_fr = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, SIGIO);
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            iow(VT, NR_VT_SETMODE, 8),
-            with_fr.as_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_SETMODE), with_fr.as_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_SETMODE with frsig named succeeds", r0, 0);
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            ior(VT, NR_VT_GETMODE, 8),
-            vm.as_mut_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_GETMODE), vm.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_GETMODE after the frsig call succeeds", r0, 0);
     check_true(
         &mut r,
         "frsig is ignored and reads back zero, the rest survives",
-        vm[4] == 0 && vm[0] == VT_PROCESS && vm[2] == SIGUSR1 && vm[3] == SIGUSR2,
+        vm[6] == 0 && vm[0] == VT_PROCESS && vm[2] == SIGUSR1 && vm[4] == SIGUSR2,
     );
 
     // The `EINVAL` set is `<linux/vt.h>`'s and each reason is its own: an
     // unknown mode, the same signal for giving the screen up and taking it.
     let junk = vt_mode_bytes(77, 0, SIGUSR1, SIGUSR2, 0);
-    let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), junk.as_ptr() as *mut c_void) };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_SETMODE), junk.as_ptr() as *mut c_void) };
     check_eq(
         &mut r,
         "VT_SETMODE with an unknown mode is EINVAL",
@@ -355,7 +341,7 @@ fn main() {
         EINVAL,
     );
     let same = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR1, 0);
-    let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), same.as_ptr() as *mut c_void) };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_SETMODE), same.as_ptr() as *mut c_void) };
     check_eq(
         &mut r,
         "VT_SETMODE with relsig == acqsig is EINVAL",
@@ -365,13 +351,7 @@ fn main() {
     // The mode the two refusals above did *not* take is still the one set,
     // because a refused SETMODE that half-wrote its struct is worse than one
     // that was never answered at all.
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            ior(VT, NR_VT_GETMODE, 8),
-            vm.as_mut_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_GETMODE), vm.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_GETMODE after the refusals succeeds", r0, 0);
     check_true(&mut r, "a refused VT_SETMODE changed nothing", vm == want);
 
@@ -564,15 +544,9 @@ fn main() {
     // later `^A` wait for an answer from a session that has already exited, and
     // the machine is left switching consoles on a timer.
     let auto = vt_mode_bytes(VT_AUTO, 0, 0, 0, 0);
-    let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), auto.as_ptr() as *mut c_void) };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_SETMODE), auto.as_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_SETMODE(VT_AUTO) restores", r0, 0);
-    let r0 = unsafe {
-        ioctl(
-            tty,
-            ior(VT, NR_VT_GETMODE, 8),
-            vm.as_mut_ptr() as *mut c_void,
-        )
-    };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_GETMODE), vm.as_mut_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_GETMODE after the restore succeeds", r0, 0);
     check_true(
         &mut r,

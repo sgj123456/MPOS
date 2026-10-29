@@ -1980,23 +1980,29 @@ impl Tty {
             // Read back what `VT_SETMODE` wrote, because a seat manager asks this to
             // find out whether the console it has is already promised to someone -
             // and because a mode the kernel accepted and forgot is a mode nobody can
-            // rely on. `size` is the caller's `sizeof(struct vt_mode)`, so an older,
-            // shorter struct gets the prefix it sized for rather than a fault.
+            // rely on. `0x5601` is a bare number: the request carries no size word,
+            // so the eight bytes are fixed by the ABI. Deriving a count from `size`
+            // wrote **nothing** (measured: bits 16.. of `0x5601` are zero), and a
+            // caller then read whatever its stack held - the guest probe that found
+            // this read `01 00 aa aa 01 00 aa aa`.
             0x01 => {
                 let Some(vc) = self.vc_number() else {
                     return err::EINVAL;
                 };
                 let out = crate::vfs::vcmux::vt_mode(vc).to_bytes();
-                let n = size.min(out.len());
-                if !buffer_ok(buf, n, true, from_user) {
+                if !buffer_ok(buf, out.len(), true, from_user) {
                     return err::EFAULT;
                 }
-                unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n) };
+                unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, out.len()) };
                 0
             }
-            // VT_SETMODE <- struct vt_mode. `_IO`, so the struct is read from the
-            // request's own size rather than from a nonzero one: the eight bytes a
-            // caller that wrote `<linux/vt.h>`'s struct gives, or fewer.
+            // VT_SETMODE <- struct vt_mode. `0x5602` is a bare number: like
+            // `VT_GETMODE` it carries no size word, so the eight bytes are fixed by
+            // the ABI. Reading `size` bits here read **zero** bytes (measured), so
+            // every `VT_SETMODE` stored an all-zero mode - `VT_AUTO` with no
+            // signals - and no seat manager's promise ever took effect, which is why
+            // a second compositor on another console could never be handed the
+            // screen (`docs/notes/` §7.1d).
             0x02 => {
                 if !owns_it() {
                     return err::EPERM;
@@ -2004,7 +2010,7 @@ impl Tty {
                 let Some(vc) = self.vc_number() else {
                     return err::EINVAL;
                 };
-                let n = size.min(8);
+                let n = 8;
                 if !buffer_ok(buf, n, false, from_user) {
                     return err::EFAULT;
                 }

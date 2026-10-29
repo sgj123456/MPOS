@@ -188,17 +188,17 @@ yours?" on a compositor boot:
 
 The ABI is pinned in `src/vfs/vtmode.rs`, which holds no clock, no tasks and no
 signals so that a host build can argue with the whole negotiation: `struct
-vt_mode`'s eight bytes (`mode, waitv, relsig, acqsig, frsig`, padding
-zero-and-read-zero on `VT_GETMODE`, which is a `_IOR` of exactly that size), the
-`EINVAL` set `<linux/vt.h>` uses (unknown mode, `relsig == acqsig`, a signal
-number that is not a signal), and the rule that a refused request is *settled*
-rather than left pending - a refusal is modelled apart from a release precisely
-so that an unrelated later switch cannot be forced through by a timer that is
-counting a conversation nobody is having. Note that `VT_SETMODE` is
-`_IOW('V', 2, struct vt_mode)` while every other request in the family is `_IO`:
-a kernel that decoded the size from the group rather than the request would read
-zero bytes of a caller that wrote eight, and `t-seat` now writes the `_IOW` form
-for exactly that reason.
+vt_mode`'s eight bytes — `__u8 mode`, `__u8 waitv`, then `__s16 relsig`,
+`__s16 acqsig`, `__s16 frsig` little-endian, with the kernel writing zero over
+`frsig` — the `EINVAL` set `<linux/vt.h>` uses (unknown mode, `relsig == acqsig`,
+a signal number that is not a signal), and the rule that a refused request is
+*settled* rather than left pending - a refusal is modelled apart from a release
+precisely so that an unrelated later switch cannot be forced through by a timer
+that is counting a conversation nobody is having. Both requests of the pair are
+`_IO(VT, n)` - plain `0x5601`/`0x5602`, with **no** size in bits 16-31 - and the
+kernel reads or writes exactly `sizeof(struct vt_mode)` bytes for them; §7.1d
+records how the kernel and its own test once agreed on a private dialect instead,
+and what that cost a seat manager.
 
 The mechanism is in `src/vfs/vcmux.rs`, and both halves of it were then measured
 against `drivers/tty/vt/vt.c` and `drivers/tty/vt/vt_ioctl.c`, which moved them.
@@ -662,6 +662,80 @@ change; the in-window-console behaviour is read off the `render.rs`/`wire_bytes`
 `vt_is_sink` gate and the getty-on-`tty1` wiring, the same caveat the a0015ba record
 carries — a manual boot of `cargo xtask run` (now defaulting to `gui`) is what closes
 it.
+
+### 7.1d The VT mode struct is Linux's, not a dialect — **LANDED** (2026-10-29)
+
+The symptom came from a desktop session, not from the gate: on Linux one
+compositor can run on `tty1` and a second on `tty2`; here the second answered
+`Failed to open session: Function not implemented (os error 38)` while the first
+was still running on `tty1`, and `^A 2` had moved the screen to `tty2`.
+`seatd`'s own log (`SEATD_LOG=debug`) then said what the kernel had failed to do:
+after the first client was killed there was no `Client disconnected`, the second
+connection logged `Could not add client: seat is VT-bound and has an active
+client` / `Resource busy`, and `os error 38` is libseat's reading of that answer,
+not a kernel `ENOSYS` (the kernel's own `syscall N -> ENOSYS` and ioctl-`ENOTTY`
+notes never appear in that boot).
+
+Three defects sat in the same struct, all three invisible to `t-seat` because the
+test spoke the kernel's dialect:
+
+* **The request words carry no size.** `VT_GETMODE` and `VT_SETMODE` are plain
+  `_IO(VT, 1)`/`_IO(VT, 2)` — `0x5601`/`0x5602`, bits 16-31 zero — and the
+  kernel's contract is `sizeof(struct vt_mode)` (8) bytes either way.
+  `Tty::vt_ioctl` derived the count from `_IOC_SIZE`, so a caller that wrote
+  Linux's plain request had **zero** bytes read (`VT_SETMODE`: every promise
+  stored all-zero, i.e. automatic, with no signals) and **zero** bytes written
+  (`VT_GETMODE`: the probe's pre-filled `0xAA` buffer came back
+  `01 00 aa aa 01 00 aa aa` — the ioctl succeeded and told the caller nothing).
+* **The mode numbers were swapped.** The crate had `VT_AUTO = 1`,
+  `VT_PROCESS = 0`; `<linux/vt.h>` is `VT_AUTO 0x00`, `VT_PROCESS 0x01`.
+* **The fields were the wrong width.** `from_bytes`/`to_bytes` put `relsig`,
+  `acqsig`, `frsig` at bytes 2, 3, 4 as `u8`; Linux's are three `__s16` at 2-3,
+  4-5, 6-7 (little-endian), and `vt_setmode` writes zero over `frsig`.
+
+`t-seat` was green throughout for the reason §7.1's `t-drm-lease` paragraph
+already records: it built its requests with `ior(VT, 0x01, 8)`/`iow(VT, 0x02, 8)`
+and wrote `[mode, waitv, relsig, acqsig, frsig, 0, 0, 0]` — the same private
+encodings the driver matched on, and the same swapped constants at the top of the
+file. A test that speaks the kernel's dialect cannot see the dialect.
+
+**Measured after the fix** on the same image (guest probe, `/root/vtraw2.txt`, and
+the two-compositor run):
+
+* `VT_SETMODE` of `{VT_PROCESS, relsig=SIGUSR1, acqsig=SIGUSR2}` reads back
+  `01 00 0a 00 0c 00 00 00`; before the fix the read-back was
+  `00 00 00 00 00 00 00 00` (the request was accepted and cannot be found).
+* `VT_ACTIVATE(2)` delivers `relsig` (SIGUSR1) to the process that wrote the
+  promise, and `VT_RELDISP` afterwards is what lets the switch complete — the
+  tested shape of the `vt_switch` dance `src/vfs/vcmux.rs` implements.
+* `seatd`'s log now shows the negotiation it was written to do:
+  `Disabling client 1 on seat0` on the switch away, `Added client 2 to seat0` /
+  `Opened client 2 on seat0`, then `No clients belonging to VT 2 to activate` on
+  the second compositor's exit and `Opened client 1 on seat0` after switching
+  back to `tty1`.
+* The second `niri` runs and exits cleanly on `SIGINT` (`VT2B-N2-RC 0`) where it
+  aborted with `os error 38` before the fix — the user-visible fact this closes:
+  two compositors on two consoles, one session released and re-acquired, as on
+  Linux.
+
+Pinned by the corrected `t-seat` (both machines; `VT_GETMODE` reads back what
+`VT_SETMODE` wrote, the `frsig` read-back is zero, the refusals are unchanged);
+host Linux is the reference. **Counterfactual**: with the driver and the struct
+helpers reverted (the corrected test kept), the x86_64 arm answers
+`pass=228 fail=1 (229 built)`, `CF-EXIT=1`, and the one red program is `t-seat`
+with five claims — `VT_GETMODE reads back the mode and both signals`,
+`frsig is ignored and reads back zero, the rest survives`,
+`a refused VT_SETMODE changed nothing`, and both `EINVAL`s reading `0` where
+`-22` is Linux's. Green on the fixed tree: x86_64 `all 229 user tests passed`,
+aarch64 `all 228 user tests passed`, `mpos-kunit 34 passed, 0 failed` on all
+twelve lanes, host stage `1178 tests, 0 failed`.
+
+**Named gap left in the family.** `0x560c` is `VT_UNLOCKSWITCH` in
+`<linux/vt.h>`, not the `VT_WAITUNTIL` this kernel used to answer, and
+`VT_LOCKSWITCH` (0x560b), `VT_UNLOCKSWITCH` (0x560c) and `VT_ACKACQ` are
+unimplemented here: an arm that answers a call no Linux caller sends is the same
+class of defect as the dialect above, one request up. Recorded as item 127 and
+the next item in this family.
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 

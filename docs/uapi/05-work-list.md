@@ -6846,3 +6846,53 @@ expiration wakes the park **inside a second**, and the report is `EPOLLIN`). Hos
 Linux is the reference (`MPOS_ON_HOST=1`, 6/6 ok). The counterfactual was measured
 both ways with the pin binary on probe images: the pre-fix kernel fails the
 arrival claim at its 2000 ms timeout, the fixed one passes the section.
+
+## item 126 — the `vt_mode` struct is Linux's, not a dialect
+
+`VT_GETMODE`/`VT_SETMODE` are plain `_IO(VT, 1)`/`_IO(VT, 2)` (`0x5601`/`0x5602`,
+no size in bits 16-31) and the kernel's contract for both is
+`sizeof(struct vt_mode)` — eight bytes, `__u8 mode, __u8 waitv, __s16 relsig,
+__s16 acqsig, __s16 frsig`, little-endian, `frsig` zeroed on `vt_setmode`
+(`/usr/include/linux/vt.h`; profile measured on Linux 7.2.11, the guest probe in
+`docs/notes/` §7.1d).
+
+This kernel had three defects in one struct, all hidden by a test that spoke the
+same dialect: it derived the byte count from `_IOC_SIZE` (so a plain request read
+and wrote **zero** bytes — `VT_SETMODE` stored an all-zero automatic mode,
+`VT_GETMODE` returned whatever the caller's stack held), it had `VT_AUTO`/`VT_PROCESS`
+swapped (`1`/`0` against Linux's `0`/`1`), and it decoded the three signals as
+`u8` at bytes 2/3/4 instead of `__s16` at 2/4/6. The measured consequence was a
+seat manager whose promise never took effect: `seatd` could not release its client
+on a VT switch, so a second compositor on another console answered
+`Failed to open session: Function not implemented (os error 38)`.
+
+Fixed in `src/vfs/tty.rs` (`Tty::vt_ioctl`'s `0x01`/`0x02` arms read/write the
+full eight bytes), `crates/term/src/vtmode.rs` (Linux's constants, the `__s16`
+layout, `frsig` ignored/zeroed, `MAX_SIGNAL` 64 because the fields are `__s16`),
+with `t-seat` corrected on **both** sides (plain requests, Linux's layout) — the
+same two-sided correction §7.1's `t-drm-lease` paragraph describes. Pinned by
+`t-seat` on both machines (it passes both halves on the fixed tree; the x86_64
+gate reports `all 229 user tests passed`, aarch64 `all 228`, `mpos-kunit 34
+passed` on every lane). Counterfactual, measured with the corrected test kept and
+the driver/ABI reverted: `pass=228 fail=1 (229 built)`, `t-seat` the only red
+program, five claims — the round-trip read-back, the `frsig` zero, "a refused
+`VT_SETMODE` changed nothing", and both `EINVAL`s answering `0`. Named gap
+recorded as item 127 (`VT_LOCKSWITCH`, `VT_UNLOCKSWITCH`, `VT_ACKACQ`, and the
+`0x0c` arm answering a call Linux does not have).
+
+## item 127 — the VT switch-acknowledgement family is still a dialect
+
+`0x560c` is Linux's `VT_UNLOCKSWITCH`, not the `VT_WAITUNTIL` this kernel's
+`Tty::vt_ioctl` answers today; `VT_LOCKSWITCH` (`0x560b`) has no arm in the
+`'V'` family at all (it falls to `ENOTTY`), and `VT_ACKACQ` (`0x02`, the
+`VT_RELDISP` argument that answers an *acquire*) is accepted and then folded
+into the release answer — `vcmux::release_ack(vc, buf != 0)` cannot tell the two
+apart.
+
+What is *not* measured yet is what these three do on a Linux console, so this
+item starts where every item in this repository starts: a guest probe that asks
+Linux first (which consoles `VT_LOCKSWITCH`/`VT_UNLOCKSWITCH` cover, what a
+`VT_ACTIVATE` to a locked console returns and whether it blocks, and the
+`VT_ACKACQ` handshake on acquire), then the arms, then the pin — `t-seat`'s
+`VT_WAITUNTIL` claims are the ones to replace, and the probe in
+`docs/notes/` §7.1d is the instrument that found this family's last defect.

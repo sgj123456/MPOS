@@ -80,14 +80,21 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// `VT_AUTO` - switching happens without asking this console's session.
-pub const VT_AUTO: u8 = 1;
+///
+/// The two numbers are `<linux/vt.h>`'s, and getting them the other way round
+/// would not be a cosmetic slip: a caller that wrote `VT_PROCESS` (Linux's `1`)
+/// would name *automatic* switching, so a seat manager's promise would be read
+/// as "ask nobody" and the console would switch without being consulted. This
+/// crate had them swapped until the guest measurement in `docs/notes/` §7.1d.
+pub const VT_AUTO: u8 = 0;
 /// `VT_PROCESS` - this console's session is asked first, by `relsig`.
-pub const VT_PROCESS: u8 = 0;
+pub const VT_PROCESS: u8 = 1;
 
-/// The largest signal number a `struct vt_mode` can name. `SIGRTMAX` aside,
-/// Linux's `vt_mode` fields are bytes and the valid set is 1..=31, so anything
-/// else is an `EINVAL` from `VT_SETMODE` rather than a signal nobody can raise.
-pub const MAX_SIGNAL: u8 = 31;
+/// The largest signal number a `struct vt_mode` can name. Linux's fields are
+/// `__s16`, so any real signal fits; `SIGRTMAX` is 64 on this kernel, and a
+/// number past that is `EINVAL` from `VT_SETMODE` rather than a signal nobody
+/// can raise.
+pub const MAX_SIGNAL: u8 = 64;
 
 /// How long a release may be waited for, in clock ticks: 60 seconds at this
 /// kernel's 250 Hz.
@@ -123,20 +130,30 @@ fn signal_ok(sig: u8) -> bool {
 }
 
 /// `struct vt_mode`, the eight bytes `VT_SETMODE` writes and `VT_GETMODE`
-/// reads back:
+/// reads back, in `<linux/vt.h>`'s layout:
 ///
 /// ```text
-///   0  u8  mode      VT_AUTO or VT_PROCESS
-///   1  u8  waitv     the session wants VT_WAITACTIVE to sleep
-///   2  u8  relsig    the signal that says "hand the screen back"
-///   3  u8  acqsig    the signal that says "the screen is yours"
-///   4  u8  frsig     the signal that says "the console you asked for refused"
-///   5..8  padding
+///   0  __u8   mode      VT_AUTO or VT_PROCESS
+///   1  __u8   waitv     the session wants writes to hang while its console is
+///                       not the active one
+///   2  __s16  relsig    the signal that says "hand the screen back"
+///   4  __s16  acqsig    the signal that says "the screen is yours"
+///   6  __s16  frsig     unused; Linux writes zero over it at `VT_SETMODE`
 /// ```
 ///
-/// The padding is part of the ABI: `VT_GETMODE` is a `_IOR` of exactly eight
-/// bytes, and a caller that sizes its struct from the request reads whatever is
-/// in `5..8`, so this answers zeroes rather than whatever the last caller left.
+/// The three signals are **sixteen-bit** fields, and getting that wrong is not
+/// a cosmetic slip: `VT_SETMODE` is a plain `0x5602`, carrying no size word, so
+/// the eight bytes are read and written by position - a `u8` at byte 3 would
+/// have taken the high half of `relsig` for `acqsig`, and a `u8` at byte 4 the
+/// low half of `acqsig` for `frsig`. That is what this kernel did until the
+/// guest measurement that produced `docs/notes/` §3.14 (`VT_GETMODE` answered
+/// stack garbage and `VT_SETMODE` stored nothing, so no seat manager's promise
+/// ever took effect and a second compositor on another console could never be
+/// handed the screen).
+///
+/// This struct is `u8`-valued internally because a signal number is small
+/// (Linux's `MAX_SIGNAL`), and a caller's out-of-range number is kept as `0xFF`
+/// - a value `validate` rejects - rather than silently truncated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VtMode {
     pub mode: u8,
@@ -157,33 +174,42 @@ impl VtMode {
         frsig: 0,
     };
 
-    /// Read the bytes `VT_SETMODE` was given. The ioctl layer hands over
-    /// `min(sizeof(struct vt_mode), the request's size)` bytes, so a shorter
-    /// slice is a caller that wrote a smaller struct than Linux's, and the
-    /// fields it did not write read as zeroes - which is also what they *are*.
+    /// Read the eight bytes `VT_SETMODE` was given.
+    ///
+    /// `VT_SETMODE` carries no size word in its request (it is the bare number
+    /// `0x5602`), so Linux reads exactly `sizeof(struct vt_mode)` bytes and
+    /// there is no shorter-struct case to be lenient about: a caller that wrote
+    /// less wrote a struct the request cannot describe, and the bytes it did
+    /// not write read as zeroes because the ioctl layer zeroes the block.
+    /// `frsig` reads as zero: Linux zeroes that field when it stores the mode,
+    /// so nothing a caller wrote there is ever kept or acted on.
     pub fn from_bytes(bytes: &[u8]) -> VtMode {
         let g = |i: usize| bytes.get(i).copied().unwrap_or(0);
+        // A signal is sixteen bits on the wire; a number that does not fit in
+        // one byte becomes `0xFF`, which `validate` refuses as not a signal.
+        let sig = |lo: usize| {
+            let wide = u16::from_le_bytes([g(lo), g(lo + 1)]);
+            if wide > u8::MAX as u16 {
+                0xFF
+            } else {
+                wide as u8
+            }
+        };
         VtMode {
             mode: g(0),
             waitv: g(1),
-            relsig: g(2),
-            acqsig: g(3),
-            frsig: g(4),
+            relsig: sig(2),
+            acqsig: sig(4),
+            frsig: 0,
         }
     }
 
-    /// The same, for `VT_GETMODE`. Always the full eight bytes.
+    /// The same, for `VT_GETMODE`: always the full eight bytes, in the same
+    /// sixteen-bit layout, with `frsig` zero as Linux answers it.
     pub fn to_bytes(self) -> [u8; 8] {
-        [
-            self.mode,
-            self.waitv,
-            self.relsig,
-            self.acqsig,
-            self.frsig,
-            0,
-            0,
-            0,
-        ]
+        let rel = (self.relsig as u16).to_le_bytes();
+        let acq = (self.acqsig as u16).to_le_bytes();
+        [self.mode, self.waitv, rel[0], rel[1], acq[0], acq[1], 0, 0]
     }
 
     /// Whether this mode is one `VT_SETMODE` would accept.
@@ -625,9 +651,11 @@ mod tests {
         }
     }
 
-    /// `<linux/vt.h>`: the struct is eight bytes and the field order is the
-    /// wire order, because a musl caller compiles this layout and `VT_GETMODE`
-    /// is a `_IOR` of `sizeof(struct vt_mode)`.
+    /// `<linux/vt.h>`: the three signals are `__s16`, so the wire layout is
+    /// `mode, waitv, relsig(u16 LE), acqsig(u16 LE), frsig(u16 LE)` - the exact
+    /// bytes a musl or glibc caller's `struct vt_mode` has (measured from
+    /// `/usr/include/linux/vt.h`; the guest probe in `docs/notes/` §3.14 is what
+    /// caught this kernel having read them as `u8`).
     #[test]
     fn the_mode_survives_its_wire_format() {
         let m = VtMode {
@@ -635,18 +663,21 @@ mod tests {
             waitv: 1,
             relsig: 10,
             acqsig: 12,
-            frsig: 21,
+            frsig: 0,
         };
-        assert_eq!(m.to_bytes(), [0, 1, 10, 12, 21, 0, 0, 0]);
+        assert_eq!(m.to_bytes(), [1, 1, 10, 0, 12, 0, 0, 0]);
         assert_eq!(VtMode::from_bytes(&m.to_bytes()), m);
-        // A caller that wrote a shorter struct reads zeroes it never wrote.
+        // A caller's `frsig` is not kept: Linux writes zero over it.
         assert_eq!(
-            VtMode::from_bytes(&[VT_AUTO]),
+            VtMode::from_bytes(&[1, 0, 10, 0, 12, 0, 33, 0]),
             VtMode {
-                mode: VT_AUTO,
-                ..VtMode::AUTO
+                waitv: 0,
+                frsig: 0,
+                ..m
             }
         );
+        // A signal that does not fit one byte is not a signal, not a truncation.
+        assert_eq!(VtMode::from_bytes(&[1, 0, 0, 1, 12, 0, 0, 0]).relsig, 0xFF);
     }
 
     /// A console nobody has spoken to is automatic and answers `VT_GETMODE`
@@ -684,7 +715,7 @@ mod tests {
             t.set_mode(
                 1,
                 VtMode {
-                    relsig: 32,
+                    relsig: 65,
                     ..VtMode::AUTO
                 },
                 KEEPER
