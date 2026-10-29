@@ -337,9 +337,12 @@ One-glance status of the whole roadmap.
   Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...))`, EGL 1.5, Mesa 26.2.5, GLES 3.2, and
   udev/`ID_PATH` under the PCI function are in place — so the llvmpipe reading this row used
   to carry, and the devpath lead it named, were both stale. What is *not* there is
-  presentation: a client's frame never reaches the scanout (four QMP screendumps
-  pixel-identical to the boot console; 82 `RESOURCE_CREATE` on the wire, no scanout switch)
-  (§7.4)
+  presentation the host can see: the driver asks for the client's resource and the device
+  accepts (`scanning out the compositor's resource 4` alternating with the driver's own
+  framebuffer, no refusal in any boot), yet every QMP `screendump` taken *inside* kmscube's
+  run is pixel-identical to the boot console (`15790` non-black pixels, 65 colours) — so
+  "the frame is presented" and "the frame is what the display shows" are two claims, and the
+  second is not measured yet (§7.4)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 

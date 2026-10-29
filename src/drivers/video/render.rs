@@ -107,6 +107,8 @@ static RE_PRESENT: AtomicBool = AtomicBool::new(false);
 /// the sentinel). Read and written only by this task's present step, where it turns
 /// a state that changes rarely into one line per change rather than one per frame.
 static LAST_SCANOUT: AtomicU32 = AtomicU32::new(0);
+/// The console paint gate's last answer, so a change is said once.
+static LAST_PAINTED: AtomicBool = AtomicBool::new(false);
 
 /// Ask the render task to re-present the compositor's framebuffer and flush.
 /// Called from the mux's VT-switch path; wakes the task so it happens now.
@@ -755,8 +757,23 @@ fn task() {
         // lands, and the console takes the screen back the moment its own
         // `^A` wins the negotiation.
         let claimed = crate::drivers::drm::master_held();
-        let painted = if !crate::console::vt_is_sink() && !claimed || !crate::vfs::vcmux::painted()
-        {
+        let sink = crate::console::vt_is_sink();
+        let mux_painted = crate::vfs::vcmux::painted();
+        // Which of the three gates lets the console paint decides, on the next
+        // frame, whether the compositor's frame stays up - and the answer
+        // alternating is exactly the shape a screendump then sees as "the
+        // console is what is on the screen". Said once per change, with its
+        // inputs, so that is a measurement and not an inference.
+        let console_may_paint = sink && (claimed || mux_painted);
+        if LAST_PAINTED.swap(console_may_paint, Ordering::Relaxed) != console_may_paint {
+            crate::print!(
+                "mpos-dbg: console paint gate sink={} claimed={} mux_painted={}\n",
+                sink,
+                claimed,
+                mux_painted
+            );
+        }
+        let painted = if !sink && !claimed || !mux_painted {
             // Forget which console was last shown: when the screen comes back,
             // whatever is on it belongs to something else, and the whole grid
             // needs redrawing rather than the changed rows.
@@ -833,7 +850,7 @@ fn task() {
                     );
                 }
             }
-            let _ = match scanout_client {
+            let landed = match scanout_client {
                 Some((resource, width, height)) => {
                     // What the screen *is* from here on: a card that kept
                     // reporting its own framebuffer's geometry would be
@@ -848,6 +865,16 @@ fn task() {
                     device.flush()
                 }
             };
+            // A refused presentation used to vanish here: the line above had
+            // already said which resource the frame is, so a `SET_SCANOUT` the
+            // device rejected left the screen on the *previous* resource with
+            // the log claiming otherwise - a client's frame measured as drawn
+            // but never shown. Name the answer instead; it is the one line that
+            // tells "the client's pixels are wrong" apart from "the card would
+            // not take them".
+            if let Err(e) = landed {
+                crate::print!("mpos-dbg: presenting scanout {presented} refused: {e:?}\n");
+            }
             // The frame has left. This is the moment a page-flip completion is
             // *about*, and it is the only moment in this kernel that honestly
             // means "the pixels are where they were asked to be" - so it is what
