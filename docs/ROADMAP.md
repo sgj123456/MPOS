@@ -344,7 +344,13 @@ One-glance status of the whole roadmap.
   render loop's frame rule, not the device's answer. Whether the host's display shows those
   20 frames is **not measured**: QMP `screendump` on this GL console reads the 2D surface
   and can only ever return the console, so the earlier pixel-identical reading measured the
-  instrument; a window capture is the next instrument to establish (§7.4)
+  instrument. Four instruments have since been tried and none established the reading: a
+  single or 2 736-back-to-back `screendump` is 2D-only by construction; `-display gtk,gl=on`
+  plus an X-root `ffmpeg` capture shows a mapped window whose content is 102 non-black pixels
+  of 1 024 000 (black); `-display dbus,gl=on` boots but sends nothing without a listener
+  (`dbus_registered_listener` 0); and the arithmetic says a 1 Hz sample misses the ≈47 ms
+  client frames ~93 % of the time, which is why the identical shots do not prove absence.
+  Next: write the D-Bus listener, or record the X root at ≥20 fps for the whole run (§7.4)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 
