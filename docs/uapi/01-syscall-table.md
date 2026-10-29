@@ -331,7 +331,7 @@ note printed once per number (`note_enosys`):
 | `fsconfig` | 431 | same context | same |
 | `fsmount` | 432 | same context — and it would hand back a mount handle whose attachment is served (`move_mount`), but there is no context to mount | same |
 | `fspick` | 433 | picks an existing superblock for reconfiguration; this kernel's mount records are not superblocks | same |
-| `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page | a per-page direct-map carve-out (remove + restore around a page-table walk), plus the `MFD_*` word and the `SECRETMEM` `/proc/meminfo` line |
+| `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page; measured on Linux 7.2.11 first — `0600` file, no `FD_CLOEXEC`, size fixed once, `MAP_SHARED` only, `PROT_EXEC` `EACCES`, `pread` `ESPIPE`, inherited by a child (item 131, §8.4) | a per-page direct-map carve-out (remove + restore around a page-table walk), plus `SECRETMEM` accounting in `/proc/meminfo`, the fixed-once size / shared-only / no-exec / no-coredump rules, and `t-secretmem` as the pin |
 
 > **Every family that was on this table has since moved out of it** — what
 > remains is `memfd_secret` (447) and the four mount-context numbers

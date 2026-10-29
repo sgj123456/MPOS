@@ -325,6 +325,81 @@ kernel's. Kernel-side stack protection is therefore complete.
 ---
 
 
+### 8.4 `memfd_secret(2)` — the one gap whose honest answer is `ENOSYS` — **MEASURED AND PINNED** (2026-10-29)
+
+`memfd_secret(2)` (447 on both machines) is the last number in the syscall table
+whose answer here is `ENOSYS`, and until this entry it was a *named* gap rather
+than a measured one: the row said "secret memory: the pages must be absent from
+the kernel's own direct map" without ever writing down what Linux's call does,
+so a reader could not tell a prerequisite from a guess.
+
+**Measured first, on Linux 7.2.11 as an ordinary user** (`build/scratch/secretmem/
+probe{,2,3}.c`):
+
+| call | answer |
+|---|---|
+| `memfd_secret(0)` | a descriptor (3 here); `memfd_secret(1)`, `(2)` → `EINVAL` |
+| `/proc/self/fd/N` | `/secretmem (deleted)`; `F_GETFL` is `O_RDWR`; **`FD_CLOEXEC` is not set** — the caller sets it |
+| `fstat` | regular file, mode `0600`, the size last set |
+| `ftruncate(4096)` then `(8192)`/`(0)` | `0`, then `EINVAL` — **the size is fixed once** |
+| `mmap MAP_SHARED` | a mapping, writable; needs no size set first |
+| `mmap MAP_PRIVATE` | `EINVAL` |
+| `mmap` past the end, touched | `SIGBUS` |
+| `mprotect` → `PROT_READ`/`PROT_WRITE`/`PROT_NONE` | `0`; → adding `PROT_EXEC` is `EACCES` |
+| `mprotect` on one of two mappings | only that mapping's permission changes; the sibling still writes |
+| `read`/`write` | `EINVAL` |
+| `pread`/`pwrite`/`lseek` | `ESPIPE` |
+| `F_ADD_SEALS` | `EINVAL` (not sealable) |
+| `fork` | the child inherits the descriptor and the mapping and sees the bytes |
+
+The descriptor row is bookkeeping; the syscall *is* the missing property: those
+pages are never placed in the kernel's direct map (so no kernel path can read
+them), never enter a core dump, and no mapping of them can become executable.
+
+**Why this kernel refuses.** MPOS has one identity map of RAM, and every frame is
+reached through it: `copy_from_user`/`copy_to_user`, the block and network
+drivers, the allocator's own bookkeeping, every `Vec` behind ramfs/tmpfs. A page
+the kernel can always read is not secret, so a served call would hand back a
+descriptor whose name promises a property the machine does not have — rule 2's
+worst outcome, the success that is a lie. `ENOSYS` is also **Linux's own answer
+for a kernel built without `CONFIG_SECRETMEM`**: the number exists, the machine
+has no such memory, and the caller is told exactly that. A libc probing the
+number branches to its fallback, which is the behaviour the contract wants.
+
+The prerequisite, restated in this kernel's terms (it was a sketch before): a
+per-page carve-out from the identity map — unmap a 4 KiB page from the direct
+map when it is turned secret, restore the mapping when the last mapping and the
+descriptor are gone, and refuse every kernel path that would have walked the
+identity map to reach it — plus the `SECRETMEM` accounting line in
+`/proc/meminfo`, the fixed-once size rule, the shared-only mapping rule, the
+no-exec rule and the coredump exclusion. None of that exists, and none of it is a
+stub: each piece is what makes the property real.
+
+**Pin** `user/tests/src/bin/t-secretmem.rs` (the gap gets its pin, per rule 6).
+On the guest the claims are the refusal: `memfd_secret(2)` is absent and says
+`ENOSYS`, and the absence is not a flag question (`1` and `0x8000_0000` are
+`ENOSYS` too, because a missing call takes no flags). If a future kernel grows
+the property, the same program measures Linux's shape instead — its host branch
+carries the table above, ten claims (`0600`, no `CLOEXEC`, fixed-once size,
+`MAP_PRIVATE` refused, `PROT_EXEC` `EACCES`, per-mapping permissions, `read`
+`EINVAL`, `pread` `ESPIPE`), and `MPOS_ON_HOST=1` is its reference direction.
+Host reference: **11/11 ok, `PASS`**. The `ENOSYS` claims are not vacuous: a stub
+that answered success would fail them — measured (see the counterfactual below).
+
+**Gates and counterfactual.** x86_64 `all 231 user tests passed` (15 not run),
+aarch64 `all 230` (16 not run), `mpos-kunit 34 passed, 0 failed` both, stage 1
+1185 tests (`build/scratch/secretmem-gate1.log`,
+`build/scratch/secretmem-gate-a1.log`). Counterfactual: a temporary dispatch arm
+`447 => 0` (the stub this repository's rules exist to forbid) — `CF-EXIT=1`,
+`pass=229 fail=2 (231 built)`. `t-enosys` went red on its two claims
+(`FAIL:  memfd_secret answers ENOSYS`, `FAIL:  memfd_secret asked a second time
+still answers ENOSYS`), and `t-secretmem` fell into its *serving* branch because a
+`0` return reads as "descriptor 0" (the descriptor is stdin), so its shape claims
+went red (`FAIL:  the flags word is not a union of useful bits: 1 and 2 are
+refused`, `FAIL:  the size is fixed once: the first ftruncate takes, the second is
+EINVAL`). The arm was restored from `build/scratch/mod-secretmem.bak` in the same
+job (`docs/uapi/` item 131; log `build/scratch/secretmem-cf.log`).
+
 ### R.8 (moved from ROADMAP's status board) — the allocator failure path, still open
 
 8.0: **a userspace process could panic the kernel** — fixed for the case that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB contiguous `realloc` is an order the buddy allocator never serves), and tmpfs now has a byte budget answering `ENOSPC`; demand paging also took "maps too much" off the list, since a mapping is now an address space and backs nothing until it is touched. Still open: the global allocator's failure path is `panic!`, so any other unbounded user-driven growth still ends the machine (§8.0).

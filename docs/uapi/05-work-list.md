@@ -7024,3 +7024,39 @@ boot has already allocated it. x86_64 `pass=230 fail=0`, aarch64 `pass=229
 fail=0`, `mpos-kunit 34 passed` both; counterfactual (the kernel edits reverted)
 leaves five claims of `t-seat` red. `docs/notes/` §7.1f carries the measured
 table and the reasoning.
+
+## item 131 — `memfd_secret(2)`: the one gap, now measured and pinned
+
+447 on both machines, and the only number the dispatch still has no arm for. The
+gap was named before it was measured; this item is the measurement. Linux 7.2.11,
+ordinary user: `memfd_secret(0)` hands back an `O_RDWR` regular file with mode
+`0600` whose `/proc/self/fd` link reads `/secretmem (deleted)` and which does
+**not** carry `FD_CLOEXEC`; `flags` 1 and 2 are `EINVAL`; `ftruncate` fixes the
+size once (second call `EINVAL`); mappings are `MAP_SHARED` only
+(`MAP_PRIVATE` → `EINVAL`), need no size set first, and fault `SIGBUS` past the
+end; `mprotect` may set read-only/writable/`PROT_NONE` per *mapping*, but adding
+`PROT_EXEC` is `EACCES`; `read`/`write` are `EINVAL`, `pread`/`pwrite`/`lseek`
+`ESPIPE`, `F_ADD_SEALS` `EINVAL`; a forked child inherits descriptor and mapping.
+The descriptor is the bookkeeping: the syscall's content is the property that
+those pages are never in the kernel's direct map, never in a core dump and never
+executable.
+
+This kernel answers `ENOSYS`, and that is **Linux's own answer for a kernel
+built without `CONFIG_SECRETMEM`** — the number exists, the machine has no such
+memory. Serving it without the property would hand out a descriptor that lies
+about secrecy, which rule 2 forbids. The prerequisite, restated after the
+measurement: a per-page carve-out from the identity map (unmap a 4 KiB page from
+the direct map when it is turned secret, restore when the last mapping and the
+descriptor are gone, and refuse every kernel path that would have reached it
+through the identity map), plus `SECRETMEM` accounting in `/proc/meminfo`, the
+fixed-once size rule, shared-only mappings, no-exec and the coredump exclusion.
+
+**Pin**: `user/tests/src/bin/t-secretmem.rs` — the guest claims are the refusal
+and its flag nuance (`1` and `0x8000_0000` are `ENOSYS`, an absent call takes no
+flags); the host branch carries the measured shape (ten claims) so a kernel that
+one day grows the property measures Linux's answers instead of a special case.
+`t-enosys` keeps the plain fall-through claim. x86_64 `all 231 user tests
+passed`, aarch64 `all 230`, `mpos-kunit 34 passed` both; counterfactual (a
+`447 => 0` stub) is `pass=229 fail=2`: `t-enosys`'s two claims and the new pin's
+shape claims, since a `0` return reads as "descriptor 0" (stdin). `docs/notes/` §8.4 carries the table and
+the reasoning.
