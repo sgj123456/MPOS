@@ -6880,22 +6880,52 @@ program, five claims — the round-trip read-back, the `frsig` zero, "a refused
 recorded as item 127 (`VT_LOCKSWITCH`, `VT_UNLOCKSWITCH`, `VT_ACKACQ`, and the
 `0x0c` arm answering a call Linux does not have).
 
-## item 127 — the VT switch-acknowledgement family is still a dialect
+## item 127 — the switch lock and the acquire ack are Linux's, and the invented `VT_WAITUNTIL` is gone
 
-`0x560c` is Linux's `VT_UNLOCKSWITCH`, not the `VT_WAITUNTIL` this kernel's
-`Tty::vt_ioctl` answers today; `VT_LOCKSWITCH` (`0x560b`) has no arm in the
-`'V'` family at all (it falls to `ENOTTY`), and `VT_ACKACQ` (`0x02`, the
-`VT_RELDISP` argument that answers an *acquire*) is accepted and then folded
-into the release answer — `vcmux::release_ack(vc, buf != 0)` cannot tell the two
-apart.
+Served: `VT_LOCKSWITCH` (`0x0b`), `VT_UNLOCKSWITCH` (`0x0c`),
+`VT_RELDISP(VT_ACKACQ)` (`2`), and Linux's range vocabulary for
+`VT_ACTIVATE`/`VT_WAITACTIVE` (`0` and `> 63` are `ENXIO`; a legal number with
+no console behind it is a silent success for `VT_ACTIVATE` and a park for
+`VT_WAITACTIVE`). Reference measured on this host's own kernel 7.2.11-arch1-1
+booted in QEMU with a static-init initramfs (`build/scratch/vt3/init*.c`), after
+the desktop's VT 1 turned out to be a `VT_PROCESS` console that could not
+separate "the lock stopped it" from "the promise was unanswered":
 
-What is *not* measured yet is what these three do on a Linux console, so this
-item starts where every item in this repository starts: a guest probe that asks
-Linux first (which consoles `VT_LOCKSWITCH`/`VT_UNLOCKSWITCH` cover, what a
-`VT_ACTIVATE` to a locked console returns and whether it blocks, and the
-`VT_ACKACQ` handshake on acquire), then the arms, then the pin — `t-seat`'s
-`VT_WAITUNTIL` claims are the ones to replace, and the probe in
-`docs/notes/` §7.1d is the instrument that found this family's last defect.
+| question | Linux |
+|---|---|
+| `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH`, root | 0 / 0 |
+| as uid 1000 (no `CAP_SYS_TTY_CONFIG`) | `EPERM` both (also `VT_ACTIVATE`, `VT_RELDISP`) |
+| scope | machine-wide: one `vt_dont_switch`, any console's descriptor locks all |
+| `VT_ACTIVATE(other)` while locked | 0, no switch |
+| unlock, no new request | no switch — the locked request was **dropped**, not replayed |
+| a lock taken while a release is owed | `VT_RELDISP(1)` still moves the screen |
+| `VT_RELDISP` on a `VT_AUTO` console | `EINVAL`, every argument |
+| `VT_RELDISP(0)`/`(1)`, `VT_PROCESS`, nothing outstanding | `EINVAL`/`EINVAL` |
+| `VT_RELDISP(2)`, `VT_PROCESS`, nothing outstanding | 0 (and again 0) |
+| `VT_ACTIVATE(0)`/`(1000)`/`(63)` | `ENXIO`/`ENXIO`/0-with-no-switch |
+| `VT_WAITACTIVE(0)`/`(1000)`/`(63)`/active | `ENXIO`/`ENXIO`/parks (signal-interruptible)/0 at once |
+
+Implementation: `crates/term/src/vtmode.rs` carries the constants and the
+machine-wide `locked` flag plus `Decision::Blocked`; `src/vfs/vcmux.rs` the
+`set_switch_lock`/`switch_locked` doors and `acquire_ack`; `src/vfs/tty.rs` the
+arms. The invented `VT_WAITUNTIL` arm (which occupied `0x0c`, Linux's
+`VT_UNLOCKSWITCH`) is deleted, and the pin was corrected on both sides: the
+test's `NR_VT_WAITUNTIL` and its three claims are gone, replaced by the lock
+claims, the drop-on-unlock claim, the switch-after-unlock claim, `VT_ACKACQ`
+(0 on a promise console, `EINVAL` on an automatic one), an argument outside
+0..=2, and `VT_WAITACTIVE(0)`.
+
+Pinned by `t-seat` (both machines; host makes no claim). Gates:
+x86_64 `pass=229 fail=0 (229 built)`, aarch64 `pass=228 fail=0 (228 built)`,
+`mpos-kunit 34 passed, 0 failed` everywhere, host stage `1178 tests, 0 failed`.
+Counterfactual with the kernel side reverted and the pin kept:
+`pass=228 fail=1 (229 built)`, `t-seat` the only red program, three claims —
+`VT_LOCKSWITCH succeeds` (`ENOTTY`), `a locked request moves nothing` (the
+screen moved), `VT_RELDISP(VT_ACKACQ) succeeds on a promise console`
+(`EINVAL`) — and `VT_UNLOCKSWITCH` passing because the invented arm answered 0,
+the dialect this item removes. Divergences named: the capability gate is root
+rather than `CAP_SYS_TTY_CONFIG`; the lock is only cleared by
+`VT_UNLOCKSWITCH`, as Linux's `vt_dont_switch` is.
 
 ## item 128 — a POSIX timer is the thread group's, and a worker's timer outlives it
 

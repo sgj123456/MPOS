@@ -300,9 +300,10 @@ approximation of it:
   rule has something to be a rule *about*. It used to be the console tty
   registered a second time, which made it `(4, 64)` and left the `(4, 0)` arm of
   `Tty::vc_number` unreachable.
-* `VT_SETMODE`, `VT_RELDISP`, `VT_ACTIVATE`, `VT_WAITACTIVE`, `VT_WAITUNTIL`
-  and `VT_OPENQRY` ask
-  who is calling: the terminal's own foreground job, or superuser. Without that,
+* `VT_SETMODE`, `VT_RELDISP`, `VT_ACTIVATE`, `VT_WAITACTIVE`,
+  `VT_LOCKSWITCH`/`VT_UNLOCKSWITCH` and `VT_OPENQRY` ask who is calling: the
+  terminal's own foreground job, or superuser. (`VT_WAITUNTIL` used to be in this
+  list; it was never a Linux command — `0x560c` is `VT_UNLOCKSWITCH`, §7.1e.) Without that,
   any process holding a `/dev/tty` fd could answer a compositor's `relsig` for
   it, or write its mode. `KDSETMODE` keeps Linux's second door as well - the
   holder of the card may set a console's video mode, because the driver that owns
@@ -730,12 +731,121 @@ with five claims — `VT_GETMODE reads back the mode and both signals`,
 aarch64 `all 228 user tests passed`, `mpos-kunit 34 passed, 0 failed` on all
 twelve lanes, host stage `1178 tests, 0 failed`.
 
-**Named gap left in the family.** `0x560c` is `VT_UNLOCKSWITCH` in
-`<linux/vt.h>`, not the `VT_WAITUNTIL` this kernel used to answer, and
-`VT_LOCKSWITCH` (0x560b), `VT_UNLOCKSWITCH` (0x560c) and `VT_ACKACQ` are
-unimplemented here: an arm that answers a call no Linux caller sends is the same
-class of defect as the dialect above, one request up. Recorded as item 127 and
-the next item in this family.
+**The rest of the family** — `VT_LOCKSWITCH`, `VT_UNLOCKSWITCH`, `VT_ACKACQ`, and
+the `VT_WAITUNTIL` arm that was occupying `0x560c` — is measured, served and
+pinned in §7.1e below.
+
+### 7.1e The switch lock, the acquire ack, and the call that was never Linux's — LANDED (2026-10-29)
+
+The `'V'` family still had three dialect-shaped holes after §7.1d:
+`VT_LOCKSWITCH` (`0x560b`) had no arm at all (`ENOTTY`), `VT_UNLOCKSWITCH`
+(`0x560c`) was shadowed by an **invented** `VT_WAITUNTIL` arm — a command no
+Linux has, answering on the number of one it does — and `VT_RELDISP`'s third
+argument, `VT_ACKACQ` (`2`), was folded into the release answer
+(`release_ack(vc, buf != 0)`), so an acknowledgement was indistinguishable from
+"hand the screen over".
+
+#### Measuring Linux first
+
+The desktop's own console was the wrong instrument: VT 1 there is niri's
+`VT_PROCESS` console and answers every switch with a promise the compositor
+owns, so a probe run from a shell could not separate "the lock stopped it" from
+"the release was never answered". The reference was taken instead from **this
+host's own kernel booted in QEMU as the guest** — `/boot/vmlinuz-linux`
+7.2.11-arch1-1 with a throwaway initramfs whose `/init` is a static probe
+(`build/scratch/vt3/init*.c`, `-kernel`/`-initrd`, `-vga std`, `-display none`,
+`console=ttyS0`): real VTs, no compositor, `/init` as root. The probes needed
+one correction of their own — `/dev/console` is the *last* `console=` in the
+list, so a first round lost its output to the VGA; printing on an explicitly
+opened `/dev/ttyS0` fixed it.
+
+Measured on that kernel (values are the ioctl returns, `EINVAL` = −22,
+`ENXIO` = −6, `EPERM` = −1):
+
+| question | measured answer |
+|---|---|
+| `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH` as root | 0 / 0, from a descriptor on *any* console |
+| as uid 1000 (no `CAP_SYS_TTY_CONFIG`) | `EPERM` for both — `VT_ACTIVATE`, `VT_RELDISP` too (`VT_GETMODE` with a NULL pointer answers `EFAULT`, so it is *not* permission-gated) |
+| scope | **machine-wide** (`vt_dont_switch` is one static): locking through console 2's descriptor stopped a switch asked from console 0 |
+| `VT_ACTIVATE(2)` while locked | 0, screen stays on 1 |
+| unlock, then nothing | screen **still** on 1 — a request made while locked is dropped, not replayed |
+| fresh `VT_ACTIVATE(2)` after unlock | 0, screen moves to 2 |
+| lock the console that owes a release, then `VT_RELDISP(1)` | 0, **screen still moves** — a lock gates new requests, not answers to ones already asked |
+| `VT_RELDISP` on a `VT_AUTO` console | `EINVAL` for every argument (0, 1, 2) |
+| `VT_RELDISP(0)` / `(1)` on a `VT_PROCESS` console with nothing outstanding | `EINVAL` / `EINVAL` |
+| `VT_RELDISP(2)` on a `VT_PROCESS` console, nothing outstanding | **0** — twice in a row |
+| `VT_RELDISP(1)` after agreeing, again | `EINVAL` |
+| activating a `VT_PROCESS` console | `acqsig` delivered, and `VT_RELDISP(2)` on it answers 0 |
+| `VT_ACTIVATE(0)` / `(1000)` | `ENXIO` / `ENXIO` |
+| `VT_ACTIVATE(63)` (`MAX_NR_CONSOLES`, a legal number with no console) | **0**, nothing moves |
+| `VT_WAITACTIVE(0)` / `(1000)` | `ENXIO` / `ENXIO` |
+| `VT_WAITACTIVE(63)` | **parks**, until a signal interrupts it (`EINTR`, errno 4) — no built-in timeout |
+| `VT_WAITACTIVE(active)` | 0 at once; while a release is outstanding it parked 402 ms and returned 0 after the answer |
+
+#### What landed
+
+* `crates/term/src/vtmode.rs`: `MAX_NR_CONSOLES = 63`, `VT_ACKACQ = 2`,
+  `VT_LOCKSWITCH = 0x0b`, `VT_UNLOCKSWITCH = 0x0c` (each with the measurement
+  beside it); a `locked: bool` on the table (Linux's one `vt_dont_switch`, not a
+  per-console field), `set_locked`/`locked`, and a `Decision::Blocked { to }` so
+  the policy can say *"answered, moved nothing"* — `request_switch` returns it
+  before anything else, while `release_ack` deliberately ignores the lock (the
+  measured in-flight case).
+* `src/vfs/vcmux.rs`: `set_switch_lock`/`switch_locked` (the table's door) and
+  `acquire_ack(vc)` — true only for a `VT_PROCESS` console, which is the mode
+  gate Linux measured for `VT_ACKACQ`. `apply` treats `Blocked` as the no-op it
+  is: Linux's answer to the request is 0, and nothing is queued.
+* `src/vfs/tty.rs`: `0x0b`/`0x0c` arms replace the invented `VT_WAITUNTIL`
+  (`0x0c` is now `VT_UNLOCKSWITCH`, as Linux has it) — both `owns_it`-gated,
+  answering 0; `VT_RELDISP` now separates `VT_ACKACQ` (0 on a promise console,
+  `EINVAL` on an automatic one) from the 0/1 answer, and refuses any other
+  argument rather than reading it as a truthy agreement; `VT_ACTIVATE` checks
+  Linux's `MAX_NR_CONSOLES` (so 63 is a silent success with no console behind
+  it, and only 0/past-63 is `ENXIO`); `VT_WAITACTIVE` gets the same range check
+  (was: parked forever on 0). The `size` word derivation the §7.1d fix left
+  unused is gone, with the reason it is unused written where it stood.
+* `user/tests/src/bin/t-seat.rs`: the three `VT_WAITUNTIL` claims are gone; the
+  lock, the drop-on-unlock, the switch-after-unlock and the acquire ack are
+  claims, all encoded with Linux's numbers. The lock/switch claims run while the
+  console is still `VT_AUTO` on purpose — a `VT_PROCESS` console being asked to
+  leave would send `relsig` to the test process itself, which installs no
+  handler.
+
+#### Pins, gates, counterfactual
+
+`t-seat` is the pin (both machines; host makes no claim — §7.1d's reason).
+Green tree: x86_64 `pass=229 fail=0 (229 built)`, aarch64 `pass=228 fail=0
+(228 built)`, `mpos-kunit 34 passed, 0 failed` on all lanes, host stage
+`1178 tests, 0 failed` (`build/scratch/vtlock-gate1.log`,
+`build/scratch/vtlock-gate-a1.log`). **Counterfactual**, kernel side reverted and
+the corrected pin kept (`build/scratch/vtlock-cf.log`): `CF-EXIT=1`,
+`pass=228 fail=1 (229 built)`, `t-seat` the one red program, exactly the claims
+the gap describes —
+
+```
+FAIL:  VT_LOCKSWITCH succeeds (got -25, want 0)
+FAIL:  a locked request moves nothing (the screen is still here) (got 2, want 1)
+FAIL:  VT_RELDISP(VT_ACKACQ) succeeds on a promise console (got -22, want 0)
+```
+
+`VT_UNLOCKSWITCH` passing under the old kernel is the dialect itself: the
+invented `VT_WAITUNTIL` arm answered 0 for argument 0, which is precisely why the
+command had to be measured before being removed.
+
+#### Named divergences
+
+* The capability gate is `root` (uid 0), the proxy this kernel uses for
+  `CAP_SYS_TTY_CONFIG` elsewhere — Linux's check is the capability bit, which a
+  root-less credential holder could have. Same shape, narrower access.
+* The lock is never cleared by anything but `VT_UNLOCKSWITCH`, which matches
+  Linux (`vt_dont_switch` is not reset on process exit) and is why a lock left by
+  a dead session holds the screen still until someone with the capability lifts
+  it — the same machine-wide trap Linux has.
+* `VT_WAITACTIVE` on a legal number with no console behind it parks until a
+  signal, as Linux's does; this kernel's consoles are six, so `VT_WAITACTIVE(63)`
+  is a park nobody will ever end except by signal — Linux's own fork of the same
+  shape (`MAX_NR_CONSOLES` is 63 there and consoles can be allocated only up to
+  it, but its callback never completes for an unallocated one either).
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 

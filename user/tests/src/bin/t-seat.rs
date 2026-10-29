@@ -70,7 +70,8 @@ const DRM: u8 = b'd';
 
 /// `<linux/vt.h>`, whose requests are `_IO(VT, n)` and so start at zero:
 /// OPENQRY 0x00, GETMODE 0x01, SETMODE 0x02, GETSTATE 0x03, SENDSIG 0x04,
-/// RELDISP 0x05, ACTIVATE 0x06, WAITACTIVE 0x07.
+/// RELDISP 0x05, ACTIVATE 0x06, WAITACTIVE 0x07, LOCKSWITCH 0x0b,
+/// UNLOCKSWITCH 0x0c.
 const NR_VT_OPENQRY: u64 = 0x00;
 const NR_VT_GETMODE: u64 = 0x01;
 const NR_VT_SETMODE: u64 = 0x02;
@@ -78,9 +79,12 @@ const NR_VT_GETSTATE: u64 = 0x03;
 const NR_VT_RELDISP: u64 = 0x05;
 const NR_VT_ACTIVATE: u64 = 0x06;
 const NR_VT_WAITACTIVE: u64 = 0x07;
-/// `VT_WAITUNTIL` - Linux's `vt_waitrelease`: the same park, with a
-/// `0` that means "nothing to wait for" instead of a range error.
-const NR_VT_WAITUNTIL: u64 = 0x0c;
+/// `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH`: Linux's `vt_dont_switch`, the
+/// machine-wide "hold the screen still" flag. `0x0c` is the number this test
+/// used to send an invented `VT_WAITUNTIL` to - a command no Linux has, on the
+/// number of one it does (`docs/uapi/` item 127).
+const NR_VT_LOCKSWITCH: u64 = 0x0b;
+const NR_VT_UNLOCKSWITCH: u64 = 0x0c;
 /// `<linux/kd.h>`: KDSETMODE 0x3a, KDGETMODE 0x3b, KDGKBMODE 0x44,
 /// KDSKBMODE 0x45.
 const NR_KDSETMODE: u64 = 0x3a;
@@ -297,6 +301,83 @@ fn main() {
         VT_AUTO as isize,
     );
 
+    // VT_LOCKSWITCH / VT_UNLOCKSWITCH: Linux's `vt_dont_switch`, and it is
+    // machine-wide rather than per console. Measured on Linux 7.2.11 (host kernel
+    // in an isolated initramfs, `build/scratch/vt3/init4.c`): a lock answers
+    // `VT_ACTIVATE` 0 and moves nothing, a request made while locked is *dropped*
+    // rather than replayed on unlock, and both ioctls need `CAP_SYS_TTY_CONFIG`
+    // (`EPERM` as uid 1000, 0 as root). CI runs this as root, so the door opens; a
+    // kernel without the pair answers `ENOTTY` here, which is the counterfactual.
+    //
+    // The switch is made while this console is still `VT_AUTO` on purpose: a
+    // `VT_PROCESS` console being asked to leave would send `relsig` to this very
+    // process, and this program installs no handler for it.
+    let other = if active == 1 { 2 } else { 1 };
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_LOCKSWITCH), 0 as *mut c_void) };
+    check_eq(&mut r, "VT_LOCKSWITCH succeeds", r0, 0);
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_ACTIVATE), other as usize as *mut c_void) };
+    check_eq(&mut r, "VT_ACTIVATE while locked still answers 0", r0, 0);
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETSTATE, 6),
+            st.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_eq(&mut r, "VT_GETSTATE after a locked request succeeds", r0, 0);
+    check_eq(
+        &mut r,
+        "a locked request moves nothing (the screen is still here)",
+        stat_shorts(&st, 0) as isize,
+        active as isize,
+    );
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_UNLOCKSWITCH), 0 as *mut c_void) };
+    check_eq(&mut r, "VT_UNLOCKSWITCH succeeds", r0, 0);
+    // Unlocked, the same request is not just answered but obeyed: the console on
+    // the screen is the one that was asked for, and asking back brings it home.
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_ACTIVATE), other as usize as *mut c_void) };
+    check_eq(&mut r, "VT_ACTIVATE after unlocking succeeds", r0, 0);
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETSTATE, 6),
+            st.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_eq(
+        &mut r,
+        "VT_GETSTATE after the unlocked switch succeeds",
+        r0,
+        0,
+    );
+    check_eq(
+        &mut r,
+        "an unlocked request switches to the console it named",
+        stat_shorts(&st, 0) as isize,
+        other as isize,
+    );
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_ACTIVATE), active as usize as *mut c_void) };
+    check_eq(
+        &mut r,
+        "VT_ACTIVATE back to the first console succeeds",
+        r0,
+        0,
+    );
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETSTATE, 6),
+            st.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_eq(&mut r, "VT_GETSTATE after coming back succeeds", r0, 0);
+    check_eq(
+        &mut r,
+        "and the screen is back where this session started",
+        stat_shorts(&st, 0) as isize,
+        active as isize,
+    );
+
     // VT_SETMODE is where a handover stops being decoration. A session that
     // wants the screen asks for `VT_PROCESS`, names the two signals the kernel
     // will use, and *must* find both back: a mode the kernel accepted and
@@ -365,6 +446,27 @@ fn main() {
         r0,
         EINVAL,
     );
+    // `VT_ACKACQ` (2) is the third argument and, measured on Linux 7.2.11, the
+    // only one a `VT_PROCESS` console answers 0 to with nothing outstanding - it
+    // is the acquiring console acknowledging the screen, its own question rather
+    // than an answer to the release. On a `VT_AUTO` console every argument is
+    // `EINVAL`, which is why this claim sits after the mode was set.
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_RELDISP), 2 as *mut c_void) };
+    check_eq(
+        &mut r,
+        "VT_RELDISP(VT_ACKACQ) succeeds on a promise console",
+        r0,
+        0,
+    );
+    // And the vocabulary is 0, 1 and 2: an argument outside it is a refusal to
+    // understand the answer, not a truthy agreement to hand the screen over.
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_RELDISP), 3 as *mut c_void) };
+    check_eq(
+        &mut r,
+        "VT_RELDISP with an argument outside 0..=2 is EINVAL",
+        r0,
+        EINVAL,
+    );
 
     // VT_SENDSIG (0x04) was removed from the vt driver years ago; measured on a
     // current console the request falls through the kernel's switch and answers
@@ -418,21 +520,11 @@ fn main() {
     );
     let r0 = unsafe { ioctl(tty, io(VT, NR_VT_ACTIVATE), 0 as *mut c_void) };
     check_eq(&mut r, "VT_ACTIVATE 0 is ENXIO", r0, ENXIO);
-    // VT_WAITUNTIL: `arg == 0` is Linux's "nothing to wait for" - a plain
-    // success without touching the screen - and a console the machine does
-    // not have is the same `ENXIO` `vt_waitactive` gives. The console that
-    // is already active ends the wait on the spot.
-    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITUNTIL), 0 as *mut c_void) };
-    check_eq(&mut r, "VT_WAITUNTIL 0 answers 0 at once", r0, 0);
-    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITUNTIL), 600 as *mut c_void) };
-    check_eq(
-        &mut r,
-        "VT_WAITUNTIL on a console that does not exist is ENXIO",
-        r0,
-        ENXIO,
-    );
-    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITUNTIL), active as usize as *mut c_void) };
-    check_eq(&mut r, "VT_WAITUNTIL on the active console returns", r0, 0);
+    // `VT_WAITACTIVE`'s range check is Linux's too, and measured: 0 is `ENXIO`
+    // at once (`build/scratch/vt3/init3.c`/`init4.c`), while a legal number with
+    // no console behind it parks - which is why only the zero is claimed here.
+    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITACTIVE), 0 as *mut c_void) };
+    check_eq(&mut r, "VT_WAITACTIVE 0 is ENXIO", r0, ENXIO);
 
     // KDSETMODE(KD_GRAPHICS) -> KDGETMODE reads it back. This pair is the
     // handover: the text console stops drawing on the screen the session has

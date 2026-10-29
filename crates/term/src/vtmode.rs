@@ -96,6 +96,38 @@ pub const VT_PROCESS: u8 = 1;
 /// can raise.
 pub const MAX_SIGNAL: u8 = 64;
 
+/// The largest console number `<linux/vt.h>` lets a caller name: `MAX_NR_CONSOLES`
+/// is 63, and both `VT_ACTIVATE` and `VT_WAITACTIVE` answer `ENXIO` for a number
+/// at zero or past it (`vt_ioctl.c`: `arg == 0 || arg > MAX_NR_CONSOLES`).
+///
+/// **Measured on Linux 7.2.11** (host kernel in an isolated initramfs, `-vga std`,
+/// the `/init` probe in `build/scratch/vt3/init4.c`): `VT_ACTIVATE(1000)` and
+/// `VT_WAITACTIVE(1000)` both answered `ENXIO` (6), and `VT_ACTIVATE(63)` - a
+/// legal number with no console behind it - answered **0** and moved nothing,
+/// while `VT_WAITACTIVE(63)` parked until a signal interrupted it. The range
+/// check is therefore about *numbering*, not about which consoles exist.
+pub const MAX_NR_CONSOLES: u32 = 63;
+
+/// `VT_ACKACQ` (`VT_RELDISP`'s third argument and `<linux/vt.h>`'s `VT_ACKACQ`):
+/// the console acknowledging that it got the screen.
+///
+/// **Measured on Linux 7.2.11** (`build/scratch/vt3/init2.c`, `init3.c`): on a
+/// `VT_PROCESS` console `VT_RELDISP(2)` answered 0 with nothing outstanding (twice
+/// in a row), and on a `VT_AUTO` console the same argument was `EINVAL` - like
+/// every other argument. `VT_RELDISP(0)` with a release outstanding is a refusal
+/// that answers 0 and moves nothing; `VT_RELDISP(1)` agrees and moves the screen.
+pub const VT_ACKACQ: usize = 2;
+
+/// `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH`, `<linux/vt.h>`'s `_IO(VT, 0x0b)` and
+/// `_IO(VT, 0x0c)`. The second number is the one this kernel used to serve with
+/// an invented `VT_WAITUNTIL` arm - a command no Linux has, occupying the number
+/// of one it does (`docs/uapi/` item 127). Both answer `EPERM` without
+/// `CAP_SYS_TTY_CONFIG`; measured on Linux 7.2.11 (`init5.c`): as uid 1000 both
+/// answered `EPERM`, as root both 0.
+pub const VT_LOCKSWITCH: u8 = 0x0b;
+/// `VT_UNLOCKSWITCH` - see [`VT_LOCKSWITCH`].
+pub const VT_UNLOCKSWITCH: u8 = 0x0c;
+
 /// How long a release may be waited for, in clock ticks: 60 seconds at this
 /// kernel's 250 Hz.
 ///
@@ -328,6 +360,13 @@ pub enum Decision {
         release: Release,
         relsig: Option<Promise>,
     },
+    /// `VT_LOCKSWITCH` is set for the machine: the request is accepted - Linux
+    /// answers `VT_ACTIVATE` 0 - and **nothing moves**, and a request already
+    /// queued while the machine was locked is dropped rather than replayed when
+    /// it is unlocked. Measured on Linux 7.2.11 (`build/scratch/vt3/init4.c`):
+    /// lock, `VT_ACTIVATE(2)` -> 0 with the screen still on console 1, unlock,
+    /// still console 1, and only a fresh `VT_ACTIVATE(2)` switched.
+    Blocked { to: u32 },
 }
 
 /// The per-console modes, plus the one negotiation in flight.
@@ -346,6 +385,12 @@ pub struct Table {
     active: u32,
     /// The negotiation in flight, if any.
     release: Option<Release>,
+    /// `VT_LOCKSWITCH`: Linux's `vt_dont_switch`, **one flag for the whole
+    /// machine**, not per console - measured: locking from a descriptor on any
+    /// console stopped a switch to any other (`docs/notes/` §7.1e). The lock
+    /// stops new requests; one already in flight finishes (a release the
+    /// console on the screen answers still moves the screen, measured).
+    locked: bool,
     /// The console that last refused to give up the screen, or 0 for nobody.
     /// Kept apart from `release` on purpose: a refusal is *settled* - nothing
     /// is being waited for and nothing will expire - and modelling it as an
@@ -362,6 +407,7 @@ impl Table {
             modes: vec![VtMode::AUTO; count as usize + 1],
             keepers: vec![0; count as usize + 1],
             active: 1,
+            locked: false,
             release: None,
             refusing: 0,
         }
@@ -370,6 +416,21 @@ impl Table {
     /// The console on the screen.
     pub fn active(&self) -> u32 {
         self.active
+    }
+
+    /// `VT_LOCKSWITCH`: stop switching the screen, machine-wide. Linux's
+    /// `vt_dont_switch` is one static, not a field per console, so a console's
+    /// descriptor locks every other console too - which is what makes it usable
+    /// from a session that wants the screen to hold still.
+    pub fn set_locked(&mut self, locked: bool) {
+        self.locked = locked;
+    }
+
+    /// Whether switching is locked. `VT_UNLOCKSWITCH` clears it and nothing else
+    /// does: a lock left behind by a dead session is Linux's own behaviour too
+    /// (`vt_dont_switch` is not reset on process exit).
+    pub fn locked(&self) -> bool {
+        self.locked
     }
 
     /// The negotiation in flight, if any.
@@ -506,6 +567,15 @@ impl Table {
         if to == 0 || self.modes.get(to as usize).is_none() {
             return None;
         }
+        // The machine-wide lock answers the request and moves nothing; it is
+        // checked before the console-on-screen special case so that a locked
+        // machine's `VT_ACTIVATE` is uniformly a no-op rather than "the one
+        // console you happen to be on". An in-flight release is deliberately
+        // *not* blocked here - the console that answered it has already been
+        // asked, and Linux completes that switch (measured, `init3.c`).
+        if self.locked {
+            return Some(Decision::Blocked { to });
+        }
         if to == self.active {
             // Asking for the screen you are on always succeeds, and it is the
             // one thing that lifts a refusal the console on the screen itself
@@ -558,6 +628,9 @@ impl Table {
     /// that it is an error rather than a success: a session answering a request
     /// that was never made would be completing someone else's switch.
     pub fn release_ack(&mut self, vc: u32, agree: bool) -> Ack {
+        // A lock does not cancel an answer to a question already asked: measured
+        // on Linux 7.2.11 (`init3.c`) - lock the console that owes the release,
+        // answer `VT_RELDISP(1)`, and the screen still moved.
         let Some(release) = self.release else {
             return Ack::NotReleasing;
         };
@@ -1104,5 +1177,69 @@ mod tests {
             t.request_switch(3, 200, false).unwrap(),
             Decision::SwitchNow { to: 3 }
         );
+    }
+
+    /// `VT_LOCKSWITCH` stops a switch without refusing the request, and it is
+    /// machine-wide: Linux's `vt_dont_switch` is one static, so a lock taken
+    /// through any console's descriptor holds every other console still.
+    #[test]
+    fn the_machine_wide_lock_answers_and_moves_nothing() {
+        let mut t = Table::new(FOUR);
+        t.set_locked(true);
+        assert!(t.locked());
+        assert_eq!(
+            t.request_switch(2, 10, false),
+            Some(Decision::Blocked { to: 2 })
+        );
+        // The lock is not a refusal: nothing has been refused, so it cannot be
+        // lifted by asking again - only by `VT_UNLOCKSWITCH`.
+        assert_eq!(
+            t.request_switch(2, 20, true),
+            Some(Decision::Blocked { to: 2 })
+        );
+        assert_eq!(t.active(), 1);
+        t.set_locked(false);
+        assert_eq!(
+            t.request_switch(2, 30, false),
+            Some(Decision::SwitchNow { to: 2 })
+        );
+    }
+
+    /// A release that is already in flight finishes under the lock. Measured on
+    /// Linux 7.2.11: lock the console that owes the release, answer
+    /// `VT_RELDISP(1)`, and the screen still moves - the lock gates new requests,
+    /// not answers to ones already asked.
+    #[test]
+    fn an_answer_to_a_question_already_asked_is_not_locked_out() {
+        let mut t = Table::new(FOUR);
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
+        let Some(Decision::BeginRelease { release, .. }) = t.request_switch(2, 100, false) else {
+            panic!("console 1 promised to be asked");
+        };
+        t.set_locked(true);
+        assert_eq!(
+            t.release_ack(release.from, true),
+            Ack::Complete {
+                from: 1,
+                to: release.to
+            }
+        );
+        t.complete_switch(release.to);
+        assert_eq!(t.active(), 2);
+        // The lock still holds for the next request.
+        assert_eq!(
+            t.request_switch(1, 200, false),
+            Some(Decision::Blocked { to: 1 })
+        );
+    }
+
+    /// The two numbers come from `<linux/vt.h>` and are what both of this
+    /// kernel's console ioctl arms and `MAX_NR_CONSOLES`'s range check read.
+    #[test]
+    fn the_console_numbers_are_linuxs() {
+        assert_eq!(MAX_NR_CONSOLES, 63);
+        assert_eq!(VT_ACKACQ, 2);
+        assert_eq!(VT_LOCKSWITCH, 0x0b);
+        assert_eq!(VT_UNLOCKSWITCH, 0x0c);
     }
 }

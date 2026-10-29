@@ -269,6 +269,45 @@ pub fn set_vt_mode(vc: u32, mode: VtMode, pid: u32) -> Result<(), Option<vtmode:
     }
 }
 
+/// `VT_LOCKSWITCH` / `VT_UNLOCKSWITCH`: Linux's `vt_dont_switch`, the machine-wide
+/// "hold the screen still" flag.
+///
+/// **Measured on Linux 7.2.11** (host kernel in an isolated initramfs,
+/// `build/scratch/vt3/init4.c`): the flag is one for the whole machine - a lock
+/// taken through a descriptor on console 2 stopped a switch asked from console 0 -
+/// `VT_ACTIVATE` still answers 0 and moves nothing, and a request made while locked
+/// is *dropped*, not replayed on unlock (the screen stayed on console 1 through
+/// lock, ask, unlock, and only a fresh ask after unlocking switched). One already
+/// in flight finishes: locking the console that owed a release and then answering
+/// `VT_RELDISP(1)` still moved the screen (`init3.c`). The pure table owns the flag;
+/// this function is its door.
+///
+/// `false` says there is no console mux yet, which is the same answer a session
+/// would get from a machine with no consoles.
+pub fn set_switch_lock(locked: bool) -> bool {
+    vt_with(|t| t.set_locked(locked)).is_some()
+}
+
+/// Whether `VT_LOCKSWITCH` is set - see [`set_switch_lock`].
+pub fn switch_locked() -> bool {
+    vt_with(|t| t.locked()).unwrap_or(false)
+}
+
+/// `VT_RELDISP(VT_ACKACQ)`: the console on the screen acknowledging that it got it.
+///
+/// **Measured on Linux 7.2.11** (`init2.c`, `init3.c`): on a `VT_PROCESS` console
+/// the answer is 0 - twice in a row too, with nothing outstanding - and on a
+/// `VT_AUTO` console `VT_RELDISP` is `EINVAL` for *every* argument, this one
+/// included. So the gate is the console's mode, not whether an acquire is
+/// pending; the acknowledgement itself changes nothing this kernel tracks (the
+/// acquire signal is sent when the switch completes, as Linux sends it), and
+/// answering 0 is what a seat manager's `vt_ack_acq` expects to read.
+pub fn acquire_ack(vc: u32) -> bool {
+    vt_with(|t| t.mode(vc))
+        .flatten()
+        .is_some_and(|mode| mode.mode == vtmode::VT_PROCESS)
+}
+
 /// `VT_GETMODE`: a console this machine has never heard of is `VT_AUTO`, which
 /// is the honest answer about a console that does not exist.
 pub fn vt_mode(vc: u32) -> VtMode {
@@ -429,6 +468,10 @@ fn apply(decision: Decision) {
         // Asking for the screen you already have moves nothing; it only lifted
         // a refusal, which the table has already done.
         Decision::Already { .. } | Decision::Waiting { .. } => {}
+        // `VT_LOCKSWITCH` is set: Linux's answer to the request is still 0, and
+        // the screen does not move. Nothing is queued, because a request made
+        // while locked is dropped rather than replayed when the lock lifts.
+        Decision::Blocked { .. } => {}
         // Nothing is sent for a refusal. Linux ignores `frsig` - it writes zero
         // over the field at `VT_SETMODE` time - and the session that asked is the
         // one calling `VT_ACTIVATE`, which reads the refusal off its own return.

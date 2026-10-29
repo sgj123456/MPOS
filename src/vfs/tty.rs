@@ -1955,7 +1955,12 @@ impl Tty {
         if (request >> 8) & 0xff != b'V' as u32 {
             return err::ENOTTY;
         }
-        let size = ((request >> 16) & 0x3fff) as usize;
+        // The `'V'` requests this driver serves are bare numbers (`_IO(VT, n)`),
+        // and the one struct either way - `struct vt_mode` - is fixed at eight
+        // bytes by the ABI, so the size word a `_IOW` would carry is not read.
+        // Deriving a copy count from it read *zero* bytes for both
+        // `VT_GETMODE`/`VT_SETMODE` (measured: bits 16.. of `0x5601` are zero,
+        // `docs/notes/` §7.1d), which is what this arm used to do.
         let nr = request & 0xff;
         // `VT_OPENQRY` and `VT_GETSTATE` only ask where things are, and Linux lets
         // any tty's descriptor read those; the rest either write a console's mode,
@@ -2063,11 +2068,22 @@ impl Tty {
             // answers `ENOTTY`, not the `0` this arm used to return for a command
             // that does nothing anywhere.
             0x04 => err::ENOTTY,
-            // VT_RELDISP: the answer to a `relsig`, and the third argument is the
-            // answer itself - nonzero agrees to hand the screen over, zero refuses.
-            // Only the console a release is outstanding on may answer; anything else
-            // is Linux's `EINVAL`, because a session that replies to a question
-            // nobody asked would be completing someone else's switch.
+            // VT_RELDISP: the answer to a `relsig`. The argument is the answer:
+            // 0 refuses, 1 agrees, and 2 is `VT_ACKACQ`, the acknowledge an
+            // acquiring console gives.
+            //
+            // All three were measured on Linux 7.2.11 (`build/scratch/vt3/`):
+            // a console in `VT_AUTO` answers `EINVAL` to every argument, a
+            // `VT_PROCESS` console with nothing outstanding answers `EINVAL` to 0
+            // and 1 but **0** to 2 (twice in a row) - the acknowledgement is its
+            // own question - and one that owes a release answers 0 to 0 (refused,
+            // screen stays) and 0 to 1 (the screen moves). A second 1 is `EINVAL`,
+            // because the question is over.
+            //
+            // Success is the *answer*, not the switch: Linux's `VT_RELDISP`
+            // returns 0 whether the session agreed or refused, and the difference
+            // is the argument. `EINVAL` is reserved for a console that was never
+            // asked - what stops a session from completing someone else's hand-over.
             0x05 => {
                 if !owns_it() {
                     return err::EPERM;
@@ -2075,11 +2091,18 @@ impl Tty {
                 let Some(vc) = self.vc_number() else {
                     return err::EINVAL;
                 };
-                // Success is the *answer*, not the switch: Linux's `VT_RELDISP`
-                // returns 0 whether the session agreed or refused, and the
-                // difference is the argument it was given. `EINVAL` is reserved for
-                // the console that was never asked - which is what stops a session
-                // from completing someone else's hand-over.
+                if buf == crate::term::vtmode::VT_ACKACQ {
+                    return if crate::vfs::vcmux::acquire_ack(vc) {
+                        0
+                    } else {
+                        err::EINVAL
+                    };
+                }
+                if buf > 1 {
+                    // The measured vocabulary is 0, 1 and 2; anything else is
+                    // Linux's `EINVAL`, not a truthy agreement.
+                    return err::EINVAL;
+                }
                 if crate::vfs::vcmux::release_ack(vc, buf != 0) {
                     0
                 } else {
@@ -2100,8 +2123,18 @@ impl Tty {
                     return err::EPERM;
                 }
                 let to = buf as u32;
-                if to == 0 || to > VC_COUNT {
+                // Linux's range check is `MAX_NR_CONSOLES` (63), not the number of
+                // consoles this machine has: measured, `VT_ACTIVATE(63)` answered
+                // **0** and moved nothing, while `VT_ACTIVATE(1000)` was `ENXIO`.
+                // So a legal number with no console behind it is a silent success,
+                // and only a number outside the vocabulary is refused. Answering
+                // `ENXIO` for the first would tell a caller "no such command" about
+                // a request Linux accepted.
+                if to == 0 || to > crate::term::vtmode::MAX_NR_CONSOLES {
                     return err::ENXIO;
+                }
+                if to > VC_COUNT {
+                    return 0;
                 }
                 if !crate::vfs::vcmux::request_activate(to, false) {
                     return err::ENXIO;
@@ -2110,32 +2143,43 @@ impl Tty {
             }
             // VT_WAITACTIVE -> int: park until that console is the active one,
             // wakeable by the release that finally moves it.
+            //
+            // The number is checked against Linux's vocabulary, not against this
+            // machine's consoles: measured (`build/scratch/vt3/init4.c`),
+            // `VT_WAITACTIVE(1000)` is `ENXIO` at once while `VT_WAITACTIVE(63)` -
+            // legal, with no console behind it - **parked** until a signal
+            // interrupted it, which is Linux leaving that wait to the caller's
+            // signals rather than inventing a timeout.
             0x07 => {
                 if !owns_it() {
                     return err::EPERM;
                 }
-                crate::vfs::vcmux::wait_active(buf as u32);
+                let want = buf as u32;
+                if want == 0 || want > crate::term::vtmode::MAX_NR_CONSOLES {
+                    return err::ENXIO;
+                }
+                crate::vfs::vcmux::wait_active(want);
                 0
             }
             0x08 => 0, // VT_DISALLOCATE: nothing to free.
             0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
             0x0a => 0, // VT_RESIZEX: same.
-            // VT_WAITUNTIL -> int: Linux's `vt_waitrelease`, and its two answers
-            // are one short: `arg == 0` means "nothing to wait for" and returns 0
-            // without looking at the screen; anything else parks in exactly
-            // `VT_WAITACTIVE`'s way, and a console this machine does not have is
-            // `ENXIO` (`vt_waitactive`'s own range check).
-            0x0c => {
+            // VT_LOCKSWITCH / VT_UNLOCKSWITCH: Linux's `vt_dont_switch`, the
+            // machine-wide "hold the screen still" flag. Both need
+            // `CAP_SYS_TTY_CONFIG` - measured as uid 1000 they answer `EPERM`,
+            // as root 0 (`build/scratch/vt3/init5.c`). The lock gates new switch
+            // requests; one already in flight finishes.
+            //
+            // The second of the two numbers is where this kernel used to answer an
+            // invented `VT_WAITUNTIL` ("Linux's `vt_waitrelease`"), a command no
+            // Linux has, on the number of one it does. `VT_WAITUNTIL` was invented
+            // here as a reading of the first command; the measured semantics of the
+            // real one are above.
+            0x0b | 0x0c => {
                 if !owns_it() {
                     return err::EPERM;
                 }
-                if buf == 0 {
-                    return 0;
-                }
-                if buf as u32 > VC_COUNT {
-                    return err::ENXIO;
-                }
-                crate::vfs::vcmux::wait_active(buf as u32);
+                crate::vfs::vcmux::set_switch_lock(nr == 0x0b);
                 0
             }
             _ => err::ENOTTY,
