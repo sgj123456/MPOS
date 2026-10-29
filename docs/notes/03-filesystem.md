@@ -723,11 +723,50 @@ its timeout`, and on the fixed kernel `PASS`. Gates on the fixed tree: x86_64
 `all 229 user tests passed`, aarch64 `all 228` (`mpos-kunit 34 passed` both,
 stage 1 `1178 tests, 0 failed`).
 
-**Named gap from the same survey** (code read, not a measurement): the other
-nodes whose readiness is produced asynchronously — `timerfd`/`signalfd` — also
-do not implement `poll_subscribe`, so a task parked in `epoll_wait` on one of
-them has no registered door either. A `signalfd` is partly covered in practice
-because a delivered signal interrupts the wait (`EINTR`), which is how the
-compositor still saw `SIGINT`; a `timerfd` has no such accident, and nothing
-here has measured it. It is recorded as the next item of this shape rather than
-folded into this fix.
+**The survey this fix left open, and its measurement**: `timerfd` and
+`signalfd` also keep no `poll_subscribe` list, so the question was whether a
+park on one of them has a door. Measured with `build/scratch/gpu/tickwake.c`
+(two cases in one guest probe): a `timerfd` armed for 150 ms and watched by
+`epoll_wait(…, 3000)` answered at **3000 ms** — the timeout, not the
+expiration — while a `signalfd` with a blocked `SIGUSR1` queued 100 ms in
+answered in **0 ms**. So the signal machinery already wakes a park, and only
+the clock's own arrival had nobody behind it. That half is §3.13.
+
+### 3.13 A timerfd's expiration reaches an `epoll_wait` park — **DONE (2026-10-29)**
+
+`poll(2)` has always kept a one-tick floor under every timeout
+(`src/syscall/linux/fs/file.rs`'s `poll_wait`: `next = since_boot_nanos() +
+ns_per_tick()`, the floor named on the same clock as the deadline for §6.23's
+reason). `epoll_wait` did not: it parked to the caller's deadline alone, so a
+wait whose only watched descriptor was a `timerfd` slept through the expiration
+it was waiting for.
+
+**Measured** (`build/scratch/gpu/tickwake.c`, musl-static, two cases in one
+guest boot): a `timerfd_create(CLOCK_MONOTONIC)` armed for 150 ms and watched by
+`epoll_wait(ep, &ev, 1, 3000)` reported `epoll_wait=1 events=0x1` after
+**3000 ms** on the kernel before this change — the wait ended at its timeout and
+only then noticed the timer. After the floor it reports the same event after
+**153 ms**. The second case in the same probe — a `signalfd` with a blocked
+`SIGUSR1` queued 100 ms in by a thread — answered in **0 ms on both kernels**, so
+it needs no floor: the signal machinery wakes the park (which is also why §3.12's
+compositor still saw `SIGINT`).
+
+**The door the floor is hung from**: `Inode::ready_without_waker()` (default
+`false`; `TimerFd` answers `true` — the clock's arrival is nobody's call to
+announce), `Epoll::needs_tick()` (any watched descriptor answering it, asked once
+per wait), and `epoll_wait`'s loop: with a floor, the park's deadline is
+`min(caller deadline, now + ns_per_tick)`, and a floor tick that found nothing is
+**not** the caller's timeout — it re-asks, and only the caller's own deadline
+ends the wait with 0. Without such a descriptor the park is unchanged
+(`u64::MAX` for an infinite wait).
+
+**Pinned** by `t-timerfd` (both machines, its new epoll section, 6 claims): a
+monotonic timerfd exists, an epoll instance watches it, it is in the interest
+list, armed for 100 ms, **the expiration wakes the park inside a second**, and
+the report is `EPOLLIN`. Host Linux is the reference (`MPOS_ON_HOST=1`, 6/6 ok).
+The counterfactual was measured in both directions on probe images with the pin
+binary injected: the pre-fix kernel `FAIL: the expiration wakes the park inside a
+second` (it returned at its 2000 ms timeout), the fixed kernel passes the whole
+section.
+
+Full record: `docs/uapi/` §5.1 item 125.

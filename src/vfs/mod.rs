@@ -956,6 +956,22 @@ pub trait Inode: Send + Sync + core::any::Any {
         let _ = id;
     }
 
+    /// Whether this node's readiness can become true with nobody in the
+    /// kernel to announce it. `poll_subscribe` is the announcement's door and
+    /// most nodes keep a waiting list behind it; the one that cannot is the
+    /// clock bringing a `timerfd`'s expiration - no other task makes a call
+    /// for that. A park that watches it must re-ask at least once a tick,
+    /// which is what `poll(2)` has always done (a one-tick floor under every
+    /// timeout); `epoll_wait` had no such floor, so a task parked on a
+    /// `timerfd` slept until its own timeout (measured 3000 ms for a timer
+    /// that fired at 150 ms, `docs/notes/` §3.13). A `signalfd` is measured
+    /// *not* to need it: a blocked signal queued to the process wakes the
+    /// park through the signal machinery in 0 ms, so this door stays false
+    /// there.
+    fn ready_without_waker(&self) -> bool {
+        false
+    }
+
     /// [`Self::read_at`] on behalf of a named client.
     ///
     /// Almost every node answers the same thing whoever is asking, and the

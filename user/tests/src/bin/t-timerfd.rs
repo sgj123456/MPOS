@@ -24,6 +24,24 @@ use rustix::time::{
     Itimerspec, TimerfdClockId, TimerfdFlags, TimerfdTimerFlags, Timespec, timerfd_create,
     timerfd_gettime, timerfd_settime,
 };
+use std::os::fd::AsRawFd;
+
+/// The machine's `struct epoll_event`, x86_64-only packing and all - the same
+/// shape `t-epoll` spells, because the wait writes it back.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
 
 /// The door returns `-1` and leaves the refusal in `errno` (batch 12's
 /// measurement); the claim is about what the kernel answered.
@@ -251,6 +269,79 @@ fn main() {
         Err(_) => {
             r.check("gettime after the disarm succeeds", false);
             r.check("the disarmed timer reports zeros", false);
+        }
+    }
+
+    // ---- epoll: the expiration reaches a *park*, not a later look --------
+    //
+    // A timerfd's readiness is the clock's own work: no task calls a wake for
+    // it, so a park that watches one must re-ask at least once a tick - the
+    // one-tick floor `poll(2)` has always kept under every timeout. Before the
+    // floor existed (`docs/notes/` §3.13, item 125) a 150 ms timer was
+    // answered by `epoll_wait` at its own 3000 ms timeout, which is what this
+    // claim is the counterfactual against: it demands the *arrival* inside a
+    // second, so a wait that only notices at the timeout fails.
+    {
+        let t = timerfd_create(TimerfdClockId::Monotonic, TimerfdFlags::empty());
+        r.check(
+            "a monotonic timerfd for the epoll wake claim exists",
+            t.is_ok(),
+        );
+        if let Ok(t) = t {
+            let ep = unsafe { libc::epoll_create1(0) };
+            r.check("an epoll instance watches it", ep >= 0);
+            let mut armed_ok = false;
+            if ep >= 0 {
+                let mut ev = Ev {
+                    events: libc::EPOLLIN as u32,
+                    data: 0x5eed_u64,
+                };
+                let added = unsafe {
+                    libc::epoll_ctl(
+                        ep,
+                        libc::EPOLL_CTL_ADD,
+                        t.as_raw_fd(),
+                        &mut ev as *mut Ev as *mut libc::epoll_event,
+                    )
+                };
+                r.check("the timerfd is in the interest list", added == 0);
+                let its = Itimerspec {
+                    it_interval: Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                    it_value: Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 100_000_000,
+                    },
+                };
+                armed_ok = timerfd_settime(&t, TimerfdTimerFlags::empty(), &its).is_ok();
+            }
+            r.check("it is armed for 100 ms", armed_ok);
+            if ep >= 0 && armed_ok {
+                let mut out = [0u8; 16];
+                let started = std::time::Instant::now();
+                let got = unsafe {
+                    libc::epoll_wait(ep, out.as_mut_ptr() as *mut libc::epoll_event, 1, 2000)
+                };
+                let waited = started.elapsed();
+                r.check(
+                    "the expiration wakes the park inside a second",
+                    got == 1 && waited < std::time::Duration::from_millis(1000),
+                );
+                r.check(
+                    "the report is EPOLLIN",
+                    got == 1
+                        && u32::from_ne_bytes([out[0], out[1], out[2], out[3]])
+                            & (libc::EPOLLIN as u32)
+                            != 0,
+                );
+            }
+            if ep >= 0 {
+                unsafe {
+                    libc::close(ep);
+                }
+            }
         }
     }
 

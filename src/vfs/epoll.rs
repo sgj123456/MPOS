@@ -426,6 +426,19 @@ impl Epoll {
         });
     }
 
+    /// Whether any watched descriptor's readiness arrives with no wake behind
+    /// it, so a park on this instance must re-ask once a tick - the floor
+    /// `poll(2)` keeps under every timeout (see `Inode::ready_without_waker`).
+    pub fn needs_tick(&self) -> bool {
+        critical_section::with(|cs| {
+            self.state
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .any(|entry| entry.file.inode().ready_without_waker())
+        })
+    }
+
     /// Whether any watched descriptor could report right now - the answer
     /// `poll` on the epfd itself wants, and the answer a wait's first look
     /// gives before it sleeps.

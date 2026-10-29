@@ -435,6 +435,11 @@ impl Inode for TimerFd {
     fn as_timerfd(&self) -> Option<&TimerFd> {
         Some(self)
     }
+
+    /// The clock brings this readiness; no other task calls a wake for it.
+    fn ready_without_waker(&self) -> bool {
+        true
+    }
 }
 
 impl TimerFd {

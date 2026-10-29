@@ -5789,14 +5789,38 @@ fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) 
     let out_cell = core::cell::RefCell::new(alloc::vec::Vec::with_capacity(maxevents));
     let me = crate::sched::current();
     instance.subscribe_waits(me);
-    let answer = crate::sched::block_until_nanos(
-        || {
-            let mut out = out_cell.borrow_mut();
-            instance.collect(&fds, &mut out);
-            !out.is_empty()
-        },
-        deadline.unwrap_or(u64::MAX),
-    );
+    // A watched node whose readiness cannot be announced - a `timerfd` the
+    // clock will fire - needs the park to re-ask, and `poll(2)` has always
+    // kept a one-tick floor under every timeout for exactly that class.
+    // `epoll_wait` used to park until its own deadline instead, so a task
+    // waiting on a `timerfd` slept through the expiration it was waiting for
+    // (`docs/notes/` §3.13).
+    let needs_tick = instance.needs_tick();
+    let mut answer = crate::sched::WaitEnd::Condition;
+    loop {
+        let tick = crate::hal::since_boot_nanos().saturating_add(crate::hal::ns_per_tick());
+        let park = match (needs_tick, deadline) {
+            (true, Some(end)) => end.min(tick),
+            (true, None) => tick,
+            (false, Some(end)) => end,
+            (false, None) => u64::MAX,
+        };
+        answer = crate::sched::block_until_nanos(
+            || {
+                let mut out = out_cell.borrow_mut();
+                instance.collect(&fds, &mut out);
+                !out.is_empty()
+            },
+            park,
+        );
+        if !matches!(answer, crate::sched::WaitEnd::Deadline) {
+            break;
+        }
+        // A floor tick that found nothing is not the caller's timeout.
+        if deadline.is_some_and(|end| crate::hal::since_boot_nanos() >= end) {
+            break;
+        }
+    }
     instance.unsubscribe_waits(me);
     let out = out_cell.into_inner();
 

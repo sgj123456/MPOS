@@ -126,6 +126,11 @@ One-glance status of the whole roadmap.
   lost and the task woke only at its timeout (measured 3000 ms against 0-1 ms for a
   pipe/socketpair); the compositor's thirteen-second park and the frame that
   appeared at `SIGINT` were downstream of it (§3.12, item 124)
+- [x] a timerfd's expiration reaches an `epoll_wait` park — its readiness is the
+  clock's own work, so no task calls a wake; `poll(2)` has always kept a one-tick
+  floor under every timeout and `epoll_wait` did not, so a 150 ms timer answered at
+  the wait's own 3000 ms timeout (153 ms with the floor; a `signalfd` measured not
+  to need it) (§3.13, item 125)
 - [x] 6.3 Namespaces — **all eight of `namespaces(7)`'s kinds served** — UTS, MNT, **PID**, **NET**, **TIME**, **USER**, **IPC** and **CGROUP** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`, `t-ns-ipc`, `t-ns-cgroup`): the numbers a process  
   sees are the  

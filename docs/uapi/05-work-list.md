@@ -6815,6 +6815,34 @@ wake the park well inside a 1500 ms budget, so a lost wake fails rather than pas
 slowly. The counterfactual is the probe-image pair — `FAIL` on the unfixed kernel,
 `PASS` on the fixed one (§3.12).
 
-Named beside it (code read, unmeasured): `timerfd` and `signalfd` also do not
-implement `poll_subscribe`, so the same park has no door there; a delivered signal
-covers `signalfd` in practice through `EINTR`, `timerfd` has no such accident.
+Named beside it, and measured the same day (item 125): `timerfd` and `signalfd`
+also keep no `poll_subscribe` list. A `signalfd` turned out not to need one — the
+signal machinery wakes the park in 0 ms — but a `timerfd`'s arrival is the
+clock's own work and had nobody behind it: a 150 ms timer watched by an
+`epoll_wait(…, 3000)` answered at 3000 ms (the timeout) before the one-tick floor
+of item 125, and at 153 ms after.
+
+## item 125 — a timerfd's expiration reaches an `epoll_wait` park
+
+`poll(2)` has always kept a one-tick floor under every timeout, because a node
+whose readiness nobody announces must be re-asked (`src/syscall/linux/fs/file.rs`
+`poll_wait`'s `next = since_boot_nanos() + ns_per_tick()`, named on the deadline's
+own clock for §6.23's reason). `epoll_wait` parked to the caller's deadline alone:
+a 150 ms `timerfd` watched by an `epoll_wait(…, 3000)` answered `events=0x1` at
+**3000 ms** — its timeout — before this change, and at **153 ms** after it.
+
+Served by `Inode::ready_without_waker()` (default `false`, `TimerFd` answers
+`true`), `Epoll::needs_tick()` (any watched descriptor answering it) and
+`epoll_wait`'s loop: with such a watcher the park's deadline is
+`min(caller deadline, now + ns_per_tick)`, and a floor tick that found nothing is
+not the caller's timeout — it re-asks, and only the caller's deadline ends the
+wait with 0. Without such a descriptor the park is unchanged. A `signalfd` is
+measured **not** to need the floor: a blocked signal queued to the process wakes
+the park in 0 ms (measured in the same probe), so it keeps `false`.
+
+Pinned by `t-timerfd`'s epoll section (both machines, 6 claims: the descriptor
+exists, an epoll watches it, it is in the interest list, armed for 100 ms, the
+expiration wakes the park **inside a second**, and the report is `EPOLLIN`). Host
+Linux is the reference (`MPOS_ON_HOST=1`, 6/6 ok). The counterfactual was measured
+both ways with the pin binary on probe images: the pre-fix kernel fails the
+arrival claim at its 2000 ms timeout, the fixed one passes the section.
