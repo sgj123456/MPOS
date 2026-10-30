@@ -103,6 +103,7 @@ pub fn register_block_disk(dev: alloc::sync::Arc<dyn crate::blk::BlockDev>) {
         crate::uevent::VIRTIO_BLK_MAJOR,
         crate::uevent::VIRTIO_BLK_DEVPATH,
         dev,
+        crate::drivers::now_ms,
     );
 }
 

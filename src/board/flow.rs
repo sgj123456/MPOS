@@ -143,6 +143,7 @@ fn attach_sata() {
         mpos::uevent::SCSI_DISK_MAJOR,
         "/devices/ahci/block",
         dev,
+        mpos::drivers::now_ms,
     );
 }
 

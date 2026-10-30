@@ -3316,6 +3316,61 @@ fn partitions_text(numbering: &crate::uevent::Numbering) -> String {
 // What is mounted where, in the shape each reader of it expects.
 // ---------------------------------------------------------------------------
 
+/// One `/proc/diskstats` row, in Linux's measured columns.
+///
+/// The widths are measured, not guessed: real Linux (host, 2026-10-30) prints
+/// `%4u %7u %s` for major, minor and name, then the seventeen counters of the
+/// last twenty fields separated by single spaces. A reader that parses this file
+/// (`iostat`, `node_exporter`) walks the *fields*, so the order is the contract
+/// and the widths are only for humans.
+///
+/// What this kernel cannot say is printed as zero rather than invented: nothing
+/// here merges two requests into one (fields 5 and 9), nothing discards (15-18),
+/// and the weighted I/O time (14) is the plain I/O time because there is no
+/// queue to weight by. Each is Linux's own zero for a device without that
+/// facility, and `docs/notes/` §4.7 names the divergence.
+fn diskstats_row(dev: &crate::blk::DeviceStats) -> String {
+    let c = &dev.counters;
+    alloc::format!(
+        "{major:4} {minor:7} {name} {reads} 0 {sectors_read} {ms_reading} {writes} 0 {sectors_written} {ms_writing} {in_flight} {ms_doing_io} {weighted} 0 0 0 0 {flushes} {ms_flushing}\n",
+        major = dev.major,
+        minor = dev.minor,
+        name = dev.name,
+        reads = c.reads,
+        sectors_read = c.sectors_read,
+        ms_reading = c.ms_reading,
+        writes = c.writes,
+        sectors_written = c.sectors_written,
+        ms_writing = c.ms_writing,
+        in_flight = c.in_flight,
+        ms_doing_io = c.ms_doing_io,
+        weighted = c.ms_doing_io,
+        flushes = c.flushes,
+        ms_flushing = c.ms_flushing,
+    )
+}
+
+/// `/proc/diskstats` over a table of devices, so the rendering can be pinned on
+/// the host where there is no disk to count.
+fn diskstats_text(devices: &[crate::blk::DeviceStats]) -> String {
+    let mut out = String::new();
+    for dev in devices {
+        out.push_str(&diskstats_row(dev));
+    }
+    out
+}
+
+/// `/proc/diskstats`: every block device this machine counts, one per line.
+///
+/// The counters are taken at one moment each; a caller comparing two reads sees
+/// the I/O that happened between them, which is the whole use of the file. The
+/// names, majors and minors come from the same table `/proc/partitions` and
+/// `/sys/class/block` are built from (`crate::uevent::Numbering`), so the three
+/// cannot disagree about which device a line is.
+fn diskstats() -> String {
+    diskstats_text(&crate::blk::stats())
+}
+
 /// `/proc/mounts`: the mount table in `fstab`'s six columns - source, mount
 /// point, type, options, dump, pass.
 ///
@@ -3686,6 +3741,11 @@ impl ProcFs {
         );
         self.root
             .add("partitions", NodeKind::File, file(partitions));
+        // `/proc/diskstats`: what each block device has done. Its readers
+        // (`iostat`, `node_exporter`) parse the fields, and the file is also the
+        // only way a session can watch the disk's in-flight count — the counter
+        // pair landed in `feat(blk)` and had no user-space door until this one.
+        self.root.add("diskstats", NodeKind::File, file(diskstats));
         // `/proc/modules`: what is loaded here, which is nothing.
         //
         // Not a stub. This kernel has no loadable modules - every driver is
@@ -4111,6 +4171,38 @@ impl FileSystem for ProcFs {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/proc/diskstats`' columns, byte for byte: the widths are Linux's
+    /// measured ones and the field order is what a parser walks, so a rendering
+    /// that drifts is a file whose readers silently mis-read every number after
+    /// the drift. The device has done one 1024-byte read (`2` sectors) and one
+    /// write, and the columns that are always zero here are asserted zero.
+    #[test]
+    fn the_diskstats_row_is_linuxs_twenty_fields() {
+        let dev = crate::blk::DeviceStats {
+            name: String::from("vda"),
+            major: 254,
+            minor: 0,
+            counters: crate::blk::Counters {
+                reads: 7,
+                sectors_read: 16,
+                ms_reading: 3,
+                writes: 5,
+                sectors_written: 8,
+                ms_writing: 4,
+                in_flight: 1,
+                ms_doing_io: 7,
+                flushes: 2,
+                ms_flushing: 1,
+            },
+        };
+        let text = super::diskstats_text(&[dev]);
+        assert_eq!(
+            text,
+            " 254       0 vda 7 0 16 3 5 0 8 4 1 7 7 0 0 0 0 2 1\n"
+        );
+        assert_eq!(text.split_whitespace().count(), 20);
+    }
     use super::*;
 
     /// `/proc/<pid>/fd/<N>`'s own permission bits come from the direction its

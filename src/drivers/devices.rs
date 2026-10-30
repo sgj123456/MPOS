@@ -356,14 +356,15 @@ pub fn standard_devfs() -> Arc<DevFs> {
             .into_iter()
             .enumerate()
         {
-            dev.register_block(
-                &alloc::format!("{}{}", disk.name, index + 1),
+            let minor = (index + 1) as u32;
+            let partition = crate::blk::partition_window(&disk.name, minor).unwrap_or_else(|| {
                 Arc::new(crate::blk::part::Window::new(
                     disk.dev.clone(),
                     start,
                     sectors,
-                )),
-            );
+                ))
+            });
+            dev.register_block(&alloc::format!("{}{}", disk.name, index + 1), partition);
         }
     }
     dev

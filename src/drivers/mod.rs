@@ -60,3 +60,12 @@ pub mod rtc_dev;
 pub mod uinput;
 pub mod video;
 pub mod virtio;
+
+/// Milliseconds since boot, for the block layer's counters.
+///
+/// The counting wrapper lives in the host-testable `mpos-blk` leaf, which cannot
+/// read a clock by design (the clock is a machine's); the drawer of the numbers
+/// hands it this function instead. The unit is Linux's `diskstats` unit.
+pub fn now_ms() -> u64 {
+    crate::hal::since_boot_nanos() / 1_000_000
+}

@@ -450,7 +450,7 @@ One-glance status of the whole roadmap.
 - [ ] [~] 10.2 context-switch/fork cost — lazy FPU, one TLB flush, smaller stacks; PCID recorded as a decision (§10.2)
 - [ ] [~] 10.3 syscall path — itimer flag landed; fault-driven user-buffer copy not (§10.3)
 - [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement is recorded (§10.4)
-- [x] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; completions interrupt-driven and the transfer **parking its task** (the ext4 cache claims its slots around the device call; `t-blk-sleep` pins the yield on both machines); multi-request pipelining dropped; the PCI transport counted in its own sweep (`t-diskbench`'s spare-disk pass, §10.5)
+- [x] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; completions interrupt-driven and the transfer **parking its task** (the ext4 cache claims its slots around the device call; `t-blk-sleep` pins the yield on both machines); multi-request pipelining dropped; the PCI transport counted in its own sweep (`t-diskbench`'s spare-disk pass, §10.5); the counters have a program's door now — `/proc/diskstats` in Linux's twenty fields, one row per disk and per partition, a partition's transfer also the disk's (item 142, §7.10)
 - [x] 10.6 serial TX ring · [x] 10.7 sub-tick sleeps — a deadline is a nanosecond one
   now, and the first machine wakes a wait *between* two clock ticks from the LAPIC's
   one-shot: fifty 1 ms sleeps are 52-59 ms instead of 200 ms, a 25 ms sleep is 25.1 ms

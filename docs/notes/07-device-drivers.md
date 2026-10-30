@@ -6542,3 +6542,72 @@ A stall with the two numbers one apart for a boot's worth of beats is a transfer
 The pin is the movement itself, read across one ordinary read in the boot's drain suite (`blk-drain.a_transfer_is_counted_when_it_is_submitted_and_when_it_is_retired`): submits rises, retires rises, and retires never overtakes submits. Its gate line is `count: submits 3 -> 4, retires 3 -> 4` on both machines (PCI on the first, MMIO on the second), `mpos-kunit 35 passed` on both arms with the case in. The counterfactual is direct: with the PCI retirement's `note_count_retire()` removed the case answers `FAILED: the retires counter did not move across a device read` (`build/scratch/blkcnt-cf.log`, `34 passed, 1 failed`), so the claim is the counter's and not the read's.
 
 **Gate, this instrument.** x86_64 `X-EXIT=0` (`build/scratch/blkcnt-gate1.log`, `blk submits=76 retires=76` in a lane's heartbeat), aarch64 `A-EXIT=0` (`build/scratch/blkcnt-gate-a1.log`), `mpos-kunit 35 passed, 0 failed` on both, and the user suites unchanged (238 / 237 built).
+
+### 7.10 The disk's counters have a door: `/proc/diskstats` — **DONE** (2026-10-30)
+
+§7.9a landed the submit/retire pair and the heartbeat that prints it, and named
+what was missing: the counters were readable only by a *measurement* (the
+`mpos.diskstat` boot word wiring them into `uname(2)`'s release field), not by a
+program. The block layer's counting wrapper already knew reads and writes; the
+stall hunt needed the in-flight pair, and a session had no way to ask.
+
+**Measured on Linux 7.2.11 first** (`cat /proc/diskstats`, host, 2026-10-30):
+
+| What | Linux |
+|---|---|
+| Fields | **20** per line: major, minor, name, then 17 counters |
+| Widths | `%4u %7u %s` then single-space-separated numbers (measured byte for byte; a line begins ` 259       0 nvme0n1 `) |
+| Devices | every **whole disk and every partition**, each its own line and counter set |
+| Order of the 17 | reads, merges-read, sectors-read, ms-reading, writes, merges-write, sectors-written, ms-writing, in-flight, ms-doing-io, weighted-ms, discards, merges-discard, sectors-discarded, ms-discarding, flushes, ms-flushing |
+| On this host | `nvme0n1` 266 635 reads / 3 498 360 writes; its partitions carry their own smaller counts; `nvme1n1` idle with zeros |
+
+**Landed**: the wrapper (`crates/blk/src/lib.rs`) counts sectors (512-byte units,
+a partial tail lifting to one, Linux's `bio_sectors` rule), milliseconds per
+direction and for flushes, and in-flight transfers; `blk::stats()` returns one
+`DeviceStats` per disk *and per partition*, the partition's window being the same
+`Counted` object devfs hands out as `/dev/<disk><n>` (a node that bypassed the
+counter would show zeros for every read userland made); and
+`src/vfs/procfs.rs` renders `/proc/diskstats` from that table in Linux's columns.
+
+**The check that found the second half, and the number it moved**: on the
+aarch64 arm the root is `/dev/vda2`, and the first version wrapped each
+partition's window over the *raw* device. A partition's transfer is the disk's
+transfer, so the disk's line stayed at zero while the root's filesystem read
+through it - the sweep's own `t-diskbench` said `DISKSTAT vda bootcold=0
+bootblocks=21504` (21 504 blocks read, no read counted) and failed its
+"the vda boot disk read the fixture's blocks, in runs" claim, while x86_64's
+arm - whose root is the boot archive, so the only counted path is the one
+`/dev/sda` gives it - passed. Wrapping the window over the *counted* disk
+fixed both the file's answer and the claim: `DISKSTAT vda bootcold=1093
+bootblocks=21504` on the next run. `mpos-blk`'s
+`a_partitions_transfer_is_the_disks_transfer_too` pins it on the host, where
+the counterfactual (a window over the raw device) leaves the disk's row at
+zero.
+
+**The clock is handed in, not reached for**: `mpos-blk` is a host-testable leaf
+and cannot read a clock (a clock is a machine's), so `Counted::new` takes a
+`fn() -> u64`; the kernel passes `drivers::now_ms` (`since_boot_nanos / 1_000_000`)
+and the host tests pass a stepping fake — which is what lets the millisecond
+columns be asserted on the host rather than only printed.
+
+**Named divergences** (each a fact about this block layer, printed as zero the
+way Linux prints zero for a device without the facility): nothing here merges
+two requests (fields 5 and 9), nothing discards (15-18), and the weighted I/O
+time (14) equals the plain I/O time because there is no queue to weight by.
+
+Pins: `procfs::tests::the_diskstats_row_is_linuxs_twenty_fields` (host, exact
+bytes and the 20-field count), `mpos-blk`'s
+`a_transfer_moves_the_numbers_diskstats_prints` (sectors, in-flight at rest,
+flushes, and the milliseconds from a stepping clock),
+`mpos-blk`'s `a_partitions_transfer_is_the_disks_transfer_too` (the partition
+law above), and `user/tests/src/bin/t-diskstats.rs` on the guest — which reads
+the disk device itself and requires *that* row's counters to move, so a counter
+at the wrong layer fails.
+
+Gates: x86_64 `pass=239`, aarch64 `all 238`, both `mpos-kunit 35 passed`; host
+715 tests and `mpos-blk`'s 22.
+
+Counterfactual: with the disk rows' counters zeroed inside `procfs::diskstats`, `t-diskstats`
+was the only red program (`1 of 239`) and exactly two of its claims failed — `the read moved
+this disk's read counter, and only forward` and `the sectors column counted eight 512-byte
+sectors` — while the rendering, in-flight-at-rest and quiet-read claims stayed green.

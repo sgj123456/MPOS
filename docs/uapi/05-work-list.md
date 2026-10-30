@@ -7551,3 +7551,33 @@ the request the machine died of instead of only Rust's message. Pin:
 Stays named: the allocation failure still ends the machine; closing it needs fallible call
 sites or a lock-free reclaim policy. The user-reachable doors were closed instead (items
 136/139, §3.20, §3.21), so a program cannot reach the panic today.
+
+## item 142 — `/proc/diskstats`: the block layer's counters, in Linux's 20 fields
+
+The counters landed in §7.9a had no door a program could read (only `uname(2)`'s private
+release word, which is a measurement). Measured on Linux 7.2.11 first: 20 fields per line,
+`%4u %7u %s` then single-space numbers, one line per whole disk **and** partition, field order
+reads/merges/sectors/ms ×2, in-flight, io-ms, weighted-ms, discard group, flushes.
+
+Landed: `Counted` counts sectors (512-byte units), per-direction and flush milliseconds, and
+in-flight transfers; `blk::stats()` returns a row per disk and per partition (a partition's
+window wraps the *counted disk*, so a root on `/dev/vda2` moves `/dev/vda`'s line too — the
+aarch64 arm's `t-diskbench` found the first version counting only the partition, and its
+`DISKSTAT vda bootcold=0 bootblocks=21504` became `bootcold=1093` once fixed); `procfs` renders
+`/proc/diskstats` in Linux's columns. The clock is a `fn() -> u64` handed to the leaf crate by
+`drivers::now_ms`, because a host-testable leaf cannot read a machine's clock — host tests pass
+a stepping fake and assert the millisecond columns.
+
+Named divergences (zero, as Linux prints for a device without the facility): no request
+merging (fields 5/9), no discard (15–18), weighted-ms equals io-ms (no queue to weight by).
+
+Pins: the host rendering test (exact bytes, 20 fields), `mpos-blk`'s two counter tests
+(the transfer's own numbers, and a partition's transfer being the disk's), and
+`t-diskstats` on the guest (reads `/dev/<disk>` itself, requires that row's reads/sectors to
+move, in-flight zero at rest, two quiet reads agree).
+
+Gates: x86_64 `all 239 user tests passed`, aarch64 `all 238`, both `mpos-kunit 35 passed`; the
+aarch64 arm is what found the partition-counting defect (`t-diskbench`'s red claim, green after).
+Counterfactual: the disk rows' counters zeroed inside `procfs::diskstats` left `t-diskstats`
+alone red (`1 of 239`), exactly `the read moved this disk's read counter, and only forward` and
+`the sectors column counted eight 512-byte sectors`.

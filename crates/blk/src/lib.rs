@@ -82,11 +82,42 @@ static DISKS: Mutex<RefCell<Vec<Disk>>> = Mutex::new(RefCell::new(Vec::new()));
 /// The name is asserted unique because it is what userland *opens*: two disks
 /// answering to `/dev/vda` would be two devices behind one name, which is a
 /// worse failure than a boot that stops.
-pub fn add_disk(name: &str, major: u32, devpath: &'static str, dev: Arc<dyn BlockDev>) {
+pub fn add_disk(
+    name: &str,
+    major: u32,
+    devpath: &'static str,
+    dev: Arc<dyn BlockDev>,
+    now_ms: fn() -> u64,
+) {
     // The counting wrapper goes on at the door rather than inside any driver:
     // every path to storage passes through a registered `BlockDev`, so this is
     // the one place a count can be taken without touching a trait Linux owns.
-    let counted = Counted::new(name, dev.clone());
+    let counted = Counted::new(name, dev.clone(), now_ms);
+    // Each partition gets a counter of its own as well, because Linux numbers a
+    // partition as its own block device: a line in `/proc/diskstats` per name
+    // is what a reader of that file parses, and the disk's total is not its
+    // partition's answer. The window is made here so the devfs node and the
+    // counter are the same object - a partition whose `/dev` node bypassed the
+    // counter would show zeros for every read userland ever made.
+    let windows: Vec<Arc<Counted>> = part::partitions(dev.as_ref())
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, sectors))| {
+            let name = alloc::format!("{name}{}", index + 1);
+            // The window reads through the *counted* disk, not the raw
+            // device: a partition's transfer is the disk's transfer too, and
+            // Linux's disk row counts it. A window over the raw device moved
+            // only the partition's row, so a root mounted from `/dev/vda2`
+            // left the disk's counters at zero (measured on the aarch64 arm:
+            // `t-diskbench`'s boot-disk cold pass read 21 504 blocks and the
+            // disk row said `bootcold=0`).
+            Counted::new(
+                &name,
+                Arc::new(part::Window::new(counted.clone(), start, sectors)),
+                now_ms,
+            )
+        })
+        .collect();
     critical_section::with(|cs| {
         let mut disks = DISKS.borrow(cs).borrow_mut();
         assert!(
@@ -100,7 +131,110 @@ pub fn add_disk(name: &str, major: u32, devpath: &'static str, dev: Arc<dyn Bloc
             dev: counted.clone(),
         });
         COUNTED.borrow(cs).borrow_mut().push(counted);
+        let mut parts = PARTITIONS.borrow(cs).borrow_mut();
+        for (index, window) in windows.into_iter().enumerate() {
+            parts.push((String::from(name), major, (index + 1) as u32, window));
+        }
     });
+}
+
+/// One partition's counted window: the device `/dev/<disk><n>` must hand out so
+/// the partition's counters are the ones userland's I/O moves.
+pub fn partition_window(disk: &str, minor: u32) -> Option<Arc<dyn BlockDev>> {
+    critical_section::with(|cs| {
+        PARTITIONS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|(owner, _, m, _)| owner == disk && *m == minor)
+            .map(|(_, _, _, dev)| dev.clone() as Arc<dyn BlockDev>)
+    })
+}
+
+/// Every partition's counter, in registration order: `(disk, major, minor,
+/// counted)`.
+static PARTITIONS: Mutex<RefCell<Vec<(String, u32, u32, Arc<Counted>)>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+/// What one block device has done, in the numbers `/proc/diskstats` prints.
+///
+/// The unit is Linux's: calls, not bytes, for the call counters; 512-byte
+/// sectors for the sector counters; milliseconds for the times. What is not
+/// here is what this kernel cannot say: nothing merges requests (so the merged
+/// columns are always zero) and nothing discards (so the discard group is),
+/// which is a divergence a reader sees rather than a number invented for it.
+pub struct Counters {
+    pub reads: u64,
+    pub sectors_read: u64,
+    pub ms_reading: u64,
+    pub writes: u64,
+    pub sectors_written: u64,
+    pub ms_writing: u64,
+    pub in_flight: u64,
+    pub ms_doing_io: u64,
+    pub flushes: u64,
+    pub ms_flushing: u64,
+}
+
+impl Counted {
+    pub fn counters(&self) -> Counters {
+        use core::sync::atomic::Ordering::Relaxed;
+        Counters {
+            reads: self.reads.load(Relaxed),
+            sectors_read: self.sectors_read.load(Relaxed),
+            ms_reading: self.ms_reading.load(Relaxed),
+            writes: self.writes.load(Relaxed),
+            sectors_written: self.sectors_written.load(Relaxed),
+            ms_writing: self.ms_writing.load(Relaxed),
+            in_flight: self.in_flight.load(Relaxed),
+            ms_doing_io: self.ms_doing_io.load(Relaxed),
+            flushes: self.flushes.load(Relaxed),
+            ms_flushing: self.ms_flushing.load(Relaxed),
+        }
+    }
+}
+
+/// One block device as `/proc/diskstats` sees it: a name, a number, and what it
+/// has done.
+pub struct DeviceStats {
+    pub name: String,
+    pub major: u32,
+    pub minor: u32,
+    pub counters: Counters,
+}
+
+/// Every block device the kernel counts - each disk, then each partition - with
+/// its numbers taken at one moment.
+pub fn stats() -> Vec<DeviceStats> {
+    critical_section::with(|cs| {
+        let mut out: Vec<DeviceStats> = DISKS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .zip(COUNTED.borrow(cs).borrow().iter())
+            .map(|(disk, counted)| DeviceStats {
+                name: disk.name.clone(),
+                major: disk.major,
+                minor: 0,
+                counters: counted.counters(),
+            })
+            .collect();
+        for (_, major, minor, counted) in PARTITIONS.borrow(cs).borrow().iter() {
+            out.push(DeviceStats {
+                name: counted.name.clone(),
+                major: *major,
+                minor: *minor,
+                counters: counted.counters(),
+            });
+        }
+        out
+    })
+}
+
+/// Sectors in a transfer: the block layer's unit is 512 bytes, and a partial
+/// tail counts as one (Linux's `bio_sectors` rounds up too).
+fn sectors_of(bytes: usize) -> u64 {
+    ((bytes as u64) + 511) / 512
 }
 
 /// The disks the kernel has, for the callers that name them to userland: the
@@ -234,15 +368,37 @@ pub struct Counted {
     inner: Arc<dyn BlockDev>,
     reads: core::sync::atomic::AtomicU64,
     writes: core::sync::atomic::AtomicU64,
+    sectors_read: core::sync::atomic::AtomicU64,
+    sectors_written: core::sync::atomic::AtomicU64,
+    ms_reading: core::sync::atomic::AtomicU64,
+    ms_writing: core::sync::atomic::AtomicU64,
+    in_flight: core::sync::atomic::AtomicU64,
+    ms_doing_io: core::sync::atomic::AtomicU64,
+    flushes: core::sync::atomic::AtomicU64,
+    ms_flushing: core::sync::atomic::AtomicU64,
+    /// Milliseconds since boot, supplied by the kernel because a leaf crate
+    /// cannot read a clock (the crate is host-testable and the clock is a
+    /// machine's). A host test hands it a fake.
+    now_ms: fn() -> u64,
     name: String,
 }
 
 impl Counted {
-    pub fn new(name: &str, inner: Arc<dyn BlockDev>) -> Arc<Counted> {
+    pub fn new(name: &str, inner: Arc<dyn BlockDev>, now_ms: fn() -> u64) -> Arc<Counted> {
+        use core::sync::atomic::AtomicU64;
         Arc::new(Counted {
             inner,
-            reads: core::sync::atomic::AtomicU64::new(0),
-            writes: core::sync::atomic::AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            sectors_read: AtomicU64::new(0),
+            sectors_written: AtomicU64::new(0),
+            ms_reading: AtomicU64::new(0),
+            ms_writing: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            ms_doing_io: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            ms_flushing: AtomicU64::new(0),
+            now_ms,
             name: String::from(name),
         })
     }
@@ -266,15 +422,42 @@ impl BlockDev for Counted {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
-        self.reads
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        use core::sync::atomic::Ordering::Relaxed;
+        self.reads.fetch_add(1, Relaxed);
+        self.sectors_read.fetch_add(sectors_of(buf.len()), Relaxed);
+        let start = (self.now_ms)();
+        self.in_flight.fetch_add(1, Relaxed);
         self.inner.read_at(offset, buf);
+        self.ms_reading
+            .fetch_add((self.now_ms)().saturating_sub(start), Relaxed);
+        self.ms_doing_io
+            .fetch_add((self.now_ms)().saturating_sub(start), Relaxed);
+        self.in_flight.fetch_sub(1, Relaxed);
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) {
-        self.writes
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        use core::sync::atomic::Ordering::Relaxed;
+        self.writes.fetch_add(1, Relaxed);
+        self.sectors_written
+            .fetch_add(sectors_of(buf.len()), Relaxed);
+        let start = (self.now_ms)();
+        self.in_flight.fetch_add(1, Relaxed);
         self.inner.write_at(offset, buf);
+        self.ms_writing
+            .fetch_add((self.now_ms)().saturating_sub(start), Relaxed);
+        self.ms_doing_io
+            .fetch_add((self.now_ms)().saturating_sub(start), Relaxed);
+        self.in_flight.fetch_sub(1, Relaxed);
+    }
+
+    fn flush(&self) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.flushes.fetch_add(1, Relaxed);
+        let start = (self.now_ms)();
+        let ok = self.inner.flush();
+        self.ms_flushing
+            .fetch_add((self.now_ms)().saturating_sub(start), Relaxed);
+        ok
     }
 
     /// Forwarded, and **this wrapper is the one that hid the width**: the first
@@ -286,10 +469,6 @@ impl BlockDev for Counted {
     /// the one the numbers come from.
     fn max_transfer(&self) -> usize {
         self.inner.max_transfer()
-    }
-
-    fn flush(&self) -> bool {
-        self.inner.flush()
     }
 }
 
@@ -317,6 +496,78 @@ pub fn io_stats() -> Vec<(String, u64, u64)> {
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
+
+    /// A clock that never moves: the shape tests do not claim any time passed.
+    fn zero_ms() -> u64 {
+        0
+    }
+
+    /// A clock that moves ten milliseconds per look, so a test can say the
+    /// millisecond columns are the clock's and not a constant.
+    fn stepping_ms() -> u64 {
+        static STEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        STEP.fetch_add(10, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A partition's transfer is the disk's transfer: a window built over the
+    /// *counted* wrapper moves both rows, which is what makes a root mounted
+    /// from `/dev/vda2` visible in `/dev/vda`'s line. The counterfactual this
+    /// pins was measured on the aarch64 sweep arm - a window over the raw device
+    /// left the disk's line reading zero while 21 504 blocks crossed it.
+    #[test]
+    fn a_partitions_transfer_is_the_disks_transfer_too() {
+        let plain: Arc<dyn BlockDev> = Plain::new(4096);
+        let disk = Counted::new("partda", plain, zero_ms);
+        let window: Arc<dyn BlockDev> = Arc::new(part::Window::new(disk.clone(), 8, 16));
+        let partition = Counted::new("partda1", window, zero_ms);
+        let mut buf = [0u8; 1024];
+        partition.read_at(0, &mut buf);
+        assert_eq!(partition.counters().reads, 1);
+        assert_eq!(partition.counters().sectors_read, 2);
+        assert_eq!(
+            disk.counters().reads,
+            1,
+            "the disk's line did not see its partition's read"
+        );
+        assert_eq!(disk.counters().sectors_read, 2);
+    }
+
+    /// The numbering `/proc/diskstats` reads: calls, sectors, ms, in-flight and
+    /// flushes, each moved by a real transfer and each equal to what the wrapper
+    /// counted rather than to what a mock said.
+    #[test]
+    fn a_transfer_moves_the_numbers_diskstats_prints() {
+        let plain = Plain::new(4096);
+        let plain_dev: Arc<dyn BlockDev> = plain.clone();
+        let counted = Counted::new("statdb", plain_dev, stepping_ms);
+        let mut buf = [0u8; 1024];
+        counted.read_at(0, &mut buf);
+        let after_read = counted.counters();
+        assert_eq!(after_read.reads, 1);
+        assert_eq!(after_read.sectors_read, 2, "1024 bytes is two sectors");
+        assert_eq!(after_read.in_flight, 0, "a finished read is not in flight");
+        assert!(after_read.ms_reading > 0, "the clock moved while it ran");
+        counted.write_at(0, &buf);
+        let after_write = counted.counters();
+        assert_eq!(after_write.writes, 1);
+        assert_eq!(after_write.sectors_written, 2);
+        assert_eq!(
+            after_write.merges(),
+            0,
+            "nothing here merges two requests into one"
+        );
+        counted.flush();
+        assert_eq!(counted.counters().flushes, 1);
+    }
+
+    impl Counters {
+        /// The merged columns are always zero here: nothing in this block layer
+        /// merges two requests, which is a fact the file reports rather than an
+        /// untracked number.
+        fn merges(&self) -> u64 {
+            0
+        }
+    }
 
     /// A device that remembers nothing and counts nothing of its own - the
     /// thing under the wrapper, so every count asserted below is the
@@ -363,7 +614,7 @@ mod tests {
     #[test]
     fn the_wrapper_counts_calls_and_forwards_every_access() {
         let plain = Plain::new(2048);
-        let counted = Counted::new("testda", plain.clone());
+        let counted = Counted::new("testda", plain.clone(), zero_ms);
 
         counted.read_at(0, &mut [0u8; 512]);
         counted.read_at(512, &mut [0u8; 512]);
@@ -384,7 +635,10 @@ mod tests {
     fn a_driver_that_says_nothing_moves_one_page() {
         let plain = Plain::new(2048);
         assert_eq!(plain.max_transfer(), PAGE_SIZE);
-        assert_eq!(Counted::new("testdb", plain).max_transfer(), PAGE_SIZE);
+        assert_eq!(
+            Counted::new("testdb", plain, zero_ms).max_transfer(),
+            PAGE_SIZE
+        );
     }
 
     /// ...and a driver that *does* say something has it forwarded through both
@@ -409,7 +663,7 @@ mod tests {
         }
         assert_eq!(Wide.max_transfer(), 4 * PAGE_SIZE);
         assert_eq!(
-            Counted::new("testdc", Arc::new(Wide)).max_transfer(),
+            Counted::new("testdc", Arc::new(Wide), zero_ms).max_transfer(),
             4 * PAGE_SIZE
         );
     }
@@ -419,7 +673,7 @@ mod tests {
     /// what keeps the disk total honest when userland opens `/dev/sda1`.
     #[test]
     fn a_window_over_a_counted_device_shares_the_count() {
-        let counted = Counted::new("testdb", Plain::new(4096));
+        let counted = Counted::new("testdb", Plain::new(4096), zero_ms);
         let win = part::Window::new(counted.clone(), 8, 16);
         win.read_at(0, &mut [0u8; 512]);
         assert_eq!(counted.reads(), 1, "the window's read reached the disk");

@@ -6560,7 +6560,7 @@ mod diskstat_tests {
     /// evidence if the door they come through is the one being measured.
     #[test]
     fn the_rows_name_every_registered_disk_and_track_live_reads() {
-        crate::blk::add_disk("dstat-da", 8, "/devices/test/block", Arc::new(Zeros));
+        crate::blk::add_disk("dstat-da", 8, "/devices/test/block", Arc::new(Zeros), || 0);
         let (release, version) = diskstat_uts_fields();
         assert_eq!(release, "0x6d706f7300000001");
         // A fresh registry may hold disks another test registered first; the
