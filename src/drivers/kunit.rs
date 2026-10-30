@@ -69,11 +69,56 @@ pub const SUITE: Suite = Suite {
 pub const DRAIN_SUITE: Suite = Suite {
     name: "blk-drain",
     phase: Phase::Scheduler,
-    cases: &[Case {
-        name: "a_ring_entry_nobody_retires_is_drained_by_the_next_reader",
-        run: a_ring_entry_nobody_retires_is_drained_by_the_next_reader,
-    }],
+    cases: &[
+        Case {
+            name: "a_ring_entry_nobody_retires_is_drained_by_the_next_reader",
+            run: a_ring_entry_nobody_retires_is_drained_by_the_next_reader,
+        },
+        Case {
+            name: "a_transfer_is_counted_when_it_is_submitted_and_when_it_is_retired",
+            run: a_transfer_is_counted_when_it_is_submitted_and_when_it_is_retired,
+        },
+    ],
 };
+
+/// A device read moves the submit/retire pair, and nothing is retired that was
+/// never submitted.
+///
+/// R.9's remaining shape is a transfer "submitted and never retired", and the
+/// heartbeat now prints the pair (`sched::task::note_blk_counts`). A counter
+/// that no device call moves would say "no submits" during a stall whether or
+/// not a transfer was in flight, so the pin is the movement itself, read across
+/// one ordinary read: the submit rises, the retire rises, and the retire never
+/// overtakes the submit. Both transports count through the same two functions,
+/// so one case covers the machine it runs on.
+fn a_transfer_is_counted_when_it_is_submitted_and_when_it_is_retired(
+    _info: &BootInfo,
+) -> Result<(), String> {
+    let Some(dev) = super::virtio::selftest_device() else {
+        return Err(String::from(
+            "no virtio-blk instance was recorded for the suite",
+        ));
+    };
+    use crate::blk::BlockDev as _;
+    let (submits, retires) = super::virtio::blk_counts();
+    let mut buf = vec![0u8; 512];
+    dev.read_at(512, &mut buf);
+    let (submits_after, retires_after) = super::virtio::blk_counts();
+    println!("count: submits {submits} -> {submits_after}, retires {retires} -> {retires_after}");
+    case_check!(
+        submits_after > submits,
+        "the submits counter did not move across a device read"
+    );
+    case_check!(
+        retires_after > retires,
+        "the retires counter did not move across a device read"
+    );
+    case_check!(
+        retires_after <= submits_after,
+        "the device retired a request that was never submitted"
+    );
+    Ok(())
+}
 
 /// A completed ring entry whose submitter has gone must not wedge the device.
 ///

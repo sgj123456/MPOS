@@ -198,6 +198,7 @@ impl VirtioBlk {
             return;
         };
         super::note_blk_submit(token, me);
+        super::note_count_submit();
 
         // The wait: parked, uninterruptible, ended by the completion
         // interrupt — with one poll per period for a wire that lost the wake.
@@ -270,6 +271,7 @@ impl VirtioBlk {
             }
         });
         super::note_blk_retire(token);
+        super::note_count_retire();
         blk_irq::finish_request();
     }
 

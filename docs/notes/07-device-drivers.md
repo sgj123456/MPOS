@@ -6532,3 +6532,13 @@ and the abandoned token was popped **later**, by an unrelated transfer (`mpos: b
 Its counterfactual is honest to name: only the deadlock's return makes the program red, and no constructed failure exists today. It is a regression instrument, not a fix's pin — this note says so rather than implying a fix landed with it.
 
 One correction for the record: the aarch64 arm was run **twice in one tree at once** during this measurement, and the first pair reported `t-ns-pid`, `t-thread-sighand` and `t-close-range` red on the aarch64 side — the tree shared `build/test-*` artefacts between the two sweeps, which AGENTS.md §5 names as its own trap. The quoted run is the one that ran alone.
+
+**The measurement R.9 asked for next: the submit/retire pair, and the heartbeat's header.** R.9's last reduction was "a device transfer that is submitted and never retired", with the next step named: count submits, IRQs and retirements inside the driver and print them. The IRQ half already exists (`blk_irq`'s `IRQ_COUNT`, pinned by a suite case); the submit/retire half did not. It does now, for both transports through one pair of functions (`drivers::virtio::note_count_submit`/`note_count_retire`, called at each successful non-blocking submission and after each retirement), mirrored into the scheduler so the heartbeat prints them beside the mailbox:
+
+    mpos: heartbeat ... blk-busy=false blk-waiter=none blk submits=76 retires=76 -- live slots:
+
+A stall with the two numbers one apart for a boot's worth of beats is a transfer the device accepted and nobody finished — the shape R.9 left open — and the pair tells that apart from "the submit never happened" without a hung boot to inspect.
+
+The pin is the movement itself, read across one ordinary read in the boot's drain suite (`blk-drain.a_transfer_is_counted_when_it_is_submitted_and_when_it_is_retired`): submits rises, retires rises, and retires never overtakes submits. Its gate line is `count: submits 3 -> 4, retires 3 -> 4` on both machines (PCI on the first, MMIO on the second), `mpos-kunit 35 passed` on both arms with the case in. The counterfactual is direct: with the PCI retirement's `note_count_retire()` removed the case answers `FAILED: the retires counter did not move across a device read` (`build/scratch/blkcnt-cf.log`, `34 passed, 1 failed`), so the claim is the counter's and not the read's.
+
+**Gate, this instrument.** x86_64 `X-EXIT=0` (`build/scratch/blkcnt-gate1.log`, `blk submits=76 retires=76` in a lane's heartbeat), aarch64 `A-EXIT=0` (`build/scratch/blkcnt-gate-a1.log`), `mpos-kunit 35 passed, 0 failed` on both, and the user suites unchanged (238 / 237 built).

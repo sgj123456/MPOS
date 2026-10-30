@@ -170,6 +170,45 @@ pub(super) fn note_blk_submit(token: u16, me: crate::sched::policy::TaskId) {
     }
 }
 
+/// How many requests this boot has submitted to the block device, and how many
+/// it has retired.
+///
+/// R.9 leaves one block transfer "submitted and never retired" and names these
+/// two numbers as the next measurement: a submit that no retirement follows is
+/// a transfer the device accepted and nobody finished, and the pair separates
+/// that from "the submit never happened" without a boot that hangs
+/// (`docs/notes/` §7.9a). Both transports count through these two functions, so
+/// the heartbeat's line covers whichever machine and whichever transport is in
+/// the tree.
+static BLK_SUBMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BLK_RETIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count a submitted request and mirror the pair for the heartbeat.
+pub(super) fn note_count_submit() {
+    let submits = BLK_SUBMITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    crate::sched::note_blk_counts(
+        submits,
+        BLK_RETIRES.load(core::sync::atomic::Ordering::Relaxed),
+    );
+}
+
+/// Count a retired request and mirror the pair for the heartbeat.
+pub(super) fn note_count_retire() {
+    let retires = BLK_RETIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    crate::sched::note_blk_counts(
+        BLK_SUBMITS.load(core::sync::atomic::Ordering::Relaxed),
+        retires,
+    );
+}
+
+/// The boot's submit/retire pair, for the pin that reads it across a device call.
+pub(crate) fn blk_counts() -> (u64, u64) {
+    (
+        BLK_SUBMITS.load(core::sync::atomic::Ordering::Relaxed),
+        BLK_RETIRES.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Clear a token's submitter once its own owner has retired it.
 pub(super) fn note_blk_retire(token: u16) {
     let at = usize::from(token);

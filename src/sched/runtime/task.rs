@@ -124,6 +124,21 @@ pub static BLK_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 pub static BLK_WAITER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 
+/// The block layer's submit/retire pair, mirrored for the heartbeat.
+///
+/// A transfer "submitted and never retired" is R.9's remaining shape, and the
+/// pair is the reading that separates it from a submit that never happened:
+/// a stall with `submits` one ahead of `retires` for a boot's worth of beats is
+/// a transfer the device accepted and nobody finished (`docs/notes/` §7.9a).
+pub static BLK_SUBMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BLK_RETIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Mirror the block layer's counters, each time one of them moves.
+pub fn note_blk_counts(submits: u64, retires: u64) {
+    BLK_SUBMITS.store(submits, Ordering::Relaxed);
+    BLK_RETIRES.store(retires, Ordering::Relaxed);
+}
+
 /// Mirror the block mailbox's claim.
 pub fn note_blk_mailbox(busy: bool, waiter: Option<usize>) {
     BLK_BUSY.store(busy, Ordering::Relaxed);
@@ -3551,14 +3566,16 @@ fn heartbeat() {
         })
         .unwrap_or_else(|| "none".into());
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} blk-busy={} blk-waiter={} -- live slots:\n",
+        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} blk-busy={} blk-waiter={} blk submits={} retires={} -- live slots:\n",
         EXT4_FILL_BUSY.load(Ordering::Relaxed),
         EXT4_RUN_BUSY.load(Ordering::Relaxed),
         BLK_BUSY.load(Ordering::Relaxed),
         match BLK_WAITER.load(Ordering::Relaxed) {
             slot if slot == usize::MAX => alloc::format!("none"),
             slot => alloc::format!("slot {slot}"),
-        }
+        },
+        BLK_SUBMITS.load(Ordering::Relaxed),
+        BLK_RETIRES.load(Ordering::Relaxed)
     ));
     crate::hal::kernel::print_line(format_args!(
         "mpos:   claim registrations={} handed-back={}\n",
