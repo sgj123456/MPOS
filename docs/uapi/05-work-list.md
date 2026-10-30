@@ -7639,3 +7639,36 @@ states it structurally ("a directory that mirrors a process") and pins the
 measured rows above. An `lstat` of a descriptor's second name
 (`/proc/<pid>/fd/0`) is not claimed, and the `ns` entries' ownership follows the
 same rule by construction rather than by a claim.
+
+## item 144 — sysfs's word is the node's, and it is enforced
+
+sysfs reported a permission word and kept nothing: the nodes answered their
+kind's constants, a directory answered `0` (rendered as `0755` by the stat
+door), and `keeps_modes()` was `false`, so the word was a report and not a gate -
+an ordinary user reached a write descriptor on a `0444` attribute, and a root
+`chmod` answered `0` without storing anything.
+
+**Measured on Linux 7.2.11** (`build/scratch/sysfsattr/p.c`, `p2.c`, `p3.c`, uid
+1000 and root): `/sys` `0555`, directories `0755`, read-only attributes `0444`,
+writable ones `0644`; root's `chmod 0700 /sys/kernel` -> `0` and the *next*
+`stat` reports `0700` (kernfs keeps the word on the inode); uid 1000's `chmod`
+-> `EPERM` (1) with the word unchanged; `fchmod` of an attribute's descriptor
+-> the same path; and `open(..., O_WRONLY)` on a `0444` attribute -> `EACCES`
+(13) **for root too**, because the attribute has no write method, while
+`O_RDONLY` answers a descriptor.
+
+**Landed.** An `AtomicU32` word per sysfs node, `set_mode` storing what a
+permitted `chmod`/`fchmod` writes (masked to `07777`), `keeps_modes()` true so
+`may_as` polices it, and `SysDir::new` passing `0755` so a directory reports the
+word the gate reads instead of `0`.
+
+**Pin**: `t-proc-modes`'s `sysfs_modes` half (11 claims, every moved word put
+back; the reference run is real Linux as root and every claim is `ok:` there).
+
+**Gates**: x86_64 `pass=240 fail=0`, aarch64 `pass=239 fail=0`, both
+`mpos-kunit 35 passed`, host 716. **Counterfactual**: `set_mode` accepting and
+dropping -> exactly the two store claims red.
+
+**Named divergence**: root's `open(O_WRONLY)` on a read-only attribute answers a
+descriptor here and the write is refused; Linux refuses the open. The word lives
+on the node where Linux keeps it on the inode - same lifetime and visibility.

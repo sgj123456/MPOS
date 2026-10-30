@@ -25,6 +25,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use critical_section::Mutex;
 
@@ -53,15 +54,18 @@ const SYS_RW_ATTR_MODE: u32 = 0o644;
 struct SysDir {
     ino: Ino,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
-    /// The permission bits Linux gives *this* directory, when they are not the
-    /// kind's default (`0755`). Zero means the default, which is what every
-    /// sysfs directory but the tree's own root reports.
-    mode: u32,
+    /// The permission bits Linux gives *this* directory - `0755` unless the
+    /// tree's own root passed `0555` - and the place a `chmod` leaves its word,
+    /// as Linux's kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
 }
 
 impl SysDir {
     fn new(ino: Ino) -> Arc<SysDir> {
-        SysDir::own(ino, 0)
+        // `0755`: the word every directory under `/sys` reports on Linux, and
+        // the one its own entries are created with here (`/sys` itself is the
+        // tree's `0555`, passed explicitly by `SysFs::new`).
+        SysDir::own(ino, 0o755)
     }
 
     /// A directory whose own word is Linux's rather than the kind's default.
@@ -74,7 +78,7 @@ impl SysDir {
         Arc::new(SysDir {
             ino,
             entries: Mutex::new(RefCell::new(BTreeMap::new())),
-            mode,
+            mode: AtomicU32::new(mode),
         })
     }
 
@@ -102,6 +106,18 @@ impl SysDir {
 }
 
 impl Inode for SysDir {
+    /// This node's word is its own: a `chmod` by the caller the word permits
+    /// stores it here, for the mount's life - Linux's kernfs does the same on
+    /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and
+    /// `stat` then reports `0700`, while an ordinary user's is `EPERM`;
+    /// `build/scratch/sysfsattr/p.c`).
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
     /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
     /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
     /// reported word, which `may_touch` asks) - measured, `build/scratch/
@@ -119,7 +135,7 @@ impl Inode for SysDir {
     }
 
     fn mode(&self) -> u32 {
-        self.mode
+        self.mode.load(Ordering::Relaxed)
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -147,10 +163,25 @@ impl Inode for SysDir {
 /// A read-only attribute with fixed contents.
 struct SysFile {
     ino: Ino,
+    /// The word a `chmod` leaves here, kept for the mount's life as Linux's
+    /// kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
     content: &'static str,
 }
 
 impl Inode for SysFile {
+    /// This node's word is its own: a `chmod` by the caller the word permits
+    /// stores it here, for the mount's life - Linux's kernfs does the same on
+    /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and
+    /// `stat` then reports `0700`, while an ordinary user's is `EPERM`;
+    /// `build/scratch/sysfsattr/p.c`).
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
     /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
     /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
     /// reported word, which `may_touch` asks) - measured, `build/scratch/
@@ -168,7 +199,7 @@ impl Inode for SysFile {
     }
 
     fn mode(&self) -> u32 {
-        SYS_RO_ATTR_MODE
+        self.mode.load(Ordering::Relaxed)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -227,6 +258,9 @@ impl Inode for SysSymlink {
 /// constant, because the space is the device's and not the mechanism's.
 struct SysConfig {
     ino: Ino,
+    /// The word a `chmod` leaves here, kept for the mount's life as Linux's
+    /// kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
     bus: u8,
     dev: u8,
     func: u8,
@@ -234,6 +268,18 @@ struct SysConfig {
 }
 
 impl Inode for SysConfig {
+    /// This node's word is its own: a `chmod` by the caller the word permits
+    /// stores it here, for the mount's life - Linux's kernfs does the same on
+    /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and
+    /// `stat` then reports `0700`, while an ordinary user's is `EPERM`;
+    /// `build/scratch/sysfsattr/p.c`).
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
     /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
     /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
     /// reported word, which `may_touch` asks) - measured, `build/scratch/
@@ -251,7 +297,7 @@ impl Inode for SysConfig {
     }
 
     fn mode(&self) -> u32 {
-        SYS_RW_ATTR_MODE
+        self.mode.load(Ordering::Relaxed)
     }
 
     #[cfg(all(target_os = "none", mpos_pci_config))]
@@ -284,11 +330,26 @@ impl Inode for SysConfig {
 /// PCI_* keys this kernel's event shape has no room for.
 struct SysPciEvent {
     ino: Ino,
+    /// The word a `chmod` leaves here, kept for the mount's life as Linux's
+    /// kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
     keys: String,
     event: Event,
 }
 
 impl Inode for SysPciEvent {
+    /// This node's word is its own: a `chmod` by the caller the word permits
+    /// stores it here, for the mount's life - Linux's kernfs does the same on
+    /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and
+    /// `stat` then reports `0700`, while an ordinary user's is `EPERM`;
+    /// `build/scratch/sysfsattr/p.c`).
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
     /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
     /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
     /// reported word, which `may_touch` asks) - measured, `build/scratch/
@@ -306,7 +367,7 @@ impl Inode for SysPciEvent {
     }
 
     fn mode(&self) -> u32 {
-        SYS_RW_ATTR_MODE
+        self.mode.load(Ordering::Relaxed)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -353,10 +414,25 @@ impl Inode for SysPciEvent {
 /// again, and the listener's netlink socket is the audience.
 struct SysEventAttr {
     ino: Ino,
+    /// The word a `chmod` leaves here, kept for the mount's life as Linux's
+    /// kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
     event: Event,
 }
 
 impl Inode for SysEventAttr {
+    /// This node's word is its own: a `chmod` by the caller the word permits
+    /// stores it here, for the mount's life - Linux's kernfs does the same on
+    /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and
+    /// `stat` then reports `0700`, while an ordinary user's is `EPERM`;
+    /// `build/scratch/sysfsattr/p.c`).
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
     /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
     /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
     /// reported word, which `may_touch` asks) - measured, `build/scratch/
@@ -376,7 +452,7 @@ impl Inode for SysEventAttr {
     }
 
     fn mode(&self) -> u32 {
-        SYS_RW_ATTR_MODE
+        self.mode.load(Ordering::Relaxed)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -626,6 +702,7 @@ fn build_block(
         dir.add(
             "dev",
             Arc::new(SysFile {
+                mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                 ino: next,
                 content: text(alloc::format!("{}:{}\n", entry.major, entry.minor)),
             }),
@@ -638,6 +715,7 @@ fn build_block(
         dir.add(
             "size",
             Arc::new(SysFile {
+                mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                 ino: next,
                 content: text(alloc::format!("{}\n", entry.sectors)),
             }),
@@ -652,6 +730,7 @@ fn build_block(
             dir.add(
                 "partition",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("{}\n", entry.minor)),
                 }),
@@ -661,6 +740,7 @@ fn build_block(
         dir.add(
             "uevent",
             Arc::new(SysEventAttr {
+                mode: AtomicU32::new(SYS_RW_ATTR_MODE),
                 ino: next,
                 event: Event {
                     action: "add",
@@ -751,6 +831,7 @@ fn build_input(
             device.add(
                 "name",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("{}\n", node.name())),
                 }),
@@ -761,6 +842,7 @@ fn build_input(
             device.add(
                 "phys",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("virtio{index}/input{index}\n")),
                 }),
@@ -769,6 +851,7 @@ fn build_input(
             device.add(
                 "properties",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("{}\n", bitmap_attr(node.prop_bits(), 32))),
                 }),
@@ -785,6 +868,7 @@ fn build_input(
             device.add(
                 "uevent",
                 Arc::new(SysEventAttr {
+                    mode: AtomicU32::new(SYS_RW_ATTR_MODE),
                     ino: next,
                     event: Event {
                         action: "add",
@@ -813,6 +897,7 @@ fn build_input(
                 ids.add(
                     attr,
                     Arc::new(SysFile {
+                        mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                         ino: next,
                         content: text(alloc::format!("{:04x}\n", value)),
                     }),
@@ -828,6 +913,7 @@ fn build_input(
                 capabilities.add(
                     attr,
                     Arc::new(SysFile {
+                        mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                         ino: next,
                         content: text(alloc::format!(
                             "{}\n",
@@ -867,6 +953,7 @@ fn build_input(
             event.add(
                 "name",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("{}\n", node.name())),
                 }),
@@ -875,6 +962,7 @@ fn build_input(
             event.add(
                 "dev",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: text(alloc::format!("{}:{}\n", major, minor)),
                 }),
@@ -883,6 +971,7 @@ fn build_input(
             event.add(
                 "uevent",
                 Arc::new(SysEventAttr {
+                    mode: AtomicU32::new(SYS_RW_ATTR_MODE),
                     ino: next,
                     event: Event {
                         action: "add",
@@ -1040,6 +1129,7 @@ fn build_drm(
             dir.add(
                 "dev",
                 Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
                     ino: next,
                     content: numbers,
                 }),
@@ -1048,6 +1138,7 @@ fn build_drm(
             dir.add(
                 "uevent",
                 Arc::new(SysEventAttr {
+                    mode: AtomicU32::new(SYS_RW_ATTR_MODE),
                     ino: next,
                     event: Event {
                         action: "add",
@@ -1147,6 +1238,7 @@ fn build_kernel(fs: &Arc<SysFs>, mut next: u64) -> u64 {
     kernel.add(
         "ostype",
         Arc::new(SysFile {
+            mode: AtomicU32::new(SYS_RO_ATTR_MODE),
             ino: next,
             content: env!("CARGO_PKG_NAME"),
         }),
@@ -1309,13 +1401,21 @@ fn add_pci_attributes(
     ];
     for (name, content) in attributes {
         let content: &'static str = Box::leak(content.into_boxed_str());
-        dir.add(name, Arc::new(SysFile { ino: next, content }));
+        dir.add(
+            name,
+            Arc::new(SysFile {
+                ino: next,
+                content,
+                mode: AtomicU32::new(SYS_RO_ATTR_MODE),
+            }),
+        );
         next += 1;
     }
 
     dir.add(
         "config",
         Arc::new(SysConfig {
+            mode: AtomicU32::new(SYS_RW_ATTR_MODE),
             ino: next,
             bus: device.bus,
             dev: device.dev,
@@ -1328,6 +1428,7 @@ fn add_pci_attributes(
     dir.add(
         "uevent",
         Arc::new(SysPciEvent {
+            mode: AtomicU32::new(SYS_RW_ATTR_MODE),
             ino: next,
             keys: device.uevent_attr(),
             event: Event {
@@ -1437,6 +1538,25 @@ mod tests {
         fs.root().lookup("class").unwrap().lookup("block").unwrap()
     }
 
+    /// The word is the node's to keep: a `chmod` by the caller the word permits
+    /// writes it here and the next reader sees it (`docs/notes/` §3.23).
+    #[test]
+    fn a_sysfs_word_is_stored_where_a_chmod_writes_it() {
+        let fs = fs();
+        let dir = fs.root().lookup("class").unwrap();
+        assert_eq!(dir.mode(), 0o755);
+        dir.set_mode(0o700);
+        assert_eq!(dir.mode(), 0o700);
+        let dev = resolve(&fs, "/sys/class/block/vda").lookup("dev").unwrap();
+        assert_eq!(dev.mode(), SYS_RO_ATTR_MODE);
+        dev.set_mode(0o600);
+        assert_eq!(dev.mode(), 0o600);
+        // A word with bits above the triads is the triads: Linux's `chmod`
+        // masks the file-type bits out rather than storing them.
+        dev.set_mode(0o10_0644);
+        assert_eq!(dev.mode(), 0o644);
+    }
+
     #[test]
     fn a_sysfs_node_reports_its_own_mode_rather_than_the_trees_kind_default() {
         // Measured on a current host (`.workbuddy/probe_proc_node_modes.c`):
@@ -1445,9 +1565,11 @@ mod tests {
         // written - a device's `uevent` and a function's `config` - are `0644`.
         let fs = fs();
         assert_eq!(fs.root().mode(), 0o555, "the tree's own root");
-        // A directory under it leaves the word to its kind: zero is "the kind's
-        // default", which the stat door renders as the directory's `0755`.
-        assert_eq!(fs.root().lookup("class").unwrap().mode(), 0);
+        // A directory under it reports its own word: `0755`. It used to answer
+        // `0` and leave the rendering to the stat door, but `mode()` is the
+        // word a permission check reads, and a `0` there is the `0000` a
+        // `chmod` could never have set.
+        assert_eq!(fs.root().lookup("class").unwrap().mode(), 0o755);
         let disk = resolve(&fs, "/sys/class/block/vda");
         assert_eq!(disk.lookup("dev").unwrap().mode(), SYS_RO_ATTR_MODE);
         assert_eq!(disk.lookup("size").unwrap().mode(), SYS_RO_ATTR_MODE);

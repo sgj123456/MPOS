@@ -396,6 +396,7 @@ fn main() {
 
     chmod_doors(&mut r);
     owner_and_time_doors(&mut r);
+    sysfs_modes(&mut r);
 
     r.finish();
 }
@@ -666,6 +667,162 @@ fn owner_and_time_doors(r: &mut Report) {
     r.check(
         &format!("and refuses the explicit pair, since it does not own it (bits {bits:02x})"),
         bits & DEVICE_EXPLICIT != 0,
+    );
+}
+
+/// sysfs's word is the node's too: root's `chmod` is stored, an ordinary
+/// user's is `EPERM`, and a read-only attribute refuses a write descriptor.
+///
+/// Measured on a current host first (`build/scratch/sysfsattr/p.c`, `p2.c`,
+/// Linux 7.2.11, uid 1000 *and* root): `chmod 0700 /sys/kernel` answers `0` for
+/// root and `stat` then reports `0700` - kernfs keeps the word on the inode, so
+/// the *same* word the next process sees - while an ordinary user's call is
+/// `EPERM` (1) and leaves the word alone; `fchmod` of a sysfs attribute's
+/// descriptor takes the same path; and `open("/sys/kernel/ostype",
+/// O_WRONLY)` is `EACCES` (13), because that attribute is `0444` and has no
+/// write method. The same two calls run here against `/sys/kernel/ostype`, the
+/// attribute this tree publishes (`uevent_seqnum` is Linux's, not ours). Every word this function moves is put back, so the tree is the
+/// same when the run ends.
+fn sysfs_modes(r: &mut Report) {
+    const EPERM: i32 = 1;
+    const EACCES: i32 = 13;
+    fn errno() -> i32 {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default()
+    }
+    fn cstring(path: &str) -> Option<std::ffi::CString> {
+        std::ffi::CString::new(path).ok()
+    }
+    fn word(path: &str) -> Option<u32> {
+        statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|st| st.st_mode & 0o7777)
+    }
+    fn chmod(path: &str, mode: u32) -> i32 {
+        match cstring(path) {
+            Some(name) => unsafe { libc::chmod(name.as_ptr(), mode as libc::mode_t) },
+            None => -1,
+        }
+    }
+
+    let dir = "/sys/kernel";
+    // The read-only attribute each kernel publishes: this tree has `ostype`,
+    // Linux has `uevent_seqnum`, and the claims are about the shape rather than
+    // the name - so the pin walks the candidates it knows and uses the one this
+    // machine has.
+    let Some(file) = ["/sys/kernel/ostype", "/sys/kernel/uevent_seqnum"]
+        .into_iter()
+        .find(|path| word(path).is_some())
+    else {
+        r.check("the tree publishes a read-only attribute to test", false);
+        return;
+    };
+
+    // Root's chmod is accepted *and stored*: the next reader sees the new word.
+    let rc = chmod(dir, 0o700);
+    let got = errno();
+    r.check(
+        &format!("root's chmod on a sysfs directory is 0 (got {rc}, errno {got})"),
+        rc == 0,
+    );
+    r.check(
+        &format!(
+            "and the word it wrote is the one stat reports (got {:?})",
+            word(dir).map(|m| format!("{m:04o}"))
+        ),
+        word(dir) == Some(0o700),
+    );
+    let rc = chmod(dir, 0o755);
+    r.check(
+        &format!("root may put the word back (got {rc})"),
+        rc == 0 && word(dir) == Some(0o755),
+    );
+
+    // The descriptor door on an attribute, and its restore.
+    if let Some(name) = cstring(file) {
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY) };
+        if fd >= 0 {
+            let rc = unsafe { libc::fchmod(fd, 0o600) };
+            let got = errno();
+            r.check(
+                &format!("fchmod of a sysfs attribute's descriptor is 0 (got {rc}, errno {got})"),
+                rc == 0,
+            );
+            r.check(
+                &format!(
+                    "and the word moves with it (got {:?})",
+                    word(file).map(|m| format!("{m:04o}"))
+                ),
+                word(file) == Some(0o600),
+            );
+            unsafe { libc::close(fd) };
+            let rc = chmod(file, 0o444);
+            r.check(
+                &format!("the attribute's word is put back (got {rc})"),
+                rc == 0 && word(file) == Some(0o444),
+            );
+        } else {
+            r.check("a sysfs attribute opens for its descriptor", false);
+        }
+    }
+
+    // ---- the unprivileged half: the word decides ---------------------------
+    const CHMOD_REFUSED: u32 = 1;
+    const WRITE_OPEN_REFUSED: u32 = 2;
+    const READ_OPEN_ALLOWED: u32 = 4;
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe {
+            libc::setuid(65534);
+        }
+        let mut bits = 0;
+        if chmod(dir, 0o700) != 0 && errno() == EPERM {
+            bits |= CHMOD_REFUSED;
+        }
+        if let Some(name) = cstring(file) {
+            let fd = unsafe { libc::open(name.as_ptr(), libc::O_WRONLY) };
+            if fd < 0 && errno() == EACCES {
+                bits |= WRITE_OPEN_REFUSED;
+            }
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+            let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY) };
+            if fd >= 0 {
+                bits |= READ_OPEN_ALLOWED;
+                unsafe { libc::close(fd) };
+            }
+        }
+        std::process::exit(bits as i32);
+    }
+    let mut status = 0;
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+    let bits = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status) as u32
+    } else {
+        0
+    };
+    r.check(
+        &format!("an ordinary user's chmod on sysfs is EPERM (bits {bits:02x})"),
+        bits & CHMOD_REFUSED != 0,
+    );
+    r.check(
+        &format!("opening a 0444 attribute for write is EACCES (bits {bits:02x})"),
+        bits & WRITE_OPEN_REFUSED != 0,
+    );
+    r.check(
+        &format!("while the same user reads it (bits {bits:02x})"),
+        bits & READ_OPEN_ALLOWED != 0,
+    );
+    r.check(
+        &format!(
+            "and the directory's word is the one root left (got {:?})",
+            word(dir).map(|m| format!("{m:04o}"))
+        ),
+        word(dir) == Some(0o755),
     );
 }
 

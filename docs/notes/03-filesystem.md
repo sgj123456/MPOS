@@ -1437,3 +1437,55 @@ in its own source; this kernel states the same set of rows structurally ("a
 directory that mirrors a process") and pins the measured table. An `lstat` of a
 descriptor's second name (`/proc/<pid>/fd/0`) is not claimed here, and the `ns`
 entries' ownership follows the same rule by construction rather than by a claim.
+
+### 3.23 sysfs reports its word and keeps it — **DONE** (2026-10-30)
+
+sysfs reported a word and kept nothing: every node answered its kind's constant,
+a directory answered `0` and left the rendering to the stat door, and
+`keeps_modes()` was `false` - so `may_as` said "not policed" and an ordinary user
+reached a write descriptor on a `0444` attribute while a root `chmod` answered
+`0` and stored nothing.
+
+**Measured first** (Linux 7.2.11, `build/scratch/sysfsattr/p.c`, `p2.c`, `p3.c`,
+as uid 1000 *and* root): `/sys` is `0555`, a directory under it `0755`, a
+read-only attribute `0444` and a writable one `0644`. Root's
+`chmod 0700 /sys/kernel` answers `0` and `stat` then reports `0700` - the word is
+stored on the inode, so **the next process sees it** - while an ordinary user's
+is `EPERM` (1) and leaves the word alone. The descriptor door (`fchmod` of an
+attribute's fd) takes the same path. And `open` of a `0444` attribute `O_WRONLY`
+is `EACCES` (13) **for root too**: the attribute has no write method, so the
+refusal is the node's answer and not a permission-bit question. `O_RDONLY`
+answers a descriptor for both callers.
+
+**Landed.** Each sysfs node carries its word in an `AtomicU32` initialised with
+the kind's constant; `keeps_modes()` is `true`, so `may_as` polices the word like
+any other filesystem's, and `set_mode` stores what a permitted `chmod`/`fchmod`
+writes (masked to the `07777` triads, as `chmod(2)` masks). `SysDir::new` now
+passes `0755` instead of `0`: a directory used to report `0` because the stat
+door rendered the kind's default, but `mode()` is the word a permission check
+reads, and a `0` there is the `0000` no `chmod` can set. The one directory with
+its own word, `/sys`, still passes `0555` through `SysDir::own`.
+
+**Pin.** `t-proc-modes`'s `sysfs_modes` half (11 claims): root's `chmod` on a
+directory is `0` *and* the word stat then reports is the one it wrote; root's
+`fchmod` of an attribute's fd is `0` and the word moves; a child that dropped to
+uid 65534 gets `EPERM` for the `chmod`, `EACCES` for the write descriptor and a
+descriptor for the read one; and the directory's word is still root's afterwards.
+Every word the claims move is put back, so the tree is unchanged when the run
+ends. The attribute is whichever one the machine publishes (this tree's
+`/sys/kernel/ostype`, Linux's `uevent_seqnum`), so the pin's reference run is
+real Linux as root - all claims `ok:` there.
+
+**Gates**: x86_64 `verdict pass=240 fail=0` (20.80 s), aarch64 `pass=239 fail=0`
+(53.06 s; the TCG arm's spread, not a cost of this change - the policing is one
+atomic load per open); both `mpos-kunit 35 passed`; host unit tests 716.
+
+**Counterfactual**: `set_mode` accepting and dropping the word (`let _ = mode`)
+-> exactly the two store claims red, `and the word it wrote is the one stat
+reports` (got `0755`) and `and the word moves with it` (got `0444`), with the
+`chmod`/`fchmod` answers still `0` - the shape this item pins against.
+
+**Named divergence.** Root's `open(O_WRONLY)` on a read-only attribute answers a
+descriptor here, where Linux refuses the `open` itself (`EACCES`): this kernel
+has no write method to ask, so the refusal lands on the write. The word lives on
+the node and Linux keeps it on the inode - same lifetime, same visibility.
