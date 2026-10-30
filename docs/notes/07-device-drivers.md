@@ -6689,3 +6689,46 @@ its announcements cannot be named).
 aarch64 `A-EXIT=0` (`build/scratch/seqnum-gate-a1.log`, 47.47 s), both
 `mpos-kunit 35 passed`. Counterfactual (`build/scratch/seqnum-cf.log`, the node
 not registered): `1 of 241`, exactly the four new claims red.
+
+#### 7.9d `poll`'s deadline is a wait, and the boot's settle is udevd's queue file — **DONE (2026-10-31)**
+
+§7.9c left one question open: the boot's 120 s `udev-settle`. The kernel's own
+heartbeat named the suspects, and one of them was this kernel's `poll`:
+
+```
+mpos:   slot 8 pid 8 name=/bin/udevadm park 2 (block_until_nanos) syscall 7 parks=4712
+mpos:   slot 6 pid 6 name=/etc/init.d/udev-settle park 2 (block_until_nanos) syscall 7 parks=2801
+mpos:   slot 9 pid 9 name=/sbin/udevd park 2 (block_until_nanos) syscall 281 parks=4090
+```
+
+syscall 7 is `poll`, 281 is `epoll_pwait` — and the third line says the daemon
+is **idle**, not busy. So the new pin `user/tests/src/bin/t-poll-wait.rs`
+(13 claims: no-descriptor and quiet-descriptor deadlines sleep the timeout and
+not longer, a zero timeout answers at once, `ppoll`'s `timespec` does the same,
+a ready descriptor ends an **infinite** wait with `revents` set, and a poll on
+the uevent netlink socket answers its deadline) was written and run.
+
+**Measured**: on real Linux 7.2.11 (the reference run) all 13 `ok:`, `PASS`;
+on the guest all 13 `ok:`, `=== PASS t-poll-wait`; x86_64 gate `pass=242
+fail=0` (`build/scratch/pollwait-gate1.log`). So the deadline and the wake are
+both honoured — `poll` is not what the boot waited in.
+
+**What it is**: this image's eudev tests emptiness by the **queue file**, not by
+`libudev`'s seqnum (`strings /bin/udevadm` has `/run/udev/queue`, no
+`uevent_seqnum`). Measured in three shapes:
+
+* the settle probe with udevd **not** started: `udevadm settle --timeout=2`
+  answered **rc=0 at once**, before and after `udevadm trigger` (twice in one
+  boot);
+* the boot's own settle: `/run/udev/queue` present, `udevadm` parked in `poll`,
+  the service timed out at its default 120 s and openrc reported
+  `udev-settle failed to start`;
+* a udevd started by hand with `--debug`: it processed
+  `udevadm trigger --action=add --subsystem-nomatch=input`'s **12 events**
+  inside 6 s and the queue file was gone afterwards.
+
+So delivery and the unlink both work for a socket bound late; what the boot's
+udevd leaves behind is the file, with the daemon idle. The next instrument is
+whether the boot's udevd received the boot's own early events at all (a socket
+bound before they were sent) and what `udev-trigger` did — named as the open
+item, not closed here. A `udev_settle_timeout=5` in the image only hides it.

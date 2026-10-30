@@ -7838,3 +7838,18 @@ a kernel netlink defect.
 Pin: `t-uevent`'s four new claims. Gates: x86_64 `pass=241 fail=0`, aarch64
 `A-EXIT=0`, kunit 35 both. Counterfactual: the node unregistered → exactly
 those four claims red, `1 of 241`.
+
+## item 150 — `poll`'s deadline is a wait, and a ready descriptor ends it
+
+`t-poll-wait` pins `poll(2)`/`ppoll(2)` end to end: a wait with no descriptors
+sleeps its timeout (and not longer), a quiet descriptor answers at its timeout,
+a zero timeout answers at once, the `ppoll` `timespec` carries the same
+deadline, a descriptor that becomes ready ends an **infinite** wait with
+`revents` set, and a poll on the uevent netlink socket answers its deadline.
+13 claims, reference-run against Linux 7.2.11 (`MPOS_ON_HOST=1`, all `ok:`) and
+green on the guest (`=== PASS t-poll-wait`, x86_64 gate `pass=242 fail=0`).
+
+Written because a desktop boot sat 120 s in `udev-settle` with `/bin/udevadm`
+parked in syscall 7 (`poll`) — `docs/notes/` §7.9c/§7.9d. The pin measures that
+`poll` is not the wait; what the boot waits on is udevd's stale
+`/run/udev/queue`, named in §7.9d with the next instrument.
