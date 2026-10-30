@@ -1359,3 +1359,93 @@ exercised through the share mount by `t-9p` and the programs that read the
 share, and `t-p9read` carries the measurement (a reported figure, not a claim —
 the `slow` group's rule). Counterfactual: the old-shape column is the same tree
 with `call`'s fresh `alloc_zeroed` restored and the same instrument re-run.
+### 10.11 The VMA table is a tree, and a process may hold 65 530 mappings — **DONE** (2026-10-30)
+
+R.8's remaining half was "the global allocator's `Vec` growth still panics", and
+the question behind it is narrower than it reads: *which kernel allocation can a
+user steer without a bound?* The audit answered it for every store but one.
+Copies are bounded by `MAX_IO = 1 << 20` (`src/uaccess.rs:23`, and
+`buffer_ok` refuses a longer buffer before anything is allocated, so `poll`'s
+and `epoll_wait`'s arrays are bounded by the same number); inotify caps
+instances, watches and queued events (`MAX_INSTANCES = 128`,
+`MAX_WATCHES = 8192`, `MAX_QUEUED_EVENTS = 16384`, `src/vfs/inotify.rs:121`);
+fanotify caps events, groups and marks (`src/vfs/fanotify.rs:156`); SysV IPC
+caps identifiers (`SHMMNI = 4096`, `IPC_MNI = 32768`); keys already charge a
+per-uid quota and answer `EDQUOT` (`src/sched/keys.rs:348`: 200 keys and 20 000
+bytes for everyone, 1 000 000 and 25 000 000 for root); tasks are capped by
+`MAX_TASKS`. **The virtual-memory area table had no cap and no shape that
+tolerates one**: `VmaTable { vmas: Vec<Vma> }` (`src/mm/vma.rs:365`) took one
+description per `mmap`, and its `insert` was `split_out` (a fresh
+`Vec::with_capacity(len + 1)` and a copy of every entry) followed by `push` and
+`tidy` (a `sort_unstable_by_key` over the whole vector plus a merge pass) — a
+quadratic placement cost with an allocation per step, and a linear `lookup` on
+every punch-through, fault and cross-process copy.
+
+**Measured before the change** (this machine, `-accel kvm`, the gate's own
+budget): a program mapping 4 KiB anonymous regions 70 000 times **timed out at
+120 s**, and one limited to **20 480 regions also timed out** — the lane's
+serial showed the task parked inside `syscall 9` (`mmap`) and not one of the
+program's marks printed. So a process could not reach Linux's own ceiling at
+all, which is why the fix is both a tree and a bound.
+
+**Linux reference measured first** (7.2.11, uid 1000, probes
+`build/scratch/mmapcount/p1.c` and `.workbuddy/probe_mapcount.c`):
+`/proc/sys/vm/max_map_count` on this host is **1 048 576** (the kernel's default
+is 65 530; this host is tuned up). Mapping one-page `PROT_NONE`/`PROT_READ`
+regions alternately — so neighbours cannot merge — was refused after
+**1 048 566** mappings (the process already had 10) with **`ENOMEM` (errno 12)**;
+`/proc/self/maps` then listed 1 048 578 lines. `munmap` of one mapping let
+exactly one more in; `MAP_FIXED` over an existing mapping did not change the
+count; writing the sysctl as uid 1000 answered `EACCES`. So the count is the
+gate, the answer past it is `ENOMEM`, and the number is a *policy* value
+(`sysctl`) whose default is 65 530.
+
+**The change**: `VmaTable` is now a `BTreeMap<usize, Vma>` keyed by an area's
+first address, entries never overlapping (the invariant the old vector kept by
+sorting). The public API is unchanged (`insert`, `insert_present`,
+`remove_range`, `take_range`, `lift_range`, `seal_range`, `seal_present`,
+`sealed_within`, `sealed_at`, `set_prot`, `set_anon_name`, `gaps`, `lookup`,
+`covers`, `iter`, `is_empty`, `len`, `Clone`) except for the ceiling, so no
+caller moved: `gaps` collects the overlapping areas by rank and sorts the
+result (the caller wants the order, not the table), `lookup` is the
+predecessor of the address, `split_out` removes the overlapping areas and
+returns the pieces with nothing allocated when the new area covers no
+existing one, `remove_range`/`take_range`/`lift_range`/`set_prot` each
+retake only what they touched, and `seal_range` keeps the merged area *or*
+the sealed splinters, never both. A merge between neighbours is a local
+`merge_at`, so two touching mappings cost nothing.
+
+**The ceiling**: `pub const MAX_MAP_COUNT: usize = 65_530;` in
+`src/mm/vma.rs:380` — Linux's *default*, not this host's tuned value, because a
+number a distribution tuned is not the answer this kernel owes a caller. The
+refusal lives in the syscall layer before the backing is chosen
+(`src/syscall/linux/fs/file.rs`'s `handle_mmap_impl`: `if !fixed &&
+crate::sched::vma_count_reached() { return err::ENOMEM; }`), which is Linux's
+own precedence — Linux answers `ENOMEM` for the count before it looks at the
+mapping — and `sched::vma_count_reached()` is `current_mm().vma_count() >=
+MAX_MAP_COUNT` (`src/sched/runtime/child_mm.rs:892`, which is the one place the
+ceiling is asked). Named divergences, both small: there is no
+`vm.max_map_count` sysctl to raise the number (Linux's default is compiled in
+here, and raising it is a `docs/ROADMAP.md` gap), and the count says nothing
+about the kernel bytes the descriptions themselves occupy (charged to the heap
+like every other metadata, as a mount's xattrs and a directory's entries are).
+
+**After the change**: the same mapping loop, with the marks printed, took
+**24 ms for 20 480 mappings** (1 024 → 1 ms, 2 048 → 2, 4 096 → 4, 8 192 → 9,
+12 288 → 14, 16 384 → 19, 20 480 → 24) — linear, and 5 000× the work the old
+shape could not finish inside its budget. The pin then hands out all of the
+65 530 descriptions in about a third of a second.
+
+**Pin**: `user/tests/src/bin/t-mmap-count.rs` — a program maps one-page regions
+(alternating permissions so nothing merges) until refused, and claims: the
+refusal is `ENOMEM`; the number handed out is Linux's default less the
+descriptions it started with (65 529 here, and the claim allows a small
+baseline); sixty-four descriptions given back are room for sixty-four more
+(`Linux`'s count is the gate, memory is not); and a forked process still gets a
+page — the machine serves on after a process sat at the ceiling. The host
+branch reports the host's own `/proc/sys/vm/max_map_count` as context instead of
+pretending to measure the boundary (it is 1 048 576 on the development host).
+
+**Gates**: x86_64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate3.log`); aarch64 `all 234 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate-a2.log`); the first aarch64 attempt failed on stage 1 alone — the documented host-suite load flake, 1200 tests in the same command being green standalone — and the re-run quoted above.
+
+**Counterfactual**: the ceiling check disabled (`if false && crate::sched::vma_count_reached()`) → `t-mmap-count` alone red, `pass=234 fail=1` of 235 built, with exactly its first two claims red — `FAIL: the ceiling refuses with ENOMEM (errno 0)` and `FAIL: the process holds Linux's default 65530 descriptions … (65563 were handed out)` — while the relieved and forked claims stayed green (`build/scratch/mmapcount-cf.log`). The tree's own before/after is the 20 480-mapping number above: 120 s budget exhausted before, 24 ms after.

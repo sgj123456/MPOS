@@ -885,6 +885,13 @@ pub fn take_vmas(virt: usize, len: usize) -> Vec<Vma> {
     current_mm().vma_lift_range(virt, virt.saturating_add(len))
 }
 
+/// Whether this process already holds as many descriptions as Linux's own
+/// default `max_map_count` allows - the question `mmap` asks before it adds
+/// one (`docs/notes/` §10.11).
+pub fn vma_count_reached() -> bool {
+    current_mm().vma_count() >= crate::mm::vma::MAX_MAP_COUNT
+}
+
 /// The parts of `virt..virt + len` the current process has not already claimed.
 pub fn vma_gaps(virt: usize, len: usize) -> Vec<(usize, usize)> {
     if len == 0 {
@@ -1780,6 +1787,12 @@ impl Mm {
     /// Whether a VMA covers `virt`.
     pub(crate) fn vma_covers(&self, virt: usize) -> bool {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow().covers(virt))
+    }
+
+    /// How many descriptions this process holds - what
+    /// [`crate::mm::vma::MAX_MAP_COUNT`] bounds.
+    pub(crate) fn vma_count(&self) -> usize {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().len())
     }
 
     pub(crate) fn vma_insert(&self, vma: Vma) {

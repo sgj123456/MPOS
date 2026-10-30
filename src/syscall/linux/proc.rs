@@ -3697,6 +3697,15 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     // claim on memory - and it is the whole of §5.1/§5.2's prerequisite, since
     // a page that can arrive on a fault is a page `MADV_DONTNEED` may take away
     // again.
+    // Linux's ceiling on how many descriptions one process may hold:
+    // `max_map_count`, 65 530 by default, answered `ENOMEM` (measured on Linux
+    // 7.2.11, `docs/notes/` §10.11). The question is asked on the path that
+    // *adds* a description; a `MAP_FIXED` replacement re-describes a range the
+    // caller already holds, so it is not asked.
+    if !fixed && crate::sched::vma_count_reached() {
+        return err::ENOMEM;
+    }
+
     match &backing {
         // A shared anonymous mapping is an *object*: an unnamed `Memfd`, which
         // is the same frame store a `memfd_create` descriptor is - real pages,

@@ -106,9 +106,9 @@ pub use runtime::{
     timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
     try_spawn_user, uid_members, unmap_user, unshare_cgroup, unshare_files, unshare_fs,
     unshare_ipc, unshare_mnt, unshare_pid, unshare_time, unshare_user, unshare_uts, user_frame_at,
-    user_mapped, user_range_sealed, vfork, vma_gaps, vma_kind_at, vma_prot_at, vma_range_free,
-    wait_any_child_event, wait_child_event, wait_for_interrupt, wake, with_current_credentials,
-    write_user, write_user_of, yield_now,
+    user_mapped, user_range_sealed, vfork, vma_count_reached, vma_gaps, vma_kind_at, vma_prot_at,
+    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
+    with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// The permissions the VMA covering a page grants - `UFFDIO_COPY` installs the

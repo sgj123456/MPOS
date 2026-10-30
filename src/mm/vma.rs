@@ -12,15 +12,21 @@
 //! per *process*: a process is one thread group, its threads share one address
 //! space, and Linux keeps `mm->mmap` in the same place.
 //!
-//! A sorted `Vec` and not a tree, for the same reason [`crate::vfs::locks`] and
-//! [`crate::vfs::inotify`] are what they are: a process holds tens of these,
-//! not thousands, and a plain slice keeps the type `Clone`-able (so `fork` is a
-//! copy) and testable on the host with no page tables anywhere in sight. The
-//! decisions that matter - which VMA covers an address, and what a
-//! map/unmap/protect/split does to the list - are pure arithmetic over ranges,
-//! so they are pinned by this file's own host tests rather than only from
-//! inside the machine.
+//! A `BTreeMap` keyed by `start` and not the sorted `Vec` this file used to
+//! keep. The old rationale - "a process holds tens of these, not thousands, so
+//! a slice is enough" - was measured wrong: a program mapping its way down the
+//! arena (a sanitizer's shadow, a JIT's code cache, `t-mmap-count`) holds
+//! thousands, and with a `Vec` every insert re-sorted and rebuilt the whole
+//! list, so 20 480 one-page mappings did not finish in the gate's 120 s budget
+//! (`docs/notes/` §10.11). The map answers the two hot questions - which VMA
+//! covers this address, and where the highest hole below the cursor is - in
+//! `log n`, keeps the same invariant the slice had (address order, no overlap,
+//! abutting descriptions folded), and is still `Clone`-able for `fork`.
+//! The decisions that matter - what a map/unmap/protect/split does to the set -
+//! are pure arithmetic over ranges, so they stay pinned by this file's own host
+//! tests rather than only from inside the machine.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -360,20 +366,62 @@ fn same_name(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
     }
 }
 
-/// The process's VMAs, sorted by `start` and never overlapping.
+/// The most descriptions one process's table may hold: Linux's own default
+/// `/proc/sys/vm/max_map_count`, 65 530.
+///
+/// Measured on Linux 7.2.11 (`build/scratch/mmapcount/p1.c`): with the count at
+/// the limit, one more `mmap` of a page answers `ENOMEM` (errno 12); `munmap`
+/// one and the next `mmap` succeeds. The count, not memory, is the gate - which
+/// is why the limit belongs to the table and not to the frame allocator.
+///
+/// The number is Linux's *default*; this host has it tuned up to 1 048 576, so
+/// the pin claims the shape the kernel ships rather than the host's setting
+/// (`docs/notes/` §10.11).
+pub const MAX_MAP_COUNT: usize = 65_530;
+
+/// The process's VMAs, keyed by `start` and never overlapping.
+///
+/// A `BTreeMap` and not the sorted `Vec` this was, for a reason a measurement
+/// gave rather than a preference: the table's two hot paths are a
+/// *predecessor* query and an *insert*. Every page fault asks which
+/// description covers an address (`lookup`), and every `mmap` asks where the
+/// highest hole below the cursor is and then puts a mapping there. With a
+/// `Vec` the lookup was a linear scan, and an insert re-sorted the whole
+/// vector and rebuilt it through `split_out` - so a program mapping its way
+/// down the arena was quadratic: 20 480 one-page mappings did not finish in
+/// the gate's 120 s budget on x86_64 (`docs/notes/` §10.11), and Linux's own
+/// default `max_map_count` (65 530) was unreachable in a program's lifetime.
+///
+/// A `BTreeMap` answers the lookup in `log n`, inserts in `log n` and moves
+/// nothing - which matters because the placement is *top-down*, so every new
+/// mapping is inserted at the front of address order, where a `Vec` pays a
+/// whole-vector move (65 530 of them). It iterates in address order for
+/// `/proc/<pid>/maps`, and it is `Clone`-able for `fork` just as the slice
+/// was.
+///
+/// The invariant is the old `tidy`'s, now kept locally: entries stand in
+/// address order (the map's own order), two entries never overlap, and
+/// adjacent ranges that describe the same thing are folded by [`Self::merge_at`]
+/// rather than by re-sorting the table.
 #[derive(Clone, Default)]
 pub struct VmaTable {
-    vmas: Vec<Vma>,
+    vmas: BTreeMap<usize, Vma>,
 }
 
 impl VmaTable {
     pub fn new() -> VmaTable {
-        VmaTable { vmas: Vec::new() }
+        VmaTable {
+            vmas: BTreeMap::new(),
+        }
     }
 
     /// The VMA covering `virt`, if any.
+    ///
+    /// One predecessor query: entries never overlap, so the only candidate is
+    /// the last one starting at or below `virt`.
     pub fn lookup(&self, virt: usize) -> Option<&Vma> {
-        self.vmas.iter().find(|v| v.covers(virt))
+        let (_, vma) = self.vmas.range(..=virt).next_back()?;
+        vma.covers(virt).then_some(vma)
     }
 
     /// Whether any VMA covers `virt`.
@@ -381,8 +429,9 @@ impl VmaTable {
         self.lookup(virt).is_some()
     }
 
-    pub fn iter(&self) -> core::slice::Iter<'_, Vma> {
-        self.vmas.iter()
+    /// The table in address order - what `/proc/<pid>/maps` prints.
+    pub fn iter(&self) -> impl Iterator<Item = &Vma> + '_ {
+        self.vmas.values()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -402,8 +451,7 @@ impl VmaTable {
     /// VMA and not a thousand.
     pub fn insert(&mut self, vma: Vma) {
         self.split_out(vma.start, vma.end);
-        self.vmas.push(vma);
-        self.tidy();
+        self.place(vma);
     }
 
     /// Claim a run of pages the caller has just *placed* - mapped eagerly or
@@ -418,18 +466,17 @@ impl VmaTable {
     /// anybody - but the *description* would be rewritten by the merge, and a
     /// caller like `brk`'s growth loop cannot tell "the hole beside me" from
     /// "somebody else's untouched mapping" without learning the machine's
-    /// page-table internals (`NOTES.md` §15.18's measurement). So this appends
-    /// without touching anything already in the table, and sorts; two plain
-    /// anonymous runs that abut are still folded, because for `Anon` the
-    /// merge is a statement about identity and not about placement.
+    /// page-table internals (`NOTES.md` §15.18's measurement). So this puts
+    /// the run down without touching anything already in the table; two plain
+    /// anonymous runs that abut are still folded, because for `Anon` the merge
+    /// is a statement about identity and not about placement.
     pub fn insert_present(&mut self, vma: Vma) {
-        if !matches!(vma.kind, VmaKind::Anon) {
-            self.vmas.push(vma);
-            self.vmas.sort_unstable_by_key(|v| v.start);
-            return;
+        let anon = matches!(vma.kind, VmaKind::Anon);
+        let key = vma.start;
+        self.vmas.insert(key, vma);
+        if anon {
+            self.merge_at(key);
         }
-        self.vmas.push(vma);
-        self.tidy();
     }
 
     /// Drop every VMA (or every part of one) inside `[start, end)`.
@@ -448,25 +495,7 @@ impl VmaTable {
     /// previously handed back to the allocator while its PTE stayed live,
     /// which is exactly the shape §15.18 found on the stack region.
     pub fn lift_range(&mut self, start: usize, end: usize) -> Vec<Vma> {
-        if start >= end {
-            return Vec::new();
-        }
-        let mut lifted = Vec::new();
-        let mut kept = Vec::with_capacity(self.vmas.len() + 1);
-        for vma in self.vmas.drain(..) {
-            if let Some(left) = vma.sliced(vma.start, start) {
-                kept.push(left);
-            }
-            if let Some(middle) = vma.sliced(start.max(vma.start), end.min(vma.end)) {
-                lifted.push(middle);
-            }
-            if let Some(right) = vma.sliced(end, vma.end) {
-                kept.push(right);
-            }
-        }
-        self.vmas = kept;
-        lifted.sort_unstable_by_key(|v| v.start);
-        lifted
+        self.split_out(start, end)
     }
 
     /// Take the VMAs inside `[start, end)` out and hand them back, clipped to
@@ -502,8 +531,7 @@ impl VmaTable {
         for vma in &mut inside {
             vma.sealed = true;
         }
-        self.vmas.append(&mut inside);
-        self.tidy();
+        self.retake(inside);
         Ok(())
     }
 
@@ -523,8 +551,7 @@ impl VmaTable {
         for vma in &mut inside {
             vma.sealed = true;
         }
-        self.vmas.append(&mut inside);
-        self.tidy();
+        self.retake(inside);
     }
 
     /// Whether any part of `[start, end)` is sealed. Every operation `mseal`
@@ -540,9 +567,7 @@ impl VmaTable {
             // `munmap(addr, 0)` that Linux accepts.
             return false;
         }
-        self.vmas
-            .iter()
-            .any(|v| v.sealed && v.end > start && v.start < end)
+        self.overlapping(start, end).any(|v| v.sealed)
     }
 
     /// Whether the VMA covering `virt` is sealed. `madvise` asks per range
@@ -562,8 +587,7 @@ impl VmaTable {
         for vma in &mut inside {
             vma.prot = prot;
         }
-        self.vmas.append(&mut inside);
-        self.tidy();
+        self.retake(inside);
     }
 
     /// `PR_SET_VMA_ANON_NAME`: give every anonymous mapping in `[start, end)`
@@ -578,7 +602,7 @@ impl VmaTable {
     ///   **file** mapping sits in is `EBADF` - the one errno a reader would not
     ///   guess from the man page's silence;
     /// * clearing the name folds the pieces back into one line, which is what
-    ///   [`Self::tidy`] does when two abutting pieces agree on the name.
+    ///   [`Self::merge_at`] does when two abutting pieces agree on the name.
     ///
     /// The name is stored already bracketed (`[anon:x]`, or `[anon:]` for an
     /// empty name, both as the host prints them), because the one reader is
@@ -596,15 +620,13 @@ impl VmaTable {
         if inside.iter().any(|vma| !matches!(vma.kind, VmaKind::Anon)) {
             // Put back what the split took before refusing: the caller's range
             // is unchanged, which is what an error means here.
-            self.vmas.append(&mut inside);
-            self.tidy();
+            self.retake(inside);
             return Err(crate::err::EBADF);
         }
         for vma in &mut inside {
             vma.name = name.clone();
         }
-        self.vmas.append(&mut inside);
-        self.tidy();
+        self.retake(inside);
         Ok(())
     }
 
@@ -614,23 +636,17 @@ impl VmaTable {
     /// range that something else already owns - musl's `PROT_NONE` guard over
     /// the first page of a fresh heap - must not be claimed by the growth.
     ///
-    /// The scan assumes the table is sorted, and *makes* it sorted rather than
-    /// trusting it: [`tidy`] and [`insert_present`] put every list back in
-    /// address order, but an unsorted table breaks the sweep below rather than
-    /// merely slowing it - a VMA that starts above `at` yet ends below it pulls
-    /// `at` backwards, and the next pass reports the same hole again. That is
+    /// The sweep walks the overlapping descriptions in address order, which is
+    /// the map's own order, so it cannot report one hole twice. (A `Vec` had to
+    /// be sorted first, and an unsorted table broke the sweep rather than
+    /// merely slowing it: a VMA that started above `at` yet ended below it
+    /// pulled `at` backwards and the next pass reported the same hole again -
     /// how one mmap placement came to claim its gap twice with two overlapping
-    /// descriptions (`NOTES.md` §15.18).
+    /// descriptions, `NOTES.md` §15.18.)
     pub fn gaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
-        let mut vmas: Vec<&Vma> = self
-            .vmas
-            .iter()
-            .filter(|v| v.end > start && v.start < end)
-            .collect();
-        vmas.sort_unstable_by_key(|v| v.start);
         let mut gaps = Vec::new();
         let mut at = start;
-        for vma in vmas {
+        for vma in self.overlapping(start, end) {
             if vma.start > at {
                 gaps.push((at, vma.start.min(end)));
             }
@@ -645,43 +661,114 @@ impl VmaTable {
         gaps
     }
 
+    /// The entries that overlap `[start, end)`, in address order.
+    ///
+    /// The predecessor comes first when it reaches past `start`: `range` only
+    /// yields keys at or above `start`, and an overlapping entry may begin
+    /// below it.
+    fn overlapping(&self, start: usize, end: usize) -> impl Iterator<Item = &Vma> + '_ {
+        let first = self
+            .vmas
+            .range(..start)
+            .next_back()
+            .map(|(_, vma)| vma)
+            .filter(move |vma| vma.end > start);
+        first
+            .into_iter()
+            .chain(self.vmas.range(start..end).map(|(_, vma)| vma))
+    }
+
+    /// Put a run down in address order and fold it into whatever it continues.
+    fn place(&mut self, vma: Vma) {
+        let key = vma.start;
+        self.vmas.insert(key, vma);
+        self.merge_at(key);
+    }
+
+    /// Put split pieces back: each may now continue a neighbour, so each is
+    /// merged on the way in.
+    fn retake(&mut self, inside: Vec<Vma>) {
+        for vma in inside {
+            self.place(vma);
+        }
+    }
+
+    /// Fold the entry at `key` into its neighbours for as long as they
+    /// describe the same thing.
+    ///
+    /// This is the old `tidy`'s merge, one entry at a time: the table is
+    /// already in address order, so only the two entries beside the one just
+    /// written can have started to abut. The loop repeats because folding
+    /// downward can make the survivor abut the next entry up.
+    fn merge_at(&mut self, mut key: usize) {
+        loop {
+            let Some(vma) = self.vmas.get(&key) else {
+                return;
+            };
+            let (start, end) = (vma.start, vma.end);
+            // Copy the answers out before touching the map: `abuts` borrows
+            // both entries and the fold below needs the map mutably.
+            let below = self
+                .vmas
+                .range(..start)
+                .next_back()
+                .map(|(&k, prev)| (k, prev.abuts(vma)));
+            let above = self
+                .vmas
+                .range(end..)
+                .next()
+                .map(|(&k, next)| (k, vma.abuts(next)));
+            if let Some((below_key, true)) = below {
+                let end = self.vmas[&key].end;
+                self.vmas.remove(&key);
+                if let Some(prev) = self.vmas.get_mut(&below_key) {
+                    prev.end = end;
+                }
+                key = below_key;
+                continue;
+            }
+            if let Some((above_key, true)) = above {
+                let above_end = self.vmas[&above_key].end;
+                self.vmas.remove(&above_key);
+                if let Some(cur) = self.vmas.get_mut(&key) {
+                    cur.end = above_end;
+                }
+                continue;
+            }
+            return;
+        }
+    }
+
     /// Take the pieces of every VMA inside `[start, end)` out of the table and
     /// return them; what is left stays, split at the boundaries as required.
+    ///
+    /// The no-overlap case - an `mmap` placement into a hole - is the common
+    /// one and returns before allocating anything.
     fn split_out(&mut self, start: usize, end: usize) -> Vec<Vma> {
         if start >= end {
             return Vec::new();
         }
-        let mut taken = Vec::new();
-        let mut kept = Vec::with_capacity(self.vmas.len() + 1);
-        for vma in self.vmas.drain(..) {
-            // Whatever of this VMA is below `start`...
+        let keys: Vec<usize> = self.overlapping(start, end).map(|vma| vma.start).collect();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut taken = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(vma) = self.vmas.remove(&key) else {
+                continue;
+            };
             if let Some(left) = vma.sliced(vma.start, start) {
-                kept.push(left);
+                self.vmas.insert(left.start, left);
             }
-            // ...whatever is inside the range, which is what the caller wants...
-            if let Some(inside) = vma.sliced(start, end) {
-                taken.push(inside);
+            if let Some(middle) = vma.sliced(start, end) {
+                taken.push(middle);
             }
-            // ...and whatever is above `end`.
             if let Some(right) = vma.sliced(end, vma.end) {
-                kept.push(right);
+                self.vmas.insert(right.start, right);
             }
         }
-        self.vmas = kept;
+        taken.sort_unstable_by_key(|vma| vma.start);
         taken
-    }
-
-    /// Sort by address and fold neighbours that describe the same thing.
-    fn tidy(&mut self) {
-        self.vmas.sort_unstable_by_key(|v| v.start);
-        let mut merged: Vec<Vma> = Vec::with_capacity(self.vmas.len());
-        for vma in self.vmas.drain(..) {
-            match merged.last_mut() {
-                Some(last) if last.abuts(&vma) => last.end = vma.end,
-                _ => merged.push(vma),
-            }
-        }
-        self.vmas = merged;
     }
 }
 
@@ -975,23 +1062,24 @@ mod tests {
     }
 
     #[test]
-    fn gaps_are_one_hole_per_hole_whatever_order_the_table_holds() {
-        // The sweep below walks the table in address order and moves its cursor
-        // forward only. A table out of that order - which `insert_present` can
-        // leave behind when a *file-backed* run is claimed beside an existing
-        // one whose pages were just placed - must not report the same hole
-        // twice: a caller that claims every gap it is handed would then place
-        // two overlapping descriptions over one range (`NOTES.md` §15.18).
+    fn gaps_are_one_hole_per_hole_whatever_order_the_runs_arrive() {
+        // The sweep walks the descriptions in address order and moves its
+        // cursor forward only. Arrival order must not matter: a *file-backed*
+        // run claimed beside an existing one through `insert_present` arrives
+        // later than a lower address, and a table that reported the same hole
+        // twice would let a caller that claims every gap it is handed place two
+        // overlapping descriptions over one range (`NOTES.md` §15.18). The map
+        // keeps the order the `Vec` had to be sorted back into.
         let object = fake(7);
         let mut table = VmaTable::new();
-        // Out-of-order on purpose: the later address first.
-        table.vmas.push(frames(0x3000, 0x4000, RW, &object, 0));
-        table.vmas.push(anon(0x1000, 0x2000, RW));
+        // The higher address first, through the door that does not split.
+        table.insert_present(frames(0x3000, 0x4000, RW, &object, 0));
+        table.insert_present(anon(0x1000, 0x2000, RW));
 
         assert_eq!(
             table.gaps(0x1000, 0x4000),
             alloc::vec![(0x2000, 0x3000)],
-            "one hole, reported once, from a table that was not sorted"
+            "one hole, reported once, whatever order the runs arrived in"
         );
     }
 

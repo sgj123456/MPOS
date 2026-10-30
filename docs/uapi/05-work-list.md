@@ -7268,3 +7268,44 @@ with the behaviour: the trio is served, `fspick` still `ENOSYS`.
 `fsmount-gate-a1.log`). **Counterfactual**: `move_mount`'s fresh-attach branch
 disabled → `t-fsmount` red on the attach and every claim after it, the other
 twenty green (`build/scratch/fsmount-cf.log`). Record: `docs/notes/` §3.16.
+
+## item 136 — the VMA table is a tree, and a process may hold 65 530 mappings
+
+R.8's remaining half was "the global allocator's `Vec` growth still panics"; the
+audit behind it found every other user-steerable allocation already bounded
+(`MAX_IO = 1 MiB` for a copy, inotify's 128 instances / 8 192 watches / 16 384
+queued events, fanotify's events-groups-marks, SysV IPC's identifier counts, the
+keys quota's `EDQUOT`, `MAX_TASKS`) and **one that was neither bounded nor
+shaped to be**: `VmaTable { vmas: Vec<Vma> }` took one entry per `mmap` and
+placed it with a full copy (`split_out`) plus a whole-vector `sort_unstable_by_key`
+(`tidy`) — quadratic, allocating, with a linear `lookup` under it.
+
+**Linux reference measured first** (7.2.11, `.workbuddy/probe_mapcount.c`):
+`/proc/sys/vm/max_map_count` is **65 530 by default** (1 048 576 on this tuned
+host); one-page alternating `PROT_NONE`/`PROT_READ` regions were refused after
+**1 048 566** mappings (10 already there) with **`ENOMEM` (12)**; one `munmap`
+let one more in; `MAP_FIXED` did not change the count; writing the sysctl as
+uid 1000 answered `EACCES`. The count is the gate and the number is policy.
+
+**Before**: mapping 4 KiB regions on this kernel **timed out at the program
+budget** — 70 000 regions and, separately, 20 480 regions — with the task parked
+in `mmap` and no mark printed. **After**: the table is a `BTreeMap<usize, Vma>`
+(entries never overlapping; `gaps` collects and sorts only what the caller
+asked for; `lookup` is a predecessor query; split/remove/take/lift/set_prot and
+seal retake only what they touched; a merge is local), and 20 480 mappings take
+**24 ms** (1 024 → 1 ms … 20 480 → 24, linear).
+
+**The ceiling**: `MAX_MAP_COUNT = 65_530` (`src/mm/vma.rs:380`, Linux's
+default, not this host's tuned value), refused with `ENOMEM` in `handle_mmap_impl`
+**before** the backing is chosen (`!fixed && crate::sched::vma_count_reached()`)
+— Linux's own precedence; the question itself is `current_mm().vma_count() >=
+MAX_MAP_COUNT` in `src/sched/runtime/child_mm.rs:892`.
+
+**Named divergences**: no `vm.max_map_count` sysctl to raise the number (the
+default is compiled in — a roadmap gap); the descriptions' own kernel bytes are
+uncharged, like every other metadata store here.
+
+**Pin**: `user/tests/src/bin/t-mmap-count.rs` (4 guest claims: `ENOMEM` at the
+ceiling; 65 529 descriptions handed out, allowing the starting ones; 64 given
+back are 64 more; a forked process still gets a page). **Gates**:
+x86_64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate3.log`); aarch64 `all 234 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate-a2.log`); the first aarch64 attempt failed on stage 1 alone — the documented host-suite load flake, 1200 tests in the same command being green standalone — and the re-run quoted above. **Counterfactual**: the ceiling check disabled (`if false && crate::sched::vma_count_reached()`) → `t-mmap-count` alone red, `pass=234 fail=1` of 235 built, with exactly its first two claims red — `FAIL: the ceiling refuses with ENOMEM (errno 0)` and `FAIL: the process holds Linux's default 65530 descriptions … (65563 were handed out)` — while the relieved and forked claims stayed green (`build/scratch/mmapcount-cf.log`). The tree's own before/after is the 20 480-mapping number above: 120 s budget exhausted before, 24 ms after. Record: `docs/notes/` §10.11.
