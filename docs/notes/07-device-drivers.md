@@ -6543,6 +6543,23 @@ The pin is the movement itself, read across one ordinary read in the boot's drai
 
 **Gate, this instrument.** x86_64 `X-EXIT=0` (`build/scratch/blkcnt-gate1.log`, `blk submits=76 retires=76` in a lane's heartbeat), aarch64 `A-EXIT=0` (`build/scratch/blkcnt-gate-a1.log`), `mpos-kunit 35 passed, 0 failed` on both, and the user suites unchanged (238 / 237 built).
 
+### 7.9b A desktop boot: the pair and the mailbox agree, and the boot's own wait is `udev-settle` (2026-10-31)
+
+The counters were built to catch the interactive stall (§7.9, R.9); the desktop image is where that stall was seen, so it is where the counters were first read. The image is the one `cargo xtask rootfs` refreshes (`build/mpos-uefi-x86_64.img`, boot files from this tree, second partition at sector 264192), booted as QEMU q35 with OVMF (`OVMF_CODE.4m.fd` plus a copy of `OVMF_VARS.4m.fd`), `-device virtio-blk-pci` over the image, `-device virtio-gpu-gl-pci -vga none -display egl-headless,gl=on`, `-serial file:` and `-monitor none`. The session is started by `/etc/local.d/zz-desk.start`, injected into the root partition with `debugfs` (extract the partition, `write` the script, `set_inode_field … mode 0100755`, write it back with `dd conv=notrunc`). Three boots: 115 s (no script), 260 s (script starting niri without `XDG_RUNTIME_DIR`), 230 s (script with `mkdir -p /run/user/0 && chmod 700`, `XDG_RUNTIME_DIR=/run/user/0`, `XDG_SESSION_TYPE=tty`, `/etc/init.d/seatd restart`, then `niri &`).
+
+Measured: **115 heartbeats across the three boots** (`HEARTBEAT_NS` = 5 s), and `blk submits` equals `blk retires` in 112 of them. In the other three the pair differs by exactly one —
+
+    mpos: heartbeat age=0ms fill-owner=slot 20/pid 20 alive=true exited=false run-owner=none fill-busy=true run-busy=false blk-busy=true blk-waiter=slot 20 blk submits=85929 retires=85928 -- live slots:
+
+— (also 24022/24021 and 25635/25634; `build/scratch/desk2-serial.log`, `desk3-serial.log`) and in each of those `blk-busy=true` with `blk-waiter` naming the same slot that holds the ext4 fill claim (`fill-owner=slot 20 … fill-busy=true`). So the two independent instruments agree: the mailbox reports a transfer in flight exactly when the counters report one submit not yet retired, the delta is one (the mailbox's one-at-a-time rule), and no transfer was submitted-and-never-retired in any of the 115 readings. The pair at the end of a boot: 13 576/13 576 (bare boot), 26 146/26 146 (session died early), **138 845/138 845 (session up)** — a niri session's startup (fonts, icons, shaders) is roughly ten times a bare boot's disk traffic.
+
+Two findings recorded beside the numbers, both for later items:
+
+- **A session started from root's shell needs `XDG_RUNTIME_DIR`.** niri 26.04 started from `/etc/local.d` without it panics at `src/niri.rs:2435: called `Result::unwrap()` on an `Err` value: RuntimeDirNotSet` (`/root/niri.log` on the image), and the session never comes up. With the variable set the session comes up on the GL card (`/dev/dri/renderD128`).
+- **The boot's own two-minute wait is `udev-settle`, not the block layer.** With `udev-settle` in the slot table, the heartbeat shows it parked in `poll(7)` with `parks` climbing from ~1 500 to ~16 700 over 115 s — it waits until its own ~120 s timeout, and openrc continues only then, which is why `/etc/local.d` (and any desktop session) starts two minutes in. `blk-busy` is `false` in every one of those heartbeats. That is a boot-time defect of our own, named as the next measurement, not a block-layer one.
+
+The stall the counters were built for did not appear in these boots: it is an interactive-session event, and the counters (and this script) are in place for the boot that reproduces it.
+
 ### 7.10 The disk's counters have a door: `/proc/diskstats` — **DONE** (2026-10-30)
 
 §7.9a landed the submit/retire pair and the heartbeat that prints it, and named

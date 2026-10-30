@@ -7772,7 +7772,7 @@ links stayed green, because their own words carry those refusals.
 
 Notes: `docs/notes/03-filesystem.md` §3.24.
 
-## item 146 — an open for writing asks the method, not only the word
+## item 147 — an open for writing asks the method, not only the word
 
 Item 144 named this and left it open: root's `open(O_WRONLY)` on a read-only
 sysfs attribute answered a descriptor here, where Linux refuses the open itself
@@ -7808,3 +7808,11 @@ claim about the method rather than the mode.
 unprivileged half stayed green, which is the point.
 
 Notes: `docs/notes/03-filesystem.md` §3.25.
+
+## item 148 — the block layer's counters on a desktop boot: the pair and the mailbox agree
+
+The counters (§7.9a, item 147) exist to catch the interactive stall; this is their first reading on the image the stall was seen on — a desktop-image boot with a niri session started from a boot script (**§7.9b** holds the instrument: the QEMU line, the `debugfs` injection of `/etc/local.d/zz-desk.start`, and the three boots).
+
+Measured: 115 heartbeats over three boots; `blk submits == blk retires` in 112, and in the remaining three the delta is exactly one with `blk-busy=true` and `blk-waiter` naming the slot that holds the ext4 fill claim — the pair and the mailbox are two instruments that agree at every reading, nothing was submitted-and-never-retired, and the pair never went backwards. End-of-boot pairs: 13 576 (bare boot), 26 146 (session died early), 138 845 (session up, ~10x a bare boot's disk traffic). Two findings beside the numbers: a session started from root's shell needs `XDG_RUNTIME_DIR` or niri panics `RuntimeDirNotSet`; and the boot's own ~120 s wait is `udev-settle` parked in `poll(7)`, not the block layer.
+
+No pin, and the reason is the item's shape: **nothing here changed.** The instrument is a booted image's own log, the claim is a measurement of an instrument that already has a pin (§7.9a's drain-suite case and its red counterfactual), so there is no new contract to pin. What it produces for the next round is the session script itself and the `udev-settle` finding — the next measurement is the boot's own two minutes, named in §7.9b.

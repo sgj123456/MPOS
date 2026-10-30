@@ -641,7 +641,10 @@ syscalls, signals, filesystems, networking, memory, devices and security, with t
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
 section states direction only: the frontier is the second compositor family (the wlroots one,
 whose first compositor to come up here is still unfound — `sway` binds no IPC socket and the GL
-card is already Mesa's, §7.4) and closing the remaining ABI gaps below. Two items left this list
+card is already Mesa's, §7.4) and closing the remaining ABI gaps below. The block layer's counters
+now read on a desktop boot — the submit/retire pair and the mailbox agree at all 115 heartbeats of
+three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`, the
+named next measurement (§7.9b, item 148). Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).
