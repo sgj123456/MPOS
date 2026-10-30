@@ -66,6 +66,13 @@ struct ProcFile {
 }
 
 impl Inode for ProcFile {
+    fn refuses_mode_change(&self) -> bool {
+        // Nothing here can be written into a node's bits - Linux's procfs
+        // has no `setattr` either, and answers `EPERM` to root for the
+        // same call (`docs/notes/` §3.17, item 138).
+        true
+    }
+
     fn metadata(&self) -> Metadata {
         // Size zero, as Linux reports for the files it generates: the answer
         // is not known until it is asked for, and asking is the work. A
@@ -117,6 +124,13 @@ struct ProcCtl {
 }
 
 impl Inode for ProcCtl {
+    fn refuses_mode_change(&self) -> bool {
+        // Nothing here can be written into a node's bits - Linux's procfs
+        // has no `setattr` either, and answers `EPERM` to root for the
+        // same call (`docs/notes/` §3.17, item 138).
+        true
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -200,6 +214,13 @@ struct ProcLink {
 }
 
 impl Inode for ProcLink {
+    fn refuses_mode_change(&self) -> bool {
+        // Nothing here can be written into a node's bits - Linux's procfs
+        // has no `setattr` either, and answers `EPERM` to root for the
+        // same call (`docs/notes/` §3.17, item 138).
+        true
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -352,6 +373,13 @@ impl ProcDir {
 }
 
 impl Inode for ProcDir {
+    fn refuses_mode_change(&self) -> bool {
+        // Nothing here can be written into a node's bits - Linux's procfs
+        // has no `setattr` either, and answers `EPERM` to root for the
+        // same call (`docs/notes/` §3.17, item 138).
+        true
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -3107,6 +3135,13 @@ struct ProcConfig {
 }
 
 impl Inode for ProcConfig {
+    fn refuses_mode_change(&self) -> bool {
+        // Nothing here can be written into a node's bits - Linux's procfs
+        // has no `setattr` either, and answers `EPERM` to root for the
+        // same call (`docs/notes/` §3.17, item 138).
+        true
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,

@@ -1162,6 +1162,20 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether this node's permission bits can be changed at all - the
+    /// question a `chmod` asks before it asks who the caller is.
+    ///
+    /// A node whose mode is a *policy* has nothing to write the bits into, and
+    /// Linux's answer for such a node is `EPERM` whatever the caller holds:
+    /// procfs's inodes carry no `setattr` operation at all, so a `chmod` there
+    /// is `EPERM` for root as well as for an ordinary user (measured,
+    /// `build/scratch/attrrefuse/p1.c`, 2026-10-30 - the same probe read `0` on
+    /// a sysfs directory as root, which is why this is not the mode-less
+    /// filesystem's question but the "this node has no attributes" one).
+    fn refuses_mode_change(&self) -> bool {
+        false
+    }
+
     /// Give the node the permission bits an archive or a `chmod` named.
     ///
     /// Not `chmod(2)` - that is a syscall with a caller to answer - but the

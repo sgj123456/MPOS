@@ -7367,3 +7367,42 @@ Linux and agrees on seven of eight claims, the eighth being that host's tuning.
 (`build/scratch/sysctl-gate4.log`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/sysctl-gate5.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (verdict `pass=235 fail=0`, `A-EXIT=0`, total 31.63 s, `build/scratch/sysctl-gate-a2.log`).
 
 **Counterfactual**: two, one per half. **The file is not the gate** — `max_map_count()` answering the compiled default again, which is the shape before this item — → `t-map-count-sysctl` alone red, `pass=235 fail=1` of 236 built, on exactly two claims: `FAIL: root may lower the ceiling to 1024` and `FAIL: the lowered ceiling is the one the next mmap is answered against (refused with 0, 1536 mapped, 1483 map rows now)` (`build/scratch/sysctl-cf1.log`). **The word is decorative again** — the `may_by_mode` call removed from `ProcCtl::write_at` — → exactly one claim red, `FAIL: an unprivileged writer cannot move the number (answered 100)`, the other seven green (`build/scratch/sysctl-cf2.log`); both stubs reverted before the final gate.. Record: `docs/notes/` §10.11a.
+
+## item 138 — a node with no attributes refuses the change: procfs's `chmod` is `EPERM`
+
+Item 137's named divergence, one door over from the `0644` it enforced. Here `chmod`
+on a procfs node answered `0` and stored nothing, where Linux answers `EPERM`; the
+tempting blanket rule ("a filesystem that keeps no modes refuses `chmod`") is wrong,
+because sysfs keeps no modes either and answers differently depending on the caller.
+
+**Linux reference measured first** (7.2.11, `build/scratch/attrrefuse/p1.c`, uid 1000
+and root): `chmod`, `fchmod`, `fchmodat(fd,"",AT_EMPTY_PATH)` are **`EPERM` (1)** on
+`/proc/self/status`, `/proc/sys/vm/max_map_count` and `/proc/self` for **both**
+callers — procfs's inodes have no `setattr`, so the refusal is the node's answer —
+while the same three on `/sys/kernel` and `/sys/fs/cgroup` are `EPERM` for uid 1000
+and **`0` for root**, and on `/dev/null` and `/tmp` the `0`/`EPERM` follows ownership.
+`chown`/`fchown`/`utimensat` on `/proc/self/status` are `0` for both callers.
+
+**Landed**: `Inode::refuses_mode_change()` (default `false`; asked of the *inode*
+because sysfs and procfs disagree), `true` on procfs's five inode types (`ProcFile`,
+`ProcCtl`, `ProcLink`, `ProcDir`, `ProcConfig`), and asked in `chmod_mode`
+(`src/syscall/linux/fs/file.rs`) after the immutable check and **before**
+`may_setattr` — so `chmod`, `fchmod`, `fchmodat` and `fchmodat2` all answer `EPERM`
+without consulting the caller, which is what makes root's answer the same as a
+user's.
+
+**Pin**: `t-proc-modes` grows eleven claims — the `EPERM` of two procfs nodes, the
+word each still reports (an `0` that writes nothing is the shape pinned against),
+`fchmod` and the `AT_EMPTY_PATH` spelling by descriptor, and a tmpfs control where the
+same call is accepted (so a blanket refusal fails the program). All green as a
+reference against Linux 7.2.11 first, then on both machines.
+
+**Gates**: x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed` (`verdict
+pass=236 fail=0`, `build/scratch/attr-gate1.log`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/attr-gate2.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, total 31.71 s, `build/scratch/attr-gate-a4.log`; the first two aarch64 attempts failed on stage 1 alone - the documented host-suite load flake, 706 tests green standalone - and one more on the documented console-RX kunit flake, `arch.console_receive` + `ipc.tty`; the re-run quoted above).
+
+**Counterfactual**: the funnel's answer disabled (`if false && inode.refuses_mode_change()`) -> `t-proc-modes` alone red, `pass=235 fail=1` of 236, with exactly the four `EPERM` claims red - `chmod on /proc/self/status is EPERM … (got 0)`, `chmod on /proc/sys/vm/max_map_count is EPERM … (got 0)`, `fchmod on a proc file's descriptor is EPERM (got 0)`, `the AT_EMPTY_PATH spelling is EPERM too (got 0)` - while the two word claims and the tmpfs control stayed green, which is the point of claiming the control (`build/scratch/attr-cf.log`).
+
+**Named**: `chown` and `utimensat` on procfs still answer `0` (Linux: `0` on
+`/proc/self/status`, `EPERM` for the `chown` on `/proc/sys/vm/max_map_count`) — those
+doors write an owner and clocks this tree does not keep; and sysfs's own half (root
+`0`, user `EPERM`, nothing stored here) stays in §5.2. Record: `docs/notes/` §3.17.

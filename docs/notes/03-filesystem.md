@@ -1051,3 +1051,66 @@ no-byte-stream door), `src/vfs/file.rs` (the read door asks it first),
 handlers, `move_mount`'s fresh branch), both `nr_*.rs` (430-432),
 `user/tests/src/bin/t-fsmount.rs` (new pin), `user/tests/src/bin/t-mount-api.rs`
 (the quartet claim), and the uapi/roadmap rows.
+
+### 3.17 A node with no attributes refuses the change, it does not accept it — **DONE** (2026-10-30)
+
+Item 137 named this divergence and deliberately did not widen its own fix: `chmod` on
+a procfs node answered `0` here where Linux answers `EPERM`. The tempting rule — "a
+filesystem that keeps no modes refuses `chmod`" — fails its own measurement, because
+sysfs keeps no modes either and answers differently depending on who asks.
+
+**Measured first** (Linux 7.2.11, `build/scratch/attrrefuse/p1.c`, once as uid 1000
+and once as root; every door in the `chmod` family, then `chown` and `utimensat`):
+
+| target | uid 1000 | root |
+|---|---|---|
+| `chmod` / `fchmod` / `fchmodat(fd, "", AT_EMPTY_PATH)` on `/proc/self/status` | **EPERM** | **EPERM** |
+| the same three on `/proc/sys/vm/max_map_count` | **EPERM** | **EPERM** |
+| the same three on `/proc/self` (a directory) | **EPERM** | **EPERM** |
+| the same three on `/sys/kernel`, `/sys/fs/cgroup` | EPERM | **0** |
+| the same three on `/dev/null`, `/tmp` | EPERM (not the owner) | **0** |
+| `chown(self)` / `fchown` / `utimensat` on `/proc/self/status` | 0 / 0 / 0 | 0 / 0 / 0 |
+| the same three on `/proc/sys/vm/max_map_count` | EPERM / EPERM / EPERM | EPERM / EPERM / **0** |
+
+The reading that matters: `EPERM` on procfs is **the node's answer, not a permission
+verdict** — root reads the same `EPERM` an ordinary user does, because procfs's inodes
+have no `setattr` operation at all. On sysfs the `EPERM` an ordinary user gets is the
+ordinary owner/capability rule, and root's `0` there is the same question answered the
+other way. Two questions, one of which this item can answer honestly and the other of
+which it must leave named.
+
+**Landed**: `Inode::refuses_mode_change()` — default `false`, and the question is asked
+of the **inode** rather than the filesystem precisely because sysfs and procfs disagree
+while both keeping no modes. procfs's five inode types (`ProcFile`, `ProcCtl`,
+`ProcLink`, `ProcDir`, `ProcConfig`) answer `true`; `chmod_mode` (`src/syscall/linux/
+fs/file.rs`) asks it immediately after the immutable check and **before** `may_setattr`,
+so all four doors (`chmod`, `fchmod`, `fchmodat`, `fchmodat2`) answer `EPERM` without
+ever consulting the caller — which is what makes root's answer the same as a user's.
+
+**Pin**: `t-proc-modes` grows eleven claims, in the place that program is about: the
+`EPERM` of `chmod` on `/proc/self/status` and `/proc/sys/vm/max_map_count`, the word
+each reports afterwards (an answer of `0` that writes nothing is the shape this pins
+against), `fchmod` and the `AT_EMPTY_PATH` spelling through a descriptor, and a tmpfs
+control that the same call *is* accepted on a filesystem that keeps bits — so a blanket
+refusal fails this program rather than passing it. All green on a current host first
+(`MPOS_ON_HOST=1` against Linux 7.2.11), then on both machines.
+
+**Gates**: x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed`
+(`build/scratch/attr-gate1.log`, `verdict pass=236 fail=0`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/attr-gate2.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, total 31.71 s, `build/scratch/attr-gate-a4.log`; the first two aarch64 attempts failed on stage 1 alone - the documented host-suite load flake, 706 tests green standalone - and one more on the documented console-RX kunit flake, `arch.console_receive` + `ipc.tty`; the re-run quoted above).
+
+**Counterfactual**: the funnel's answer disabled (`if false && inode.refuses_mode_change()`) -> `t-proc-modes` alone red, `pass=235 fail=1` of 236, with exactly the four `EPERM` claims red - `chmod on /proc/self/status is EPERM … (got 0)`, `chmod on /proc/sys/vm/max_map_count is EPERM … (got 0)`, `fchmod on a proc file's descriptor is EPERM (got 0)`, `the AT_EMPTY_PATH spelling is EPERM too (got 0)` - while the two word claims and the tmpfs control stayed green, which is the point of claiming the control (`build/scratch/attr-cf.log`).
+
+**What stays named.** `chown` and `utimensat` on a procfs node still answer `0` here
+(Linux answers `0` for both on `/proc/self/status`, and `EPERM` for the `chown` on
+`/proc/sys/vm/max_map_count`): those two doors write an owner and two clocks that this
+tree does not keep, which is the same "reported, not kept" shape item 137 found for the
+mode, and closing it needs per-node owner and time storage rather than an answer. And
+sysfs's own half — root's `chmod` is `0` there and an ordinary user's is `EPERM`, where
+this kernel answers `0` to both and stores nothing — stays named in `docs/uapi/` §5.2.
+
+**A lesson about the instrument.** The probe above ran its matrix as root, and the
+matrix included `chmod("/tmp", 0640)`. It did what it was told: the development host's
+`/tmp` lost its sticky bit and its `1777` for the length of a turn, and every command
+the harness spawned failed in its own temporary directory before it could start. An
+instrument that changes the machine it runs on is aimed at a path it created under
+`build/scratch/`, never at a directory the machine shares with everything else.

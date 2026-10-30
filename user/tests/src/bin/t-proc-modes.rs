@@ -51,6 +51,14 @@
 //! the word a caller reads back from `lstat`, which is the whole of what a
 //! listing tool sees.
 //!
+//! One thing the word cannot be talked out of, and it is claimed at the end of
+//! this file: **the bits cannot be changed at all.** A node with no attributes
+//! answers `EPERM` to `chmod`, `fchmod` and `fchmodat`, root included - measured
+//! on a current host as both uid 1000 and root (`build/scratch/attrrefuse/p1.c`);
+//! the same call on a tmpfs file is `0`, which is the control. The bit *report*
+//! and the bit *mutation* are two different promises, and a filesystem can keep
+//! the first and refuse the second (`docs/notes/` §3.17, item 138).
+//!
 //! Nor are the nodes Linux makes writable and this kernel did not claimed at
 //! Linux's `0644`: `/proc/sys/kernel/pid_max`, `/proc/sys/kernel/threads-max`,
 //! `/proc/sys/kernel/pty/max` and `/proc/<pid>/comm` are read-only files here,
@@ -386,7 +394,88 @@ fn main() {
         );
     }
 
+    chmod_doors(&mut r);
+
     r.finish();
+}
+
+/// The three `chmod` doors against a node that cannot carry attributes, and the
+/// control that shows the refusal is the node's rather than the caller's.
+///
+/// Measured on a current host first (`build/scratch/attrrefuse/p1.c`, Linux
+/// 7.2.11, uid 1000 *and* root): `chmod`, `fchmod` by descriptor and
+/// `fchmodat(fd, "", AT_EMPTY_PATH)` answer **`EPERM` (1)** on
+/// `/proc/self/status` and `/proc/sys/vm/max_map_count` for both callers -
+/// procfs has no `setattr` operation, which is why root's answer is the same as
+/// an ordinary user's - while the same call on a tmpfs file answers `0` and the
+/// word does move. The claimed pair is the refusal *and* the word it leaves
+/// behind: an answer of `0` that writes nothing is the shape this pins against.
+fn chmod_doors(r: &mut Report) {
+    const EPERM: i32 = 1;
+    fn errno() -> i32 {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default()
+    }
+    fn cstring(path: &str) -> Option<std::ffi::CString> {
+        std::ffi::CString::new(path).ok()
+    }
+    // One claim for `chmod` alone: the door's own answer, and the word after it.
+    for path in ["/proc/self/status", "/proc/sys/vm/max_map_count"] {
+        let Some(cpath) = cstring(path) else { continue };
+        let rc = unsafe { libc::chmod(cpath.as_ptr(), 0o640) };
+        let got = errno();
+        r.check(
+            &format!("chmod on {path} is EPERM for a caller who owns nothing there (got {got})"),
+            rc != 0 && got == EPERM,
+        );
+        let word = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|st| st.st_mode & 0o7777);
+        let printed = word.map(|m| format!("{m:04o}"));
+        r.check(
+            &format!(
+                "and the word {path} reports is the one it had (got {printed:?}, want 0444 or 0644)"
+            ),
+            matches!(word, Some(0o444) | Some(0o644)),
+        );
+    }
+    // The descriptor doors, which are what a program actually holds.
+    let Some(status) = cstring("/proc/self/status") else {
+        return;
+    };
+    let fd = unsafe { libc::open(status.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        r.check("a proc file opens for the descriptor doors", false);
+    } else {
+        let rc = unsafe { libc::fchmod(fd, 0o640) };
+        let got = errno();
+        r.check(
+            &format!("fchmod on a proc file's descriptor is EPERM (got {got})"),
+            rc != 0 && got == EPERM,
+        );
+        let empty = cstring("").expect("an empty name is a valid C string");
+        let rc = unsafe { libc::fchmodat(fd, empty.as_ptr(), 0o640, libc::AT_EMPTY_PATH) };
+        let got = errno();
+        r.check(
+            &format!("the AT_EMPTY_PATH spelling is EPERM too (got {got})"),
+            rc != 0 && got == EPERM,
+        );
+        unsafe { libc::close(fd) };
+    }
+    // The control: a filesystem that *does* keep modes accepts the same call, so
+    // a refusal everywhere would fail this claim rather than pass for a reason.
+    let tmp = "/tmp/t-proc-modes-chmod";
+    let _ = std::fs::remove_file(tmp);
+    std::fs::write(tmp, b"x").ok();
+    if let Some(cpath) = cstring(tmp) {
+        let rc = unsafe { libc::chmod(cpath.as_ptr(), 0o600) };
+        r.check(
+            &format!("chmod on a tmpfs file is 0, so the refusal above is the node's (got {rc})"),
+            rc == 0,
+        );
+    }
+    let _ = std::fs::remove_file(tmp);
 }
 
 /// Claim that `path`'s link reads back `want`.

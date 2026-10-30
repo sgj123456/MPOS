@@ -5719,6 +5719,16 @@ fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
     if crate::vfs::is_immutable(inode) {
         return Err(err::EPERM);
     }
+    // A node whose filesystem can give it no attributes is `EPERM` before the
+    // caller is even looked at: Linux's procfs has no `setattr` operation, so
+    // its answer is about the node and not about standing - root reads the same
+    // `EPERM` an ordinary user does (measured 2026-10-30, `build/scratch/
+    // attrrefuse/p1.c`; root's `chmod` on a sysfs directory there is `0`, which
+    // is why this asks the inode and not the filesystem). `docs/notes/` §3.17,
+    // item 138.
+    if inode.refuses_mode_change() {
+        return Err(err::EPERM);
+    }
     let caller = crate::vfs::current_caller();
     if crate::vfs::may_setattr(caller, inode).is_err() {
         return Err(err::EPERM);
