@@ -720,6 +720,19 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether this node has an operation that can write it at all.
+    ///
+    /// Linux's `do_dentry_open` asks the *method*, not the word: a sysfs
+    /// attribute kernfs has no writer for refuses `open(O_WRONLY)` with
+    /// `EACCES` **for root too** (measured, `build/scratch/wopen/q.c`: root's
+    /// `open("/sys/kernel/uevent_seqnum", O_WRONLY)` is `EACCES`, while root's
+    /// write-open of a writable attribute - `net/lo/mtu` - is a descriptor, and
+    /// of a `0444` *regular* file is a descriptor too). The word is a
+    /// permission; the method is what an open for writing needs.
+    fn has_write_method(&self) -> bool {
+        true
+    }
+
     /// The process a node describes, when the node is one that answers *about*
     /// a process rather than being one of its files.
     ///

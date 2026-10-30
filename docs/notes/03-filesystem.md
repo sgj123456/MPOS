@@ -1538,10 +1538,11 @@ atomic load per open); both `mpos-kunit 35 passed`; host unit tests 716.
 reports` (got `0755`) and `and the word moves with it` (got `0444`), with the
 `chmod`/`fchmod` answers still `0` - the shape this item pins against.
 
-**Named divergence.** Root's `open(O_WRONLY)` on a read-only attribute answers a
-descriptor here, where Linux refuses the `open` itself (`EACCES`): this kernel
-has no write method to ask, so the refusal lands on the write. The word lives on
-the node and Linux keeps it on the inode - same lifetime, same visibility.
+**Named divergence, closed since.** Root's `open(O_WRONLY)` on a read-only
+attribute answered a descriptor here, where Linux refuses the `open` itself
+(`EACCES`) - closed by §3.25, the method door: the refusal is Linux's
+`do_dentry_open` and not a permission verdict. The word lives on the node and
+Linux keeps it on the inode - same lifetime, same visibility.
 
 ### 3.24 A node that describes a process is read by a caller that may inspect it — **DONE** (2026-10-30)
 
@@ -1629,3 +1630,63 @@ the claim that is *not* also enforced by a mode — and `t-pidfd` red, because
 the links stayed green under the stub, which is itself a measurement: those
 refusals are carried by their `0500`/`0700` words, so only the `0444` file needed
 the second rule.
+
+### 3.25 An open for writing asks the method, not only the word — **DONE** (2026-10-31)
+
+Item144 left one sentence named: root's `open(O_WRONLY)` on a read-only sysfs
+attribute answered a descriptor here, where Linux refuses the open itself. It
+looked like a permission question and is not one - the word says `0444` to
+everyone equally, root's permission override passes it, and Linux still says
+`EACCES`. The rule is Linux's `do_dentry_open`: a write-mode open asks whether
+the node **has** a write method, and kernfs's read-only attributes do not.
+
+**Measured first** (`build/scratch/wopen/q.c`, Linux 7.2.11, uid 1000 and root):
+
+| node | word | `O_WRONLY` as uid 1000 | `O_WRONLY` as root |
+|---|---|---|---|
+| `/sys/kernel/uevent_seqnum` | 0444 | `EACCES` | **`EACCES`** |
+| `/sys/devices/system/cpu/online` | 0444 | `EACCES` | **`EACCES`** |
+| `/sys/kernel/vmcoreinfo` | 0444 | `EACCES` | **`EACCES`** |
+| `/sys/class/net/lo/address` | 0444 | `EACCES` | **`EACCES`** |
+| `/sys/class/net/lo/mtu` | 0644 (writable) | `EACCES` | descriptor |
+| `/proc/version` | 0444 | `EACCES` | descriptor |
+| `/proc/self/environ` | 0400 | `EACCES` | descriptor |
+| a `0444` regular file | 0444 | `EACCES` | descriptor |
+| `/sys/kernel` (directory) | 0555 | `EISDIR` (21) | `EISDIR` |
+
+Two lines carry the whole design. Root on a read-only **sysfs** attribute is
+refused, so the rule cannot be the mode (root overrides 0644/0444 on a regular
+file and gets a descriptor — last-but-one row). Root on a read-only **procfs**
+file is *not* refused, because procfs's file operations carry a write wrapper
+that fails later at the write; only kernfs asks the method at the open. And a
+directory's `EISDIR` still comes first, root included.
+
+**Landed.** One door and one refusal:
+
+- `Inode::has_write_method() -> bool` (default `true`), documented as "the word
+  is a permission, the method is what an open for writing needs". `SysFile`
+  answers `false` — a value kernfs renders and nothing sets, whatever `chmod`
+  later puts in the word.
+- `open_linux` refuses a `want & W_OK` open of such a node with `EACCES` after
+  `may_access` and before the immutable/append-only checks — the same place
+  Linux's `do_dentry_open` runs it — closing the descriptor on the way out,
+  exactly as the other refusals there do.
+
+**Pin.** `t-proc-modes`'s `sysfs_modes` half gained four claims, run as root
+(the sweep is root): root's `O_WRONLY` on the read-only attribute is `EACCES`
+and `O_RDWR` likewise, while `O_RDONLY` is a descriptor; and the contrast that
+keeps the rule honest — root's `O_WRONLY` of a `0444` **regular** file is a
+descriptor, so the claim is about the method and not the mode. Reference run
+against real Linux as root (`sudo -n`): all four `ok:`, `PASS`.
+
+**Gates**: x86_64 `verdict pass=241 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/wopen-gate1.log`, `X-EXIT=0`); aarch64
+`verdict pass=240 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/wopen-gate-a1.log`, `A-EXIT=0`).
+
+**Counterfactual**: the refusal's condition made permanently false (the
+pre-item behaviour) -> `1 of 241`, `t-proc-modes` alone, red on exactly
+`root's write-open of a read-only attribute is EACCES (got 3, errno 1)` and
+`and O_RDWR is refused the same way (got 4, errno 1)`; the unprivileged half
+stayed green, which is the point — a mode-only kernel refuses the user and hands
+root a descriptor.

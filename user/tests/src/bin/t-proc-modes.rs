@@ -719,6 +719,54 @@ fn sysfs_modes(r: &mut Report) {
         return;
     };
 
+    // Root asks with the word's permission and is still refused: an open for
+    // writing asks whether the node *has* a write method, and this one does
+    // not. Linux answers `EACCES` for root on a `0444` attribute and hands a
+    // descriptor for a *writable* one (`net/lo/mtu`) and for a `0444` regular
+    // file - measured, `build/scratch/wopen/q.c`, `docs/notes/` §3.25.
+    if let Some(name) = cstring(file) {
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_WRONLY) };
+        let got = errno();
+        r.check(
+            &format!(
+                "root's write-open of a read-only attribute is EACCES (got {fd}, errno {got})"
+            ),
+            fd < 0 && got == EACCES,
+        );
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
+        let got = errno();
+        r.check(
+            &format!("and O_RDWR is refused the same way (got {fd}, errno {got})"),
+            fd < 0 && got == EACCES,
+        );
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY) };
+        r.check(
+            &format!("while the read open is a descriptor (got {fd})"),
+            fd >= 0,
+        );
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+    // The word is not the rule: a `0444` *regular* file has a write method, and
+    // root's write-open of it is a descriptor on Linux too.
+    let contrast = "/tmp/t-proc-modes-0444";
+    if let Some(name) = cstring(contrast) {
+        let _ = std::fs::write(contrast, b"x");
+        let _ = chmod(contrast, 0o444);
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_WRONLY) };
+        r.check(
+            &format!(
+                "another 0444 file does take a write descriptor, so the word is not the rule (got {fd})"
+            ),
+            fd >= 0,
+        );
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(contrast);
+    }
+
     // Root's chmod is accepted *and stored*: the next reader sees the new word.
     let rc = chmod(dir, 0o700);
     let got = errno();

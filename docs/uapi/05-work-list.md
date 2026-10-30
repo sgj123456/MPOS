@@ -7771,3 +7771,40 @@ and `t-pidfd` red (the same predicate gates it); the `fd` directory and the
 links stayed green, because their own words carry those refusals.
 
 Notes: `docs/notes/03-filesystem.md` §3.24.
+
+## item 146 — an open for writing asks the method, not only the word
+
+Item 144 named this and left it open: root's `open(O_WRONLY)` on a read-only
+sysfs attribute answered a descriptor here, where Linux refuses the open itself
+with `EACCES`. It looks like a permission question and is not one — the word
+says `0444` to everyone, root's override passes it, and Linux still refuses.
+
+Measured on Linux 7.2.11 (`build/scratch/wopen/q.c`, uid 1000 and root):
+root's `O_WRONLY`/`O_RDWR` on `/sys/kernel/uevent_seqnum`,
+`/sys/devices/system/cpu/online`, `/sys/kernel/vmcoreinfo` and
+`/sys/class/net/lo/address` (all `0444`) are `EACCES`; root's `O_WRONLY` on a
+*writable* sysfs attribute (`/sys/class/net/lo/mtu`, `0644`) is a descriptor; on
+`/proc/version` (`0444`) and `/proc/self/environ` (`0400`) it is a descriptor,
+because procfs's operations carry a write wrapper that fails at the write; on a
+`0444` **regular** file it is a descriptor (root overrides the mode); and a
+directory's `EISDIR` still comes first, root included. So the rule is Linux's
+`do_dentry_open`: a write-mode open asks whether the node *has* a write method.
+
+**Landed**: `Inode::has_write_method()` (default `true`) — `SysFile` answers
+`false`, since a kernfs value is rendered and nothing sets it, whatever `chmod`
+later puts in the word; `open_linux` refuses a `W_OK` open of such a node with
+`EACCES` after `may_access` and before the immutable/append-only checks (where
+Linux's `do_dentry_open` runs it), closing the descriptor it opened.
+
+**Pin**: `t-proc-modes`'s `sysfs_modes` half, four claims run as root — the two
+refusals, the read descriptor, and the `0444`-regular contrast that makes the
+claim about the method rather than the mode.
+
+**Gates**: x86_64 `pass=241 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/wopen-gate1.log`); aarch64 `pass=240 fail=0`
+(`build/scratch/wopen-gate-a1.log`).
+**Counterfactual**: the refusal's condition made false -> `1 of 241`,
+`t-proc-modes` alone, exactly the two refusal claims red (`got 3`/`got 4`); the
+unprivileged half stayed green, which is the point.
+
+Notes: `docs/notes/03-filesystem.md` §3.25.

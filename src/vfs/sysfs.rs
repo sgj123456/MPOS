@@ -170,6 +170,15 @@ struct SysFile {
 }
 
 impl Inode for SysFile {
+    /// A `SysFile` is a value kernfs renders and nothing can set: Linux's
+    /// `kernfs_fop_open` refuses an `O_WRONLY`/`O_RDWR` open of such an
+    /// attribute with `EACCES` before the caller's ids are even weighed - root
+    /// gets `EACCES` on a `0444` attribute and a descriptor on a writable one
+    /// (measured, `build/scratch/wopen/q.c`, `docs/notes/` §3.25).
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
     /// This node's word is its own: a `chmod` by the caller the word permits
     /// stores it here, for the mount's life - Linux's kernfs does the same on
     /// the inode (measured: root's `chmod 0700 /sys/kernel` answers `0` and

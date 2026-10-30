@@ -341,6 +341,18 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                         let _ = crate::sched::current_fds().close(fd);
                         return err_of(e);
                     }
+                    // A node with no write operation refuses a write-mode
+                    // open whoever the caller is: Linux's `do_dentry_open`
+                    // asks the method, and root's `open(O_WRONLY)` of a
+                    // read-only sysfs attribute is `EACCES` there while its
+                    // `O_WRONLY` of a `0444` regular file is a descriptor
+                    // (measured, `build/scratch/wopen/q.c`; `docs/notes/`
+                    // §3.25). The word was asked a line above; this is the
+                    // other half of what an open for writing needs.
+                    if want & W_OK != 0 && !inode.has_write_method() {
+                        let _ = crate::sched::current_fds().close(fd);
+                        return err::EACCES;
+                    }
                     // Then the inode's own flags, and only for an open that
                     // means to write. `chattr(1)` is precise about both: an
                     // immutable file "cannot be opened in write mode", and an
