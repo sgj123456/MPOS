@@ -101,11 +101,9 @@ const IFF_LOOPBACK: u32 = 0x8;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
 
-/// The interface indexes this kernel's single NIC and its loopback answer
-/// under: `lo` is 1 and `eth0` is 2, the pair Linux's own enumeration of a
-/// one-NIC machine would hand out.
-const LO_INDEX: u32 = 1;
-const ETH_INDEX: u32 = 2;
+// The interface indexes (`lo` 1, `eth0` 2) live in the stack module, because
+// three doors index by them; the link dump and `RTM_NEWLINK` are two of them.
+use super::{ETH_INDEX, LO_INDEX};
 
 /// `AF_INET`, the one family the stack speaks.
 const AF_INET: u8 = 2;
@@ -777,10 +775,9 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 return e;
             }
             if let Some(mtu) = mtu {
-                if index != ETH_INDEX {
-                    return crate::err::EOPNOTSUPP;
-                }
-                if let Err(e) = crate::net::set_mtu(mtu) {
+                // `lo` and `eth0` both carry a settable MTU; an index that names
+                // no link is the stack's `ENODEV`, not a shape error.
+                if let Err(e) = crate::net::set_mtu(index, mtu) {
                     return e;
                 }
             }
@@ -819,7 +816,7 @@ fn dump_links(seq: u32, pid: u32) -> Vec<Vec<u8>> {
         flags_of(facts.lo_up, true),
         ARPHRD_LOOPBACK,
         None,
-        65536,
+        facts.lo_mtu,
     ));
     // Only where there is a wire: a namespace that has none lists `lo` and
     // nothing else, which is what a machine with no NIC reports - an entry for a

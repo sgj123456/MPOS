@@ -648,8 +648,9 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
 `memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs keep `user.*` on the memory filesystems and refuse the other namespaces by name (item 132, §3.15);  
-the semantics still incomplete are the datagram line itself, which is the ring's rather than  
-Linux's 65507 until this stack fragments IP (item 58). A datagram socket's `SO_RCVBUF` now  
+the datagram lines are Linux's now - 65 507 for a datagram, and `EMSGSIZE` from the  
+destination link's MTU where Linux's default would fragment it - while IP fragmentation  
+itself stays a named gap behind a measured blocker (item 134, §4.6). A datagram socket's `SO_RCVBUF` now  
 sizes its receive queue, as a stream's sizes its window (items 98 and 58's boundary,  
 §4.3.3.1: the payload is what the queue is charged here where Linux charges each skb's  
 truesize, the ring is capped at 64 KiB per socket, and the number still reads back its Linux  
@@ -1059,8 +1060,9 @@ that the buffer can be the smaller number, and the grace for an empty queue is L
 `t-sockbuf` (a new program, 12 claims, green on a host and on both machines) and `t-udpblock`'s  
 fill, which now stops where the buffer's number says. Named at the time: `SO_RCVBUF` is a number  
 and not a window (the receive ring is a fixed 16 KiB - a stream's became its window in item 98,  
-a datagram's is still fixed), the datagram-too-big line is still the ring's rather than 65507  
-(no IP fragmentation), and a floor buffer admits three here against Linux's two (payload  
+a datagram's is still fixed), the datagram-too-big line was the ring's rather than 65507 at  
+the time (closed since: item 134 makes it 65507 and the link's MTU the second line, while  
+IP fragmentation stays a named gap), and a floor buffer admits three here against Linux's two (payload  
 accounting against skb truesize).
 
 **Giving the terminal back is the session's act, and only the session's** (`docs/uapi/` §5.1  
@@ -1545,8 +1547,8 @@ so spins). Measured whole on a current host first: with the buffer full behind a
 answers ARP, three datagrams go in and the fourth blocking send sleeps 3072-3098 ms and then returns  
 it, where the non-blocking one is `EAGAIN` at once. Three things stay named: Linux's `EMSGSIZE` line  
 is the maximum UDP datagram (65507), not the send buffer, so a datagram wider than `SO_SNDBUF` is  
-taken there and refused here — that is the buffer-size item below, since this kernel's payload ring  
-is 4 KiB; the park is **bounded** at three seconds (the window Linux's own neighbour resolution  
+taken there and refused here — the buffer-size item below answered that line (the ring is 64 KiB  
+now and the size answer is 65507, item 134); the park is **bounded** at three seconds (the window Linux's own neighbour resolution  
 takes), because smoltcp keeps a datagram its egress could not dispatch where Linux's device drops the  
 frame and releases the charge, so an unbounded park would be a hang; and the ring's wraparound, which  
 the condition cannot see and which clears as the buffer drains. The MTU story that program also caught  

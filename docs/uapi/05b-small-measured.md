@@ -848,9 +848,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   reads and not a window this kernel resizes: the receive ring is fixed at 16 KiB, so a
   socket that asks for less does not shrink it (Linux drops at delivery once the queue
   passes the buffer). A **stream's** number is its window now - item 98 below. The
-  datagram-too-big line is still the ring's rather than Linux's 65507 - this stack has no
-  IP fragmentation, so a datagram wider than a frame cannot leave, and `EMSGSIZE` is the
-  honest answer where a queue entry would die at dispatch. And the count a floor buffer
+  datagram-too-big line is Linux's 65507 now and the line above it is the destination
+  link's MTU (item 134, `docs/notes/` §4.6) - a datagram wider than a frame cannot leave
+  because this stack has no IP fragmentation, so `EMSGSIZE` is the honest answer where a
+  queue entry would die at dispatch. And the count a floor buffer
   admits is 3 here against Linux's 2, because this kernel charges the payload where Linux
   charges each skb's truesize.
 

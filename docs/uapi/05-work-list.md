@@ -2605,10 +2605,12 @@ the commit bodies), and each moved its pin in the same commit.
     and "a larger SO_RCVBUF queues more datagrams (11 -> 11)". Record:
     `docs/notes/` §4.3.3.1.
 
-    Still named, and measured: the datagram-too-big line remains the ring's rather than
-    Linux's 65507, because this stack has no IP fragmentation and a wider datagram could
-    not leave the machine; a floor buffer now admits one 1400-byte datagram, as Linux
-    does; and a stream's `SO_SNDBUF` still does not size its send ring.
+    Closed by item 134: the datagram-too-big line is Linux's 65507 and the line above it is
+    the destination link's MTU (`EMSGSIZE` where Linux's default would fragment), because
+    the datagram ring is 64 KiB and `lo`'s MTU is Linux's 65536. Still named: IP fragmentation
+    itself has no home in this stack (measured blocker in item 134's entry), a floor buffer
+    admits one 1400-byte datagram as Linux does, and a stream's `SO_SNDBUF` still does not
+    size its send ring.
 
 ## item 59 — a `clone` child's own exit signal is what its death reports (item 50's other half)
 
@@ -7174,3 +7176,43 @@ x86_64 `all 232 user tests passed` (`t-oom-kill` 1.03 s), aarch64 `all 231`
 exhaustion is ~500k of them), `mpos-kunit 34 passed` both. Counterfactual
 (`OutOfMemory` answered `Refused`, the old `SIGSEGV`) is `pass=231 fail=1`:
 `t-oom-kill` alone, both `SIGKILL` claims red.
+
+## item 134 — a datagram's size line is Linux's 65507, and the line above it is the link's MTU
+
+    `sendto` refused anything wider than this kernel's 16 KiB datagram ring with
+    `EMSGSIZE`, a limit no header carries; Linux's maximum is the IPv4 datagram's 65507
+    (65535 less the 20-byte IP and 8-byte UDP headers) and its `SO_SNDBUF` never bounds one
+    datagram. Measured on a current host first (Linux 7.2.11, `.workbuddy/probe_dgram*.c`):
+    on the loopback 65507 goes out and comes back whole while 65508 and 70000 are
+    `EMSGSIZE`; a socket whose `SO_SNDBUF` reads 9216 still sends the maximum; 65507 to the
+    gateway over a 1500-byte link is accepted because **Linux fragments**, and with
+    `IP_MTU_DISCOVER=IP_PMTUDISC_DO` the same send is `EMSGSIZE`; in a netns with
+    `ip link set lo mtu 1500` the 65507 bytes still arrive whole (fragmented out,
+    reassembled in).
+
+    Served: `MAX_UDP_DGRAM` 65507 in `udp_send` before the implicit bind and the queue; the
+    datagram ring is `UDP_TX_BYTES` = 64 KiB at construction (a bound socket's ring cannot be
+    rebuilt, so one maximum datagram has to fit the ring from the start); a datagram wider
+    than the destination link's MTU answers `EMSGSIZE`, Linux's no-fragment answer; the
+    loopback is this module's own device with a settable MTU, so `ip link set lo mtu N`,
+    `SIOCSIFMTU` and `RTM_SETLINK` serve `lo` too (`lo` reports Linux's 65536 by default,
+    where it used to answer `EOPNOTSUPP` and a hardcoded number in the link dump). Both
+    devices give smoltcp a *frame* budget of the reported MTU plus the 14-byte Ethernet
+    header - without it the 65507-byte datagram "fits" and is then dropped in silence by
+    smoltcp's no-fragmentation path (measured, and the counterfactual's two red claims).
+
+    Pin `t-dgram-size` (15 claims, host-referenced: on a host the ten non-privileged claims
+    pass). Gates x86_64 `pass=233 fail=0`, aarch64 `pass=232 fail=0`, both `mpos-kunit 34
+    passed`; counterfactual (frame budget reverted) leaves the accepts green and reddens
+    "it arrives whole and unchanged" and "it comes back whole after the MTU is restored".
+
+    Named divergence and gap: **IP fragmentation is not served** - Linux's default over a
+    1500-byte link is to fragment, this kernel answers `EMSGSIZE` (Linux's own answer when
+    fragmentation is forbidden) - and the measured reason is that smoltcp's fragmenter keeps
+    the whole datagram in a 64 KiB array **inline in `Interface`**, while this kernel builds
+    an `Interface` on a 32/64 KiB task stack (`Stack::deviceless()` when a process enters a
+    network namespace); enabling the feature produced three user-mode page faults across two
+    lanes, clearing when it was removed. Closing it needs the interface constructed where
+    64 KiB is free (a heap `Box<Interface>` path, or a smoltcp that keeps that buffer in a
+    `Vec`). `IP_MTU_DISCOVER`/`IP_MTU` remain refused by name (item 58). Record:
+    `docs/notes/` §4.6.

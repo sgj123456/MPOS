@@ -2439,6 +2439,37 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
             let Some(target) = dst.or(*peer) else {
                 return Err(err::EDESTADDRREQ);
             };
+            // Linux's own size line for one datagram: the IPv4 packet's 65 535
+            // bytes less its 20-byte header and UDP's 8, so 65 507 leaves and
+            // 65 508 is `EMSGSIZE` - whatever the socket's buffer says, because
+            // this is a fact about the arguments (measured). The check sits
+            // before the implicit bind and before the queue, so a refused
+            // datagram neither binds a socket nor waits for room in one.
+            if data.len() > super::MAX_UDP_DGRAM {
+                return Err(err::EMSGSIZE);
+            }
+            // The link's own line, the second fact about a datagram's size: a
+            // datagram wider than the device it leaves by has to be fragmented
+            // at the IP layer, and this stack has none (the measured blocker is
+            // `docs/notes/` §4.6). Linux's answer in the shape that forbids
+            // fragmentation - `IP_MTU_DISCOVER` set to `IP_PMTUDISC_DO`, which
+            // was measured on a 1500-byte link - is `EMSGSIZE`, so that is the
+            // answer here for every link, whatever the ring can hold. The
+            // loopback is the exception that proves the rule: its MTU is
+            // Linux's 65 536, so the whole 65 507-byte datagram is one frame
+            // and needs no fragments.
+            let link_mtu = match super::home_of(target.addr) {
+                super::Home::Lo => stack.lo.device.mtu,
+                // No wire in this namespace: there is nowhere for the datagram
+                // to go, and the send below answers that already.
+                super::Home::Eth => match &stack.eth.device {
+                    Some(device) => device.mtu,
+                    None => usize::MAX,
+                },
+            };
+            if data.len().saturating_add(28) > link_mtu {
+                return Err(err::EMSGSIZE);
+            }
             if !*bound {
                 // The destination decides the interface for a socket that was
                 // never bound - the implicit bind on first send is the first

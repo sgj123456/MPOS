@@ -556,23 +556,23 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
         }
         0x8921 => {
-            // SIOCGIFMTU: the link's current MTU - the loopback's is the
-            // 64 KiB an IPv4 datagram tops out at, the NIC's is what
-            // `RTM_SETLINK` last set.
+            // SIOCGIFMTU: the link's current MTU - the loopback's is Linux's
+            // 65 536 until `ip link set lo mtu N` names another, the NIC's is
+            // what `RTM_SETLINK`/this call last set. Both numbers are live, so a
+            // caller that sets one reads it back.
             if !buffer_ok(buf, 40, true, from_user) {
                 return err::EFAULT;
             }
             match ifreq_index(buf) {
-                Some(1) => {
-                    unsafe {
-                        ((buf + 16) as *mut i32).write_unaligned(65536);
-                    }
-                    0
-                }
-                Some(_) => match crate::net::link_facts() {
+                Some(index) => match crate::net::link_facts() {
                     Some(facts) => {
+                        let mtu = if index == crate::net::LO_INDEX {
+                            facts.lo_mtu
+                        } else {
+                            facts.mtu
+                        };
                         unsafe {
-                            ((buf + 16) as *mut i32).write_unaligned(facts.mtu as i32);
+                            ((buf + 16) as *mut i32).write_unaligned(mtu as i32);
                         }
                         0
                     }
@@ -588,14 +588,13 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::EFAULT;
             }
             match ifreq_index(buf) {
-                Some(2) => {
+                Some(index) => {
                     let mtu = unsafe { ((buf + 16) as *const i32).read_unaligned() };
-                    match crate::net::set_mtu(mtu as u32) {
+                    match crate::net::set_mtu(index, mtu as u32) {
                         Ok(()) => 0,
                         Err(e) => e,
                     }
                 }
-                Some(_) => err::EOPNOTSUPP,
                 None => err::ENODEV,
             }
         }

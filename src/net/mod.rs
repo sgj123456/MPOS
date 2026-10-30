@@ -205,6 +205,23 @@ pub(crate) type EchoQueue = alloc::sync::Arc<
 const UDP_PACKET_SLOTS: usize = 16;
 const UDP_PAYLOAD_BYTES: usize = 16 * 1024;
 
+/// The largest datagram an IPv4 socket can carry: the IP packet's 65 535 bytes
+/// less its 20-byte header and UDP's 8. Linux's own line, measured: 65 507
+/// leaves, 65 508 is `EMSGSIZE` (`docs/notes/` §4.6, `.workbuddy/probe_dgram*.c`).
+pub(crate) const MAX_UDP_DGRAM: usize = 65535 - 20 - 8;
+
+/// The send ring one datagram socket owns.
+///
+/// Linux's `SO_SNDBUF` bounds the *queue*, not one datagram - a socket that
+/// asked for 4 608 bytes still sends 65 507 in one call (measured). The ring
+/// behind the queue therefore has to hold a maximum datagram whole, or the
+/// memory figure is answering a question one step too early. It is one ring for
+/// every datagram socket because smoltcp sizes the buffer at construction and a
+/// *bound* socket's ring cannot be swapped here ([`Stack::resize_udp`] is safe
+/// only while unbound); the cost is one ring per open descriptor, bounded by the
+/// descriptor table rather than by anything a caller can steer.
+const UDP_TX_BYTES: usize = 64 * 1024;
+
 /// How one open socket is wired into the stack: which smoltcp socket it owns,
 /// and the endpoint state the syscalls layered on top of it maintain.
 pub(crate) enum Channel {
@@ -429,6 +446,98 @@ pub(crate) fn sock_buffer_size(asked: i32, floor: u32) -> u32 {
     (capped.saturating_mul(2)).max(floor)
 }
 
+/// The loopback, with the one thing smoltcp's own cannot be told: its MTU.
+///
+/// smoltcp's `Loopback` is eleven lines that hand every transmitted frame back
+/// to the next receive, and it reports a fixed 65 535 - which is right for
+/// Linux's `lo` (65 536) until a caller sets another, and it exports none of its
+/// tokens, so it cannot be wrapped. This is the same device with `mtu` a field.
+///
+/// It exists for a *measured* reason: `ip link set lo mtu 1500` is how Linux
+/// makes loopback traffic fragment, and a 65 507-byte datagram still arrives
+/// whole over that loopback because the stack puts it back together
+/// (`unshare -rn`, `docs/notes/` §4.6). A reassembling stack whose loopback
+/// can never be shown a fragment would have an untestable half, so `lo`'s MTU
+/// is settable here the way the NIC's is.
+struct LoDevice {
+    queue: VecDeque<Vec<u8>>,
+    /// The IP-layer frame size. Linux's own number for `lo` until a caller sets
+    /// another through `SIOCSIFMTU`/`RTM_NEWLINK`.
+    mtu: usize,
+}
+
+impl LoDevice {
+    fn new(mtu: usize) -> LoDevice {
+        LoDevice {
+            queue: VecDeque::new(),
+            mtu,
+        }
+    }
+}
+
+/// One frame the loopback handed back, copied out of the queue.
+struct LoRx(Vec<u8>);
+
+impl smoltcp::phy::RxToken for LoRx {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.0)
+    }
+}
+
+/// The loopback's transmit side: a `len`-byte buffer that lands back in the same
+/// queue. Length is whatever smoltcp asked for, so a fragmented datagram and a
+/// maximum one both fit.
+struct LoTx<'a>(&'a mut VecDeque<Vec<u8>>);
+
+impl smoltcp::phy::TxToken for LoTx<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = alloc::vec![0u8; len];
+        let result = f(&mut buffer);
+        self.0.push_back(buffer);
+        result
+    }
+}
+
+impl Device for LoDevice {
+    type RxToken<'a>
+        = LoRx
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = LoTx<'a>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.queue
+            .pop_front()
+            .map(move |buffer| (LoRx(buffer), LoTx(&mut self.queue)))
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(LoTx(&mut self.queue))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ethernet;
+        caps.max_transmission_unit = self.mtu + ETHERNET_HEADER_BYTES;
+        // A loopback frame is handed straight back, so its checksums are not a
+        // question the wire can ask (smoltcp's own device ignores them too).
+        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
+        caps
+    }
+}
+
 /// One interface, the device that carries it and the sockets that live on it.
 ///
 /// The three always move together: an interface is polled *over* a device and
@@ -436,7 +545,7 @@ pub(crate) fn sock_buffer_size(asked: i32, floor: u32) -> u32 {
 /// operation at all - so the grouping is not tidiness, it is the fact that
 /// makes [`Home`] a decision rather than a lookup. The device is a type
 /// parameter because the two fabrics have different ones ([`NicDevice`] and
-/// smoltcp's own loopback), and only [`Stack::poll_home`] needs them unified.
+/// [`LoDevice`]), and only [`Stack::poll_home`] needs them unified.
 struct Fabric<D> {
     iface: Interface,
     device: D,
@@ -623,8 +732,9 @@ pub(crate) struct Stack {
     /// eth0: the virtio NIC and QEMU's user network - absent in a namespace
     /// with no wire.
     eth: Wire,
-    /// lo: `127.0.0.0/8`, carried by smoltcp's own loopback device.
-    lo: Fabric<smoltcp::phy::Loopback>,
+    /// lo: `127.0.0.0/8`, carried by this module's own loopback device
+    /// ([`LoDevice`]), whose MTU a caller can set the way Linux's can.
+    lo: Fabric<LoDevice>,
     pub(crate) entries: Vec<Option<Entry>>,
     /// The passive-open state behind every `listen`ing socket, indexed by the
     /// id a [`Channel::TcpListen`] carries. Slots are reused, so a listener
@@ -675,6 +785,28 @@ pub(crate) const MTU_FLOOR: usize = 68;
 /// The MTU ceiling: an IPv4 datagram cannot name a length past 65535, and a
 /// link that claims more only lies to whoever reads it back.
 pub(crate) const MTU_CEIL: usize = 65536;
+
+/// The interface indexes this kernel's loopback and its single NIC answer
+/// under: `lo` is 1 and `eth0` is 2, the pair Linux's own enumeration of a
+/// one-NIC machine would hand out. They are here rather than in the netlink
+/// half because three doors index by them - `SIOCGIFMTU`/`SIOCSIFMTU`, the
+/// link dump, and [`set_mtu`].
+pub(crate) const LO_INDEX: u32 = 1;
+pub(crate) const ETH_INDEX: u32 = 2;
+
+/// Linux's `lo` MTU: 65 536, one past the largest IPv4 datagram, so every legal
+/// datagram crosses the loopback as one frame until a caller sets `lo` smaller.
+const LO_MTU: usize = 65536;
+
+/// The Ethernet header's own 14 bytes: smoltcp's `DeviceCapabilities` reports a
+/// *frame* budget and its `ip_mtu()` subtracts this header for the Ethernet
+/// medium, while an `ifreq` MTU - Linux's, and what `SIOCGIFMTU` answers - is the
+/// IP packet's. Both devices below therefore give the frame budget as the
+/// reported MTU plus this header, so that a datagram which fits the reported MTU
+/// also fits the frame. Without it a 65 507-byte datagram "fits" the 65 536-byte
+/// loopback and is then dropped by smoltcp's no-fragmentation path, which
+/// discards an over-`ip_mtu` datagram in silence (`docs/notes/` §4.6).
+const ETHERNET_HEADER_BYTES: usize = 14;
 
 /// How many closed-but-still-tearing-down sockets the stack carries at once.
 const TEARDOWN_MAX: usize = 32;
@@ -1169,15 +1301,15 @@ impl Stack {
     }
 
     /// The same, with a receive ring of `rx_bytes` — what the socket's stored
-    /// `SO_RCVBUF` buys (see [`udp_rx_bytes`]). The send ring keeps the
-    /// default size: this kernel's `SO_SNDBUF` for a datagram socket already
-    /// gates the queue by its memory figure in `socket::udp_room_for`, and the
-    /// ring behind it is not what that number is about.
+    /// `SO_RCVBUF` buys (see [`udp_rx_bytes`]). The send ring is
+    /// [`UDP_TX_BYTES`] for every socket: `SO_SNDBUF` gates the *queue*
+    /// (`socket::udp_room_for`), while one datagram of Linux's maximum size has
+    /// to fit the ring at all.
     pub(crate) fn add_udp_sized(&mut self, home: Home, rx_bytes: usize) -> SocketHandle {
         let rx_meta = alloc::vec![udp::PacketMetadata::EMPTY; udp_rx_slots(rx_bytes)];
         let tx_meta = alloc::vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS];
         let rx = udp::PacketBuffer::new(rx_meta, alloc::vec![0u8; rx_bytes]);
-        let tx = udp::PacketBuffer::new(tx_meta, alloc::vec![0u8; UDP_PAYLOAD_BYTES]);
+        let tx = udp::PacketBuffer::new(tx_meta, alloc::vec![0u8; UDP_TX_BYTES]);
         self.sockets_mut(home).add(udp::Socket::new(rx, tx))
     }
 
@@ -2029,6 +2161,10 @@ pub(crate) struct LinkFacts {
     pub eth_up: bool,
     pub eth_name: String,
     pub mtu: u32,
+    /// `lo`'s MTU, which `ip link set lo mtu N` changes - Linux's 65 536 by
+    /// default, and the number that decides whether a loopback datagram is one
+    /// frame or fragments.
+    pub lo_mtu: u32,
     pub mac: [u8; 6],
 }
 
@@ -2126,6 +2262,7 @@ pub(crate) fn link_facts() -> Option<LinkFacts> {
         eth_up: st.eth.up && st.eth.device.is_some(),
         eth_name: st.eth_name.clone(),
         mtu: st.eth.device.as_ref().map_or(MTU as u32, |d| d.mtu as u32),
+        lo_mtu: st.lo.device.mtu as u32,
         mac: st.eth.device.as_ref().map_or([0; 6], |d| d.net.mac()),
     })
 }
@@ -2285,20 +2422,34 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
     .unwrap_or(Err(crate::err::ENODEV))
 }
 
-/// `ip link set eth0 mtu N`. The floor is the smallest an IPv4 datagram can
-/// be; above that the frame path carries whatever a setter names. Out of
-/// range is `EINVAL`.
-pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
-    with_stack(|st| {
-        let Some(device) = st.eth.device.as_mut() else {
-            return Err(crate::err::ENODEV);
-        };
-        if (MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
-            device.mtu = mtu as usize;
+/// `ip link set <dev> mtu N`, for `lo` and `eth0` alike. The floor is the
+/// smallest an IPv4 datagram can be; above that the frame path carries whatever
+/// a setter names (the loopback's frames are `vec!`-sized, the NIC's are one
+/// driver frame each). Out of range is `EINVAL`, and an index that names no link
+/// here is `ENODEV`.
+///
+/// `lo` is settable because that is Linux's own way to make loopback traffic
+/// fragment: at its 65 536 a maximum datagram is one frame, and below it the
+/// same datagram is fragmented by the IP layer and reassembled on the way in
+/// (measured on Linux, `docs/notes/` §4.6) - the only instrument this kernel
+/// has for its own reassembly.
+pub(crate) fn set_mtu(index: u32, mtu: u32) -> Result<(), isize> {
+    if !(MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
+        return Err(crate::err::EINVAL);
+    }
+    with_stack(|st| match index {
+        LO_INDEX => {
+            st.lo.device.mtu = mtu as usize;
             Ok(())
-        } else {
-            Err(crate::err::EINVAL)
         }
+        ETH_INDEX => match st.eth.device.as_mut() {
+            Some(device) => {
+                device.mtu = mtu as usize;
+                Ok(())
+            }
+            None => Err(crate::err::ENODEV),
+        },
+        _ => Err(crate::err::ENODEV),
     })
     .unwrap_or(Err(crate::err::ENODEV))
 }
@@ -2488,8 +2639,9 @@ pub fn init(dev: Arc<dyn NetDevice>) {
         GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3],
     ));
 
-    // The loopback: smoltcp's own device, which hands every transmitted frame
-    // back to the next receive. It carries `127.0.0.0/8` - the prefix Linux
+    // The loopback: this module's own device ([`LoDevice`]), which hands every
+    // transmitted frame back to the next receive and reports the MTU a caller
+    // set (Linux's 65 536 until then). It carries `127.0.0.0/8` - the prefix Linux
     // gives `lo`, so the whole range routes here rather than only the one
     // address - and it has no routes at all, which is deliberate: a socket in
     // its set aimed at anything off-box finds no route and emits nothing,
@@ -2499,7 +2651,7 @@ pub fn init(dev: Arc<dyn NetDevice>) {
     // smoltcp's Ethernet medium insists on one, and because a self-addressed
     // first packet resolves by ARP against ourselves - the answer has to be the
     // address the frame was sent to.
-    let mut lo_device = smoltcp::phy::Loopback::new(Medium::Ethernet);
+    let mut lo_device = LoDevice::new(LO_MTU);
     let mut lo_iface = Interface::new(
         Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
         &mut lo_device,
@@ -2552,7 +2704,7 @@ impl Stack {
     /// bring up: moving one in is `ip link set ... netns`, which this kernel has no
     /// place for yet.
     pub(crate) fn deviceless() -> Stack {
-        let mut lo_device = smoltcp::phy::Loopback::new(Medium::Ethernet);
+        let mut lo_device = LoDevice::new(LO_MTU);
         let mut lo_iface = Interface::new(
             Config::new(HardwareAddress::Ethernet(EthernetAddress([
                 0x02, 0, 0, 0, 0, 0,
@@ -2914,7 +3066,7 @@ impl Device for NicDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = self.mtu;
+        caps.max_transmission_unit = self.mtu + ETHERNET_HEADER_BYTES;
         // Not a description of the hardware - smoltcp multiplies this by the
         // segment size and clamps every advertised receive window to the
         // result (`iface/packet.rs`, and the comment there calls it "a

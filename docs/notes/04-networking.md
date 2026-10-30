@@ -1604,3 +1604,94 @@ The named gaps, each with what it waits on:
 
 ---
 
+
+## 4.6 A datagram's size line, and the link's line under it — **DONE** (2026-10-30)
+
+The datagram family carried one wrong number for a long time: `sendto` answered
+`EMSGSIZE` for anything wider than this kernel's own 16 KiB datagram ring
+(`src/net/mod.rs`'s `UDP_PAYLOAD_BYTES`), so a 20 000-byte telemetry frame was
+refused by the *buffer's* size while Linux sends it. The ring's number was the
+only line. Two lines were measured on a current host first
+(`.workbuddy/probe_dgram.c`, `probe_dgram2.c`, `probe_dgram3.c`; Linux 7.2.11,
+uid 1000 unless said otherwise):
+
+| caller's shape | Linux's answer |
+|---|---|
+| `sendto` 65 507 on `127.0.0.1` | 65 507, and the receiver reads all of it back |
+| `sendto` 65 508 / 70 000 | `EMSGSIZE` (90), both |
+| `SO_SNDBUF` asked 4 608 (reads back 9 216) then 65 507 | still sent — the send buffer never bounds one datagram |
+| 65 507 to the QEMU gateway over a 1 500-byte link | accepted — **Linux fragments it** |
+| the same send with `IP_MTU_DISCOVER = IP_PMTUDISC_DO` | `EMSGSIZE`; 1 200 bytes still sends |
+| in a netns, `ip link set lo mtu 1500`, then 65 507 | arrives **whole** — fragmented out, reassembled in |
+
+So the size line is the IPv4 datagram's 65 535 less the 20-byte IP and 8-byte UDP
+headers, and the line above it is the *link's*: a caller that may not fragment is
+refused by the link's MTU, never by a buffer's, and between the two numbers the
+MTU is the one that moves when `ip link set … mtu` moves.
+
+**Landed.** `udp_send` answers `EMSGSIZE` for a payload past `MAX_UDP_DGRAM`
+(65 507) *before* the implicit bind and before the queue, and answers `EMSGSIZE`
+again when the IPv4 packet would not fit the destination link's MTU — which is
+Linux's answer in the no-fragment shape, measured above. The datagram ring became
+`UDP_TX_BYTES` = 64 KiB at socket construction: the ring has to hold one maximum
+datagram while the egress sends it, and a *bound* socket's ring cannot be rebuilt
+(`resize_udp` is legal only while unbound), so the size is the socket's from the
+start and is bounded by the fd table rather than by a caller's claim. The
+loopback is this module's own device now (`LoDevice`) instead of smoltcp's
+`Loopback`, whose capabilities fix the MTU at 65 535 and whose tokens are not
+exported: an owned queue with an adjustable MTU is what lets `ip link set lo mtu`
+and `SIOCSIFMTU` mean something, and `lo`'s default MTU is reported as Linux's
+**65 536** (`set_mtu(index, mtu)` serves both links now; before, `lo` answered
+`EOPNOTSUPP` and `dump_links` printed a hardcoded number).
+
+**A framing fact that bit on the way.** smoltcp's `DeviceCapabilities` reports a
+*frame* budget and its `ip_mtu()` subtracts the 14-byte Ethernet header for the
+Ethernet medium, while an `ifreq` MTU — what `SIOCGIFMTU` answers and what
+`ip link set` writes — is the IP packet's. With the reported number used directly
+as the frame budget, the 65 507-byte datagram "fit" the 65 536-byte loopback and
+was then **dropped in silence** by smoltcp's no-fragmentation path (`net_debug!`
+and `Ok(())` — the sender's buffer had accepted it, the receiver saw nothing);
+both devices now give the frame budget as the reported MTU plus that header.
+
+**Pin.** `user/tests/src/bin/t-dgram-size.rs`, 15 claims: 65 507 out and back on
+the loopback (bytes compared at both ends), 65 508 and 70 000 `EMSGSIZE`, a small
+send buffer still sending the maximum, a small datagram still going afterwards,
+`lo`'s MTU read as 65 536, set to 1 500 (`SIOCSIFMTU`) with `eth0`'s number left
+alone, the 65 507-byte datagram **`EMSGSIZE` at `lo` MTU 1 500** (the no-fragment
+answer, where Linux fragments), restored to 65 536 and the datagram going through
+again, and on the wire: the 65 507-byte datagram `EMSGSIZE` and a 1 400-byte one
+leaving. A host run skips the privileged `lo` write and the wire half; measured
+on this host, all nine remaining claims pass, which is what makes the
+kernel-side answers the *divergence* rather than the shape.
+
+**Gates.** x86_64 `verdict pass=233 fail=0`, `mpos-kunit 34 passed`, exit 0;
+aarch64 `verdict pass=232 fail=0`, `mpos-kunit 34 passed`, exit 0 (the first
+aarch64 run died on the known console-RX kunit flake, `arch.console_receive
+FAILED: the poll after injecting 0x5a gave Some(109)` — re-run cleared it, §12.4a).
+
+**Counterfactual.** Reverting the frame budget (both devices back to
+`self.mtu`) leaves the accepts and the MTU writes green and turns exactly the
+two arrival claims red — `FAIL: it arrives whole and unchanged (got None bytes)`,
+`FAIL: it comes back whole after the MTU is restored` — which is the silent-drop
+path above being pinned rather than described.
+
+**The gap that stays: IP fragmentation.** It is *not* served, and the attempt to
+serve it measured why. With smoltcp's `proto-ipv4-fragmentation` feature on and
+`SMOLTCP_FRAGMENTATION_BUFFER_SIZE` = 65 535 (the fragmenter has to hold the whole
+datagram), `Fragmenter` keeps `buffer: [u8; FRAGMENTATION_BUFFER_SIZE]` **inline
+inside `Interface`** (`src/iface/fragmentation.rs`), and this kernel builds an
+`Interface` on a **task** stack when a process enters a new network namespace
+(`Stack::deviceless()`, 32 KiB release / 64 KiB debug — `STACK_ORDER`), so the
+construction alone (`Interface::new` returns a 65 545-byte value, then it is
+copied into `Fabric`) overflows it. The gate found it as memory corruption, not
+as a clean failure: three user-mode page faults across two lanes at unrelated
+addresses (`0x28`, `0x10`, `0x7ed2d3da9000`, two of them in `t-ns-net`, one
+after it in another program), all clearing when the feature was removed. Closing
+the gap therefore needs the interface to live somewhere 64 KiB is free — a heap
+`Box<Interface>` construction (which needs `Box::new`'s in-place path to be
+relied on, and `Fabric` re-typed) or a smoltcp change to hold the fragmenter's
+buffer in a `Vec` (the crate is unpatched here). Until then the honest answers
+are the two above: 65 507 on a 65 536-byte loopback, `EMSGSIZE` where a link's
+MTU would have to be fragmented, and `IP_MTU_DISCOVER`/`IP_MTU` still refused
+(named in `docs/uapi/` §5.1 item 58; the refusal is Linux's no-fragment shape,
+not an invented limit).
