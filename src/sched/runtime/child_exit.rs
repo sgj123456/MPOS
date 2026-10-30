@@ -39,7 +39,12 @@ fn user_byte_address(virt: usize, write: bool) -> Option<usize> {
         // VMA behind it is still a refusal - that is a process handing the
         // kernel an address it never mapped.
         None => {
-            if !resolve_anon_fault(virt, write) {
+            // The third answer - the machine has no frame - is a refusal here
+            // too: this walk is the kernel reading a *dying* thread's memory to
+            // finish its exit, and there is nowhere to send the OOM kill from a
+            // thread the process is already letting go of. Either way the caller
+            // gets `EFAULT` (§8.0).
+            if resolve_anon_fault(virt, write) != crate::hal::kernel::FaultAnswer::Resolved {
                 return None;
             }
             crate::hal::translate(virt)?
@@ -2077,6 +2082,42 @@ pub fn exit_group(code: isize) -> ! {
     let tgid = current_tgid();
     with_table(|t| end_group_siblings(t, me, tgid));
     exit(code)
+}
+
+/// The machine has no frame left for the running task's own fault: end the
+/// process the way Linux's OOM killer does, and never return.
+///
+/// Measured on a current Linux (`docs/notes/` §8.0) before this was written: a
+/// process whose touch cannot get a page is killed with **`SIGKILL`** - its
+/// parent's `wait` reads `WIFSIGNALED`/`WTERMSIG == 9` - and the machine and every
+/// other process carry on, the freed pages coming back with its address space.
+/// The same measurement rules out the two shapes this kernel had before it: a
+/// `SIGSEGV` (which makes "the machine has no memory" indistinguishable from "you
+/// dereferenced a wild pointer") and a kernel panic (which takes a whole machine
+/// down over one process's memory use).
+///
+/// **The whole group, not the faulting thread**, for the reason the fatal-signal
+/// path already gives: on this kernel a thread parked in a futex or a pipe never
+/// runs the syscall-exit gate a pending signal is taken at, so a
+/// thread-by-thread death would leave the rest of the process parked on memory it
+/// no longer has. [`end_group_siblings`] takes them out of every queue the picker
+/// can reach, and the caller's own `exit` is what releases the group's frames.
+///
+/// The line is printed **before** the death rather than after, because after it
+/// there is no process to print from - and it is affordable only because the
+/// frames this fault was refused came out of [`crate::mm::alloc_user_frame`]'s
+/// reserve, which keeps the console's `Vec` and the exit path's own bookkeeping
+/// alive on a machine whose last frame a process has just used up.
+pub fn out_of_memory() -> ! {
+    let me = current();
+    let tgid = current_tgid();
+    crate::hal::kernel::print_line(format_args!(
+        "mpos: out of memory: a fault could not get a page, ending the process \
+         (SIGKILL, tid {} group {}; Linux's OOM answer, docs/notes/ §8.0)\n",
+        me.0, tgid.0
+    ));
+    with_table(|t| end_group_siblings(t, me, tgid));
+    exit(-(crate::sched::signal::SIGKILL as isize))
 }
 
 /// End every other thread of one thread group, for a caller that is about to

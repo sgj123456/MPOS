@@ -56,7 +56,7 @@ impl Kernel for Services {
         sched::mapping_name_at(addr)
     }
 
-    fn resolve_anon_fault(&self, virt: usize, write: bool) -> bool {
+    fn resolve_anon_fault(&self, virt: usize, write: bool) -> crate::hal::kernel::FaultAnswer {
         sched::resolve_anon_fault(virt, write)
     }
 
@@ -78,6 +78,10 @@ impl Kernel for Services {
 
     fn exit(&self, code: isize) -> ! {
         sched::exit(code)
+    }
+
+    fn out_of_memory(&self) -> ! {
+        sched::out_of_memory()
     }
 
     fn preempt(&self) {

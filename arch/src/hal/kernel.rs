@@ -29,6 +29,27 @@
 //!
 //! [`Current`]: super::Current
 
+/// What a resolver did with a demand-paged fault's address.
+///
+/// Three answers, not two, because a refusal and a machine with no memory to
+/// give are different facts about the same address. A refusal is the process's
+/// own fault to bear (`SIGSEGV`); no memory is the machine's, and Linux's
+/// measured answer to that is the OOM killer - `SIGKILL` to the process that
+/// asked, with the machine and every other process running on (`docs/notes/`
+/// §8.0). Collapsing the two would make a process that used up the machine's
+/// memory indistinguishable from one that dereferenced a wild pointer, which is
+/// the shape this kernel's fault path had before the OOM path was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultAnswer {
+    /// The page is there now; the faulting instruction can be re-executed.
+    Resolved,
+    /// Not the process's to touch: no mapping covers the address, or the
+    /// mapping that does does not permit the access.
+    Refused,
+    /// The address *is* the process's and the machine has no frame for it.
+    OutOfMemory,
+}
+
 /// The kernel services a machine's trap and interrupt entry needs.
 ///
 /// Deliberately a *fact* interface rather than a policy one: each method answers
@@ -74,7 +95,11 @@ pub trait Kernel: Sync {
     fn mapping_name_at(&self, addr: usize) -> Option<alloc::string::String>;
 
     /// A fault on a page a mapping covers but nothing has populated yet.
-    fn resolve_anon_fault(&self, virt: usize, write: bool) -> bool;
+    ///
+    /// The answer says which of the three cases it was: the page is in place,
+    /// the address is not the process's, or the address is and there was no
+    /// frame to bring it in with.
+    fn resolve_anon_fault(&self, virt: usize, write: bool) -> FaultAnswer;
 
     /// A push past the mapped end of the stack: extend it, within its bounds.
     fn resolve_stack_growth(&self, addr: usize) -> bool;
@@ -92,6 +117,17 @@ pub trait Kernel: Sync {
 
     /// End the running task with `code`. Never returns.
     fn exit(&self, code: isize) -> !;
+
+    /// The machine has no frame for the running task's own fault: end the
+    /// process the way Linux's OOM killer does, and never return.
+    ///
+    /// The whole group, not just the faulting thread - Linux kills a process -
+    /// and with `SIGKILL`'s number as the exit word, so a parent's `wait` reads
+    /// `WIFSIGNALED`/`SIGKILL` exactly as it would on Linux
+    /// (`docs/notes/` §8.0). A machine calls this only on
+    /// [`FaultAnswer::OutOfMemory`]: the other two answers are not its to end a
+    /// task over.
+    fn out_of_memory(&self) -> !;
 
     /// Let the scheduler take the CPU at the end of an interrupt.
     fn preempt(&self);
@@ -330,7 +366,7 @@ pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
 
 /// Resolve a demand-paged fault. See [`Kernel::resolve_anon_fault`].
 #[inline]
-pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
+pub fn resolve_anon_fault(virt: usize, write: bool) -> FaultAnswer {
     registered().resolve_anon_fault(virt, write)
 }
 
@@ -364,6 +400,13 @@ pub fn disposition_is_default(sig: u8) -> bool {
 #[inline]
 pub fn exit(code: isize) -> ! {
     registered().exit(code)
+}
+
+/// End the process that used up the machine's memory. See
+/// [`Kernel::out_of_memory`].
+#[inline]
+pub fn out_of_memory() -> ! {
+    registered().out_of_memory()
 }
 
 /// Let the scheduler take the CPU. See [`Kernel::preempt`].

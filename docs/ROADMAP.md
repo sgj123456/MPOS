@@ -438,7 +438,7 @@ One-glance status of the whole roadmap.
 
 **Security (Phase 8)**
 
-- [ ] [~] 8.0 allocation-failure panic — reproducing case fixed, tmpfs budget landed; global allocator still panics (§8.0, R.8)
+- [ ] [~] 8.0 allocation-failure panic — reproducing case fixed, tmpfs budget landed; a demand-paged fault with no frame now answers Linux's OOM kill (`SIGKILL`, the group; a 4 MiB frame reserve pays for the death) instead of reading as `SIGSEGV` (§8.0.1, item 133); the global allocator's own `Vec` growth still panics (R.8)
 - [x] 8.1 ASLR · [x] 8.3 user stack canary (§8.1, §8.3)
 - [x] 8.2 seccomp — STRICT + FILTER with all eight actions measured, the `PTRACE_EVENT_SECCOMP` stop landed, and a tracer rewriting the frame now redirects the call at that stop and at an ordinary `PTRACE_SYSCALL` entry stop — the `-1` sentinel cancelling it instead, and a filter judging the number the tracer wrote (§8.2)
 

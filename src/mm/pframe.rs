@@ -40,6 +40,24 @@ pub(crate) use mpos_vm::{align_down, align_up};
 /// lists for a benefit nothing here has needed.
 pub const MAX_ORDER: usize = 14;
 
+/// Frames a process's demand paging may **not** have: the kernel's own reserve,
+/// spent while it ends the process that ran the machine out of memory.
+///
+/// When [`Pmm::alloc_for_user`] refuses, the kernel answers the way Linux's OOM
+/// killer does - it ends the faulting process (`docs/notes/` §8.0) - and that
+/// death *allocates*: the console gathers its line into a `Vec`, the kernel heap
+/// grows a slab, the group's frame list is taken. Every one of those draws on the
+/// frames this reserve holds back, so the process that used the machine up is the
+/// only thing that dies. With the reserve at zero the death path would be the
+/// next allocation to fail, which is a machine that dies inside its own
+/// out-of-memory answer.
+///
+/// 4 MiB: a process that touches the machine out of memory owns on the order of
+/// half a million pages (2 GiB at 4 KiB), and the group's frame list - one
+/// `usize` per owned frame - doubles to 2 MiB on its last growth, which is 512
+/// frames. The rest is the console line and the heap's own bookkeeping.
+pub const USER_FRAME_RESERVE: usize = 1024;
+
 /// One zone per usable memory region; QEMU and real firmware both stay far below.
 pub const MAX_ZONES: usize = 32;
 
@@ -478,6 +496,25 @@ impl Pmm {
         self.zones[..self.zone_count]
             .iter_mut()
             .find_map(|zone| zone.alloc(order))
+    }
+
+    /// Allocate one frame for a process's demand paging, refusing while the
+    /// machine is down to its last [`USER_FRAME_RESERVE`] frames.
+    ///
+    /// The test and the allocation happen under the caller's one critical
+    /// section (see [`crate::mm::alloc_user_frame`]), so no other allocator
+    /// caller can take the last frames in between: the refusal is a fact about
+    /// the machine at the moment the frame is asked for, not a guess taken and
+    /// acted on later.
+    ///
+    /// Order 0, because a demand-paged page is one page. A caller that wants a
+    /// larger, contiguous block is the kernel's own plan, not a process's, and
+    /// keeps [`alloc`](Self::alloc).
+    pub fn alloc_for_user(&mut self) -> Option<usize> {
+        if self.free_frames() <= USER_FRAME_RESERVE {
+            return None;
+        }
+        self.alloc(0)
     }
 
     pub fn free(&mut self, phys: usize, order: usize) {

@@ -54,6 +54,99 @@ user-facing allocation fallible end to end (`ENOMEM` out of the syscall, not a
 panic) and give a process that runs the memory out something to lose besides the
 kernel.
 
+#### 8.0.1 A fault that cannot get a frame answers like Linux's OOM killer — **DONE (2026-10-30)**
+
+The section above was the *shape* of the failure (a file is not one buffer, a
+mount's budget answers `ENOSPC`). This is the fault path's own answer, and it was
+a **wrong shape rather than a missing one**: `populate_in` asked the frame
+allocator for the page a process had just faulted on, and when there was none it
+`return false`d - which every caller reads as "this address is not yours" and
+turns into `SIGSEGV`. A machine with no memory therefore looked exactly like a
+program with a wild pointer, and the same `return false` was what made the
+earlier note's "the page tables a process that touches enough of what it mapped
+will need" the next panic.
+
+Linux was measured before any of it was written, and the instrument is part of
+the finding because the obvious one lies on this host:
+
+    systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 <command>
+
+(The two fixtures are `.workbuddy/probe_oom.c` - a child that touches a growing
+anonymous mapping - and `.workbuddy/probe_oom_tmpfs.c` - the same for a
+`/dev/shm` write and a `MAP_SHARED` touch -, both `gcc -O1 -static`.)
+
+A cgroup whose `memory.max` is set but whose swap is not capped is not a memory
+limit at all here: this host carries 4095 MB of swap, and with `MemoryMax=64M`
+alone a child touched 512 MB and survived. With `MemorySwapMax=0` as well, Linux
+7.2.11 answers:
+
+    $ systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 build/scratch/oom/oom
+    parent: child killed by signal 9 (Killed)
+    parent-after: touched 4 MB
+    $ systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 build/scratch/oom/shm
+    writer: 48 MB
+    writer: 56 MB
+    parent: child killed by 9 (Killed)
+
+So the answers are one rule with two mechanisms, and only the second was
+missing here: a **memory** that has run out ends the process that asked
+(`WIFSIGNALED`/`WTERMSIG == 9`, the parent and every sibling carrying on and
+mapping 4 MB afterwards), while a **mount's size** running out is `ENOSPC` -
+which this kernel's `Usage` budget already answered. The tmpfs probes show the
+memory limit arriving as the killer rather than as a refusal, in the writer and
+in a `MAP_SHARED` touch alike (`build/scratch/oom/map.out`: `mapper: 56 MB`, then
+`parent: child killed by 9`), which is why the fault path is where this landed
+rather than the filesystem's write path.
+
+**The seam that makes the distinction expressible.** `resolve_anon_fault` used
+to answer `bool`, and a `bool` cannot say whose fault an out-of-memory is. It now
+answers `hal::kernel::FaultAnswer`:
+
+- `Resolved` - the page is there; the instruction retries.
+- `Refused` - not this process's to touch (no VMA, no permission, a
+  frame-backed page its object will not hand over): the `SIGSEGV`/`EFAULT` every
+  caller already had.
+- `OutOfMemory` - the address *is* the process's and the machine has no frame
+  for it. The fault handlers then call `hal::kernel::out_of_memory`:
+  `sched::out_of_memory` prints one line and ends the **whole thread group**
+  with `exit(-(SIGKILL as isize))`, the group rule `end_group_siblings` already
+  carried for a fatal signal (`docs/notes/` §6.37) - a parked thread that never
+  runs the syscall-exit gate is exactly the state that argument was measured
+  against. The line is printed *before* the death, because after it there is no
+  process to print from.
+
+**The reserve, and why the answer needs one.** The frames this kernel refuses to
+a process are the frames the death path itself spends: the console gathers its
+line into a `Vec`, the kernel heap grows a slab, and the group's owned-frame
+list - one `usize` per frame, ~500k of them for a 2 GiB machine - doubles to
+2 MiB (512 frames) on its last growth. Refusing at zero free frames would be a
+machine that panics inside its own out-of-memory answer. So
+`pframe::USER_FRAME_RESERVE = 1024` frames (4 MiB) are what
+`mm::alloc_user_frame` will not hand to demand paging; `Pmm::alloc_for_user`
+tests and allocates under the one critical section, so the refusal is a fact
+about the machine rather than a guess acted on later. The kernel's own
+allocations still draw on the reserve, which is what lets the map that carried
+the fault succeed after the data frame was granted.
+
+**Named residuals, so the next reader does not think this closed R.8.** (1) The
+page tables a fault's `try_map` needs come out of the same reserve, not from an
+error path: a table frame taken by *another* path inside that one-fault window
+would surface as `Refused` again. (2) aarch64's `Tables::frame` still `expect`s
+for the **kernel's own** plan (`arch/src/arch/aarch64/paging.rs`), which is not a
+process's fault. (3) The kernel heap's `Vec` growth still reaches
+`handle_alloc_error` and panics: this item ends *demand paging's* half of
+`ENOMEM`, not the allocator's. R.8 now says exactly that.
+
+**The pin** is `user/tests/src/bin/t-oom-kill.rs`: two re-executed fixtures touch
+a 1900 MiB anonymous mapping - one on its own thread, one on a *thread of* a
+process whose leader sleeps 22 s - and the parent claims `WIFSIGNALED`/
+`WTERMSIG == SIGKILL` for both, then maps and touches 16 MiB to show the frames
+came back. The group case is a claim and not a detail because a kernel that ended
+only the touching thread would let the leader finish its sleep and exit 0, which
+the parent reads as an ordinary exit; neither claim runs on a host, where the
+fixture would either fit or meet a real OOM killer that has nothing to do with
+this kernel.
+
 ### 8.1 ASLR — **DONE** (four landmarks; `ET_EXEC`'s own address deliberately not one of them)
 
 Measured on Linux before writing any of it, over 64 runs of the same program
@@ -402,4 +495,6 @@ job (`docs/uapi/` item 131; log `build/scratch/secretmem-cf.log`).
 
 ### R.8 (moved from ROADMAP's status board) — the allocator failure path, still open
 
-8.0: **a userspace process could panic the kernel** — fixed for the case that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB contiguous `realloc` is an order the buddy allocator never serves), and tmpfs now has a byte budget answering `ENOSPC`; demand paging also took "maps too much" off the list, since a mapping is now an address space and backs nothing until it is touched. Still open: the global allocator's failure path is `panic!`, so any other unbounded user-driven growth still ends the machine (§8.0).
+8.0: **a userspace process could panic the kernel** — fixed for the case that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB contiguous `realloc` is an order the buddy allocator never serves), and tmpfs now has a byte budget answering `ENOSPC`; demand paging also took "maps too much" off the list, since a mapping is now an address space and backs nothing until it is touched.
+
+**§8.0.1 (2026-10-30) took the fault path's half of "give the process something to lose instead of the kernel":** a fault that cannot get a frame now ends the whole thread group with `SIGKILL` - Linux's measured OOM answer - rather than being reported as `SIGSEGV`, and the 1024-frame reserve is what lets the death itself run. Still open, and these are the sentences that keep R.8 open: the **global allocator's** failure path is `panic!`, so a `Vec` grown on a user's behalf in any path other than demand paging still ends the machine; §8.0.1's own named residuals are the page-table frame a `try_map` may take inside the one-fault window, and aarch64's `Tables::frame` `expect` - which only the kernel's own plan reaches.

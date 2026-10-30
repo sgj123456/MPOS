@@ -261,31 +261,46 @@ fn owner_of_root(t: &Table, root: usize) -> Option<TaskId> {
 /// refusal it already had - `SIGSEGV` from the fault handler, `EFAULT` from a
 /// kernel copy - so a page that is merely *absent* is distinguishable from one
 /// that is not there at all, and only the former is ever created.
-pub(crate) fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) -> bool {
+///
+/// The third answer is the machine's, not the address's: an anonymous page this
+/// process may touch and no frame left to bring it in with. Linux's measured
+/// answer to that is the OOM killer, `SIGKILL` to the process that asked (§8.0),
+/// and it is a *different* answer from the refusal for the reason the fault
+/// handler needs it to be: a process that used the machine up must not look like
+/// one that dereferenced a wild pointer. The frame it asks for comes from
+/// [`mm::alloc_user_frame`], which keeps the kernel's own reserve back so the
+/// death it triggers can run.
+pub(crate) fn populate_in(
+    t: &mut Table,
+    root: usize,
+    virt: usize,
+    write: bool,
+) -> crate::hal::kernel::FaultAnswer {
+    use crate::hal::kernel::FaultAnswer;
     let page = pframe::align_down(virt, PAGE_SIZE);
     let Some(owner) = owner_of_root(t, root) else {
-        return false;
+        return FaultAnswer::Refused;
     };
     // Normalised to the group: a thread's slot holds no space, and the frames
     // belong to the group either way.
     let owner = t.space_owner(owner);
     let Some(task) = t.tasks[owner.0].as_mut() else {
-        return false;
+        return FaultAnswer::Refused;
     };
     let mm = Arc::clone(&task.mm);
     let Some(space) = task.space.as_mut() else {
-        return false;
+        return FaultAnswer::Refused;
     };
     let Some(vma) = mm.vma_at(page) else {
-        return false;
+        return FaultAnswer::Refused;
     };
     if !vma.permits(write) {
-        return false;
+        return FaultAnswer::Refused;
     }
     let frame = match &vma.kind {
         VmaKind::Anon => {
-            let Some(frame) = mm::alloc_frames(0) else {
-                return false;
+            let Some(frame) = mm::alloc_user_frame() else {
+                return FaultAnswer::OutOfMemory;
             };
             // A page nobody has written reads as zeros - it is a hole in the
             // program's memory, not whatever the frame's last owner left there.
@@ -299,7 +314,7 @@ pub(crate) fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) 
             let index = ((offset + (page - vma.start)) / PAGE_SIZE) as u64;
             match object.frame_at(index) {
                 Some(frame) => frame,
-                None => return false,
+                None => return FaultAnswer::Refused,
             }
         }
     };
@@ -315,11 +330,17 @@ pub(crate) fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) 
         // Somebody is already there. On one core that cannot happen between the
         // miss and here, but a `PROT_NONE` reserve that was never populated can
         // still be met, and the frame must go back rather than leak.
+        //
+        // The one other way to land here is the page tables' own frame
+        // allocation, which comes out of [`mm::alloc_user_frame`]'s reserve and
+        // so cannot have failed: the check and the map are one fault wide, and
+        // nothing else in it allocates a frame (`docs/notes/` §8.0's named
+        // residual keeps the interrupt-context window).
         crate::mm::free_frames(frame, 0);
-        return false;
+        return FaultAnswer::Refused;
     }
     mm.own(frame);
-    true
+    FaultAnswer::Resolved
 }
 
 /// The `#PF` entry: resolve a fault on a lazily-mapped page, the way
@@ -329,7 +350,7 @@ pub(crate) fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) 
 /// because the two can differ - the scheduler writes a dying thread's clear-tid
 /// word after switching the CPU to that thread's tables - and the tables the
 /// fault came through are the ones that decide what the address means.
-pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
+pub fn resolve_anon_fault(virt: usize, write: bool) -> crate::hal::kernel::FaultAnswer {
     let root = hal::active_root();
     // A page a `userfaultfd` registered is not this kernel's to resolve: the
     // fault becomes a record on that descriptor and the faulting task parks
@@ -338,7 +359,7 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
     // is that its closure must not (`docs/ARCHITECTURE.md` §7). `deliver`
     // answers `true` only when a descriptor really owns the page.
     if super::super::userfault::deliver(pframe::align_down(virt, PAGE_SIZE), write) {
-        return true;
+        return crate::hal::kernel::FaultAnswer::Resolved;
     }
     with_table(|t| populate_in(t, root, virt, write))
 }
@@ -346,8 +367,14 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
 /// [`resolve_anon_fault`] for an address space named by its root rather than by
 /// whatever CR3 holds: the cross-process half, what `process_vm_readv` and a
 /// tracer's `PTRACE_POKEDATA` reach a lazily-mapped page through.
+///
+/// The third answer is folded into the refusal here on purpose: a kernel copy
+/// into another process's address space has no process to end over it, and Linux
+/// answers a copy that could not get a page with `EFAULT` too - the OOM kill is
+/// the *fault handler's* answer, for a process faulting on its own memory
+/// (`docs/notes/` §8.0).
 pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
-    with_table(|t| populate_in(t, root, virt, write))
+    with_table(|t| populate_in(t, root, virt, write)) == crate::hal::kernel::FaultAnswer::Resolved
 }
 
 /// Whether the kernel may treat the *absent* page holding `virt` as one it can

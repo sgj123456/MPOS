@@ -84,6 +84,18 @@ pub fn alloc_frames(order: usize) -> Option<usize> {
     critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc(order))
 }
 
+/// Allocate the single frame a process's demand paging needs, or say the machine
+/// has none to give it.
+///
+/// `None` here is a fact the fault path answers with the OOM kill rather than
+/// `SIGSEGV` (`docs/notes/` §8.0), so the frames it refuses to hand out are the
+/// kernel's own reserve: [`pframe::USER_FRAME_RESERVE`], spent while the process
+/// that used the machine up is being ended.
+#[cfg(target_os = "none")]
+pub fn alloc_user_frame() -> Option<usize> {
+    critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc_for_user())
+}
+
 /// Return frames allocated by [`alloc_frames`] with the same order.
 /// For order-0 (single page) allocations, the reference count is decremented
 /// first; the frame is only returned to the buddy allocator when no owners

@@ -797,11 +797,24 @@ extern "C" fn sync() {
             // The order is the EL0 entry's, and for the same reason: a write to
             // a present copy-on-write page is the split, and a page that gets
             // past it is absent, so its answer is the VMA table's.
-            if crate::hal::kernel::started()
-                && ((is_write && crate::hal::kernel::resolve_cow_fault(addr))
-                    || crate::hal::kernel::resolve_anon_fault(addr, is_write))
-            {
-                return; // The instruction retries and succeeds.
+            //
+            // `OutOfMemory` is the machine's answer, not the address's - no
+            // frame is left for the process's own fault - and Linux's measured
+            // answer to it is the OOM kill (`docs/notes/` §8.0), not the
+            // `EXCEPTION: synchronous` halt this used to reach.
+            if crate::hal::kernel::started() {
+                let answer = if is_write && crate::hal::kernel::resolve_cow_fault(addr) {
+                    crate::hal::kernel::FaultAnswer::Resolved
+                } else {
+                    crate::hal::kernel::resolve_anon_fault(addr, is_write)
+                };
+                match answer {
+                    crate::hal::kernel::FaultAnswer::Resolved => return,
+                    crate::hal::kernel::FaultAnswer::Refused => {}
+                    crate::hal::kernel::FaultAnswer::OutOfMemory => {
+                        crate::hal::kernel::out_of_memory()
+                    }
+                }
             }
         }
     }
@@ -1173,8 +1186,17 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                 if is_write && crate::hal::kernel::resolve_cow_fault(addr) {
                     return 0; // The COW page split; the instruction retries.
                 }
-                if crate::hal::kernel::resolve_anon_fault(addr, is_write) {
-                    return 0; // A demand-paged anon page now backs the address.
+                match crate::hal::kernel::resolve_anon_fault(addr, is_write) {
+                    // A demand-paged anon page now backs the address.
+                    crate::hal::kernel::FaultAnswer::Resolved => return 0,
+                    crate::hal::kernel::FaultAnswer::Refused => {}
+                    // The machine, not the address: no frame for this process's
+                    // own page. Linux's measured answer is the OOM kill
+                    // (`docs/notes/` §8.0); the `EXCEPTION: synchronous` halt
+                    // below is what that used to reach.
+                    crate::hal::kernel::FaultAnswer::OutOfMemory => {
+                        crate::hal::kernel::out_of_memory()
+                    }
                 }
                 if crate::hal::kernel::resolve_stack_growth(addr) {
                     return 0; // The stack grew over the faulting address.

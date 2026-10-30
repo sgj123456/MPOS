@@ -7061,7 +7061,7 @@ passed`, aarch64 `all 230`, `mpos-kunit 34 passed` both; counterfactual (a
 shape claims, since a `0` return reads as "descriptor 0" (stdin). `docs/notes/` §8.4 carries the table and
 the reasoning.
 
-### 132. The extended-attribute family — `user.*` stored on the memory filesystems
+## item 132 — the extended-attribute family: `user.*` stored on the memory filesystems
 
 The twelve doors (188–199) were wired, validated, then answered `EOPNOTSUPP`
 because no filesystem kept an attribute. That was Linux's answer for an ext4 or
@@ -7111,3 +7111,66 @@ to be (44 claims), with the same claims run against real Linux on the host
 where the three named divergences are accepted. x86_64 `all 231 user tests passed`, aarch64 `all 230`, `mpos-kunit 34 passed` both;
 counterfactual (`xattr_vault` answering `None` for every inode) is `pass=230
 fail=1`: `t-xattr` alone, 15 claims red, every refusal green.
+
+## item 133 — a fault that cannot get a frame ends the process with `SIGKILL`, and the machine lives
+
+The last sentence of §8.0 said what remained: "give a process that runs the
+memory out something to lose besides the kernel". Demand paging's half of that
+is now Linux's answer. Before it, `populate_in`'s anonymous branch asked the
+frame allocator for the faulting page and, on `None`, `return false`d - which
+every caller reads as "this address is not yours": `SIGSEGV` from the fault
+handler, `EFAULT` from a kernel copy. A machine with no memory and a program
+with a wild pointer were the same answer.
+
+Measured on Linux 7.2.11 first, with the instrument being part of the finding:
+`systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 <cmd>`
+(the fixtures are `.workbuddy/probe_oom.c` and `.workbuddy/probe_oom_tmpfs.c`). A
+`memory.max` with the host's 4095 MB of swap left unbounded is not a limit at
+all (a child touched 512 MB and survived); with `MemorySwapMax=0`:
+
+- anonymous touch past the limit → `parent: child killed by signal 9 (Killed)`,
+  and the parent then touches 4 MB: the process that asked dies, the machine and
+  every sibling run on (`WIFSIGNALED`, `WTERMSIG == 9`);
+- tmpfs write and tmpfs `MAP_SHARED` touch past the limit → also `SIGKILL` at
+  ~56 MB, not `ENOSPC`. A *mount's size* is the `ENOSPC` mechanism (this
+  kernel's `Usage` budget already answers it); a *memory* that has run out is
+  the OOM killer, which is why this item is in the fault path.
+
+**Served**: `hal::kernel::FaultAnswer { Resolved, Refused, OutOfMemory }` is the
+seam that makes "whose fault is this" expressible - no VMA or no permission is
+`Refused` (`SIGSEGV`/`EFAULT`, every caller's old answer), an address the process
+may touch with no frame for it is `OutOfMemory`, and the three fault handlers
+(x86_64 `#PF`, aarch64 EL1 and EL0 data aborts) answer it with
+`sched::out_of_memory`: one console line, then the **whole thread group** ended
+with `exit(-(SIGKILL as isize))` through `end_group_siblings` - the group rule a
+fatal signal already carries, because a thread parked in a futex never runs the
+syscall-exit gate a per-thread death would need. `populate_user_page_at` folds
+`OutOfMemory` into the refusal: a cross-process copy has no process to end, and
+Linux answers an `EFAULT` there too.
+
+The frames the death path spends are held back by
+`pframe::USER_FRAME_RESERVE = 1024` (4 MiB) and refused by
+`Pmm::alloc_for_user`/`mm::alloc_user_frame` (test and allocation in one
+critical section). The arithmetic: the console's `Vec`, the heap's slab growth,
+and the group's owned-frame list - one `usize` per frame, ~500k on a 2 GiB
+machine - doubling to 2 MiB (512 frames) on its last growth. Without the
+reserve, running the machine out of memory would be a panic inside the
+out-of-memory answer.
+
+**Named residuals** (§8.0.1): a page-table frame taken by another path inside
+the fault's `try_map`; aarch64's `Tables::frame` `expect`, which only the
+kernel's own plan reaches; and the global allocator's `Vec` growth, which still
+panics - this closes demand paging's half of `ENOMEM`, not R.8.
+
+**Pin**: `user/tests/src/bin/t-oom-kill.rs` (6 claims). Two re-executed fixtures
+touch fresh 128 MiB chunks until death - one on its own thread, one on a thread
+of a process whose leader sleeps 22 s - and the parent claims `WIFSIGNALED`/
+`WTERMSIG == SIGKILL` for both, then maps and touches 16 MiB to show the frames
+came back. The chunk loop is deliberate: a fixed 1900 MiB mapping was measured
+surviving on the aarch64 machine, which made the claim vacuous (the fixture
+finished instead of dying) before the fixture asked the machine how much it had.
+x86_64 `all 232 user tests passed` (`t-oom-kill` 1.03 s), aarch64 `all 231`
+(`t-oom-kill` 17.93 s, the arm's slowest - a TCG fault is ~38 µs and an
+exhaustion is ~500k of them), `mpos-kunit 34 passed` both. Counterfactual
+(`OutOfMemory` answered `Refused`, the old `SIGSEGV`) is `pass=231 fail=1`:
+`t-oom-kill` alone, both `SIGKILL` claims red.

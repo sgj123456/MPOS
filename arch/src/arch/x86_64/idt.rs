@@ -343,13 +343,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // mapping is for, and the populate tells the two apart the only way that
     // matters: the VMA's permissions decide, so a read of a `PROT_NONE` page is
     // still refused and still a signal.
-    if user_address
-        && crate::hal::kernel::resolve_anon_fault(
+    //
+    // The third answer is the machine's: the address is the process's to touch
+    // and there is no frame left to bring the page in with. Linux's measured
+    // answer (`docs/notes/` §8.0) is the OOM killer - the process is killed with
+    // `SIGKILL` and the machine carries on - and reading it as a `SIGSEGV` here
+    // was the defect: a machine out of memory looked like a program with a wild
+    // pointer.
+    if user_address {
+        match crate::hal::kernel::resolve_anon_fault(
             addr,
             code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
-        )
-    {
-        return; // The page is there now; the instruction retries.
+        ) {
+            crate::hal::kernel::FaultAnswer::Resolved => return, // Retries and succeeds.
+            crate::hal::kernel::FaultAnswer::Refused => {}
+            crate::hal::kernel::FaultAnswer::OutOfMemory => crate::hal::kernel::out_of_memory(),
+        }
     }
 
     // A push past the end of what the loader mapped is an ordinary thing for a
