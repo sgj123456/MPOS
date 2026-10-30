@@ -7505,3 +7505,26 @@ keeps, so the third is ENOSPC`.
 Named residual: directory entries are still uncharged (one name is a `String`, the same
 argument); closing that needs its accounting reconciled with `t-tmpfs-limits`' "a `size=64k`
 mount takes exactly its 64 KiB" claim, which counts data only as Linux does.
+
+## item 140 — a mount's room covers the names its directories hold
+
+§3.20's residual, closed. A directory entry is a `String` on the kernel heap, so the
+same argument that made attributes draw on a mount's room applies to names: without it a
+caller creating names in a loop grew the heap past any `size=`.
+
+Measured on Linux 7.2.11 first (`build/scratch/namecharge/p.c`, root, tmpfs `size=65536`):
+ten thousand empty files with ten-byte names (about 100 kB of names on a 64 kB mount) were
+all created. A tmpfs's `size=` is page cache; names are dentries and answer to the
+allocator. Named divergence, in the worst-case rule's direction.
+
+Landed: `Usage::charge_name`/`release_name` at every name edge — `create` (released again
+when the name is taken), `symlink` (name and target path), `link` (a second name is a
+second edge), `unlink`/`rmdir` (released after the removal); a refused charge is `ENOSPC`.
+`t-tmpfs-limits`' fill claim reconciled: a file's name is part of the mount's number, so
+`size=64k` lands `65 536 - 4` bytes into a file called `fill` and the next byte is
+`ENOSPC`.
+
+Pins: `a_mounts_room_covers_the_names_it_holds`, the ledger test's name-inclusive numbers,
+and the reconciled `t-tmpfs-limits` claim. Gates: x86_64 `pass=238`, aarch64 `all 237`.
+Counterfactual: `charge_name` answering `true` → `t-tmpfs-limits` alone red on exactly the
+fill claim.

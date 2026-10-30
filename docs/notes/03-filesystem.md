@@ -1325,3 +1325,44 @@ built by `Vault::new()` instead of `Vault::with_budget(...)`, `t-xattr`'s third
 claim answers `FAIL: a mount's size= covers the attributes it keeps, so the third
 is ENOSPC` while the other two stay green — the claim is the budget's, not the
 mount's.
+
+### 3.21 A mount's room covers the names it holds — **DONE** (2026-10-30)
+
+§3.20 closed the attribute door and left this one named: a directory entry is a
+`String` on the kernel heap, and nothing charged it to the mount, so a caller
+creating names in a loop could grow the heap past any `size=` — the same
+worst-case shape as the attributes, one door over.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/namecharge/p.c`, root, a tmpfs
+mounted `size=65536`): ten thousand empty files with ten-byte names — about
+100 kB of name bytes on a mount whose number is 64 kB — were all created, and
+the mount still worked. A tmpfs's `size=` is page cache; names are dentries and
+answer to the allocator. So this again is this kernel's own bound, not Linux's,
+and the divergence is named rather than claimed against it.
+
+**Landed**: every place a name enters a directory charges its length to the
+mount's room (`Usage::charge_name`), and every place one leaves gives it back
+(`release_name`): `create` (release again when the name turns out taken),
+`symlink` (the name *and* the path it points at — both are bytes the mount
+keeps), `link` (a second edge is a second name), `unlink`/`rmdir` (release after
+the removal succeeded). A refused charge is `ENOSPC`, the same number the data
+and attribute doors answer.
+
+**The one existing claim this had to reconcile**: `t-tmpfs-limits`'s "a
+`size=64k` mount takes exactly its 64 KiB and then answers ENOSPC" counted data
+only, as Linux's `size=` does. A file's name is now part of that 64 KiB, so the
+fill names its own file (`fill`, four bytes) and the claim became "holds its
+name plus the rest of its 64 KiB" — `65 536 - 4` bytes land, the next one is
+`ENOSPC`. That is the honest reading of this kernel's `size=` now, and the
+reconciliation is the reason the item was named rather than folded into §3.20.
+
+Host tests: `a_mounts_room_covers_the_names_it_holds` (a 8-byte mount: `abcdef`
+fits, `ghij` is refused, the name given back makes room, a hard link takes room
+again, a symlink asks for its target's path too) and the ledger test's numbers
+now count the name (`3001` for a three-thousand-byte file called `a`).
+`t-tmpfs-limits` carries the reconciled claim on the guest.
+
+Gates: x86_64 `pass=238`, aarch64 `all 237`, both `mpos-kunit 35 passed`.
+Counterfactual: `Usage::charge_name` answering `true` without charging →
+`t-tmpfs-limits` alone red, exactly `a size=64k mount holds its name plus the
+rest of its 64 KiB, then answers ENOSPC`, because the data alone then fits.

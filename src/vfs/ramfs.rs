@@ -189,6 +189,24 @@ impl Usage {
         }
     }
 
+    /// Take the room one directory entry's name needs, or refuse. A name is a
+    /// `String` on the kernel heap just as a value is, so the same rule applies:
+    /// a mount with a `size=` is a promise about everything it keeps, and a
+    /// caller creating names in a loop must not be able to grow the heap past a
+    /// budget (`docs/notes/` §3.20's residual, closed in §3.21).
+    ///
+    /// Linux does not count names against `size=` either - a tmpfs's `size=` is
+    /// page cache, and dentries answer to the allocator - so this is again a
+    /// named divergence in the direction of the worst-case rule.
+    fn charge_name(&self, len: usize) -> bool {
+        self.charge(len as u64)
+    }
+
+    /// Give back the room one name took.
+    fn release_name(&self, len: usize) {
+        self.release(len as u64);
+    }
+
     /// Give bytes back: a shrink, or a file whose last name went away.
     fn release(&self, bytes: u64) {
         // Never below zero, whatever the order the drops arrive in.
@@ -1317,18 +1335,23 @@ impl Inode for RamDir {
             // never by a filesystem name; nothing a caller can `mknod` is one.
             NodeKind::Anon { .. } => return Err(VfsError::Unsupported),
         };
-        critical_section::with(|cs| {
+        if !self.fs.charge_name(name.len()) {
+            return Err(VfsError::NoSpace);
+        }
+        let made = critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {
                 // The ledger was charged for a node no name will reach; the
                 // `Arc` above is dropped on this path, and its `Drop` gives the
-                // inode back.
+                // inode back. The name's room goes back too.
+                self.fs.release_name(name.len());
                 return Err(VfsError::Exists);
             }
             entries.insert(String::from(name), node.clone());
             self.mtime.borrow(cs).set(at);
             Ok(node)
-        })
+        });
+        made
     }
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -1350,9 +1373,16 @@ impl Inode for RamDir {
             mode: Mutex::new(Cell::new(birth_mode(NodeKind::Symlink))),
             owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
         });
+        // A link keeps both its name and the path it points at; the inode's own
+        // bytes are already charged by `charge_inode`.
+        let kept = name.len() + target.len();
+        if !self.fs.charge_name(kept) {
+            return Err(VfsError::NoSpace);
+        }
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {
+                self.fs.release_name(kept);
                 return Err(VfsError::Exists);
             }
             entries.insert(String::from(name), node.clone());
@@ -1378,6 +1408,7 @@ impl Inode for RamDir {
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)?;
+            self.fs.release_name(name.len());
             self.mtime.borrow(cs).set(at);
             Ok(())
         })?;
@@ -1399,9 +1430,13 @@ impl Inode for RamDir {
             return Err(VfsError::Invalid);
         }
         let at = now();
+        if !self.fs.charge_name(name.len()) {
+            return Err(VfsError::NoSpace);
+        }
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {
+                self.fs.release_name(name.len());
                 return Err(VfsError::Exists);
             }
             entries.insert(alloc::string::String::from(name), target.clone());
@@ -1433,6 +1468,7 @@ impl Inode for RamDir {
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)?;
+            self.fs.release_name(name.len());
             self.mtime.borrow(cs).set(at);
             Ok(())
         })
@@ -1813,6 +1849,37 @@ mod tests {
         assert_eq!(vault.set("user.c", &big, 0), Ok(()));
     }
 
+    /// A name is a `String` on the heap, so a name's bytes are the mount's room
+    /// - the residual §3.20 left open, closed here: a caller creating names in a
+    /// loop cannot grow the kernel heap past a mount's budget. Linux's tmpfs does
+    /// not count names against `size=` either (its `size=` is page cache), so the
+    /// bound is this kernel's, named in `docs/notes/` §3.21.
+    #[test]
+    fn a_mounts_room_covers_the_names_it_holds() {
+        let usage = Usage::with_limit(8);
+        let fs = RamFs::with_usage(usage.clone());
+        let root = fs.root();
+        root.create("abcdef", NodeKind::File, None).unwrap();
+        assert_eq!(usage.used(), 6);
+        assert_eq!(
+            root.create("ghij", NodeKind::File, None).map(|_| ()),
+            Err(VfsError::NoSpace)
+        );
+        root.unlink("abcdef").unwrap();
+        assert_eq!(usage.used(), 0);
+        root.create("ghij", NodeKind::File, None).unwrap();
+        assert_eq!(usage.used(), 4);
+        // A hard link is a second name, so it takes room again; a symlink keeps
+        // its target's path as well as its own name.
+        let target = root.create("k", NodeKind::File, None).unwrap();
+        root.link("k2", &target).unwrap();
+        assert_eq!(usage.used(), 7, "ghij 4 + k 1 + k2 2");
+        assert_eq!(
+            root.symlink("link", "a/target/path").map(|_| ()),
+            Err(VfsError::NoSpace)
+        );
+    }
+
     fn a_full_mount_answers_enospc_instead_of_growing() {
         let fs = RamFs::with_usage(Usage::with_limit(4096));
         let root = fs.root();
@@ -1835,11 +1902,14 @@ mod tests {
         let fs = RamFs::with_usage(usage.clone());
         let root = fs.root();
 
+        // The name is room too (one byte here), which is why the ledger counts
+        // it: a mount's `size=` covers everything the mount keeps (§3.21).
         let file = root.create("a", NodeKind::File, None).unwrap();
+        assert_eq!(usage.used(), 1, "the name took its byte");
         file.write_at(0, &vec![7u8; 3000]).unwrap();
-        assert_eq!(usage.used(), 3000);
+        assert_eq!(usage.used(), 3001);
         file.truncate(100).unwrap();
-        assert_eq!(usage.used(), 100, "the truncated tail came back");
+        assert_eq!(usage.used(), 101, "the truncated tail came back");
         // And it is usable again: the same write that would have been refused
         // now fits.
         assert_eq!(file.write_at(100, &vec![7u8; 2900]).unwrap(), 2900);

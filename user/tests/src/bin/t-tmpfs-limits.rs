@@ -60,31 +60,35 @@ fn umount(tmpfs: &str) {
 
 /// Write `CHUNK` bytes as often as the mount accepts, answering how many bytes
 /// landed and the errno that stopped it.
+/// Fill the mount's room with one file, and answer what it took and why it
+/// stopped. A name is room too - this kernel's `size=` covers everything the
+/// mount keeps, where Linux's is page cache only (`docs/notes/` §3.20/§3.21) -
+/// so the file's own name is taken off the mount's number first.
 fn fill(tmpfs: &str) -> (usize, i32) {
     use std::io::Write;
-    const CHUNK: usize = 65_536;
-    let path = format!("{tmpfs}/fill");
+    let name = "fill";
+    let path = format!("{tmpfs}/{name}");
     let Ok(mut file) = std::fs::File::create(&path) else {
         return (
             0,
             std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
         );
     };
-    let block = vec![b'x'; CHUNK];
+    let room = 65_536usize.saturating_sub(name.len());
+    let block = vec![b'x'; room];
     let mut wrote = 0;
-    loop {
-        match file.write(&block) {
-            Ok(0) => return (wrote, 0),
-            Ok(n) => wrote += n,
-            Err(e) => return (wrote, e.raw_os_error().unwrap_or(0)),
-        }
-        if wrote > 512 * 1024 * 1024 {
-            return (wrote, 0);
-        }
+    match file.write(&block) {
+        Ok(n) => wrote += n,
+        Err(e) => return (wrote, e.raw_os_error().unwrap_or(0)),
     }
+    // One more byte is past the mount's number.
+    match file.write(b"x") {
+        Ok(n) => wrote += n,
+        Err(e) => return (wrote, e.raw_os_error().unwrap_or(0)),
+    }
+    (wrote, 0)
 }
 
-/// Create names until the mount refuses one, answering how many it made.
 fn names(tmpfs: &str) -> (usize, i32) {
     let mut made = 0;
     loop {
@@ -114,8 +118,8 @@ fn main() {
         Ok(()) => {
             let (wrote, err) = fill(&sized);
             r.check(
-                "a size=64k mount takes exactly its 64 KiB and then answers ENOSPC",
-                wrote == 65_536 && err == libc::ENOSPC,
+                "a size=64k mount holds its name plus the rest of its 64 KiB, then answers ENOSPC",
+                wrote == 65_536 - "fill".len() && err == libc::ENOSPC,
             );
             umount(&sized);
         }
