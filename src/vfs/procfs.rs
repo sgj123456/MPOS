@@ -95,9 +95,27 @@ struct ProcFile {
     /// contents are generated on the read, because the length is not known
     /// until it is asked for and asking is the work.
     size: u64,
+    /// The process this file describes, when access to it is the *ptrace*
+    /// question rather than the word's: `maps`/`smaps` report `0444` and still
+    /// refuse another user with `EACCES`, because Linux runs
+    /// `ptrace_may_access` on them (`build/scratch/ptraceacc/p.c`, measured).
+    describes: Option<usize>,
 }
 
 impl Inode for ProcFile {
+    /// `maps`/`smaps` describe the process, so Linux's `ptrace_may_access`
+    /// answers for them; every other generated file is its own word's business.
+    fn describes_task(&self) -> Option<usize> {
+        self.describes
+    }
+
+    /// procfs reports a word and keeps none, and Linux answers access by that
+    /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
+    /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
     fn owner(&self) -> (u32, u32) {
         self.owner.get()
     }
@@ -173,6 +191,13 @@ struct ProcCtl {
 }
 
 impl Inode for ProcCtl {
+    /// procfs reports a word and keeps none, and Linux answers access by that
+    /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
+    /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
     fn owner(&self) -> (u32, u32) {
         self.owner.get()
     }
@@ -287,6 +312,13 @@ struct ProcLink {
 }
 
 impl Inode for ProcLink {
+    /// procfs reports a word and keeps none, and Linux answers access by that
+    /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
+    /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
     fn owner(&self) -> (u32, u32) {
         self.owner.get()
     }
@@ -365,6 +397,21 @@ impl Inode for ProcLink {
     /// door asks a different question - what the link names - and answers with
     /// the inode, so `stat("/proc/<other>/fd/N")` reports the file rather than
     /// `ENOENT` (Linux's own resolution, measured in `build/scratch/fdns/p2.c`).
+    /// The process this link describes: a descriptor's second name and a
+    /// namespace's name both answer *about* that process, and Linux asks
+    /// `ptrace_may_access` before it answers either (measured: a dropped
+    /// process's `fd/0` and `ns/net` are `EACCES` to another user through
+    /// `readlink`). The `exe`/`cwd`/`root` links name a process too and are the
+    /// same rule; they are built by a helper that carries no pid yet, so the
+    /// claim below stops at the two that do (`docs/notes/` §3.24).
+    fn describes_task(&self) -> Option<usize> {
+        if self.fd.is_some() || self.ns.is_some() {
+            Some(self.pid)
+        } else {
+            None
+        }
+    }
+
     fn as_fd_inode(&self) -> Option<Arc<dyn Inode>> {
         let fd = self.fd?;
         #[cfg(target_os = "none")]
@@ -510,6 +557,13 @@ impl ProcDir {
 }
 
 impl Inode for ProcDir {
+    /// procfs reports a word and keeps none, and Linux answers access by that
+    /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
+    /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
     fn owner(&self) -> (u32, u32) {
         self.owner.get()
     }
@@ -654,6 +708,7 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
         generate: Box::new(move || Some(generate())),
         mode: 0,
         size: 0,
+        describes: None,
     })
 }
 
@@ -735,6 +790,22 @@ fn cpuinfo_text() -> String {
 }
 
 /// A file that reports something which can go away.
+/// A file whose access is the **ptrace** question about `slot`, and whose
+/// contents are generated on the read.
+fn task_file(
+    slot: usize,
+    generate: impl Fn() -> Option<String> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(generate),
+        mode: 0,
+        size: 0,
+        describes: Some(slot),
+    })
+}
+
 fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
@@ -742,6 +813,7 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
         generate: Box::new(generate),
         mode: 0,
         size: 0,
+        describes: None,
     })
 }
 
@@ -761,6 +833,7 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
         generate: Box::new(generate),
         mode: 0o400,
         size: 0,
+        describes: None,
     })
 }
 
@@ -783,6 +856,7 @@ fn file_of_size(
         generate: Box::new(move || Some(generate())),
         mode: 0,
         size,
+        describes: None,
     })
 }
 
@@ -2990,11 +3064,19 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         NodeKind::File,
         maybe_file(move || statm_line(slot)),
     );
-    node.add("maps", NodeKind::File, maybe_file(move || maps_of(slot)));
+    node.add(
+        "maps",
+        NodeKind::File,
+        task_file(slot, move || maps_of(slot)),
+    );
     // `smaps` is `maps` with a field block under each line, and its records'
     // headers *are* the `maps` lines - which is what lets a reader compare the
     // two files, and what `t-smaps` pins.
-    node.add("smaps", NodeKind::File, maybe_file(move || smaps_of(slot)));
+    node.add(
+        "smaps",
+        NodeKind::File,
+        task_file(slot, move || smaps_of(slot)),
+    );
     // The other two spellings of the same accounting, so that a reader asking
     // for one of them by name finds it: `numa_maps` (one line per mapping) and
     // `smaps_rollup` (one record for the whole space). Both read the same
@@ -3397,6 +3479,13 @@ struct ProcConfig {
 }
 
 impl Inode for ProcConfig {
+    /// procfs reports a word and keeps none, and Linux answers access by that
+    /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
+    /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
     fn refuses_mode_change(&self) -> bool {
         // Nothing here can be written into a node's bits - Linux's procfs
         // has no `setattr` either, and answers `EPERM` to root for the

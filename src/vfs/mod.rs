@@ -702,6 +702,36 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
+    /// Whether the word this node reports is the **verdict** for reading,
+    /// writing and searching it, rather than the node handler's business.
+    ///
+    /// A filesystem that keeps its modes answers access by them ([`Self::
+    /// keeps_modes`]); a node that reports one and keeps none - procfs, and
+    /// sysfs before it owned its word - has to say whether the report is also
+    /// the rule. Linux's procfs says yes for the nodes under `/proc/<pid>`: an
+    /// `0400` `maps`/`environ` refuses another user's read with `EACCES` and
+    /// an `0500` `fd` directory refuses its listing, while a `0444` `status`
+    /// answers everyone (measured, `build/scratch/ptraceacc/p.c`, uid 1000 and
+    /// root over a plain and a dropped child). Naming it separately keeps the
+    /// refusal doors this tree already answers by name: `chmod` is `EPERM`
+    /// because the node has no attributes, `chown` of `0` because it accepts
+    /// and drops, and neither is a permission verdict on the word.
+    fn mode_polices_access(&self) -> bool {
+        false
+    }
+
+    /// The process a node describes, when the node is one that answers *about*
+    /// a process rather than being one of its files.
+    ///
+    /// A magic link (`/proc/<pid>/fd/<N>`, `exe`, `ns/<kind>`) is the case:
+    /// Linux checks `ptrace_may_access` before it answers the link's target,
+    /// which is why a dropped process's `exe` is `EACCES` to another user even
+    /// though the link's own word is `0777` (measured, the probe above). The
+    /// walk and the `readlink` door both ask this door.
+    fn describes_task(&self) -> Option<usize> {
+        None
+    }
+
     /// The namespace this node names, if it names one.
     ///
     /// `/proc/<pid>/ns/<kind>` is a *magic* link in the same sense
@@ -2260,7 +2290,21 @@ fn current_groups() -> [u32; 3] {
 /// Whether the running process may do `want` to `node`, asked for its
 /// effective ids - the check every syscall that touches a path makes.
 pub fn may_access(inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
-    may_as(current_caller(), inode, want)
+    let caller = current_caller();
+    // A node that describes a process is read only by a caller that may
+    // inspect it: Linux runs `ptrace_may_access` on `maps`/`smaps`, which are
+    // `0444` and still refuse another user (`Inode::describes_task`).
+    if let Some(pid) = inode.describes_task()
+        && crate::sched::may_inspect(crate::sched::TaskId(pid)) == Some(false)
+    {
+        return Err(VfsError::Access);
+    }
+    if !inode.keeps_modes() && inode.mode_polices_access() {
+        // A node that reports a word and keeps none, where the word is the
+        // verdict (`Inode::mode_polices_access`): Linux's procfs.
+        return may_by_mode(caller, inode.mode(), inode.owner(), want);
+    }
+    may_as(caller, inode, want)
 }
 
 /// Whether the running process may **search** `dir`: look a name up in it.

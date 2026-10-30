@@ -2200,10 +2200,22 @@ fn readlink_named(path: &str, buf: usize, size: usize, base: &Arc<dyn Inode>) ->
         // The link, not what it points at: a resolver that followed it would
         // answer EINVAL for every link and the target for nothing.
         match crate::vfs::resolve_no_follow_at(path, base.clone()) {
-            Ok(node) => match node.readlink() {
-                Ok(target) => target,
-                Err(e) => return err_of(e),
-            },
+            Ok(node) => {
+                // A link that describes a process is answered only to a caller
+                // that may inspect it: Linux runs `ptrace_may_access` here, so
+                // a dropped process's `fd/<N>` or `ns/<kind>` is `EACCES` to
+                // another user even though the link's own word is `0777`
+                // (`build/scratch/ptraceacc/p.c`, `docs/notes/` §3.24).
+                if let Some(pid) = node.describes_task()
+                    && crate::sched::may_inspect(crate::sched::TaskId(pid)) == Some(false)
+                {
+                    return err::EACCES;
+                }
+                match node.readlink() {
+                    Ok(target) => target,
+                    Err(e) => return err_of(e),
+                }
+            }
             Err(e) => return err_of(e),
         }
     };

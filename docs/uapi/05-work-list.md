@@ -7700,9 +7700,74 @@ Gates: x86_64 `pass=240 fail=0` (23.72 s), aarch64 `pass=239 fail=0` (43.52 s),
 `mpos-kunit 35 passed` both. Counterfactual: the walk's `as_fd_inode` arm
 removed -> exactly the follow claim red (`got None`).
 
-**Stays named**: `ptrace_may_access` — who may *read* another process's tree.
-This kernel's uid/`dumpable` answers ownership, not access; a process can read a
-sibling's `/proc/<pid>/status` it does not own. Linux's rule is a predicate over
-the two, and it would also cover the `/proc/<pid>/fd` listing.
+**Closed since**: `ptrace_may_access` as the *read* rule is item 145 below
+(`docs/notes/03-filesystem.md` §3.24) — `/proc/<pid>/maps`/`smaps`, the `fd`
+directory and the `fd`/`ns`/`exe` links are answered by `sched::may_inspect`,
+which is the same predicate over the caller's four ids and the target's
+dumpability. What stays named there is narrower: the caller's own credential
+*transition* (a process started as uid 1000 reads a root process's `maps` on
+Linux and is refused here).
 
-Notes: `docs/notes/03-filesystem.md` §3.22/§3.22a.
+Notes: `docs/notes/03-filesystem.md` §3.22/§3.22a/§3.24.
+
+## item 145 — a node that describes a process is read by a caller that may inspect it
+
+`/proc/<pid>/maps` reports `0444`, and an ordinary user cannot read another
+user's. Linux's answer there is not its mode: measured on Linux 7.2.11
+(`build/scratch/ptraceacc/p.c`, reader at uid 1000 over a plain root child, and
+the same probe as root):
+
+| door | root target, reader uid 1000 | reader root |
+|---|---|---|
+| `/proc/<pid>` `opendir` | ok | ok |
+| `status` / `cmdline` / `stat` | ok | ok |
+| `maps` / `environ` | `EACCES` | ok |
+| `fd` directory | `EACCES` | ok |
+| `fd/0`, `exe`, `ns/net` (readlink) | `EACCES` | ok |
+
+`maps`/`smaps` report `0444`, `environ` `0400` — so only the second is refused by
+its word. The rule on the first is `ptrace_may_access`: a caller may read what a
+process's memory files say when it shares a uid and the target is dumpable. One
+measurement makes it concrete: a process that *reached* uid 1000 through
+`setuid(2)` is refused a root process's `maps`, while one started as uid 1000
+(`sudo -n -u '#1000'`) is allowed — the credential transition is what the
+predicate reads.
+
+**Landed** (`src/vfs/mod.rs`, `src/vfs/procfs.rs`,
+`src/syscall/linux/fs/file.rs`):
+
+- `Inode::mode_polices_access()` — the reported word is the verdict, for a
+  filesystem that keeps no modes and does no handler check (procfs: `true` on
+  its descriptors and euid; sysfs answers through `keeps_modes`, item 144).
+- `Inode::describes_task() -> Option<usize>` — the process a node answers
+  *about*: a `ProcFile` built by `task_file(slot, generate)` (`maps`, `smaps`),
+  an `fd`/`ns` link, the `fd` directory.
+- `may_access` asks `sched::may_inspect(TaskId(pid)) == Some(false)` first and
+  answers `EACCES` before the mode check; `None` (the task is gone) falls
+  through — that distinction is what keeps `t-ns-time` green.
+- `readlink_named` runs the same test before `node.readlink()`, with `==
+  Some(false)` (the first attempt used `!= Some(true)` and made a dead
+  process's `ns/time` link `EACCES`; `t-ns-time` went red on exactly that
+  claim).
+
+**Named divergences**: (1) the caller's credential transition is not modelled —
+`may_inspect` answers on ids plus dumpability, so a process started as uid 1000
+reads a root process's `maps` on Linux and is refused here; (2) `pagemap`,
+`mem` and `auxv` are not served, so their verdicts are moot; (3)
+`/proc/<pid>/environ` is refused by its already-policed `0400` word rather than
+by this rule (same errno, a different door).
+
+**Pin**: `user/tests/src/bin/t-proc-access.rs` — 8 claims: another uid is
+refused `maps`, allowed `status`/`cmdline`/`stat`, refused the `fd` directory
+and its entries, `exe` and `ns/net`; root reads `maps` and lists `fd`. Host
+branch prints the reference verdicts for a root process and a dropped child.
+
+**Gates**: x86_64 `verdict pass=241 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/access-gate1.log`); aarch64 `pass=240 fail=0`
+(`build/scratch/access-gate-a3.log`), both `mpos-kunit 35`.
+**Counterfactual**: `may_inspect` answering `Some(true)` for every live task ->
+`pass=239 fail=2`: `t-proc-access`'s `its maps is still the owner's alone` red,
+and `t-pidfd` red (the same predicate gates it); the `fd` directory and the
+links stayed green, because their own words carry those refusals.
+
+Notes: `docs/notes/03-filesystem.md` §3.24.

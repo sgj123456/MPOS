@@ -1542,3 +1542,90 @@ reports` (got `0755`) and `and the word moves with it` (got `0444`), with the
 descriptor here, where Linux refuses the `open` itself (`EACCES`): this kernel
 has no write method to ask, so the refusal lands on the write. The word lives on
 the node and Linux keeps it on the inode - same lifetime, same visibility.
+
+### 3.24 A node that describes a process is read by a caller that may inspect it — **DONE** (2026-10-30)
+
+`/proc/<pid>/maps` reports `0444`, and an ordinary user cannot read another
+user's. That is not a contradiction in Linux's file mode; it is a second rule on
+top of it, and the mode is not the one that decides. Measured first, because the
+answer looks like a permission verdict and is not one.
+
+**Linux 7.2.11** (`build/scratch/ptraceacc/p.c`, a reader at uid 1000 over a
+plain root child and over a child that dropped to uid 65 534; and the same
+probe run as root):
+
+| door | root target, reader uid 1000 | reader root |
+|---|---|---|
+| `/proc/<pid>` `opendir` | ok (54 entries) | ok |
+| `status` / `cmdline` / `stat` read | ok | ok |
+| `maps` read | `EACCES` (13) | ok |
+| `environ` read | `EACCES` | ok |
+| `fd` `opendir` | `EACCES` | ok |
+| `fd/0` `readlink` | `EACCES` | ok |
+| `exe` `readlink` | `EACCES` | ok |
+| `ns/net` `readlink` | `EACCES` | ok |
+
+`maps` is `0444` and `smaps` `0444`; `environ` is `0400`. So the refusal on
+`maps` cannot be its word. The rule behind it is `ptrace_may_access`: a caller
+may read what a process's *memory* files say when the two share a uid and the
+target is dumpable. One measurement makes that concrete and is worth writing
+down because it looks like a contradiction: a process that **reached** uid 1000
+through `setuid(2)` is refused a root process's `maps`, while a process started
+*as* uid 1000 (`sudo -n -u '#1000'`) is allowed it — the transition is what
+`ptrace_may_access` reads, not the id. This kernel implements the rule the probe
+drives: `shares_uid` over the four id pairs of the caller against the target's
+credentials, plus `target dumpable != SUID_DUMP_DISABLE`
+(`crates/cred/src/lib.rs`'s `ptrace_may_access`), which is also what
+`sched::may_inspect` answers.
+
+**The shape, as landed.** Two doors on `Inode` name the fact, and one funnel
+uses it:
+
+- `fn mode_polices_access(&self) -> bool` — the word this node reports *is* the
+  verdict for reading/writing/searching it, because the filesystem keeps no
+  modes and no handler does the check. procfs answers `true` on the descriptors
+  and euid; the sysfs half is item 144's (`keeps_modes`).
+- `fn describes_task(&self) -> Option<usize>` — the process a node answers
+  *about*: a `ProcFile` built by `task_file(slot, generate)` (`maps`, `smaps`),
+  an `fd`/`ns` link, and the `fd` directory. `readlink_named` and the walk ask
+  it before the node's own answer.
+- `may_access` runs `sched::may_inspect(TaskId(pid)) == Some(false)` first and
+  answers `EACCES` before the mode check; `None` (the task is gone) falls
+  through, which is exactly what `t-ns-time` measures for a dead process's
+  namespace link.
+- `readlink`'s check is `== Some(false)`, not `!= Some(true)`: the first attempt
+  used the second and turned a dead process's `ns/time` link into `EACCES`
+  (`t-ns-time` went red on exactly that claim) — the difference between "the
+  machine refuses" and "the machine has nothing to ask".
+
+**The pin** is `user/tests/src/bin/t-proc-access.rs`, 8 claims: another uid
+reader is refused `maps` (`EACCES`), is *allowed* `status`/`cmdline`/`stat`,
+is refused the `fd` directory and its entries, `exe` and `ns/net` (readlink),
+while root reads `maps` and lists `fd`. Its host branch prints the reference
+verdicts for a root process and a dropped child.
+
+**Named divergences, plainly.** (1) The reader's own credential *transition* is
+not modelled here: `may_inspect` answers on ids and dumpability, so a process
+started as uid 1000 reads a root process's `maps` on Linux and is refused here
+(the probe's own shape is the one the pin drives, and the measurement above
+records why the two differ). (2) `pagemap`/`mem`/`auxv` are not served at all,
+so their verdicts are moot. (3) `/proc/<pid>/environ` is refused by its `0400`
+word, which this tree already policed, not by the ptrace rule — same errno, a
+different door.
+
+**Gates.** x86_64 `verdict pass=241 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/access-gate1.log`, `X-EXIT=0`); aarch64 `verdict pass=240
+fail=0`, `mpos-kunit 35 passed` (`build/scratch/access-gate-a3.log`,
+`A-EXIT=0`) — after two runs whose lane 1 hit the documented EL0 flake onset
+(`EXCEPTION: synchronous ESR_EL1 0x96000047` at `FAR_EL1
+0xffffffff802ff000`, before any user program, with the lane then hanging at the
+dump; killed that lane's QEMU and re-ran).
+
+**Counterfactual.** With `sched::may_inspect` answering `Some(true)` for every
+live process (the pre-item behaviour: nothing asked it), the gate went to
+`pass=239 fail=2`: `t-proc-access`'s `its maps is still the owner's alone` red —
+the claim that is *not* also enforced by a mode — and `t-pidfd` red, because
+`pidfd_open`/`pidfd_send_signal` ask the same predicate. The `fd` directory and
+the links stayed green under the stub, which is itself a measurement: those
+refusals are carried by their `0500`/`0700` words, so only the `0444` file needed
+the second rule.

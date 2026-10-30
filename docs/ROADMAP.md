@@ -390,7 +390,11 @@ One-glance status of the whole roadmap.
 - [x] the socket a compositor binds; `GETRESOURCES`' two-call idiom; property shapes (§7.4)
 - [x] DRM sync objects incl. timeline flags, measured on the real card (§7.4, `t-drm-sync`)
 - [x] the lease family with `drm.h`'s request numbers; legacy KMS queries refused by name; cursor plane driven (§7.4, `t-drm-lease`, `t-drm-args`)
-- [x] `/proc/<pid>/maps` — three sources, two named divergences (§7.4, R.6)
+- [x] `/proc/<pid>/maps` — three sources, two named divergences (§7.4, R.6); and the
+  *read* rule on top of its word is Linux's now: `ptrace_may_access` as
+  `sched::may_inspect`, so another uid's `maps`/`smaps`, the `fd` directory and the
+  `fd`/`ns`/`exe` links are `EACCES` while `status` stays world-readable (item 145,
+  §3.24; what stays named is the caller's own credential transition)
 - [x] niri booted end to end on the 3D card: the card negotiates its cap sets so  
   `DRM_VIRTGPU_GET_CAPS` is served rather than refused, and `niri`/`xwayland-satellite` are  
   image packages now, so the compositor's own two remaining warnings are the renderer's  
