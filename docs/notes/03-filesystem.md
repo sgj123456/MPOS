@@ -1434,9 +1434,62 @@ tests passed` (25.84 s, `-35.9%`); both `mpos-kunit 35 passed`.
 
 **Named divergences.** Linux's exemption for the naming directory is a predicate
 in its own source; this kernel states the same set of rows structurally ("a
-directory that mirrors a process") and pins the measured table. An `lstat` of a
-descriptor's second name (`/proc/<pid>/fd/0`) is not claimed here, and the `ns`
-entries' ownership follows the same rule by construction rather than by a claim.
+directory that mirrors a process") and pins the measured table.
+
+### 3.22a The links and the thread's own trees, and a foreign descriptor followed — **DONE** (2026-10-30)
+
+The ownership rule above stops at names; this section is what came after it,
+and it found two shapes missing rather than two rules wrong.
+
+**Measured first** (`build/scratch/fdns/p2.c`, Linux 7.2.11, run as uid 1000
+and as root; `lstat` and `stat` asked separately). A plain process owns
+everything in its own entry — `/proc/<pid>` `0555`, `fd` `0500`, `fd/0` link
+`0500`, `ns` `0511`, `ns/net` `0777`, `exe` `0777`, `status` `0444`, all
+uid 1000. A `setuid`-dropped process (`dumpable == 0`) still owns the two
+directories that *name* it — `/proc/<pid>` and `/proc/<pid>/task/<tid>`, uid
+65534 — and everything else answers **root**: `fd` `0500`, `fd/0` link `0500`,
+`ns` `0511`, `ns/net` `0777`, `exe` `0777`, `status` `0444`, and
+`/proc/<pid>/task/<tid>/fd/0` the same. So the two rules are exactly the two
+functions of §3.22, one applied per node.
+
+**Landed.** `t-proc-owner` gained seven claims for those nodes (the link's own
+`lstat`, because a descriptor's *target* has an identity of its own), and
+`/proc/<pid>/task/<tid>` gained the two subtrees Linux has there and this tree
+did not: `fd` (`0500`, the process's descriptor table — a thread shares it) and
+`ns` (`0511`, the same namespace objects), both inheriting down the `lookup`
+funnel like every other child.
+
+The second finding is a following question rather than an ownership one:
+`stat("/proc/<other>/fd/0")` used to answer `ENOENT`, because the walk's magic
+link door is [`Inode::as_fd`], whose answer is a descriptor **number** — only
+meaningful in the caller's own table, so it refuses another process's link.
+Linux follows that link to the very file the process holds
+(`build/scratch/fdns/p2.c`: `stat` reports the pipe's `S_IFIFO`, `lstat` the
+link). The fix adds the second payload door, [`Inode::as_fd_inode`] — the link
+answers with the **inode** for a foreign descriptor (from
+`sched::descriptor_inode_of`, the sibling of the `descriptor_access` that
+already answered `fd/<N>`'s own word), and the walk pushes it the same way it
+pushes the own-descriptor arm. `/proc/self/fd/<N>` is unchanged: its `as_fd`
+answer still works, and the inode door is what a *foreign* name needed.
+
+**Pin**: `t-proc-owner`'s new claim compares the *kind* `stat` of the link
+answers with the kind the child's own `fstat(0)` reports — the descriptor the
+child inherits belongs to the harness, so naming one would pin the harness
+rather than the rule. Reference run against Linux as root: `got Some(4096)`
+(`S_IFIFO`), `PASS`.
+
+**Gates**: x86_64 `verdict pass=240 fail=0` (23.72 s), aarch64 `pass=239
+fail=0` (43.52 s), both `mpos-kunit 35 passed, 0 failed`.
+
+**Counterfactual**: the `as_fd_inode` arm removed from the walk ->
+`t-proc-owner` alone red on exactly `a foreign descriptor's second name is the
+file it holds (got None)`, the other thirteen claims green.
+
+**Named residual**: what is still not policed is *who may read* another
+process's tree — Linux's `ptrace_may_access`, which a `dumpable` flag and a uid
+answer together. This kernel's uid answers ownership and permission but not
+access: a process can read a sibling's `/proc/<pid>/status` it does not own.
+Recorded in `docs/uapi/` §5.1's process-tree item.
 
 ### 3.23 sysfs reports its word and keeps it — **DONE** (2026-10-30)
 

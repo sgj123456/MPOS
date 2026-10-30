@@ -20,11 +20,19 @@
 //! was made. `status`'s `Uid:`/`Gid:` lines are the same ids, printed four
 //! times: real, effective, saved, and the filesystem one.
 //!
+//! The claims stop at the links' own `lstat`: a *foreign* process's
+//! `/proc/<pid>/fd/<N>` is not followed here - the walk answers `ENOENT`
+//! where Linux follows to the described file's identity - because this kernel
+//! has no door that hands out another process's descriptor target. Named in
+//! `docs/notes/` §3.22 as the item's residual; the shared-position door
+//! (`Inode::as_fd`) still makes `/proc/self/fd/<N>` a second name for the
+//! caller's own descriptor.
+//!
 //! Run as `--child`, the program is the dropped process it describes: it
 //! changes its ids and then reports its own view of `/proc/self/status`.
 
 use mpos_user_tests::Report;
-use rustix::fs::stat;
+use rustix::fs::{AtFlags, statat};
 
 /// The ids the child of this pin changes to, and the ones the claims below
 /// expect to find on the tree: `nobody`/`nogroup`, which every image here has.
@@ -53,8 +61,18 @@ fn child_report() -> String {
             gid = rest.trim().replace('\t', " ");
         }
     }
+    // The kind of the file descriptor 0 holds: the parent compares it with
+    // what `stat` of the *link* answers, which is the whole question a magic
+    // link poses.
+    let mut kind = 0u32;
+    unsafe {
+        let mut st: libc::stat = core::mem::zeroed();
+        if libc::fstat(0, &mut st) == 0 {
+            kind = st.st_mode & libc::S_IFMT as libc::mode_t;
+        }
+    }
     format!(
-        "pid={} uid={} gid={} status_uid={uid} status_gid={gid}",
+        "pid={} uid={} gid={} fd0={kind} status_uid={uid} status_gid={gid}",
         std::process::id(),
         unsafe { libc::getuid() },
         unsafe { libc::getgid() },
@@ -62,7 +80,25 @@ fn child_report() -> String {
 }
 
 fn owner(path: &str) -> Option<(u32, u32)> {
-    stat(path).ok().map(|st| (st.st_uid, st.st_gid))
+    statat(rustix::fs::CWD, path, AtFlags::empty())
+        .ok()
+        .map(|st| (st.st_uid, st.st_gid))
+}
+
+/// The `S_IFMT` kind a followed name answers, for the magic-link claim: the
+/// question there is *which file* the link names, not who owns it.
+fn kind_of(path: &str) -> Option<u32> {
+    statat(rustix::fs::CWD, path, AtFlags::empty())
+        .ok()
+        .map(|st| st.st_mode & 0o170_000)
+}
+
+/// The same question asked of the link itself rather than its target: a
+/// descriptor under `fd` is a link, and Linux decides who owns *that*.
+fn link_owner(path: &str) -> Option<(u32, u32)> {
+    statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+        .ok()
+        .map(|st| (st.st_uid, st.st_gid))
 }
 
 fn main() {
@@ -114,6 +150,12 @@ fn main() {
         r.check("the child reported a pid", false);
         r.finish();
     }
+    let mut child_fd0 = None;
+    for field in said.split_whitespace() {
+        if let Some(value) = field.strip_prefix("fd0=") {
+            child_fd0 = value.parse::<u32>().ok();
+        }
+    }
 
     // The directory that names the process: its own ids, whatever the process
     // did to itself.
@@ -136,6 +178,62 @@ fn main() {
     r.check(
         "the fd directory follows the dumpability, not the name",
         owner(&format!("{dir}/fd")) == Some((0, 0)),
+    );
+
+    // The links and directories under it follow the same rule - the
+    // measurement that added these (`build/scratch/fdns/p2.c`) asked `lstat`
+    // of each, because a descriptor's *target* has its own owner and the
+    // question here is the link's.
+    r.check(
+        &format!(
+            "a descriptor link is root's, because the process made itself un-dumpable (got {:?})",
+            link_owner(&format!("{dir}/fd/0"))
+        ),
+        link_owner(&format!("{dir}/fd/0")) == Some((0, 0)),
+    );
+    r.check(
+        &format!(
+            "a task's descriptor link carries the same rule (got {:?})",
+            link_owner(&format!("{dir}/task/{pid}/fd/0"))
+        ),
+        link_owner(&format!("{dir}/task/{pid}/fd/0")) == Some((0, 0)),
+    );
+    r.check(
+        &format!(
+            "the namespaces directory is root's too (got {:?})",
+            owner(&format!("{dir}/ns"))
+        ),
+        owner(&format!("{dir}/ns")) == Some((0, 0)),
+    );
+    r.check(
+        &format!(
+            "a namespace link is root's too (got {:?})",
+            link_owner(&format!("{dir}/ns/net"))
+        ),
+        link_owner(&format!("{dir}/ns/net")) == Some((0, 0)),
+    );
+    r.check(
+        &format!(
+            "the executable link is root's too (got {:?})",
+            link_owner(&format!("{dir}/exe"))
+        ),
+        link_owner(&format!("{dir}/exe")) == Some((0, 0)),
+    );
+    r.check(
+        &format!(
+            "a task's namespaces directory carries the same rule (got {:?})",
+            owner(&format!("{dir}/task/{pid}/ns"))
+        ),
+        owner(&format!("{dir}/task/{pid}/ns")) == Some((0, 0)),
+    );
+
+    // Following the link - `stat`, not `lstat` - names the very file the child
+    // holds, whatever that is: the claim compares kinds rather than naming one,
+    // because the descriptor the pin's child inherits is the harness's to pick.
+    let followed = kind_of(&format!("{dir}/fd/0"));
+    r.check(
+        &format!("a foreign descriptor's second name is the file it holds (got {followed:?})"),
+        matches!((followed, child_fd0), (Some(seen), Some(expected)) if seen == expected),
     );
 
     // The ids are also what the process reports about itself.

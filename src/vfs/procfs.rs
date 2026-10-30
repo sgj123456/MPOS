@@ -358,6 +358,29 @@ impl Inode for ProcLink {
         self.fd
     }
 
+    /// The other process's descriptor, as the file it holds.
+    ///
+    /// [`Self::as_fd`] answers only for the caller's own group, because a
+    /// descriptor *number* is only meaningful in the table it came from. This
+    /// door asks a different question - what the link names - and answers with
+    /// the inode, so `stat("/proc/<other>/fd/N")` reports the file rather than
+    /// `ENOENT` (Linux's own resolution, measured in `build/scratch/fdns/p2.c`).
+    fn as_fd_inode(&self) -> Option<Arc<dyn Inode>> {
+        let fd = self.fd?;
+        #[cfg(target_os = "none")]
+        {
+            if crate::sched::current_tgid().0 == self.pid {
+                return None;
+            }
+            crate::sched::descriptor_inode_of(self.pid, fd)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = fd;
+            None
+        }
+    }
+
     fn as_namespace(&self) -> Option<crate::vfs::ns::Namespace> {
         // Asked when the object is wanted, and answered with the namespace the
         // process is in *at that instant*: a process that unshared a moment ago
@@ -2626,6 +2649,20 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         maybe_file(move || crate::vfs::cgroupfs::cgroup_line(tid)),
     );
+    // The descriptors are the process's, and Linux gives a thread directory
+    // its own way to reach them (`/proc/<pid>/task/<tid>/fd`) - measured on a
+    // current host, where a thread's `fd` directory answers `0500` and its
+    // names are the group's descriptors (`build/scratch/fdns/p2.c`). The
+    // directory is the process's, asked for through the thread's name.
+    node.add("fd", NodeKind::Dir, descriptor_dir(pid));
+    // Likewise the namespaces: `/proc/<pid>/task/<tid>/ns` is `0511` and its
+    // names are the namespaces the process is in.
+    node.add(
+        "ns",
+        NodeKind::Dir,
+        ProcDir::own(Some(Arc::new(Namespaces { pid })), 0o511, false),
+    );
+
     // A thread sees the same mounts its process does, and asks at its own
     // name: `/proc/thread-self/mountinfo` is where a threaded program looks.
     node.add("mounts", NodeKind::File, file(mounts_text));

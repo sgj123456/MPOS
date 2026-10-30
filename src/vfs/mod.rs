@@ -688,6 +688,20 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
+    /// The inode a magic link names when the descriptor is **another**
+    /// process's.
+    ///
+    /// [`Inode::as_fd`] hands back a descriptor *number*, which only means
+    /// something in the caller's own table - so it answers for the caller's own
+    /// group and nobody else's. But `/proc/<pid>/fd/<N>` is a magic link for
+    /// any caller: `stat` of it names the file that process holds, and Linux
+    /// follows it there (measured, `build/scratch/fdns/p2.c`, `docs/notes/`
+    /// §3.22). That second answer is an inode rather than a number, and the
+    /// walk follows it the same way (`crate::vfs::mount`).
+    fn as_fd_inode(&self) -> Option<Arc<dyn Inode>> {
+        None
+    }
+
     /// The namespace this node names, if it names one.
     ///
     /// `/proc/<pid>/ns/<kind>` is a *magic* link in the same sense

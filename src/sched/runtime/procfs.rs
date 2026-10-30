@@ -522,6 +522,29 @@ pub fn descriptor_access(pid: usize, fd: usize) -> Option<u32> {
     })
 }
 
+/// The inode another process's descriptor holds.
+///
+/// The sibling of [`descriptor_access`]: one asks the direction a
+/// `/proc/<pid>/fd/<N>` link's own word is derived from, this one asks what the
+/// link *names*. `/proc/<pid>/fd/<N>` is a magic link, so following it is not
+/// reopening the text `pipe:[123]` - it is naming the very file that process
+/// holds, and the walk (`crate::vfs::mount::MountTable`) needs the inode to do
+/// that (`docs/notes/` §3.22).
+pub fn descriptor_inode_of(
+    pid: usize,
+    fd: usize,
+) -> Option<alloc::sync::Arc<dyn crate::vfs::Inode>> {
+    with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
+        Some(task) if task.user => task
+            .fds
+            .open_files()
+            .into_iter()
+            .find(|(number, _file)| *number as usize == fd)
+            .map(|(_number, file)| file.inode()),
+        _ => None,
+    })
+}
+
 /// The descriptor numbers `pid` has open, without asking for any of their
 /// names.
 ///

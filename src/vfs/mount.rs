@@ -1662,6 +1662,13 @@ impl MountTable {
                                 stack.push(denoted);
                                 continue;
                             }
+                            // The same payload, when the descriptor is another
+                            // process's: the number means nothing in this table,
+                            // so the link answers with the inode itself.
+                            if let Some(denoted) = child.as_fd_inode() {
+                                stack.push(denoted);
+                                continue;
+                            }
                             if let Some(ns) = child.as_namespace() {
                                 stack.push(crate::vfs::ns::NsFile::opened(ns));
                                 continue;

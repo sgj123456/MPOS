@@ -7672,3 +7672,37 @@ dropping -> exactly the two store claims red.
 **Named divergence**: root's `open(O_WRONLY)` on a read-only attribute answers a
 descriptor here and the write is refused; Linux refuses the open. The word lives
 on the node where Linux keeps it on the inode - same lifetime and visibility.
+
+## item 146 — the pid tree's links, a thread's own `fd`/`ns`, and a foreign descriptor followed
+
+What `/proc/<pid>` answers about ownership had been pinned for names and files;
+the nodes *between* them were not: the `fd`/`ns` directory, a descriptor's own
+link, `exe`, and the same names under `/proc/<pid>/task/<tid>`. Linux 7.2.11
+measured (`build/scratch/fdns/p2.c`, uid 1000 and root): a plain process owns
+every one of them; a `setuid`-dropped process still owns the two *naming*
+directories (`/proc/<pid>`, `task/<tid>`) and nothing else — `fd`, `fd/0`, `ns`,
+`ns/net`, `exe`, `status` all answer root. This kernel's two rules
+(`mpos_cred::process_dir_owner`, `mpos_cred::task_dump_owner`) were already the
+right ones; what was missing was the trees and the claims: `task/<tid>` had no
+`fd` or `ns`, and the links were unclaimed.
+
+Served now, all pinned in `t-proc-owner` (14 claims, seven of them new):
+`/proc/<pid>/task/<tid>/fd` (`0500`) and `/proc/<pid>/task/<tid>/ns` (`0511`);
+`lstat` of `fd/<N>`, `task/<tid>/fd/<N>`, `ns/<kind>` and `exe` answering the
+dumpability rule; and **`stat` of another process's `/proc/<pid>/fd/<N>`
+following to the very file that process holds** — via the new
+`Inode::as_fd_inode` door, which exists because `Inode::as_fd` answers a
+descriptor *number* (meaningful only in the caller's own table) while a foreign
+link needs the inode (`sched::descriptor_inode_of`). Reference run against real
+Linux: `S_IFIFO` for a pipe target, all `ok:`.
+
+Gates: x86_64 `pass=240 fail=0` (23.72 s), aarch64 `pass=239 fail=0` (43.52 s),
+`mpos-kunit 35 passed` both. Counterfactual: the walk's `as_fd_inode` arm
+removed -> exactly the follow claim red (`got None`).
+
+**Stays named**: `ptrace_may_access` — who may *read* another process's tree.
+This kernel's uid/`dumpable` answers ownership, not access; a process can read a
+sibling's `/proc/<pid>/status` it does not own. Linux's rule is a predicate over
+the two, and it would also cover the `/proc/<pid>/fd` listing.
+
+Notes: `docs/notes/03-filesystem.md` §3.22/§3.22a.
