@@ -64,7 +64,10 @@ One-glance status of the whole roadmap.
   "implicit rendezvous" it used to name as a divergence was never Linux's shape (§4.1.10) — and  
   `accept`'s address is the connector's, its two pointers asked separately (§4.1.11) — and a  
   peer's close is a hang-up, not silence: `POLLIN|POLLHUP` on stream and seqpacket alike,  
-  read 0 after the queued messages, and the wake udev's settle used to wait 120 s for (§4.1.12) —  
+  read 0 after the queued messages, and the wake udev's settle used to wait 120 s for (§4.1.12) — and  
+  the other input that wait reads now exists too, `/sys/kernel/uevent_seqnum` answering a counter that
+  moves with the events sent (item 149, §7.9c; the boot's 120 s itself is udevd's pending queue, not
+  this kernel) —  
   and the sender's half of that close is Linux's too: `EPIPE` with the `SIGPIPE` raised  
   before the call returns, `MSG_NOSIGNAL` to suppress it, and the seqpacket/datagram  
   exemptions as measured (§4.1.13, item 97)

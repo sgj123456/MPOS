@@ -6628,3 +6628,64 @@ Counterfactual: with the disk rows' counters zeroed inside `procfs::diskstats`, 
 was the only red program (`1 of 239`) and exactly two of its claims failed — `the read moved
 this disk's read counter, and only forward` and `the sectors column counted eight 512-byte
 sectors` — while the rendering, in-flight-at-rest and quiet-read claims stayed green.
+
+#### 7.9c The kernel's event counter is a file — **DONE (2026-10-31)**
+
+A desktop boot spent 120 s in `udev-settle` before the session started (§7.9b's
+measurement: 115 heartbeats before `setup-session`, and the block layer quiet).
+One of the inputs that wait reads was missing from this kernel's `/sys`:
+`/sys/kernel/uevent_seqnum`, the counter the kernel bumps for every uevent it
+sends. `libudev`'s queue-emptiness test compares it with udevd's own
+`/run/udev/uevent-seqnum`; a file that cannot be opened makes the comparison an
+error, and `udevadm settle` treats an error as "not empty" and waits out its
+whole timeout.
+
+**Measured before the fix** (the image's own `/etc/init.d/udev-settle` replaced
+by a probe, booted on the desktop image):
+
+```
+seqnum: cat: can't open '/sys/kernel/uevent_seqnum': No such file or directory
+```
+
+**Landed**: `src/vfs/sysfs.rs`'s `SysSeqnum` — `/sys/kernel/uevent_seqnum`, mode
+`0444`, metadata size rendered from the decimal word, content
+`crate::uevent::seqnum()` (the counter the kernel already bumps in
+`crate::uevent::emit` and the char-device add path). Linux's file is a `0424`
+`kernfs` attribute; the word here is `0444` for the same reason every other
+read-only sysfs attribute is (the node's word is the file's shape and the
+method table is the door, `docs/notes/` §3.25).
+
+**Measured after** (same probe, same image, kernel refreshed):
+
+```
+seqnum: 25          # at the probe's start, after udevd's coldplug
+seqnum: 37          # after `udevadm trigger --action=add`, `--subsystem-nomatch=input`
+```
+
+So the counter is readable and it moves with the events the machine sends —
+the two claims the pin makes.
+
+**The 120 s wait is not fixed by this.** The probe that ran with udevd *not*
+started answered `udevadm settle --timeout=2` with **rc=0 immediately**, both
+before and after `udevadm trigger` (measured twice in one boot), while the
+probe that ran with udevd up left `/run/udev/queue` behind and settle waited its
+default 120 s and then failed (`openrc`: `udev-settle failed to start`). The
+emptiness test in this image's eudev build is therefore the **queue file's**
+state, not `libudev`'s seqnum comparison: `strings /bin/udevadm` contains
+`/run/udev/queue` and no `uevent_seqnum` path at all. That localises the delay
+to udevd's own pending queue — an event whose worker never retires — and not to
+`libudev`, nor to this kernel's netlink side. The next instrument is udevd's
+`/run/udev/{queue,data}` contents and the device event left pending; a
+`udev_settle_timeout=5` in the image would hide the symptom and is *not* a
+kernel answer.
+
+**Pin**: `user/tests/src/bin/t-uevent.rs` gained four claims — the file is a
+decimal file, it is `0444`, an announcement moves it, and it never moves back.
+The reference run against real Linux 7.2.11 answers the first two and skips the
+last two with the sweep's own note (this host has no `/sys/dev/char/226:0`, so
+its announcements cannot be named).
+
+**Gates**: x86_64 `pass=241 fail=0` (`build/scratch/seqnum-gate1.log`),
+aarch64 `A-EXIT=0` (`build/scratch/seqnum-gate-a1.log`, 47.47 s), both
+`mpos-kunit 35 passed`. Counterfactual (`build/scratch/seqnum-cf.log`, the node
+not registered): `1 of 241`, exactly the four new claims red.

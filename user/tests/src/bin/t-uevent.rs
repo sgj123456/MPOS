@@ -34,10 +34,29 @@
 //! to is a `sockaddr_nl` this test builds by hand.
 
 use mpos_user_tests::{Report, host_run};
+use std::os::unix::fs::PermissionsExt;
 
 const AF_NETLINK: libc::c_int = 16;
 /// `SOCK_RAW`, the type `libudev` opens the uevent socket as.
 const SOCK_RAW: libc::c_int = 3;
+
+/// `/sys/kernel/uevent_seqnum`: the counter udev's `settle` compares against
+/// udevd's own before it will declare the kernel's event queue drained.
+const SEQNUM_PATH: &str = "/sys/kernel/uevent_seqnum";
+
+/// The counter as a number, read the way `libudev` reads it.
+///
+/// A **missing** file is not a cosmetic gap: `udev_queue_get_queue_is_empty()`
+/// answers an error, `udevadm settle` reads that as "not empty", and the boot
+/// waits out settle's whole timeout - measured on the desktop image at 120 s
+/// in `udev-settle` with the block layer quiet (`docs/notes/` §7.9c).
+fn read_seqnum() -> Option<u64> {
+    std::fs::read_to_string(SEQNUM_PATH)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
 const NETLINK_KOBJECT_UEVENT: libc::c_int = 15;
 const MSG_DONTWAIT: libc::c_int = 0x40;
 /// `MSG_PEEK`: look at the front without taking it.
@@ -207,6 +226,21 @@ fn main() {
     println!("t-uevent");
     let mut r = Report::new();
 
+    // First the file itself: the counter is what a boot's `udev-settle` waits
+    // on, and these two claims hold on both machines (Linux's own file is
+    // `0444` with a decimal word, `probe_uevent.c`).
+    let seq_before = read_seqnum();
+    r.check(
+        "the kernel's event counter is a decimal file",
+        seq_before.is_some(),
+    );
+    r.check(
+        "and it is a read-only attribute, as Linux's is",
+        std::fs::metadata(SEQNUM_PATH)
+            .map(|m| m.permissions().mode() & 0o777 == 0o444)
+            .unwrap_or(false),
+    );
+
     // The announcement needs a device whose uevent file can be written. Saying
     // so is better than waiting: without one, the blocking `recvmsg` below
     // parks for a machine that is never going to answer it, and a claim that
@@ -314,6 +348,19 @@ fn main() {
             has(block, b"ACTION=add") && has(block, b"SUBSYSTEM=") && has(block, b"SEQNUM="),
         );
     }
+
+    // The counter is a counter: the event just received moved it, and nothing
+    // ever moves it back - a value that only grows is what lets a listener
+    // order "this arrived after that" (`docs/notes/` §7.9c).
+    let seq_after = read_seqnum();
+    r.check(
+        "the announcement moved the kernel's event counter",
+        matches!((seq_before, seq_after), (Some(before), Some(after)) if after > before),
+    );
+    r.check(
+        "and the counter never goes backwards",
+        matches!((seq_after, read_seqnum()), (Some(a), Some(b)) if b >= a),
+    );
 
     let mut status: libc::c_int = 0;
     unsafe {

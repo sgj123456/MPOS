@@ -7816,3 +7816,25 @@ The counters (§7.9a, item 147) exist to catch the interactive stall; this is th
 Measured: 115 heartbeats over three boots; `blk submits == blk retires` in 112, and in the remaining three the delta is exactly one with `blk-busy=true` and `blk-waiter` naming the slot that holds the ext4 fill claim — the pair and the mailbox are two instruments that agree at every reading, nothing was submitted-and-never-retired, and the pair never went backwards. End-of-boot pairs: 13 576 (bare boot), 26 146 (session died early), 138 845 (session up, ~10x a bare boot's disk traffic). Two findings beside the numbers: a session started from root's shell needs `XDG_RUNTIME_DIR` or niri panics `RuntimeDirNotSet`; and the boot's own ~120 s wait is `udev-settle` parked in `poll(7)`, not the block layer.
 
 No pin, and the reason is the item's shape: **nothing here changed.** The instrument is a booted image's own log, the claim is a measurement of an instrument that already has a pin (§7.9a's drain-suite case and its red counterfactual), so there is no new contract to pin. What it produces for the next round is the session script itself and the `udev-settle` finding — the next measurement is the boot's own two minutes, named in §7.9b.
+
+## item 149 — the kernel's uevent counter is a file, and the boot's settle wait is not it
+
+`/sys/kernel/uevent_seqnum` now exists (`src/vfs/sysfs.rs`'s `SysSeqnum`, mode
+`0444`, content `crate::uevent::seqnum()`), which is the file `libudev`'s queue
+comparison reads and the one whose absence the desktop image's boot showed
+(`/sys/kernel/uevent_seqnum: No such file or directory`, `docs/notes/` §7.9c).
+Measured on the fixed image: `25` at the probe's start and `37` after
+`udevadm trigger --action=add`, so the counter is readable and moves with the
+events the machine sends.
+
+**Not closed by this**: the desktop boot's 120 s `udev-settle` wait. The same
+probe with udevd *not* started answers `udevadm settle --timeout=2` with rc=0 at
+once, while the boot with udevd up leaves `/run/udev/queue` and waits the
+default 120 s — and this image's eudev reads the queue file, not the seqnum
+(`strings /bin/udevadm` has no `uevent_seqnum`). The delay is udevd's pending
+queue (an event whose worker never retires), which is the next instrument, not
+a kernel netlink defect.
+
+Pin: `t-uevent`'s four new claims. Gates: x86_64 `pass=241 fail=0`, aarch64
+`A-EXIT=0`, kunit 35 both. Counterfactual: the node unregistered → exactly
+those four claims red, `1 of 241`.

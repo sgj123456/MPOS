@@ -220,6 +220,73 @@ impl Inode for SysFile {
     }
 }
 
+/// The number of the last uevent this kernel sent, as `/sys/kernel/uevent_seqnum`.
+///
+/// It is the one fact udev's `settle` needs before it will stop: libudev's
+/// `udev_queue_get_queue_is_empty()` compares this counter with udevd's own,
+/// and a **missing** file makes that call an error, which `udevadm settle`
+/// treats as "not empty" -- so it waits out its whole timeout. Measured on the
+/// desktop image: `udev-settle` parked 120 s in `poll(7)` with nothing in the
+/// block layer, and `/sys/kernel/uevent_seqnum` did not exist
+/// (`build/scratch/settle.txt`, `docs/notes/` §7.9c).
+///
+/// The shape is Linux's attribute: `0444`, a decimal word and a newline, read
+/// from the live counter rather than stored, because the counter moves under
+/// the reader (`/sys/kernel/uevent_seqnum` is `uevent_seqnum_show` there).
+struct SysSeqnum {
+    ino: Ino,
+    /// The word a `chmod` leaves here, kept for the mount's life as Linux's
+    /// kernfs keeps it on the inode (`docs/notes/` §3.23).
+    mode: AtomicU32,
+}
+
+impl SysSeqnum {
+    /// Linux prints the counter with a trailing newline; the width is not
+    /// padded, so a reader parses the same word any value renders as.
+    fn rendered() -> alloc::string::String {
+        alloc::format!("{}\n", crate::uevent::seqnum())
+    }
+}
+
+impl Inode for SysSeqnum {
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
+
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: Self::rendered().len() as u64,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.load(Ordering::Relaxed)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let bytes = Self::rendered();
+        let bytes = bytes.as_bytes();
+        let start = offset.min(bytes.len() as u64) as usize;
+        let end = (start + buf.len()).min(bytes.len());
+        buf[..end - start].copy_from_slice(&bytes[start..end]);
+        Ok(end - start)
+    }
+}
+
 /// A symbolic link in the device tree.
 ///
 /// `/sys/bus/pci/devices/<bdf>` is not a directory: it is a link to the
@@ -1250,6 +1317,17 @@ fn build_kernel(fs: &Arc<SysFs>, mut next: u64) -> u64 {
             mode: AtomicU32::new(SYS_RO_ATTR_MODE),
             ino: next,
             content: env!("CARGO_PKG_NAME"),
+        }),
+    );
+    next += 1;
+    // The counter udev's `settle` compares against its own before declaring the
+    // kernel's event queue drained; without it the call errors and the wait is
+    // its full timeout (`docs/notes/` §7.9c).
+    kernel.add(
+        "uevent_seqnum",
+        Arc::new(SysSeqnum {
+            ino: next,
+            mode: AtomicU32::new(SYS_RO_ATTR_MODE),
         }),
     );
     next
