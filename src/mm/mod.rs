@@ -257,3 +257,87 @@ pub unsafe fn init(info: &BootInfo) -> FrameStats {
     );
     stats
 }
+
+/// The line the machine prints when the kernel heap cannot serve a request,
+/// before the caller's own panic ends it. **Not allocating itself**, on purpose:
+/// this runs when the allocator has nothing, so a `format!` here would ask the
+/// failed allocator again. Pure text, so it lives on the host side and is tested
+/// there (`docs/notes/` §8.0.2 says why the answer is a line and not a kill).
+pub fn exhaustion_line(size: usize, into: &mut [u8]) -> usize {
+    const PREFIX: &[u8] = b"mpos: heap exhausted: ";
+    const SUFFIX: &[u8] = b" bytes (the machine stops here; docs/notes/ 8.0.2)\n";
+    let mut n = 0;
+    for &b in PREFIX {
+        if n < into.len() {
+            into[n] = b;
+            n += 1;
+        }
+    }
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    let mut value = size;
+    if value == 0 {
+        digits[0] = b'0';
+        count = 1;
+    }
+    while value > 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+    }
+    for i in (0..count).rev() {
+        if n < into.len() {
+            into[n] = digits[i];
+            n += 1;
+        }
+    }
+    for &b in SUFFIX {
+        if n < into.len() {
+            into[n] = b;
+            n += 1;
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod exhaustion_tests {
+    use super::exhaustion_line;
+
+    /// The death line names the request and never allocates: a heap that has
+    /// nothing left may not grow a string to say so.
+    #[test]
+    fn the_heaps_last_line_names_the_request() {
+        let mut buf = [0u8; 96];
+        let n = exhaustion_line(4096, &mut buf);
+        assert_eq!(
+            &buf[..n],
+            b"mpos: heap exhausted: 4096 bytes (the machine stops here; docs/notes/ 8.0.2)\n"
+        );
+        for (size, digits) in [
+            (0usize, "0"),
+            (1, "1"),
+            (999, "999"),
+            (123_456_789, "123456789"),
+        ] {
+            let n = exhaustion_line(size, &mut buf);
+            let mut want = [0u8; 96];
+            let pfx = b"mpos: heap exhausted: ";
+            let sfx = b" bytes (the machine stops here; docs/notes/ 8.0.2)\n";
+            let mut k = 0;
+            for &b in pfx {
+                want[k] = b;
+                k += 1;
+            }
+            for b in digits.as_bytes() {
+                want[k] = *b;
+                k += 1;
+            }
+            for &b in sfx {
+                want[k] = b;
+                k += 1;
+            }
+            assert_eq!(&buf[..n], &want[..k], "size {size}");
+        }
+    }
+}

@@ -7528,3 +7528,26 @@ Pins: `a_mounts_room_covers_the_names_it_holds`, the ledger test's name-inclusiv
 and the reconciled `t-tmpfs-limits` claim. Gates: x86_64 `pass=238`, aarch64 `all 237`.
 Counterfactual: `charge_name` answering `true` → `t-tmpfs-limits` alone red on exactly the
 fill claim.
+
+## item 141 — the allocator's failure path: measured, named, and made legible
+
+R.8's remaining half. Measured on Linux 7.2.11 first (`build/scratch/allocfail/`):
+`socket`/`pipe`/`mmap`/`fork` under a 64 MiB memory cap all *succeed* (overcommit); touching
+past the cap gives the OOM `SIGKILL`; pressure on accounted objects (200 000 tmpfs creates)
+gives a scope-wide `SIGKILL` (137), never `ENOMEM`; an accounted *limit* (`ulimit -v`) gives
+`mmap` → `ENOMEM` 12. So Linux's two answers are "accounted limit → ENOMEM/ENOSPC" and
+"unaccounted exhaustion → OOM kill".
+
+Not adopted: killing the current process from inside the allocator. (1) its null is reached
+inside a caller's borrow/lock, so a kill abandons the machine with those held and the kernel
+hangs; (2) the death path itself allocates, recursing into the failing allocator. Linux
+escapes because its call sites return `-ENOMEM`; Rust's `GlobalAlloc` cannot express that.
+
+Landed: `mm::exhaustion_line(size, buf)` (pure, host-tested) + `KernelHeap::alloc` printing it
+through the non-allocating `console::write_bytes` before returning null, so the serial names
+the request the machine died of instead of only Rust's message. Pin:
+`mm::exhaustion_tests::the_heaps_last_line_names_the_request`.
+
+Stays named: the allocation failure still ends the machine; closing it needs fallible call
+sites or a lock-free reclaim policy. The user-reachable doors were closed instead (items
+136/139, §3.20, §3.21), so a program cannot reach the panic today.

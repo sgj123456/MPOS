@@ -497,4 +497,68 @@ job (`docs/uapi/` item 131; log `build/scratch/secretmem-cf.log`).
 
 8.0: **a userspace process could panic the kernel** — fixed for the case that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB contiguous `realloc` is an order the buddy allocator never serves), and tmpfs now has a byte budget answering `ENOSPC`; demand paging also took "maps too much" off the list, since a mapping is now an address space and backs nothing until it is touched.
 
-**§8.0.1 (2026-10-30) took the fault path's half of "give the process something to lose instead of the kernel":** a fault that cannot get a frame now ends the whole thread group with `SIGKILL` - Linux's measured OOM answer - rather than being reported as `SIGSEGV`, and the 1024-frame reserve is what lets the death itself run. Still open, and these are the sentences that keep R.8 open: the **global allocator's** failure path is `panic!`, so a `Vec` grown on a user's behalf in any path other than demand paging still ends the machine; §8.0.1's own named residuals are the page-table frame a `try_map` may take inside the one-fault window, and aarch64's `Tables::frame` `expect` - which only the kernel's own plan reaches.
+**§8.0.1 (2026-10-30) took the fault path's half of "give the process something to lose instead of the kernel":** a fault that cannot get a frame now ends the whole thread group with `SIGKILL` - Linux's measured OOM answer - rather than being reported as `SIGSEGV`, and the 1024-frame reserve is what lets the death itself run. Still open, and these are the sentences that keep R.8 open: the **global allocator's** failure path is `panic!`, so a `Vec` grown on a user's behalf in any path other than demand paging still ends the machine; §8.0.1's own named residuals are the page-table frame a `try_map` may take inside the one-fault window, and aarch64's `Tables::frame` `expect` - which only the kernel's own plan reaches. **§8.0.2 (2026-10-30) turned that first sentence into a measured named gap rather than a patch**: Linux answers an accounted limit with `ENOMEM`/`ENOSPC` and unaccounted exhaustion with the OOM killer (both measured); a kill from inside `KernelHeap::alloc` was rejected because its null is reached under a caller's borrow and its death path allocates, so what landed is the death's own line (`mm::exhaustion_line`) and the doors that used to reach the panic are closed instead (items 136/139, §3.20, §3.21). The allocation failure itself still ends the machine, and that is what keeps R.8 open.
+
+#### 8.0.2 The allocator's failure path is a named gap, and the measurement that says why — **named** (2026-10-30)
+
+§8.0.1 took the fault path's half of R.8: a fault that cannot get a frame ends
+the process with Linux's OOM `SIGKILL`. The other half — "the global allocator
+still panics" — is where R.8 stays open, and this note records the measurement
+that decided what to do about it, and the one thing landed (a legible death).
+
+**Measured on Linux 7.2.11 first** (`build/scratch/allocfail/`):
+
+| Shape | Linux's answer |
+|---|---|
+| `socket(2)`, `pipe(2)`, `mmap(64 MiB)`, `fork(2)` under `MemoryMax=64M` with 48 MiB already touched | all **succeed** — overcommit means no memory is allocated until a page is touched |
+| touching that memory past the limit (measured for §8.0.1) | the touching process is **`SIGKILL`ed**, machine and siblings run on |
+| the *accounted* objects under pressure (tmpfs names/inodes: 200 000 creates with 48 MiB held) | the whole scope is **`SIGKILL`ed** (exit `137`) — no `ENOMEM` ever comes back |
+| an accounted *limit* (`ulimit -v 64M`) | `mmap(128 MiB)` → **`ENOMEM` 12** ("Cannot allocate memory") |
+| `vm.overcommit_memory` | `0` (heuristic) on this host |
+
+So Linux has exactly two answers, and they belong to two different things: a
+**limit the caller's resource accounting knows about** answers `ENOMEM`/`ENOSPC`
+(this kernel's VMA ceiling, tmpfs `size=`/`nr_inodes=`, the name and attribute
+charges of §3.20/§3.21 are that shape), and **memory exhaustion nobody accounted
+for is the OOM killer** — the process dies, the machine lives.
+
+**Why the allocator's `panic!` was not replaced by a process kill.** The
+tempting move is to make `KernelHeap::alloc`'s null path end the current process
+like `out_of_memory()` does. It is not safe, for two measured-by-reading
+reasons: (1) the allocator's null is reached *inside* whatever the caller was
+doing — a `Vec` growth under a `Mutex<RefCell<_>>` borrow, an inode lock, a
+directory borrowed for an insertion — so a kill from here abandons the machine
+with those borrows still held, and the kernel then hangs instead of losing one
+process; (2) the death path itself allocates (the console's `Vec` sink, the
+group's frame list), which is the same allocator that just said no, so the kill
+would recurse into its own failure. Linux escapes both because its allocation
+call sites are fallible *return values* (`-ENOMEM` travels up the same stack that
+still holds the locks) — a shape Rust's `GlobalAlloc` cannot express. Making
+every call site fallible is a rewrite of the kernel, not an item.
+
+**What landed**: the heap's last words, and nothing else.
+
+`src/mm/mod.rs` grew `pub fn exhaustion_line(size, into: &mut [u8]) -> usize` — a
+pure, host-tested formatter building `mpos: heap exhausted: N bytes (the machine
+stops here; docs/notes/ 8.0.2)` into a caller's buffer, because a `format!` at
+that point would ask the failed allocator for the string. `src/mm/heap.rs`
+calls it through `crate::console::write_bytes` (which `record`s into a
+fixed-size buffer and never allocates) before returning null, so Rust's own
+`handle_alloc_error` panic still ends the machine — but the serial now says
+which request it died of, where before it said only Rust's
+"memory allocation of N bytes failed" with no kernel line at all.
+
+Pin: `mm::exhaustion_tests::the_heaps_last_line_names_the_request` (host, 714th
+test) asserts the exact bytes and the digit rendering for 0, 1, 999 and
+123 456 789. The print is one-shot (`REPORTING` in `src/mm/heap.rs:381`): if the
+console path ever allocated, the print would recurse into the allocator that
+just refused, so a second entry stays silent and lets the panic come.
+
+**What stays named** (and why it is a gap and not a TODO): the allocator's
+failure path still ends the machine. Closing it honestly needs either fallible
+allocation at every user-facing call site, or a reclaim policy that can free
+memory without holding the locks the failing caller holds; both are design work,
+not a patch. The doors that could reach it from user space were closed instead —
+VMA table (item 136), tmpfs `size=`/`nr_inodes=` (item 139), attributes (§3.20),
+names (§3.21) — which is why the panic is currently unreachable by a program
+rather than merely unexplored.

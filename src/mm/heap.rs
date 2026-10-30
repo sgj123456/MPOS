@@ -318,9 +318,32 @@ impl KernelHeap {
     }
 }
 
+/// Print the heap's own last words, then let the caller panic exactly as before.
+///
+/// One-shot on purpose: the console path is written not to allocate, but if it
+/// ever did, this would be a recursion into the allocator that just failed -
+/// so a second entry answers nothing and lets the panic come.
+#[cfg(target_os = "none")]
+fn note_exhausted(size: usize) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static REPORTING: AtomicBool = AtomicBool::new(false);
+    if REPORTING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut line = [0u8; 96];
+    let n = super::exhaustion_line(size, &mut line);
+    crate::console::write_bytes(&line[..n]);
+}
+
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        critical_section::with(|cs| self.0.borrow(cs).borrow_mut().alloc(layout))
+        let ptr = critical_section::with(|cs| self.0.borrow(cs).borrow_mut().alloc(layout));
+        if ptr.is_null() {
+            #[cfg(target_os = "none")]
+            note_exhausted(layout.size());
+            return ptr;
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
