@@ -6510,3 +6510,25 @@ created, and whether the desktop of a compositor with a config and a client draw
 at all. The client fixture must also be fixed first — the probe's
 `weston-terminal` wrote an empty log and never made a window, and the probe shell
 needs `NIRI_SOCKET` exported to ask niri anything.
+
+### 7.9a The completion wait behind a head that is not ours — the loop, and the window that could not be constructed (2026-10-30)
+
+R.9 leaves the block audit with one transfer "submitted and never retired" (§7.9), and the completion wait it points at had two shapes a reader can see without a boot:
+
+* a **masked spin** at the end — `critical_section::with(|cs| while device.peek_used() != Some(token) { spin_loop() })`. Interrupts are off inside it, so the completion interrupt cannot land: the spin only ends if the used-ring entry was already written, which is the opposite of the state it is asked about. Both transports had it.
+* a head that is **not** ours (an abandoned entry, a task that died in the transfer arm) was printed once and then waited *behind* for ever: `peek_used()` answered `Some(other)` on every pass, the loop re-parked, and the device's later used entries stayed queued behind a head nobody popped.
+
+Both were rewritten in one shape, for both transports: the wait peeks the ring under the critical section; its own token completes it; a foreign head is **drained** (`drivers::virtio::drain_abandoned`, the function the drain suite already pins); a head that resists the drain is printed once; and every empty pass re-parks on
+`block_until_uninterruptible_until(4, …)` at the same 4 ms period as before. Nothing masked is spun, and a foreign head cannot outlive the wait that meets it.
+
+**The pin could not be built, and that is the measurement.** A test door (`SelftestBlk::selftest_submit_racing`) submits a real read and returns its token *without retiring it* — the in-flight abandoned shape — and a kunit case then reads through the ordinary door and counts which drain retired the abandoned entry. Three gate runs (256 KiB racing read with a print between the two submissions; the print moved after the read; 16 MiB instead of 256 KiB) answered the same way:
+
+    drain: racing token 0 left in flight; the wait drained 0, the submit 0
+
+and the abandoned token was popped **later**, by an unrelated transfer (`mpos: blk drain: token=0 submitter=0 drained=1`). So on this device the later-submitted read completed *first*: the used ring carried our token at the head while the earlier submission's entry had not arrived yet. That is **out-of-order completion**, and it makes "a foreign head in front of mine" unreachable by construction — the state the loop exists for is not the state this machine produces. The loop was reverted rather than landed: a rewrite whose counterfactual cannot be built has no pin, and an unproven change does not land here (AGENTS.md §3's rule 4). The two defects stay named above with their code lines, so the next reader starts from the reading rather than from the fix.
+
+**What did land: the gate's first concurrent reader of the disk.** R.9's reproduction is four children that each `exec` a binary off the ext4 root; the record says why the gate cannot see it ("the first machine's root is an initramfs... and no test forked concurrent readers"). `user/tests/src/bin/t-exec-concurrent.rs` is that reader: four children forked behind a pipe barrier, released together by one write, each `execve`ing `/bin/t-getpid` from the machine's own program directory, reaped inside a 5 s bound. A wedge answers the bound (the claims name the parked child) rather than the lane's budget. Both arms pass it at this commit — x86_64 `all 238 user tests passed` (`build/scratch/execc-gate2.log`), aarch64 `all 237` (`build/scratch/execc-gate-a2.log`), `mpos-kunit 34 passed` on both — so **R.9's reproduction does not reproduce at HEAD**: the four children draw their programs at once and finish.
+
+Its counterfactual is honest to name: only the deadlock's return makes the program red, and no constructed failure exists today. It is a regression instrument, not a fix's pin — this note says so rather than implying a fix landed with it.
+
+One correction for the record: the aarch64 arm was run **twice in one tree at once** during this measurement, and the first pair reported `t-ns-pid`, `t-thread-sighand` and `t-close-range` red on the aarch64 side — the tree shared `build/test-*` artefacts between the two sweeps, which AGENTS.md §5 names as its own trap. The quoted run is the one that ran alone.
