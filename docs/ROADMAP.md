@@ -186,7 +186,7 @@ One-glance status of the whole roadmap.
 
 **ABI gaps → `ENOSYS` (remaining)**
 
-- [x] inotify · [x] `memfd_create` (§7 Stage 3) · [x] xattrs — `user.*` is stored on the memory filesystems (`ramfs`/`tmpfs`), every other namespace and every filesystem with no store refused by name (item 132, §3.15)
+- [x] inotify · [x] `memfd_create` (§7 Stage 3) · [x] xattrs — `user.*` is stored on the memory filesystems (`ramfs`/`tmpfs`) and charged to the mount's room, every other namespace and every filesystem with no store refused by name (items 132/139, §3.15/§3.20)
 - [x] POSIX message queues — `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/
   `mq_notify`/`mq_getsetattr`, priority-ordered and bounded by `RLIMIT_MSGQUEUE`;
   `t-mqueue` pins 41 claims measured on the host first (§6.12) — and **System V

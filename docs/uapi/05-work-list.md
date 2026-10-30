@@ -7469,3 +7469,39 @@ fail=0`; both `mpos-kunit 34 passed`. Counterfactuals: the refusal doors answeri
 -> exactly the three `EPERM` claims red; `may_touch` back to "not policed" -> exactly the
 child's two `EACCES` claims red. Named: per-process ownership of `/proc/<pid>` nodes
 (Linux's are owned by the reader, this tree reports root's) and sysfs's `chmod` half.
+
+## item 139 — a mount's room covers the attributes its inodes keep (R.8's last open door)
+
+Item 132 wrote this down as a divergence: a `RamFs` charged file *contents* to a mount's
+room, and nothing else, so a `size=64k` tmpfs could hold a gigabyte of `user.*` values -
+each one a `String` and a `Vec` on the kernel heap, with no budget in the way. That is the
+shape the worst-case rule forbids, and the door the allocator's `panic!` sits behind.
+
+Measured on Linux 7.2.11 first (`build/scratch/xcharge/p.c`, root, `tmpfs` mounted
+`size=1M`): forty 64 KiB attributes (2 621 440 bytes) all answered `0` on one file, and a
+64 KiB data write on the same file still fit. A tmpfs's `size=` is a page-cache budget;
+attributes are metadata and answer to the allocator (and, under pressure, the OOM killer),
+not to the mount's size.
+
+Landed: `vfs::xattr::Budget` (`charge`/`release`), implemented by `RamFs` over its own
+`Usage`, so a node's store (`Vault::with_budget`) charges a new attribute's name plus value,
+a replacement's difference, and releases on remove, replacement and the inode's drop. A
+refused charge is `ENOSPC` - the number a tmpfs already answers when its size is reached, so
+a caller sees the same errno on both of the mount's doors. **This kernel's `size=` therefore
+means everything the mount keeps, where Linux's means page cache**: named divergence, in the
+direction the worst-case rule requires (`docs/notes/` §3.20).
+
+Pin: three host tests in `src/vfs/xattr.rs` (a counting room), `src/vfs/ramfs.rs`'s
+`a_mounts_room_covers_the_attributes_its_inodes_keep`, and `t-xattr`'s guest claims (`a
+size=64k mount holds two 22 KiB attributes`, `a mount's size= covers the attributes it
+keeps, so the third is ENOSPC`, `an attribute given back is room for the next one`; a host
+run skips the sized-mount block because Linux accepts all three, which is the divergence
+itself).
+
+Gates: x86_64 `X-EXIT=0`, aarch64 `A-EXIT=0`, host 712. Counterfactual: `Error::NoSpace`
+answering `0` -> `t-xattr` alone red, exactly `a mount's size= covers the attributes it
+keeps, so the third is ENOSPC`.
+
+Named residual: directory entries are still uncharged (one name is a `String`, the same
+argument); closing that needs its accounting reconciled with `t-tmpfs-limits`' "a `size=64k`
+mount takes exactly its 64 KiB" claim, which counts data only as Linux does.

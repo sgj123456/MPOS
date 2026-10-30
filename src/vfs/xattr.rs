@@ -40,13 +40,16 @@
 //! readable by anyone, the second visible only to root), and this kernel keeps
 //! neither - it has no LSM and no per-caller visibility to hide one - so a name
 //! in either namespace answers `EOPNOTSUPP` here where Linux's *root* would
-//! store it. The store is close to the one thing a caller can steer without a
-//! bound, so each value is capped at Linux's own `XATTR_SIZE_MAX`; the number of
-//! attributes is not capped, for the reason directory entries are not - the
-//! bytes are the filesystem's metadata, and `RamFs` charges only file contents
-//! to a mount's room.
+//! store it. Each value is capped at Linux's own `XATTR_SIZE_MAX`, and the
+//! store's bytes are charged to the filesystem's [`Budget`] - the shape `RamFs`
+//! already gives file contents - because an attribute is an allocation on the
+//! caller's behalf, and a mount with a `size=` is a promise about everything it
+//! keeps. Linux's tmpfs does not count attributes against its `size=` (measured:
+//! forty 64 KiB attributes on a mount sized 1 MiB all landed), so this is a
+//! named divergence in the direction of the worst-case rule.
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -87,6 +90,28 @@ pub enum Error {
     Exists,
     /// E2BIG: the value is larger than [`VALUE_MAX`].
     TooBig,
+    /// ENOSPC: the filesystem has no room left for the bytes this attribute
+    /// would keep. Linux's tmpfs does not count attributes against its `size=`
+    /// (measured: forty 64 KiB attributes on a mount sized 1 MiB were all
+    /// accepted), so this is this kernel's own bound - a named divergence, and
+    /// the reason a mount with room is still a mount whose heap is bounded
+    /// (`docs/notes/` §3.20).
+    NoSpace,
+}
+
+/// The room an attribute's bytes come out of.
+///
+/// The store lives on the kernel heap, which has no per-mount budget of its
+/// own, so the filesystem that keeps the inode supplies one. Without it the
+/// number of attributes a caller can set would be unbounded - each `set` is an
+/// allocation on the caller's behalf, which is exactly the shape the worst-case
+/// rule forbids (`AGENTS.md` §3, rule 4).
+pub trait Budget: Send + Sync {
+    /// Take `bytes` more room, or refuse. Refusing is the caller's `ENOSPC`.
+    fn charge(&self, bytes: u64) -> bool;
+    /// Give `bytes` back: a removed or replaced attribute, or an inode whose
+    /// last name went away.
+    fn release(&self, bytes: u64);
 }
 
 /// Which vocabulary the name belongs to.
@@ -145,6 +170,9 @@ struct Entry {
     /// because `classify` has already decided which one this is.
     name: String,
     value: Vec<u8>,
+    /// What this entry was charged to the store's budget: the name and the
+    /// value, because both are bytes the mount keeps for as long as it does.
+    charged: u64,
 }
 
 /// One inode's attributes: the store a memory filesystem keeps.
@@ -156,6 +184,8 @@ struct Entry {
 /// the push, with no user memory touched while it is held.
 pub struct Vault {
     entries: Mutex<RefCell<Vec<Entry>>>,
+    /// The room these bytes come out of, when the filesystem has one.
+    budget: Option<Arc<dyn Budget>>,
 }
 
 impl Vault {
@@ -163,6 +193,33 @@ impl Vault {
     pub const fn new() -> Vault {
         Vault {
             entries: Mutex::new(RefCell::new(Vec::new())),
+            budget: None,
+        }
+    }
+
+    /// An empty store whose bytes are charged to `budget` - the shape every
+    /// `RamFs` node uses, so a mount's room covers what its attributes keep.
+    pub fn with_budget(budget: Arc<dyn Budget>) -> Vault {
+        Vault {
+            entries: Mutex::new(RefCell::new(Vec::new())),
+            budget: Some(budget),
+        }
+    }
+
+    /// Take room for one more entry, refusing the operation if the filesystem
+    /// has none. `delta` is signed because a replacement may shrink a value
+    /// while its name stays charged.
+    fn charge(&self, bytes: u64) -> Result<(), Error> {
+        match &self.budget {
+            None => Ok(()),
+            Some(budget) if budget.charge(bytes) => Ok(()),
+            Some(_) => Err(Error::NoSpace),
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Some(budget) = &self.budget {
+            budget.release(bytes);
         }
     }
 
@@ -204,17 +261,28 @@ impl Vault {
                     if flags & XATTR_CREATE != 0 {
                         return Err(Error::Exists);
                     }
+                    let want = (name.len() + value.len()) as u64;
+                    let had = entry.charged;
+                    if want > had {
+                        self.charge(want - had)?;
+                    } else {
+                        self.release(had - want);
+                    }
                     entry.value.clear();
                     entry.value.extend_from_slice(value);
+                    entry.charged = want;
                     Ok(())
                 }
                 None => {
                     if flags & XATTR_REPLACE != 0 {
                         return Err(Error::NoData);
                     }
+                    let want = (name.len() + value.len()) as u64;
+                    self.charge(want)?;
                     entries.push(Entry {
                         name: name.to_string(),
                         value: value.to_vec(),
+                        charged: want,
                     });
                     Ok(())
                 }
@@ -228,7 +296,8 @@ impl Vault {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             match entries.iter().position(|entry| entry.name == name) {
                 Some(at) => {
-                    entries.remove(at);
+                    let entry = entries.remove(at);
+                    self.release(entry.charged);
                     Ok(())
                 }
                 None => Err(Error::NoData),
@@ -264,6 +333,23 @@ impl Vault {
     }
 }
 
+impl Drop for Vault {
+    /// Give every byte this store still holds back to the filesystem's room. An
+    /// inode's store drops with its last name, so a mount that has been filled
+    /// by attributes is empty again once the files are gone.
+    fn drop(&mut self) {
+        let total = critical_section::with(|cs| {
+            self.entries
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|entry| entry.charged)
+                .sum::<u64>()
+        });
+        self.release(total);
+    }
+}
+
 impl Default for Vault {
     fn default() -> Vault {
         Vault::new()
@@ -274,6 +360,83 @@ impl Default for Vault {
 mod tests {
     use super::*;
     use alloc::vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// A room that counts what it was asked for, so a test can see both the
+    /// charge and the release - the filesystem's budget in miniature.
+    struct Counting {
+        free: AtomicU64,
+        taken: AtomicU64,
+    }
+
+    impl Counting {
+        fn new(free: u64) -> Arc<Counting> {
+            Arc::new(Counting {
+                free: AtomicU64::new(free),
+                taken: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl Budget for Counting {
+        fn charge(&self, bytes: u64) -> bool {
+            if self.free.load(Ordering::Relaxed) < bytes {
+                return false;
+            }
+            self.free.fetch_sub(bytes, Ordering::Relaxed);
+            self.taken.fetch_add(bytes, Ordering::Relaxed);
+            true
+        }
+
+        fn release(&self, bytes: u64) {
+            self.free.fetch_add(bytes, Ordering::Relaxed);
+            self.taken.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// The store spends the filesystem's room for the bytes it keeps, and gives
+    /// them back when the attribute goes - the door that keeps a caller from
+    /// growing the kernel heap without a bound (the worst-case rule).
+    #[test]
+    fn a_store_spends_the_room_of_the_bytes_it_keeps() {
+        let room = Counting::new(64);
+        let vault = Vault::with_budget(room.clone());
+        vault.set("user.a", b"1234", 0).unwrap(); // name 6 + value 4
+        assert_eq!(room.taken.load(Ordering::Relaxed), 10);
+        assert_eq!(vault.set("user.b", &[0u8; 32], 0), Ok(()));
+        assert_eq!(room.taken.load(Ordering::Relaxed), 10 + 38);
+        // Nothing left for one more name and value.
+        assert_eq!(vault.set("user.c", &[0u8; 32], 0), Err(Error::NoSpace));
+        vault.remove("user.b").unwrap();
+        assert_eq!(room.taken.load(Ordering::Relaxed), 10);
+        assert_eq!(vault.set("user.c", &[0u8; 32], 0), Ok(()));
+    }
+
+    /// A replaced attribute is charged the difference, not the whole value
+    /// again: growing it spends room, shrinking it gives room back.
+    #[test]
+    fn a_replacement_spends_only_the_difference() {
+        let room = Counting::new(1024);
+        let vault = Vault::with_budget(room.clone());
+        vault.set("user.a", b"0123", 0).unwrap(); // 10 bytes
+        vault.set("user.a", &[0u8; 100], 0).unwrap(); // 106 bytes
+        assert_eq!(room.taken.load(Ordering::Relaxed), 106);
+        vault.set("user.a", b"", 0).unwrap(); // 6 bytes: the name only
+        assert_eq!(room.taken.load(Ordering::Relaxed), 6);
+    }
+
+    /// An inode whose last name goes away takes its attributes' room with it.
+    #[test]
+    fn a_dropped_store_gives_its_room_back() {
+        let room = Counting::new(64);
+        {
+            let vault = Vault::with_budget(room.clone());
+            vault.set("user.a", &[0u8; 20], 0).unwrap();
+            assert_eq!(room.taken.load(Ordering::Relaxed), 26);
+        }
+        assert_eq!(room.taken.load(Ordering::Relaxed), 0);
+        assert_eq!(room.free.load(Ordering::Relaxed), 64);
+    }
 
     #[test]
     fn a_value_round_trips_and_the_probe_answers_its_length() {

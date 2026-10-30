@@ -1274,3 +1274,54 @@ keeps no dynamic owner, so the same caller reads the root-owned file's answers
 "reported, not kept" shape as item 137's mode. `chown` on a sysfs node answers `0` and
 stores nothing - Linux's kernfs does store what root names, so a later `stat` differs
 from this kernel's; named, not claimed.
+
+### 3.20 A mount's room covers the attributes its inodes keep — **DONE** (2026-10-30)
+
+R.8's last open door was the one item 132 wrote down as a divergence: a `RamFs`
+charged file *contents* to a mount's room, and nothing else. An extended
+attribute is kernel heap (a `String` name and a `Vec` value per attribute), so a
+caller who set attributes in a loop grew the kernel heap with no mount budget in
+the way — a `size=64k` tmpfs could hold a gigabyte of `user.*` values.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/xcharge/p.c`, uid 0, a tmpfs
+mounted `size=1M`): forty 64 KiB attributes (**2 621 440 bytes**) all answered
+`0` on the same file, and one 64 KiB *data* write on that file still fit. So a
+tmpfs's `size=` is a page-cache budget: attributes are the filesystem's metadata
+and are not counted against it. Linux bounds them where it bounds any kernel
+allocation — the allocator's answer, and under pressure the OOM killer, not
+`ENOSPC`.
+
+**Landed**: a store's bytes are charged to the filesystem's room through
+`vfs::xattr::Budget` (`charge`/`release`). `RamFs` implements it with its own
+`Usage`, so a node's vault (`Vault::with_budget`) charges a new attribute's name
+plus value, a replacement's difference, and releases on remove, replacement and
+the inode's own drop (`Vault::drop` gives back everything still held). A refused
+charge is `ENOSPC` (`xattr::Error::NoSpace`) — the number a tmpfs already answers
+when its size is reached, so a caller that treats one errno as "the filesystem is
+full" sees the same thing on both of its doors. This kernel's `size=` therefore
+means *everything this mount keeps*, where Linux's means *page cache*: a named
+divergence in the direction the worst-case rule requires, and the reason it is
+recorded here rather than claimed against Linux.
+
+Named residual: **directory entries are still uncharged** — one name in a
+`RamDir` is a `String`, so the same argument applies to names, and the fix is
+the same shape. It is left named because the accounting has to agree with
+`t-tmpfs-limits`' existing "a `size=64k` mount takes exactly its 64 KiB" claim,
+which counts data only (as Linux's `size=` does), and that reconciliation is its
+own measured item.
+
+Pins: `src/vfs/xattr.rs`'s three host tests (a counting room: charge, replacement
+difference, drop releasing) and `src/vfs/ramfs.rs`'s
+`a_mounts_room_covers_the_attributes_its_inodes_keep` (a 64 KiB mount holds two
+22 KiB attributes, refuses the third, and takes the third after one is given
+back). `user/tests/src/bin/t-xattr.rs` carries the same claims on the guest
+(`a size=64k mount holds two 22 KiB attributes`, `a mount's size= covers the
+attributes it keeps, so the third is ENOSPC`, `an attribute given back is room
+for the next one`); a host run skips them because Linux accepts all three, which
+is the divergence itself.
+
+Gates: x86_64 `X-EXIT=0`, aarch64 `A-EXIT=0`. Counterfactual: with the vault
+built by `Vault::new()` instead of `Vault::with_budget(...)`, `t-xattr`'s third
+claim answers `FAIL: a mount's size= covers the attributes it keeps, so the third
+is ENOSPC` while the other two stay green — the claim is the budget's, not the
+mount's.

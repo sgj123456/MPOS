@@ -504,6 +504,47 @@ fn main() {
         }
     }
 
+    // ------------------------------------- a mount's room covers its attributes
+    //
+    // This is this kernel's own bound, not Linux's: a tmpfs here spends its
+    // `size=` on everything it keeps, attributes included, while Linux's tmpfs
+    // counts only page cache - measured, forty 64 KiB attributes landed on a
+    // mount sized 1 MiB (`docs/notes/` §3.19). The guest run pins the bound; a
+    // host run cannot (Linux accepts all three), so the claim is ours-only and
+    // the divergence is named where the store is.
+    let opts = cs("size=64k");
+    let sized = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts.as_ptr().cast(),
+        ) == 0
+    };
+    if sized {
+        let inside = format!("{MNT}/kept");
+        std::fs::write(&inside, b"").expect("an empty file in the sized mount");
+        let value = vec![0u8; 22 * 1024];
+        r.check(
+            "a size=64k mount holds two 22 KiB attributes",
+            setxattr(&inside, "user.a", &value, 0) == 0
+                && setxattr(&inside, "user.b", &value, 0) == 0,
+        );
+        r.check(
+            "a mount's size= covers the attributes it keeps, so the third is ENOSPC",
+            failed(setxattr(&inside, "user.c", &value, 0), libc::ENOSPC)
+                || mpos_user_tests::host_run(),
+        );
+        r.check(
+            "an attribute given back is room for the next one",
+            removexattr(&inside, "user.b") == 0 && setxattr(&inside, "user.c", &value, 0) == 0,
+        );
+        unsafe {
+            libc::umount2(target.as_ptr(), 0);
+        }
+    }
+
     // --------------------------------------------------------------- cleanup
     drop(file);
     let _ = std::fs::remove_dir_all(DIR);

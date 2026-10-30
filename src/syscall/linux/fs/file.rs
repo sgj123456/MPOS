@@ -1238,6 +1238,12 @@ fn xattr_errno(e: crate::vfs::xattr::Error) -> isize {
         Error::NoData => err::ENODATA,
         Error::Exists => err::EEXIST,
         Error::TooBig => err::E2BIG,
+        // The mount's room. Linux's tmpfs does not spend `size=` on attributes
+        // (measured, `docs/notes/` §3.20), so this is this kernel's own bound;
+        // `ENOSPC` is the number a tmpfs answers when its size is reached, so a
+        // caller that treats one number as "the filesystem is full" sees the
+        // same thing on both doors.
+        Error::NoSpace => err::ENOSPC,
     }
 }
 

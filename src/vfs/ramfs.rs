@@ -1251,7 +1251,7 @@ impl Inode for RamDir {
                 mtime: Mutex::new(Cell::new(at)),
                 ctime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
-                xattrs: Vault::new(),
+                xattrs: xattr_store(&self.fs),
                 data: Mutex::new(RefCell::new(Chunked::new())),
             }),
             NodeKind::Dir => Arc::new(RamDir {
@@ -1261,7 +1261,7 @@ impl Inode for RamDir {
                 owner: Mutex::new(Cell::new(owner)),
                 mtime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
-                xattrs: Vault::new(),
+                xattrs: xattr_store(&self.fs),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node `mknod` made. The number is the whole of why this
@@ -1292,7 +1292,7 @@ impl Inode for RamDir {
                 mode: Mutex::new(Cell::new(birth)),
                 owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
-                xattrs: Vault::new(),
+                xattrs: xattr_store(&self.fs),
             }),
             // A FIFO: a name whose channel a `mknod(S_IFIFO)` made. The channel
             // is born with the node and outlives every open of it; the birth
@@ -1554,6 +1554,33 @@ fn total_ram_bytes() -> u64 {
 }
 
 /// A mounted ramfs instance: one root directory and everything under it.
+/// A node's attributes charged to its mount's room.
+///
+/// The store's bytes are kernel heap, so without this a caller could set
+/// attributes until the heap (and the machine) ran out - each `setxattr` is an
+/// allocation on its own behalf. Linux's tmpfs does not count attributes against
+/// `size=` (forty 64 KiB attributes landed on a 1 MiB mount, measured), so this
+/// is a named divergence in the direction the worst-case rule requires
+/// (`docs/notes/` §3.20): a mount's room is about everything it keeps.
+struct UsageBudget {
+    usage: Arc<Usage>,
+}
+
+impl crate::vfs::xattr::Budget for UsageBudget {
+    fn charge(&self, bytes: u64) -> bool {
+        self.usage.charge(bytes)
+    }
+
+    fn release(&self, bytes: u64) {
+        self.usage.release(bytes);
+    }
+}
+
+/// A fresh store for `fs`'s node, charged to its mount's room.
+fn xattr_store(fs: &Arc<Usage>) -> Vault {
+    Vault::with_budget(Arc::new(UsageBudget { usage: fs.clone() }))
+}
+
 pub struct RamFs {
     root: Arc<RamDir>,
 }
@@ -1584,18 +1611,17 @@ impl RamFs {
         // The mount's own root is an inode, and Linux's tmpfs counts it: a
         // `nr_inodes=8` mount held the root plus seven names, measured.
         let _ = fs.charge_inode();
-        Arc::new(RamFs {
-            root: Arc::new(RamDir {
-                fs,
-                ino: fresh_ino(),
-                mode: Mutex::new(Cell::new(None)),
-                owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
-                mtime: Mutex::new(Cell::new(now())),
-                flags: NodeFlags::new(),
-                xattrs: Vault::new(),
-                entries: Mutex::new(RefCell::new(BTreeMap::new())),
-            }),
-        })
+        let root = Arc::new(RamDir {
+            fs: fs.clone(),
+            ino: fresh_ino(),
+            mode: Mutex::new(Cell::new(None)),
+            owner: Mutex::new(Cell::new(crate::sched::current_fs_owner())),
+            mtime: Mutex::new(Cell::new(now())),
+            flags: NodeFlags::new(),
+            xattrs: xattr_store(&fs),
+            entries: Mutex::new(RefCell::new(BTreeMap::new())),
+        });
+        Arc::new(RamFs { root })
     }
 }
 
@@ -1763,6 +1789,30 @@ mod tests {
     /// The whole point of the mount's room: a write that would take the bytes
     /// the machine does not have is refused, not attempted.
     #[test]
+    /// The room a mount names is the room for everything it keeps, attributes
+    /// included - the difference between a bounded mount and one whose caller
+    /// can grow the kernel heap past any budget. Linux's tmpfs does not count
+    /// attributes against `size=` (measured: forty 64 KiB attributes landed on
+    /// a mount sized 1 MiB), so the shape here is this kernel's own bound, named
+    /// in `docs/notes/` §3.20.
+    #[test]
+    fn a_mounts_room_covers_the_attributes_its_inodes_keep() {
+        let fs = RamFs::with_usage(Usage::with_limit(64 * 1024));
+        let root = fs.root();
+        let vault = root.xattr_vault().expect("a memory node keeps a store");
+        // Each of these is 22 KiB of value plus a 6-byte name, so two fit in
+        // the mount's 64 KiB and the third does not.
+        let big = vec![0u8; 22 * 1024];
+        assert_eq!(vault.set("user.a", &big, 0), Ok(()));
+        assert_eq!(vault.set("user.b", &big, 0), Ok(()));
+        assert_eq!(
+            vault.set("user.c", &big, 0),
+            Err(crate::vfs::xattr::Error::NoSpace)
+        );
+        vault.remove("user.b").unwrap();
+        assert_eq!(vault.set("user.c", &big, 0), Ok(()));
+    }
+
     fn a_full_mount_answers_enospc_instead_of_growing() {
         let fs = RamFs::with_usage(Usage::with_limit(4096));
         let root = fs.root();
