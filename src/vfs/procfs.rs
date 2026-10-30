@@ -139,6 +139,22 @@ impl Inode for ProcCtl {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        // The word this node reports is `0644` owned by root, and procfs keeps
+        // no mode of its own for the access check to read (`keeps_modes`
+        // answers false, so `may_as` refuses nothing) - a decorative `0644`
+        // would make every knob one `nobody` can move. So the rule the word
+        // states is applied here, and Linux's answer for an ordinary user's
+        // write to such a file is `EACCES`: its `/proc/sys` inodes carry the
+        // same word and refuse the `open(O_WRONLY)` itself with it (measured
+        // on a current host, `docs/notes/` §10.11a). The refusal lives on the
+        // write rather than the open because the open is the filesystem's
+        // question, and this filesystem answers "not policed" to it.
+        crate::vfs::may_by_mode(
+            crate::vfs::current_caller(),
+            PROC_RW_FILE_MODE,
+            (0, 0),
+            crate::vfs::W_OK,
+        )?;
         // Trailing newlines are how every tool writes these: `sysctl -w`
         // writes the value and a newline, and a hostname with one inside it
         // would then be a hostname `hostname` prints with a line break.
@@ -3716,6 +3732,38 @@ impl ProcFs {
         fs_knobs.add("protected_hardlinks", NodeKind::File, stub("1"));
         fs_knobs.add("protected_symlinks", NodeKind::File, stub("1"));
         sys.add("fs", NodeKind::Dir, fs_knobs);
+        // `/proc/sys/vm`: the one knob in this tree whose number the kernel
+        // *asks*. `max_map_count` is the ceiling the `mmap` handler reads
+        // (`vma_count_reached`), so a write here changes what the next `mmap`
+        // answers - measured on Linux 7.2.11 first (`build/scratch/sysctl/p2.c`):
+        // root-only (an unprivileged open for write is `EACCES`, 13), `0` and
+        // any number up to `INT_MAX` accepted, `abc`/`-1`/`2147483648` each
+        // `EINVAL` with the value untouched, and a write *below* the count a
+        // process already holds leaving those mappings alive. Nothing else
+        // under `/proc/sys/vm` exists here yet, and an absent file answers
+        // `ENOENT` - which is what Linux's own answer is for a knob a kernel
+        // does not carry.
+        let vm = dir();
+        vm.add(
+            "max_map_count",
+            NodeKind::File,
+            ctl(
+                || alloc::format!("{}\n", crate::mm::vma::max_map_count()),
+                |text: &str| {
+                    let value = text.trim();
+                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(VfsError::Invalid);
+                    }
+                    let count: usize = value.parse().map_err(|_| VfsError::Invalid)?;
+                    if count > i32::MAX as usize {
+                        return Err(VfsError::Invalid);
+                    }
+                    crate::mm::vma::set_max_map_count(count);
+                    Ok(())
+                },
+            ),
+        );
+        sys.add("vm", NodeKind::Dir, vm);
         // `/proc/sys/net`: the per-protocol and per-interface knobs. The
         // network stack here is smoltcp with no sysctl surface, so every one
         // of these is a `stub` - the Linux default as the answer, the write

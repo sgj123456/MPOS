@@ -889,7 +889,7 @@ pub fn take_vmas(virt: usize, len: usize) -> Vec<Vma> {
 /// default `max_map_count` allows - the question `mmap` asks before it adds
 /// one (`docs/notes/` §10.11).
 pub fn vma_count_reached() -> bool {
-    current_mm().vma_count() >= crate::mm::vma::MAX_MAP_COUNT
+    current_mm().vma_count() >= crate::mm::vma::max_map_count()
 }
 
 /// The parts of `virt..virt + len` the current process has not already claimed.
@@ -1790,7 +1790,7 @@ impl Mm {
     }
 
     /// How many descriptions this process holds - what
-    /// [`crate::mm::vma::MAX_MAP_COUNT`] bounds.
+    /// [`crate::mm::vma::max_map_count`] bounds.
     pub(crate) fn vma_count(&self) -> usize {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow().len())
     }

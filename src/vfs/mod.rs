@@ -1977,6 +1977,33 @@ pub fn may_as(caller: Caller, inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     }
 }
 
+/// Whether `caller` may do `want` to a node whose **word** says a mode it does
+/// not keep.
+///
+/// [`may_as`] answers `Ok` for every node whose filesystem keeps no modes, and
+/// that is right for a pipe or a procfs listing whose bits nobody set. It is
+/// wrong for a node whose `0644` is a promise to the caller: procfs's
+/// `/proc/sys` knobs report `0644` owned by root, and a mode that is reported
+/// but not enforced would make the knob one nobody can move. Linux's own
+/// answer is the `EACCES` its policed inode answers, so a handler that keeps
+/// the word itself asks the triads here - the same tiers, the same overrides,
+/// and the same errno - instead of asking a question the filesystem has
+/// already answered "not policed".
+pub fn may_by_mode(caller: Caller, mode: u32, owner: (u32, u32), want: u32) -> VfsResult<()> {
+    let allowed = permitted(
+        mode,
+        owner,
+        want,
+        (caller.uid, caller.gid),
+        &current_groups(),
+    ) || overrides_allow(caller.overrides, false, mode, want);
+    if allowed {
+        Ok(())
+    } else {
+        Err(VfsError::Access)
+    }
+}
+
 /// Whether `caller` may rewrite `node`'s **attributes**: its mode, its owner,
 /// or one clock of its timestamps.
 ///

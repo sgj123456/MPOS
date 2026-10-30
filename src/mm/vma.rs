@@ -26,6 +26,8 @@
 //! are pure arithmetic over ranges, so they stay pinned by this file's own host
 //! tests rather than only from inside the machine.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -376,8 +378,31 @@ fn same_name(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
 ///
 /// The number is Linux's *default*; this host has it tuned up to 1 048 576, so
 /// the pin claims the shape the kernel ships rather than the host's setting
-/// (`docs/notes/` §10.11).
-pub const MAX_MAP_COUNT: usize = 65_530;
+/// (`docs/notes/` §10.11). It is the *live* ceiling's starting value: on Linux
+/// the number is policy, `/proc/sys/vm/max_map_count`'s contents, so a write to
+/// that file moves the gate every later `mmap` asks (item 137) rather than
+/// being a second number nothing reads.
+pub const DEFAULT_MAX_MAP_COUNT: usize = 65_530;
+
+/// The live ceiling: `/proc/sys/vm/max_map_count`.
+///
+/// Measured on Linux 7.2.11 first (`build/scratch/sysctl/p2.c`, as root, the
+/// host's sysctl restored afterwards): a write of `1000` was accepted and the
+/// next `mmap` past 1 000 descriptions answered `ENOMEM`; a write of `10`
+/// *below* the count already held was accepted too and the mappings already
+/// made kept working; `abc`, `-1` and `2147483648` were each `EINVAL` and left
+/// the value alone. So the file is the policy and the table is its answer.
+static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MAP_COUNT);
+
+/// The number of descriptions a process may hold, as the sysctl holds it.
+pub fn max_map_count() -> usize {
+    MAX_MAP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Move the ceiling, from a write to `/proc/sys/vm/max_map_count`.
+pub fn set_max_map_count(count: usize) {
+    MAX_MAP_COUNT.store(count, Ordering::Relaxed);
+}
 
 /// The process's VMAs, keyed by `start` and never overlapping.
 ///

@@ -1449,3 +1449,66 @@ pretending to measure the boundary (it is 1 048 576 on the development host).
 **Gates**: x86_64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate3.log`); aarch64 `all 234 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/mmapcount-gate-a2.log`); the first aarch64 attempt failed on stage 1 alone — the documented host-suite load flake, 1200 tests in the same command being green standalone — and the re-run quoted above.
 
 **Counterfactual**: the ceiling check disabled (`if false && crate::sched::vma_count_reached()`) → `t-mmap-count` alone red, `pass=234 fail=1` of 235 built, with exactly its first two claims red — `FAIL: the ceiling refuses with ENOMEM (errno 0)` and `FAIL: the process holds Linux's default 65530 descriptions … (65563 were handed out)` — while the relieved and forked claims stayed green (`build/scratch/mmapcount-cf.log`). The tree's own before/after is the 20 480-mapping number above: 120 s budget exhausted before, 24 ms after.
+
+#### 10.11a The ceiling is a file, and the word on it is enforced — **DONE** (2026-10-30)
+
+§10.11 named one divergence: there is no `vm.max_map_count` sysctl to raise the
+number. On Linux that number *is* a file, and the next `mmap` is answered against
+what the file says — so this kernel keeps it there too, and the file is the gate
+rather than a copy of it.
+
+**Measured first** (Linux 7.2.11; `.workbuddy/probe_max_map_count.c` and
+`.workbuddy/probe_max_map_count_write.c`; the second runs as root): the file is mode
+`0644`, owner root, and reads **`1 048 576`** on this host — a distribution's tuning;
+the kernel's compiled default is 65 530. A root write of `1024` moves the ceiling, and
+the *next* `mmap` is answered against 1 024 (993–994 one-page mappings fit, then
+`ENOMEM` 12), while the same write as an ordinary user is `EACCES` 13. The value is a
+decimal with a trailing newline; a word that is not a number this knob takes (`abc`,
+`-1`, `2147483648`) is `EINVAL` 22 and moves nothing. `chmod` on it is `EPERM` 1 even
+for root — procfs keeps no attributes — where `/dev/null`, a pipe and a socket accept
+`fchmod` (measured: a blanket "this file keeps no modes" rule would be wrong in both
+directions).
+
+**Landed**: `src/mm/vma.rs`'s `MAX_MAP_COUNT` became `DEFAULT_MAX_MAP_COUNT = 65_530`
+(what it was) plus `static MAX_MAP_COUNT: AtomicUsize` starting there, with
+`max_map_count()` and `set_max_map_count(count)`; `sched::vma_count_reached()`
+(`src/sched/runtime/child_mm.rs`) now answers `vma_count() >= max_map_count()`, so the
+one place the ceiling is asked reads the file's number. `src/vfs/procfs.rs`'s
+`/proc/sys` node gained a `vm` directory holding `max_map_count`: a `ProcCtl` whose
+reader prints the number and whose writer runs the measured parse (a digit string in
+`1..=u32::MAX`, an optional trailing newline, anything else `EINVAL` and no change),
+the node reporting `0644` through the word it publishes.
+
+**A wrong word found on the way.** The `0644` was decorative: procfs's nodes keep no
+mode of their own (`keeps_modes()` answers false) and `may_as` deliberately answers
+"not policed" for such a node, so an ordinary user's write **landed** — measured in
+the guest, uid 65 534 moving the knob, the pin's first red claim. Linux's `0644` is
+policed: its `/proc/sys` inode carries the word and refuses the *open* with `EACCES`.
+So the handler now applies the rule the word states — `vfs::may_by_mode` (the same
+triads, the same overrides, the same errno `may_as` uses) is asked at the top of
+`ProcCtl::write_at`, and an unprivileged write is `EACCES`. The open still succeeds
+here; that is a named divergence (this procfs keeps no modes, so the open is not
+where it is refused), and `chmod` on such a node answers 0 where Linux answers
+`EPERM` — the second named divergence, and a `docs/ROADMAP.md` gap of its own (the fix
+is a per-filesystem "attributes refused" answer; a blanket rule would have to
+contradict the pipe and socket rows measured above).
+
+**Pin**: `user/tests/src/bin/t-map-count-sysctl.rs`, eight claims, both machines': the
+file reads 65 530; an unprivileged writer cannot move the number (`EACCES`, value
+still 65 530); root may lower it and the *next* `mmap` is answered against the lowered
+number (refused with 12 after ~1 020 mappings, asserted as a band); three malformed
+words are `EINVAL` and move nothing; a mapping made before the ceiling moved still
+reads and writes; root may restore it; the restored ceiling accepts mappings again.
+The pin formats nothing while the process sits at a lowered ceiling — its own heap's
+next growth is an `mmap` like any other and at 1 024 of 1 024 the allocator's request
+is refused (measured: `memory allocation of 32 bytes failed`, exit 134) — so it
+munmaps a relief block and restores the ceiling before writing its claims. Its host
+branch skips the write half on purpose (this development host's sysctl is 1 048 576, a
+policy a test must not move); run by hand as root *without* `MPOS_ON_HOST` it is a
+reference against Linux and agrees on seven of eight claims, the eighth being that
+host's tuning.
+
+**Gates**: x86_64 `all 237 user tests passed` / `mpos-kunit 34 passed`
+(`build/scratch/sysctl-gate4.log`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/sysctl-gate5.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (verdict `pass=235 fail=0`, `A-EXIT=0`, total 31.63 s, `build/scratch/sysctl-gate-a2.log`).
+
+**Counterfactual**: two, one per half. **The file is not the gate** — `max_map_count()` answering the compiled default again, which is the shape before this item — → `t-map-count-sysctl` alone red, `pass=235 fail=1` of 236 built, on exactly two claims: `FAIL: root may lower the ceiling to 1024` and `FAIL: the lowered ceiling is the one the next mmap is answered against (refused with 0, 1536 mapped, 1483 map rows now)` (`build/scratch/sysctl-cf1.log`). **The word is decorative again** — the `may_by_mode` call removed from `ProcCtl::write_at` — → exactly one claim red, `FAIL: an unprivileged writer cannot move the number (answered 100)`, the other seven green (`build/scratch/sysctl-cf2.log`); both stubs reverted before the final gate..
