@@ -51,8 +51,40 @@ type Entries = Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>;
 /// `stat` - a file whose contents are "how long has the machine been up"
 /// does not have a size that stays still, and pretending otherwise is the
 /// kind of lie a `cp` trips over.
+/// The owner a node of a described process inherits.
+///
+/// Linux's procfs makes `/proc/<pid>` and everything it lists carry the ids of
+/// the process (`mpos_cred::task_dump_owner`, measured on a current host:
+/// `build/scratch/attr2/powner*.c`), and takes them back to root's for a
+/// process that has made itself un-dumpable - except the directories that name
+/// the process, which keep its ids whatever it did. A node is therefore born
+/// with no owner and told one when the directory that listed it knows the
+/// process; until then it is root's, which is what a node outside `/<pid>`
+/// is.
+struct Inherited {
+    owner: Mutex<RefCell<(u32, u32)>>,
+}
+
+impl Inherited {
+    fn new() -> Inherited {
+        Inherited {
+            owner: Mutex::new(RefCell::new((0, 0))),
+        }
+    }
+
+    fn get(&self) -> (u32, u32) {
+        critical_section::with(|cs| *self.owner.borrow(cs).borrow())
+    }
+
+    fn set(&self, owner: (u32, u32)) {
+        critical_section::with(|cs| *self.owner.borrow(cs).borrow_mut() = owner);
+    }
+}
+
 struct ProcFile {
     ino: Ino,
+    /// The owner this node inherits from the process it describes.
+    owner: Inherited,
     generate: Generator,
     /// The permission bits Linux gives *this* file, when they are not the
     /// read-only default every generated file here carries. Zero means that
@@ -66,6 +98,14 @@ struct ProcFile {
 }
 
 impl Inode for ProcFile {
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        self.owner.set(crate::cred::task_dump_owner(ids, dumpable));
+    }
+
     /// The timestamps are accepted and dropped: Linux answers `0` for the
     /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
     /// 2026-10-30), so the store that cannot keep them is not a refusal.
@@ -126,11 +166,21 @@ impl Inode for ProcFile {
 /// leave the reader to conclude the write had not taken.
 struct ProcCtl {
     ino: Ino,
+    /// The owner this node inherits from the process it describes.
+    owner: Inherited,
     read: Generator,
     write: Writer,
 }
 
 impl Inode for ProcCtl {
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        self.owner.set(crate::cred::task_dump_owner(ids, dumpable));
+    }
+
     /// The timestamps are accepted and dropped: Linux answers `0` for the
     /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
     /// 2026-10-30), so the store that cannot keep them is not a refusal.
@@ -207,6 +257,8 @@ impl Inode for ProcCtl {
 /// no longer there names nothing.
 struct ProcLink {
     ino: Ino,
+    /// The owner this node inherits from the process it describes.
+    owner: Inherited,
     target: Generator,
     /// The process whose descriptor this link is a second name for.
     pid: usize,
@@ -235,6 +287,14 @@ struct ProcLink {
 }
 
 impl Inode for ProcLink {
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        self.owner.set(crate::cred::task_dump_owner(ids, dumpable));
+    }
+
     /// The timestamps are accepted and dropped: Linux answers `0` for the
     /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
     /// 2026-10-30), so the store that cannot keep them is not a refusal.
@@ -356,6 +416,11 @@ trait Dynamic: Send + Sync {
 /// A directory of generated files and other directories, by name.
 struct ProcDir {
     ino: Ino,
+    /// The owner this directory inherits from the process it names.
+    owner: Inherited,
+    /// The process this directory names, kept so the nodes it lists can be
+    /// told the same ids as they are handed out.
+    process: Mutex<RefCell<Option<(crate::cred::Ids, u8)>>>,
     /// Each entry with its kind, recorded as it is added: a listing must not
     /// have to ask a node what it is, because asking a generated file is what
     /// generates it.
@@ -406,6 +471,8 @@ impl ProcDir {
             mode,
             size_is_count,
             mirror: false,
+            owner: Inherited::new(),
+            process: Mutex::new(RefCell::new(None)),
         })
     }
 
@@ -420,6 +487,25 @@ impl ProcDir {
 }
 
 impl Inode for ProcDir {
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        // The directory that names a process keeps its ids whatever the
+        // process's dumpability, and everything it lists follows the
+        // dumpability alone (measured: a setuid-dropped child's own pid
+        // directory answered `1000` while its `status` and `fd` had gone back
+        // to root's - `mpos_cred::task_dump_owner`).
+        let owner = if self.mirror {
+            crate::cred::process_dir_owner(ids)
+        } else {
+            crate::cred::task_dump_owner(ids, dumpable)
+        };
+        self.owner.set(owner);
+        critical_section::with(|cs| *self.process.borrow(cs).borrow_mut() = Some((ids, dumpable)));
+    }
+
     /// A pid directory mirrors a process, and Linux's has no `setattr`:
     /// `chown(2)` and all three `utimensat(2)` shapes are `EPERM` for root too
     /// (`build/scratch/attr2/p1.c`/`p2.c`). Every other procfs directory
@@ -479,11 +565,22 @@ impl Inode for ProcDir {
                 .get(name)
                 .map(|(node, _kind)| node.clone())
         });
-        match (fixed, &self.dynamic) {
+        let child = match (fixed, &self.dynamic) {
             (Some(node), _) => Ok(node),
             (None, Some(live)) => live.node(name).ok_or(VfsError::NoEntry),
             (None, None) => Err(VfsError::NoEntry),
+        }?;
+        // A node made on the demand of this directory's name inherits the
+        // process this directory names - the fd and ns directories, a task's
+        // own directory, the entries of either. Doing it on the way out is what
+        // makes the walk find them owned even though they were built after the
+        // process directory was.
+        if let Some((ids, dumpable)) =
+            critical_section::with(|cs| *self.process.borrow(cs).borrow())
+        {
+            child.adopt_process(ids, dumpable);
         }
+        Ok(child)
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
@@ -530,6 +627,7 @@ fn next_ino() -> Ino {
 fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
+        owner: Inherited::new(),
         generate: Box::new(move || Some(generate())),
         mode: 0,
         size: 0,
@@ -617,6 +715,7 @@ fn cpuinfo_text() -> String {
 fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
+        owner: Inherited::new(),
         generate: Box::new(generate),
         mode: 0,
         size: 0,
@@ -635,6 +734,7 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
 fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
+        owner: Inherited::new(),
         generate: Box::new(generate),
         mode: 0o400,
         size: 0,
@@ -656,6 +756,7 @@ fn file_of_size(
 ) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
+        owner: Inherited::new(),
         generate: Box::new(move || Some(generate())),
         mode: 0,
         size,
@@ -669,6 +770,7 @@ fn ctl(
 ) -> Arc<dyn Inode> {
     Arc::new(ProcCtl {
         ino: next_ino(),
+        owner: Inherited::new(),
         read: Box::new(move || Some(read())),
         write: Box::new(write),
     })
@@ -691,6 +793,7 @@ fn stub(value: &'static str) -> Arc<dyn Inode> {
 fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
         ino: next_ino(),
+        owner: Inherited::new(),
         target: Box::new(target),
         pid: 0,
         fd: None,
@@ -708,6 +811,7 @@ fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn 
 fn fixed_link(target: &'static str) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
         ino: next_ino(),
+        owner: Inherited::new(),
         target: Box::new(move || Some(alloc::string::String::from(target))),
         pid: 0,
         fd: None,
@@ -725,6 +829,7 @@ fn fd_link(
 ) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
         ino: next_ino(),
+        owner: Inherited::new(),
         target: Box::new(target),
         pid,
         fd: Some(fd),
@@ -2295,6 +2400,18 @@ fn status_of(slot: usize) -> Option<String> {
         'Z' => "zombie",
         _ => "unknown",
     };
+    // The four ids Linux prints on each line: real, effective, saved, and the
+    // filesystem one a file operation acts as.
+    #[cfg(target_os = "none")]
+    let (uid_line, gid_line) = match crate::sched::identity_of(crate::sched::TaskId(slot)) {
+        Some(ids) => (
+            alloc::format!("{}\t{}\t{}\t{}", ids.ruid, ids.euid, ids.suid, ids.fsuid),
+            alloc::format!("{}\t{}\t{}\t{}", ids.rgid, ids.egid, ids.sgid, ids.fsgid),
+        ),
+        None => (alloc::string::String::new(), alloc::string::String::new()),
+    };
+    #[cfg(not(target_os = "none"))]
+    let (uid_line, gid_line) = (alloc::string::String::new(), alloc::string::String::new());
     Some(alloc::format!(
         "Name:\t{name}\n\
          Umask:\t0022\n\
@@ -2304,8 +2421,8 @@ fn status_of(slot: usize) -> Option<String> {
          Pid:\t{pid}\n\
          PPid:\t{ppid}\n\
          TracerPid:\t0\n\
-         Uid:\t0\t0\t0\t0\n\
-         Gid:\t0\t0\t0\t0\n\
+         Uid:\t{uid_line}\n\
+         Gid:\t{gid_line}\n\
          FDSize:\t64\n\
          Groups:\t\n\
          NStgid:\t{nstgid}\n\
@@ -2351,6 +2468,8 @@ fn status_of(slot: usize) -> Option<String> {
          voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n",
         name = task.comm,
+        uid_line = uid_line,
+        gid_line = gid_line,
         state = task.state,
         tgid = reader_number(leader),
         pid = reader_number(slot),
@@ -2468,7 +2587,11 @@ fn limits_of_pid(pid: usize) -> Option<String> {
 /// `timerslack_ns`. Which is why the tid's own directory is not built here:
 /// [`process_dir`] is that set.
 fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
-    let node = dir();
+    // A thread's directory names a process too - `/proc/<pid>/task/<tid>` is
+    // the same kind of name `/proc/<pid>` is - so it is a mirroring directory:
+    // it keeps the task's ids whatever its dumpability, and refuses the
+    // attribute doors the way a pid directory does.
+    let node = ProcDir::mirroring();
     node.add(
         "stat",
         NodeKind::File,
@@ -2507,6 +2630,9 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // name: `/proc/thread-self/mountinfo` is where a threaded program looks.
     node.add("mounts", NodeKind::File, file(mounts_text));
     node.add("mountinfo", NodeKind::File, file(mountinfo_text));
+    if let Some((ids, dumpable)) = inherited_ids(tid) {
+        node.adopt_process(ids, dumpable);
+    }
     node
 }
 
@@ -2533,6 +2659,7 @@ const OOM_SCORE_ADJ_MAX: i32 = 1000;
 fn oom_score_adj_ctl(pid: usize) -> Arc<dyn Inode> {
     Arc::new(ProcCtl {
         ino: next_ino(),
+        owner: Inherited::new(),
         read: Box::new(move || {
             crate::sched::oom_score_adj_of(pid).map(|(value, _)| alloc::format!("{value}\n"))
         }),
@@ -2603,6 +2730,7 @@ fn timens_offsets_ctl(pid: usize) -> Arc<dyn Inode> {
     }
     Arc::new(ProcCtl {
         ino: next_ino(),
+        owner: Inherited::new(),
         read: Box::new(move || ns(pid).map(|ns| ns.offsets_text())),
         write: Box::new(move |text: &str| {
             let Some(ns) = ns(pid) else {
@@ -2686,6 +2814,7 @@ fn gid_map_ctl(pid: usize) -> Arc<dyn Inode> {
 fn map_ctl(pid: usize, uid: bool) -> Arc<dyn Inode> {
     Arc::new(ProcCtl {
         ino: next_ino(),
+        owner: Inherited::new(),
         read: Box::new(move || {
             user_ns_of(pid).map(|ns| {
                 if uid {
@@ -2729,6 +2858,7 @@ fn map_ctl(pid: usize, uid: bool) -> Arc<dyn Inode> {
 fn setgroups_ctl(pid: usize) -> Arc<dyn Inode> {
     Arc::new(ProcCtl {
         ino: next_ino(),
+        owner: Inherited::new(),
         read: Box::new(move || {
             user_ns_of(pid).map(|ns| alloc::string::String::from(ns.setgroups_text()))
         }),
@@ -2760,6 +2890,31 @@ fn setgroups_ctl(pid: usize) -> Arc<dyn Inode> {
 /// *relative* name `task` beside not one absolute `/proc/<pid>/task/<tid>`
 /// path. So both spellings have a program behind them and neither is a
 /// convenience.
+/// The ids a process's procfs nodes inherit, and whether the process may be
+/// inspected at all - the two answers `mpos_cred::task_dump_owner` turns on.
+#[cfg(target_os = "none")]
+fn inherited_ids(slot: usize) -> Option<(crate::cred::Ids, u8)> {
+    let ids = crate::sched::identity_of(crate::sched::TaskId(slot))?;
+    let dumpable = crate::sched::credentials_of(crate::sched::TaskId(slot))
+        .map_or(crate::cred::SUID_DUMP_DISABLE, |creds| creds.dumpable);
+    Some((
+        crate::cred::Ids {
+            ruid: ids.ruid,
+            euid: ids.euid,
+            suid: ids.suid,
+            rgid: ids.rgid,
+            egid: ids.egid,
+            sgid: ids.sgid,
+        },
+        dumpable,
+    ))
+}
+
+#[cfg(not(target_os = "none"))]
+fn inherited_ids(_slot: usize) -> Option<(crate::cred::Ids, u8)> {
+    None
+}
+
 fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // A tid names a **thread**, and a thread is a task this tree may describe -
     // which `process_ids` (the *listing*'s filter, which asks for a leader) is
@@ -2937,6 +3092,12 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     let namespaces = ProcDir::own(Some(Arc::new(Namespaces { pid: slot })), 0o511, false);
     node.add("ns", NodeKind::Dir, namespaces);
 
+    // The directory carries the described process's ids, and everything it
+    // lists inherits them on the way out of `lookup` - Linux's rule, measured
+    // (`mpos_cred::task_dump_owner`).
+    if let Some((ids, dumpable)) = inherited_ids(slot) {
+        node.adopt_process(ids, dumpable);
+    }
     Some(node)
 }
 
@@ -3031,6 +3192,7 @@ fn namespace_of(_pid: usize, _entry: crate::vfs::ns::Entry) -> Option<crate::vfs
 fn ns_link(pid: usize, entry: crate::vfs::ns::Entry) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
         ino: next_ino(),
+        owner: Inherited::new(),
         target: Box::new(move || namespace_of(pid, entry).map(|ns| ns.link_text())),
         pid,
         fd: None,

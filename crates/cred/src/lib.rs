@@ -519,8 +519,73 @@ pub fn ptrace_may_access(
     target_creds.dumpable != SUID_DUMP_DISABLE
 }
 
+/// Linux's `task_dump_owner`: who owns a procfs node that describes a process.
+///
+/// Measured on a current host (`build/scratch/attr2/powner.c`/`powner2.c`,
+/// Linux 7.2.11): a plain process's nodes carry its `euid`/`egid`; a process
+/// that made itself un-dumpable (a child that changed its ids) still has its
+/// own *directory* entry, and everything else it describes answers root's.
+pub fn task_dump_owner(ids: Ids, dumpable: u8) -> (u32, u32) {
+    if dumpable == SUID_DUMP_DISABLE {
+        return (0, 0);
+    }
+    process_dir_owner(ids)
+}
+
+/// The owner of the directory that *names* a process - `/proc/<pid>` and
+/// `/proc/<pid>/task/<tid>` - which keeps the process's effective ids whatever
+/// its dumpability: measured `1000` for a `setuid`-dropped child whose `status`
+/// and `fd` had gone back to root's.
+pub fn process_dir_owner(ids: Ids) -> (u32, u32) {
+    if ids.euid != 0 || ids.egid != 0 {
+        (ids.euid, ids.egid)
+    } else {
+        (0, 0)
+    }
+}
+
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
+    /// The measured table: a plain process's nodes are its own; a process that
+    /// dropped to another id without staying dumpable keeps only the directory
+    /// that names it.
+    #[test]
+    fn a_processs_nodes_carry_the_ids_it_measured() {
+        let plain = Ids {
+            ruid: 1000,
+            euid: 1000,
+            suid: 1000,
+            rgid: 1000,
+            egid: 1000,
+            sgid: 1000,
+        };
+        assert_eq!(process_dir_owner(plain), (1000, 1000));
+        assert_eq!(task_dump_owner(plain, SUID_DUMP_USER), (1000, 1000));
+        assert_eq!(task_dump_owner(plain, SUID_DUMP_ROOT), (1000, 1000));
+
+        let dropped = Ids {
+            ruid: 0,
+            euid: 1000,
+            suid: 0,
+            rgid: 0,
+            egid: 1000,
+            sgid: 0,
+        };
+        assert_eq!(process_dir_owner(dropped), (1000, 1000));
+        assert_eq!(task_dump_owner(dropped, SUID_DUMP_DISABLE), (0, 0));
+
+        let root = Ids {
+            ruid: 0,
+            euid: 0,
+            suid: 0,
+            rgid: 0,
+            egid: 0,
+            sgid: 0,
+        };
+        assert_eq!(process_dir_owner(root), (0, 0));
+        assert_eq!(task_dump_owner(root, SUID_DUMP_USER), (0, 0));
+    }
+
     use super::*;
 
     fn root() -> Ids {

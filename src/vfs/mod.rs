@@ -1227,6 +1227,16 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// before this existed.
     fn set_owner(&self, _uid: u32, _gid: u32) {}
 
+    /// Inherit the ownership of the process this node describes.
+    ///
+    /// Only procfs asks this, and only of the nodes under a `/proc/<pid>`
+    /// directory: Linux gives those the described process's ids rather than
+    /// root's (`mpos_cred::task_dump_owner`, whose doc carries the measured
+    /// table), and the directory that names a process keeps them even when the
+    /// process has made itself un-dumpable. A filesystem whose nodes describe
+    /// nothing inherits nothing, which is this default.
+    fn adopt_process(&self, _ids: crate::cred::Ids, _dumpable: u8) {}
+
     /// The node's attribute flags: Linux's `FS_*_FL` vocabulary, the word
     /// `FS_IOC_GETFLAGS` returns and `lsattr` prints.
     ///

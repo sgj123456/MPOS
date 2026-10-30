@@ -1366,3 +1366,74 @@ Gates: x86_64 `pass=238`, aarch64 `all 237`, both `mpos-kunit 35 passed`.
 Counterfactual: `Usage::charge_name` answering `true` without charging →
 `t-tmpfs-limits` alone red, exactly `a size=64k mount holds its name plus the
 rest of its 64 KiB, then answers ENOSPC`, because the data alone then fits.
+
+### 3.22 A pid directory names the process it describes — **DONE** (2026-10-30)
+
+The pid tree reported root's ownership for every node it made, which is what a
+`stat /proc/<pid>` of any program's directory answered. Linux does not: the
+nodes describing a process belong to that process.
+
+**Measured first** (Linux 7.2.11, `build/scratch/attr2/powner.c`, `powner2.c`
+and `powner3.c`, as uid 1000 and as root). A plain process (uid 1000, dumpable
+1) hands its ids to everything; a child that changed its ids (`setuid(65534)`,
+which clears the dumpable flag) keeps them **only on the names**:
+
+| node | mode | plain uid-1000 process | `setuid`-dropped child (dumpable 0) |
+|---|---|---|---|
+| `/proc/<pid>` | `0555` | 1000/1000 | **65534/65534** |
+| `/proc/<pid>/task/<tid>` | `0555` | 1000/1000 | **65534/65534** |
+| `/proc/<pid>/status` | `0444` | 1000/1000 | **0/0** |
+| `/proc/<pid>/fd` | `0500` | 1000/1000 | **0/0** |
+| `/proc/<pid>/ns` | `0511` | 1000/1000 | **0/0** |
+| `/proc/<pid>/cwd`, `/proc/<pid>/root` (links) | `0777` | 1000/1000 | 1000/1000 |
+
+A root process answers `(0, 0)` everywhere, so the two rules below are only
+distinguishable on a process that changed its ids - the same shape as item
+140's two attribute doors, and the reason this pin needs a child fixture rather
+than a claim about the sweep's own root identity.
+
+The two rules:
+- the directory that **names** a process carries the process's `euid`/`egid`,
+  whatever its `dumpable` flag says;
+- everything **inside** it follows the `dumpable` flag, which a changed `euid`
+  clears (`Credentials::on_identity_change`, `crates/cred/src/lib.rs`) - so the
+  same process's `status` and `fd` answer root.
+
+**Landed.** `mpos_cred::process_dir_owner` and `mpos_cred::task_dump_owner`
+(pure, host-tested against the table above, in the crate the rules belong to),
+one new default door `Inode::adopt_process(ids, dumpable)`, and in procfs an
+`Inherited` cell per node plus, on a `ProcDir`, the process it names. The
+adoption happens in `ProcDir::lookup`: a node built on demand *after* the
+process directory was made (the `fd` directory, the `ns` directory, a task's
+directory, and each of their entries) is handed the process on the way out, so
+the rule is one funnel rather than a constructor argument threaded through every
+builder. `/proc/<pid>/task/<tid>` is a mirroring directory now too - it names a
+thread the way `/proc/<pid>` names a process - which also gives it the attribute
+refusals item 138 gave the pid directory. `status` prints its `Uid:`/`Gid:`
+lines from the task's identity (real, effective, saved, filesystem) instead of
+four zeroes.
+
+**Pin**: `user/tests/src/bin/t-proc-owner.rs`, seven claims, with the child
+fixture staying alive on its stdin while the parent inspects `/proc/<pid>`. Its
+first version had the child exit before the parent looked, and every ownership
+claim failed against Linux for the trivial reason that the pid was gone - the
+fixture now keeps the process alive until the parent is done. Reference run:
+against real Linux 7.2.11 as root, all seven `ok:`.
+
+**Gates**: x86_64 `verdict pass=240 fail=0` (25.73 s), aarch64 `all 239 user
+tests passed` (25.84 s, `-35.9%`); both `mpos-kunit 35 passed`.
+
+**Counterfactuals**, one per half of the rule:
+1. the two `adopt_process` calls dropped (from `process_dir` and
+   `thread_dir`) -> `t-proc-owner` alone red, exactly `the process's directory
+   names the user it runs as` and `its thread directory carries the same ids`;
+2. the `dumpable` flag ignored (every node handed `process_dir_owner`'s answer)
+   -> exactly `a file inside it is root's, because the process made itself
+   un-dumpable` and `the fd directory follows the dumpability, not the name` red,
+   the other five green.
+
+**Named divergences.** Linux's exemption for the naming directory is a predicate
+in its own source; this kernel states the same set of rows structurally ("a
+directory that mirrors a process") and pins the measured table. An `lstat` of a
+descriptor's second name (`/proc/<pid>/fd/0`) is not claimed here, and the `ns`
+entries' ownership follows the same rule by construction rather than by a claim.
