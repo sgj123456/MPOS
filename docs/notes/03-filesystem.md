@@ -1007,7 +1007,8 @@ a context closed before creation costs nothing (nothing was built).
 
 **Two named divergences, and one that is not.** (1) An option this kernel does
 not read is refused `EINVAL` rather than recorded into a data string nothing
-parses - so a tmpfs `size=` is `EINVAL` where Linux accepts it. That is
+parses - so a tmpfs `size=` was `EINVAL` where Linux accepts it until item 139
+made the two numbers real (`§3.18`). That was
 `mount(2)`'s own existing silence about the option made explicit; accepting it
 would be the "returning success for something not implemented" rule 2 forbids,
 and the alternative (implementing a tmpfs size budget through this door) is a
@@ -1026,7 +1027,8 @@ answer now comes from both descriptors.
 state machine's refusals, the descriptor's directory/`EBADF` shape, the attach
 and the device the attached name answers). Its claims were first run *as a
 reference against real Linux as root* (`sudo -n`, no `MPOS_ON_HOST`): every
-claim agreed except the deliberate `size=` refusal, which is the point of it.
+claim agreed except the deliberate `size=` refusal, which was the point of it then (`item 139`
+made that claim Linux's: `an option tmpfs reads moves its room`).
 `t-mount-api`'s old quartet claim changed with the behaviour - it now asserts
 the trio is served and `fspick` is still `ENOSYS`.
 
@@ -1114,3 +1116,80 @@ matrix included `chmod("/tmp", 0640)`. It did what it was told: the development 
 the harness spawned failed in its own temporary directory before it could start. An
 instrument that changes the machine it runs on is aimed at a path it created under
 `build/scratch/`, never at a directory the machine shares with everything else.
+
+### 3.18 A memory filesystem's room is a number in its option string — **DONE** (2026-10-30)
+
+`/tmp`'s byte budget (§8.0, `t-fill-ramfs`) was a fixed quarter of the machine and
+nothing else: a mount could not be told how much room it had, and the number of
+*names* it could hold was not a number at all. That second half is the same hole the
+first one closed, one door over — a directory of empty files charges the mount no
+bytes and costs one inode of kernel heap each, so a `create` loop asked the heap for
+memory through a path with no bound on it, and the answer to a heap with nothing left
+is a panic. Linux's tmpfs has both words in its option string and answers `ENOSPC` at
+either.
+
+**Measured first** (Linux 7.2.11; `mount(8)` is the instrument because it drives the
+new mount API, so its errors are `fsconfig()`'s):
+
+| option | measured |
+|---|---|
+| default | `df` shows **16 GiB** of a 32 GiB machine (half of memory); `df -i` shows 4 014 765 inodes (half the pages) |
+| `size=1M` | `statfs` = 256 4 KiB blocks; sixteen 64 KiB writes landed, the seventeenth is **`ENOSPC`**, and the file is exactly 1 048 576 bytes |
+| `size=4k`, `size=2m`, `size=1G`, `size=50%` | all move the number (`4k` → 4 096 bytes, `50%` → 16 444 481 536) |
+| `size=0` | accepted: a mount with no room |
+| `size=abc`, `size=-1` | refused, and the refusal names the call: `fsconfig() failed: tmpfs: Bad value for 'size'` |
+| `nr_inodes=8` | the root counts: `df -i` shows 8 total, 7 free; the eighth name is **`ENOSPC`**; an `unlink` makes room for one more; a directory, symlink and FIFO are names too |
+| `nr_inodes=0` | accepted, and behaves as "no number given" (the default) |
+| `frobnicate=1` | refused: `tmpfs: Unknown parameter 'frobnicate'.` |
+
+**Landed**: `Usage` carries a second ledger (`inodes`/`inode_limit`) beside its bytes,
+charged before a node is built and given back when the last reference to the node
+goes — which is Linux's shape (`shmem_free_inode` runs on eviction, not on `unlink`,
+so an unlinked-but-open file is still counted) and is what keeps an `open`+`unlink`
+loop from hiding its inodes from the ledger. Every inode type in the filesystem holds
+the mount's `Arc<Usage>` and releases on `Drop`; the mount's own root is charged too,
+because Linux counts it (a `nr_inodes=8` mount held the root plus seven names). The
+default inode ceiling is **half the machine's pages**, Linux's default, and each charge
+also asks `machine_has_room` for the node's few hundred bytes so a create loop cannot
+take the last frame — the byte ledger's own argument, made for metadata.
+
+`usage_from_options` parses the option string with Linux's `memparse` spellings (`k`,
+`M`, `GiB`, …), `size=N%` as a share of physical memory, and `size=0` as a room of
+zero; `nr_inodes=0` is the default. `mode=`, `uid=` and `gid=` are accepted and not
+stored (this kernel's tmpfs root is `01777` because that is what `/tmp` is, and a
+mount's ids are whoever created it — a named divergence). An unknown key, a bare
+word, or a value that is not a number is `EINVAL`; a value is refused **at the
+`fsconfig` call that carries it**, which is where Linux refuses it, not later at
+creation.
+
+Both doors pass the string: `mount(2)`'s `data` argument (which used to be ignored
+for tmpfs) and `fsconfig(2)`'s recorded options (whose key gate now admits tmpfs's
+six). That last one closes the divergence item 135 wrote down — "a tmpfs `size=` is
+`EINVAL` here where Linux accepts it" — and `t-fsmount`'s claim moved with it from
+"an option no filesystem reads" to "an option tmpfs reads moves its room" plus "a
+size that is not a number is `EINVAL`".
+
+**Pin**: `t-tmpfs-limits` (new). Claims: a `size=64k` mount takes exactly 64 KiB and
+the next write is `ENOSPC`; an `nr_inodes=8` mount holds its root plus seven names
+and the eighth is `ENOSPC`; a name removed makes room for one more; a directory is a
+name the ceiling counts; `size=abc`/`size=-1`/`frobnicate=1` are `EINVAL`; and a mount
+with no options is the default room. Its privileged claims are checked as a reference
+against real Linux first (as root: every claim `ok:`), and skip with one passing note
+on a host run without privilege.
+
+**Host tests**: `the_option_string_names_the_mounts_room` (1 MiB / 4k / 2MiB / 50% /
+0 / `nr_inodes=0` = default / six refusals) and
+`a_name_past_the_inode_budget_is_enospc_and_one_given_back_fits` (a four-inode mount
+holds root plus three, `ENOSPC` on the fourth, `unlink` frees one, a hard link is
+*not* charged — another name for the same inode).
+
+**Gates**: x86_64 `all 237 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=237 fail=0`, `X-EXIT=0`, `build/scratch/tmpfs-gate4.log`); aarch64 `all 236 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, `build/scratch/tmpfs-gate-a1.log`).
+
+**Counterfactual**: the tmpfs arm back to `RamFs::new()` (the option string ignored, as it was before this item) -> `t-tmpfs-limits` alone red, `1 of 237`, with exactly its five discriminating claims red - `a size=64k mount takes exactly its 64 KiB and then answers ENOSPC`, `an nr_inodes=8 mount holds its root plus seven names, then ENOSPC`, and the three `mount refuses … with EINVAL` claims (an ignored option is accepted by definition) - while the control claims stayed green (`build/scratch/tmpfs-cf.log`).
+
+**What the item does not claim.** The default *byte* ceiling is still a quarter of
+memory rather than Linux's half, for the reason `Usage`'s doc gives (no swap, and the
+page cache is the kernel heap here); and `nr_inodes`' ceiling counts nodes, not the
+names their directories hold, so a mount can hold fewer names than inodes would
+suggest when a name is shared by `link(2)` — Linux counts the inode once there too,
+which is why a hard link is not charged.

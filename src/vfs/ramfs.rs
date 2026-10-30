@@ -110,14 +110,27 @@ fn machine_has_room(_need: u64) -> bool {
 pub struct Usage {
     used: AtomicU64,
     limit: u64,
+    /// How many inodes this mount is holding, and how many it may hold.
+    ///
+    /// The byte budget alone was not a bound on the *mount*: a directory full
+    /// of empty files costs no bytes at all and one inode's worth of kernel
+    /// heap each, so a process that created names in a loop was asking the heap
+    /// for memory through a door with no number on it - the same shape as the
+    /// `dd` that started the byte budget. Linux keeps this number too
+    /// (`nr_inodes`; its tmpfs default is half of physical memory in pages) and
+    /// answers `ENOSPC` at it, which is the answer measured below.
+    inodes: AtomicU64,
+    inode_limit: u64,
 }
 
 impl Usage {
-    /// A mount with room for a quarter of the machine's physical memory.
+    /// A mount with room for a quarter of the machine's physical memory, and
+    /// as many inodes as Linux's tmpfs would default to (half the machine's
+    /// pages).
     #[cfg(target_os = "none")]
     pub fn new() -> Arc<Usage> {
         let frames = critical_section::with(|cs| crate::mm::PMM.borrow(cs).borrow().total_frames());
-        Usage::with_limit((frames as u64) * 4096 / 4)
+        Usage::with_limits((frames as u64) * 4096 / 4, (frames as u64) / 2)
     }
 
     #[cfg(not(target_os = "none"))]
@@ -126,10 +139,21 @@ impl Usage {
         Usage::with_limit(64 * 1024 * 1024)
     }
 
+    /// A mount with a named number of bytes and no limit on names - what the
+    /// byte-budget tests use, so their `ENOSPC` is the number they asked for and
+    /// not an inode cap they did not.
     pub fn with_limit(limit: u64) -> Arc<Usage> {
+        Usage::with_limits(limit, u64::MAX)
+    }
+
+    /// A mount with both numbers named, which is what a `size=`/`nr_inodes=`
+    /// mount is.
+    pub fn with_limits(limit: u64, inode_limit: u64) -> Arc<Usage> {
         Arc::new(Usage {
             used: AtomicU64::new(0),
             limit,
+            inodes: AtomicU64::new(0),
+            inode_limit,
         })
     }
 
@@ -186,7 +210,64 @@ impl Usage {
     pub fn used(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
     }
+
+    /// One more name. `false` is the mount out of inodes - `ENOSPC`, the same
+    /// answer Linux's tmpfs gives a `touch` when `nr_inodes` is reached, and the
+    /// answer that keeps a create loop from reaching an allocator with nothing
+    /// left. Charged *before* the node is built, like the bytes.
+    fn charge_inode(&self) -> bool {
+        let mut cur = self.inodes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_add(1) else {
+                return false;
+            };
+            if next > self.inode_limit || !machine_has_room(INODE_HEAP_BYTES) {
+                return false;
+            }
+            match self
+                .inodes
+                .compare_exchange(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// A name gone: the inode it reached is being dropped.
+    fn release_inode(&self) {
+        let mut cur = self.inodes.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self
+                .inodes
+                .compare_exchange(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Inodes held, and the mount's ceiling - what a `df -i`-shaped report reads.
+    pub fn inodes_used(&self) -> u64 {
+        self.inodes.load(Ordering::Relaxed)
+    }
+
+    pub fn inode_limit(&self) -> u64 {
+        self.inode_limit
+    }
+
+    pub fn byte_limit(&self) -> u64 {
+        self.limit
+    }
 }
+
+/// Roughly what one inode's node struct costs the heap, charged against the
+/// machine's free memory before it is built. An estimate in the refusal's
+/// favour (the structs are a few hundred bytes each plus their name), because
+/// the number only has to keep a create loop from taking the last frame.
+const INODE_HEAP_BYTES: u64 = 512;
 
 /// One file's bytes, as a list of fixed-size chunks.
 ///
@@ -396,6 +477,10 @@ impl RamFile {
 impl Drop for RamFile {
     fn drop(&mut self) {
         self.fs.release(self.len() as u64);
+        // The inode goes with the same edge, and for the same reason: Linux's
+        // `shmem_free_inode` runs on eviction, not on `unlink`, so an
+        // unlinked-but-open file is still counted against `nr_inodes`.
+        self.fs.release_inode();
     }
 }
 
@@ -608,6 +693,9 @@ impl Inode for RamFile {
 /// A directory: name edges, aka the dentries of this filesystem.
 /// A symbolic link: nothing but the path it stands for.
 struct RamSymlink {
+    /// The mount whose inode count this node is charged to, released when the
+    /// last reference to it goes.
+    fs: Arc<Usage>,
     ino: Ino,
     /// How many names reach it: one, plus one per `link` of the link itself.
     links: Mutex<Cell<u64>>,
@@ -623,6 +711,14 @@ struct RamSymlink {
     /// writes through to the target, as it does on Linux.
     mode: Mutex<Cell<Option<u32>>>,
     owner: Mutex<Cell<(u32, u32)>>,
+}
+
+/// The mount's inode count drops with the last reference, as it does for a
+/// file and a directory.
+impl Drop for RamSymlink {
+    fn drop(&mut self) {
+        self.fs.release_inode();
+    }
 }
 
 impl Inode for RamSymlink {
@@ -702,6 +798,9 @@ impl Inode for RamSymlink {
 /// `/dev/null` does - so a caller could not tell a device that is not there
 /// from the one device that is.
 struct RamDev {
+    /// The mount whose inode count this node is charged to, released when the
+    /// last reference to it goes.
+    fs: Arc<Usage>,
     ino: Ino,
     /// Which of the two device types `mknod` asked for. They are different
     /// nodes on Linux and were the same node here: every placeholder reported
@@ -723,6 +822,14 @@ struct RamDev {
     /// How many names reach it: a `mknod` placeholder can be linked like any
     /// other node.
     links: Mutex<Cell<u64>>,
+}
+
+/// The mount's inode count drops with the last reference, as it does for a
+/// file and a directory.
+impl Drop for RamDev {
+    fn drop(&mut self) {
+        self.fs.release_inode();
+    }
 }
 
 impl Inode for RamDev {
@@ -801,6 +908,9 @@ impl Inode for RamDev {
 /// the question a socket never answers, and `open(2)` on the path gets
 /// Linux's `ENXIO` from the read/write refusals below.
 struct RamSocket {
+    /// The mount whose inode count this node is charged to, released when the
+    /// last reference to it goes.
+    fs: Arc<Usage>,
     ino: Ino,
     /// How many names reach it - the bound path, and any `link` of it.
     links: Mutex<Cell<u64>>,
@@ -814,6 +924,14 @@ struct RamSocket {
     /// where a FIFO and a device node answer `EPERM`
     /// (`.workbuddy/probe_xattr4.c`).
     xattrs: Vault,
+}
+
+/// The mount's inode count drops with the last reference, as it does for a
+/// file and a directory.
+impl Drop for RamSocket {
+    fn drop(&mut self) {
+        self.fs.release_inode();
+    }
 }
 
 impl Inode for RamSocket {
@@ -901,6 +1019,9 @@ impl Inode for RamSocket {
 /// behind the name are a pipe's. `docs/uapi/` §5.2 carries the measured
 /// contract; `.workbuddy/probe_fifo.c` is where it was measured.
 struct RamFifo {
+    /// The mount whose inode count this node is charged to, released when the
+    /// last reference to it goes.
+    fs: Arc<Usage>,
     ino: Ino,
     /// How many names reach it - the `mknod`ed name, and any `link` of it.
     links: Mutex<Cell<u64>>,
@@ -912,6 +1033,14 @@ struct RamFifo {
     /// the name does; each open takes a count on the way in and gives it back
     /// on close, and the buffer is discarded when both counts reach zero.
     channel: Arc<crate::vfs::pipe::Channel>,
+}
+
+/// The mount's inode count drops with the last reference, as it does for a
+/// file and a directory.
+impl Drop for RamFifo {
+    fn drop(&mut self) {
+        self.fs.release_inode();
+    }
 }
 
 impl Inode for RamFifo {
@@ -1006,6 +1135,15 @@ struct RamDir {
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
 }
 
+/// A directory's inode is charged on creation and given back when the last
+/// reference to it goes - including the mount's own root, which is why a mount
+/// whose `nr_inodes=` is exhausted cannot be created in the first place.
+impl Drop for RamDir {
+    fn drop(&mut self) {
+        self.fs.release_inode();
+    }
+}
+
 impl Inode for RamDir {
     fn flags(&self) -> VfsResult<u32> {
         Ok(self.flags.get())
@@ -1077,6 +1215,16 @@ impl Inode for RamDir {
         kind: NodeKind,
         rdev: Option<(u32, u32)>,
     ) -> VfsResult<Arc<dyn Inode>> {
+        // The kinds this filesystem cannot name are refused before the ledger is
+        // touched, and every node below is charged before it is built: a mount's
+        // `nr_inodes=` reaches a `create` loop before the allocator does, which
+        // is the whole reason the number exists.
+        if matches!(kind, NodeKind::Symlink | NodeKind::Anon { .. }) {
+            return Err(VfsError::Unsupported);
+        }
+        if !self.fs.charge_inode() {
+            return Err(VfsError::NoSpace);
+        }
         let at = now();
         // The birth mode, as every filesystem that stores modes gives one: a
         // new node is born with the kind's default minus the caller's mask
@@ -1123,6 +1271,7 @@ impl Inode for RamDir {
             // The pair is the argument's, decoded at the door, and the mode and
             // ids are the call's own - see `RamDev`.
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
+                fs: self.fs.clone(),
                 ino: fresh_ino(),
                 kind,
                 dev: rdev.unwrap_or((0, 0)),
@@ -1136,6 +1285,7 @@ impl Inode for RamDir {
             // mode is Linux's birth mode for a unix socket because the DAC
             // check reads the stored word, not `mode_of`'s default.
             NodeKind::Socket => Arc::new(RamSocket {
+                fs: self.fs.clone(),
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
                 mtime: Mutex::new(Cell::new(now())),
@@ -1150,6 +1300,7 @@ impl Inode for RamDir {
             NodeKind::Fifo => {
                 let ino = fresh_ino();
                 Arc::new(RamFifo {
+                    fs: self.fs.clone(),
                     ino,
                     links: Mutex::new(Cell::new(1)),
                     mode: Mutex::new(Cell::new(birth)),
@@ -1169,6 +1320,9 @@ impl Inode for RamDir {
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {
+                // The ledger was charged for a node no name will reach; the
+                // `Arc` above is dropped on this path, and its `Drop` gives the
+                // inode back.
                 return Err(VfsError::Exists);
             }
             entries.insert(String::from(name), node.clone());
@@ -1178,6 +1332,9 @@ impl Inode for RamDir {
     }
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        if !self.fs.charge_inode() {
+            return Err(VfsError::NoSpace);
+        }
         let at = now();
         // Linux's birth mode for a link (`S_IFLNK | 0777`, mask applied to the
         // permission half): nothing consults a link's own bits - resolution
@@ -1185,6 +1342,7 @@ impl Inode for RamDir {
         // unset word there is a stored `chmod 000`, not "no mode". ext4's
         // `new_inode` gives its links the same number.
         let node: Arc<dyn Inode> = Arc::new(RamSymlink {
+            fs: self.fs.clone(),
             ino: fresh_ino(),
             links: Mutex::new(Cell::new(1)),
             mtime: Mutex::new(Cell::new(at)),
@@ -1292,6 +1450,109 @@ impl Inode for RamDir {
     }
 }
 
+/// The mount's room as its option string names it: `size=` and `nr_inodes=`, the
+/// two numbers Linux's tmpfs keeps.
+///
+/// Measured on Linux 7.2.11 (probes under `build/scratch/tmpfs-mnt`, `mount(8)`
+/// which drives the new mount API): `size=1M` makes a mount whose `statfs`
+/// carries 256 4 KiB blocks and whose seventeenth 64 KiB write answers
+/// `ENOSPC`; `size=4k`, `size=2m`, `size=1G`, `size=50%` all move the number
+/// (`4k` -> 4 096 bytes, `50%` -> half of the machine); `size=abc` and `size=-1`
+/// are refused, `size=0` is accepted as a mount with no room, and an unknown
+/// word is refused (`tmpfs: Unknown parameter 'frobnicate'`). `nr_inodes=8` is
+/// the inode ceiling: the mount's root plus six files, the seventh `touch`
+/// answering `ENOSPC`, and an `unlink` freeing one. A mount with no option takes
+/// the defaults (half of physical memory in bytes on Linux; a quarter here, for
+/// the reason `Usage`'s doc records) and half the machine's pages in inodes.
+///
+/// `mode=`, `uid=` and `gid=` are accepted and not stored: this kernel's tmpfs
+/// root is `01777` because that is what `/tmp` is, and the ids of a mount belong
+/// to whoever created it (`docs/notes/` §3.18 names the divergence).
+pub fn usage_from_options(data: &str) -> VfsResult<Arc<Usage>> {
+    let mut bytes: Option<u64> = None;
+    let mut inodes: Option<u64> = None;
+    for item in data.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = item.split_once('=') else {
+            // A bare word is not a number Linux's tmpfs would take.
+            return Err(VfsError::Invalid);
+        };
+        match key.trim() {
+            "size" => bytes = Some(parse_size(value.trim())?),
+            "nr_inodes" => inodes = Some(parse_size(value.trim())?),
+            // Linux's tmpfs takes these; they are not stored here - see above.
+            "mode" | "uid" | "gid" => {}
+            _ => return Err(VfsError::Invalid),
+        }
+    }
+    let default = Usage::new();
+    let limit = bytes.unwrap_or_else(|| default.byte_limit());
+    // `nr_inodes=0` is Linux's "no number given" (measured: accepted, and the
+    // mount then takes the default), so zero falls back rather than meaning a
+    // mount that cannot even hold its own root.
+    let inode_limit = match inodes {
+        Some(0) | None => default.inode_limit(),
+        Some(n) => n,
+    };
+    Ok(Usage::with_limits(limit, inode_limit))
+}
+
+/// Whether one `key=value` pair is a number this filesystem's mount would take.
+///
+/// The question is asked at the call that carries the value, which is where
+/// Linux asks it: `mount(8)`'s failure for a bad `size=` reads `fsconfig()
+/// failed: tmpfs: Bad value for 'size'`, not a failure at creation. Only the
+/// two numeric keys are checked - `mode`/`uid`/`gid` are strings and are
+/// accepted as they are.
+pub fn option_value_is_valid(key: &str, value: &str) -> bool {
+    match key {
+        "size" | "nr_inodes" => parse_size(value.trim()).is_ok(),
+        _ => true,
+    }
+}
+
+/// Linux's `memparse`: decimal digits, an optional binary suffix (`k`, `M`,
+/// `G`, `T`, `P`, case-insensitive, optionally followed by `iB`/`B`), or a
+/// percentage of the machine's memory for `size=`.
+fn parse_size(text: &str) -> VfsResult<u64> {
+    if let Some(percent) = text.strip_suffix('%') {
+        let digits: u64 = percent.parse().map_err(|_| VfsError::Invalid)?;
+        if digits > 100 {
+            return Err(VfsError::Invalid);
+        }
+        return Ok(total_ram_bytes().saturating_mul(digits) / 100);
+    }
+    let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let suffix = &text[digits.len()..];
+    let base: u64 = digits.parse().map_err(|_| VfsError::Invalid)?;
+    let shift = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" | "ib" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        "p" | "pb" | "pib" => 50,
+        _ => return Err(VfsError::Invalid),
+    };
+    base.checked_shl(shift).ok_or(VfsError::Invalid)
+}
+
+/// The memory `size=N%` is a percentage of: Linux's `totalram_pages` in bytes.
+#[cfg(target_os = "none")]
+fn total_ram_bytes() -> u64 {
+    let frames = critical_section::with(|cs| crate::mm::PMM.borrow(cs).borrow().total_frames());
+    (frames as u64) * 4096
+}
+
+#[cfg(not(target_os = "none"))]
+fn total_ram_bytes() -> u64 {
+    // No frame allocator on the host; the percentage tests name their own.
+    256 * 1024 * 1024
+}
+
 /// A mounted ramfs instance: one root directory and everything under it.
 pub struct RamFs {
     root: Arc<RamDir>,
@@ -1310,9 +1571,19 @@ impl RamFs {
         RamFs::with_usage(Usage::new())
     }
 
+    /// A mount whose room is its option string's, as `mount(2)` and
+    /// `fsconfig(2)` hand it over. An unreadable option is `EINVAL`, which is
+    /// Linux's answer for a word its tmpfs does not take.
+    pub fn from_mount_options(data: &str) -> VfsResult<Arc<RamFs>> {
+        Ok(RamFs::with_usage(usage_from_options(data)?))
+    }
+
     /// A mount with a named amount of room - what the tests use to reach an
     /// `ENOSPC` without filling a machine first.
     pub fn with_usage(fs: Arc<Usage>) -> Arc<RamFs> {
+        // The mount's own root is an inode, and Linux's tmpfs counts it: a
+        // `nr_inodes=8` mount held the root plus seven names, measured.
+        let _ = fs.charge_inode();
         Arc::new(RamFs {
             root: Arc::new(RamDir {
                 fs,
@@ -2058,5 +2329,80 @@ mod tests {
                 .unwrap(),
             4
         );
+    }
+
+    /// A mount's option string is two numbers, and Linux's spellings of them.
+    /// The measured table this follows is `usage_from_options`'s doc.
+    #[test]
+    fn the_option_string_names_the_mounts_room() {
+        let usage = super::usage_from_options("size=1M,nr_inodes=8").unwrap();
+        assert_eq!(usage.byte_limit(), 1024 * 1024);
+        assert_eq!(usage.inode_limit(), 8);
+        // Suffixes are binary, and case-insensitive; `4k` is 4096 bytes.
+        assert_eq!(
+            super::usage_from_options("size=4k").unwrap().byte_limit(),
+            4096
+        );
+        assert_eq!(
+            super::usage_from_options("size=2MiB").unwrap().byte_limit(),
+            2 * 1024 * 1024
+        );
+        // A percentage is of the machine's memory (256 MiB on the host harness).
+        assert_eq!(
+            super::usage_from_options("size=50%").unwrap().byte_limit(),
+            128 * 1024 * 1024
+        );
+        // Linux accepts a mount with no room at all, and `nr_inodes=0` as "the
+        // default" - measured, not assumed.
+        assert_eq!(super::usage_from_options("size=0").unwrap().byte_limit(), 0);
+        let default = super::usage_from_options("").unwrap();
+        assert_eq!(
+            super::usage_from_options("nr_inodes=0")
+                .unwrap()
+                .inode_limit(),
+            default.inode_limit()
+        );
+        // Everything Linux's tmpfs refuses with EINVAL.
+        for bad in [
+            "size=abc",
+            "size=-1",
+            "size=1Q",
+            "nr_inodes=abc",
+            "frobnicate=1",
+            "size",
+        ] {
+            assert_eq!(
+                super::usage_from_options(bad).map(|_| ()).err(),
+                Some(VfsError::Invalid),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A name past the mount's inode number is `ENOSPC`, and a name given back
+    /// makes room for another - the create-loop hole the byte budget did not
+    /// cover.
+    #[test]
+    fn a_name_past_the_inode_budget_is_enospc_and_one_given_back_fits() {
+        let fs = RamFs::with_usage(Usage::with_limits(1 << 20, 4));
+        let dir = fs.root();
+        // The root is one of the four; the third name fits and the fourth does not.
+        dir.create("a", NodeKind::File, None).unwrap();
+        dir.create("b", NodeKind::File, None).unwrap();
+        dir.create("c", NodeKind::File, None).unwrap();
+        assert_eq!(
+            dir.create("d", NodeKind::File, None).map(|_| ()),
+            Err(VfsError::NoSpace)
+        );
+        assert_eq!(fs.usage().inodes_used(), 4);
+        // The name given back drops the node's last reference, and its own
+        // inode with it.
+        dir.unlink("b").unwrap();
+        assert_eq!(fs.usage().inodes_used(), 3);
+        dir.create("d", NodeKind::File, None).unwrap();
+        // A hard link is another name for the *same* inode, so it is not charged.
+        let a = dir.lookup("a").unwrap();
+        dir.link("a2", &a).unwrap();
+        assert_eq!(fs.usage().inodes_used(), 4);
     }
 }

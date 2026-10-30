@@ -7406,3 +7406,37 @@ pass=236 fail=0`, `build/scratch/attr-gate1.log`); aarch64 x86_64 `all 236 user 
 `/proc/self/status`, `EPERM` for the `chown` on `/proc/sys/vm/max_map_count`) — those
 doors write an owner and clocks this tree does not keep; and sysfs's own half (root
 `0`, user `EPERM`, nothing stored here) stays in §5.2. Record: `docs/notes/` §3.17.
+
+## item 139 — a memory filesystem's room is its option string: `size=` and `nr_inodes=`
+
+The byte budget `/tmp` got in §8.0 was a fixed quarter of the machine, and the number
+of *names* a mount could hold was not a number at all: empty files charge no bytes and
+one inode of kernel heap each, so a create loop reached the allocator through an
+unbounded door. Linux's tmpfs has both words and answers `ENOSPC` at either.
+
+**Measured first** (7.2.11, `mount(8)`, which drives the new API): `size=1M` -> 256
+4 KiB blocks and `ENOSPC` on the seventeenth 64 KiB write; `size=4k`/`2m`/`1G`/`50%`
+move the number; `size=0` is a mount with no room; `size=abc`/`size=-1` are refused at
+the `fsconfig` call (`tmpfs: Bad value for 'size'`); `nr_inodes=8` is the root plus
+seven names, the eighth `ENOSPC`, an `unlink` freeing one, and directories/symlinks/
+FIFOs counting; `nr_inodes=0` is the default; `frobnicate=1` is refused. Defaults:
+half of memory in bytes, half the pages in inodes.
+
+**Landed**: `Usage` gains an inode ledger beside its bytes; every inode type holds the
+mount's `Arc<Usage>` and releases on `Drop` (Linux frees on eviction, so an
+unlinked-but-open file stays counted); the root is charged too; the default ceiling is
+half the pages and each charge also asks `machine_has_room` for the node's bytes.
+`usage_from_options` parses Linux's `memparse` spellings, `size=N%` of physical memory
+and `size=0`, with `nr_inodes=0` as the default; `mode`/`uid`/`gid` accepted and not
+stored (named); unknown key / bare word / non-number value `EINVAL`, the value refused
+at the `fsconfig` call that carries it. `mount(2)`'s data and `fsconfig(2)`'s recorded
+options both reach the parser, which closes item 135's `size=` divergence.
+
+**Pin**: `t-tmpfs-limits` (size exact at 64 KiB then `ENOSPC`; seven names then
+`ENOSPC`; unlink frees; directories count; three refusals; the default mount works),
+verified as a reference against real Linux as root first. `t-fsmount`'s option claim
+moved to the new rule.
+
+**Gates**: x86_64 `all 237 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=237 fail=0`, `X-EXIT=0`, `build/scratch/tmpfs-gate4.log`); aarch64 `all 236 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, `build/scratch/tmpfs-gate-a1.log`).
+
+**Counterfactual**: the tmpfs arm back to `RamFs::new()` (the option string ignored, as it was before this item) -> `t-tmpfs-limits` alone red, `1 of 237`, with exactly its five discriminating claims red - `a size=64k mount takes exactly its 64 KiB and then answers ENOSPC`, `an nr_inodes=8 mount holds its root plus seven names, then ENOSPC`, and the three `mount refuses … with EINVAL` claims (an ignored option is accepted by definition) - while the control claims stayed green (`build/scratch/tmpfs-cf.log`).

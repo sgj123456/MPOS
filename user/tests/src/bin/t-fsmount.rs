@@ -26,10 +26,9 @@
 //!
 //! This kernel serves the trio for the types it can build; `fspick(2)` stays a
 //! named gap (what it picks a mount *for* is reconfiguration, which no
-//! filesystem here can do). One divergence is deliberate and named in
-//! `docs/notes/` §3.16: an option this kernel does not read is refused rather
-//! than recorded and ignored, so a tmpfs `size=` is `EINVAL` here where Linux
-//! accepts it (`mount(2)`'s data argument ignores the same option silently).
+//! filesystem here can do). An option no filesystem here reads is refused
+//! rather than recorded and ignored (`docs/notes/` §3.16), and the ones tmpfs
+//! does read are its room (`size=`, `nr_inodes=`; §3.18, item 139).
 
 use std::ffi::CString;
 
@@ -196,12 +195,18 @@ fn main() {
         &format!("a command number past Linux's eight is EOPNOTSUPP (is {unknown_command})"),
         unknown_command == -libc::EOPNOTSUPP,
     );
-    // Deliberate divergence, named above: Linux's tmpfs reads `size=`, this
-    // kernel's does not, so the option is refused rather than ignored.
+    // tmpfs's own numbers are read here, as they are on Linux: `size=1M` is
+    // accepted and a word that is not a number is refused (`docs/notes/`
+    // §3.18). The mount's room itself is the pin's `t-tmpfs-limits`.
     let size = fsconfig(fd, FSCONFIG_SET_STRING, Some("size"), Some("1M"));
     r.check(
-        &format!("an option no filesystem here reads is refused (is {size})"),
-        size == -libc::EINVAL,
+        &format!("an option tmpfs reads moves its room (is {size})"),
+        size == 0,
+    );
+    let bad_size = fsconfig(fd, FSCONFIG_SET_STRING, Some("size"), Some("abc"));
+    r.check(
+        &format!("a size that is not a number is EINVAL (is {bad_size})"),
+        bad_size == -libc::EINVAL,
     );
     let early = fsmount(fd, 0, 0);
     r.check(

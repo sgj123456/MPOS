@@ -2517,7 +2517,11 @@ fn build_filesystem(
             crate::vfs::devpts::DevPts::new()
         }
         "tmpfs" | "ramfs" => {
-            let fs = crate::vfs::ramfs::RamFs::new();
+            // The mount's numbers are its option string's, as Linux's tmpfs
+            // takes them (`size=`, `nr_inodes=`): a `size=1M` mount is a
+            // megabyte of room, not a mount that silently ignored the word -
+            // measured, `docs/notes/` §3.18.
+            let fs = crate::vfs::ramfs::RamFs::from_mount_options(data).map_err(err_of)?;
             // A tmpfs root starts out `S_IRWXUGO | S_ISVTX` - 01777 - and that
             // default is the whole of what `/tmp` is: writable by everyone,
             // with each name removable only by its own owner. It is not
@@ -2937,7 +2941,18 @@ fn known_filesystem(name: &str) -> bool {
 /// key its own type does not know) instead of recorded and ignored.
 fn option_key_accepted(fstype: &str, key: &str) -> bool {
     match fstype {
+        // The keys each type's own mount path reads. `source` is every type's
+        // (Linux accepts and ignores it for a pseudo-filesystem, and so does
+        // this kernel's `mount(2)`); a type that reads nothing else refuses the
+        // rest with `EINVAL`, Linux's answer for a key its type does not know.
         "devpts" => matches!(key, "source" | "mode" | "uid" | "gid"),
+        // tmpfs's room is its option string's (`docs/notes/` §3.18): the two
+        // numbers are read, and `mode`/`uid`/`gid` are Linux's other tmpfs keys,
+        // accepted here and not stored.
+        "tmpfs" | "ramfs" => matches!(
+            key,
+            "source" | "size" | "nr_inodes" | "mode" | "uid" | "gid"
+        ),
         _ => key == "source",
     }
 }
@@ -3023,6 +3038,12 @@ pub fn handle_fsconfig(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
                 Err(error) => return error,
             };
             if !option_key_accepted(context.fstype(), &key) {
+                return err::EINVAL;
+            }
+            // A value the type would refuse is refused here, where Linux refuses
+            // it: `mount(8)`'s error for a bad `size=` is `fsconfig() failed:
+            // tmpfs: Bad value for 'size'` (`docs/notes/` §3.18).
+            if !crate::vfs::ramfs::option_value_is_valid(&key, &value) {
                 return err::EINVAL;
             }
             match context.set_option(&key, &value) {
