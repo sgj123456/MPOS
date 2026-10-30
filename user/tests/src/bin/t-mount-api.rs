@@ -1,8 +1,9 @@
 //! t-mount-api - the mount API's attachment half: `open_tree(2)`,
 //! `move_mount(2)` and `mount_setattr(2)`.
 //!
-//! The superblock quartet (`fsopen`/`fsconfig`/`fsmount`/`fspick`, 430-433) is
-//! a named gap here and must still answer `ENOSYS`; the last claim asks.
+//! The superblock half (`fsopen`/`fsconfig`/`fsmount`, 430-432) is served now
+//! and has its own pin (`t-fsmount`); `fspick` (433) is the family's last
+//! named gap and must still answer `ENOSYS` - the last claim asks.
 //!
 //! Measured on Linux 7.2.11 before any of this was written
 //! (`build/scratch/mountapi/probe{2,3,4}.c`, under `unshare -Urm
@@ -45,6 +46,7 @@ const SYS_OPEN_TREE: libc::c_long = 428;
 const SYS_MOVE_MOUNT: libc::c_long = 429;
 const SYS_MOUNT_SETATTR: libc::c_long = 442;
 const SYS_FSOPEN: libc::c_long = 430;
+const SYS_FSPICK: libc::c_long = 433;
 
 const OPEN_TREE_CLONE: usize = 0x1;
 const OPEN_TREE_CLOEXEC: usize = 0o2_000_000;
@@ -566,14 +568,27 @@ fn main() {
     );
     let _ = unmount(SUB, UnmountFlags::empty());
 
-    // --- the quartet this kernel refuses by name ------------------------
+    // --- the superblock half, and the one number of it still refused ----
+    // The trio is served now (`t-fsmount` owns its contract); `fspick` is the
+    // family's remaining named gap: what it picks a mount *for* is
+    // reconfiguration, and no filesystem here can be reconfigured.
     let fs = unsafe { libc::syscall(SYS_FSOPEN, c"tmpfs".as_ptr() as usize, 0usize) };
-    let fs_errno = errno();
     r.check(
-        &format!(
-            "fsopen, the superblock path this kernel has no object for, is ENOSYS (is {fs_errno})"
-        ),
-        fs < 0 && fs_errno == -libc::ENOSYS,
+        &format!("fsopen names a type and answers a descriptor (is {fs})"),
+        fs >= 0,
+    );
+    let pick = unsafe {
+        libc::syscall(
+            SYS_FSPICK,
+            libc::AT_FDCWD as i64,
+            c"/tmp".as_ptr() as usize,
+            0usize,
+        )
+    };
+    let pick_errno = errno();
+    r.check(
+        &format!("fspick, the reconfiguration door, is still ENOSYS (is {pick_errno})"),
+        pick < 0 && pick_errno == -libc::ENOSYS,
     );
 
     // --- cleanup ---------------------------------------------------------

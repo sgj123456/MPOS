@@ -942,3 +942,112 @@ green, which is the shape the old pin had.
 Files: `crates/err` (`ENODATA`), `src/vfs/xattr.rs` (new), `src/vfs/mod.rs`
 (`xattr_vault`), `src/vfs/ramfs.rs` (three stores), `src/syscall/linux/fs/file.rs`
 (the handlers), `user/tests/src/bin/t-xattr.rs`, and the uapi/roadmap rows.
+### 3.16 The mount API's superblock half — **DONE (2026-10-30)**
+
+The mount family landed in two halves. The *attachment* half (`open_tree`,
+`move_mount`, `mount_setattr`, item 122, §3.11) and the introspection pair
+(`statmount`/`listmount`, item 129, §3.14) were already served; the *superblock*
+half - `fsopen`/`fsconfig`/`fsmount`, the three calls that name a filesystem and
+speak its options *before* there is a place to put it - answered `ENOSYS`, with
+the note that "this kernel mounts a `FileSystem` object directly and has no
+`fs_context` for those four to name".
+
+That note was true of the code and wrong as a conclusion. `mount(2)` here
+already builds the object and hangs it on a target in one function
+(`mount_new`'s type match plus `MountTable::mount_at`); what it had no *door*
+for was the middle state - a filesystem that exists and is attached nowhere. So
+the item is the same model with the two ends cut apart, not a second model.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/mntapi/p{1,2,3,4,5}.c`, built
+`gcc -O1 -static`, run through `sudo -n unshare -m --propagation private`:
+`fsopen` wants `CAP_SYS_ADMIN`, so an ordinary user's first answer is `EPERM`
+and the reference needs the mount namespace; the probes are archived as
+`.workbuddy/probe_mntapi*.c`):
+
+| call | Linux's answer |
+|---|---|
+| `fsopen("tmpfs", 0)` | a descriptor; `/proc/self/fd/N` → `anon_inode:[fscontext]`, `fstat` = 0-byte `0600` file, `fcntl(F_GETFL)` → `O_RDWR` |
+| `read(2)` / `write(2)` on that context | `ENODATA` (61) / `EINVAL` (22); `pread`/`lseek` → `ESPIPE` (29) |
+| `fsopen("nonexistentfs", 0)` | `ENODEV` (19) |
+| `fsopen(..., 0x1)` / `(..., 0x8000_0000)` | accepted (`FSOPEN_CLOEXEC`, and the flag is *set*) / `EINVAL` |
+| `fsconfig(SET_STRING, "size", "1M")` on a tmpfs context | 0 (tmpfs reads it) |
+| `fsconfig(SET_STRING, unknown key)` / `SET_STRING` with a null value | `EINVAL` / `EINVAL` |
+| `fsconfig(SET_BINARY)` / `SET_FLAG("size")` | `EINVAL` / `EINVAL` |
+| `fsconfig(command 9)` | `EOPNOTSUPP` (95) |
+| `fsconfig(CMD_CREATE)`, then any `SET_*` or a second `CREATE` | 0, then `EBUSY` (16) |
+| `fsconfig(CMD_RECONFIGURE)` with an option, on a created tmpfs context | `EINVAL` |
+| `fsmount` before `CMD_CREATE` / a second `fsmount` from one context | `EINVAL` / `EBUSY` |
+| `fsmount`'s flag word | only `FSMOUNT_CLOEXEC` 0x1 and `FSMOUNT_NAMESPACE` 0x2; anything else `EINVAL` |
+| `fsmount`'s *third* argument (mount attributes) | `RDONLY`/`NOSUID`/`NODEV`/`NOEXEC`/`NODIRATIME` accepted; `MOUNT_ATTR_IDMAP` `EINVAL` (no idmapped mounts) |
+| the descriptor `fsmount` answers | `fstat` = the root directory (`041777` for tmpfs), `read(2)` = `EBADF` (9), `fsconfig` on it = `EBADF` |
+| `move_mount(desc, "", …, MOVE_MOUNT_F_EMPTY_PATH)` | 0, and the name then answers the new filesystem's `st_dev` |
+| `fspick(path)` on a mount point / a non-mount | a descriptor / `EINVAL`; `fsmount` of it `EBUSY`; `fsconfig(CMD_RECONFIGURE)` with nothing → 0 |
+| `fsopen("ext4")`, `SET_STRING("source","/dev/null")`, `CMD_CREATE` | 0, then `ENOTBLK` (15) |
+
+**What landed.** `fsopen`(430) names one of the twelve types `build_filesystem`
+can build and answers a `FsContext` descriptor (`src/vfs/fscontext.rs`); the
+descriptor reports a 0-byte file, `read(2)` is `ENODATA` and `write(2)` `EINVAL`
+- the shape Linux gives it. `fsconfig`(431) speaks one `(key, value)` into the
+context and `FSCONFIG_CMD_CREATE` builds the `FileSystem` through the *same*
+factory `mount(2)` uses (the match was extracted out of `mount_new` into
+`build_filesystem`, so the two doors cannot drift). `fsmount`(432) spends the
+context once and answers a mount descriptor (`MountFd::fresh`) that carries the
+never-mounted filesystem, its type, its source and its read-only bit;
+`move_mount` then attaches it with `MountTable::mount_at` - a *first* mount, not
+a bind, because `bind_mount` requires a source already served by a mounted
+filesystem, which is exactly what this object is not. `fspick`(433) stays a
+`ENOSYS` gap: what it picks a mount *for* is reconfiguration, and no filesystem
+in this kernel can be reconfigured (Linux's own tmpfs answers `EINVAL` to a
+reconfiguration that carries an option).
+
+The state machine is the measured one and lives in the object rather than in
+the syscall layer: an option after the creation is `EBUSY`, a second creation
+`EBUSY`, `fsmount` before the creation `EINVAL`, a second `fsmount` `EBUSY`, and
+a context closed before creation costs nothing (nothing was built).
+
+**Two named divergences, and one that is not.** (1) An option this kernel does
+not read is refused `EINVAL` rather than recorded into a data string nothing
+parses - so a tmpfs `size=` is `EINVAL` where Linux accepts it. That is
+`mount(2)`'s own existing silence about the option made explicit; accepting it
+would be the "returning success for something not implemented" rule 2 forbids,
+and the alternative (implementing a tmpfs size budget through this door) is a
+filesystem option the tmpfs does not take today. (2) No filesystem here takes
+an option by descriptor, path or byte blob, so `SET_FD`/`SET_PATH`/
+`SET_PATH_EMPTY`/`SET_BINARY` are `EINVAL` by name (Linux's own answer for a
+type with no handler for the command). (3) Not a divergence but a fix found on
+the way: a mount descriptor's `read(2)` used to be `EISDIR`, because its `fstat`
+reports the root directory and the directory rule answered before the
+descriptor could; Linux answers `EBADF` there (measured for both the `fsmount`
+descriptor and the `open_tree` clone this kernel already served), so `Inode`
+gained `refuses_file_io()` and the read door asks it before the kind. The same
+answer now comes from both descriptors.
+
+**Pin**: `user/tests/src/bin/t-fsmount.rs` (21 claims - the context's shape, the
+state machine's refusals, the descriptor's directory/`EBADF` shape, the attach
+and the device the attached name answers). Its claims were first run *as a
+reference against real Linux as root* (`sudo -n`, no `MPOS_ON_HOST`): every
+claim agreed except the deliberate `size=` refusal, which is the point of it.
+`t-mount-api`'s old quartet claim changed with the behaviour - it now asserts
+the trio is served and `fspick` is still `ENOSYS`.
+
+**Gates**: x86_64 `all 234 user tests passed`, `mpos-kunit 34 passed, 0 failed`;
+aarch64 `all 233 user tests passed`, `mpos-kunit 34 passed, 0 failed`
+(`build/scratch/fsmount-gate4.log`, `fsmount-gate-a1.log`). **Counterfactual**, two of them, and the first attempt is worth recording:
+disabling `move_mount`'s fresh-attach branch (`fresh.filter(|_| false)`, which
+falls back to the bind path) left the whole sweep **green** - a bind of the new
+filesystem through an empty source name also resolves, so that branch is not
+what the attach claim measures. The two stubs that do discriminate:
+(1) the three dispatch arms put back to `ENOSYS` → `t-mount-api`'s `fsopen`
+claim and `t-fsmount`'s first claims red, and the sweep reports 2 of 234
+(`build/scratch/fsmount-cf2.log`); (2) `refuses_file_io()` skipped in the read
+door → exactly one claim red, `read(2) on a mount descriptor is EBADF (is
+-21)`, everything else green (`build/scratch/fsmount-cfb.log`) - the fix half
+is pinned as sharply as the feature half.
+
+Files: `src/vfs/fscontext.rs` (new), `src/vfs/mountfd.rs` (`FreshMount`, the
+no-byte-stream door), `src/vfs/file.rs` (the read door asks it first),
+`src/vfs/mod.rs` (`NoData`, `as_fs_context`, `refuses_file_io`), `src/uaccess.rs`
+(`ENODATA`), `src/syscall/linux/fs/file.rs` (`build_filesystem` extracted, three
+handlers, `move_mount`'s fresh branch), both `nr_*.rs` (430-432),
+`user/tests/src/bin/t-fsmount.rs` (new pin), `user/tests/src/bin/t-mount-api.rs`
+(the quartet claim), and the uapi/roadmap rows.

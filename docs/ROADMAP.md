@@ -306,9 +306,11 @@ One-glance status of the whole roadmap.
   limited to what this kernel can keep — `RDO`/`NODIRATIME` where the
   filesystem honours read-only, `EOPNOTSUPP` where it cannot (and `mount -o ro`
   on a tmpfs now says so too instead of recording a promise it cannot keep),
-  `NOATIME`/`IDMAP` `EINVAL` as Linux answers them, `fsopen`/`fsconfig`/
-  `fsmount`/`fspick` (430–433) a named `ENOSYS` gap because a superblock
-  context is an object this kernel does not have (§3.11, item 122)
+  `NOATIME`/`IDMAP` `EINVAL` as Linux answers them, and the superblock half
+  `fsopen`/`fsconfig`/`fsmount` (430–432) served since item 135 (§3.16) —
+  `fspick` (433) is the family's one remaining `ENOSYS` gap, because what it
+  picks a mount for is reconfiguration and no filesystem here can be
+  reconfigured (§3.11, item 122; §3.16, item 135)
 - [x] `statmount(2)` (457) / `listmount(2)` (458) — the mount table reading
   itself out: Linux's 512-byte struct with its string area (offset 0 = the empty
   string), the unique mount id `listmount` walked, `STATMOUNT_BY_FD`, the mask

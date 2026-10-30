@@ -327,10 +327,10 @@ note printed once per number (`note_enosys`):
 
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| `fsopen` | 430 | a superblock context is an object this kernel does not have: `mount(2)` builds a `FileSystem` directly | a `fs_context` object with its own lifetime and `fsconfig` command stream |
-| `fsconfig` | 431 | same context | same |
-| `fsmount` | 432 | same context — and it would hand back a mount handle whose attachment is served (`move_mount`), but there is no context to mount | same |
-| `fspick` | 433 | picks an existing superblock for reconfiguration; this kernel's mount records are not superblocks | same |
+| `fsopen` | 430 | served: names one of the types this kernel can build and answers a context descriptor (`ENODATA` on `read(2)`, `EINVAL` on `write(2)`, `FD_CLOEXEC` on request, `ENODEV` for a type it cannot build) | `src/vfs/fscontext.rs`, pin `t-fsmount`, `docs/notes/` §3.16 |
+| `fsconfig` | 431 | served: one option per call into the context, `FSCONFIG_CMD_CREATE` builds the filesystem through the same factory `mount(2)` uses. An option this kernel does not read is `EINVAL` (named divergence: Linux's tmpfs takes `size=`; `mount(2)`'s data argument ignores it here too) | same |
+| `fsmount` | 432 | served: spends the context once and answers a mount descriptor that `move_mount` attaches as a first mount. `EINVAL` before creation, `EBUSY` after one mount, `MOUNT_ATTR_IDMAP` `EINVAL` | same |
+| `fspick` | 433 | **`ENOSYS`**: what it picks a mount for is reconfiguration, and no filesystem here can be reconfigured | the gap named; needs per-filesystem reconfigure support first |
 | `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page; measured on Linux 7.2.11 first — `0600` file, no `FD_CLOEXEC`, size fixed once, `MAP_SHARED` only, `PROT_EXEC` `EACCES`, `pread` `ESPIPE`, inherited by a child (item 131, §8.4) | a per-page direct-map carve-out (remove + restore around a page-table walk), plus `SECRETMEM` accounting in `/proc/meminfo`, the fixed-once size / shared-only / no-exec / no-coredump rules, and `t-secretmem` as the pin |
 
 > **Every family that was on this table has since moved out of it** — what

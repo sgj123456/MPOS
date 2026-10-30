@@ -52,6 +52,9 @@ pub mod eventfd;
 pub mod ext4;
 pub mod fanotify;
 pub mod file;
+/// The descriptor `open_tree(2)` hands out: a mount rather than a file, so
+/// `move_mount` can attach it by name later.
+pub mod fscontext;
 pub mod inotify;
 /// The `io_uring` ring: frames, Linux's header layout, and the three mmap
 /// regions. Bare metal only - the ring hands out physical pages.
@@ -70,8 +73,6 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
-/// The descriptor `open_tree(2)` hands out: a mount rather than a file, so
-/// `move_mount` can attach it by name later.
 pub mod mountfd;
 pub mod mountstat;
 pub mod mqueue;
@@ -320,6 +321,10 @@ pub enum VfsError {
     NoProcess,
     /// EBADF: no such open file description.
     BadFd,
+    /// ENODATA: the object has no data to read back - a filesystem context's
+    /// `read(2)`, which Linux answers with the same `ENODATA` an extended
+    /// attribute's absence does.
+    NoData,
     /// The tree has no root filesystem mounted yet.
     NoRoot,
     /// EINVAL: the path is unusable, e.g. relative with no cwd yet.
@@ -845,6 +850,29 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// a descriptor that is not one answers `EINVAL` there.
     #[cfg(target_os = "none")]
     fn as_mount_fd(&self) -> Option<&crate::vfs::mountfd::MountFd> {
+        None
+    }
+
+    /// Whether a description of this node refuses `read(2)` with `EBADF`
+    /// *before* the kind is consulted, because the node is not a byte stream at
+    /// all.
+    ///
+    /// A mount descriptor is the case this exists for: its `fstat` reports the
+    /// root directory (Linux does the same), so the directory rule would answer
+    /// `EISDIR` - but Linux's answer to reading *that descriptor* is `EBADF`
+    /// (measured: `read(2)` on a `fsmount`/`open_tree` descriptor). The
+    /// difference is what the object is: not a directory someone is reading,
+    /// but a descriptor with no file behind it.
+    fn refuses_file_io(&self) -> bool {
+        false
+    }
+
+    /// The filesystem context behind an `fsopen` descriptor, if it is one.
+    /// `fsconfig` and `fsmount` speak to these; a descriptor that is not one
+    /// answers `EBADF` there, which is Linux's answer for a context command
+    /// sent to a mount descriptor.
+    #[cfg(target_os = "none")]
+    fn as_fs_context(&self) -> Option<&crate::vfs::fscontext::FsContext> {
         None
     }
 

@@ -36,6 +36,7 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::Busy => err::EBUSY,
         // ESRCH: a membership write named no process the table holds - the
         // cgroup tree's `cgroup.procs` move of a pid that is not there.
+        VfsError::NoData => err::ENODATA,
         VfsError::NoProcess => err::ESRCH,
         VfsError::BadFd => err::EBADF,
         VfsError::NoRoot | VfsError::Invalid => err::EINVAL,

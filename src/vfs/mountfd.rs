@@ -28,7 +28,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Inode, Metadata, VfsError, VfsResult};
+use super::{FileSystem, Inode, Metadata, VfsError, VfsResult};
 
 /// The inode numbers descriptors of this class report. A mount descriptor is
 /// not a file in any tree, so no filesystem can hand out a number that
@@ -53,7 +53,43 @@ pub struct MountFd {
     /// The read-only promise the source mount carried, carried on so that
     /// attaching a clone of a read-only mount does not silently widen it.
     read_only: bool,
+    /// A filesystem that exists but has never been mounted - what
+    /// `fsmount(2)` hands out. Attaching one is not a bind (there is no
+    /// second name for it to alias) but a first mount, which is why this is
+    /// carried here rather than invented as a pivot in the syscall layer.
+    fresh: Option<FreshMount>,
     ino: u64,
+}
+
+/// The filesystem an `fsmount(2)` descriptor names, with the facts the mount
+/// table needs to attach it: what type it is, the source name the caller gave,
+/// and whether it is read-only.
+pub struct FreshMount {
+    /// The filesystem the context's `FSCONFIG_CMD_CREATE` built.
+    pub fs: Arc<dyn FileSystem>,
+    /// The type `fsopen` named, recorded on the mount the way `mount(2)`'s
+    /// `fstype` argument is.
+    pub fstype: String,
+    /// The source name (`/dev/vda3`, a 9p tag, or the type's own name).
+    pub source: String,
+    /// Whether the mount's attributes made it read-only.
+    pub read_only: bool,
+}
+
+impl FreshMount {
+    pub fn new(
+        fs: Arc<dyn FileSystem>,
+        fstype: String,
+        source: String,
+        read_only: bool,
+    ) -> FreshMount {
+        FreshMount {
+            fs,
+            fstype,
+            source,
+            read_only,
+        }
+    }
 }
 
 impl MountFd {
@@ -70,8 +106,35 @@ impl MountFd {
             source_path,
             attachable,
             read_only,
+            fresh: None,
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// The descriptor `fsmount(2)` hands out: a filesystem that exists and is
+    /// attached nowhere. Its display is `/` - a detached mount's own tree's
+    /// root, which is what a clone reports too - and it is attachable by
+    /// construction, because attaching it is the only thing it is for.
+    pub fn fresh(mount: FreshMount, display: String) -> Arc<MountFd> {
+        let root = mount.fs.root();
+        let read_only = mount.read_only;
+        let source = mount.source.clone();
+        Arc::new(MountFd {
+            root,
+            display,
+            source_path: source,
+            attachable: true,
+            read_only,
+            fresh: Some(mount),
+            ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// The never-mounted filesystem this descriptor names, when it names one -
+    /// how `move_mount` tells an `fsmount` descriptor from an `open_tree`
+    /// clone.
+    pub fn fresh_mount(&self) -> Option<&FreshMount> {
+        self.fresh.as_ref()
     }
 
     /// The inode a `move_mount` of this descriptor attaches.
@@ -121,6 +184,13 @@ impl Inode for MountFd {
 
     /// The descriptor names a mount, not a byte stream: reading or writing it
     /// is `EBADF`, the answer an `O_PATH` descriptor gets.
+    /// Measured on Linux: `read(2)` on a mount descriptor is `EBADF`, even
+    /// though `fstat` reports the root directory - the object has no file
+    /// behind it, so the kind's own rule must not answer first.
+    fn refuses_file_io(&self) -> bool {
+        true
+    }
+
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
         Err(VfsError::BadFd)
     }

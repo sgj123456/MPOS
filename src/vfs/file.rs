@@ -363,6 +363,13 @@ impl File {
         // (`open(dir, O_RDWR)` and `open(dir, O_WRONLY)` are both `EISDIR`,
         // refused where the description is made), so `EBADF` from
         // [`Self::check_writable`] is the whole of what a caller meets there.
+        // A descriptor that is not a file at all answers `EBADF` before the
+        // kind is asked: a mount descriptor reports the root directory, and
+        // Linux's `read(2)` on one is `EBADF` rather than `EISDIR` - the object
+        // is a descriptor with no file behind it, not a directory being read.
+        if self.inode.refuses_file_io() {
+            return Err(VfsError::BadFd);
+        }
         if self.inode.metadata().kind == NodeKind::Dir {
             return Err(VfsError::IsDir);
         }

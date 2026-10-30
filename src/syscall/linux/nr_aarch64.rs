@@ -341,12 +341,19 @@ pub const CLOSE_RANGE: u64 = 436;
 
 /// The mount API's attachment half: `open_tree(2)`, `move_mount(2)` and
 /// `mount_setattr(2)`. Same numbers on both machines - these landed after the
-/// number tables converged. The superblock quartet (`fsopen`/`fsconfig`/
-/// `fsmount`/`fspick`, 430-433 on x86_64, 430-433 asm-generic too) stays a
-/// named gap: this kernel mounts a `FileSystem` object directly and has no
-/// `fs_context` for those four to name, so they answer `ENOSYS`.
+/// number tables converged.
 pub const OPEN_TREE: u64 = 428;
 pub const MOVE_MOUNT: u64 = 429;
+/// The superblock half: `fsopen(2)`, `fsconfig(2)` and `fsmount(2)` - the
+/// three that make a filesystem before `move_mount` attaches it. `fspick(2)`
+/// (433) is the one number of the family still answering `ENOSYS`: what it
+/// picks a mount *for* is reconfiguration, and no filesystem in this kernel
+/// can be reconfigured (`FSCONFIG_CMD_RECONFIGURE` is `EINVAL`, Linux's own
+/// answer for a tmpfs context), so it is a named gap in `docs/ROADMAP.md`
+/// rather than a number that answers a door to nothing.
+pub const FSOPEN: u64 = 430;
+pub const FSCONFIG: u64 = 431;
+pub const FSMOUNT: u64 = 432;
 pub const MOUNT_SETATTR: u64 = 442;
 
 // See `nr_x86_64.rs`: the mount introspection pair, same numbers on both

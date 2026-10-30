@@ -6753,9 +6753,11 @@ being asked to become read-only, and answer `EOPNOTSUPP` when it does not — so
 now refuses instead of recording a promise it cannot keep. `ext4` keeps it and
 is unaffected.
 
-**Named gaps**: `fsopen`/`fsconfig`/`fsmount`/`fspick` (430–433) answer
-`ENOSYS` (this kernel mounts a `FileSystem` object directly; those four need a
-`fs_context`/superblock object to name); `NOSUID`/`NODEV`/`NOEXEC`/
+**Named gaps**: `fspick` (433) answers `ENOSYS` — the trio that names and
+builds a superblock (`fsopen`/`fsconfig`/`fsmount`, 430–432) is served since
+item 135 (§3.16), because this kernel's `mount(2)` was already the same model
+with its two ends fused, and `fspick` only exists to *reconfigure* a mount,
+which no filesystem here can do; `NOSUID`/`NODEV`/`NOEXEC`/
 `NODIRATIME`/`NOIDMAP` answer `EOPNOTSUPP` (no per-mount storage);
 `propagation`/`userns_fd` answer `EOPNOTSUPP` (no propagation, no idmapped
 mounts).
@@ -7216,3 +7218,53 @@ exhaustion is ~500k of them), `mpos-kunit 34 passed` both. Counterfactual
     64 KiB is free (a heap `Box<Interface>` path, or a smoltcp that keeps that buffer in a
     `Vec`). `IP_MTU_DISCOVER`/`IP_MTU` remain refused by name (item 58). Record:
     `docs/notes/` §4.6.
+
+## item 135 — the mount API's superblock half: `fsopen`, `fsconfig`, `fsmount` served; `fspick` the one gap left
+
+Measured on Linux 7.2.11 first (`build/scratch/mntapi/p{1,2,3,4,5}.c`, through
+`sudo -n unshare -m --propagation private` because the calls want mount-namespace
+authority; archived as `.workbuddy/probe_mntapi*.c`; the full table is
+`docs/notes/` §3.16). What the trio does here, and the shape it answers:
+
+- `fsopen("tmpfs", 0)` → a descriptor that `fstat`s as a 0-byte `0600` file,
+  whose `read(2)` is `ENODATA`, `write(2)` `EINVAL` and `pread`/`lseek` `ESPIPE`;
+  `FSOPEN_CLOEXEC` is the only bit its word carries and it *is* set; an unknown
+  type is `ENODEV` (`src/vfs/fscontext.rs`).
+- `fsconfig(fd, SET_STRING, key, value)` speaks one option into the context;
+  `FSCONFIG_CMD_CREATE` builds the `FileSystem` through `build_filesystem` —
+  the *same* factory `mount(2)` uses, extracted out of `mount_new` so the two
+  doors cannot drift. The state machine is measured and lives in the object:
+  an option after the creation is `EBUSY`, a second creation `EBUSY`, a command
+  number past Linux's eight `EOPNOTSUPP`, `CMD_RECONFIGURE` `EINVAL`.
+- `fsmount(fd, flags, attributes)` spends the context once (`EINVAL` before the
+  creation, `EBUSY` after one mount) and answers a mount descriptor whose
+  `read(2)` is `EBADF` and whose `fstat` is the root directory; `move_mount`
+  attaches it as a **first** mount (`MountTable::mount_at`) rather than a bind —
+  a bind needs a source an already-mounted filesystem serves, which this object
+  by definition is not.
+- `fspick` (433) remains `ENOSYS`: what it picks a mount *for* is
+  reconfiguration, and no filesystem here can be reconfigured.
+
+**Named divergences.** An option this kernel does not read is refused `EINVAL`
+rather than recorded and ignored — so a tmpfs `size=` is `EINVAL` here where
+Linux's tmpfs accepts it (`mount(2)`'s data argument already ignores the same
+option, so the two doors now say the same thing out loud). No filesystem takes
+an option by descriptor, path or byte blob, so `SET_FD`/`SET_PATH`/
+`SET_PATH_EMPTY`/`SET_BINARY` are `EINVAL` by name.
+
+**Found on the way and fixed**: a mount descriptor's `read(2)` used to answer
+`EISDIR` — its `fstat` reports the root directory, so the directory rule
+answered before the descriptor could. Linux answers `EBADF`, measured for both
+the `fsmount` descriptor and the `open_tree` clone this kernel already served;
+`Inode` gained `refuses_file_io()` and the read door asks it before the kind.
+
+**Pin**: `user/tests/src/bin/t-fsmount.rs` (21 claims; its claims were run as a
+reference against real Linux as root before the guest ran them, and all agreed
+except the deliberate `size=` refusal). `t-mount-api`'s quartet claim changed
+with the behaviour: the trio is served, `fspick` still `ENOSYS`.
+
+**Gates**: x86_64 `all 234 user tests passed` / `mpos-kunit 34 passed`; aarch64
+`all 233 user tests passed` / `mpos-kunit 34 passed` (`build/scratch/fsmount-gate4.log`,
+`fsmount-gate-a1.log`). **Counterfactual**: `move_mount`'s fresh-attach branch
+disabled → `t-fsmount` red on the attach and every claim after it, the other
+twenty green (`build/scratch/fsmount-cf.log`). Record: `docs/notes/` §3.16.

@@ -2437,6 +2437,106 @@ pub fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     }
 }
 
+/// The filesystem a type name builds, without a place to put it: the half
+/// `mount(2)` and `fsconfig(2)`'s `FSCONFIG_CMD_CREATE` share.
+///
+/// `source` and `data` are the strings the caller gave - a device path, a 9p
+/// tag, the type's own name, and the comma-joined option word - and the
+/// returned device number is the one `stat` will report as `st_dev` for
+/// everything under the mount. A type this kernel does not speak answers
+/// `ENODEV`, which is what a caller walking a list of types expects.
+fn build_filesystem(
+    fstype: &str,
+    source: &str,
+    data: &str,
+    cwd: &Arc<dyn Inode>,
+) -> Result<(alloc::sync::Arc<dyn crate::vfs::FileSystem>, Option<u64>), isize> {
+    let mut source_dev: Option<u64> = None;
+
+    let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype {
+        // The block types. The source names a device node; the node knows
+        // which storage it stands for.
+        "ext2" | "ext3" | "ext4" => {
+            if source.is_empty() {
+                return Err(err::ENOENT);
+            }
+            let dev_node = match crate::vfs::resolve_opt(source, Some(cwd.clone())) {
+                Ok(node) => node,
+                Err(e) => return Err(err_of(e)),
+            };
+            let Some(dev) = dev_node.as_block() else {
+                return Err(err::ENOTBLK);
+            };
+            // A block node's own `st_rdev`, which is its identity in the
+            // numbering `/sys/class/block`, `/dev` and a `add` event all agree
+            // on. Taking it from the node rather than re-deriving it from the
+            // source string means a caller that reached the same device by
+            // another name - a bind, a different `/dev` entry - still mounts
+            // it under the device's own number.
+            source_dev = dev_node
+                .rdev()
+                .map(|(major, minor)| crate::uevent::makedev(major, minor));
+            match crate::vfs::ext4::Ext4Fs::mount(dev) {
+                Ok(fs) => alloc::sync::Arc::new(fs) as alloc::sync::Arc<dyn crate::vfs::FileSystem>,
+                Err(_) => return Err(err::EINVAL),
+            }
+        }
+        // The kernel's own trees, by name. Both machines have these now: a real
+        // init mounts `/proc` and `/sys` on either one (Alpine's openrc does it
+        // on every boot), and the filesystems themselves build for both, with
+        // their machine-specific leaves behind capability flags. The gate that
+        // used to be here named the architecture for a *deferral*, and the
+        // deferral is over - an arm that answered `ENODEV` for a filesystem the
+        // kernel has is the "wrong shape" answer these are supposed to avoid.
+        "proc" => crate::vfs::procfs::ProcFs::new(),
+        "sysfs" => crate::vfs::sysfs::SysFs::new(),
+        // The cgroup2 tree: one hierarchy for the machine, whatever mounts
+        // name it - a second `mount -t cgroup2` binds the same tree, which
+        // is Linux's own rule for the single writable hierarchy.
+        "cgroup2" => crate::vfs::cgroupfs::CgroupFs::new(),
+        // A host share, served over 9p: the *source* is the mount tag the
+        // host exported the share under - `mount -t 9p hostshare /mnt`
+        // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
+        // for. An empty source takes the only share the bus has, which is
+        // the same call the boot's own mount makes. Both machines have the
+        // device now (`NOTES.md` §13.29), so the arm is the filesystem's
+        // rather than one machine's.
+        "9p" => match crate::vfs::p9::mount(source) {
+            Ok(fs) => fs,
+            Err(e) => return Err(err_of(e)),
+        },
+        "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
+        // The only type whose option string this kernel reads today. Every
+        // other arm ignores it - a named gap rather than a silent claim, and
+        // the reason the word is threaded through here instead of parsed in
+        // `handle_mount`: a filesystem's options are its own to interpret.
+        "devpts" => {
+            if let Err(e) = crate::vfs::devpts::apply_mount_options(data) {
+                return Err(err_of(e));
+            }
+            crate::vfs::devpts::DevPts::new()
+        }
+        "tmpfs" | "ramfs" => {
+            let fs = crate::vfs::ramfs::RamFs::new();
+            // A tmpfs root starts out `S_IRWXUGO | S_ISVTX` - 01777 - and that
+            // default is the whole of what `/tmp` is: writable by everyone,
+            // with each name removable only by its own owner. It is not
+            // decoration. A root that kept no mode at all is one whose
+            // permissions are never checked, sticky bit included, so without
+            // this the rule the bit exists for simply does not run - which is
+            // how any user could delete any other user's files out of `/tmp`.
+            if fstype == "tmpfs" {
+                fs.root().set_mode(0o1777);
+            }
+            fs
+        }
+        // A type this kernel does not speak. ENODEV is what Linux answers, and
+        // it is the answer a caller walks a list of types on.
+        _ => return Err(err::ENODEV),
+    };
+    Ok((fs, source_dev))
+}
+
 /// The mount half of `mount(2)`: build the filesystem the type names and
 /// hang it on the target.
 fn mount_new(
@@ -2469,88 +2569,9 @@ fn mount_new(
     // own `lookup_bdev`, in the same place. A type whose source is a name
     // rather than a path ("proc", "tmpfs", a 9p tag) leaves it `None` and gets
     // an anonymous number, which is what Linux gives a pseudo-filesystem.
-    let mut source_dev: Option<u64> = None;
-
-    let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype {
-        // The block types. The source names a device node; the node knows
-        // which storage it stands for.
-        "ext2" | "ext3" | "ext4" => {
-            if source.is_empty() {
-                return err::ENOENT;
-            }
-            let dev_node = match crate::vfs::resolve_opt(source, Some(cwd.clone())) {
-                Ok(node) => node,
-                Err(e) => return err_of(e),
-            };
-            let Some(dev) = dev_node.as_block() else {
-                return err::ENOTBLK;
-            };
-            // A block node's own `st_rdev`, which is its identity in the
-            // numbering `/sys/class/block`, `/dev` and a `add` event all agree
-            // on. Taking it from the node rather than re-deriving it from the
-            // source string means a caller that reached the same device by
-            // another name - a bind, a different `/dev` entry - still mounts
-            // it under the device's own number.
-            source_dev = dev_node
-                .rdev()
-                .map(|(major, minor)| crate::uevent::makedev(major, minor));
-            match crate::vfs::ext4::Ext4Fs::mount(dev) {
-                Ok(fs) => alloc::sync::Arc::new(fs) as alloc::sync::Arc<dyn crate::vfs::FileSystem>,
-                Err(_) => return err::EINVAL,
-            }
-        }
-        // The kernel's own trees, by name. Both machines have these now: a real
-        // init mounts `/proc` and `/sys` on either one (Alpine's openrc does it
-        // on every boot), and the filesystems themselves build for both, with
-        // their machine-specific leaves behind capability flags. The gate that
-        // used to be here named the architecture for a *deferral*, and the
-        // deferral is over - an arm that answered `ENODEV` for a filesystem the
-        // kernel has is the "wrong shape" answer these are supposed to avoid.
-        "proc" => crate::vfs::procfs::ProcFs::new(),
-        "sysfs" => crate::vfs::sysfs::SysFs::new(),
-        // The cgroup2 tree: one hierarchy for the machine, whatever mounts
-        // name it - a second `mount -t cgroup2` binds the same tree, which
-        // is Linux's own rule for the single writable hierarchy.
-        "cgroup2" => crate::vfs::cgroupfs::CgroupFs::new(),
-        // A host share, served over 9p: the *source* is the mount tag the
-        // host exported the share under - `mount -t 9p hostshare /mnt`
-        // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
-        // for. An empty source takes the only share the bus has, which is
-        // the same call the boot's own mount makes. Both machines have the
-        // device now (`NOTES.md` §13.29), so the arm is the filesystem's
-        // rather than one machine's.
-        "9p" => match crate::vfs::p9::mount(source) {
-            Ok(fs) => fs,
-            Err(e) => return err_of(e),
-        },
-        "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
-        // The only type whose option string this kernel reads today. Every
-        // other arm ignores it - a named gap rather than a silent claim, and
-        // the reason the word is threaded through here instead of parsed in
-        // `handle_mount`: a filesystem's options are its own to interpret.
-        "devpts" => {
-            if let Err(e) = crate::vfs::devpts::apply_mount_options(data) {
-                return err_of(e);
-            }
-            crate::vfs::devpts::DevPts::new()
-        }
-        "tmpfs" | "ramfs" => {
-            let fs = crate::vfs::ramfs::RamFs::new();
-            // A tmpfs root starts out `S_IRWXUGO | S_ISVTX` - 01777 - and that
-            // default is the whole of what `/tmp` is: writable by everyone,
-            // with each name removable only by its own owner. It is not
-            // decoration. A root that kept no mode at all is one whose
-            // permissions are never checked, sticky bit included, so without
-            // this the rule the bit exists for simply does not run - which is
-            // how any user could delete any other user's files out of `/tmp`.
-            if fstype == "tmpfs" {
-                fs.root().set_mode(0o1777);
-            }
-            fs
-        }
-        // A type this kernel does not speak. ENODEV is what Linux answers, and
-        // it is the answer a caller walks a list of types on.
-        _ => return err::ENODEV,
+    let (fs, source_dev) = match build_filesystem(fstype, source, data, cwd) {
+        Ok(built) => built,
+        Err(error) => return error,
     };
 
     match crate::vfs::mount::mount_at_opt(
@@ -2770,6 +2791,10 @@ pub fn handle_move_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         return err::EINVAL;
     }
     let table = crate::vfs::mount::caller_table();
+    // A descriptor may hold a *never-mounted* filesystem (`fsmount`'s): attaching
+    // that is making the mount rather than binding a second name for one, so the
+    // filesystem itself is carried through to the attach below.
+    let mut fresh: Option<crate::vfs::mountfd::FreshMount> = None;
     // The source: a path naming a mount, or a descriptor holding one.
     let (source, source_path, source_read_only, attachable, from_fd) =
         if flags & MOVE_MOUNT_F_EMPTY_PATH != 0 && from_path.is_empty() {
@@ -2777,17 +2802,35 @@ pub fn handle_move_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
                 Ok(inode) => inode,
                 Err(error) => return error,
             };
-            match mount_root_of(&inode) {
-                Some((root, source_path, read_only, attachable)) => {
-                    (root, source_path, read_only, attachable, true)
-                }
-                None => {
-                    let source_path = table
-                        .path_of(&inode)
-                        .unwrap_or_else(|| alloc::string::String::from("/"));
-                    let attachable = table.holds_mount(&inode);
-                    let read_only = table.read_only_of(&inode);
-                    (inode, source_path, read_only, attachable, true)
+            if let Some(mount) = inode.as_mount_fd()
+                && let Some(filesystem) = mount.fresh_mount()
+            {
+                fresh = Some(crate::vfs::mountfd::FreshMount::new(
+                    filesystem.fs.clone(),
+                    filesystem.fstype.clone(),
+                    filesystem.source.clone(),
+                    filesystem.read_only,
+                ));
+                (
+                    filesystem.fs.root(),
+                    filesystem.source.clone(),
+                    filesystem.read_only,
+                    true,
+                    true,
+                )
+            } else {
+                match mount_root_of(&inode) {
+                    Some((root, source_path, read_only, attachable)) => {
+                        (root, source_path, read_only, attachable, true)
+                    }
+                    None => {
+                        let source_path = table
+                            .path_of(&inode)
+                            .unwrap_or_else(|| alloc::string::String::from("/"));
+                        let attachable = table.holds_mount(&inode);
+                        let read_only = table.read_only_of(&inode);
+                        (inode, source_path, read_only, attachable, true)
+                    }
                 }
             }
         } else {
@@ -2831,7 +2874,19 @@ pub fn handle_move_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         Some(mount) => mount.root(),
         None => at,
     };
-    let result = if from_fd {
+    let result = if let Some(filesystem) = fresh {
+        // The first mount of that filesystem: no path serves it yet, so this is
+        // `mount(2)`'s attach with the object already built - the same table
+        // entry, and the same refusal when the target already carries a mount.
+        table.mount_at(
+            at.clone(),
+            filesystem.fs,
+            &filesystem.fstype,
+            &filesystem.source,
+            filesystem.read_only || source_read_only,
+            None,
+        )
+    } else if from_fd {
         table.bind_mount(at.clone(), source.clone(), &source_path, source_read_only)
     } else {
         table.move_mount(&source, &at)
@@ -2844,6 +2899,244 @@ pub fn handle_move_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         Err(crate::vfs::VfsError::Busy) => err::EINVAL,
         Err(error) => err_of(error),
     }
+}
+
+/// The type names `fsopen(2)` accepts: exactly the types `build_filesystem`
+/// can build. A name outside this list is `ENODEV` at `fsopen` time - measured
+/// on Linux 7.2.11 for `"nonexistentfs"` - which is the answer a caller
+/// walking a list of types expects.
+fn known_filesystem(name: &str) -> bool {
+    matches!(
+        name,
+        "ext2"
+            | "ext3"
+            | "ext4"
+            | "proc"
+            | "sysfs"
+            | "cgroup2"
+            | "9p"
+            | "devtmpfs"
+            | "devfs"
+            | "devpts"
+            | "tmpfs"
+            | "ramfs"
+    )
+}
+
+/// The option keys a type actually reads, which is the whole of what
+/// `fsconfig(2)` may accept for it.
+///
+/// This is deliberately shorter than Linux's lists: the door must refuse an
+/// option this kernel does not honour rather than accept it into a data string
+/// nothing parses. `source` is every type's (Linux accepts it for a
+/// pseudo-filesystem and ignores it, and so does `mount(2)` here), and devpts
+/// reads `mode`/`uid`/`gid` through `apply_mount_options` - the one filesystem
+/// in this kernel whose options are not decoration. A `tmpfs` `size=` is the
+/// named gap: Linux reads it, this kernel's tmpfs takes its budget from
+/// somewhere else, so the option is refused (`EINVAL`, Linux's answer for a
+/// key its own type does not know) instead of recorded and ignored.
+fn option_key_accepted(fstype: &str, key: &str) -> bool {
+    match fstype {
+        "devpts" => matches!(key, "source" | "mode" | "uid" | "gid"),
+        _ => key == "source",
+    }
+}
+
+/// `fsopen(2)`: name a filesystem type and get the context its options are
+/// spoken into, before anything exists to mount.
+///
+/// The descriptor answers `ENODATA` to `read(2)`, `EINVAL` to `write(2)` and
+/// `ESPIPE` to a seek - measured on Linux 7.2.11. Nothing is built yet: a
+/// context that is closed without a `FSCONFIG_CMD_CREATE` costs no filesystem,
+/// which is the difference this call makes to `mount(2)`.
+pub fn handle_fsopen(args: [usize; ARG_COUNT]) -> isize {
+    use crate::vfs::fscontext;
+    let flags = args[1] as u32;
+    // `FSOPEN_CLOEXEC` is the only bit the word carries: `0x8000_0000` and
+    // every other stray bit answer `EINVAL`, measured.
+    if flags & !fscontext::FSOPEN_CLOEXEC != 0 {
+        return err::EINVAL;
+    }
+    let fstype = match cstr_arg(args[0], true) {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    if !known_filesystem(&fstype) {
+        return err::ENODEV;
+    }
+    let context = fscontext::FsContext::new(fstype);
+    let fd = match crate::vfs::open_inode(context) {
+        Ok(fd) => fd,
+        Err(error) => return err_of(error),
+    };
+    if flags & fscontext::FSOPEN_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    fd as isize
+}
+
+/// `fsconfig(2)`: speak one option into a context, or ask it to create the
+/// filesystem.
+///
+/// The state machine is Linux's and was measured before it was written: an
+/// option after `FSCONFIG_CMD_CREATE` is `EBUSY`, a second creation is
+/// `EBUSY`, a creation with an option no type reads is `EINVAL`, and a
+/// command number past Linux's eight is `EOPNOTSUPP`. `fsconfig` on a *mount*
+/// descriptor (what `open_tree` or `fsmount` hands out) is `EBADF` - a
+/// descriptor that is not a context is not a context.
+pub fn handle_fsconfig(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    use crate::vfs::fscontext;
+    let inode = match fd_inode(args[0] as i32) {
+        Ok(inode) => inode,
+        Err(error) => return error,
+    };
+    let Some(context) = inode.as_fs_context() else {
+        return err::EBADF;
+    };
+    let command = args[1] as u32;
+    match command {
+        fscontext::FSCONFIG_SET_FLAG => {
+            let key = match cstr_arg(args[2], true) {
+                Ok(key) => key,
+                Err(error) => return error,
+            };
+            if !option_key_accepted(context.fstype(), &key) {
+                return err::EINVAL;
+            }
+            match context.set_flag(&key) {
+                Ok(()) => 0,
+                Err(error) => err_of(error),
+            }
+        }
+        fscontext::FSCONFIG_SET_STRING => {
+            // A string option is a key and a value; a null value is `EINVAL`,
+            // measured (a flag-shaped option has its own command).
+            let key = match cstr_arg(args[2], true) {
+                Ok(key) => key,
+                Err(error) => return error,
+            };
+            if args[3] == 0 {
+                return err::EINVAL;
+            }
+            let value = match cstr_arg(args[3], true) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            if !option_key_accepted(context.fstype(), &key) {
+                return err::EINVAL;
+            }
+            match context.set_option(&key, &value) {
+                Ok(()) => 0,
+                Err(error) => err_of(error),
+            }
+        }
+        // The three object-shaped option commands (`SET_BINARY`, `SET_PATH`,
+        // `SET_PATH_EMPTY`) and `SET_FD` have no taker here: no filesystem in
+        // this kernel takes an option by descriptor, path or byte blob, and
+        // Linux's answer for a type with no handler for one is `EINVAL`
+        // (measured for `SET_BINARY` on a tmpfs context). They are refused by
+        // name in `docs/notes/` §3.16 rather than recorded.
+        fscontext::FSCONFIG_SET_BINARY
+        | fscontext::FSCONFIG_SET_PATH
+        | fscontext::FSCONFIG_SET_PATH_EMPTY
+        | fscontext::FSCONFIG_SET_FD => err::EINVAL,
+        fscontext::FSCONFIG_CMD_CREATE | fscontext::FSCONFIG_CMD_CREATE_EXCL => {
+            if context.is_created() {
+                return err::EBUSY;
+            }
+            let source = context.source();
+            let data = context.data();
+            let fstype = alloc::string::String::from(context.fstype());
+            let fs = match build_filesystem(&fstype, &source, &data, cwd) {
+                Ok((fs, _dev)) => fs,
+                Err(error) => return error,
+            };
+            match context.create(fs) {
+                Ok(()) => 0,
+                Err(error) => err_of(error),
+            }
+        }
+        // `CMD_RECONFIGURE` names a filesystem that can be reconfigured, and
+        // none here can: measured on Linux, a tmpfs context answers `EINVAL`
+        // to a reconfiguration that carries an option too.
+        fscontext::FSCONFIG_CMD_RECONFIGURE => err::EINVAL,
+        // A command number this kernel does not know: measured `EOPNOTSUPP`
+        // (95) on Linux for a number past its own eight.
+        _ => err::EOPNOTSUPP,
+    }
+}
+
+/// `fsmount(2)`: turn a created context into a mount descriptor - a
+/// filesystem that exists and is attached nowhere, which `move_mount` is what
+/// attaches.
+///
+/// Measured on Linux 7.2.11: the second argument carries `FSMOUNT_CLOEXEC`
+/// and/or `FSMOUNT_NAMESPACE` and nothing else (a stray bit is `EINVAL`), and
+/// the *mount attributes* are the third argument (`MOUNT_ATTR_RDONLY` and
+/// friends - `MOUNT_ATTR_IDMAP` is `EINVAL` without idmapped mounts). Before
+/// `FSCONFIG_CMD_CREATE` this is `EINVAL`; a second `fsmount` from one context
+/// is `EBUSY`. The descriptor it answers is a mount, not a file: `read(2)` is
+/// `EBADF`, and `fstat` reports the root directory.
+pub fn handle_fsmount(args: [usize; ARG_COUNT]) -> isize {
+    use crate::vfs::fscontext;
+    use crate::vfs::mountfd::{FreshMount, MountFd};
+    const MOUNT_ATTR_RDONLY: u32 = 0x0000_0001;
+    const MOUNT_ATTR_NOSUID: u32 = 0x0000_0002;
+    const MOUNT_ATTR_NODEV: u32 = 0x0000_0004;
+    const MOUNT_ATTR_NOEXEC: u32 = 0x0000_0008;
+    const MOUNT_ATTR_NOATIME: u32 = 0x0000_0010;
+    const MOUNT_ATTR_STRICTATIME: u32 = 0x0000_0020;
+    const MOUNT_ATTR_NODIRATIME: u32 = 0x0000_0080;
+    let flags = args[1] as u32;
+    let attributes = args[2] as u32;
+    let inode = match fd_inode(args[0] as i32) {
+        Ok(inode) => inode,
+        Err(error) => return error,
+    };
+    let Some(context) = inode.as_fs_context() else {
+        return err::EBADF;
+    };
+    if flags & !(fscontext::FSMOUNT_CLOEXEC | fscontext::FSMOUNT_NAMESPACE) != 0 {
+        return err::EINVAL;
+    }
+    // The attributes a mount can carry here. `read-only` is the one this
+    // table acts on; the other four are the flag-shaped promises `mount(2)`
+    // already accepts and does not apply (there is no setuid bit to honour, no
+    // device to refuse, no attribute to leave unstamped), and accepting them
+    // is not the same as refusing them. `MOUNT_ATTR_IDMAP` is `EINVAL`:
+    // idmapped mounts do not exist in this kernel, which is Linux's own answer
+    // for a machine without them.
+    const KNOWN_ATTRIBUTES: u32 = MOUNT_ATTR_RDONLY
+        | MOUNT_ATTR_NOSUID
+        | MOUNT_ATTR_NODEV
+        | MOUNT_ATTR_NOEXEC
+        | MOUNT_ATTR_NOATIME
+        | MOUNT_ATTR_STRICTATIME
+        | MOUNT_ATTR_NODIRATIME;
+    if attributes & !KNOWN_ATTRIBUTES != 0 {
+        return err::EINVAL;
+    }
+    // `take_for_mount` answers the two measured refusals: `EINVAL` before a
+    // creation, `EBUSY` after this context already made a mount.
+    let fs = match context.take_for_mount() {
+        Ok(fs) => fs,
+        Err(error) => return err_of(error),
+    };
+    let fstype = alloc::string::String::from(context.fstype());
+    let source = context.source();
+    let read_only = attributes & MOUNT_ATTR_RDONLY != 0;
+    let mount = MountFd::fresh(
+        FreshMount::new(fs, fstype, source, read_only),
+        alloc::string::String::from("/"),
+    );
+    let fd = match crate::vfs::open_inode(mount) {
+        Ok(fd) => fd,
+        Err(error) => return err_of(error),
+    };
+    if flags & fscontext::FSMOUNT_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    fd as isize
 }
 
 /// `mount_setattr(2)`: change a mount's attributes, or everything below it.
