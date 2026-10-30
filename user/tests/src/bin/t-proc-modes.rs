@@ -395,6 +395,7 @@ fn main() {
     }
 
     chmod_doors(&mut r);
+    owner_and_time_doors(&mut r);
 
     r.finish();
 }
@@ -476,6 +477,196 @@ fn chmod_doors(r: &mut Report) {
         );
     }
     let _ = std::fs::remove_file(tmp);
+}
+
+/// The other two attribute doors (`chown`/`utimensat`) against a node that
+/// keeps no owner and no timestamps.
+///
+/// Measured on a current host first (`build/scratch/attr2/p1.c` and `p2.c`,
+/// Linux 7.2.11, uid 1000 *and* root), and the shape is not one rule: a
+/// `/proc/sys` file **drops** the timestamps (all three `utimensat` shapes
+/// answer `0` to root) but **refuses** the owner (`chown` is `EPERM` even for
+/// root, because its inode has no `setattr`); a `/proc/<pid>` directory refuses
+/// both, whoever asks, because it mirrors a process; and a sysfs directory
+/// drops them like the sysctl. Who may ask is the ordinary question on top of
+/// that: an ordinary user's `utimensat` on a `0444` proc file is `EACCES` for
+/// the "now" shapes and `EPERM` for an explicit pair, and on `/dev/null` (mode
+/// `0666`) the "now" shape is `0` because write permission stands in for
+/// ownership.
+fn owner_and_time_doors(r: &mut Report) {
+    const EPERM: i32 = 1;
+    const EACCES: i32 = 13;
+    const ENOENT: i32 = 2;
+    fn errno() -> i32 {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default()
+    }
+    fn name(path: &str) -> Option<std::ffi::CString> {
+        std::ffi::CString::new(path).ok()
+    }
+    /// `utimensat` in one of its three shapes: 0 = both clocks "now", 1 = an
+    /// explicit pair, 2 = no pair at all.
+    fn touch(path: &str, shape: i32) -> i32 {
+        let Some(cpath) = name(path) else {
+            return ENOENT;
+        };
+        let now = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+        ];
+        let set = [
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+        ];
+        let times = match shape {
+            0 => now.as_ptr(),
+            1 => set.as_ptr(),
+            _ => std::ptr::null(),
+        };
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times, 0) };
+        if rc == 0 { 0 } else { errno() }
+    }
+    fn chown_self(path: &str) -> i32 {
+        let Some(cpath) = name(path) else {
+            return ENOENT;
+        };
+        let Ok(st) = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) else {
+            return ENOENT;
+        };
+        let rc = unsafe { libc::chown(cpath.as_ptr(), st.st_uid, st.st_gid) };
+        if rc == 0 { 0 } else { errno() }
+    }
+
+    // ---- root: the sysctl drops the times and refuses the owner ---------------
+    let sysctl = "/proc/sys/vm/max_map_count";
+    let now = touch(sysctl, 0);
+    let set = touch(sysctl, 1);
+    let null = touch(sysctl, 2);
+    r.check(
+        &format!("a /proc/sys file accepts the timestamps and drops them (now/null {now}/{null})"),
+        now == 0 && null == 0,
+    );
+    r.check(
+        &format!("an explicit pair of times on it is accepted for root too (got {set})"),
+        set == 0,
+    );
+    let sysctl_owner = chown_self(sysctl);
+    r.check(
+        &format!("chown on a /proc/sys file is EPERM even for root (got {sysctl_owner})"),
+        sysctl_owner == EPERM,
+    );
+
+    // ---- root: the pid directory refuses both, whoever asks ------------------
+    let pid_dir = "/proc/self";
+    let m = (touch(pid_dir, 0), touch(pid_dir, 1), touch(pid_dir, 2));
+    r.check(
+        &format!(
+            "the pid directory refuses the three timestamps shapes with EPERM (got {}/{}/{})",
+            m.0, m.1, m.2
+        ),
+        m == (EPERM, EPERM, EPERM),
+    );
+    let pid_owner = chown_self(pid_dir);
+    r.check(
+        &format!("and it refuses chown with EPERM for root too (got {pid_owner})"),
+        pid_owner == EPERM,
+    );
+    // A proc file accepts the owner question: root may name the owner, and the
+    // call answers 0 even though the tree keeps what it named nowhere.
+    let status_owner = chown_self("/proc/self/status");
+    r.check(
+        &format!("chown on a proc file answers 0 (accepted, dropped; got {status_owner})"),
+        status_owner == 0,
+    );
+
+    // ---- the unprivileged half, in a child that dropped its ids --------------
+    const WRITABLE_NOW: u32 = 1;
+    const WRITABLE_EXPLICIT: u32 = 2;
+    const WRITABLE_NULL: u32 = 4;
+    const CHOWN_REFUSED: u32 = 8;
+    const DEVICE_NOW: u32 = 16;
+    const DEVICE_EXPLICIT: u32 = 32;
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe {
+            libc::setuid(65534);
+        }
+        let mut bits = 0;
+        if touch(sysctl, 0) == EACCES {
+            bits |= WRITABLE_NOW;
+        }
+        if touch(sysctl, 1) == EPERM {
+            bits |= WRITABLE_EXPLICIT;
+        }
+        if touch(sysctl, 2) == EACCES {
+            bits |= WRITABLE_NULL;
+        }
+        if chown_self(sysctl) == EPERM {
+            bits |= CHOWN_REFUSED;
+        }
+        if touch("/dev/null", 0) == 0 {
+            bits |= DEVICE_NOW;
+        }
+        if touch("/dev/null", 1) == EPERM {
+            bits |= DEVICE_EXPLICIT;
+        }
+        std::process::exit(bits as i32);
+    }
+    let mut status = 0;
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+    let bits = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status) as u32
+    } else {
+        0
+    };
+    if bits == 0 && !libc::WIFEXITED(status) {
+        r.check(
+            "the unprivileged child could run the attribute doors",
+            false,
+        );
+        return;
+    }
+    r.check(
+        &format!(
+            "an ordinary user's \"now\" timestamps on a 0444 proc file are EACCES (bits {bits:02x})"
+        ),
+        bits & WRITABLE_NOW != 0,
+    );
+    r.check(
+        &format!("an explicit pair from that user is EPERM (bits {bits:02x})"),
+        bits & WRITABLE_EXPLICIT != 0,
+    );
+    r.check(
+        &format!("the null-pointer form from that user is EACCES (bits {bits:02x})"),
+        bits & WRITABLE_NULL != 0,
+    );
+    r.check(
+        &format!("and that user's chown on it is EPERM (bits {bits:02x})"),
+        bits & CHOWN_REFUSED != 0,
+    );
+    r.check(
+        &format!("a 0666 device node takes the \"now\" form from that user (bits {bits:02x})"),
+        bits & DEVICE_NOW != 0,
+    );
+    r.check(
+        &format!("and refuses the explicit pair, since it does not own it (bits {bits:02x})"),
+        bits & DEVICE_EXPLICIT != 0,
+    );
 }
 
 /// Claim that `path`'s link reads back `want`.

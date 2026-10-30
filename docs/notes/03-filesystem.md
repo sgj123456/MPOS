@@ -1098,17 +1098,15 @@ refusal fails this program rather than passing it. All green on a current host f
 (`MPOS_ON_HOST=1` against Linux 7.2.11), then on both machines.
 
 **Gates**: x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed`
-(`build/scratch/attr-gate1.log`, `verdict pass=236 fail=0`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/attr-gate2.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, total 31.71 s, `build/scratch/attr-gate-a4.log`; the first two aarch64 attempts failed on stage 1 alone - the documented host-suite load flake, 706 tests green standalone - and one more on the documented console-RX kunit flake, `arch.console_receive` + `ipc.tty`; the re-run quoted above).
+(verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/attr-gate2.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, total 31.71 s, `build/scratch/attr-gate-a4.log`; the first two aarch64 attempts failed on stage 1 alone - the documented host-suite load flake, 706 tests green standalone - and one more on the documented console-RX kunit flake, `arch.console_receive` + `ipc.tty`; the re-run quoted above).
 
 **Counterfactual**: the funnel's answer disabled (`if false && inode.refuses_mode_change()`) -> `t-proc-modes` alone red, `pass=235 fail=1` of 236, with exactly the four `EPERM` claims red - `chmod on /proc/self/status is EPERM … (got 0)`, `chmod on /proc/sys/vm/max_map_count is EPERM … (got 0)`, `fchmod on a proc file's descriptor is EPERM (got 0)`, `the AT_EMPTY_PATH spelling is EPERM too (got 0)` - while the two word claims and the tmpfs control stayed green, which is the point of claiming the control (`build/scratch/attr-cf.log`).
 
-**What stays named.** `chown` and `utimensat` on a procfs node still answer `0` here
-(Linux answers `0` for both on `/proc/self/status`, and `EPERM` for the `chown` on
-`/proc/sys/vm/max_map_count`): those two doors write an owner and two clocks that this
-tree does not keep, which is the same "reported, not kept" shape item 137 found for the
-mode, and closing it needs per-node owner and time storage rather than an answer. And
-sysfs's own half — root's `chmod` is `0` there and an ordinary user's is `EPERM`, where
-this kernel answers `0` to both and stores nothing — stays named in `docs/uapi/` §5.2.
+**What stayed named here** (closed by §3.19, item 140): `chown` and `utimensat` on a
+procfs node answered `0` at this point; the two doors' refusals are the node's answer
+rather than a store, and §3.19 landed them. sysfs's own `chmod` half — root's is `0`
+and an ordinary user's is `EPERM` there, where this kernel answers `0` to both and
+stores nothing — stays named in `docs/uapi/` §5.2.
 
 **A lesson about the instrument.** The probe above ran its matrix as root, and the
 matrix included `chmod("/tmp", 0640)`. It did what it was told: the development host's
@@ -1193,3 +1191,86 @@ page cache is the kernel heap here); and `nr_inodes`' ceiling counts nodes, not 
 names their directories hold, so a mount can hold fewer names than inodes would
 suggest when a name is shared by `link(2)` — Linux counts the inode once there too,
 which is why a hard link is not charged.
+
+### 3.19 A node that keeps no owner and no clocks refuses or drops, as Linux does — **DONE** (2026-10-30)
+
+Item 138 gave a `chmod` on a procfs/sysfs node its refusal (`EPERM`, the node's own
+answer, for root too) and named the other two attribute doors as still open: `chown(2)`
+and `utimensat(2)` answered `0` everywhere, because this tree keeps no owner and no
+timestamps to write. Linux has three different answers there, and which one a node
+gives is a property of the node rather than of the caller.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/attr2/p1.c` for `chown`, `p2.c` for
+the three `utimensat` shapes; run twice, as uid 1000 and as root; `status` = `EPERM`,
+`denied` = `EACCES`):
+
+| node (mode) | `chown(self)` | times "now" | times explicit | times null |
+|---|---|---|---|---|
+| `/proc/sys/vm/max_map_count` (`0644` root) | root **`EPERM`** / user `EPERM` | root `0` / user `denied` | root `0` / user `EPERM` | root `0` / user `denied` |
+| `/proc/self` pid directory (`0555`) | **`EPERM`** for both | `EPERM` for both | `EPERM` both | `EPERM` both |
+| `/proc/self/status` (`0444`, owned by the reader) | `0` both | `0` both | `0` both | `0` both |
+| `/proc/uptime` (`0444` root) | `0` root / `EPERM` user | `0` / `denied` | `0` / `EPERM` | `0` / `denied` |
+| `/sys/kernel` directory (`0755` root) | `0` root / `EPERM` user | `0` / `denied` | `0` / `EPERM` | `0` / `denied` |
+| `/dev/null` (`020666` root) | `0` root / `EPERM` user | `0` / `0` | `0` / `EPERM` | `0` / `0` |
+| a tmpfs file owned by the caller | `0` both | `0` both | `0` both | `0` both |
+
+Three readings, and they are the design:
+
+* a `/proc/sys` file **refuses the owner** (its inode has no `setattr`, so root reads
+  what a user reads) and **drops the timestamps** (all three shapes are `0` to root);
+* a pid directory **refuses both** - it mirrors a process, and Linux's mirror has no
+  `setattr` either;
+* everything else - a sysfs directory, a `/proc` file, a device node - **drops both**,
+  and who may ask is the ordinary question on top: an ordinary user's timestamps on a
+  `0444` node are `EACCES` for the "now" shapes and `EPERM` for an explicit pair
+  (`setattr_prepare`'s two arms), and on a `0666` device node the "now" shape is `0`
+  because write permission stands in for ownership.
+
+This kernel before the change (measured by the temporary `t-proc-attrs-diag`, run in
+the sweep and deleted again): `chown` `0` on every node including the two Linux refuses,
+and `utimensat` **`EPERM`** on every node but `/dev/null`, because the node's default
+`set_times` is a refusal and nothing overrode it.
+
+**Landed.** Two trait doors beside item 138's `refuses_mode_change`:
+`Inode::refuses_owner_change()` and `Inode::refuses_times_change()`, asked by their
+handlers *before* the caller's standing because each is the node's answer. On procfs:
+true for the owner on `ProcCtl` and on the mirroring pid directory, true for the times
+on the mirroring directory only, and `set_times` answering `Ok(())` (accepted, dropped)
+on the node types that accept it - `ProcFile`, `ProcCtl`, `ProcLink`, `ProcDir`. On
+sysfs all five node types accept the timestamps the same way. The mirror is a flag on
+`ProcDir` (`mirroring()`, set by `process_dir`) rather than "the directory has generated
+children": `/proc` itself has those and Linux does not report it as a pid directory.
+`may_touch` gained the rule the item needed: for a node that *reports* a mode without
+*keeping* one, the write-permission arm asks the reported word (`may_by_mode`) instead
+of `may_as`'s "not policed", which is what makes an ordinary user's `0444` answer
+`EACCES` rather than `0`. `may_setattr` needed no change - it asks ownership, and the
+reported owner is root's.
+
+**Pin**: `user/tests/src/bin/t-proc-modes.rs` grew an `owner_and_time_doors` half - the
+sysctl's three time shapes and its refused `chown`, the pid directory's four `EPERM`s, a
+proc file's accepted `chown`, and six claims from a child that dropped to uid 65534
+(its `EACCES`/`EPERM` split on the sysctl, its device-node pair). The whole program was
+run as root against real Linux first and answered every claim `ok:`.
+
+**Gates**: x86_64 `pass=237 fail=0` / `mpos-kunit 34 passed` (`build/scratch/attr2-gate2.log`, `X-EXIT=0`); aarch64 `all 236 user tests passed` / kunit 34 (`verdict pass=236 fail=0`, `A-EXIT=0`, `build/scratch/attr2-gate-a1.log`).
+
+**Counterfactuals**, both run on x86_64:
+
+* the two refusal doors answering `false` - `t-proc-modes` alone red, `1 of 237`, with
+  exactly three claims red (`chown on a /proc/sys file is EPERM even for root (got 0)`,
+  `the pid directory refuses the three timestamps shapes with EPERM (got 0/0/0)`,
+  `and it refuses chown with EPERM for root too (got 0)`), the drops staying green
+  (`build/scratch/attr2-cfa.log`);
+* `may_touch` back to the mode-less "not policed" answer - exactly two claims red, the
+  child's "now" and null shapes on the `0444` sysctl (`bits 3a`), while its explicit-pair
+  and `chown` claims stayed green because those are the ownership arm's
+  (`build/scratch/attr2-cfb.log`).
+
+**What stays named.** Per-process ownership: Linux's `/proc/<pid>` nodes are owned by
+the process they describe, so a non-root caller's `chown(self)`/`utimensat` on
+`/proc/self/status` is `0` there; this tree reports every procfs node as root's and
+keeps no dynamic owner, so the same caller reads the root-owned file's answers
+(`EPERM`/`EACCES`). That is an ownership model, not an answer, and it is the same
+"reported, not kept" shape as item 137's mode. `chown` on a sysfs node answers `0` and
+stores nothing - Linux's kernfs does store what root names, so a later `stat` differs
+from this kernel's; named, not claimed.

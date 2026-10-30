@@ -7440,3 +7440,32 @@ moved to the new rule.
 **Gates**: x86_64 `all 237 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=237 fail=0`, `X-EXIT=0`, `build/scratch/tmpfs-gate4.log`); aarch64 `all 236 user tests passed` / `mpos-kunit 34 passed` (`A-EXIT=0`, `build/scratch/tmpfs-gate-a1.log`).
 
 **Counterfactual**: the tmpfs arm back to `RamFs::new()` (the option string ignored, as it was before this item) -> `t-tmpfs-limits` alone red, `1 of 237`, with exactly its five discriminating claims red - `a size=64k mount takes exactly its 64 KiB and then answers ENOSPC`, `an nr_inodes=8 mount holds its root plus seven names, then ENOSPC`, and the three `mount refuses … with EINVAL` claims (an ignored option is accepted by definition) - while the control claims stayed green (`build/scratch/tmpfs-cf.log`).
+
+## item 140 — the other two attribute doors on a node that keeps no owner and no clocks
+
+Item 138 gave `chmod` its refusal on a procfs/sysfs node and named `chown(2)` and
+`utimensat(2)` as still answering `0`. Linux's answer is three answers, and which one a
+node gives is a property of the node:
+
+- a `/proc/sys` file **refuses the owner** (`EPERM` for root too, its inode has no
+  `setattr`) and **drops the three timestamp shapes** (all `0` to root);
+- a pid directory (`/proc/<pid>`) **refuses both** - it mirrors a process, and the
+  mirror has no `setattr`;
+- a `/proc` file, a sysfs directory and a device node **drop both**, and who may ask is
+  the ordinary question: an ordinary user's "now" shapes on a `0444` node are `EACCES`,
+  an explicit pair is `EPERM`, and a `0666` device node takes the "now" shape because
+  write permission stands in for ownership.
+
+Measured on Linux 7.2.11 first (`build/scratch/attr2/p1.c`, `p2.c`; uid 1000 and root).
+Landed as two trait doors (`refuses_owner_change`, `refuses_times_change`) asked by their
+handlers before the caller's standing, `set_times` answering `Ok(())` on the procfs/sysfs
+node types that accept and drop, a `mirroring()` flag on the procfs pid directory (not
+"has generated children" - `/proc` itself has those), and `may_touch` asking the
+*reported* mode (`may_by_mode`) for a node that keeps none.
+
+Pin: `t-proc-modes`'s new `owner_and_time_doors` half (reference-run as root against real
+Linux first: every claim `ok:`). Gates: x86_64 `pass=237 fail=0`; aarch64 `pass=236
+fail=0`; both `mpos-kunit 34 passed`. Counterfactuals: the refusal doors answering `false`
+-> exactly the three `EPERM` claims red; `may_touch` back to "not policed" -> exactly the
+child's two `EACCES` claims red. Named: per-process ownership of `/proc/<pid>` nodes
+(Linux's are owned by the reader, this tree reports root's) and sysfs's `chmod` half.

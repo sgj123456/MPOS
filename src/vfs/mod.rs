@@ -1176,6 +1176,32 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether this node refuses a change of **owner**, whoever asks - the
+    /// question the `chown` family asks before it asks who the caller is.
+    ///
+    /// Measured on Linux 7.2.11 (`build/scratch/attr2/p1.c`, 2026-10-30, uid
+    /// 1000 and root): `chown(2)` on a `/proc/sys` file and on a `/proc/<pid>`
+    /// directory is `EPERM` for **root too**, because those inodes carry no
+    /// `setattr` operation; `chown(2)` on a sysfs directory, on `/proc/<pid>/
+    /// status` and on `/dev/null` answers `0` for root. So this is the same
+    /// "the node has no attribute" answer [`Inode::refuses_mode_change`] is,
+    /// asked about a second attribute - and the two are separate because
+    /// procfs's `/proc/sys` file refuses the owner and accepts the timestamps.
+    fn refuses_owner_change(&self) -> bool {
+        false
+    }
+
+    /// Whether this node refuses a change of **timestamps**, whoever asks.
+    ///
+    /// Measured in the same run: the three `utimensat(2)` shapes on a
+    /// `/proc/<pid>` directory are `EPERM` for root and for an ordinary user,
+    /// while `/proc/sys`'s file, `/proc/uptime`, a sysfs directory and
+    /// `/dev/null` answer `0` to root - the timestamps are *dropped*, not
+    /// stored, and only the pid directory refuses them outright.
+    fn refuses_times_change(&self) -> bool {
+        false
+    }
+
     /// Give the node the permission bits an archive or a `chmod` named.
     ///
     /// Not `chmod(2)` - that is a syscall with a caller to answer - but the
@@ -2072,7 +2098,17 @@ pub fn may_touch(caller: Caller, inode: &Arc<dyn Inode>) -> VfsResult<()> {
     if caller.uid == inode.owner().0 || caller.overrides.fowner {
         return Ok(());
     }
-    may_as(caller, inode, W_OK)
+    // [`may_as`] answers "not policed" for a node that keeps no modes, which is
+    // right for a read or a write - the node's handler decides those - but not
+    // for the timestamps: Linux asks the *reported* word here (measured, an
+    // ordinary user touching `/proc/uptime` at `0444` gets `EACCES`, not `0`),
+    // so a node that reports a mode without keeping one answers this question
+    // by the word it reports.
+    if inode.keeps_modes() {
+        may_as(caller, inode, W_OK)
+    } else {
+        may_by_mode(caller, inode.mode(), inode.owner(), W_OK)
+    }
 }
 
 /// Whether `caller`'s groups cover `gid`, or `CAP_FSETID` stands in for them.

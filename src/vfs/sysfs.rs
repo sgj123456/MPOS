@@ -102,6 +102,14 @@ impl SysDir {
 }
 
 impl Inode for SysDir {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -143,6 +151,14 @@ struct SysFile {
 }
 
 impl Inode for SysFile {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -177,6 +193,14 @@ struct SysSymlink {
 }
 
 impl Inode for SysSymlink {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -210,6 +234,14 @@ struct SysConfig {
 }
 
 impl Inode for SysConfig {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -257,6 +289,14 @@ struct SysPciEvent {
 }
 
 impl Inode for SysPciEvent {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -317,6 +357,14 @@ struct SysEventAttr {
 }
 
 impl Inode for SysEventAttr {
+    /// sysfs reports a mode and keeps no timestamps, and Linux answers `0` to
+    /// root's `utimensat(2)` here (an ordinary user gets `EACCES` from the
+    /// reported word, which `may_touch` asks) - measured, `build/scratch/
+    /// attr2/p2.c`.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,

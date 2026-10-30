@@ -66,6 +66,13 @@ struct ProcFile {
 }
 
 impl Inode for ProcFile {
+    /// The timestamps are accepted and dropped: Linux answers `0` for the
+    /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
+    /// 2026-10-30), so the store that cannot keep them is not a refusal.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn refuses_mode_change(&self) -> bool {
         // Nothing here can be written into a node's bits - Linux's procfs
         // has no `setattr` either, and answers `EPERM` to root for the
@@ -124,6 +131,20 @@ struct ProcCtl {
 }
 
 impl Inode for ProcCtl {
+    /// The timestamps are accepted and dropped: Linux answers `0` for the
+    /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
+    /// 2026-10-30), so the store that cannot keep them is not a refusal.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    /// A `/proc/sys` file has no `setattr` operation, so `chown(2)` on it is
+    /// `EPERM` for root as well - measured, and separate from the timestamps
+    /// it accepts (`build/scratch/attr2/p1.c`).
+    fn refuses_owner_change(&self) -> bool {
+        true
+    }
+
     fn refuses_mode_change(&self) -> bool {
         // Nothing here can be written into a node's bits - Linux's procfs
         // has no `setattr` either, and answers `EPERM` to root for the
@@ -214,6 +235,13 @@ struct ProcLink {
 }
 
 impl Inode for ProcLink {
+    /// The timestamps are accepted and dropped: Linux answers `0` for the
+    /// three `utimensat(2)` shapes on this node (`build/scratch/attr2/p2.c`,
+    /// 2026-10-30), so the store that cannot keep them is not a refusal.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn refuses_mode_change(&self) -> bool {
         // Nothing here can be written into a node's bits - Linux's procfs
         // has no `setattr` either, and answers `EPERM` to root for the
@@ -342,6 +370,15 @@ struct ProcDir {
     /// which is Linux's rule for `/proc/<pid>/fd` alone (`st_size` there is
     /// the descriptor count) and no other directory in this tree.
     size_is_count: bool,
+    /// Whether this directory *mirrors* something outside the tree - a process
+    /// (`/proc/<pid>`) - rather than listing the tree's own names. Linux's
+    /// pid directory has no `setattr`, so `chown(2)` and the three
+    /// `utimensat(2)` shapes are `EPERM` there whatever the caller holds
+    /// (`build/scratch/attr2/p1.c`/`p2.c`); every directory this tree makes for
+    /// itself accepts the timestamps and drops them. The distinction is a flag
+    /// rather than "has generated children", because `/proc` itself has those
+    /// and is not a mirror.
+    mirror: bool,
 }
 
 impl ProcDir {
@@ -352,6 +389,15 @@ impl ProcDir {
     /// A directory whose own metadata is Linux's rather than the tree's
     /// default: its permission bits, and whether its size is the number of
     /// entries it lists.
+    /// A directory that mirrors a process: see [`ProcDir::mirror`].
+    fn mirroring() -> Arc<ProcDir> {
+        let mut node = ProcDir::own(None, 0, false);
+        if let Some(dir) = Arc::get_mut(&mut node) {
+            dir.mirror = true;
+        }
+        node
+    }
+
     fn own(dynamic: Option<Arc<dyn Dynamic>>, mode: u32, size_is_count: bool) -> Arc<ProcDir> {
         Arc::new(ProcDir {
             ino: next_ino(),
@@ -359,6 +405,7 @@ impl ProcDir {
             dynamic,
             mode,
             size_is_count,
+            mirror: false,
         })
     }
 
@@ -373,6 +420,22 @@ impl ProcDir {
 }
 
 impl Inode for ProcDir {
+    /// A pid directory mirrors a process, and Linux's has no `setattr`:
+    /// `chown(2)` and all three `utimensat(2)` shapes are `EPERM` for root too
+    /// (`build/scratch/attr2/p1.c`/`p2.c`). Every other procfs directory
+    /// accepts the timestamps and drops them.
+    fn refuses_owner_change(&self) -> bool {
+        self.mirror
+    }
+
+    fn refuses_times_change(&self) -> bool {
+        self.mirror
+    }
+
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn refuses_mode_change(&self) -> bool {
         // Nothing here can be written into a node's bits - Linux's procfs
         // has no `setattr` either, and answers `EPERM` to root for the
@@ -2723,7 +2786,7 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         return None;
     }
     let leader = this.pid;
-    let node = dir();
+    let node = ProcDir::mirroring();
 
     node.add(
         "stat",

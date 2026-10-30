@@ -1541,6 +1541,14 @@ fn store_times(inode: &Arc<dyn Inode>, atime: u64, mtime: u64, shape: TimesShape
     if let Err(e) = crate::vfs::may_modify(inode) {
         return err_of(e);
     }
+    // A node whose timestamps are a mirror of something else refuses the
+    // request outright, and it refuses it for root too - `/proc/<pid>` is the
+    // case Linux measured (`build/scratch/attr2/p2.c`). It is asked before the
+    // caller's standing, because this is the node's answer and not a verdict
+    // about who is asking.
+    if inode.refuses_times_change() {
+        return err::EPERM;
+    }
     if let Err(e) = may_set_times(inode, shape) {
         return e;
     }
@@ -5914,6 +5922,12 @@ fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
     // One check for all four `chown` handlers, which reach this through
     // `handle_chown`, `handle_fchown`, `handle_fchownat` and `handle_lchown`.
     if crate::vfs::is_immutable(inode) {
+        return err::EPERM;
+    }
+    // The second node-shaped refusal, measured in the same run as the
+    // timestamps': a `/proc/sys` file and a `/proc/<pid>` directory answer
+    // `EPERM` to `chown(2)` for root as well, because neither has a `setattr`.
+    if inode.refuses_owner_change() {
         return err::EPERM;
     }
     let (uid, gid) = match chown_allowed(inode, uid_arg, gid_arg) {
