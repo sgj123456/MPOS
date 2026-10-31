@@ -181,6 +181,110 @@ pub fn seqnum() -> u64 {
 
 /// A netlink socket, as far as the kernel is concerned: an address, a queue of
 /// messages and whether its owner asked to receive them.
+/// The receive and send buffer a fresh socket starts with.
+///
+/// Linux's `SOCK_DGRAM` sysctl pair, measured at 212 992 (`net.core.rmem_default`
+/// / `wmem_default`) and re-read off a `NETLINK_KOBJECT_UEVENT` socket itself
+/// (`build/scratch/opt/wide`). It is repeated here rather than borrowed from
+/// `net::SockOpts`, which holds the same pair for its own sockets: this module
+/// is compiled for the host and `net` is not, and a netlink socket's buffers
+/// have no transport behind them to steer anyway.
+pub const DEFAULT_RCVBUF: u32 = 212_992;
+/// The same figure for the send side, named separately because Linux's two
+/// sysctls are separate knobs even when they happen to agree.
+pub const DEFAULT_SNDBUF: u32 = 212_992;
+
+/// The options a device-event socket keeps but does not act on, by name.
+///
+/// One row per option Linux's `setsockopt` accepts on a
+/// `NETLINK_KOBJECT_UEVENT` socket and `getsockopt` reads back (measured:
+/// `build/scratch/opt/set2`, `wide`, `tv` on 7.2.11, as both root and
+/// unprivileged - the two agree). The names Linux *refuses* are not rows
+/// here: `SO_SNDLOWAT` is `ENOPROTOOPT`, and so are `SO_TYPE`, `SO_PROTOCOL`,
+/// `SO_DOMAIN`, `SO_ERROR`, `SO_ACCEPTCONN` and any unknown name, while
+/// `SO_REUSEPORT` is `EOPNOTSUPP` and `SO_PRIORITY`/`SO_MARK` are `EPERM`.
+///
+/// Two of these are *pairs* rather than one number - `SO_LINGER` is a
+/// `struct linger` and the timeouts are `struct timeval`s - so the row names
+/// the half it stores.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Opt {
+    /// The socket's identity, which is a fact about the family rather than
+    /// stored state - `option_get` answers these from the constants and
+    /// `option_set` never receives them.
+    IdentitySocketType,
+    IdentityProtocol,
+    IdentityDomain,
+    Rcvbuf,
+    Sndbuf,
+    Rcvlowat,
+    Rcvtimeo,
+    RcvtimeoUsec,
+    Sndtimeo,
+    SndtimeoUsec,
+    LingerOn,
+    LingerSec,
+    Oobinline,
+    Dontroute,
+    Timestamp,
+    Broadcast,
+    Reuseaddr,
+    Keepalive,
+    IncomingCpu,
+    BusyPoll,
+}
+
+/// What a fresh socket's options read as.
+///
+/// The buffer pair is Linux's `SOCK_DGRAM` default, 212 992 (`net.core
+/// .rmem_default`/`wmem_default`, re-read off a netlink socket itself);
+/// `SO_RCVLOWAT` is 1 and everything else starts at zero except
+/// `SO_INCOMING_CPU`, which Linux answers as -1 until a packet has named one.
+#[derive(Clone, Copy)]
+struct SubOpts {
+    rcvbuf: i32,
+    sndbuf: i32,
+    rcvlowat: i32,
+    rcvtimeo: i32,
+    rcvtimeo_usec: i32,
+    sndtimeo: i32,
+    sndtimeo_usec: i32,
+    linger_on: i32,
+    linger_sec: i32,
+    oobinline: i32,
+    dontroute: i32,
+    timestamp: i32,
+    broadcast: i32,
+    reuseaddr: i32,
+    keepalive: i32,
+    incoming_cpu: i32,
+    busy_poll: i32,
+}
+
+impl SubOpts {
+    const fn new() -> SubOpts {
+        SubOpts {
+            rcvbuf: DEFAULT_RCVBUF as i32,
+            sndbuf: DEFAULT_SNDBUF as i32,
+            rcvlowat: 1,
+            rcvtimeo: 0,
+            rcvtimeo_usec: 0,
+            sndtimeo: 0,
+            sndtimeo_usec: 0,
+            linger_on: 0,
+            linger_sec: 0,
+            oobinline: 0,
+            dontroute: 0,
+            timestamp: 0,
+            broadcast: 0,
+            reuseaddr: 0,
+            keepalive: 0,
+            incoming_cpu: -1,
+            busy_poll: 0,
+        }
+    }
+}
+
 struct Subscriber {
     id: usize,
     /// Whether `bind(2)` - or the implicit bind a first send performs - has
@@ -203,6 +307,15 @@ struct Subscriber {
     /// gate and the reason a listener that never asked still recognises the
     /// kernel by `uid 0`.
     passcred: bool,
+    /// The options a socket keeps that steer nothing here (`SO_RCVLOWAT`,
+    /// `SO_OOBINLINE`, `SO_DONTROUTE`, `SO_TIMESTAMP`, `SO_INCOMING_CPU`,
+    /// `SO_BUSY_POLL`) plus the receive buffer's size. They are stored because
+    /// `getsockopt` has to answer what `setsockopt` was told - Linux's own
+    /// contract - and a socket that answers `0` to a question it accepted the
+    /// answer to is a dialect, not a simplification. Measured: Linux reads
+    /// `SO_RCVBUF` back as `8192` after `set(4096)`, `SO_RCVLOWAT` as the
+    /// number just set, `SO_INCOMING_CPU`/`SO_BUSY_POLL` likewise.
+    opts: SubOpts,
     /// A shared buffer rather than a `Vec` each: a send runs inside a critical
     /// section, and handing one more recipient a copy of the message must not
     /// mean allocating there - see [`publish`].
@@ -273,6 +386,9 @@ pub const NETLINK_ID_BASE: usize = 0x4000_0000;
 
 /// `AF_NETLINK`, and the one protocol this kernel speaks on it.
 pub const AF_NETLINK: u16 = 16;
+/// `SOCK_RAW`, the type every device-event socket is: Linux requires it and so
+/// does this kernel's `socket(2)` arm, and `SO_TYPE` answers it.
+pub const SOCK_RAW: i32 = 3;
 pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 
 static SUBSCRIBERS: Mutex<RefCell<Vec<Subscriber>>> = Mutex::new(RefCell::new(Vec::new()));
@@ -293,6 +409,7 @@ pub fn open() -> usize {
             pid: 0,
             groups: 0,
             passcred: false,
+            opts: SubOpts::new(),
             // Sized here, in task context, so that the publisher never has to
             // grow it: [`publish`] runs inside a critical section, and
             // `VecDeque::push_back` reallocating there is an allocation with
@@ -396,6 +513,148 @@ pub fn passcred(id: usize) -> bool {
             .map(|s| s.passcred)
             .unwrap_or(false)
     })
+}
+
+/// The option a `(level, optname)` pair names on a device-event socket.
+///
+/// One row per stored *word*: the pair-valued options are two consecutive
+/// rows so a caller reading `struct linger` or `struct timeval` gets both
+/// halves in Linux's own order. `width` is the whole value's size - 8 for a
+/// pair, 4 for an `int` - and it is the `optlen` a `getsockopt` answers with.
+///
+/// `Err(errno)` is Linux's own refusal, measured on a
+/// `NETLINK_KOBJECT_UEVENT` socket: a foreign level is `ENOPROTOOPT` (and
+/// `SOL_NETLINK` refuses every option it has - `NETLINK_NO_ENOBUFS`,
+/// `NETLINK_ADD_MEMBERSHIP` and the rest), `SO_REUSEPORT` is `EOPNOTSUPP`,
+/// `SO_PRIORITY`/`SO_MARK` are `EPERM`, and everything unmodelled -
+/// `SO_SNDLOWAT`, `SO_TYPE`, `SO_PROTOCOL`, `SO_DOMAIN`, `SO_ERROR`,
+/// `SO_ACCEPTCONN`, any unknown name - is `ENOPROTOOPT`.
+pub fn option_named(level: usize, optname: usize, for_set: bool) -> Result<Named, isize> {
+    const SOL_SOCKET: usize = 1;
+    const SOL_NETLINK: usize = 270;
+    if level != SOL_SOCKET {
+        let _ = SOL_NETLINK;
+        return Err(crate::err::ENOPROTOOPT);
+    }
+    let (first, width) = match optname {
+        // The socket's own identity: readable, never settable (Linux answers
+        // the three on `getsockopt` and refuses them on `setsockopt`, so a
+        // single table cannot serve both doors and the caller asks for the
+        // direction it is on).
+        3 if !for_set => (Opt::IdentitySocketType, 4),
+        38 if !for_set => (Opt::IdentityProtocol, 4),
+        39 if !for_set => (Opt::IdentityDomain, 4),
+        7 => (Opt::Sndbuf, 4),
+        8 => (Opt::Rcvbuf, 4),
+        18 => (Opt::Rcvlowat, 4),
+        20 => (Opt::Rcvtimeo, 8),
+        21 => (Opt::Sndtimeo, 8),
+        13 => (Opt::LingerOn, 8),
+        10 => (Opt::Oobinline, 4),
+        5 => (Opt::Dontroute, 4),
+        29 => (Opt::Timestamp, 4),
+        6 => (Opt::Broadcast, 4),
+        2 => (Opt::Reuseaddr, 4),
+        9 => (Opt::Keepalive, 4),
+        49 => (Opt::IncomingCpu, 4),
+        46 => (Opt::BusyPoll, 4),
+        12 => return Err(crate::err::EPERM),
+        36 => return Err(crate::err::EPERM),
+        15 => return Err(crate::err::EOPNOTSUPP),
+        _ => return Err(crate::err::ENOPROTOOPT),
+    };
+    Ok(Named { first, width })
+}
+
+/// What [`option_named`] resolved to.
+#[derive(Clone, Copy)]
+pub struct Named {
+    /// The first word's row.
+    pub first: Opt,
+    /// The value's whole size: `4` for an `int`, `8` for a pair.
+    pub width: usize,
+}
+
+impl Named {
+    /// The word at `index` of this value, `0` being the first.
+    pub fn word(&self, index: usize) -> Opt {
+        if index == 0 {
+            return self.first;
+        }
+        match self.first {
+            Opt::LingerOn => Opt::LingerSec,
+            Opt::Rcvtimeo => Opt::RcvtimeoUsec,
+            Opt::Sndtimeo => Opt::SndtimeoUsec,
+            other => other,
+        }
+    }
+}
+
+/// One stored word of a socket's options, or `None` if the socket is gone.
+pub fn option_get(id: usize, opt: Opt) -> Option<i32> {
+    critical_section::with(|cs| {
+        let subs = SUBSCRIBERS.borrow(cs).borrow();
+        let o = &subs.iter().find(|s| s.id == id)?.opts;
+        Some(match opt {
+            Opt::IdentitySocketType => SOCK_RAW,
+            Opt::IdentityProtocol => NETLINK_KOBJECT_UEVENT as i32,
+            Opt::IdentityDomain => AF_NETLINK as i32,
+            Opt::Rcvbuf => o.rcvbuf,
+            Opt::Sndbuf => o.sndbuf,
+            Opt::Rcvlowat => o.rcvlowat,
+            Opt::Rcvtimeo => o.rcvtimeo,
+            Opt::RcvtimeoUsec => o.rcvtimeo_usec,
+            Opt::Sndtimeo => o.sndtimeo,
+            Opt::SndtimeoUsec => o.sndtimeo_usec,
+            Opt::LingerOn => o.linger_on,
+            Opt::LingerSec => o.linger_sec,
+            Opt::Oobinline => o.oobinline,
+            Opt::Dontroute => o.dontroute,
+            Opt::Timestamp => o.timestamp,
+            Opt::Broadcast => o.broadcast,
+            Opt::Reuseaddr => o.reuseaddr,
+            Opt::Keepalive => o.keepalive,
+            Opt::IncomingCpu => o.incoming_cpu,
+            Opt::BusyPoll => o.busy_poll,
+        })
+    })
+}
+
+/// Store one word. The caller has already refused everything
+/// [`option_named`] refuses and has converted a buffer size through Linux's
+/// doubling rule, so this only records.
+pub fn option_set(id: usize, opt: Opt, value: i32) {
+    critical_section::with(|cs| {
+        if let Some(sub) = SUBSCRIBERS
+            .borrow(cs)
+            .borrow_mut()
+            .iter_mut()
+            .find(|s| s.id == id)
+        {
+            let o = &mut sub.opts;
+            match opt {
+                // Facts, not state: a caller cannot set them, so nothing to do.
+                Opt::IdentitySocketType | Opt::IdentityProtocol | Opt::IdentityDomain => {}
+                Opt::Rcvbuf => o.rcvbuf = value,
+                Opt::Sndbuf => o.sndbuf = value,
+                Opt::Rcvlowat => o.rcvlowat = value,
+                Opt::Rcvtimeo => o.rcvtimeo = value,
+                Opt::RcvtimeoUsec => o.rcvtimeo_usec = value,
+                Opt::Sndtimeo => o.sndtimeo = value,
+                Opt::SndtimeoUsec => o.sndtimeo_usec = value,
+                Opt::LingerOn => o.linger_on = value,
+                Opt::LingerSec => o.linger_sec = value,
+                Opt::Oobinline => o.oobinline = value,
+                Opt::Dontroute => o.dontroute = value,
+                Opt::Timestamp => o.timestamp = value,
+                Opt::Broadcast => o.broadcast = value,
+                Opt::Reuseaddr => o.reuseaddr = value,
+                Opt::Keepalive => o.keepalive = value,
+                Opt::IncomingCpu => o.incoming_cpu = value,
+                Opt::BusyPoll => o.busy_poll = value,
+            }
+        }
+    });
 }
 
 /// The next free port id: the caller's own pid when nothing holds it, and a

@@ -293,7 +293,25 @@ const SO_REUSEADDR: usize = 2;
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
 const SO_KEEPALIVE: usize = 9;
+const SO_OOBINLINE: usize = 10;
 const SO_LINGER: usize = 13;
+/// `struct timeval`-valued options: `SO_RCVTIMEO` and `SO_SNDTIMEO`.
+const SO_RCVTIMEO: usize = 20;
+const SO_SNDTIMEO: usize = 21;
+const SO_RCVLOWAT: usize = 18;
+const SO_SNDLOWAT: usize = 19;
+const SO_ACCEPTCONN: usize = 30;
+const SO_TIMESTAMP: usize = 29;
+const SO_INCOMING_CPU: usize = 49;
+const SO_BUSY_POLL: usize = 46;
+const SO_PROTOCOL: usize = 38;
+const SO_DOMAIN: usize = 39;
+const SO_MARK: usize = 36;
+const SO_PRIORITY: usize = 12;
+const SO_BROADCAST: usize = 6;
+const SO_DONTROUTE: usize = 5;
+/// `SOL_NETLINK`, whose one option a device-event socket refuses to model.
+const SOL_NETLINK: usize = 270;
 const SOL_TCP: usize = 6;
 const TCP_NODELAY: usize = 1;
 /// The IP level's number, and its one option this kernel models: a socket
@@ -5504,21 +5522,49 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     // no credentials - and the ordinary bookkeeping options, accepted by name so
     // a caller's setup never fails on this family.
     if let Some(handle) = uevent_handle_of_fd(fd) {
-        if level != SOL_SOCKET {
-            return err::ENOPROTOOPT;
-        }
-        if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
+        if optval == 0 {
             return err::EINVAL;
         }
-        let val = unsafe { (optval as *const i32).read_unaligned() };
-        return match optname {
-            SO_PASSCRED => {
-                crate::uevent::set_passcred(handle, val != 0);
-                0
+        if (level, optname) == (SOL_SOCKET, SO_PASSCRED) {
+            if optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
+                return err::EINVAL;
             }
-            SO_REUSEADDR | SO_SNDBUF | SO_RCVBUF | SO_KEEPALIVE | SO_LINGER => 0,
-            _ => err::ENOPROTOOPT,
+            let val = unsafe { (optval as *const i32).read_unaligned() };
+            crate::uevent::set_passcred(handle, val != 0);
+            return 0;
+        }
+        let named = match crate::uevent::option_named(level, optname, true) {
+            Ok(named) => named,
+            Err(e) => return e,
         };
+        // Linux wants the whole value: a 4-byte `struct linger` and a 4-byte
+        // `struct timeval` are `EINVAL`, measured (`build/scratch/opt/set`,
+        // `tv`), while an 8-byte one is accepted.
+        if optlen < named.width || !crate::uaccess::buffer_ok(optval, named.width, false, from_user)
+        {
+            return err::EINVAL;
+        }
+        // The buffer pair is not a plain word: Linux stores the ask doubled and
+        // clamped, so a `set(4096)` reads back `8192` - the arithmetic
+        // `super::sock_buffer_size` already owns for the IP family.
+        let (first, second) = match named.width {
+            8 => {
+                let a = unsafe { (optval as *const i32).read_unaligned() };
+                let b = unsafe { ((optval + 4) as *const i32).read_unaligned() };
+                (a, Some(b))
+            }
+            _ => (unsafe { (optval as *const i32).read_unaligned() }, None),
+        };
+        let stored = match optname {
+            SO_RCVBUF => super::sock_buffer_size(first, super::SOCK_MIN_RCVBUF) as i32,
+            SO_SNDBUF => super::sock_buffer_size(first, super::SOCK_MIN_SNDBUF) as i32,
+            _ => first,
+        };
+        crate::uevent::option_set(handle, named.word(0), stored);
+        if let Some(b) = second {
+            crate::uevent::option_set(handle, named.word(1), b);
+        }
+        return 0;
     }
     // A unix socket is not in the network registry either; its options are the
     // credential knobs. `SO_PASSCRED` is the one that matters: it makes every
@@ -5720,27 +5766,68 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
 pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen_ptr) =
         (args[0] as i32, args[1], args[2], args[3], args[4]);
-    // A device-event socket is not in the network registry either. What a caller
-    // asks it is `SO_PASSCRED`, which reads back what `setsockopt` was told; the
-    // rest is the permissive answer the other families give an option they do
-    // not model.
+    // A device-event socket is not in the network registry either, and it does
+    // not answer zero to a question it does not model: Linux's own per-name
+    // table applies (`netlink` is a real family there, so `SO_TYPE` is
+    // `SOCK_RAW`, an empty buffer reads back its sysctl default and a name the
+    // family refuses answers `ENOPROTOOPT` - measured, `docs/notes/` §7.9s).
+    // Answering `0` for every unmodelled name was a claim that the socket had
+    // been told a value it never stored.
     if let Some(handle) = uevent_handle_of_fd(fd) {
-        if level != SOL_SOCKET {
-            return err::ENOPROTOOPT;
-        }
         if optval == 0 || optlen_ptr == 0 {
             return err::EFAULT;
         }
         if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
             return err::EFAULT;
         }
-        let value: i32 = match optname {
-            SO_PASSCRED => crate::uevent::passcred(handle) as i32,
-            _ => 0,
+        let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() } as usize;
+        if (level, optname) == (SOL_SOCKET, SO_PASSCRED) {
+            if cap < 4 || !crate::uaccess::buffer_ok(optval, 4, true, from_user) {
+                return err::EINVAL;
+            }
+            unsafe {
+                (optval as *mut i32).write_unaligned(crate::uevent::passcred(handle) as i32);
+                (optlen_ptr as *mut u32).write_unaligned(4);
+            }
+            return 0;
+        }
+        let named = match crate::uevent::option_named(level, optname, false) {
+            Ok(named) => named,
+            Err(e) => return e,
         };
+        // Linux truncates rather than refusing a short buffer: it copies the
+        // bytes that fit and answers the *full* width in `optlen`. Measured
+        // with a 2-byte buffer on `SO_RCVBUF` (`build/scratch/opt/trunc`), and
+        // with `0`, which copies nothing and answers `0`.
+        let width = named.width;
+        let mut words = [0i32; 2];
+        for (i, w) in words.iter_mut().enumerate().take(width / 4) {
+            *w = crate::uevent::option_get(handle, named.word(i)).unwrap_or(0);
+        }
+        // ...and it answers `min(cap, width)`, not always `width`: a 4-byte
+        // buffer on `SO_LINGER` copies the first word and reports 4, a 1-byte
+        // buffer copies one byte and reports 1. Measured at every cap from 0
+        // to 8 in `build/scratch/opt/trunc`.
+        let copy = cap.min(width);
+        if copy != 0 && !crate::uaccess::buffer_ok(optval, copy, true, from_user) {
+            return err::EFAULT;
+        }
+        let full = copy / 4;
+        for i in 0..full {
+            unsafe {
+                ((optval + i * 4) as *mut i32).write_unaligned(words[i]);
+            }
+        }
+        // A partial trailing word is copied byte by byte, little-endian as the
+        // word is stored - the shape the same probe measured.
+        for i in full * 4..copy {
+            let byte = (words[full] >> ((i % 4) * 8)) as u8;
+            unsafe {
+                ((optval + i) as *mut u8).write_unaligned(byte);
+            }
+        }
         unsafe {
-            (optval as *mut i32).write_unaligned(value);
-            (optlen_ptr as *mut u32).write_unaligned(4);
+            (optlen_ptr as *mut u32).write_unaligned(copy as u32);
         }
         return 0;
     }

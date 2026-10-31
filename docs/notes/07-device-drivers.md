@@ -7415,3 +7415,63 @@ branch disabled): `pass=244 fail=1`, exactly **8** claims of this program red �
 every `read`/`recv`/`recvfrom` claim and the blocking `recv` — while both
 `recvmsg` claims stayed green. Gates: x86_64 `pass=245`, aarch64 `pass=244`,
 `mpos-kunit 35`, host lib 719.
+
+### 7.9s A device-event socket answers its options, or refuses the name
+
+A `NETLINK_KOBJECT_UEVENT` socket is not in the network registry, so
+`getsockopt(2)` reached a branch written when the only option anyone asked was
+`SO_PASSCRED`: one name answered from stored state, **everything else a zero**.
+That zero was a claim — the socket had been told a value it never stored — and it
+is the shape this repository treats as the worst answer it can give. It was found
+by asking a freshly bound socket the questions a socket-api shim asks.
+
+Measured first, on Linux 7.2.11, as root **and** unprivileged (the two tables
+agree; `build/scratch/opt/{wide,set,set2,tv,trunc,pc}.c`):
+
+| the question | Linux's answer |
+|---|---|
+| `SO_TYPE` / `SO_PROTOCOL` / `SO_DOMAIN` | `3` (`SOCK_RAW`) / `15` / `16` (`AF_NETLINK`) — answered on `get`, refused (`ENOPROTOOPT`) on `set` |
+| `SO_RCVBUF` / `SO_SNDBUF` fresh | `212992` each (the `SOCK_DGRAM` sysctl pair) |
+| `set(SO_RCVBUF, 4096)` then read | `8192` — the ask is doubled |
+| `set(SO_RCVBUF, 1<<28)` | `8388608` — capped at `SOCK_MEM_MAX` before doubling |
+| `set(-1)` | `8388608` — a negative ask reads as unsigned |
+| `SO_RCVLOWAT` / `SO_SNDLOWAT` | `1` (both fresh); `SO_SNDLOWAT` is `ENOPROTOOPT` on `set` |
+| `SO_INCOMING_CPU` / `SO_BUSY_POLL` | `-1` / `0` fresh, both read back what a set stored |
+| `SO_OOBINLINE`, `SO_DONTROUTE`, `SO_TIMESTAMP`, `SO_BROADCAST`, `SO_REUSEADDR`, `SO_KEEPALIVE` | `0` fresh, read back a set |
+| `SO_LINGER` | a `struct linger`: `8` bytes, `{0,0}` fresh, a 4-byte set is `EINVAL` |
+| `SO_RCVTIMEO` / `SO_SNDTIMEO` | a `struct timeval`: `16` bytes, a 4-byte set is `EINVAL` |
+| unknown `SOL_SOCKET` name, `SO_TYPE`/`SO_PROTOCOL`/`SO_DOMAIN`/`SO_ERROR`/`SO_ACCEPTCONN` on `set`, any `SOL_NETLINK` option | `ENOPROTOOPT` |
+| `SO_REUSEPORT` | `EOPNOTSUPP` |
+| `SO_PRIORITY`, `SO_MARK` | `EPERM` |
+| a short `get` buffer | **truncated**, not refused: `optlen` answers `min(cap, width)` — a 2-byte buffer on `SO_RCVBUF` gives 2 bytes, a 4-byte one on `SO_LINGER` gives the first word |
+| `set(SO_PASSCRED, len<4)` | `EINVAL` |
+
+Served: every row above. `src/uevent.rs` gained `SubOpts` (one stored word per
+option, the defaults Linux's), `option_named(level, optname, for_set) -> Result<Named,
+isize>` (the one table, with the direction as an argument because the identity
+names are readable and not settable), `Named::word(i)` for the pair-valued options,
+and `option_get`/`option_set`. `src/net/socket.rs`'s `getsockopt` branch now
+truncates and reports `min(cap, width)`, its `setsockopt` branch refuses by name
+and runs the buffer pair through the same `super::sock_buffer_size` the IP family
+already used (so the doubling, the ceiling and the floors are one implementation
+rather than two).
+
+Named divergences, all harmless to a listener: `SO_RCVTIMEO`/`SO_SNDTIMEO` are
+stored and read back but steer no deadline here (a blocking receive waits on the
+bus, and this kernel has no per-socket timeout on any family yet — the IP path
+does not model it either); `SO_TIMESTAMP` is stored but no control message is
+attached for it; `SO_BUSY_POLL`/`SO_INCOMING_CPU` are pure state. `SO_RCVBUF`
+does not size the bus's queue — that is `QUEUE_MAX`, which is the bus's own
+policy and measured in §7.9g.
+
+Pin: `user/tests/src/bin/t-uevent-opts.rs`, 22 claims. Host runs claim nothing:
+Linux refuses two rows of this very table by permission on a host
+(`SO_REUSEPORT` sets, `SO_PRIORITY`/`SO_MARK` are `EPERM` only unprivileged), so
+the reference is the table above rather than a claim made there. Counterfactual
+(the pre-fix branch restored, a zero for every unmodelled name): `pass=245 fail=1`,
+**14 of the 22 claims red** — identity, both defaults, both doublings, both
+low-water rows, `SO_INCOMING_CPU`, three refusals, the identity `set`, the
+truncation and the `SO_LINGER` width — while the two claims that were already
+right (`SO_PASSCRED`, `SO_REUSEPORT`'s refusal under the short guard) stayed
+green. Gates: x86_64 `pass=246`, aarch64 `pass=245`, `mpos-kunit 35`, host lib
+719.

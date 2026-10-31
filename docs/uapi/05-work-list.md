@@ -8070,3 +8070,30 @@ a cycle) — so no rewrite was made, and the code-level weakness is named.
 
 Pin: `t-uevent-doors` (11 claims). Counterfactual: 8 claims red, both `recvmsg`
 claims green.
+
+### Item 166 - a device-event socket answers its options, or refuses the name (2026-11-01)
+
+A `NETLINK_KOBJECT_UEVENT` socket used to answer **zero** to every option name it
+was not told about, and it was never told about `SO_RCVBUF`, `SO_SNDBUF`,
+`SO_RCVLOWAT`, `SO_INCOMING_CPU` or its own `SO_TYPE` — a claim that the socket
+held a value nobody had stored. Linux's per-name table was measured first
+(`docs/notes/07-device-drivers.md` §7.9s) and is now served from one place.
+
+| row | before | now |
+|---|---|---|
+| `SO_TYPE` / `SO_PROTOCOL` / `SO_DOMAIN` | `0` / `0` / `0` | `3` / `15` / `16` |
+| `SO_RCVBUF`, `SO_SNDBUF` fresh | `0` | `212992` |
+| `set(SO_RCVBUF, 4096)` then read | `0` | `8192` |
+| `SO_RCVLOWAT` | `0` | `1` |
+| `SO_INCOMING_CPU` | `0` | `-1` |
+| unknown name / foreign level / any `SOL_NETLINK` option | `0` | `ENOPROTOOPT` |
+| `SO_PRIORITY`, `SO_MARK` | accepted, `0` | `EPERM` |
+| `SO_REUSEPORT` | accepted, `0` | `EOPNOTSUPP` |
+| short `get` buffer | `4` bytes always | truncated to `min(cap, width)` |
+
+Stored and read back but not acted on (named above the row): `SO_RCVTIMEO`,
+`SO_SNDTIMEO`, `SO_TIMESTAMP`, `SO_BUSY_POLL`, `SO_OOBINLINE`, `SO_DONTROUTE`.
+`SO_LINGER` keeps its `struct linger` shape (8 bytes, a 4-byte set is `EINVAL`).
+
+Pin: `t-uevent-opts` (22 claims). Counterfactual restores the zero-for-everything
+branch: 14 claims red.

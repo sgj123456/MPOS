@@ -652,6 +652,10 @@ every listener, parked or spinning, in one process or two (§7.9e, item 152, pin
 `t-uevent-multi`), and every receive door on a device-event socket answers the event - `recv(2)`
 and `read(2)` had answered `EBADF` while only `recvmsg(2)` worked (§7.9r, item 165, pinned by
 `t-uevent-doors`), because a listener's choice of door must not decide whether it hears a device.
+Its options are Linux's table now, too: a device-event socket used to answer **zero** to every
+name it had not been told about - `SO_TYPE` included - and now answers `SOCK_RAW`/`AF_NETLINK`,
+the datagram buffer defaults with Linux's doubling, and `ENOPROTOOPT`/`EOPNOTSUPP`/`EPERM` where
+the family refuses (§7.9s, item 166, pinned by `t-uevent-opts`).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
