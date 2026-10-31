@@ -7263,17 +7263,58 @@ unbuilt the sweep is `pass=243 fail=1` and the red claims are exactly the class 
 (the `dev`-absence claim stays green, correctly - it asserts nothing is there).
 **Gates**: x86_64 `pass=244 fail=0`, `mpos-kunit 35 passed`; aarch64 `pass=243
 fail=0`, kunit 35.
-cat >> docs/uapi/05-work-list.md <<'EOF'
 
-### Item 164 - the module directory and the root bus's uevent (2026-10-31)
+### §7.9p The two directories a device manager probes, and the one Linux does not have
 
-The last two absences in §7.9n's refusal table. Measured on Linux (§7.9p):
-`/sys/module` is a directory and empty on a kernel with no loadable modules;
-`/sys/devices/pci0000:00/uevent` is a `0644` zero-byte file whose write of `add`
-answers `0`; and `/sys/subsystem` is **absent** on a current host.
+§7.9o closed the network side of the refusal table. What was left in it, after the
+partitions (§7.9m), the tree (§7.9l) and the class (§7.9o):
 
-Served now: `/sys/module` (empty) and the root bus's empty `uevent`
-(`SysEmptyEvent`). Refused, deliberately: `/sys/subsystem`, and any module *name*
-under `/sys/module` - Linux answers ENOENT for both on a machine that never loaded
-the module. Pin: three claims in `t-uevent` plus a host test; CF red on exactly the
-two nodes.
+```
+open(2) /sys/module/compression -> ENOENT         (pid 9, udevd)
+open(2) /sys/devices/pci0000:00/uevent -> ENOENT  (pid 18)
+```
+
+**Measured on this host first** (`build/scratch/sysprobe`, 7.2.11):
+
+| path | answer on Linux |
+|---|---|
+| `/sys/module` | a directory, and **empty** on a kernel built without loadable modules |
+| `/sys/module/compression` | a *file* here - this host's kernel exposes a `/sys/module` entry that is not a directory (`stat` says regular file, `cat` reads `zstd`) - so a manager probing it is asking about that host's own module set |
+| `/sys/devices/pci0000:00/uevent` | a `0644` file of **zero bytes**; a root write of `add` answers `0` |
+| `/sys/bus/pci/uevent` | the same kind of file, word `0200` |
+| `/sys/subsystem` | **ENOENT** - absent on a current kernel |
+
+Two of the three are this tree's problem and one is not:
+
+1. **`/sys/module` was absent** and is now an empty directory. Linux's answer for a
+   kernel with no loadable modules is an empty directory, not a missing one, and a
+   probe tells them apart: absent reads as "this machine has no `/sys`", empty as
+   "that module is not loaded". A module *name* under it stays absent, exactly as on
+   a machine whose kernel never loaded it.
+2. **The root bus had no `uevent` file.** Every kobject in Linux carries one, and on
+   a directory that is not a device it is empty; `/devices/pci0000:00/uevent` is the
+   bus's. Made here as `SysEmptyEvent`: `0644`, zero bytes, a read of 0. The
+   directories with no kobject behind them (`/sys/bus`, `/sys/class`,
+   `/sys/devices/virtual`) have none on Linux either, so the file is per directory
+   and not per kind.
+3. **`/sys/subsystem` stays absent.** It is absent on a current host, so inventing
+   one here would be *more* Linux-like than Linux; the pin asserts its absence, so a
+   later "fix" that adds it goes red.
+
+**Pin**: three claims in `user/tests/src/bin/t-uevent.rs` (the module directory
+exists and is empty, `/sys/subsystem` stays absent, the root bus's `uevent` reads as
+an empty file) and a host test
+(`the_module_directory_exists_and_is_empty_and_the_root_bus_answers_uevent`) pinning
+the same table with the mode. **Counterfactual**: with both nodes unbuilt the sweep
+is `pass=243 fail=1` and the two red claims are exactly those two (the absence claim
+stays green, correctly). **Gates**: x86_64 `pass=244 fail=0`, kunit 35; aarch64
+`pass=243 fail=0`, kunit 35 - after three runs whose reds were all the documented
+aarch64 EL0 flake (`EXCEPTION: synchronous ESR_EL1 0x96000047`, the lane hung at the
+report; killing that lane's QEMU and re-running was green).
+
+**A pin defect these runs exposed** (fixed in the same turn,
+`user/tests/src/bin/t-proc-access.rs`): that pin's two fixtures slept 20 s and the
+aarch64 arm spends longer than that on the matrix under TCG, so
+`the dropped process's entry still names it` went red because the fixture had
+*exited* - a race the machine's speed decided, not a behaviour. Both fixtures sleep
+120 s now and the parent kills them, so the matrix cannot outlive them.

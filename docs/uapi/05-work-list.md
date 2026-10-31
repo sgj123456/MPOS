@@ -8031,3 +8031,16 @@ exactly the class claims.
 **Follow-up (same turn)**: `t-proc-access`'s two fixtures slept 20 s; the aarch64
 matrix outlived that under TCG and one claim went red on a process that had exited
 (not a behaviour). Both now sleep 120 s and the parent kills them.
+
+### Item 164 - the module directory and the root bus's uevent (2026-10-31)
+
+The last two absences in §7.9n's refusal table. Measured on Linux (§7.9p):
+`/sys/module` is a directory and empty on a kernel with no loadable modules;
+`/sys/devices/pci0000:00/uevent` is a `0644` zero-byte file whose write of `add`
+answers `0`; and `/sys/subsystem` is **absent** on a current host.
+
+Served now: `/sys/module` (empty) and the root bus's empty `uevent`
+(`SysEmptyEvent`). Refused, deliberately: `/sys/subsystem`, and any module *name*
+under `/sys/module` - Linux answers ENOENT for both on a machine that never loaded
+the module. Pin: three claims in `t-uevent` plus a host test; CF red on exactly the
+two nodes.
