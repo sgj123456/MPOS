@@ -6997,3 +6997,31 @@ working (and failing somewhere), or stuck in something that is not a park. The
 next instrument has to be on the daemon's side: which calls it makes after the
 first event, and what it answers. Until then the wake path is a discharged
 suspect, measured, not assumed.
+
+### §7.9j What the machine actually announces, counted
+
+The phrase "the daemon's silence" (§7.9f-§7.9i) was shorthand and it read as a
+claim about the system, which it never was: the boot completes, the sweep is
+green, and a session starts. What was silent is one daemon's *record*, and the
+honest way to say it is in numbers. A temporary `mpos-dbg:` line in
+`uevent::publish` printed every announcement of one desktop-image boot (the
+instrument is removed; §7.9h's rule about naming the image state applies):
+
+| sequence | what | who was listening |
+|---|---|---|
+| 1-13 | console, kmsg, null/full/zero/random/urandom, uinput, rtc0/rtc, `vda`, `vda1`, `vda2` | **nobody** - the kernel registers its devices before `Starting udev` |
+| 14-16 | `vda`, `vda1`, `vda2` again | `udevd` - these are the cold-plug `add` writes `udevadm trigger` makes |
+| 17-22 | six `pci` functions, `card0`, `renderD128` | `udevd` |
+| 23-25 | three more `pci` functions | `udevd` |
+
+So the machine announces **25** events, 12 of them after the daemon starts, and
+the daemon's `/run/udev/data` holds **three** files - the three block devices -
+and stops. That is what "silent" meant: not that the boot is quiet, but that a
+daemon which was handed twelve events recorded three. The boot does not care
+because openrc proceeds after `udevadm settle`'s own 120 s default (§7.9h) and
+nothing in the sweep depends on the daemon.
+
+Why it stops after the third record is the open question, and it is now a
+question about the *processing* of an event, not about delivery (§7.9i
+discharged the wake path measured on both arms) nor about the kernel being
+quiet (this table).

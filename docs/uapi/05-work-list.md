@@ -7950,3 +7950,12 @@ Open: which boot state starts that service, and whether the shipped
   counterfactual (`subscribe_waits` skipped) reddens exactly those two claims
   (`pass=242 fail=2`). So the wake path is discharged; what the worker does after
   its first event is the open half. Notes §7.9i.
+
+- [ ] **Item 158 - the machine announces 25 uevents; the daemon records three.**
+  An instrument in `uevent::publish` counted one desktop boot's announcements:
+  seq 1-13 are the kernel's own devices registered before `udevd` starts (nobody
+  listens), 14-16 are the block devices `udevadm trigger` re-announces, 17-25 are
+  pci/drm functions. `/run/udev/data` holds three files - the block devices - so
+  the daemon stops after its third record. "The daemon's silence" in §7.9f-§7.9i
+  meant exactly this, not a boot that fails: the sweep is green and a session
+  starts. Open: why the third event's processing does not continue. Notes §7.9j.
