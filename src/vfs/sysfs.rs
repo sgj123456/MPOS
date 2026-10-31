@@ -220,6 +220,58 @@ impl Inode for SysFile {
     }
 }
 
+/// The `uevent` file a **directory** carries: Linux puts one on every kobject, and
+/// on a directory that is not a device it is empty.
+///
+/// Measured on this host (7.2.11): `/sys/devices/pci0000:00/uevent` is `0644`, 0
+/// bytes, and a root write of `add` answers `0`; `/sys/bus/pci/uevent` is the same
+/// file whose word is printed and whose value is never used (a device's own
+/// `uevent` is what a listener reads). Directories without a kobject behind them -
+/// `/sys/bus`, `/sys/class`, `/sys/devices/virtual`, `/sys/class/net` - have no
+/// such file at all, so the rule is per directory and not per kind.
+///
+/// The emptiness is the answer: `udevadm` (pid 18) asked for
+/// `/sys/devices/pci0000:00/uevent` and this tree answered `ENOENT`
+/// (`build/scratch/info-boot.log`), which reads as "no such directory".
+struct SysEmptyEvent {
+    ino: Ino,
+    mode: AtomicU32,
+}
+
+impl Inode for SysEmptyEvent {
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
+
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: 0,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.load(Ordering::Relaxed)
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
+    }
+}
+
 /// An attribute whose text is the driver's answer at the moment of the read.
 ///
 /// A netlink link declaration can be *changed* - `SIOCSIFMTU`, a rename, a
@@ -824,6 +876,14 @@ impl SysFs {
             next,
             &mut devnodes,
         );
+        // `/sys/module`: what the kernel has loaded. This kernel has no module
+        // loader - everything is in the image - so Linux's answer for a kernel
+        // built without one is an empty directory, and that is what this is. It
+        // is not decoration either: a device manager probes `/sys/module/<name>`
+        // for a driver's parameters, and the directory being absent reads as
+        // "this machine has no /sys" rather than "that module is not loaded".
+        fs.root.add_dir("module", next);
+        next += 1;
         next = build_net(&class, &virtual_root, links, next);
         next = build_dev_index(&fs, devnodes, next);
         // The PCI bus was built above, before the DRM class: the card hangs
@@ -1744,6 +1804,18 @@ fn build_pci(
     next += 1;
     let drivers = pci_dir.add_dir("drivers", next);
     next += 1;
+    // The root bus's own `uevent`: Linux's empty per-kobject file, measured on
+    // this host (`/sys/devices/pci0000:00/uevent`, 0644, zero bytes). A listener
+    // that opens it is asking whether the bus can announce; in this tree it
+    // cannot, and an empty file says so where a missing one says "no bus".
+    root_bus.add(
+        "uevent",
+        Arc::new(SysEmptyEvent {
+            ino: next,
+            mode: AtomicU32::new(SYS_RW_ATTR_MODE),
+        }),
+    );
+    next += 1;
 
     // The display function, if the machine has one, and the path it lives at.
     // The DRM class is built from this: a DRM node hangs off the device that
@@ -2055,6 +2127,33 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3, "vda and both of its partitions");
+    }
+
+    /// The two directories a device manager probes that used to be absent.
+    ///
+    /// Measured on this host (7.2.11, `build/scratch/sysprobe`): `/sys/module`
+    /// exists and is empty on a kernel with no loadable modules, and
+    /// `/sys/devices/pci0000:00/uevent` is a `0644` file of zero bytes. `/sys/
+    /// subsystem`, the third probe, is **absent** on the same host, so it stays
+    /// absent here too - a tree that invented one would be more Linux-like than
+    /// Linux.
+    #[test]
+    fn the_module_directory_exists_and_is_empty_and_the_root_bus_answers_uevent() {
+        let fs = fs();
+        let module = resolve(&fs, "/sys/module");
+        assert_eq!(module.metadata().kind, NodeKind::Dir);
+        assert!(
+            module.read_dir().unwrap().is_empty(),
+            "no loadable modules means an empty directory, not an absent one"
+        );
+        assert!(
+            resolve(&fs, "/sys").lookup("subsystem").is_err(),
+            "absent on Linux too"
+        );
+        let uevent = resolve(&fs, "/sys/devices/pci0000:00/uevent");
+        assert_eq!(uevent.mode() & 0o7777, 0o644, "Linux's word for it");
+        let mut buf = [0u8; 16];
+        assert_eq!(uevent.read_at(0, &mut buf).unwrap(), 0, "zero bytes");
     }
 
     /// `/sys/class/net` exists, its entries are links into the device tree, and

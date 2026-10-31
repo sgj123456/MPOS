@@ -943,6 +943,25 @@ fn main() {
     // when `SIOCSIFMTU` moves a link - measured as `nothing` on Linux, so what
     // is claimed here is only what Linux claims: that a link going up or down
     // is not a uevent.
+    // `/sys/module` and the root bus's `uevent`: measured on Linux (7.2.11) as
+    // an empty directory and a zero-byte file, and absent here until now - the
+    // device manager asked for both (`build/scratch/info-boot.log`).
+    r.check(
+        "the kernel's module directory exists and is empty",
+        std::fs::read_dir("/sys/module")
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(false),
+    );
+    r.check(
+        "and /sys/subsystem stays absent, as it is on Linux",
+        std::fs::metadata("/sys/subsystem").is_err(),
+    );
+    r.check(
+        "the root bus's uevent reads as an empty file",
+        std::fs::read_to_string("/sys/devices/pci0000:00/uevent")
+            .map(|text| text.is_empty())
+            .unwrap_or(false),
+    );
     let watcher = nl_socket();
     let bound_now = nl_bind(watcher, &unspecific) == 0;
     r.check(

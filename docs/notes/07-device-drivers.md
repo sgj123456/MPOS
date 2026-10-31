@@ -7263,3 +7263,17 @@ unbuilt the sweep is `pass=243 fail=1` and the red claims are exactly the class 
 (the `dev`-absence claim stays green, correctly - it asserts nothing is there).
 **Gates**: x86_64 `pass=244 fail=0`, `mpos-kunit 35 passed`; aarch64 `pass=243
 fail=0`, kunit 35.
+cat >> docs/uapi/05-work-list.md <<'EOF'
+
+### Item 164 - the module directory and the root bus's uevent (2026-10-31)
+
+The last two absences in §7.9n's refusal table. Measured on Linux (§7.9p):
+`/sys/module` is a directory and empty on a kernel with no loadable modules;
+`/sys/devices/pci0000:00/uevent` is a `0644` zero-byte file whose write of `add`
+answers `0`; and `/sys/subsystem` is **absent** on a current host.
+
+Served now: `/sys/module` (empty) and the root bus's empty `uevent`
+(`SysEmptyEvent`). Refused, deliberately: `/sys/subsystem`, and any module *name*
+under `/sys/module` - Linux answers ENOENT for both on a machine that never loaded
+the module. Pin: three claims in `t-uevent` plus a host test; CF red on exactly the
+two nodes.
