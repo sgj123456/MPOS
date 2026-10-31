@@ -378,5 +378,110 @@ fn main() {
         unsafe { libc::waitpid(again, std::ptr::null_mut(), 0) };
     }
 
+    // ---- the endless park, woken *twice* ------------------------------------
+    //
+    // The shape `udevd`'s workers park in is `epoll_wait(2)` with a timeout of
+    // -1: a park that no clock ends. §7.9h measured those workers waking once
+    // and never again, so the question is not "does the first announcement wake
+    // them" (the claim above) but "does the second". The waiter is a child
+    // process, so an endless park that never ends is killed here instead of
+    // stalling the lane - each staged read has its own budget, and the
+    // program's is the outer bound.
+    let fresh = nl_socket();
+    let fresh_ep = unsafe { libc::epoll_create1(0) };
+    r.check(
+        "the twice-watched listener opens",
+        fresh >= 0 && fresh_ep >= 0,
+    );
+    if fresh >= 0 && fresh_ep >= 0 {
+        r.check(
+            "and binds",
+            nl_bind(fresh, &nl_addr(0, UEVENT_GROUP_KERNEL)) == 0,
+        );
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fresh as u64,
+        };
+        r.check(
+            "and joins an epoll set for readability",
+            unsafe { libc::epoll_ctl(fresh_ep, libc::EPOLL_CTL_ADD, fresh, &mut ev) } == 0,
+        );
+
+        const ONCE: u8 = b'A';
+        const TWICE: u8 = b'B';
+        let mut report = [0 as libc::c_int; 2];
+        r.check(
+            "a pipe carries the twice-woken waiter's report",
+            unsafe { libc::pipe(report.as_mut_ptr()) } == 0,
+        );
+        let endless = unsafe { libc::fork() };
+        if endless == 0 {
+            unsafe { libc::close(report[0]) };
+            let mut out = [libc::epoll_event { events: 0, u64: 0 }; 4];
+            for round in 0..2u8 {
+                let n = unsafe { libc::epoll_wait(fresh_ep, out.as_mut_ptr(), 4, -1) };
+                if n < 1 {
+                    unsafe { libc::_exit(1) };
+                }
+                // Drain what the report names, so the next park starts empty -
+                // a level-triggered set that never empties would report twice
+                // without ever being woken twice.
+                let mut buf = [0u8; 512];
+                if receive(fresh, &mut buf, libc::MSG_DONTWAIT) <= 0 {
+                    unsafe { libc::_exit(2) };
+                }
+                let mark = if round == 0 { ONCE } else { TWICE };
+                let wrote =
+                    unsafe { libc::write(report[1], &mark as *const u8 as *const libc::c_void, 1) };
+                if wrote != 1 {
+                    unsafe { libc::_exit(3) };
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(report[1]) };
+        for round in 0..2 {
+            let announced = unsafe { libc::fork() };
+            if announced == 0 {
+                let nap = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 100_000_000,
+                };
+                let mut rem = nap;
+                unsafe {
+                    libc::nanosleep(&nap, &mut rem);
+                }
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&trigger) {
+                    let _ = f.write_all(b"add");
+                }
+                unsafe { libc::_exit(0) };
+            }
+            let mut pfd = libc::pollfd {
+                fd: report[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, BUDGET_MS as libc::c_int) };
+            let mut got = 0u8;
+            let read = if ready == 1 {
+                unsafe { libc::read(report[0], &mut got as *mut u8 as *mut libc::c_void, 1) }
+            } else {
+                0
+            };
+            r.check(
+                match round {
+                    0 => "an endless epoll_wait(2) park is woken by an announcement",
+                    _ => "and a second announcement wakes the same park again",
+                },
+                read == 1 && got == if round == 0 { ONCE } else { TWICE },
+            );
+            unsafe { libc::waitpid(announced, std::ptr::null_mut(), 0) };
+        }
+        unsafe {
+            libc::kill(endless, libc::SIGKILL);
+            libc::waitpid(endless, std::ptr::null_mut(), 0);
+        }
+    }
+
     r.finish();
 }

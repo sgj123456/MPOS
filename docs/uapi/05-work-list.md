@@ -7942,3 +7942,11 @@ Open: which boot state starts that service, and whether the shipped
   `--timeout`), and the boot continues afterwards. The daemon's half stays open:
   its workers wake once and never again, with kernel fan-out proved (§7.9e).
   Notes §7.9h.
+
+- [x] **Item 157 - an endless epoll park is woken by every announcement.** §7.9h
+  read `udevd`'s workers as a lost wake (`epoll_pwait`, `parks=1`). `t-uevent-multi`
+  now parks a child in `epoll_wait(2)` with timeout `-1` on a fresh uevent socket,
+  drains, and parks again: both a first and a second announcement wake it. The
+  counterfactual (`subscribe_waits` skipped) reddens exactly those two claims
+  (`pass=242 fail=2`). So the wake path is discharged; what the worker does after
+  its first event is the open half. Notes §7.9i.

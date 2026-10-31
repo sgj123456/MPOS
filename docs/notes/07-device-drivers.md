@@ -6962,3 +6962,38 @@ The lesson is the instrument's, and it is worth a trap of its own: **an in-place
 image edit is durable across build refreshes**, so a probe written into the image
 must be removed in the same session, and a reading taken on an image must name
 the files it was taken with.
+
+### §7.9i The endless park is woken again, and again
+
+§7.9h's park table reads as a lost wake: `udevd`'s workers sit in
+`epoll_pwait` (281) with `parks=1` - woken once at startup and never again -
+while the daemon records three devices and stops. An endless `epoll_wait(2)`
+(timeout `-1`) is the one spell the kernel could lose: `epoll_wait`'s loop parks
+on `u64::MAX` when no watched descriptor needs a tick floor
+(`src/syscall/linux/fs/file.rs:6493`, `(false, None) => u64::MAX`), so the only
+thing that can end it is the watched node's own wake. A one-shot registration
+that is dropped by the first wake would produce exactly `parks=1`.
+
+`t-uevent-multi` now asks the question directly. A child process parks that
+endless wait on a fresh `NETLINK_KOBJECT_UEVENT` socket in its own epoll set,
+**drains** the record it was woken for, and parks again; the parent stages two
+announcements 100 ms apart and reads a one-byte mark after each:
+
+```text
+ok:    an endless epoll_wait(2) park is woken by an announcement
+ok:    and a second announcement wakes the same park again
+```
+
+Both arrive. The counterfactual - `subscribe_waits` skipped in `epoll_wait`,
+so the wait is never registered with the watched nodes - reddens **exactly those
+two claims** (`pass=242 fail=2` of 244) and nothing else, which is the
+measurement that the two claims bind the registration and not something
+incidental.
+
+So the daemon's silence is not this kernel losing a wake: with no timeout at
+all, the first announcement wakes the park and so does the second. What the
+`parks=1` worker does *after* its first event is therefore not waiting - it is
+working (and failing somewhere), or stuck in something that is not a park. The
+next instrument has to be on the daemon's side: which calls it makes after the
+first event, and what it answers. Until then the wake path is a discharged
+suspect, measured, not assumed.
