@@ -7058,3 +7058,53 @@ can still make sense of. The fix is a tree change, not a daemon change - give th
 block devices a real home under `/sys/devices` at the announced path (with `dev`,
 `size`, `subsystem` and `uevent`), and make the class entry a link to it, Linux's
 shape. Item 159.
+
+### §7.9l The announced path now exists: block devices get a home under `/sys/devices`
+
+§7.9k found the daemon reading `/sys/devices/virtio/block/vda/uevent` and getting
+`ENOENT`, while every event announced `DEVPATH=/devices/virtio/block/vda`. This is the
+tree change that closes it.
+
+**Linux's shape, measured on the host** (`ls -l /sys/class/block`, `/sys/block`,
+`/sys/devices/virtual/block`):
+
+```
+/sys/devices/virtual/block/nbd0        a directory: dev, size, uevent, subsystem, ...
+/sys/class/block/nbd0 -> ../../devices/virtual/block/nbd0
+/sys/block/nbd0       -> ../devices/virtual/block/nbd0
+```
+
+Three facts, and the tree had none of them: the device's own directory is under
+`/sys/devices`; the class entry is a *link* to it; and `/sys/block` is a second set of
+links to the *same* homes (not a link to the class directory, which is what this tree
+had).
+
+**What changed.** `src/vfs/sysfs.rs`'s `build_block` now builds the device tree at
+exactly the path the event names (`entry.devpath` + the device's name), with `dev`,
+`size`, `partition`, the writable `uevent` and a `subsystem` link to `/sys/class/block`;
+`device_dir` makes each intermediate directory once (a second `add` of one name is a
+panic, not a replacement), and the class entry is a link into that home
+(`../../devices/...`). Two follow-ons the shape forced: `/sys/block/<disk>` targets
+`../devices/...` (measured above), and `/sys/dev/block/<m>:<n>` now points at the
+device's own directory rather than at its class entry - the rule the devnum table
+already used for PCI and input devices, with block devices as its stated exception
+until now.
+
+**The pin** is in `t-uevent` (the file that already owns device events), four claims
+over every entry `/sys/class/block` lists: the class entry is a link into
+`/sys/devices`; every home it names is a directory this tree serves; that home's `dev`,
+`size` and `uevent` read; and `/sys/block`'s entries are links to those same homes.
+
+**Counterfactual**: the old tree (`git checkout` of `sysfs.rs` alone, the pin kept) -
+`pass=244 fail=4`, and the four red claims are exactly the new ones, everything else in
+`t-uevent` green (its listener, bind, `EAGAIN` and announcement claims unaffected).
+
+**Gates**: x86_64 `all 244 user tests passed`, `mpos-kunit 35 passed, 0 failed`;
+`cargo test -p mpos --lib` 716; the seven sysfs host tests that pinned the old shape
+moved with it (their expectation - "the class entry is a directory holding the
+attributes" - was the compromise this item removes; the measurement above is why the
+rotation is right, not a convenience).
+
+**Left open**: whether udevd now records the devices it used to drop, and whether the
+boot's `udevadm settle` still waits its 120 s default. That is the next measurement, on
+the refreshed image.

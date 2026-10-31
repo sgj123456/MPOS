@@ -695,7 +695,14 @@ impl SysFs {
         // directory under `/sys/devices` in this tree, so their class entry is
         // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
-        next = build_block(&numbering, &block, &block_root, next, &mut devnodes);
+        next = build_block(
+            &numbering,
+            &devices,
+            &block,
+            &block_root,
+            next,
+            &mut devnodes,
+        );
         #[cfg(all(target_os = "none", mpos_input_registry))]
         {
             next = build_input(&class, &virtual_root, next, &mut devnodes);
@@ -723,12 +730,18 @@ impl SysFs {
 
 fn build_block(
     numbering: &Numbering,
+    devices: &Arc<SysDir>,
     block: &Arc<SysDir>,
     block_root: &Arc<SysDir>,
     mut next: u64,
     devnodes: &mut Vec<(&'static str, String, u32, u32)>,
 ) -> u64 {
     let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    // Every directory of `/sys/devices` this loop has made, keyed by its
+    // `/sys`-relative path. `add` panics on the second add of one name, and a
+    // directory is made once and then shared by every device under it, so the
+    // key is the path rather than the name.
+    let mut made: Vec<(String, Arc<SysDir>)> = Vec::new();
     // The disk the partitions that follow belong to. `BlockEntry::of_disk`
     // contributes a disk and then its own partitions, one disk at a time,
     // and that order is the whole of what says which partition is whose -
@@ -737,43 +750,74 @@ fn build_block(
     let mut disk_home: Option<(alloc::string::String, Arc<SysDir>)> = None;
     for entry in numbering.devices.iter() {
         let name = &entry.name;
-        // Where this device's attributes really live: one home per file.
-        // A whole disk's home is its own class entry; a partition's is
-        // *inside* its disk's, which is where Linux puts it - the partition
-        // is a child of the disk in the device tree - and where a reader
-        // that walks a disk looking for its partitions finds it. The class
-        // entry of a partition is then a link to that one home rather than a
-        // second copy of the same three attributes.
-        let (dir, home) = if entry.whole {
-            let dir = block.add_dir(name, next);
-            next += 1;
+        // Where this device really lives: the path its own announcement
+        // names, `/sys`-relative. A driver files a disk under the bus that
+        // found it (`/devices/virtio/block`), and the tree is built at
+        // exactly that path - the reader that got the event opens this
+        // directory by the name the event gave it, and it has to be there
+        // (`/run/udev`'s record of a device begins with this read).
+        let home = alloc::format!(
+            "devices/{}/{name}",
+            entry
+                .devpath
+                .trim_start_matches('/')
+                .trim_start_matches("devices")
+                .trim_start_matches('/')
+        );
+        // A whole disk makes its own home; a partition lives inside its
+        // disk's home, which is where Linux puts it - a partition is a child
+        // of the disk in the device tree - and where a reader that walks a
+        // disk looking for its partitions finds it.
+        let home = if entry.whole || disk_home.is_none() {
+            home
+        } else {
+            alloc::format!("{}/{name}", disk_home.as_ref().unwrap().0)
+        };
+        let dir = if entry.whole {
+            let dir = device_dir(devices, &home, &mut made, &mut next);
             block_root.add(
                 name,
                 Arc::new(SysSymlink {
                     ino: next,
-                    target: alloc::format!("../class/block/{name}"),
+                    target: alloc::format!("../devices/{}", &home["devices/".len()..]),
                 }),
             );
             next += 1;
-            disk_home = Some((name.clone(), dir.clone()));
-            (dir, alloc::format!("class/block/{name}"))
+            disk_home = Some((home.clone(), dir.clone()));
+            dir
         } else {
-            let (disk_name, parent) = disk_home
+            let (_disk, parent) = disk_home
                 .clone()
                 .expect("a partition is numbered after its own disk");
             let dir = parent.add_dir(name, next);
             next += 1;
-            block.add(
-                name,
-                Arc::new(SysSymlink {
-                    ino: next,
-                    target: alloc::format!("{disk_name}/{name}"),
-                }),
-            );
-            next += 1;
-            (dir, alloc::format!("class/block/{disk_name}/{name}"))
+            dir
         };
-        devnodes.push(("block", home, entry.major, entry.minor));
+        // The class entry is a link to that one home, not a second copy of
+        // the same attributes: `/sys/class/block/vda` *is* `vda`, and a
+        // reader that resolves it lands on the device.
+        block.add(
+            name,
+            Arc::new(SysSymlink {
+                ino: next,
+                target: alloc::format!("../../{home}"),
+            }),
+        );
+        next += 1;
+        devnodes.push(("block", home.clone(), entry.major, entry.minor));
+        // `subsystem`, the link every device node carries to the class it
+        // belongs to - `../../../..` is `/sys` from a home four deep.
+        dir.add(
+            "subsystem",
+            Arc::new(SysSymlink {
+                ino: next,
+                target: alloc::format!(
+                    "{}class/block",
+                    "../".repeat(home.matches('/').count() + 1)
+                ),
+            }),
+        );
+        next += 1;
         // The numbers, as `/dev` nodes are made from them.
         dir.add(
             "dev",
@@ -820,21 +864,11 @@ fn build_block(
                 ino: next,
                 event: Event {
                     action: "add",
-                    // The tree position comes from the disk's own driver,
-                    // so a SATA disk is filed under the SATA controller
-                    // rather than under virtio with the rest.
                     devpath: alloc::format!("{}/{}", entry.devpath, name),
                     subsystem: "block",
                     devname: name.clone(),
                     major: entry.major,
                     minor: entry.minor,
-                    // `DEVTYPE=disk` for the whole disk and `partition` for
-                    // what lives inside it - the distinction this loop already
-                    // carries as `entry.whole`, and the word udev's own rules
-                    // key the two apart by (measured on this host: every
-                    // `/sys/class/block/*/uevent` here has one or the other,
-                    // beside a `DISKSEQ` this card has no source for and so does
-                    // not invent).
                     extra: if entry.whole {
                         &[("DEVTYPE", "disk")]
                     } else {
@@ -846,6 +880,32 @@ fn build_block(
         next += 1;
     }
     next
+}
+
+/// The directory a device's tree path names, made once: `/devices/virtio/block`
+/// is two directories that every disk under it shares, and `add` panics on the
+/// second add of one name.
+fn device_dir(
+    devices: &Arc<SysDir>,
+    home: &str,
+    made: &mut Vec<(String, Arc<SysDir>)>,
+    next: &mut u64,
+) -> Arc<SysDir> {
+    let mut at = devices.clone();
+    let mut prefix = alloc::string::String::from("devices");
+    for part in home.split('/').skip(1) {
+        prefix.push('/');
+        prefix.push_str(part);
+        if let Some((_, dir)) = made.iter().find(|(path, _)| *path == prefix) {
+            at = dir.clone();
+            continue;
+        }
+        let dir = at.add_dir(part, *next);
+        *next += 1;
+        made.push((prefix.clone(), dir.clone()));
+        at = dir;
+    }
+    at
 }
 
 #[cfg(all(target_os = "none", mpos_input_registry))]
@@ -1841,7 +1901,10 @@ mod tests {
         crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
         let block = block_dir(&fs);
         let (name, _) = block.read_dir().unwrap().into_iter().next().unwrap();
-        let uevent = block.lookup(&name).unwrap().lookup("uevent").unwrap();
+        // The class entry is a link to the device's home under `/sys/devices`,
+        // and the writable attribute is there - one home per file.
+        let device = resolve(&fs, &alloc::format!("/sys/class/block/{name}"));
+        let uevent = device.lookup("uevent").unwrap();
         assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
 
         let event = crate::uevent::recv(watcher)
@@ -1959,8 +2022,15 @@ mod tests {
                 },
             ],
         });
-        let block = block_dir(&fs);
-        let sda = block.lookup("sda").expect("the SATA disk is in the tree");
+        // The class entry is a link to the disk's own home, which is filed
+        // under the bus that found it - `/devices/ahci/block/sda` here, the
+        // path its own event names.
+        let sda = resolve(&fs, "/sys/class/block/sda");
+        assert_eq!(
+            sda.metadata().ino,
+            resolve(&fs, "/sys/devices/ahci/block/sda").metadata().ino,
+            "the class entry is the same directory the event names"
+        );
 
         // The numbers, which is how userland tells the two disks apart: a
         // virtio disk is major 254 and a SATA one is major 8.
@@ -2401,7 +2471,12 @@ mod tests {
         let blocks = resolve(&fs, "/sys/dev/block");
         let link = blocks.lookup("254:0").expect("the disk's number");
         assert_eq!(link.metadata().kind, NodeKind::Symlink);
-        assert_eq!(link.readlink().unwrap(), "../../class/block/vda");
+        // Measured on the host: `/sys/dev/block/<m>:<n>` points at the
+        // device's own directory (`../../devices/virtual/block/nbd0` there),
+        // not at its class entry - the class entry is itself a link to the
+        // same home, and a reader is expected to land on the device, not on
+        // another link. Block devices are no longer this tree's exception.
+        assert_eq!(link.readlink().unwrap(), "../../devices/virtio/block/vda");
         // And it resolves to the device itself, not to a link to nowhere.
         assert_eq!(
             resolve(&fs, "/sys/dev/block/254:0").metadata().kind,

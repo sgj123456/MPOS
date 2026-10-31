@@ -241,6 +241,88 @@ fn main() {
             .unwrap_or(false),
     );
 
+    // ---- the tree the announcements name -----------------------------------
+    //
+    // A device event's `DEVPATH` is an absolute path under `/sys`, and the
+    // listener that receives one opens exactly that path: `udevd` reads
+    // `<DEVPATH>/uevent` before it records a device at all, so a `DEVPATH`
+    // this tree does not serve is an event a listener cannot act on (measured
+    // on the desktop image: `/sys/devices/virtio/block/vda/uevent` answered
+    // ENOENT while every event announced `/devices/virtio/block/vda`).
+    //
+    // Linux's shape, measured on the host: a block device really lives at
+    // `/sys/devices/<bus path>/<name>` - `/sys/devices/virtual/block/nbd0` is
+    // a directory holding `dev`, `size` and the writable `uevent` - while
+    // `/sys/class/block/nbd0 -> ../../devices/virtual/block/nbd0` and
+    // `/sys/block/nbd0 -> ../devices/virtual/block/nbd0` are both links to
+    // that one home.
+    let mut homes: Vec<(String, String)> = Vec::new();
+    let mut class_links = true;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = format!("/sys/class/block/{name}");
+            let Ok(target) = std::fs::read_link(&path) else {
+                class_links = false;
+                continue;
+            };
+            let target = target.to_string_lossy().into_owned();
+            match target.strip_prefix("../../devices/") {
+                Some(rest) => homes.push((name, format!("/sys/devices/{rest}"))),
+                None => class_links = false,
+            }
+        }
+    }
+    r.check(
+        "every block device's class entry is a link into /sys/devices",
+        !homes.is_empty() && class_links,
+    );
+    r.check(
+        "and every home the class entries name is a directory this tree serves",
+        !homes.is_empty()
+            && homes
+                .iter()
+                .all(|(_, home)| std::fs::metadata(home).map(|m| m.is_dir()).unwrap_or(false)),
+    );
+    // The three attributes a listener reads to turn an event into a record:
+    // the number, the size and the file that announces it again.
+    r.check(
+        "whose dev, size and uevent attributes are readable",
+        !homes.is_empty()
+            && homes.iter().all(|(_, home)| {
+                ["dev", "size", "uevent"].iter().all(|attr| {
+                    std::fs::read(format!("{home}/{attr}"))
+                        .map(|bytes| !bytes.is_empty())
+                        .unwrap_or(false)
+                })
+            }),
+    );
+    // `/sys/block` is the whole-disks view, and on Linux it is a second set of
+    // links to the same homes - not a second set of directories.
+    let mut block_links = true;
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(target) = std::fs::read_link(format!("/sys/block/{name}")) else {
+                block_links = false;
+                continue;
+            };
+            let target = target.to_string_lossy().into_owned();
+            let Some(rest) = target.strip_prefix("../devices/") else {
+                block_links = false;
+                continue;
+            };
+            let home = format!("/devices/{rest}");
+            if !homes.iter().any(|(_, seen)| seen.ends_with(&home)) {
+                block_links = false;
+            }
+        }
+    }
+    r.check(
+        "and /sys/block's entries are links to those same homes",
+        !homes.is_empty() && block_links,
+    );
+
     // The announcement needs a device whose uevent file can be written. Saying
     // so is better than waiting: without one, the blocking `recvmsg` below
     // parks for a machine that is never going to answer it, and a claim that

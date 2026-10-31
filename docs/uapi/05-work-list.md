@@ -7969,3 +7969,19 @@ Open: which boot state starts that service, and whether the shipped
   tree does not keep, which is the wrong shape; fix the tree (a real directory at the
   announced path with `dev`, `size`, `subsystem`, `uevent`, and the class entry as a
   link), pin it, and the daemon's record follows. Notes §7.9k.
+
+### Item 160 - a block device's event names a path the tree serves (2026-10-31)
+
+Measured on the desktop image (§7.9k): udevd `open(2)`s `<DEVPATH>/uevent` for every
+event it receives and got `ENOENT` for `/sys/devices/virtio/block/vda/uevent`, because
+this tree kept block devices' attributes only in their class entry. Linux keeps one
+home per device under `/sys/devices` and makes `/sys/class/block/<name>` and
+`/sys/block/<name>` links to it (measured on the host, §7.9l).
+
+Served now: `build_block` files every block device (disk and partition alike) under
+`/sys/devices/<driver path>/<name>` with `dev`, `size`, `partition`, writable `uevent`
+and a `subsystem` link; the class and `/sys/block` entries are links to those homes;
+`/sys/dev/block/<m>:<n>` points at the device itself. Pin: four claims in `t-uevent`
+(counterfactual red on exactly those four). §7.9l.
+
+Left open: what udevd records now, and whether `udevadm settle` still waits.
