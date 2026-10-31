@@ -6733,7 +6733,7 @@ whether the boot's udevd received the boot's own early events at all (a socket
 bound before they were sent) and what `udev-trigger` did — named as the open
 item, not closed here. A `udev_settle_timeout=5` in the image only hides it.
 
-#### 7.9e Two uevent listeners: the kernel's delivery is whole; udevd's half is open (2026-10-31)
+#### 7.9e Two uevent listeners, the queue file, and what is left of the 120 s (2026-10-31)
 
 The boot's 120 s settle (§7.9d) was traced to udevd leaving its queue non-empty,
 with the daemon *idle*. This round measured who actually receives the machine's
@@ -6779,12 +6779,53 @@ the second in-process listener, the cross-process pair, and both parked
 listeners - and nothing else in the sweep moves.
 
 So the kernel's delivery path is **not** the boot's bug: one announcement does
-reach every listener, spinning or parked, in one process or across two. What
-remains is udevd's own half - how it binds and what it does with what it holds
-- and the boot measurement above is the evidence that it holds nothing while
-the machine announces 13 events. The narrowed question, recorded open rather
-than answered: does the desktop image's `udevd` bind `GROUP_KERNEL` (1) or
-only its own group (2), and does its monitor read the socket it opened?
+reach every listener, spinning or parked, in one process or across two.
+
+**Second round, the queue file and its wake (2026-10-31).** A probe in
+`/etc/local.d` (named `aa-*` so it runs before the session script, §7.9e's
+earlier lesson) read the daemon itself and the file `settle` waits on:
+
+```
+udevd pids: 9 25 24 23 22 21 20 19 18 15      (the daemon and its workers)
+udevd(9) fds: 3 -> /dev/kmsg   5 -> socket:[2952790016]
+              7 -> anon_inode:inotify   8 -> anon_inode:[signalfd]
+              11 -> anon_inode:[eventpoll]   (and three anon shm fds)
+/run/udev: control data links queue rules.d watch
+data files: 3
+queue: /run/udev/queue
+settle --timeout=3  -> rc=1                   (times out: queue present)
+udevadm trigger --action=add -> rc=0, sleep 2
+data files after: 3                           (not one device processed)
+queue after: /run/udev/queue                  (never removed)
+settle --timeout=3  -> rc=0                   (returns at once now)
+```
+
+Two readings in that table. The second `settle` returning 0 while the queue
+file is still there and no data file was written says the daemon never
+removed it - the wait that ends is not "the queue emptied", it is whatever
+event the trigger's touch of the file left behind. And the daemon does not
+process what it is sent: `data files` is 3 before and 3 after a trigger that
+announces every device.
+
+The wake itself is measured whole too: `t-inotify-wake` (`12` claims, x86_64
+`244`) parks a watcher in `poll(2)` and another in `epoll_wait(2)` while a
+*child process* changes the file, and both see `POLLIN`; the watcher being the
+other process is the boot's arrangement with the sides swapped. And the
+counterfactual is itself a measurement: with `deliver`'s wake loop deleted - the
+queue fills and the woken list stays empty, `poll(-1)` and `epoll_wait(-1)` both
+parked with no timeout - the program still passes. So this kernel's park
+**re-asks its descriptors every cycle** and a lost wake is invisible through
+`poll(2)`; the claim that survives is "a change reaches a parked watcher", not
+"only a wake can deliver it". The distinction matters for the boot: a missing
+`inotify` wake cannot be what `udevadm settle` waits 120 s for, because its wait
+would re-ask the queue file and return.
+
+What remains is udevd's own half, and the next instrument is narrower than
+"does the bus carry": the daemon's worker pids show it forks, so the question
+is what its workers are waiting on (`/proc/<pid>/syscall`/`wchan` at the
+moment `settle` times out), and why its event processing stops after the first
+three devices - a shape this kernel's `inotify`/`netlink`/`epoll` wake has now
+been measured out of.
 
 Why the boot cares: udevd records nothing (`data files: 0`), `udevadm settle`
 times out its 120 s, and openrc spends the boot's first minutes on it - with

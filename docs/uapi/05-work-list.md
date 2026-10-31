@@ -7887,3 +7887,23 @@ image's `udevd` binds (kernel group 1 or only its own group 2) and whether its
 monitor reads the socket it opened. The boot's own numbers are §7.9e's image
 table; the next instrument there is a probe that asks the daemon's socket its
 group mask (`getsockname`) instead of asking the kernel.
+
+## item 153 — an inotify change wakes a parked watcher, in this process or another
+
+Served and pinned (2026-10-31, `docs/notes/` §7.9e). `udevadm settle` waits on
+`/run/udev/queue` with `inotify`, and the image's second `settle` returned while
+the queue file was still there, so the wake was the suspect:
+`user/tests/src/bin/t-inotify-wake.rs` parks one watcher in `poll(2)` and another
+in `epoll_wait(2)` while a **child process** changes the file - both are woken
+with `POLLIN`, and the third claim has the watcher in the other process and the
+writer here. Twelve claims, both arms green (`244`/`243`).
+
+So a change reaches a parked watcher too, and the boot's 120 s is inside udevd:
+it holds a netlink socket, an `inotify` and an `eventpoll`, yet records three
+devices and then nothing, and never removes `/run/udev/queue`. Two things this
+round also measured: the pin's own counterfactual (wake loop deleted, both parks
+at `-1`) stays **green**, because this kernel's park re-asks the descriptor each
+cycle - so "a lost wake" is not even observable through `poll(2)` here, and is
+not the boot's cause. The open instrument is the daemon's own park:
+`/proc/<pid>/syscall` and `wchan` of its worker pids at the moment `settle`
+times out.
