@@ -8097,3 +8097,17 @@ Stored and read back but not acted on (named above the row): `SO_RCVTIMEO`,
 
 Pin: `t-uevent-opts` (22 claims). Counterfactual restores the zero-for-everything
 branch: 14 claims red.
+
+### Item 167 - a device-event socket's receive timeout bounds the wait (2026-11-01)
+
+`SO_RCVTIMEO` was stored and read back (§7.9s) and steered no wait at all. Now:
+`{0,0}` is "no timeout", a 200 ms timeout answers `EAGAIN` at 200-208 ms on
+`recv(2)`/`recvmsg(2)`/`read(2)`, an event inside the window is returned, and
+`MSG_DONTWAIT` still answers at once. Measured on Linux 7.2.11 first, including
+two shapes the implementation had wrong: the value is **16 bytes** (two 64-bit
+fields; a shorter `set` is `EINVAL`) and `tv_usec` outside `0..=999_999` is
+`EDOM` while a valid one is rounded up to a whole millisecond with a carry
+(`{0,999999}` -> `{1,0}`). `crates/err` gained the missing `EDOM`.
+Pin `t-uevent-doors` (11 timeout claims, each blocking door in a bounded child);
+counterfactual reds the three doors by name. `docs/notes/07-device-drivers.md`
+§7.9t; gates x86_64 246 / aarch64 245.

@@ -655,7 +655,9 @@ and `read(2)` had answered `EBADF` while only `recvmsg(2)` worked (§7.9r, item 
 Its options are Linux's table now, too: a device-event socket used to answer **zero** to every
 name it had not been told about - `SO_TYPE` included - and now answers `SOCK_RAW`/`AF_NETLINK`,
 the datagram buffer defaults with Linux's doubling, and `ENOPROTOOPT`/`EOPNOTSUPP`/`EPERM` where
-the family refuses (§7.9s, item 166, pinned by `t-uevent-opts`).
+the family refuses (§7.9s, item 166, pinned by `t-uevent-opts`), and its
+`SO_RCVTIMEO` now bounds the receive it used to only store (§7.9t, item 167,
+pinned by `t-uevent-doors`'s timeout section).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

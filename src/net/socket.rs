@@ -909,6 +909,37 @@ fn park_until_deadline(ready: impl Fn() -> bool, deadline: u64) -> isize {
     }
 }
 
+/// Wait for a device event on `handle`, honouring the socket's receive
+/// timeout: zero when the caller should look at the queue, `EAGAIN` when the
+/// timeout ran out first, `EINTR` on a signal.
+///
+/// Linux's contract, measured (`docs/notes/` §7.9t): `SO_RCVTIMEO` bounds a
+/// blocking receive and its expiry is `EAGAIN` - not zero bytes, not
+/// `ETIMEDOUT` - while `{0, 0}` means no bound. A socket with no timeout keeps
+/// the unbounded park it had.
+#[cfg(target_os = "none")]
+fn wait_for_event(handle: usize) -> isize {
+    match crate::uevent::receive_deadline(handle) {
+        None => park_until(|| crate::uevent::ready(handle)),
+        Some(deadline) => {
+            let me = crate::sched::current();
+            super::subscribe(me);
+            let end = crate::sched::block_until_nanos(|| crate::uevent::ready(handle), deadline);
+            super::unsubscribe(me);
+            match end {
+                crate::sched::WaitEnd::Interrupted => err::EINTR,
+                crate::sched::WaitEnd::Condition => 0,
+                crate::sched::WaitEnd::Deadline => err::EAGAIN,
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn wait_for_event(_handle: usize) -> isize {
+    0
+}
+
 /// Receive one device event, or one message a peer sent on the same socket.
 ///
 /// Three things go back beyond the payload, and a real listener needs all
@@ -936,7 +967,7 @@ fn recvfrom_netlink(
     flags: usize,
 ) -> isize {
     if !dontwait(fd, flags) {
-        let waited = park_until(|| crate::uevent::ready(handle));
+        let waited = wait_for_event(handle);
         if waited != 0 {
             return waited;
         }
@@ -994,7 +1025,7 @@ fn recvmsg_netlink(
     // on a quiet machine it can shut down - it is why a `killall udevd` hung.
     // Only `MSG_DONTWAIT` or `O_NONBLOCK` earns `EAGAIN`, as it does on Linux.
     if !dontwait {
-        let waited = park_until(|| crate::uevent::ready(handle));
+        let waited = wait_for_event(handle);
         if waited != 0 {
             return waited;
         }
@@ -5539,31 +5570,59 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         };
         // Linux wants the whole value: a 4-byte `struct linger` and a 4-byte
         // `struct timeval` are `EINVAL`, measured (`build/scratch/opt/set`,
-        // `tv`), while an 8-byte one is accepted.
-        if optlen < named.width || !crate::uaccess::buffer_ok(optval, named.width, false, from_user)
-        {
+        // `rt/tv2`), while the whole width is accepted.
+        let width = named.width();
+        if optlen < width || !crate::uaccess::buffer_ok(optval, width, false, from_user) {
             return err::EINVAL;
+        }
+        // A `struct timeval`'s two fields are eight bytes each and a `struct
+        // linger`'s are four, so the value is read field by field rather than
+        // word by word.
+        let mut first = 0i32;
+        let mut second = None;
+        let mut index = 0;
+        while let Some((_, field_width)) = named.field(index) {
+            let value = unsafe {
+                if field_width == 8 {
+                    ((optval + index * 8) as *const i64).read_unaligned()
+                } else {
+                    ((optval + index * 4) as *const i32).read_unaligned() as i64
+                }
+            };
+            if index == 0 {
+                first = value as i32;
+            } else {
+                second = Some(value as i32);
+            }
+            index += 1;
         }
         // The buffer pair is not a plain word: Linux stores the ask doubled and
         // clamped, so a `set(4096)` reads back `8192` - the arithmetic
         // `super::sock_buffer_size` already owns for the IP family.
-        let (first, second) = match named.width {
-            8 => {
-                let a = unsafe { (optval as *const i32).read_unaligned() };
-                let b = unsafe { ((optval + 4) as *const i32).read_unaligned() };
-                (a, Some(b))
-            }
-            _ => (unsafe { (optval as *const i32).read_unaligned() }, None),
-        };
         let stored = match optname {
             SO_RCVBUF => super::sock_buffer_size(first, super::SOCK_MIN_RCVBUF) as i32,
             SO_SNDBUF => super::sock_buffer_size(first, super::SOCK_MIN_SNDBUF) as i32,
             _ => first,
         };
-        crate::uevent::option_set(handle, named.word(0), stored);
-        if let Some(b) = second {
-            crate::uevent::option_set(handle, named.word(1), b);
+        // A `struct timeval` is stored the way Linux stores it: the range
+        // check (`EDOM` on a bad `tv_usec`) and the rounding to whole
+        // milliseconds belong to the pair, not to a field.
+        if let (Some(b), Some(opt)) = (second, crate::uevent::pair_second_of(named.first)) {
+            if named.layout == crate::uevent::Layout::Timeval {
+                let (secs, usecs) = match crate::uevent::normalise_timeval(stored as i64, b as i64)
+                {
+                    Ok(pair) => pair,
+                    Err(e) => return e,
+                };
+                crate::uevent::option_set(handle, named.first, secs);
+                crate::uevent::option_set(handle, opt, usecs);
+                return 0;
+            }
+            crate::uevent::option_set(handle, named.first, stored);
+            crate::uevent::option_set(handle, opt, b);
+            return 0;
         }
+        crate::uevent::option_set(handle, named.first, stored);
         return 0;
     }
     // A unix socket is not in the network registry either; its options are the
@@ -5799,10 +5858,16 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         // bytes that fit and answers the *full* width in `optlen`. Measured
         // with a 2-byte buffer on `SO_RCVBUF` (`build/scratch/opt/trunc`), and
         // with `0`, which copies nothing and answers `0`.
-        let width = named.width;
-        let mut words = [0i32; 2];
-        for (i, w) in words.iter_mut().enumerate().take(width / 4) {
-            *w = crate::uevent::option_get(handle, named.word(i)).unwrap_or(0);
+        let width = named.width();
+        // At most four words: a `struct timeval` is 16 bytes. The row's own
+        // expansion supplies the high half of an eight-byte field as
+        // `Opt::Zero`, so this loop is the same shape for all three layouts.
+        let mut words = [0i32; 4];
+        for i in 0..(width / 4) {
+            words[i] = named
+                .word(i)
+                .and_then(|opt| crate::uevent::option_get(handle, opt))
+                .unwrap_or(0);
         }
         // ...and it answers `min(cap, width)`, not always `width`: a 4-byte
         // buffer on `SO_LINGER` copies the first word and reports 4, a 1-byte

@@ -83,6 +83,7 @@ pub const ESPIPE: isize = -29;
 /// both say 61.
 pub const ENODATA: isize = -61;
 pub const ERANGE: isize = -34;
+pub const EDOM: isize = -33;
 pub const EPIPE: isize = -32;
 pub const ENOSYS: isize = -38;
 pub const EPERM: isize = -1;

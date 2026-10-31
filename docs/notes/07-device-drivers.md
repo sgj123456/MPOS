@@ -7475,3 +7475,53 @@ truncation and the `SO_LINGER` width — while the two claims that were already
 right (`SO_PASSCRED`, `SO_REUSEPORT`'s refusal under the short guard) stayed
 green. Gates: x86_64 `pass=246`, aarch64 `pass=245`, `mpos-kunit 35`, host lib
 719.
+
+### §7.9t The receive timeout a device-event socket stores, and the wait it bounds
+
+`SO_RCVTIMEO` was one of the options §7.9s taught the socket to *answer*: it
+stored a value, read it back, and steered nothing. A blocking receive on an
+empty queue therefore waited forever however small the timeout was, which is
+not Linux: measured on the host (`build/scratch/rt/rt`, Linux 7.2.11, HZ=100)
+a socket given 200 ms answers **`EAGAIN` at 202-208 ms** on `recv(2)`,
+`recvmsg(2)` and `read(2)` alike, and an event announced at 150 ms inside that
+window is returned instead (156 bytes). `MSG_DONTWAIT` answers at once whatever
+the timeout says, and `{0, 0}` means *no* timeout rather than a zero-second one.
+
+Two more facts the same probe series settled, both of which the implementation
+had to honour:
+
+- **The value is 16 bytes, not 8.** `struct timeval` on this host is two 64-bit
+  fields, so `get` answers `optlen = min(cap, 16)` at every cap from 0 to 20 and
+  `set` refuses every length 0..15 with `EINVAL` while accepting 16 and longer
+  (`build/scratch/rt/tv2`). Cap 0 copies nothing and reports 0.
+- **`tv_usec` is range-checked and the value is quantised to the tick.**
+  Outside `0..=999_999` the answer is `EDOM` (`{0,1000000}`, `{0,-1}`, `{-5,-5}`
+  all refused); inside it, the microseconds are **rounded up to the next whole
+  millisecond with a carry into the seconds** — `{0,1}` reads back
+  `{0,1000}`, `{0,4999}` → `{0,5000}`, `{0,5001}` → `{0,6000}`, `{0,999999}` →
+  `{1,0}`, `{2,500000}` unchanged (`build/scratch/rt/tv4`). A negative pair alone
+  (`{-1,0}`) stores `{0,0}`.
+
+Served: `crates/err`'s missing `EDOM = -33`; `uevent::normalise_timeval` (the
+range check and the rounding, one place, so `set` and the wait agree);
+`uevent::receive_deadline(id)`, which turns the stored pair into an absolute
+`since_boot_nanos` stamp or `None` for "no timeout"; and `net::socket`'s
+`wait_for_event(handle)`, which both receive doors now call instead of parking
+unbounded — the timeout path registers with the stack the same way `park_until`
+does and maps `WaitEnd::Deadline` to `EAGAIN`.
+
+Named divergences: the rounding is to the millisecond rather than to a tick this
+machine does not have a fixed period for; and a timeout is per call, re-read at
+each receive, where Linux reads the stored `timeval` against its own clock.
+
+Pin: `t-uevent-doors`'s timeout section (11 claims). Each *blocking* door runs
+in a forked child that reports `(answer, errno, millis)` through a pipe and is
+bounded by the parent at `BOUND_MS`, because a door that waits forever would
+otherwise report as a lane timeout rather than a claim — the first
+counterfactual measured exactly that (`=== FAIL t-uevent-doors timeout=120s`),
+and an `alarm(1)` did not end the park either. Counterfactual (the stored
+timeout steers no wait, `match None::<u64>`): the three doors go red — the
+bounded child is killed at its bound and the claim fails by name — and the
+`{0,0}` claim goes red with them, since "did not answer inside 300 ms" and
+"never answers" are the same observation. Gates: x86_64 `pass=246`, aarch64
+`pass=245`, `mpos-kunit 35`, host lib 719.

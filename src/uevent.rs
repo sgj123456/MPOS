@@ -213,6 +213,8 @@ pub enum Opt {
     /// stored state - `option_get` answers these from the constants and
     /// `option_set` never receives them.
     IdentitySocketType,
+    /// The high half of a 64-bit field: reads zero, stores nothing.
+    Zero,
     IdentityProtocol,
     IdentityDomain,
     Rcvbuf,
@@ -536,61 +538,194 @@ pub fn option_named(level: usize, optname: usize, for_set: bool) -> Result<Named
         let _ = SOL_NETLINK;
         return Err(crate::err::ENOPROTOOPT);
     }
-    let (first, width) = match optname {
+    let (first, layout) = match optname {
         // The socket's own identity: readable, never settable (Linux answers
         // the three on `getsockopt` and refuses them on `setsockopt`, so a
         // single table cannot serve both doors and the caller asks for the
         // direction it is on).
-        3 if !for_set => (Opt::IdentitySocketType, 4),
-        38 if !for_set => (Opt::IdentityProtocol, 4),
-        39 if !for_set => (Opt::IdentityDomain, 4),
-        7 => (Opt::Sndbuf, 4),
-        8 => (Opt::Rcvbuf, 4),
-        18 => (Opt::Rcvlowat, 4),
-        20 => (Opt::Rcvtimeo, 8),
-        21 => (Opt::Sndtimeo, 8),
-        13 => (Opt::LingerOn, 8),
-        10 => (Opt::Oobinline, 4),
-        5 => (Opt::Dontroute, 4),
-        29 => (Opt::Timestamp, 4),
-        6 => (Opt::Broadcast, 4),
-        2 => (Opt::Reuseaddr, 4),
-        9 => (Opt::Keepalive, 4),
-        49 => (Opt::IncomingCpu, 4),
-        46 => (Opt::BusyPoll, 4),
+        3 if !for_set => (Opt::IdentitySocketType, Layout::Int),
+        38 if !for_set => (Opt::IdentityProtocol, Layout::Int),
+        39 if !for_set => (Opt::IdentityDomain, Layout::Int),
+        8 => (Opt::Rcvbuf, Layout::Int),
+        7 => (Opt::Sndbuf, Layout::Int),
+        18 => (Opt::Rcvlowat, Layout::Int),
+        20 => (Opt::Rcvtimeo, Layout::Timeval),
+        21 => (Opt::Sndtimeo, Layout::Timeval),
+        13 => (Opt::LingerOn, Layout::TwoInts),
+        10 => (Opt::Oobinline, Layout::Int),
+        5 => (Opt::Dontroute, Layout::Int),
+        29 => (Opt::Timestamp, Layout::Int),
+        6 => (Opt::Broadcast, Layout::Int),
+        2 => (Opt::Reuseaddr, Layout::Int),
+        9 => (Opt::Keepalive, Layout::Int),
+        49 => (Opt::IncomingCpu, Layout::Int),
+        46 => (Opt::BusyPoll, Layout::Int),
         12 => return Err(crate::err::EPERM),
         36 => return Err(crate::err::EPERM),
         15 => return Err(crate::err::EOPNOTSUPP),
         _ => return Err(crate::err::ENOPROTOOPT),
     };
-    Ok(Named { first, width })
+    Ok(Named { first, layout })
 }
 
 /// What [`option_named`] resolved to.
 #[derive(Clone, Copy)]
 pub struct Named {
-    /// The first word's row.
+    /// The first field's row.
     pub first: Opt,
-    /// The value's whole size: `4` for an `int`, `8` for a pair.
-    pub width: usize,
+    /// The value's shape.
+    pub layout: Layout,
+}
+
+/// The three shapes a value under these names has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// One 32-bit field.
+    Int,
+    /// Two 32-bit fields: `struct linger`.
+    TwoInts,
+    /// Two 64-bit fields: `struct timeval`.
+    Timeval,
 }
 
 impl Named {
-    /// The word at `index` of this value, `0` being the first.
-    pub fn word(&self, index: usize) -> Opt {
-        if index == 0 {
-            return self.first;
+    /// The value's whole size in bytes: `4`, `8` or `16`.
+    ///
+    /// The three shapes are what Linux actually stores under these names
+    /// (measured, `docs/notes/` §7.9s/§7.9t): a plain `int`, a `struct linger`
+    /// of two `int`s, and a `struct timeval`, which on this ABI is **two
+    /// 64-bit fields** - Linux answers 16 bytes for it at every cap and
+    /// refuses a `set` shorter than 16 (`build/scratch/rt/tv2`).
+    pub fn width(&self) -> usize {
+        match self.layout {
+            Layout::Int => 4,
+            Layout::TwoInts => 8,
+            Layout::Timeval => 16,
         }
-        match self.first {
-            Opt::LingerOn => Opt::LingerSec,
-            Opt::Rcvtimeo => Opt::RcvtimeoUsec,
-            Opt::Sndtimeo => Opt::SndtimeoUsec,
-            other => other,
+    }
+
+    /// The `index`th four-byte word of this value, `None` past its end.
+    ///
+    /// The expansion is per field width, so a `struct timeval`'s eight-byte
+    /// seconds become two words (the second [`Opt::Zero`], because every value
+    /// here fits in 32 bits) while a `struct linger`'s two `int`s stay one word
+    /// each. That is what makes one copy loop serve all three shapes.
+    pub fn word(&self, index: usize) -> Option<Opt> {
+        let mut i = 0;
+        let mut field = 0;
+        while let Some((opt, width)) = self.field(field) {
+            if i == index {
+                return Some(opt);
+            }
+            i += 1;
+            if width == 8 {
+                if i == index {
+                    return Some(Opt::Zero);
+                }
+                i += 1;
+            }
+            field += 1;
+        }
+        None
+    }
+
+    /// The field at `index`, with its own width in bytes.
+    pub fn field(&self, index: usize) -> Option<(Opt, usize)> {
+        match (self.layout, index) {
+            (Layout::Int, 0) => Some((self.first, 4)),
+            (Layout::TwoInts, 0) => Some((self.first, 4)),
+            (Layout::TwoInts, 1) => pair_second(self.first).map(|o| (o, 4)),
+            (Layout::Timeval, 0) => Some((self.first, 8)),
+            (Layout::Timeval, 1) => pair_second(self.first).map(|o| (o, 8)),
+            _ => None,
         }
     }
 }
 
+/// The row a pair's second field belongs to.
+fn pair_second(first: Opt) -> Option<Opt> {
+    match first {
+        Opt::LingerOn => Some(Opt::LingerSec),
+        Opt::Rcvtimeo => Some(Opt::RcvtimeoUsec),
+        Opt::Sndtimeo => Some(Opt::SndtimeoUsec),
+        _ => None,
+    }
+}
+
+/// [`pair_second`], for the callers that store a value they read field by
+/// field.
+pub fn pair_second_of(first: Opt) -> Option<Opt> {
+    pair_second(first)
+}
+
 /// One stored word of a socket's options, or `None` if the socket is gone.
+/// Normalise a `struct timeval` the way Linux stores it, and refuse the one
+/// range it refuses.
+///
+/// Measured (`build/scratch/rt/tv4`, `docs/notes/` §7.9t): `tv_usec` outside
+/// `0..=999_999` is `EDOM`; inside it, the microseconds are **rounded up to
+/// the next whole millisecond** and a carry moves into the seconds, so
+/// `{0, 1}` reads back `{0, 1000}`, `{0, 5001}` reads back `{0, 6000}` and
+/// `{0, 999_999}` reads back `{1, 0}`. A negative pair stores `{0, 0}`, which
+/// is "no timeout".
+///
+/// Returns the pair to store, or `EDOM`.
+pub fn normalise_timeval(secs: i64, usecs: i64) -> Result<(i32, i32), isize> {
+    if usecs < 0 || usecs >= 1_000_000 {
+        return Err(crate::err::EDOM);
+    }
+    if secs < 0 {
+        return Ok((0, 0));
+    }
+    // Up to the next whole millisecond, carrying into the seconds.
+    let rounded = ((usecs + 999) / 1000) * 1000;
+    let (carry, usecs) = if rounded >= 1_000_000 {
+        (1, rounded - 1_000_000)
+    } else {
+        (0, rounded)
+    };
+    let secs = secs.saturating_add(carry);
+    Ok((secs.min(i32::MAX as i64) as i32, usecs as i32))
+}
+
+/// The receive deadline this socket was given, as an absolute nanosecond
+/// stamp: `None` when it has no timeout, which is Linux's meaning for
+/// `{0, 0}`.
+///
+/// Measured (`docs/notes/` §7.9t): `SO_RCVTIMEO` of 200 ms on a blocking
+/// `recv(2)`/`read(2)`/`recvmsg(2)` over an empty queue answers `EAGAIN` at
+/// 202-208 ms and returns the event when one arrives inside the window (156
+/// bytes at 150 ms); `MSG_DONTWAIT` still answers at once; a zero timeout
+/// means "no timeout", not "no wait". The deadline is built at the call, so a
+/// timeout changed between two receives applies to the second.
+#[cfg(target_os = "none")]
+pub fn receive_deadline(id: usize) -> Option<u64> {
+    let (secs, usecs) = critical_section::with(|cs| {
+        SUBSCRIBERS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| (s.opts.rcvtimeo, s.opts.rcvtimeo_usec))
+            .unwrap_or((0, 0))
+    });
+    // Both halves can be set separately on Linux, and a negative pair is
+    // "no timeout" (`{-1, 0}` stores `{0, 0}`, measured).
+    if secs <= 0 && usecs <= 0 {
+        return None;
+    }
+    let nanos = (secs.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usecs.max(0) as u64).saturating_mul(1000));
+    Some(crate::hal::since_boot_nanos().saturating_add(nanos))
+}
+
+/// A host build has no park to bound.
+#[cfg(not(target_os = "none"))]
+pub fn receive_deadline(_id: usize) -> Option<u64> {
+    None
+}
+
 pub fn option_get(id: usize, opt: Opt) -> Option<i32> {
     critical_section::with(|cs| {
         let subs = SUBSCRIBERS.borrow(cs).borrow();
@@ -599,6 +734,7 @@ pub fn option_get(id: usize, opt: Opt) -> Option<i32> {
             Opt::IdentitySocketType => SOCK_RAW,
             Opt::IdentityProtocol => NETLINK_KOBJECT_UEVENT as i32,
             Opt::IdentityDomain => AF_NETLINK as i32,
+            Opt::Zero => 0,
             Opt::Rcvbuf => o.rcvbuf,
             Opt::Sndbuf => o.sndbuf,
             Opt::Rcvlowat => o.rcvlowat,
@@ -635,6 +771,7 @@ pub fn option_set(id: usize, opt: Opt, value: i32) {
             match opt {
                 // Facts, not state: a caller cannot set them, so nothing to do.
                 Opt::IdentitySocketType | Opt::IdentityProtocol | Opt::IdentityDomain => {}
+                Opt::Zero => {}
                 Opt::Rcvbuf => o.rcvbuf = value,
                 Opt::Sndbuf => o.sndbuf = value,
                 Opt::Rcvlowat => o.rcvlowat = value,
