@@ -7318,3 +7318,24 @@ aarch64 arm spends longer than that on the matrix under TCG, so
 `the dropped process's entry still names it` went red because the fixture had
 *exited* - a race the machine's speed decided, not a behaviour. Both fixtures sleep
 120 s now and the parent kills them, so the matrix cannot outlive them.
+
+### §7.9q With a NIC on the bus, `settle` returns at once
+
+Two boots of the same image (the tree of §7.9o/§7.9p in both), differing only in
+whether QEMU was given `-device virtio-net-pci`:
+
+| | no NIC (`build/scratch/nc-boot.log`) | with a NIC (`build/scratch/nc2-boot.log`) |
+|---|---|---|
+| `/run/udev/data` at local.d time | **1** record (`b254:0`) | **5** (`b254:0/1/2`, `c226:0`, `c226:128`) |
+| an explicit `udevadm trigger --action=add` | lists 12 syspaths, still 1 record | lists 14 (the two links included), still 5 |
+| `udevadm settle --timeout=5` | `rc=1` | **`rc=0`** |
+| heartbeats between `Waiting for uevents to be processed` and `Starting networking` | 24 (≈120 s, libudev's default) | **0** |
+| `/sys/class/net` | an empty class | `lo` and `eth0`, with the words of §7.9o |
+
+So the 120 s wait of §7.9h is **not** a fixed cost: on a machine whose bus carries a
+network card it does not happen at all. The obvious next question is which of the two
+facts changed - the daemon recording more devices, or the class existing at all - and
+one boot with the class but no NIC answer is already in the table: the class is empty
+there and the wait is still 120 s, so the difference is on the device side rather than
+the class side. **An observation, not a diagnosis**: two boots, one variable, and the
+mechanism inside udevd is still unread.
