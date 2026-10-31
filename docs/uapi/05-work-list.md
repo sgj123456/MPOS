@@ -7853,3 +7853,19 @@ Written because a desktop boot sat 120 s in `udev-settle` with `/bin/udevadm`
 parked in syscall 7 (`poll`) — `docs/notes/` §7.9c/§7.9d. The pin measures that
 `poll` is not the wait; what the boot waits on is udevd's stale
 `/run/udev/queue`, named in §7.9d with the next instrument.
+
+## item 151 — the uevent bus has two listeners, and the second receives nothing (open)
+
+Measured on the desktop image (session time, `docs/notes/` §7.9e): with udevd
+running, `udevadm trigger --action=add` moved `/sys/kernel/uevent_seqnum`
+(24 -> 37) while `udevadm monitor --kernel`, bound before the trigger, printed
+**no event**; the same trigger with udevd not running delivered **137 lines**
+of events to the same monitor, and udevd's own `/run/udev/data` stays empty
+(`0` files). So the machine's uevent bus serves one listener.
+
+The code path is `src/uevent.rs`'s `publish` (every bound, kernel-grouped
+subscriber gets a queued copy, then `crate::net::wake_waiters()`) and the
+waiters are one list in the network stack (`net::Stack::waiters`). The next
+instrument is a two-socket pin in the sweep: two uevent sockets bound, one
+`write("add")` to a device's `uevent` attribute, both must receive it - the
+counterfactual is the reported failure.

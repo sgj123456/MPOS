@@ -6732,3 +6732,46 @@ udevd leaves behind is the file, with the daemon idle. The next instrument is
 whether the boot's udevd received the boot's own early events at all (a socket
 bound before they were sent) and what `udev-trigger` did — named as the open
 item, not closed here. A `udev_settle_timeout=5` in the image only hides it.
+
+#### 7.9e Two uevent listeners: delivery works alone and stops with a second — **OPEN (2026-10-31)**
+
+The boot's 120 s settle (§7.9d) was traced to udevd leaving its queue non-empty,
+with the daemon *idle*. This round measured who actually receives the machine's
+uevents, by holding the kernel's own counter next to a listener started before
+the events.
+
+**Measured on the desktop image, session time (a `local.d` probe running before
+the session script):**
+
+```
+udev-trigger:  *   status: started
+run/udev: control rules.d
+queue: ls: /run/udev/queue: No such file or directory
+data files: 0
+seqnum: 37
+monitor lines: 3              <- udevadm monitor's three header lines, no event
+queue after: no such file
+data after: 0
+settle rc=1                   <- timed out at 4 s: "not empty"
+```
+
+`udevadm trigger --action=add` moved the kernel counter (24 -> 37) and
+`udevadm monitor --kernel`, bound *before* the trigger, printed **no event at
+all**. The same trigger on a boot where `udevd` was **not** running delivered
+**137 lines** of KERNEL events to the same monitor, with `SEQNUM=20` and onward
+in its body. So with a daemon bound, the events reach nobody; without one, they
+reach the listener.
+
+That is a kernel-side shape: `src/uevent.rs`'s `publish` walks every bound
+subscriber with `GROUP_KERNEL` in its groups and queues a copy, then calls
+`crate::net::wake_waiters()` - the subscribers' registrations live in
+`net::Stack::waiters` (`poll_subscribe`), one list for all of them. The loop
+looks right on the page, which is why the next instrument is a *measurement*,
+not a reading: two uevent sockets bound at once in the sweep (no image, no
+udev), one `write("add")` to a device's `uevent` attribute, and both sockets
+must answer it. That is the pin this finding needs, and the shape it would
+close is "the first listener takes the events".
+
+Why the boot cares: udevd records nothing (`data files: 0`), `udevadm settle`
+times out its 120 s, and openrc spends the boot's first minutes on it - with
+udevd idle the whole time, because nothing arrives to wake it.
