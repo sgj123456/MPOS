@@ -864,7 +864,15 @@ fn build_block(
                 ino: next,
                 event: Event {
                     action: "add",
-                    devpath: alloc::format!("{}/{}", entry.devpath, name),
+                    // And the announcement names that same directory: a
+                    // partition is a child of its disk in the tree, so its
+                    // `DEVPATH` is `.../vda/vda1` and not the disk's path
+                    // with the partition's name appended (`.../vda1`) - the
+                    // listener opens this path and a wrong one is a device it
+                    // never records (measured: `vda1`'s and `vda2`'s homes
+                    // were asked for at the wrong depth and answered ENOENT
+                    // while `vda`'s was found).
+                    devpath: alloc::format!("/{home}"),
                     subsystem: "block",
                     devname: name.clone(),
                     major: entry.major,
@@ -1999,6 +2007,34 @@ mod tests {
     /// name - `/devices/virtio/block/<name>` in three files - so this fixture's
     /// SATA disk would have been filed under the virtio tree, and a device event
     /// would have pointed a listener at a bus the disk is not on.
+    /// A partition's announcement names the partition's own directory.
+    ///
+    /// Measured on the desktop image (§7.9l): the listener that gets the event
+    /// opens `<DEVPATH>/uevent`, and the announcement used to append the
+    /// partition's name to the disk's path (`.../vda1`) while the tree filed
+    /// the partition inside its disk (`.../vda/vda1`) - twelve ENOENTs per
+    /// boot, and the device was never recorded. Linux's own `DEVPATH` for a
+    /// partition is the nested one, because a partition is a child of its disk
+    /// in the device tree.
+    #[test]
+    fn a_partition_announces_its_own_directory_inside_its_disk() {
+        let _bus = crate::uevent::test_bus::take();
+        let fs = fs();
+        let watcher = crate::uevent::open();
+        crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
+        let partition = resolve(&fs, "/sys/class/block/vda1");
+        let uevent = partition.lookup("uevent").expect("uevent");
+        assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
+        let event = crate::uevent::recv(watcher).expect("the event").bytes;
+        let text = String::from_utf8(event.to_vec()).unwrap();
+        assert!(
+            text.contains("DEVPATH=/devices/virtio/block/vda/vda1"),
+            "the partition's own directory, not the disk's path with its name: {text}"
+        );
+        assert!(text.contains("DEVTYPE=partition"));
+        crate::uevent::close(watcher);
+    }
+
     #[test]
     fn a_second_disk_is_numbered_under_its_own_name_and_tree() {
         let _bus = crate::uevent::test_bus::take();

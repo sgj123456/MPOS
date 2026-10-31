@@ -7985,3 +7985,17 @@ and a `subsystem` link; the class and `/sys/block` entries are links to those ho
 (counterfactual red on exactly those four). §7.9l.
 
 Left open: what udevd records now, and whether `udevadm settle` still waits.
+
+### Item 161 - a partition's announcement names its nested home (2026-10-31)
+
+Follow-on to item 160. The tree files a partition inside its disk
+(`/sys/devices/virtio/block/vda/vda1`, Linux's shape), but the `uevent` attribute
+stored `entry.devpath` + the partition's name - the disk's path with the partition
+appended (`.../vda1`) - so the listener's `open(<DEVPATH>/uevent)` answered ENOENT
+twelve times a boot for each partition (§7.9m). Served now: `devpath` is `"/{home}"`,
+the directory the tree built, so the two cannot drift. Pin: host test
+`a_partition_announces_its_own_directory_inside_its_disk` (CF red on exactly it).
+
+Left open: udevd still records one device per boot and never removes
+`/run/udev/queue`, so `udevadm settle` still waits its default; that is the daemon's
+state machine, not a path this tree refuses.

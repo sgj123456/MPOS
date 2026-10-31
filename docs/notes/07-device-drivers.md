@@ -7122,3 +7122,40 @@ processed` - still the 120 s default. So the tree made the daemon work; what `se
 waits for is still unanswered. Next instrument: how many records `/run/udev/data` holds
 now (the file count was 3 of 12 events before), and what `udevadm settle` is waiting on
 when the queue is empty.
+
+### §7.9m The partition's announcement was a level too shallow
+
+§7.9l's tree change made `vda`'s own home readable, and one boot later the refusal
+table had moved rather than gone (`build/scratch/diag3.txt`): `vda` was gone, but
+
+```
+open(2) /sys/devices/virtio/block/vda1/uevent -> ENOENT   (twelve times)
+open(2) /sys/devices/virtio/block/vda2/uevent -> ENOENT   (twelve times)
+```
+
+stayed. The tree files a partition **inside** its disk (`.../vda/vda1`), Linux's shape,
+but the announcement still appended the partition's name to the *disk's* path
+(`.../vda1`): the `uevent` attribute's stored `DEVPATH` was built from
+`entry.devpath` + the name, and a partition entry's `devpath` is its disk's. Measured
+after the change (`build/scratch/diag4.txt`): no `/sys/devices/.../vda*` refusal left,
+only `/sys/module/compression`, `/sys/subsystem`, `/sys/class/net/lo|eth0` and two
+probe-shaped `pci` reads - `sources` this tree does not have, not paths it fumbles.
+
+The fix is one line: the attribute's `devpath` is `"/{home}"`, the same directory the
+tree built, so an announcement and a home cannot drift apart again by construction.
+
+**Measured after it, on the refreshed image** (same `aa-records.start` probe): udevd
+still leaves **one** record in `/run/udev/data` (`b254:2` on one boot, `c226:128` on
+another), `/run/udev/queue` is still there, and `udevadm settle --timeout=5` answers
+`rc=1` before and after a `trigger --action=add`. So the paths a listener reads are all
+served now, and the daemon's remaining silence is in its own state machine - the next
+instrument is on that side (what it does with the queue file it never removes).
+
+**Pin**: a host test, `a_partition_announces_its_own_directory_inside_its_disk`, writes
+a partition's `uevent` and asserts the record's `DEVPATH` is the nested path and
+`DEVTYPE=partition`. Counterfactual (the old `entry.devpath` + name form): that test
+alone goes red (`717 -> 1 failed`), which is the exact claim.
+
+**Gates**: x86_64 `pass=244 fail=0`, `mpos-kunit 35 passed`; aarch64 `pass=243
+fail=0`, kunit 35 (its first run died on the documented EL0 dump - `ESR_EL1
+0x96000047`, lane hung at the report - and the re-run was green).
