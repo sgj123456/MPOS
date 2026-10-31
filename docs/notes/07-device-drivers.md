@@ -6733,7 +6733,7 @@ whether the boot's udevd received the boot's own early events at all (a socket
 bound before they were sent) and what `udev-trigger` did — named as the open
 item, not closed here. A `udev_settle_timeout=5` in the image only hides it.
 
-#### 7.9e Two uevent listeners: delivery works alone and stops with a second — **OPEN (2026-10-31)**
+#### 7.9e Two uevent listeners: the kernel's delivery is whole; udevd's half is open (2026-10-31)
 
 The boot's 120 s settle (§7.9d) was traced to udevd leaving its queue non-empty,
 with the daemon *idle*. This round measured who actually receives the machine's
@@ -6762,15 +6762,29 @@ all**. The same trigger on a boot where `udevd` was **not** running delivered
 in its body. So with a daemon bound, the events reach nobody; without one, they
 reach the listener.
 
-That is a kernel-side shape: `src/uevent.rs`'s `publish` walks every bound
+That *looked* kernel-side: `src/uevent.rs`'s `publish` walks every bound
 subscriber with `GROUP_KERNEL` in its groups and queues a copy, then calls
 `crate::net::wake_waiters()` - the subscribers' registrations live in
-`net::Stack::waiters` (`poll_subscribe`), one list for all of them. The loop
-looks right on the page, which is why the next instrument is a *measurement*,
-not a reading: two uevent sockets bound at once in the sweep (no image, no
-udev), one `write("add")` to a device's `uevent` attribute, and both sockets
-must answer it. That is the pin this finding needs, and the shape it would
-close is "the first listener takes the events".
+`net::Stack::waiters` (`poll_subscribe`), one list for all of them. So the
+instrument was a measurement rather than another reading.
+
+**Measured (2026-10-31, `user/tests/src/bin/t-uevent-multi.rs`, one
+announcement, every claim green on both arms):** two listeners bound in one
+process both hold the event; a listener in a second process holds it too; a
+listener parked in `poll(2)` is woken and reports `POLLIN`; a listener parked
+in `epoll_wait(2)` likewise. The counterfactual says the pin measures
+something: with `publish`'s subscription test narrowed to `... && !queued`
+(only the first bound listener is given the event), **five** claims go red -
+the second in-process listener, the cross-process pair, and both parked
+listeners - and nothing else in the sweep moves.
+
+So the kernel's delivery path is **not** the boot's bug: one announcement does
+reach every listener, spinning or parked, in one process or across two. What
+remains is udevd's own half - how it binds and what it does with what it holds
+- and the boot measurement above is the evidence that it holds nothing while
+the machine announces 13 events. The narrowed question, recorded open rather
+than answered: does the desktop image's `udevd` bind `GROUP_KERNEL` (1) or
+only its own group (2), and does its monitor read the socket it opened?
 
 Why the boot cares: udevd records nothing (`data files: 0`), `udevadm settle`
 times out its 120 s, and openrc spends the boot's first minutes on it - with

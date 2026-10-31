@@ -646,8 +646,10 @@ section states direction only: the frontier is the second compositor family (the
 whose first compositor to come up here is still unfound — `sway` binds no IPC socket and the GL
 card is already Mesa's, §7.4) and closing the remaining ABI gaps below. The block layer's counters
 now read on a desktop boot — the submit/retire pair and the mailbox agree at all 115 heartbeats of
-three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`, the
-named next measurement (§7.9b, item 148). Two items left this list
+three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`
+(§7.9b, item 148). The kernel's half of it is now measured out: one uevent announcement reaches
+every listener, parked or spinning, in one process or two (§7.9e, item 152, pinned by
+`t-uevent-multi`), so what remains is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).

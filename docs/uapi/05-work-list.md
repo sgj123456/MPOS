@@ -7869,3 +7869,21 @@ waiters are one list in the network stack (`net::Stack::waiters`). The next
 instrument is a two-socket pin in the sweep: two uevent sockets bound, one
 `write("add")` to a device's `uevent` attribute, both must receive it - the
 counterfactual is the reported failure.
+
+## item 152 — one announcement reaches every uevent listener, parked or spinning
+
+Served and pinned (2026-10-31, `docs/notes/` §7.9e). Item 151's premise - that
+the kernel's bus serves one listener - is measured **false**: `publish` queues
+the event for every bound kernel-grouped subscriber and `wake_waiters()` ends
+each one's park. `user/tests/src/bin/t-uevent-multi.rs` binds two listeners and
+announces once: the second in-process listener holds the event, a listener in a
+second process holds it, a listener parked in `poll(2)` is woken with `POLLIN`,
+and one parked in `epoll_wait(2)` likewise. Counterfactual (`publish` narrowed
+to the first bound subscriber) reddens exactly five claims - the second
+in-process listener, the cross-process pair, and both parked listeners.
+
+Still open, and now on udevd's side rather than the kernel's: how the desktop
+image's `udevd` binds (kernel group 1 or only its own group 2) and whether its
+monitor reads the socket it opened. The boot's own numbers are §7.9e's image
+table; the next instrument there is a probe that asks the daemon's socket its
+group mask (`getsockname`) instead of asking the kernel.
