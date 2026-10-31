@@ -649,7 +649,10 @@ now read on a desktop boot — the submit/retire pair and the mailbox agree at a
 three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`
 (§7.9b, item 148). The kernel's half of it is now measured out: one uevent announcement reaches
 every listener, parked or spinning, in one process or two (§7.9e, item 152, pinned by
-`t-uevent-multi`), so what remains is how the image's `udevd` binds and reads. Two items left this list
+`t-uevent-multi`), and every receive door on a device-event socket answers the event - `recv(2)`
+and `read(2)` had answered `EBADF` while only `recvmsg(2)` worked (§7.9r, item 165, pinned by
+`t-uevent-doors`), because a listener's choice of door must not decide whether it hears a device.
+What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).

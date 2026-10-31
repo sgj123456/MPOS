@@ -904,6 +904,51 @@ fn park_until_deadline(ready: impl Fn() -> bool, deadline: u64) -> isize {
 ///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0` for a kernel event, with the
 ///     ids rendered through the **reader's** user namespace (the peer's or the
 ///     kernel's stored ids, mapped at the read; `observed_event_cred`).
+/// The `recv(2)`/`recvfrom(2)` door onto a device-event socket: the same queue
+/// [`recvmsg_netlink`] serves, with the source reported in the `sockaddr_nl`
+/// the caller left room for. A blocking call waits for an event rather than
+/// spinning, for the reason that function's own header gives.
+fn recvfrom_netlink(
+    fd: i32,
+    buf: usize,
+    len: usize,
+    name: usize,
+    namelen: usize,
+    handle: usize,
+    flags: usize,
+) -> isize {
+    if !dontwait(fd, flags) {
+        let waited = park_until(|| crate::uevent::ready(handle));
+        if waited != 0 {
+            return waited;
+        }
+    }
+    let peek = flags & MSG_PEEK != 0;
+    let Some(message) = (if peek {
+        crate::uevent::peek(handle)
+    } else {
+        crate::uevent::recv(handle)
+    }) else {
+        return err::EAGAIN;
+    };
+    let event = &message.bytes;
+    let n = event.len().min(len);
+    unsafe {
+        core::ptr::copy_nonoverlapping(event.as_ptr(), buf as *mut u8, n);
+    }
+    if name != 0 && namelen != 0 {
+        unsafe {
+            core::ptr::write_bytes(name as *mut u8, 0, 12);
+        }
+        write_sockaddr_nl(name, namelen, message.from_pid, message.group);
+    }
+    (if flags & MSG_TRUNC as usize != 0 {
+        event.len()
+    } else {
+        n
+    }) as isize
+}
+
 ///     `nlplug-findfs` drops every message that arrives without credentials,
 ///     which makes this the difference between an initramfs that finds its
 ///     root and one that waits forever; libudev's monitor demands the record
@@ -2669,6 +2714,28 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             }
         }
         return if truncate { msg.len() } else { n } as isize;
+    }
+    // A device-event socket's receive. `recvmsg(2)` had a branch for these
+    // handles and `recv(2)`/`read(2)` did not, so both of those fell through
+    // to the IP registry - which does not know a uevent handle - and answered
+    // `EBADF` on a descriptor the process had bound a moment earlier. Linux
+    // answers the event on all three doors (measured, `build/scratch/uevdoor/`:
+    // 156 bytes from each), and `udevd`'s older workers read the family without
+    // `recvmsg`, so the door a listener happens to pick must not decide whether
+    // it hears anything.
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        let src = if args[4] != 0 && args[5] != 0 {
+            Some((args[4], args[5]))
+        } else {
+            None
+        };
+        if let Err(e) = validate_source_slot(src) {
+            return e;
+        }
+        return recvfrom_netlink(fd, buf, len, args[4], args[5], handle, args[3]);
     }
     // A packet socket's receive: one frame per call - the payload only for a
     // `SOCK_DGRAM` socket (the header is the kernel's to add back on a send),

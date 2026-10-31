@@ -8044,3 +8044,29 @@ Served now: `/sys/module` (empty) and the root bus's empty `uevent`
 under `/sys/module` - Linux answers ENOENT for both on a machine that never loaded
 the module. Pin: three claims in `t-uevent` plus a host test; CF red on exactly the
 two nodes.
+
+### Item 165 - every receive door on a device-event socket answers the event (2026-10-31)
+
+Measured first on Linux (§7.9r): on a `NETLINK_KOBJECT_UEVENT` socket, `read(2)`,
+`recv(2)` and `recvmsg(2)` all answer the announcement (156 bytes each), an empty
+queue answers `EAGAIN` on all three when the caller asked not to wait, and a
+blocking door is woken by an event 300 ms later.
+
+Measured on this kernel, on the same descriptor: `recvmsg(2)` answered the 145-byte
+event with no source name, filling the same data with the same payload and correctly
+reporting `EAGAIN` on an empty queue — while `read(2)`, `recv(2)` and `recvfrom(2)`
+answered **`EBADF`**. Cause: `handle_recvfrom` (`src/net/socket.rs`) had branches for
+the route family, packet, unix, channel and vsock sockets and then fell through to
+the IP registry, which answers `EBADF` for a kobject handle it has never seen; only
+`handle_recvmsg` checked `crate::uevent::exists`. `read(2)` inherited the answer
+through `socket_read`.
+
+Served now: `recvfrom_netlink` — the same queue, the park for a blocking call, and
+the 12-byte `sockaddr_nl` naming the kernel (port 0, group 1). Divergence recorded
+rather than served: the uevent socket's park registers on the caller's network
+namespace's stack while the bus wakes the machine's, which the NIC-less boot showed
+is unobservable (`block_until_nanos` re-evaluates each cycle, so a missed wake costs
+a cycle) — so no rewrite was made, and the code-level weakness is named.
+
+Pin: `t-uevent-doors` (11 claims). Counterfactual: 8 claims red, both `recvmsg`
+claims green.

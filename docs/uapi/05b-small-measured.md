@@ -88,6 +88,22 @@ Section numbers are unchanged from the original `UAPI.md`.
   sweep's machine has no vsock peer to pin a peek against; the chain and zero-length room are
   the next item's work.
 
+- **A device-event socket answers on every receive door, not only `recvmsg`.**
+  **Landed 2026-10-31** (`docs/uapi/` §5.1 item 165). On a `NETLINK_KOBJECT_UEVENT` socket,
+  `recv(2)`, `recvfrom(2)` and `read(2)` answered **`EBADF`** on a descriptor the process had
+  just bound - only `recvmsg(2)` served the family, because `handle_recvfrom` had branches for
+  the route family, packet, unix, channel and vsock sockets and then fell through to the IP
+  registry (which answers `EBADF` for a kobject handle), while `handle_recvmsg` alone asked
+  `crate::uevent::exists`. Measured on Linux 7.2.11 first (`build/scratch/uevdoor/`): all
+  three doors answer the announcement (156 bytes each), an empty queue is `EAGAIN` on each
+  when the caller asked not to wait, and a blocking door is woken by an event 300 ms later.
+  Served now: `recvfrom_netlink` - the same queue, the same `sockaddr_nl` source (kernel:
+  port 0 on group 1), the same park, `MSG_PEEK`/`MSG_TRUNC` honoured. Pin
+  **`t-uevent-doors`, 11 claims**; counterfactual 8 claims red with both `recvmsg` claims
+  green. Divergence named rather than served: the socket's park registers on the caller's
+  network namespace's stack while the bus wakes the machine's, which a NIC-less boot showed
+  costs one scheduling cycle and nothing observable.
+
 - **AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own
   length.** **Landed 2026-10-20** (`docs/uapi/` §5.1 item 76) - the AF_UNIX half of the
   `MSG_PEEK` bullet below. Both flags used to be refused `EOPNOTSUPP` on every unix door.

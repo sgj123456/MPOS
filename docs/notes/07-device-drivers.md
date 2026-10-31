@@ -7339,3 +7339,79 @@ one boot with the class but no NIC answer is already in the table: the class is 
 there and the wait is still 120 s, so the difference is on the device side rather than
 the class side. **An observation, not a diagnosis**: two boots, one variable, and the
 mechanism inside udevd is still unread.
+
+### §7.9r Every receive door on a device-event socket, not only `recvmsg`
+
+The bus was handed a socket whose `recvmsg(2)` worked and whose `read(2)` and
+`recv(2)` answered `EBADF`. Both facts are measured, on both sides of the seam.
+
+**Linux first** (`build/scratch/uevdoor/doors.c`, 7.2.11, root, publishing by
+writing `add` to `/sys/devices/virtual/mem/null/uevent`):
+
+| door | empty queue | after an event |
+|---|---|---|
+| `recv(MSG_DONTWAIT)` | `-1 EAGAIN` | 156 bytes |
+| `recvmsg(MSG_DONTWAIT)` | `-1 EAGAIN` | 156 bytes |
+| `read` `O_NONBLOCK` | `-1 EAGAIN` | 156 bytes |
+| `recv(0)` | parks | woken by an event 300 ms later, 156 bytes |
+
+So the family is one contract on every door, and the empty queue's answer is
+`EAGAIN`.
+
+**The same program inside the guest** (a NIC-less image, `build/scratch/nonic/`,
+`/root/doors.txt`), on a descriptor just bound:
+
+```
+recv(MSG_DONTWAIT) empty   -> -1 errno=9 (Bad file descriptor)
+recvmsg(MSG_DONTWAIT)      -> -1 errno=11 (EAGAIN)          correct
+read O_NONBLOCK empty      -> -1 errno=9 (EBADF)
+read() after an event      -> -1 errno=9 (EBADF)
+recv(0) after an event     -> -1 errno=9 (EBADF)
+recvmsg(0) after an event  -> 145 bytes                      correct
+recv(0) empty (blocking)   -> -1 errno=9 (EBADF)
+```
+
+`EBADF` on a descriptor the process had bound a moment earlier, and only on a
+*kobject* socket. The cause was a single missing branch: `handle_recvmsg`
+(`src/net/socket.rs:3304`) asked `crate::uevent::exists(handle)` and served the
+handle from the bus, while `handle_recvfrom` (`:2637`) had branches for the route
+family, packet sockets, the unix family, the channel family and vsock and then fell
+through to `socket_handle_of_fd` + `recv_common` — whose IP-registry lookup
+(`src/net/socket.rs:3494`) answers `Err(err::EBADF)` for a handle the IPv4 tables
+have never heard of. `read(2)` inherits it, because `handle_read`
+(`src/syscall/linux/fs/file.rs:4846`) routes a socket descriptor through
+`socket_read` → `handle_recvfrom`.
+
+**Served now**: `recvfrom_netlink`, called from `handle_recvfrom` for a
+`uevent_handle_of_fd` descriptor — the same queue, the same `sockaddr_nl` source
+(kernel: port 0 on group 1), the same park for a blocking door, and `EAGAIN` when
+`MSG_DONTWAIT`/`O_NONBLOCK` asked not to wait. `recvmsg_netlink` keeps the
+control-message half (`SCM_CREDENTIALS`) that only `recvmsg` can carry.
+
+**Why the door must not decide the answer**: `read(2)` and `recv(2)` are what a
+program uses when it does not care who sent the message, and udev's older workers
+and the small initramfs listeners read the bus that way. Which door a listener
+happens to pick cannot be the difference between hearing a device and being told
+its own descriptor is invalid.
+
+**The measurement that had to be discarded, and why it is recorded**: the same
+NIC-less image was built to test a planned rewrite of the bus's *wake* path — a
+per-socket waiter list in place of `crate::net::wake_waiters()`, whose registration
+lands on the caller's network namespace's stack while the publisher wakes the
+machine's. A listener parked on an empty queue in that image was woken **without
+any net stack running** (`net: no adapter; sockets answer ENETDOWN`, so
+`net::service` never starts), because `block_until_nanos` re-evaluates its
+condition every cycle: a missed wake costs one cycle here, not a hang. The rewrite
+would therefore have had no observable defect to pin, and a rewrite whose
+counterfactual stays green is not a fix (AGENTS.md's counterfactual criterion). The
+namespace weakness is real in the code and named as a divergence instead; the pin
+went to the defect the same probe had actually found.
+
+Pin: `user/tests/src/bin/t-uevent-doors.rs` — 11 claims, the three non-blocking
+doors on an empty queue, `read`/`recv`/`recvfrom` answering an announcement, the
+`recvfrom` source being the kernel's port 0 on group 1, and a blocking `recv(2)`
+holding an event announced 300 ms away. Counterfactual (`uevent_handle_of_fd`'s
+branch disabled): `pass=244 fail=1`, exactly **8** claims of this program red —
+every `read`/`recv`/`recvfrom` claim and the blocking `recv` — while both
+`recvmsg` claims stayed green. Gates: x86_64 `pass=245`, aarch64 `pass=244`,
+`mpos-kunit 35`, host lib 719.
