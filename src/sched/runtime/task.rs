@@ -133,6 +133,32 @@ pub static BLK_WAITER: core::sync::atomic::AtomicUsize =
 pub static BLK_SUBMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static BLK_RETIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The longest a parked transfer has waited, and how many waited a long time.
+///
+/// `docs/notes/` §7.9f read a boot's park table and found a `udevadm` parked
+/// *uninterruptibly* on `mmap` 619 times: the shape the interactive-session
+/// stall was reported in. The pair below answers whether those parks are many
+/// short waits or one long one - a submit and a retire can be one apart at a
+/// heartbeat because one transfer is in flight, which says nothing about the
+/// wait's duration. A transfer that takes a poll period is a wire that lost its
+/// wake, recovered; a transfer that takes seconds is the stall.
+pub static BLK_MAX_WAIT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BLK_SLOW_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How long a transfer may wait before it is worth counting as slow, in ns.
+const SLOW_WAIT_NS: u64 = 100_000_000;
+
+/// Note one transfer's wait, measured from the moment it was submitted to the
+/// moment it retired.
+pub fn note_blk_wait(ns: u64) {
+    if ns > BLK_MAX_WAIT_NS.load(Ordering::Relaxed) {
+        BLK_MAX_WAIT_NS.store(ns, Ordering::Relaxed);
+    }
+    if ns > SLOW_WAIT_NS {
+        BLK_SLOW_WAITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Mirror the block layer's counters, each time one of them moves.
 pub fn note_blk_counts(submits: u64, retires: u64) {
     BLK_SUBMITS.store(submits, Ordering::Relaxed);
@@ -3576,6 +3602,11 @@ fn heartbeat() {
         },
         BLK_SUBMITS.load(Ordering::Relaxed),
         BLK_RETIRES.load(Ordering::Relaxed)
+    ));
+    crate::hal::kernel::print_line(format_args!(
+        "mpos:   blk max-wait={}us slow={}\n",
+        BLK_MAX_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+        BLK_SLOW_WAITS.load(Ordering::Relaxed)
     ));
     crate::hal::kernel::print_line(format_args!(
         "mpos:   claim registrations={} handed-back={}\n",

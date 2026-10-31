@@ -6869,3 +6869,47 @@ that is measurable on any boot.
 Why the boot cares: udevd records nothing (`data files: 0`), `udevadm settle`
 times out its 120 s, and openrc spends the boot's first minutes on it - with
 udevd idle the whole time, because nothing arrives to wake it.
+
+The uninterruptible park this table shows is §7.9g's question, and it is
+measured there: ten milliseconds is the ceiling.
+
+### §7.9g The parked transfer's wait, measured: ten milliseconds is the ceiling
+
+§7.9f left one reading open. A `udevadm` was parked *uninterruptibly* on
+`mmap` 619 times, which is the shape the interactive-session stall was
+reported in - but a park **count** cannot tell many short waits from one long
+one, and `submits`/`retires` one apart at a heartbeat is one transfer in
+flight, not a stall.
+
+The heartbeat now answers it with a duration:
+
+```text
+    mpos:   blk max-wait=10272us slow=0
+```
+
+`blk max-wait=` is the longest submit-to-retire wait since boot and `slow=` the
+number of transfers that waited more than 100 ms (`SLOW_WAIT_NS`, the pair in
+`src/sched/runtime/task.rs`, noted from `blk.rs`'s `transfer` either side of
+the wait). It rides the same 5 s heartbeat as `submits=`/`retires=`, so a stall
+on any future boot is readable from the wire without an injected probe.
+
+One boot of the current image, `zz-desk.start`'s niri session running, 145 206
+transfers over 125 s of heartbeat:
+
+| reading | value |
+|---|---|
+| `blk max-wait` while the boot filled root | 4 081 us |
+| `blk max-wait` during the session's IO | **10 272 us** |
+| transfers that waited over 100 ms | **0** |
+| `submits`/`retires` at every beat | equal (one in flight at most) |
+
+So those many parks are many *short* parks: a transfer whose completion
+interrupt was lost waits one `WAIT_NS` poll period (4 ms, §10.5's recovery) and
+answers - the fallback working, not a stall. The stall this line was opened for
+(a reader parked for seconds while the device sits idle) did not appear in
+145 206 transfers.
+
+What stays open is the shape the stall was *reported* under: an interactive
+session, a hand poking the compositor, which a scripted boot does not
+reproduce. The instrument is what makes the next occurrence answerable from the
+serial alone: `slow>0` names how many, and `blk-waiter=slot N` names who.

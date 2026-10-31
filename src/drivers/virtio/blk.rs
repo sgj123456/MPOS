@@ -199,6 +199,10 @@ impl VirtioBlk {
         };
         super::note_blk_submit(token, me);
         super::note_count_submit();
+        // From here to the retire is this transfer's wait, and its duration is
+        // what separates a wire that lost its wake (`WAIT_NS`, recovered by the
+        // poll) from a stall (`docs/notes/` §7.9f's instrument).
+        let wait_started = crate::hal::since_boot_nanos();
 
         // The wait: parked, uninterruptible, ended by the completion
         // interrupt — with one poll per period for a wire that lost the wake.
@@ -272,6 +276,7 @@ impl VirtioBlk {
         });
         super::note_blk_retire(token);
         super::note_count_retire();
+        crate::sched::note_blk_wait(crate::hal::since_boot_nanos().saturating_sub(wait_started));
         blk_irq::finish_request();
     }
 

@@ -77,7 +77,7 @@ pub use runtime::{
     is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible, last_syscall,
     madvise_dontneed, map_anon, map_facts, map_frames, mapping_name_at, may_inspect,
     may_mint_pid_ns, may_signal, membarrier_registrations, move_eager_ranges, move_user_page,
-    munmap_user, name_user_range, nice_of, note_blk_counts, note_blk_mailbox,
+    munmap_user, name_user_range, nice_of, note_blk_counts, note_blk_mailbox, note_blk_wait,
     note_claim_registration, note_claim_wake, note_claim_wake_result, note_ext4_scratch,
     note_fill_begin, note_fill_end, note_fill_owner, note_run_begin, note_run_end, note_run_owner,
     note_syscall, ns_of, oom_score_adj_of, out_of_memory, own_pid_number, page_present_in,

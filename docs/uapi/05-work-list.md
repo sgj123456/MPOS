@@ -7925,3 +7925,12 @@ image as it stands** - that boot's service list is `Starting udev` then
 image state, before the settle script was instrumented and restored (§7.9c).
 Open: which boot state starts that service, and whether the shipped
 `/etc/init.d/udev-settle` is what that boot ran.
+
+- [ ] **Item 155 - a transfer's wait, measured rather than counted.** §7.9f left
+  the block layer's parked transfers unmeasured: a park count says nothing about
+  duration. The heartbeat now carries `blk max-wait=<us> slow=<n>` (`SLOW_WAIT_NS`
+  = 100 ms, `src/sched/runtime/task.rs`), noted across `blk.rs`'s `transfer`. One
+  desktop boot, 145 206 transfers: max 10 272 us, zero over 100 ms - so the 619
+  uninterruptible parks are many short polls recovering a lost wake, not a stall.
+  What stays open is the *interactive* shape the stall was reported under. Notes
+  §7.9g.
