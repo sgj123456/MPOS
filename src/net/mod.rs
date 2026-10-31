@@ -2433,11 +2433,118 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
 /// same datagram is fragmented by the IP layer and reassembled on the way in
 /// (measured on Linux, `docs/notes/` §4.6) - the only instrument this kernel
 /// has for its own reassembly.
+/// The words an interface's announcement carries in its `ACTION`.
+const ADD: &str = "add";
+const CHANGE: &str = "change";
+const MOVE: &str = "move";
+
+/// Announce an interface, the way the kernel announces one when `ip link` changes
+/// it.
+///
+/// Measured on this host (`build/scratch/netmon3.txt`/`netmon4.txt`): creating a
+/// link announces `add` at `/devices/virtual/net/<name>` with `SUBSYSTEM=net`,
+/// `INTERFACE=` and `IFINDEX=`; renaming it announces `move` at the *new* path;
+/// deleting it announces `remove`; and neither an up/down nor an mtu change
+/// announces **anything** (netdev's `NETDEV_CHANGE` for those two is not a
+/// uevent - `rtnl_notify` runs only for the register/unregister/rename cases).
+/// That last half is the one a listener can be surprised by: a daemon that only
+/// watches the bus never learns the mtu moved, which is why `udevadm` reports
+/// nothing after `ip link set lo mtu 1200`.
+pub(crate) fn announce_link(index: u32, action: &'static str) {
+    let Some(facts) = link_facts() else { return };
+    let (name, arp_type) = match index {
+        LO_INDEX => (String::from("lo"), 772u32),
+        ETH_INDEX if facts.eth_present => (facts.eth_name.clone(), 1),
+        _ => return,
+    };
+    crate::uevent::publish(&crate::uevent::Event {
+        action,
+        devpath: alloc::format!("/devices/virtual/net/{name}"),
+        subsystem: "net",
+        // The device's name under `/dev` is empty: a net device has no node
+        // there, and Linux's own record carries `INTERFACE`/`IFINDEX` instead.
+        devname: name,
+        major: 0,
+        minor: index,
+        extra: if arp_type == 772 {
+            &[("DEVTYPE", "loopback")]
+        } else {
+            &[("DEVTYPE", "ether")]
+        },
+    });
+}
+
+/// One word of an interface, read live: what `/sys/class/net/<name>` answers for
+/// the attributes the stack owns (`docs/notes/` §7.9o).
+///
+/// The tree asks for these at the moment a file is read, not when it was built,
+/// because they move: `SIOCSIFMTU` changes the mtu, `SIOCSIFFLAGS` the flags,
+/// and Linux's own `netdev_show` reads the device rather than a copy
+/// (`netdev_mtu_show` prints `dev->mtu`). A stored word would be a claim about
+/// the machine at boot.
+pub(crate) fn sysfs_word(index: u32, which: u8) -> Option<u64> {
+    let facts = link_facts()?;
+    let (up, mtu, loopback) = match index {
+        LO_INDEX => (facts.lo_up, facts.lo_mtu, true),
+        ETH_INDEX if facts.eth_present => (facts.eth_up, facts.mtu, false),
+        _ => return None,
+    };
+    Some(match which {
+        // 0 = mtu, 1 = flags.
+        0 => mtu as u64,
+        _ => {
+            // `IFF_UP`, `IFF_BROADCAST`/`IFF_LOOPBACK`, `IFF_RUNNING` and
+            // `IFF_MULTICAST` - the words Linux reports for these two kinds
+            // (measured: `lo` is `0x9` up, an ethernet link `0x1003` up and
+            // `0x1002` down).
+            let mut word: u64 = if loopback { 0x8 } else { 0x1002 };
+            if up {
+                word |= 0x1;
+            }
+            if up && !loopback {
+                word |= 0x40;
+            }
+            word
+        }
+    })
+}
+
+/// The interfaces the tree should show, as `/sys/class/net` needs them: the
+/// identity of each (name, index, kind, address) plus the words it starts with.
+/// The mutable ones are re-read through [`sysfs_word`] on every open.
+pub(crate) fn sysfs_links() -> Vec<crate::vfs::sysfs::SysLink> {
+    let mut links = Vec::new();
+    let Some(facts) = link_facts() else {
+        return links;
+    };
+    links.push(crate::vfs::sysfs::SysLink {
+        name: String::from("lo"),
+        index: LO_INDEX,
+        mtu: facts.lo_mtu,
+        address: [0; 6],
+        arp_type: 772,
+        flags: sysfs_word(LO_INDEX, 1).unwrap_or(0) as u16,
+        up: facts.lo_up,
+    });
+    if facts.eth_present {
+        links.push(crate::vfs::sysfs::SysLink {
+            name: facts.eth_name.clone(),
+            index: ETH_INDEX,
+            mtu: facts.mtu,
+            address: facts.mac,
+            arp_type: 1,
+            flags: sysfs_word(ETH_INDEX, 1).unwrap_or(0) as u16,
+            up: facts.eth_up,
+        });
+    }
+    links
+}
+
 pub(crate) fn set_mtu(index: u32, mtu: u32) -> Result<(), isize> {
     if !(MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
         return Err(crate::err::EINVAL);
     }
-    with_stack(|st| match index {
+    let answer = with_stack(|st| match index {
         LO_INDEX => {
             st.lo.device.mtu = mtu as usize;
             Ok(())
@@ -2451,14 +2558,23 @@ pub(crate) fn set_mtu(index: u32, mtu: u32) -> Result<(), isize> {
         },
         _ => Err(crate::err::ENODEV),
     })
-    .unwrap_or(Err(crate::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV));
+    // Measured (`build/scratch/netmon3.txt`, host 7.2.11): a rename announces
+    // `move`, a link arriving or leaving announces `add`/`remove`, and neither an
+    // mtu change nor a link going up/down announces **anything** - netdev's own
+    // notifier does not reach the event bus for those two, which is why
+    // `udevadm monitor` stays silent after `ip link set lo mtu 1200`.
+    if answer.is_ok() {
+        announce_link(index, CHANGE);
+    }
+    answer
 }
 
 /// `ip link set eth0 name X`: one to fifteen bytes, and not the name the
 /// loopback already answers to. The new name is what the dumps report from
 /// then on - the stack itself never looks itself up by name.
 pub(crate) fn set_eth_name(name: &str) -> Result<(), isize> {
-    with_stack(|st| {
+    let answer = with_stack(|st| {
         if name.is_empty() || name.len() > 15 {
             return Err(crate::err::EINVAL);
         }
@@ -2468,7 +2584,11 @@ pub(crate) fn set_eth_name(name: &str) -> Result<(), isize> {
         st.eth_name = String::from(name);
         Ok(())
     })
-    .unwrap_or(Err(crate::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV));
+    if answer.is_ok() {
+        announce_link(ETH_INDEX, MOVE);
+    }
+    answer
 }
 
 /// What a descriptor on this socket could do right now, for `poll(2)`.
@@ -2683,6 +2803,13 @@ pub fn init(dev: Arc<dyn NetDevice>) {
             eth_name: String::from("eth0"),
         });
     });
+    // The interfaces the machine came up with are announced once, now that the
+    // stack can say what they are: a listener that bound after this point finds
+    // them through `/sys/class/net`, and one that bound before it gets the
+    // events (the shape Linux's own `netdev_register_kobject` produces, and the
+    // reason the boot's uevent count carries a `lo` at all).
+    announce_link(ETH_INDEX, ADD);
+    announce_link(LO_INDEX, ADD);
 }
 
 impl Stack {

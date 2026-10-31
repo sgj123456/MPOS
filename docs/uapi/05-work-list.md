@@ -8011,3 +8011,19 @@ for a path whose `uevent`, `dev`, `size` and `subsystem` all read (§7.9n).
 
 Open: what `udevadm info`'s syspath resolution needs that this tree does not answer (the
 next instrument), and the queue-file drain once a device is recorded at boot.
+
+### Item 163 - the network class, and what a link's own changes announce (2026-10-31)
+
+The fourth source of §7.9n's refusal table: this tree had no `/sys/class/net` at
+all, so a device manager asking for `/sys/class/net/lo` was told the machine has no
+network device. Measured first on Linux (§7.9o): the class entry is a link into
+`devices/virtual/net/<name>`; the home answers `ifindex`, `mtu`, `address`, `flags`
+(`0x9` for an up loopback, `0x1003` for an up ethernet link), `type` (772/1) and
+`operstate`, with no `dev` node; its `uevent` is `INTERFACE=`/`IFINDEX=`; creating a
+link announces `add`, a rename `move`, deleting it `remove`, while an up/down or an
+mtu change announces **nothing**.
+
+Served now: the class and its attributes (`SysLiveFile` re-reads the mutable ones,
+so `SIOCSIFMTU` is visible through `/sys`), and `net::announce_link` for the three
+actions Linux does send. Pin: ten claims in `t-uevent` plus a host test; CF red on
+exactly the class claims.

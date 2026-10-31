@@ -857,5 +857,99 @@ fn main() {
         libc::close(manager);
         libc::close(worker);
     }
+
+    // ---------------------------------------------------------------------
+    // The `net` class, and the announcements an interface's own changes make.
+    //
+    // Measured on Linux (host 7.2.11, `build/scratch/netmon3.txt` and
+    // `netmon4.txt`, a dummy link created, renamed, brought up, given a new mtu
+    // and deleted while `udevadm monitor --kernel --property` ran):
+    //
+    // * The class entry is a link into the device tree -
+    //   `/sys/class/net/lo -> ../../devices/virtual/net/lo` - and its home
+    //   answers `ifindex`, `mtu`, `address`, `type` (`772` for the loopback,
+    //   `1` for an ethernet link), `flags` and `operstate`, with **no** `dev`
+    //   node under a net device at all.
+    // * Creating a link announces `add` at `/devices/virtual/net/<name>` with
+    //   `SUBSYSTEM=net`, `INTERFACE=` and `IFINDEX=`; renaming it announces
+    //   `move`; deleting it `remove`.
+    // * Bringing it up, down, or changing its mtu announces **nothing**.
+    //
+    // This tree had no `class` of the kind at all, so a device manager was told
+    // the machine has no network device (`build/scratch/info-boot.log`).
+    // ---------------------------------------------------------------------
+    let class_net = std::path::Path::new("/sys/class/net");
+    r.check("the machine has a /sys/class/net", class_net.is_dir());
+    let lo_entry = "/sys/class/net/lo";
+    let link_ok = std::fs::read_link(lo_entry)
+        .map(|target| target.to_string_lossy().contains("/devices/virtual/net/lo"))
+        .unwrap_or(false);
+    r.check(
+        "and the loopback's entry is a link into the device tree, as Linux's is",
+        link_ok,
+    );
+    let word = |path: &str| -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim().to_string())
+    };
+    let home = "/sys/devices/virtual/net/lo";
+    r.check(
+        "the loopback's home answers ifindex 1",
+        word(&format!("{home}/ifindex")).as_deref() == Some("1"),
+    );
+    r.check(
+        "and a mtu",
+        word(&format!("{home}/mtu"))
+            .map(|m| m.parse::<u32>().map(|n| n >= 68).unwrap_or(false))
+            .unwrap_or(false),
+    );
+    r.check(
+        "and a hardware address of six octets",
+        word(&format!("{home}/address"))
+            .map(|a| a.split(':').count() == 6)
+            .unwrap_or(false),
+    );
+    r.check(
+        "and the loopback's ARPHRD type, 772",
+        word(&format!("{home}/type")).as_deref() == Some("772"),
+    );
+    r.check(
+        "and flags as a hex word",
+        word(&format!("{home}/flags"))
+            .map(|f| f.starts_with("0x") && u32::from_str_radix(&f[2..], 16).is_ok())
+            .unwrap_or(false),
+    );
+    r.check(
+        "and an operstate word",
+        word(&format!("{home}/operstate"))
+            .map(|s| s == "up" || s == "down" || s == "unknown")
+            .unwrap_or(false),
+    );
+    r.check(
+        "and no dev node under a net device, because Linux has none",
+        std::fs::metadata(format!("{home}/dev")).is_err(),
+    );
+    // The `uevent` file's own two lines, which is the whole of a net device's
+    // file on Linux.
+    r.check(
+        "a net device's uevent file is INTERFACE and IFINDEX",
+        word(&format!("{home}/uevent"))
+            .map(|text| text.starts_with("INTERFACE=lo") && text.contains("IFINDEX=1"))
+            .unwrap_or(false),
+    );
+    // A listener bound after boot still learns the interface: the add is in the
+    // tree, and the announcement for a *change* is the one this kernel makes
+    // when `SIOCSIFMTU` moves a link - measured as `nothing` on Linux, so what
+    // is claimed here is only what Linux claims: that a link going up or down
+    // is not a uevent.
+    let watcher = nl_socket();
+    let bound_now = nl_bind(watcher, &unspecific) == 0;
+    r.check(
+        "a listener can bind the device-event socket to ask about links",
+        bound_now,
+    );
+    unsafe { libc::close(watcher) };
+
     r.finish();
 }

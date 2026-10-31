@@ -7197,3 +7197,69 @@ Three facts, in the order they matter:
 
 **Named next**: what `udevadm info` does with the syspath (which call answers what it
 cannot accept), and the queue file's writer/remover once the daemon records a device again.
+
+### §7.9o The tree had no `net` class, and an interface's own changes
+
+The refusal table of a desktop boot (§7.9n) was down to four sources this tree does
+not have. One of them is the whole network side of a device manager:
+
+```
+open(2) /sys/class/net/lo -> ENOENT     (pid 20, udevadm)
+open(2) /sys/class/net/eth0 -> ENOENT
+```
+
+**Measured on Linux first** (host 7.2.11, `build/scratch/netmon3.txt` and
+`netmon4.txt`; a dummy link created, renamed, brought up, given a new mtu and deleted
+while `udevadm monitor --kernel --property` ran):
+
+| what was done | what was announced |
+|---|---|
+| the link created | `add` at `/devices/virtual/net/<name>`, `SUBSYSTEM=net`, `INTERFACE=`, `IFINDEX=` |
+| renamed | `move` at the **new** path, same two keys |
+| brought up / down | **nothing** |
+| mtu changed | **nothing** |
+| deleted | `remove`, same path and keys |
+
+and the tree's own shape, from `ls -l /sys/class/net` / `udevadm info -q all -p
+/sys/devices/virtual/net/lo`:
+
+```
+/sys/class/net/lo -> ../../devices/virtual/net/lo
+/sys/class/net/enp2s0 -> ../../devices/pci0000:00/.../net/enp2s0
+/sys/devices/virtual/net/lo/uevent   ==  INTERFACE=lo\nIFINDEX=1
+ifindex 1   mtu 65536   address 00:00:00:00:00:00   type 772 (ARPHRD_LOOPBACK)
+flags 0x9   operstate unknown   addr_len 6   name_assign_type 2
+/sys/class/net/lo/dev ->  ENOENT   (a net device has no dev node at all)
+```
+
+Three consequences were written into the tree, and one into the stack:
+
+1. **`/sys/class/net` exists now** (`src/vfs/sysfs.rs`'s `build_net`): one entry per
+   interface, a link into `devices/virtual/net/<name>`, and the home answers
+   `ifindex`, `mtu`, `address`, `flags`, `type` and `operstate`, plus a `uevent`
+   file whose text is `INTERFACE=`/`IFINDEX=` - the two lines Linux's file carries
+   and nothing else. No `dev` node is made, because Linux has none there.
+2. **The mutable words are read at the open, not stored at boot** (`SysLiveFile`).
+   A `mtu` that `SIOCSIFMTU` changed is the stack's answer now, not a page cached
+   when the tree was built - Linux's own `netdev_mtu_show` reads `dev->mtu`.
+3. **The class is built from the stack's own facts** (`net::sysfs_links`,
+   `net::sysfs_word`): one place computes which links exist, so the tree, the
+   interface ioctls and the announcements cannot disagree. On the host there is no
+   stack, so the tree a test builds carries whatever the test handed it.
+4. **A link's own changes announce what Linux announces** (`net::announce_link`):
+   the interfaces come up with `add` when the stack is built, a rename announces
+   `move`, and an mtu/flag change announces the `change` netdev sends. The measured
+   surprise - Linux announces **nothing** for up/down or an mtu change - is written
+   down rather than "fixed", because a listener on that bus has the same blind spot
+   on Linux.
+
+**Pin**: `user/tests/src/bin/t-uevent.rs` gained ten claims (the class exists, the
+entry is a link into the device tree, `ifindex`/`mtu`/`address`/`type`/`flags`/
+`operstate` read, no `dev` node, and the `uevent` file's two lines), each the shape
+measured above; a host test
+(`the_net_class_names_the_interfaces_and_their_home_answers_linuxs_words`) pins the
+whole table including the ethernet address. **Counterfactual**: with `build_net`
+unbuilt the sweep is `pass=243 fail=1` and the red claims are exactly the class ones
+(the `dev`-absence claim stays green, correctly - it asserts nothing is there).
+**Gates**: x86_64 `pass=244 fail=0`, `mpos-kunit 35 passed`; aarch64 `pass=243
+fail=0`, kunit 35.

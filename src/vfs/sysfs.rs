@@ -220,6 +220,65 @@ impl Inode for SysFile {
     }
 }
 
+/// An attribute whose text is the driver's answer at the moment of the read.
+///
+/// A netlink link declaration can be *changed* - `SIOCSIFMTU`, a rename, a
+/// link going up - so a word stored when the tree was built would be a claim
+/// about the machine at boot, not about the machine. Linux's `netdev_show`
+/// reads the device every time; this is the same rule for the attributes whose
+/// value the stack owns (`/sys/class/net/*`, `docs/notes/` §7.9o).
+///
+/// Not `has_write_method`: nothing here is settable through the file (the
+/// `mtu` door is `SIOCSIFMTU`, as in Linux, where `mtu` is `0644` but its
+/// `store` is the device's own and not a general writable attribute).
+struct SysLiveFile {
+    ino: Ino,
+    mode: AtomicU32,
+    /// The answer, made at the read: whatever the closure captured was the
+    /// driver's value when the tree was built, and a `&'static str` here would
+    /// be that value for the mount's life.
+    render: Arc<dyn Fn() -> alloc::string::String + Send + Sync>,
+}
+
+impl Inode for SysLiveFile {
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+    }
+
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: (self.render)().len() as u64,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode.load(Ordering::Relaxed)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let content = (self.render)();
+        let bytes = content.as_bytes();
+        let start = (offset as usize).min(bytes.len());
+        let n = buf.len().min(bytes.len() - start);
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
 /// The number of the last uevent this kernel sent, as `/sys/kernel/uevent_seqnum`.
 ///
 /// It is the one fact udev's `settle` needs before it will stop: libudev's
@@ -547,6 +606,23 @@ impl Inode for SysEventAttr {
         // dropped ones - `DEVTYPE` among them - are what the udev rules that give
         // a card its seat and its `by-path` link match on.
         let mut content = alloc::string::String::new();
+        // A `net` device's file is its name and index and nothing else (measured
+        // on this host: `/sys/devices/virtual/net/<dev>/uevent` is exactly two
+        // lines, `INTERFACE=` and `IFINDEX=`), where a device with a `/dev` node
+        // leads with its numbers - which is why the two keys are chosen by the
+        // subsystem rather than printed for all.
+        if self.event.subsystem == "net" {
+            content.push_str(&alloc::format!(
+                "INTERFACE={}\nIFINDEX={}\n",
+                self.event.devname,
+                self.event.minor
+            ));
+            let bytes = content.as_bytes();
+            let start = (offset as usize).min(bytes.len());
+            let n = buf.len().min(bytes.len() - start);
+            buf[..n].copy_from_slice(&bytes[start..start + n]);
+            return Ok(n);
+        }
         if !self.event.devname.is_empty() {
             content.push_str(&alloc::format!(
                 "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
@@ -602,7 +678,11 @@ impl SysFs {
     /// The tree for the machine as it is: the boot disk, its partitions, and
     /// every PCI function the boot found.
     pub fn new() -> Arc<SysFs> {
-        SysFs::with(Numbering::of_this_machine(), crate::pci::devices())
+        SysFs::with_links(
+            Numbering::of_this_machine(),
+            crate::pci::devices(),
+            SysFs::this_machines_links(),
+        )
     }
 
     /// The tree for a given set of block devices, and no PCI bus. The host has
@@ -612,10 +692,38 @@ impl SysFs {
         SysFs::with(numbering, Vec::new())
     }
 
+    /// The interfaces this machine has, as the stack knows them. The host has
+    /// no stack (`crate::net` is `target_os = "none"`), and a host test wants a
+    /// machine of its own making anyway, so this is empty there.
+    #[cfg(target_os = "none")]
+    fn this_machines_links() -> Vec<SysLink> {
+        crate::net::sysfs_links()
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn this_machines_links() -> Vec<SysLink> {
+        Vec::new()
+    }
+
+    /// The tree with the interfaces given rather than looked up, for a host
+    /// test that wants a machine of its own making (the stack does not exist
+    /// on the host, so `SysFs::new` cannot ask it).
+    pub fn with_links(
+        numbering: Numbering,
+        pci_devices: Vec<Device>,
+        links: Vec<SysLink>,
+    ) -> Arc<SysFs> {
+        SysFs::build(numbering, pci_devices, links)
+    }
+
     /// The tree for a given set of devices: the same walk the kernel's own
     /// tree is built by, with the devices handed in rather than looked up, so
     /// a host test can put a machine of its own choosing behind it.
     pub fn with(numbering: Numbering, pci_devices: Vec<Device>) -> Arc<SysFs> {
+        SysFs::build(numbering, pci_devices, Vec::new())
+    }
+
+    fn build(numbering: Numbering, pci_devices: Vec<Device>, links: Vec<SysLink>) -> Arc<SysFs> {
         let fs = Arc::new(SysFs {
             // The tree's own root, and the one sysfs directory Linux does not
             // leave at the kind's `0755`: measured on a current host, `/sys`
@@ -716,6 +824,7 @@ impl SysFs {
             next,
             &mut devnodes,
         );
+        next = build_net(&class, &virtual_root, links, next);
         next = build_dev_index(&fs, devnodes, next);
         // The PCI bus was built above, before the DRM class: the card hangs
         // off the function that drives it, so the function's directory has to
@@ -1158,6 +1267,188 @@ fn build_input(
                 minor,
             ));
         }
+    }
+    next
+}
+
+/// One word of an interface as the running stack answers it, or `None` where
+/// there is no stack (the host), so a tree built by a test answers what the test
+/// put in it.
+#[cfg(target_os = "none")]
+fn live_word(index: u32, which: u8) -> Option<u64> {
+    crate::net::sysfs_word(index, which)
+}
+
+#[cfg(not(target_os = "none"))]
+fn live_word(_index: u32, _which: u8) -> Option<u64> {
+    None
+}
+
+/// One interface, as the words `/sys/class/net/<name>` answers.
+///
+/// The stack fills this in (`crate::net::sysfs_links`) and the tree renders it,
+/// so the tree holds no second copy of an interface's numbers: a `mtu` that
+/// `SIOCSIFMTU` changed is read from the stack on every open rather than stored
+/// here at boot (`docs/notes/` §7.9o).
+pub struct SysLink {
+    pub name: String,
+    pub index: u32,
+    pub mtu: u32,
+    pub address: [u8; 6],
+    /// `ARPHRD_*`: 772 is the loopback and 1 the ethernet, Linux's own words.
+    pub arp_type: u32,
+    /// `IFF_*` as the attribute prints them, lowercase hex with `0x`.
+    pub flags: u16,
+    pub up: bool,
+}
+
+/// `/sys/class/net`: the interfaces this machine has, each a link to its home
+/// under the device tree, and the home a directory whose words are the stack's.
+///
+/// Measured against Linux (host 7.2.11, `udevadm info -q all -p
+/// /sys/devices/virtual/net/<dev>` on a dummy link created and removed to read
+/// the record): a link declared on a `net` device announces `DEVPATH` only to
+/// the device's own directory (`/devices/virtual/net/mposd3`), its `uevent`
+/// file holds `INTERFACE=` and `IFINDEX=` and nothing else, and the netlink
+/// message is `ACTION`/`DEVPATH`/`SUBSYSTEM=net` plus those two keys. A second
+/// `add` at one path is a rename's `move`. The class entry is a link into that
+/// home (`../../devices/virtual/net/<dev>`), which is why a reader resolving
+/// `/sys/class/net/lo` lands on the device. Linux has **no** `dev` node under a
+/// net device, so none is made here.
+///
+/// This tree had no `class/net` at all, and a desktop boot's refusal table said
+/// so: `udevadm` (pid 20) asked for `/sys/class/net/lo` and `/sys/class/net/eth0`
+/// and got `ENOENT` (`build/scratch/info-boot.log`). A device manager walks this
+/// class, so an absent one is a machine whose every client is told there is no
+/// network device, whatever `ip link` answers.
+fn build_net(
+    class: &Arc<SysDir>,
+    virtual_root: &Arc<SysDir>,
+    links: Vec<SysLink>,
+    mut next: u64,
+) -> u64 {
+    let net = class.add_dir("net", next);
+    next += 1;
+    let virtual_net = virtual_root.add_dir("net", next);
+    next += 1;
+    for link in links {
+        let name: &'static str = Box::leak(link.name.clone().into_boxed_str());
+        let dir = virtual_net.add_dir(name, next);
+        next += 1;
+        net.add(
+            name,
+            Arc::new(SysSymlink {
+                ino: next,
+                target: alloc::format!("../../devices/virtual/net/{name}"),
+            }),
+        );
+        next += 1;
+        let index = link.index;
+        let mtu_stored = link.mtu;
+        let address = link.address;
+        let arp_type = link.arp_type;
+        let up_stored = link.up;
+        let flags_stored = link.flags;
+        let rendered: Vec<(&'static str, u32, Arc<dyn Fn() -> String + Send + Sync>)> = alloc::vec![
+            (
+                "ifindex",
+                SYS_RO_ATTR_MODE,
+                Arc::new(move || alloc::format!("{index}\n")),
+            ),
+            (
+                "mtu",
+                SYS_RW_ATTR_MODE,
+                Arc::new(move || {
+                    let mtu = live_word(index, 0)
+                        .map(|word| word as u32)
+                        .unwrap_or(mtu_stored);
+                    alloc::format!("{mtu}\n")
+                }),
+            ),
+            (
+                "address",
+                SYS_RO_ATTR_MODE,
+                Arc::new(move || {
+                    alloc::format!(
+                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                        address[0],
+                        address[1],
+                        address[2],
+                        address[3],
+                        address[4],
+                        address[5]
+                    )
+                }),
+            ),
+            (
+                "flags",
+                SYS_RO_ATTR_MODE,
+                Arc::new(move || {
+                    let flags = live_word(index, 1)
+                        .map(|word| word as u16)
+                        .unwrap_or(flags_stored);
+                    alloc::format!("0x{flags:x}\n")
+                }),
+            ),
+            (
+                "type",
+                SYS_RO_ATTR_MODE,
+                Arc::new(move || alloc::format!("{arp_type}\n")),
+            ),
+            (
+                "operstate",
+                SYS_RO_ATTR_MODE,
+                Arc::new(move || {
+                    let flags = live_word(index, 1)
+                        .map(|word| word as u16)
+                        .unwrap_or(flags_stored);
+                    let up = if live_word(index, 1).is_some() {
+                        flags & 1 != 0
+                    } else {
+                        up_stored
+                    };
+                    alloc::format!("{}\n", if up { "up" } else { "down" })
+                }),
+            ),
+        ];
+        for (attr, mode, render) in rendered {
+            dir.add(
+                attr,
+                Arc::new(SysLiveFile {
+                    ino: next,
+                    mode: AtomicU32::new(mode),
+                    render,
+                }),
+            );
+            next += 1;
+        }
+        dir.add(
+            "uevent",
+            Arc::new(SysEventAttr {
+                mode: AtomicU32::new(SYS_RW_ATTR_MODE),
+                ino: next,
+                event: Event {
+                    action: "add",
+                    devpath: alloc::format!("/devices/virtual/net/{name}"),
+                    subsystem: "net",
+                    // The uevent file renders `INTERFACE`/`IFINDEX` from these
+                    // two, which is the pair Linux's own file carries.
+                    devname: link.name.clone(),
+                    major: 0,
+                    minor: index,
+                    extra: &[],
+                },
+            }),
+        );
+        next += 1;
+        dir.add(
+            "subsystem",
+            Arc::new(SysSymlink {
+                ino: next,
+                target: String::from("../../../class/net"),
+            }),
+        );
+        next += 1;
     }
     next
 }
@@ -1764,6 +2055,93 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3, "vda and both of its partitions");
+    }
+
+    /// `/sys/class/net` exists, its entries are links into the device tree, and
+    /// the home answers the words `/sys/class/net/lo` answers on Linux.
+    ///
+    /// Measured on this host (7.2.11): `/sys/class/net/lo -> ../../devices/
+    /// virtual/net/lo`, the home's `ifindex` is `1`, its `mtu` `65536`, its
+    /// `address` six zero octets, its `type` `772` (`ARPHRD_LOOPBACK`), its
+    /// `flags` `0x9` and its `operstate` `unknown`; and there is **no** `dev`
+    /// node under a net device at all.
+    #[test]
+    fn the_net_class_names_the_interfaces_and_their_home_answers_linuxs_words() {
+        let fs = SysFs::with_links(
+            Numbering {
+                devices: Vec::new(),
+            },
+            Vec::new(),
+            alloc::vec![
+                SysLink {
+                    name: String::from("lo"),
+                    index: 1,
+                    mtu: 65536,
+                    address: [0; 6],
+                    arp_type: 772,
+                    flags: 0x9,
+                    up: true,
+                },
+                SysLink {
+                    name: String::from("eth0"),
+                    index: 2,
+                    mtu: 1500,
+                    address: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+                    arp_type: 1,
+                    flags: 0x1043,
+                    up: true,
+                },
+            ],
+        );
+        let class = resolve(&fs, "/sys/class/net");
+        let names: Vec<String> = class
+            .read_dir()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, alloc::vec![String::from("eth0"), String::from("lo")]);
+        // The entry is a link into the device's own home, and resolving it lands
+        // on the device - not on a second copy of the attributes.
+        let target = class.lookup("lo").unwrap();
+        assert_eq!(
+            target.readlink().unwrap(),
+            "../../devices/virtual/net/lo",
+            "Linux's own class link"
+        );
+        let home = resolve(&fs, "/sys/devices/virtual/net/lo");
+        let word = |name: &str| -> String {
+            let node = home.lookup(name).expect(name);
+            let mut buf = [0u8; 64];
+            let n = node.read_at(0, &mut buf).expect("read");
+            String::from(String::from_utf8_lossy(&buf[..n]).trim())
+        };
+        assert_eq!(word("ifindex"), "1");
+        assert_eq!(word("mtu"), "65536");
+        assert_eq!(word("address"), "00:00:00:00:00:00");
+        assert_eq!(word("type"), "772");
+        assert_eq!(word("flags"), "0x9");
+        assert_eq!(word("operstate"), "up");
+        assert!(home.lookup("dev").is_err(), "Linux has no dev node here");
+        // The `uevent` file is `INTERFACE`/`IFINDEX` and nothing else: measured
+        // shape, and the words a listener's record starts with.
+        let uevent = home.lookup("uevent").expect("uevent");
+        let mut buf = [0u8; 128];
+        let n = uevent.read_at(0, &mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            text.starts_with("INTERFACE=lo\nIFINDEX=1"),
+            "Linux's own two lines, got {text:?}"
+        );
+        // The ethernet's address is the one the machine's card published.
+        let eth = resolve(&fs, "/sys/devices/virtual/net/eth0");
+        let node = eth.lookup("address").unwrap();
+        let mut buf = [0u8; 64];
+        let n = node.read_at(0, &mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&buf[..n]).trim(),
+            "52:54:00:12:34:56"
+        );
     }
 
     #[test]
