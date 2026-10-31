@@ -7907,3 +7907,21 @@ cycle - so "a lost wake" is not even observable through `poll(2)` here, and is
 not the boot's cause. The open instrument is the daemon's own park:
 `/proc/<pid>/syscall` and `wchan` of its worker pids at the moment `settle`
 times out.
+
+## item 154 — a boot's park table is readable from the heartbeat alone
+
+Measured (2026-10-31, `docs/notes/` §7.9f): the kernel's 5 s heartbeat names
+every parked task, so the daemon question needs no injected probe. On one 130 s
+boot of the current image: udevd's main loop is in `clock_nanosleep` (228) with
+22 123 parks (its `epoll_wait` timeout served by the tick-driven park - the
+designed shape), its workers are in `epoll_pwait` (281) with `parks=1` (woken
+once at start, never again), one `udevadm` is in 619 **uninterruptible** parks
+on `mmap` (page faults parking on the block transfer), and `niri` the same at
+13 188.
+
+Correction recorded with it: **the 120 s `udev-settle` does not reproduce on the
+image as it stands** - that boot's service list is `Starting udev` then
+`Starting seatd`, so `udev-settle` never runs; the figure came from the earlier
+image state, before the settle script was instrumented and restored (§7.9c).
+Open: which boot state starts that service, and whether the shipped
+`/etc/init.d/udev-settle` is what that boot ran.

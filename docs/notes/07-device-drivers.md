@@ -6827,6 +6827,45 @@ moment `settle` times out), and why its event processing stops after the first
 three devices - a shape this kernel's `inotify`/`netlink`/`epoll` wake has now
 been measured out of.
 
+#### 7.9f The boot's park table, and the 120 s that does not reproduce (2026-10-31)
+
+The daemon's own park is visible without a probe: the kernel prints every parked
+task on its 5 s heartbeat (`src/sched/runtime/task.rs`, `park {kind} syscall
+{n} parks={n}`), so a plain boot's serial *is* the instrument. One 130 s boot of
+the current image:
+
+```
+slot  9 pid  9 name=/sbin/udevd            park 2 (block_until_nanos) syscall 228 parks=22123
+slot 15 pid 15 name=/sbin/udevd            park 2 (block_until_nanos) syscall 281 parks=1450
+slot 16 pid 16 name=/sbin/udevd            park 2 (block_until_nanos) syscall 281 parks=6317
+slot 17..25    name=/sbin/udevd            park 2 (block_until_nanos) syscall 281 parks=1
+slot 18 pid 18 name=/sbin/udevadm          park 4 (block_until_uninterruptible) syscall 9 parks=619
+slot 26 pid 26 name=/usr/bin/seatd         park 2 (block_until_nanos) syscall 7   parks=13701
+slot 13 pid 13 name=/usr/bin/niri          park 4 (block_until_uninterruptible) syscall 9 parks=13188
+```
+
+Three readings. The daemon's **main** loop (pid 9) sits in `clock_nanosleep`
+(228) with 22 123 parks - its `epoll_wait` timeout is served by the kernel's
+tick-driven park, which is the designed shape (`vfs/epoll.rs`'s park = the
+nearer of deadline and next tick), so 22 123 is a tick count, not a spin. The
+**workers** are in `epoll_pwait` (281) with `parks=1`: they were woken once, at
+their start, and never again - which is the same daemon that records three
+devices and stops. And one `udevadm` (pid 18) is in an **uninterruptible** park
+on syscall 9 (`mmap`), 619 times: page faults on the ext4 root that park on the
+block device, the transfer shape `docs/notes/` §10.5 describes.
+
+The correction this boot carries: **the 120 s `udev-settle` wait does not
+reproduce on the image as it stands.** The service list on this boot reads
+`Starting udev` then `Starting seatd` - `udev-settle` never runs, and the
+`udevd` workers park with `parks=1` because nothing sends them work in this
+image state. The 120 s figure came from a boot of the *earlier* image state
+(before the settle script was instrumented and restored, §7.9c), so the open
+question is now about the **image**, not only the daemon: which boot state
+starts `udev-settle`, and whether `/etc/init.d/udev-settle` in the shipped
+rootfs is what the earlier boot ran. Recording the park table matters either
+way: a daemon whose workers park once is a daemon that receives nothing, and
+that is measurable on any boot.
+
 Why the boot cares: udevd records nothing (`data files: 0`), `udevadm settle`
 times out its 120 s, and openrc spends the boot's first minutes on it - with
 udevd idle the whole time, because nothing arrives to wake it.
