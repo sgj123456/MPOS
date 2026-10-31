@@ -8027,3 +8027,7 @@ Served now: the class and its attributes (`SysLiveFile` re-reads the mutable one
 so `SIOCSIFMTU` is visible through `/sys`), and `net::announce_link` for the three
 actions Linux does send. Pin: ten claims in `t-uevent` plus a host test; CF red on
 exactly the class claims.
+
+**Follow-up (same turn)**: `t-proc-access`'s two fixtures slept 20 s; the aarch64
+matrix outlived that under TCG and one claim went red on a process that had exited
+(not a behaviour). Both now sleep 120 s and the parent kills them.

@@ -113,7 +113,14 @@ fn main() {
             return;
         }
         if mode == "--sleep" {
-            std::thread::sleep(std::time::Duration::from_secs(20));
+            // Long enough that the whole matrix finishes before this process
+            // does, on the slower of the two machines: the aarch64 sweep runs
+            // under TCG, and a fixture that expired mid-matrix turns the last
+            // claims into a race the machine's speed decides (observed once:
+            // `the dropped process's entry still names it` went red with no
+            // code change). The parent kills both fixtures at the end, so a
+            // longer nap costs nothing.
+            std::thread::sleep(std::time::Duration::from_secs(120));
             return;
         }
         if mode == "--dropped" {
@@ -122,7 +129,7 @@ fn main() {
                 libc::setgid(NOBODY);
                 libc::setuid(NOBODY);
             }
-            std::thread::sleep(std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_secs(120));
             return;
         }
     }
