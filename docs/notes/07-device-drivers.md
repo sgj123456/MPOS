@@ -7108,3 +7108,17 @@ rotation is right, not a convenience).
 **Left open**: whether udevd now records the devices it used to drop, and whether the
 boot's `udevadm settle` still waits its 120 s default. That is the next measurement, on
 the refreshed image.
+
+**What the refreshed image did** (one 150 s boot, `build/scratch/sysdev-boot.txt`): the
+workers wake now - `/sbin/udevd` pids 18 and 19 park **42** and **32** times, against
+`parks=1` in §7.9f's table - so the events the daemon had been handed are being
+processed. Its main loop still answers `clock_nanosleep` (parks 6 571), which the
+endless-epoll item (§7.9i) showed is the tick-sized park and not a lost wake.
+
+The boot's own wait is **not** fixed by this: `/etc/init.d/udev-settle` still sits in
+`poll` (pid 6, parks 1 785) with `/bin/udevadm settle` beside it (pid 8, parks 3 776),
+and `Starting networking` follows 24 heartbeats after `Waiting for uevents to be
+processed` - still the 120 s default. So the tree made the daemon work; what `settle`
+waits for is still unanswered. Next instrument: how many records `/run/udev/data` holds
+now (the file count was 3 of 12 events before), and what `udevadm settle` is waiting on
+when the queue is empty.
