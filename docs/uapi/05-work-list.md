@@ -7934,3 +7934,11 @@ Open: which boot state starts that service, and whether the shipped
   uninterruptible parks are many short polls recovering a lost wake, not a stall.
   What stays open is the *interactive* shape the stall was reported under. Notes
   §7.9g.
+- [ ] **Item 156 - the 120 s `udev-settle` is the shipped script, and the probe leaked.**
+  §7.9f's "does not reproduce" was a leak: the image still carried the old
+  instrumented `/etc/init.d/udev-settle`, and `debugfs` edits survive every
+  `rootfs` refresh. Restored from the package: the service runs, parks 25 164
+  times in `poll` (~120 s = libudev's default when `start()` passes no
+  `--timeout`), and the boot continues afterwards. The daemon's half stays open:
+  its workers wake once and never again, with kernel fan-out proved (§7.9e).
+  Notes §7.9h.

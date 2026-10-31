@@ -6862,7 +6862,8 @@ image state. The 120 s figure came from a boot of the *earlier* image state
 (before the settle script was instrumented and restored, §7.9c), so the open
 question is now about the **image**, not only the daemon: which boot state
 starts `udev-settle`, and whether `/etc/init.d/udev-settle` in the shipped
-rootfs is what the earlier boot ran. Recording the park table matters either
+rootfs is what the earlier boot ran. §7.9h answers it: the image still carried
+my probe, so this correction was itself the leak. Recording the park table matters either
 way: a daemon whose workers park once is a daemon that receives nothing, and
 that is measurable on any boot.
 
@@ -6913,3 +6914,51 @@ What stays open is the shape the stall was *reported* under: an interactive
 session, a hand poking the compositor, which a scripted boot does not
 reproduce. The instrument is what makes the next occurrence answerable from the
 serial alone: `slow>0` names how many, and `blk-waiter=slot N` names who.
+
+### §7.9h The 120 s `udev-settle` is the shipped script - and the image had been carrying my probe
+
+§7.9f's correction ("the 120 s does not reproduce on the current image") was
+itself wrong, and the reason is an instrument that outlived its measurement: the
+image's `/etc/init.d/udev-settle` was **still the probe from §7.9c**. Its
+`start()` wrote `/root/probe5.txt`, started a monitor, fired a trigger and ran a
+pre-set `settle --timeout=6`. An image edited with `debugfs` keeps that file
+across every `cargo xtask rootfs` refresh - the refresh writes boot files and the
+package difference and leaves every other inode alone - so the boot that "no
+longer waits 120 s" was running the probe, not the shipped script.
+
+Restoring the packaged file (`tar -xzf
+build/apk-cache/x86_64/udev-init-scripts-5*.apk`, write it back, mode `0100755`)
+and booting the same image:
+
+| reading | value |
+|---|---|
+| service list | `Starting udev` … `Waiting for uevents to be processed` … `Starting networking` / `seatd` / `local` |
+| the waiting task | `slot 6 pid 6 name=/etc/init.d/udev-settle park 2 (block_until_nanos) syscall 7 parks=25 164` |
+| udevd's workers during it | `epoll_pwait` (281), `parks=1` … `73` |
+| boot continues past it | yes - `networking`, `seatd`, `local` start afterwards |
+| the wait itself | ~120 s |
+
+The shipped `start()` is `udevadm settle` **with no `--timeout`**
+(`udev_settle_timeout` is unset in this image), and libudev's default is 120 s.
+So the wait is the daemon's queue never emptying - its workers park once and
+never wake (§7.9f) and `/run/udev/queue` is still there when the timeout expires.
+Nothing else in the boot is at fault: the 25 164 parks are the `poll`'s own
+4-5 ms period, not a spinner.
+
+What this settles: the open question §7.9f left was "which boot state starts
+`udev-settle`". The shipped graph starts it (it is **not** a runlevel symlink -
+`/etc/runlevels/sysinit` holds `udev` and `udev-trigger` - but `udev-settle`
+`provide`s `dev-settle` and openrc reaches it through the boot's dependency
+graph), and the 120 s is that script's own default, not an image accident. What
+stays open is the daemon's: why the workers wake once and never again, with the
+kernel's own fan-out proved whole (§7.9e's pin).
+
+The image is back to the shipped state - the packaged `udev-settle`, and only
+`xdg-runtime.start` + `README` in `/etc/local.d` (the probes' `zz-desk.start`,
+`zz-probe2.start`, `aa-probe.start` and `aa-uddiag2.start` are removed) - so a
+boot of it is a boot of the shipped image again.
+
+The lesson is the instrument's, and it is worth a trap of its own: **an in-place
+image edit is durable across build refreshes**, so a probe written into the image
+must be removed in the same session, and a reading taken on an image must name
+the files it was taken with.
