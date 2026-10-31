@@ -7999,3 +7999,15 @@ the directory the tree built, so the two cannot drift. Pin: host test
 Left open: udevd still records one device per boot and never removes
 `/run/udev/queue`, so `udevadm settle` still waits its default; that is the daemon's
 state machine, not a path this tree refuses.
+
+### Item 162 - the daemon's own view of the tree (2026-10-31)
+
+Follow-on to items 160/161. Measured (`aa-udevdbg2.start`, `aa-queue.start`): the trigger
+enumerates all twelve syspaths and an explicit trigger makes udevd record all five devices,
+so the tree is right; but the boot's 25 announcements become **one** record,
+`/run/udev/queue` stays empty and present (so `udevadm settle` is `rc=1`), and
+`udevadm info -q all -p /sys/devices/virtio/block/vda1` answers **`syspath not found`**
+for a path whose `uevent`, `dev`, `size` and `subsystem` all read (§7.9n).
+
+Open: what `udevadm info`'s syspath resolution needs that this tree does not answer (the
+next instrument), and the queue-file drain once a device is recorded at boot.

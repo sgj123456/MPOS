@@ -7159,3 +7159,41 @@ alone goes red (`717 -> 1 failed`), which is the exact claim.
 **Gates**: x86_64 `pass=244 fail=0`, `mpos-kunit 35 passed`; aarch64 `pass=243
 fail=0`, kunit 35 (its first run died on the documented EL0 dump - `ESR_EL1
 0x96000047`, lane hung at the report - and the re-run was green).
+
+### §7.9n The daemon's own view: one record, an empty queue file, and a syspath it cannot find
+
+The tree half is closed (§7.9l/m), so the next measurement is udevd's own account, taken
+from a probe that runs after the boot (`aa-queue.start`, `build/scratch/queue-boot.log`)
+and from an earlier one that asks the daemon to trigger (`aa-udevdbg2.start`,
+`build/scratch/udevdbg2-boot.log`):
+
+```
+kernel seqnum at local.d time:        25
+udevd's /run/udev/data records:        1
+/run/udev/queue:                       present, EMPTY (0 bytes)
+udevadm settle --timeout=10:           rc=1   (queue still there 3 s later)
+udevadm info -q all -p \
+  /sys/devices/virtio/block/vda1:      syspath not found
+udevadm trigger --action=add --verbose: lists all twelve syspaths, partitions included
+   (…/virtio/block/vda, …/vda/vda1, …/vda/vda2, pci functions, card0, renderD128)
+after that trigger:                    /run/udev/data holds FIVE records
+   (b254:0, b254:1, b254:2, c226:0, c226:128)
+```
+
+Three facts, in the order they matter:
+
+1. **The tree is right now.** The trigger enumerates every device it should, partitions at
+   their nested homes included, and pointing udevd at them explicitly makes it record all
+   five of them. The paths a listener reads are served.
+2. **The boot's own 25 announcements do not become records.** `/run/udev/data` holds one
+   after a full boot, and the queue file is empty and never removed, so
+   `udevadm settle` answers `rc=1` for the whole default wait. The daemon is handed the
+   devices late or not at all, not given a path it cannot open.
+3. **A utility cannot resolve a syspath that exists.** `udevadm info -q all -p
+   /sys/devices/virtio/block/vda1` - a path this tree serves, whose `uevent`, `dev`, `size`
+   and `subsystem` all read - answers `syspath not found`. That is the next instrument: it
+   is `strip_syspath`/`realpath`-shaped, and it is what a rules engine needs before it can
+   treat a device as known. `udevd` reaching only one record is consistent with it.
+
+**Named next**: what `udevadm info` does with the syspath (which call answers what it
+cannot accept), and the queue file's writer/remover once the daemon records a device again.
