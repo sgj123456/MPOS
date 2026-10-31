@@ -7025,3 +7025,36 @@ Why it stops after the third record is the open question, and it is now a
 question about the *processing* of an event, not about delivery (§7.9i
 discharged the wake path measured on both arms) nor about the kernel being
 quiet (this table).
+
+### §7.9k Why the daemon records three devices: the path it is told to read does not exist
+
+§7.9j counted the announcements. §7.9i pinned delivery. Both are discharged, so the
+instrument went to the daemon's own side: a temporary print in
+`syscall::linux::dispatch` named every call whose answer was a refusal, for the pids
+`udevd` runs as (9-40), on one desktop-image boot (`build/scratch/udevdiag2.txt`,
+443 lines; the instrument is removed). The decisive ones:
+
+| call | path | answer |
+|---|---|---|
+| `open(2)` | `/sys/devices/virtio/block/vda/uevent` | `ENOENT` (**six times**) |
+| `stat(4)` | `/sys/devices/virtio/block/uevent` | `ENOENT` |
+| `stat(4)` | `/sys/devices/virtio/uevent` | `ENOENT` |
+| `open(2)` | `/usr/local/lib/udev/rules.d` | `ENOENT` (48 times, harmless: an optional rules directory) |
+| `mkdir(83)` | (a `/run/udev` directory) | `EEXIST` (fine) |
+
+The kernel announces `DEVPATH=/devices/virtio/block/vda` (§7.9j's seq 11-16), and the
+daemon reads exactly that path back out of `/sys` - and gets `ENOENT`, because it is
+not there. `src/vfs/sysfs.rs` says why, in a comment that is now the measurement's
+counterpart: block devices in this tree have **no** directory under `/sys/devices`
+("their class entry is where they really live"), while the announcement names one.
+Linux has both: the device lives in `/sys/devices/virtio/block/vda`, and
+`/sys/class/block/vda` is a *link* to it - so `DEVPATH` is a path a reader can open,
+and its `uevent` is readable. Here the announced path and the served tree disagree,
+which is our bug and not the daemon's.
+
+That is the whole of "the daemon's silence": it is handed twelve events, goes to read
+each device at the path the event names, finds nothing, and stops after the ones it
+can still make sense of. The fix is a tree change, not a daemon change - give the
+block devices a real home under `/sys/devices` at the announced path (with `dev`,
+`size`, `subsystem` and `uevent`), and make the class entry a link to it, Linux's
+shape. Item 159.

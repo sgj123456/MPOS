@@ -7959,3 +7959,13 @@ Open: which boot state starts that service, and whether the shipped
   the daemon stops after its third record. "The daemon's silence" in §7.9f-§7.9i
   meant exactly this, not a boot that fails: the sweep is green and a session
   starts. Open: why the third event's processing does not continue. Notes §7.9j.
+
+- [ ] **Item 159 - a block device's announced DEVPATH is a path `/sys` must serve.**
+  Measured (§7.9k): the kernel announces `DEVPATH=/devices/virtio/block/vda` and
+  `udev` opens `/sys/devices/virtio/block/vda/uevent` - `ENOENT`, because in this tree
+  block devices live only under `/sys/class/block`, which `src/vfs/sysfs.rs` records
+  as an honest exception. Linux has both: the real directory under `/sys/devices` and
+  `/sys/class/block/<name>` as a link to it. The announcement makes a promise the
+  tree does not keep, which is the wrong shape; fix the tree (a real directory at the
+  announced path with `dev`, `size`, `subsystem`, `uevent`, and the class entry as a
+  link), pin it, and the daemon's record follows. Notes §7.9k.
