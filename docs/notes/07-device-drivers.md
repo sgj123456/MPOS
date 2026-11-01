@@ -3878,6 +3878,24 @@ renderer measures nothing about it.
 
     00:00:00.128 [ERROR] [sway/ipc-server.c:106] Unable to bind IPC socket
 
+> **Re-measured 2026-11-01: the failure above no longer reproduces, and the wlroots family comes up
+> headless.** `apk add sway` inside the guest (`sway 1.12-r0`, `wlroots 0.20.1`), then
+> `WLR_BACKENDS=headless sway --debug`: the headless backend creates, EGL opens on
+> `/dev/dri/renderD128` and then `/dev/dri/card0` (`EGL driver name: virtio_gpu`, DMA-BUF formats
+> enumerated with `LINEAR` and `INVALID` modifiers), the output `HEADLESS-1` is created and
+> arranged (`Usable area for ws: 1280x720`), a transaction commits, scan-out enables, and
+> `sway/ipc-server.c:196` accepts two clients (`fd 23`, `fd 27`) which disconnect at shutdown - the
+> log is 867 lines and ends with `Shutting down sway` when the probe's timeout ends it. So the
+> `Unable to bind IPC socket` line was a shape of that session, not of the IPC socket: the same
+> boot's own probe (`build/scratch/ipc/ipc.c`) binds an abstract `sway-ipc.<pid>.<uid>.sock` name,
+> a filesystem path, and the blocking variant of each - `0` on all three, exactly as Linux 7.2.11
+> answers them.
+>
+> The **DRM** backend is the open half: `WLR_BACKENDS=drm WLR_RENDERER=gles2 sway --debug` printed
+> **nothing at all** in 20 s (the log holds only the timeout's `Killed`), so it stalls before its
+> first log line - a startup wait, and `strace -f /usr/bin/sway` on that run is the next
+> measurement. The old `user #PF at 0x4` NULL dereferences did not recur in either run.
+
 The line carries no `: <strerror>` suffix — what `wlr_log_errno` appends when it has one — and the
 sequence it stands for is `unlink` of a stale path then `bind` of
 `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock` (`/run/user/0` exists, root, mode 0700). So the next

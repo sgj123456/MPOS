@@ -626,7 +626,13 @@ In the order that keeps each step verifiable on its own:
    with no allocator to be handed, while the same binary with its default renderer gets past the  
    line. What the same session found in its place: `sway 1.12` fails `Unable to bind IPC socket` on  
    the DRM backend and headless alike (the errno is the next measurement), and takes a user-mode  
-   NULL dereference it survives (§7.4 carries both instruction sites).
+   NULL dereference it survives (§7.4 carries both instruction sites). **Re-measured 2026-11-01: the
+   headless backend now runs a whole sway session** - EGL on the virtio_gpu card, `HEADLESS-1`
+   created and arranged, transactions committing, its IPC server accepting clients - so that line
+   was that session's shape, not the socket's (the IPC doors answer 0 for an abstract name, a
+   filesystem path and the blocking variant of each, as Linux 7.2.11 does); the **DRM** backend
+   stalls before printing its first line, and `strace -f sway` on that run is the next measurement
+   (§7.4, item 175).
 5. **the renderer's device identity** — **answered** (2026-10-18). The devpath this item's own lead  
    named has landed (2026-10-13: `/sys/devices/pci0000:00/0000:00:04.0/drm/card0`, which `udevadm  
    info -a -n /dev/dri/card0` walks up to `SUBSYSTEMS=="pci" / DRIVERS=="virtio-pci"`), and Mesa is  

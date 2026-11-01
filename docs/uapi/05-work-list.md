@@ -8365,3 +8365,25 @@ that keeps them (`Inode::touch_atime`, `src/vfs/file.rs:409`) and to the
 measurement; the code comment says the group shape and records that it said the
 opposite for a while - the gap between the landed pin and its prose is the
 reason the pin exists.
+
+### Item 175 - the wlroots family runs headless, and its 2026-10-18 failure no longer reproduces (2026-11-01)
+
+Re-measured `sway 1.12-r0` (`wlroots 0.20.1`) on this kernel, installed inside the
+guest (`apk add sway`, the package is not in the image):
+
+- `WLR_BACKENDS=headless sway --debug` **runs a whole session**: the headless
+  backend is created, EGL opens on `/dev/dri/renderD128` and `/dev/dri/card0`
+  (`EGL driver name: virtio_gpu`, DMA-BUF formats enumerated), `HEADLESS-1` is
+  created and arranged (`Usable area for ws: 1280x720`), a transaction commits,
+  scan-out enables, and `sway/ipc-server.c:196` accepts two clients before the
+  probe's timeout shuts it down. 867 log lines, no `Unable to bind IPC socket`.
+- The old line was that session's shape, not the socket's: the same boot's probe
+  binds an abstract `sway-ipc.<pid>.<uid>.sock` name, a filesystem path, and the
+  blocking variant of each - `0` on all three, exactly as Linux 7.2.11 answers.
+- The **DRM** backend (`WLR_BACKENDS=drm WLR_RENDERER=gles2`) printed **nothing**
+  in 20 s - it stalls before its first log line, so the next measurement is
+  `strace -f /usr/bin/sway` on that run.
+
+Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
+transcript, so the superseded reading stays visible) and in the ROADMAP's
+display row.
