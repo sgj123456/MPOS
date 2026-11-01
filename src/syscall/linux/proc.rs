@@ -4215,13 +4215,15 @@ const ITIMERSPEC_SIZE: usize = 32;
 /// callback timer work are `SIGEV_THREAD_ID` (below) and `SIGEV_NONE`; the
 /// bare `SIGEV_SIGNAL` is honoured too, aimed at the creating task.
 ///
-/// Two divergences are recorded here rather than hidden. A timer belongs to
-/// the *task* that created it, not to its thread group: `timer_delete` from a
-/// sibling finds nothing, where Linux's process-wide table would. And a
-/// process-directed expiry (`SIGEV_SIGNAL`) goes to the creating task rather
-/// than Linux's "the first thread that does not block it" — a difference no
-/// caller in this image can observe, because the one program that uses the
-/// family (vim, through musl) aims its timers at a thread.
+/// A timer belongs to the **thread group**, not to the task that made it -
+/// the shape `docs/notes/` §2.11 (item 128) measured and landed: the table is
+/// resolved through the leader, a sibling's `timer_delete` finds the timer, a
+/// worker's timer outlives its maker, and a process-directed expiry goes to a
+/// live thread that does not block the signal, leader first. Measured on the
+/// guest the way Linux answers it (`build/scratch/ipc/truth.c`: a worker's
+/// `timer_create`, then the leader's `timer_delete` -> 0 on both). This
+/// comment said the opposite for a while after the group table landed - the
+/// stale sentence is exactly what the pin exists to catch.
 ///
 /// A `clockid` this kernel has no clock for — the CPU-time clocks, whose
 /// accounting does not exist here — is `EINVAL`, as is an out-of-range

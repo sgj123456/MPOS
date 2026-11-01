@@ -8342,3 +8342,26 @@ after their polls; `Stack.waiters` deleted. Named limitation of the instrument:
 every sweep lane attaches a NIC, so reverting this fix leaves the lane pins
 green - the distinguishing evidence is the NIC-less boot, and `t-uevent-multi`
 stays the pin that the wake works at all.
+
+### Item 174 - the status board named two divergences the tree had already closed (2026-11-01)
+
+Not a behaviour change: the appendix's `R.Remaining` prose still claimed two
+shapes the tree contradicts, and one of them was repeated in a shipped doc
+comment (`src/syscall/linux/proc.rs`'s `timer_create` header).
+
+Measured on the guest with one probe, and on Linux 7.2.11 with the same probe
+(`build/scratch/ipc/truth.c`):
+
+| question | Linux | this kernel |
+|---|---|---|
+| a worker thread's `timer_create`, then the leader's `timer_delete` | `0` | `0` |
+| `inotify` watch on a file (`IN_ACCESS|IN_MODIFY`), then a plain `read(2)` | `mask=0x1` | `mask=0x1` |
+| `atime` set to 1000000, then `read(2)`, then `stat` | current clock | current clock |
+
+So the timer is the **thread group's** (item 128, §2.11) and `IN_ACCESS` is
+emitted by the read doors with atime moved under Linux's relatime rule
+(ROADMAP item 60). The appendix now says both, with the pointer to the code
+that keeps them (`Inode::touch_atime`, `src/vfs/file.rs:409`) and to the
+measurement; the code comment says the group shape and records that it said the
+opposite for a while - the gap between the landed pin and its prose is the
+reason the pin exists.
