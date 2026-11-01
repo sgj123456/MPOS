@@ -645,8 +645,9 @@ In the order that keeps each step verifiable on its own:
 
 ## Current Status
 
-  A description placed over an existing one no longer leaves `/proc/<pid>/maps` printing a span
-  twice (`insert_present` clips; pinned by a host test on the table's shape, item 182).
+  A generated procfs file is a snapshot for the length of one read: `/proc/<pid>/maps` re-rendered
+  on every `read_at`, so a chunked reader of a file the process was growing printed a span twice
+  (`insert_present`'s clipping fixed a second defect on the same path; item 182).
   `t-maps` now also pins the maps offset column as the byte offset Linux prints, with the
   memfd's own inode beside it (item 181).
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  

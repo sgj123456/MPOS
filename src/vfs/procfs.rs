@@ -100,6 +100,20 @@ struct ProcFile {
     /// refuse another user with `EACCES`, because Linux runs
     /// `ptrace_may_access` on them (`build/scratch/ptraceacc/p.c`, measured).
     describes: Option<usize>,
+    /// The text this instance last rendered, kept so a read that arrives in
+    /// several chunks cannot splice two snapshots together.
+    ///
+    /// A generated file's content is not fixed: `/proc/<pid>/maps` is a
+    /// different file once the process maps another page, and a reader that
+    /// hands the kernel a small buffer first - `File::read_to_end` in std starts
+    /// at 32 bytes and doubles - gets its offsets applied to *different* text
+    /// each time. Measured on a guest: `t-maps` read its own `maps` while its
+    /// buffer growth mapped a page, and the file came back with one `rw-s` span
+    /// printed twice, an unnamed inode-`0` line above the named one
+    /// (`docs/notes/` §6.68). Linux materialises a seq_file once per open for
+    /// exactly this reason; here the snapshot is refreshed when a read starts at
+    /// offset zero (a fresh open) and reused by the chunks that follow.
+    rendered: Mutex<RefCell<Option<Arc<str>>>>,
 }
 
 impl Inode for ProcFile {
@@ -163,7 +177,25 @@ impl Inode for ProcFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let content = (self.generate)().ok_or(VfsError::NoEntry)?;
+        // A read that starts at zero is a new file: re-render, so a second open
+        // (or a re-read from the beginning) sees the process as it is now. Any
+        // other offset continues whichever snapshot this instance already
+        // produced - the one thing a chunked reader must be able to rely on.
+        let mut content = if offset == 0 {
+            None
+        } else {
+            critical_section::with(|cs| self.rendered.borrow(cs).borrow().clone())
+        };
+        let content = match content.take() {
+            Some(text) => text,
+            None => {
+                let fresh: Arc<str> = (self.generate)().ok_or(VfsError::NoEntry)?.into();
+                critical_section::with(|cs| {
+                    *self.rendered.borrow(cs).borrow_mut() = Some(Arc::clone(&fresh));
+                });
+                fresh
+            }
+        };
         let bytes = content.as_bytes();
         let start = offset.min(bytes.len() as u64) as usize;
         let end = (start + buf.len()).min(bytes.len());
@@ -709,6 +741,7 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
         mode: 0,
         size: 0,
         describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -803,6 +836,7 @@ fn task_file(
         mode: 0,
         size: 0,
         describes: Some(slot),
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -814,6 +848,7 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
         mode: 0,
         size: 0,
         describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -834,6 +869,7 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
         mode: 0o400,
         size: 0,
         describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -857,6 +893,7 @@ fn file_of_size(
         mode: 0,
         size,
         describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -4459,6 +4496,41 @@ impl FileSystem for ProcFs {
 
 #[cfg(test)]
 mod tests {
+    /// A generated file read in chunks stays one snapshot.
+    ///
+    /// The file is not a constant: `/proc/<pid>/maps` grows when the process
+    /// maps a page, and std's `read_to_end` starts with a 32-byte buffer, so an
+    /// implementation that re-rendered on every `read_at` applied the next
+    /// chunk's offset to different text. Measured on a guest: one `rw-s` span
+    /// printed twice in the file's own output (`docs/notes/` §6.68). A read
+    /// from zero is a fresh open and re-renders; the chunks after it do not.
+    #[test]
+    fn a_chunked_read_of_a_generated_file_keeps_one_snapshot() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&calls);
+        let node = file(move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                String::from("AAAA\n")
+            } else {
+                String::from("AAAA\nBBBB\n")
+            }
+        });
+
+        let mut head = [0u8; 5];
+        assert_eq!(node.read_at(0, &mut head).unwrap(), 5);
+        assert_eq!(&head, b"AAAA\n");
+
+        // The second chunk continues the snapshot the first read produced, not
+        // the longer file the generator would answer if asked again.
+        let mut tail = [0u8; 16];
+        assert_eq!(node.read_at(5, &mut tail).unwrap(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Reading from zero again is a fresh open and sees the new content.
+        let mut again = [0u8; 16];
+        let read = node.read_at(0, &mut again).unwrap();
+        assert_eq!(&again[..read], b"AAAA\nBBBB\n");
+    }
 
     /// `/proc/diskstats`' columns, byte for byte: the widths are Linux's
     /// measured ones and the field order is what a parser walks, so a rendering

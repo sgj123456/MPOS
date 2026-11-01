@@ -4507,7 +4507,28 @@ and dealt with the frames of anything it maps over, exactly as `MAP_FIXED` does 
 before it gets here), then places the run. And the pin is the host test itself, because it is
 deterministic where the guest was not: `every_description_is_keyed_by_its_own_start_and_stands_alone`
 fails on the old code at a named step and passes after the fix, `a_lift_and_retake_round_trip_keeps_the_cover`
-pins the `mremap` shape as well. The lesson is the one this file keeps relearning: when a report is
-intermittent, pin the *invariant* the reader assumes, not the report.
+pins the `mremap` shape as well.
+
+**That was a real defect, but it was not the reported one.** With the clipping in and the claims
+back in `t-maps` — a private file mapping beside the anonymous shared one, plus "no range is listed
+twice" — the guest still printed the shared span twice. The kernel-side detector put with those
+claims (print every source when two rendered lines share a range) printed **nothing**, which moved
+the question from the table to the *file*: the text `/proc/<pid>/maps` handed back was produced by
+two renderings spliced together. `ProcFile::read_at` re-ran its generator on **every** call and
+applied the caller's offset to whatever that generation answered, so a reader whose buffer grows -
+std's `read_to_end` starts at 32 bytes and doubles, and growing the buffer maps pages - got its
+second chunk's offset applied to a longer file than its first chunk came from. The bytes past the
+first chunk's end are the new snapshot's tail; a line appears twice, and only sometimes, because it
+depends on whether the process grew between two chunk reads. That is the whole intermittency.
+
+Linux materialises a seq_file once per open for this reason. The fix keeps the rendered text on the
+`ProcFile` instance: a read that starts at offset zero re-renders (a fresh open sees the process as
+it is), and every chunk after it continues that same snapshot. Measured after: the same pin on both
+arms is green, with `a_chunked_read_of_a_generated_file_keeps_one_snapshot` as the deterministic pin
+(a generator that grows between calls; the second chunk must end where the first did, and a read from
+zero must see the new text).
+
+The lesson, twice over: an intermittent report is diagnosed by pinning the invariant the reader
+assumes, and a file whose content changes under the reader must be a snapshot, not a live view.
 
 Full record: `docs/uapi/` §5.1 item 182.

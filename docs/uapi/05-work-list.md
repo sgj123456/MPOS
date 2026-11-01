@@ -8600,9 +8600,13 @@ panicked at step 9 — `insert_present` of a run overlapping an existing descrip
 `NOTES.md` §15.18), but three of its callers (`insert_vma`, `brk`, `claim_anon_gaps`) can hand it a
 run that overlaps.
 
-**Fixed**: `insert_present` clips `[start, end)` out of the table before placing (the pieces are
-dropped, not freed — the caller owns the frames). **Pin**: the host tests
+**Fixed (two defects, in order)**: (1) `insert_present` clips `[start, end)` out of the table before
+placing (the pieces are dropped, not freed — the caller owns the frames), pinned by the host tests
 `every_description_is_keyed_by_its_own_start_and_stands_alone` (fails on the old code at a named
-step) and `a_lift_and_retake_round_trip_keeps_the_cover`. Gates: x86_64 `pass=252`, aarch64
-`pass=251`.
+step) and `a_lift_and_retake_round_trip_keeps_the_cover`; and (2) the actual symptom — a generated
+file re-rendered on **every** `read_at`, so a chunked reader applied its offsets to different text
+of a file the process was growing. `ProcFile` now keeps the text it rendered: a read from offset
+zero re-renders, later chunks continue that snapshot (Linux's seq_file materialises once per open).
+Pinned by `a_chunked_read_of_a_generated_file_keeps_one_snapshot` plus `t-maps`' "no range is listed
+twice". Gates: x86_64 `pass=252`, aarch64 `pass=251`.
 

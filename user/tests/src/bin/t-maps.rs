@@ -489,6 +489,78 @@ fn main() {
         Err(_) => r.check("the maps file still opens", false),
     }
 
+    // --- a private mapping of a real file, and one line per range ---
+    // This is the shape that uncovered the duplicate: a private file mapping
+    // beside an anonymous shared one used to leave the shared range described
+    // twice (`insert_present` did not clip an overlapping description), and a
+    // first-match reader took the line with no object behind it. The claims
+    // below are the two the duplicate used to break, plus the rule itself.
+    let file_map = (|| -> Option<(usize, u64)> {
+        let path = if host_run() {
+            "/tmp/t-maps-dup.bin"
+        } else {
+            "/t-maps-dup.bin"
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        file.set_len(3 * 4096).ok()?;
+        let ino = fstat(file.as_fd()).ok()?.st_ino;
+        let at = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                4096,
+                ProtFlags::READ,
+                MapFlags::PRIVATE,
+                file.as_fd(),
+                4096,
+            )
+        }
+        .ok()? as usize;
+        Some((at, ino))
+    })()
+    .unwrap_or((0, 0));
+
+    match read_maps() {
+        Ok(maps) => {
+            match line_at(&maps, file_map.0) {
+                Some(line) => {
+                    r.check("a private file mapping is listed", true);
+                    r.check(
+                        "and it names the file's inode, which a copy of the file could not",
+                        core::str::from_utf8(line.inode)
+                            .ok()
+                            .and_then(|text| text.parse::<u64>().ok())
+                            == Some(file_map.1),
+                    );
+                    r.check(
+                        "and its byte offset, as a file mapping's line has",
+                        line.offset == b"00001000",
+                    );
+                }
+                None => r.check("a private file mapping is listed", false),
+            }
+
+            // One range is one line: Linux never prints a span twice, and a
+            // reader that takes the first match reads the one with no object
+            // when this kernel does (`insert_present`'s clipping, item 182).
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            let mut duplicated = false;
+            for line in lines(&maps) {
+                if seen.contains(&(line.start, line.end)) {
+                    duplicated = true;
+                }
+                seen.push((line.start, line.end));
+            }
+            r.check("no range is listed twice", !duplicated);
+        }
+        Err(_) => r.check("the maps file still opens", false),
+    }
+
     // --- a private file mapping, and the two calls that rewrite it ---
     // A `MAP_PRIVATE` mapping of a file is what `record_eager_range` exists for:
     // its pages are read in at `mmap` time, so this kernel leaves no VMA and
