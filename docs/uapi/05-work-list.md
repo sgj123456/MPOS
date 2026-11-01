@@ -8587,3 +8587,22 @@ made the pin red on a pre-existing claim, and a dump showed one `rw-s` range pri
 unnamed inode-`0` line above the named one). The dedupe attempt was reverted and the claim dropped -
 `docs/notes/06-process-management.md` carries the dump and the next instrument.
 
+## 182. `insert_present` left overlapping descriptions — one range, two maps lines (2026-11-02)
+
+**Observed first**: `/proc/<pid>/maps` printed one `rw-s` span twice on a guest (unnamed inode-`0`
+line above the named one), so a first-match reader took the line with no object. Intermittent — 2 of
+5 runs, unreproducible by the detector built for it (two green gates).
+
+**Diagnosed by a host test of the table's shape**, not by the guest: a seeded `insert` /
+`insert_present` / `remove_range` sequence checking key-is-start, address order and non-overlap
+panicked at step 9 — `insert_present` of a run overlapping an existing description kept both.
+`insert_present` is the no-`split_out` placement (whose neighbours' pages must not be freed,
+`NOTES.md` §15.18), but three of its callers (`insert_vma`, `brk`, `claim_anon_gaps`) can hand it a
+run that overlaps.
+
+**Fixed**: `insert_present` clips `[start, end)` out of the table before placing (the pieces are
+dropped, not freed — the caller owns the frames). **Pin**: the host tests
+`every_description_is_keyed_by_its_own_start_and_stands_alone` (fails on the old code at a named
+step) and `a_lift_and_retake_round_trip_keeps_the_cover`. Gates: x86_64 `pass=252`, aarch64
+`pass=251`.
+

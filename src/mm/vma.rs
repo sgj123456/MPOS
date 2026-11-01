@@ -498,6 +498,16 @@ impl VmaTable {
     pub fn insert_present(&mut self, vma: Vma) {
         let anon = matches!(vma.kind, VmaKind::Anon);
         let key = vma.start;
+        // The run is described as *placed*, which says nothing about what was
+        // described there before: an overlapping description is superseded, and
+        // leaving it in the table is how one range came to be printed twice by
+        // `/proc/<pid>/maps` (measured on a guest: the same `rw-s` span above
+        // its own line, so a first-match reader took the one with no object -
+        // `docs/notes/` §6.68). Clipping here keeps the table a cover rather
+        // than a stack, and drops no page: the caller has already dealt with
+        // the frames of whatever it maps over, exactly as `MAP_FIXED` does
+        // through `munmap` before it gets here.
+        self.split_out(vma.start, vma.end);
         self.vmas.insert(key, vma);
         if anon {
             self.merge_at(key);
@@ -1290,5 +1300,88 @@ mod tests {
         );
         assert!(table.sealed_at(0x1000));
         assert!(!table.sealed_at(0x2000));
+    }
+
+    /// The table's entries with their keys, for the invariant test above.
+    fn table_keys(table: &VmaTable) -> Vec<(usize, Vma)> {
+        table
+            .vmas
+            .iter()
+            .map(|(&key, vma)| (key, vma.clone()))
+            .collect()
+    }
+
+    const PAGE: usize = 4096;
+
+    /// The table's shape invariant, checked after every mutation of a
+    /// pseudo-random sequence: each entry's key is its own `start`, entries
+    /// stand in address order without overlap, and each one is described once.
+    ///
+    /// The invariant is what `/proc/<pid>/maps` reads: the file prints one line
+    /// per entry, so a table holding two descriptions of one range prints that
+    /// range twice - which happened on a guest, intermittently, and could not be
+    /// reproduced (`docs/notes/` §6.68). This pins the invariant the renderer
+    /// assumes against the mutation shapes the table actually sees - `insert`
+    /// (with its split-and-merge), `insert_present` (which must not fold a lazy
+    /// neighbour), and `remove_range`.
+    #[test]
+    fn every_description_is_keyed_by_its_own_start_and_stands_alone() {
+        let object = fake(7);
+        let mut table = VmaTable::new();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+
+        for step in 0..4000 {
+            let page = next(16) + 1;
+            let start = MMAP_BASE + page * PAGE;
+            let pages = next(6) + 1;
+            let end = start + pages * PAGE;
+            let op = next(4);
+            let cut = start + next(pages + 1) * PAGE;
+            match op {
+                0 => table.insert(anon(start, end, RW)),
+                1 => table.insert(frames(start, end, RW, &object, page * PAGE)),
+                2 => table.insert_present(anon(start, end, RW)),
+                _ => table.remove_range(start, cut),
+            }
+            let mut last_end = 0;
+            for (key, vma) in self::table_keys(&table) {
+                assert_eq!(key, vma.start, "an entry's key is not its own start");
+                assert!(vma.start < vma.end, "an entry describes an empty range");
+                if vma.start < last_end {
+                    panic!(
+                        "two descriptions overlap at step {step} (op {op}, {start:x}-{end:x}, cut {cut:x}): {:?}",
+                        self::table_keys(&table)
+                            .iter()
+                            .map(|(k, v)| (*k, v.start, v.end))
+                            .collect::<alloc::vec::Vec<_>>()
+                    );
+                }
+                last_end = vma.end;
+            }
+        }
+    }
+
+    /// Lifting a range out and putting the pieces back describes the same
+    /// address space: what `mremap` and `mseal`'s split-and-retake do.
+    #[test]
+    fn a_lift_and_retake_round_trip_keeps_the_cover() {
+        let mut table = VmaTable::new();
+        table.insert(anon(MMAP_BASE, MMAP_BASE + 4 * PAGE, RW));
+        let taken = table.lift_range(MMAP_BASE + PAGE, MMAP_BASE + 3 * PAGE);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            table.gaps(MMAP_BASE, MMAP_BASE + 4 * PAGE),
+            alloc::vec![(MMAP_BASE + PAGE, MMAP_BASE + 3 * PAGE)]
+        );
+        for vma in taken {
+            table.insert_present(vma);
+        }
+        assert!(table.gaps(MMAP_BASE, MMAP_BASE + 4 * PAGE).is_empty());
     }
 }

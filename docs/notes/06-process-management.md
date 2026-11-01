@@ -4480,3 +4480,34 @@ the counterfactual — `end_group_siblings` not called — is
 `the death is the signal that killed it`); nothing else moved.
 
 Full record: `docs/uapi/` §5.1 item 123.
+
+### 6.68 One range, two descriptions: `/proc/<pid>/maps` printed a span twice — **FIXED (2026-11-02)**
+
+`t-maps` was extended to a private mapping of a real file and a pre-existing claim went red: the
+maps file had **two lines for one address span**, an unnamed inode-`0` `rw-s` line above the named
+one, and `line_at` (first match) read the one with no object behind it. Observed on a guest in 2 of 5
+runs with the extra mappings present; not reproducible on demand, and the temporary detector built
+for it (print both sources when two lines share `(start,end)`) reproduced nothing in two further
+gates — an intermittent report is not a diagnosis.
+
+What turned it into one was a **host test of the table's shape** instead of another gate run. A
+seeded sequence of `insert` / `insert_present` / `remove_range` over one `VmaTable`, checking after
+each step that each entry's key is its own `start`, that entries stand in address order, and that no
+two of them overlap, panicked at step 9: `insert_present` of an anonymous run whose range overlapped
+an existing description left **both** in the table. `insert_present` is `place`-without-`split_out`
+on purpose — `split_out` is the path that rewrites neighbours and frees their pages (`NOTES.md`
+§15.18) — but it was written as if the caller could only ever hand it a hole or abutting run, while
+its callers are `mremap`'s `insert_vma`, `brk`'s growth and `claim_anon_gaps`; only the last one
+takes its ranges from `gaps()`. A run placed over an existing description therefore described one
+span twice, and the maps file printed what the table held.
+
+The fix is the one line the invariant needs: `insert_present` clips the range out of the table
+first (`split_out`, whose pieces are dropped, not freed — the caller has already placed the pages
+and dealt with the frames of anything it maps over, exactly as `MAP_FIXED` does through `munmap`
+before it gets here), then places the run. And the pin is the host test itself, because it is
+deterministic where the guest was not: `every_description_is_keyed_by_its_own_start_and_stands_alone`
+fails on the old code at a named step and passes after the fix, `a_lift_and_retake_round_trip_keeps_the_cover`
+pins the `mremap` shape as well. The lesson is the one this file keeps relearning: when a report is
+intermittent, pin the *invariant* the reader assumes, not the report.
+
+Full record: `docs/uapi/` §5.1 item 182.
