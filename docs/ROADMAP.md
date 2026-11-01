@@ -701,6 +701,12 @@ and the `set` door refuses a read-only identity name and a foreign level before 
 counterfactual — the one leniency left, `set` of an unknown name under a level the socket
 *has*, is a named divergence because a partial allow-list would be stricter than Linux for
 the real names it omits).
+The bus's wake list no longer belongs to a network stack, either: a machine with no NIC used to
+park a device-event listener on no list at all, so `udevd` slept through every announcement —
+its database stayed empty across a full trigger, `udevadm settle` burnt its timeout and the
+boot's "Waiting for uevents" ran 555 serial lines; the list is machine-wide now and that boot
+reaches "Starting networking" 2 lines later (§7.9u, item 173; the distinguishing evidence is
+that NIC-less boot, because every lane attaches a NIC and the lane pins stay green either way).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

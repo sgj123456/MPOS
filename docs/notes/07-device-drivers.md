@@ -7525,3 +7525,49 @@ bounded child is killed at its bound and the claim fails by name — and the
 `{0,0}` claim goes red with them, since "did not answer inside 300 ms" and
 "never answers" are the same observation. Gates: x86_64 `pass=246`, aarch64
 `pass=245`, `mpos-kunit 35`, host lib 719.
+
+### §7.9u A parked listener wakes on a machine that has no network device
+
+The bus's wake list was a field of a **network stack** (`Stack.waiters`), and
+`subscribe`/`wake_waiters` both went through `with_stack(…)`. A machine with no
+NIC has no stack, so both calls were no-ops: a listener that parked in
+`poll(2)`/`epoll_wait(2)` on a `NETLINK_KOBJECT_UEVENT` socket was never on any
+list, and an announcement's `wake_waiters()` woke nobody. The events were
+queued — an instrumented `publish` printed `queued=1` for udevd's group on a
+NIC-less boot — and the daemon nevertheless stayed asleep.
+
+How that reads as a user-visible defect: `udevd` parks in `epoll_wait(-1)` with
+no timeout, so "no wake, no work" is permanent. Measured on the same image,
+`-device virtio-net-pci` removed:
+
+| | NIC-less, before (§ commit `fac5a41`) | NIC-less, after |
+|---|---|---|
+| `udevd`'s database after `udevadm trigger` | **0 records** | **5 records** (`c254:0`, `c254:1`, `c254:2`, `c226:0`, `c226:128`) |
+| `/run/udev/queue` after the trigger's events | left behind, 0 bytes | removed by udevd |
+| `udevadm settle --timeout=2` | killed at the outer bound (`rc=137`) | `rc=0` |
+| boot, "Waiting for uevents to be processed" → "Starting networking" | **555** serial lines (the whole ~120 s `udevadm settle` timeout) | **2** lines |
+
+The boot wait was never about the handler's speed or the block layer: the
+`udev-settle` service ran `udevadm settle`, whose queue file udevd never
+cleared, because udevd had never been told the events were there.
+
+### Served shape
+
+`src/net/mod.rs` now keeps one machine-wide `static WAITERS: Mutex<RefCell<
+Vec<TaskId>>>`; `subscribe`/`unsubscribe`/`wake_waiters` use it directly, and
+`service`/`irq_service` call `wake_waiters()` after their polls instead of
+cloning a per-stack list. `Stack.waiters` is gone: a list that lives inside a
+stack cannot outlive one, and a device-event socket does not need a wire.
+
+### Why the pin is a boot measurement, not a `t-*` program
+
+Every sweep lane attaches a `virtio-net-*` device (`docs/notes/` §15.64), so
+`with_stack` answers `Some` in every lane and the defective path is
+unreachable there. Reverting the fix leaves `t-uevent-multi` **green**, and that
+green is the measurement of exactly this blind spot: the lane cannot see the
+class. The distinguishing evidence is therefore the NIC-less boot table above,
+reproduced on `fac5a41` and on the fixed kernel with the same image and the same
+probe (`build/scratch/noudev/`, `build/scratch/qmove/`). `t-uevent-multi`
+remains the pin that the wake *works*, and it would go red if the new door were
+wired wrong — the lane's absence is a limitation of the instrument, recorded
+here rather than hidden behind a green run.

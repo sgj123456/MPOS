@@ -792,13 +792,6 @@ pub(crate) struct Stack {
     /// [`Stack::tcp_name_taken`]).
     teardown: Vec<(Home, SocketHandle, bool)>,
     next_ephemeral: u16,
-    /// Tasks parked on any socket's readiness, registered through
-    /// [`subscribe`] and woken by [`service`] after every poll. One flat
-    /// list rather than a waiter set per entry, because a wake is allowed to
-    /// be spurious: the woken task re-checks its own condition and parks
-    /// again if it is still false, which is the same licence `poll(2)` gives
-    /// itself, and one list is less state to keep consistent.
-    waiters: Vec<crate::sched::policy::TaskId>,
     /// eth0's name, settable by `ip link set eth0 name X` - what the link
     /// dump reports and what the address labels are derived from.
     eth_name: String,
@@ -2086,38 +2079,48 @@ pub(crate) fn free_entry(handle: usize) {
 /// in memory. The waiters are woken *after* the poll, outside the stacks'
 /// locks, so a woken task never runs under one.
 pub fn service() {
-    let mut pending: Vec<crate::sched::policy::TaskId> = Vec::new();
     // The machine's stack first: it is the one with the wire, and the one
-    // whose waiters a device interrupt would have woken anyway.
-    if let Some(waiters) = with_machine_stack(|stack| {
-        stack.poll_once();
-        stack.waiters.clone()
-    }) {
-        pending.extend(waiters);
-    }
+    // whose poll a device interrupt would have driven anyway.
+    with_machine_stack(|stack| stack.poll_once());
     // Then each namespace's, under the one lock that names them. A namespace
     // with no wire has no interrupt to acknowledge and no frame to receive;
     // its loopback still has to progress, which is the whole point.
     critical_section::with(|cs| {
         for (_, stack) in NAMESPACES.borrow(cs).borrow_mut().iter_mut() {
             stack.poll_once();
-            pending.extend(stack.waiters.iter().copied());
         }
     });
-    for id in pending {
-        crate::sched::wake(id);
-    }
+    // One machine-wide waiter list, woken after the polls and outside every
+    // stack's lock (`WAITERS`). It outlives the stacks on purpose: a machine
+    // with no NIC still has device-event sockets whose listeners must wake.
+    wake_waiters();
 }
 
-/// Register `id` to be woken after every stack poll, until the matching
-/// [`unsubscribe`]. The `poll_subscribe` on [`socket::SocketInode`] is what
-/// routes a `poll(2)`/`epoll` wait through here; the blocked socket calls
-/// in `socket.rs` use it directly. A task already registered is not added
-/// twice.
+/// The tasks parked on socket readiness, woken by [`wake_waiters`].
+///
+/// One list for the whole machine, and deliberately **not** a field of a
+/// stack: a device-event socket is servable whether or not this machine has a
+/// network device, and a list that only exists inside a stack made a parked
+/// listener unwakeable on a machine with no NIC. Measured on a NIC-less boot
+/// (`docs/notes/` §7.9u): `udevd` parked in `epoll_wait(-1)` never woke, its
+/// database stayed empty across a full `udevadm trigger`, and the boot's
+/// `udevadm settle` burnt its whole timeout - the events were queued and the
+/// daemon was asleep. A wake is allowed to be spurious (the woken task
+/// re-checks its own condition), so one flat list is enough and is less state
+/// to keep true than a waiter set per stack.
+static WAITERS: Mutex<RefCell<Vec<crate::sched::policy::TaskId>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+/// Register `id` to be woken after every stack poll and after every
+/// announcement, until the matching [`unsubscribe`]. The `poll_subscribe` on
+/// [`socket::SocketInode`] is what routes a `poll(2)`/`epoll` wait through
+/// here; the blocked socket calls in `socket.rs` use it directly. A task
+/// already registered is not added twice.
 pub(crate) fn subscribe(id: crate::sched::policy::TaskId) {
-    with_stack(|stack| {
-        if !stack.waiters.contains(&id) {
-            stack.waiters.push(id);
+    critical_section::with(|cs| {
+        let mut waiters = WAITERS.borrow(cs).borrow_mut();
+        if !waiters.contains(&id) {
+            waiters.push(id);
         }
     });
 }
@@ -2126,7 +2129,9 @@ pub(crate) fn subscribe(id: crate::sched::policy::TaskId) {
 /// ended, however it ended. A task that is not registered is a no-op, which
 /// is what makes an interrupted wait's cleanup unconditional.
 pub(crate) fn unsubscribe(id: crate::sched::policy::TaskId) {
-    with_stack(|stack| stack.waiters.retain(|w| *w != id));
+    critical_section::with(|cs| {
+        WAITERS.borrow(cs).borrow_mut().retain(|w| *w != id);
+    });
 }
 
 /// Wake everything parked on a socket, without touching the network.
@@ -2140,7 +2145,7 @@ pub(crate) fn unsubscribe(id: crate::sched::policy::TaskId) {
 /// `udevd` ended up with an empty database here: the events were queued, the
 /// daemon was asleep, and `udevadm trigger` returned having changed nothing.
 pub(crate) fn wake_waiters() {
-    let waiters = with_stack(|stack| stack.waiters.clone()).unwrap_or_default();
+    let waiters = critical_section::with(|cs| WAITERS.borrow(cs).borrow().clone());
     for id in waiters {
         crate::sched::wake(id);
     }
@@ -2155,19 +2160,15 @@ pub(crate) fn wake_waiters() {
 /// EOI, which ends the delivery itself, belongs to the caller's handler, not
 /// to the stack: it is machine bookkeeping, not network state.
 pub fn irq_service() {
-    let waiters = with_stack(|stack| {
+    with_stack(|stack| {
         stack.poll_once();
         // A namespace with no wire has no interrupt to acknowledge; the
         // service task still walks its other interfaces.
         if let Some(device) = stack.eth.device.as_ref() {
             device.net.ack_interrupt();
         }
-        stack.waiters.clone()
-    })
-    .unwrap_or_default();
-    for id in waiters {
-        crate::sched::wake(id);
-    }
+    });
+    wake_waiters();
 }
 
 // ---------------------------------------------------------------------------
@@ -2838,7 +2839,6 @@ pub fn init(dev: Arc<dyn NetDevice>) {
             listeners: Vec::new(),
             teardown: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
-            waiters: Vec::new(),
             eth_name: String::from("eth0"),
         });
     });
@@ -2898,7 +2898,6 @@ impl Stack {
             listeners: Vec::new(),
             teardown: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
-            waiters: Vec::new(),
             eth_name: String::from("eth0"),
         }
     }

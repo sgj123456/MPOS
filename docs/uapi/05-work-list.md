@@ -8318,3 +8318,27 @@ Pin `t-sockopt-names` (23 claims, `user/tests/src/bin/t-sockopt-names.rs`).
 Gates x86_64 `pass=249` / aarch64 `pass=248`, kunit 35 both; the counterfactual
 (identity rows back to zero, tail back to `_ => 0`) reddens exactly the seven
 distinguishing claims and leaves the modelled-name claim green.
+
+### Item 173 - a parked listener wakes on a machine with no network device (2026-11-01)
+
+The bus's wake list lived inside a **network stack** (`Stack.waiters`) and both
+its doors went through `with_stack(…)`, so on a machine with no NIC a listener
+parked in `poll(2)`/`epoll_wait(2)` on a device-event socket was on no list and
+`publish`'s `wake_waiters()` found nobody. The events were queued and the daemon
+stayed asleep - `udevd` parks in `epoll_wait(-1)`, so "no wake, no work" is
+permanent.
+
+Measured on the same image without `-device virtio-net-pci`
+(`docs/notes/` §7.9u): before, `udevd`'s database held **0** records after a full
+`udevadm trigger`, `/run/udev/queue` stayed behind and `udevadm settle` burnt its
+whole timeout - the boot's "Waiting for uevents to be processed" ran **555**
+serial lines before "Starting networking"; after, the same trigger records
+**5** devices, udevd removes the queue, `settle` answers `rc=0`, and the boot
+wait is **2** lines.
+
+Served: one machine-wide `static WAITERS` in `src/net/mod.rs`, used by
+`subscribe`/`unsubscribe`/`wake_waiters`, with `service`/`irq_service` waking it
+after their polls; `Stack.waiters` deleted. Named limitation of the instrument:
+every sweep lane attaches a NIC, so reverting this fix leaves the lane pins
+green - the distinguishing evidence is the NIC-less boot, and `t-uevent-multi`
+stays the pin that the wake works at all.
