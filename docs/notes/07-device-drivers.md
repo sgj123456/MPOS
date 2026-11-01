@@ -7664,6 +7664,32 @@ Instrument note: the print was temporary and the untouched file is restored
 (`git diff --stat` clean at `8d81b62`); a boot costs ~11 minutes, so the diagnostic and the
 attribution fix land in the same round rather than a second boot.
 
+### 7.4e Master is not the variable: card-node EGL stays uninitialized — **MEASUREMENT**
+
+§7.4d left two shapes: `drmSetMaster` before `eglInitialize` on the card node, and the card-node
+path with `prime_handle_to_fd` instrumented. The first was measured (`build/scratch/swayd/`, source
+`eglprobe2.c`, one boot, `-I/usr/include/libdrm` because Alpine's `libdrm-dev` keeps `drm.h` in a
+subdirectory):
+
+| step | answer |
+|---|---|
+| `open("/dev/dri/card0")` | `3` |
+| `drmSetMaster(fd)` | **0** |
+| `gbm_create_device(fd)` | non-null |
+| `eglInitialize` on the GBM platform display | **0**, `eglGetError 0x3001` |
+
+So the card node's EGL does not initialize even as master, and the split §7.4d found is Mesa's
+driver/loader choice rather than a permission this kernel withholds: the render node initializes,
+the card node does not. That also means a compositor's *renderer* can never be the card node's -
+correct behaviour for wlroots, which opens the render node for rendering and keeps the card node
+for scan-out.
+
+The remaining question is therefore not "can this kernel export" (both spellings succeed, §7.4d)
+but "what does the compositor's own buffer do before it asks". The decisive instrument is a sway
+boot with `prime_handle_to_fd` printing **every** call - not only the refusals, which §7.4a's
+instrument already showed to be zero - so the log says whether the 17 failing commits reach the
+door at all.
+
 ### 7.4d The export doors answer; EGL on the card node does not initialize — **MEASUREMENT**
 
 §7.4c named the next instrument: a guest probe that exports a GBM buffer through both spellings.

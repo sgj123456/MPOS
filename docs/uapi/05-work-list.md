@@ -8462,6 +8462,12 @@ scan-out` (36 and 36 lines in `build/scratch/swayd/sway.log`), with `[render/egl
 format modifiers unsupported` earlier. So the kernel's own framebuffer path (kmscube, the paint
 gate) works and the route a client's GBM buffer takes does not.
 
+**Narrowed again (§7.4e)**: `drmSetMaster` before `eglInitialize` on the card node does **not** help -
+`eglInitialize` still answers 0 with `eglGetError 0x3001` while the render node initializes - so the
+renderer/scan-out split is Mesa's loader choice, not a permission this kernel withholds. The next
+instrument is a sway boot whose `prime_handle_to_fd` prints every call (not only refusals), to say
+whether the failing commits reach the door at all.
+
 **Narrowed again (§7.4d)**: the export doors answer both spellings - a rendered GBM surface on
 `renderD128` exports `gbm_bo_get_fd` = 10 and `_for_plane(0)` = 11 - while **EGL does not
 initialize on the card node** (`eglInitialize` 0, `eglGetError 0x3001`) and does on `renderD128`.
