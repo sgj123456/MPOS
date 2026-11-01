@@ -1717,3 +1717,43 @@ number is the caller's. `exceptfds` never reports a bit on either machine,
 because nothing here generates OOB data. `select`'s impossible deadlines
 (`LLONG_MAX`) are saturated into a `u64` of milliseconds rather than kept exact;
 both shapes sleep "forever" either way.
+
+## §10.15 A private mapping of a file is a copy, and the copy costs seconds — open (2026-11-01)
+
+Found while chasing why `sway` with `WLR_BACKENDS=drm` printed nothing for twenty seconds
+(§7.4's note, item 175). `strace -f` on that run shows the time inside **one `mmap(2)`**:
+
+    09:45:06.209342 mmap(NULL, 189906944, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7e26db23b000
+    09:45:18.275761 mmap(0x7e26db7c0000, 105525248, PROT_READ|PROT_EXEC, MAP_FIXED, 3, 0x585000) = …
+
+`libLLVM.so.23.1` is 189 132 768 bytes; the loader maps it, then the `PROT_EXEC` piece, and each
+call is seconds. Measured directly in the guest with one probe
+(`build/scratch/ipc/pf2.c`, the page cache cold at each size):
+
+| mapping | `mmap(2)` itself | first touch of every page |
+|---:|---:|---:|
+| 1 MiB | 21.6 ms | 0.1 ms |
+| 8 MiB | 132.3 ms | 0.2 ms |
+| 32 MiB | 498.6 ms | 0.7 ms |
+| 128 MiB | 2 451.1 ms | 2.9 ms |
+| 180 MiB | 3 439.9 ms | 4.3 ms |
+
+Linear in the length, and the first touch afterwards is free: the `mmap` call has already read the
+whole file. For comparison the same file by `read(2)` is **329 MB/s** and by `dd` **377 MB/s**, so
+the device is not the problem — the copy is ~55 MB/s because it is 4 KiB per page, one
+`alloc_frames` and one `inode.read_at` per page (46 000 of them for that file).
+
+The code says why, and the reason is a missing capability rather than a bug in this loop
+(`src/syscall/linux/proc.rs`, the ordinary-file arm of `handle_mmap_impl`): "the bytes are read in
+now, because a mapping of a file this kernel does not page is a copy of what the file held and
+nothing tracks the file afterwards". So a private mapping is turned into anonymous memory at map
+time, page by page. An anonymous mapping, a `memfd` and a framebuffer alias are lazy (they go
+through `map_frames`/`MappedInode` and fault in through `mmap_frame`); an ext4/ramfs file is not.
+
+What it costs a real session: a compositor that starts through Mesa and LLVM maps a few hundred
+megabytes of shared objects, so startup blocks for ~15 s inside `mmap` - the twenty seconds of
+silence, measured. The direction is to give a plain file the same fault path the frame-backed
+inodes have (the fault reads the page at the faulting offset from the inode, the VMA remembers the
+descriptor's inode), and to keep the eager copy only where a copy is the correct semantics
+(`MAP_SHARED` of a file this kernel cannot write back). Not landed; the numbers above are the
+"before" this entry will be closed against.

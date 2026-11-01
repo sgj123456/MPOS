@@ -8387,3 +8387,28 @@ guest (`apk add sway`, the package is not in the image):
 Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
+
+### Item 176 - a private file mapping copies the whole file inside `mmap(2)` (2026-11-01, open)
+
+Found via `sway`'s silent DRM startup (§7.4, item 175). Measured on the guest
+(`build/scratch/ipc/pf2.c`, cold page cache): `mmap(2)` of a file costs
+21.6 ms/1 MiB, 132 ms/8 MiB, 499 ms/32 MiB, 2 451 ms/128 MiB, 3 440 ms/180 MiB -
+linear in the length, with the first touch of every page afterwards free, i.e.
+the call itself read the file. `read(2)` on the same file runs at 329 MB/s and
+`dd` at 377 MB/s, so the ~55 MB/s here is the per-page shape: 4 KiB, one frame
+allocation and one `read_at` per page.
+
+The code says why (`src/syscall/linux/proc.rs`, the ordinary-file arm): a
+private mapping is *copied* into anonymous pages at map time, because nothing
+tracks the file afterwards. Anonymous and frame-backed mappings are already
+lazy (`map_frames`/`mmap_frame`); a plain file is the one shape without a fault
+path. Cost to a session: a compositor's ~500 MB of Mesa/LLVM shared objects
+blocks ~15 s inside `mmap` - the twenty-second silence sway's DRM backend
+showed.
+
+Direction: give a plain file the fault path the frame-backed inodes have (the
+VMA keeps the inode, the fault reads the page at the faulting offset) and keep
+the eager copy only where a copy is the right semantics (`MAP_SHARED` of a file
+with no writeback). Pinned as an observation by the numbers above, not by a
+`t-*` program: a timing claim is not a contract, and the semantics pin lands
+with the fault path.
