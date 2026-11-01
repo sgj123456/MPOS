@@ -648,9 +648,11 @@ In the order that keeps each step verifiable on its own:
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
-section states direction only: the frontier is the second compositor family (the wlroots one,
-whose first compositor to come up here is still unfound — `sway` binds no IPC socket and the GL
-card is already Mesa's, §7.4) and closing the remaining ABI gaps below. The block layer's counters
+section states direction only: the frontier is the second compositor family (the wlroots one, which
+now comes up on this kernel — `sway` runs as a compositor, binds its IPC socket and applies three
+transactions, §7.4a; what it cannot do yet is scan out a client buffer, and the run names one real
+kernel gap, the missing framebuffer-close request, item 179) and closing the remaining ABI gaps
+below. The block layer's counters
 now read on a desktop boot — the submit/retire pair and the mailbox agree at all 115 heartbeats of
 three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`
 (§7.9b, item 148). The kernel's half of it is now measured out: one uevent announcement reaches

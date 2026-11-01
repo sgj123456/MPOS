@@ -8388,6 +8388,31 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 179 - the framebuffer-close request is missing, and wlroots only falls back on `EINVAL` (2026-11-01, open)
+
+Measured in the same sway run as item 178 (`build/scratch/swayd/sway.log`, two lines at
+`00:00:38.80`), and read out of wlroots 0.20.1's `backend/drm/fb.c`:
+
+```c
+int ret = drmModeCloseFB(drm->fd, fb->id);
+if (ret == -EINVAL) { ret = drmModeRmFB(drm->fd, fb->id); }
+if (ret != 0) { wlr_log_errno(WLR_ERROR, "Failed to close FB"); }
+```
+
+The guest answers `-25` there, which `strerror` prints as "Not a tty". `<drm.h>` puts the request at
+`DRM_IOWR(0xD0, struct drm_mode_closefb)` (`{ __u32 fb_id; __u32 pad; }`) and documents what makes it
+different from `RMFB`: "this IOCTL is similar to ... RMFB, except it doesn't disable planes and
+CRTCs. As long as the framebuffer is used by a plane, it's kept alive. When the plane no longer uses
+the framebuffer ... the framebuffer is cleaned up." This card's dispatch falls off the end of the
+`match` for `0xD0` and answers `ENOTTY` (its own `sequence_refused()`, item 003's convention), which
+is exactly the answer wlroots does **not** fall back from - so a compositor that closes a
+framebuffer on a flicker-free transition leaks its slot here rather than reusing it.
+
+Next: measure Linux's answers for `0xD0` (unknown id, an id this file did not create, a closed id,
+one still on a plane, and `RMFB` after `CLOSEFB`) on a Linux guest with virtio-gpu, then serve it -
+reuse only when the plane no longer names the fb, defer the release otherwise - and pin it at the
+decode level in a host test, since no sweep lane runs a compositor.
+
 ### Item 178 - the wlroots DRM backend starts; scan-out's dma-buf is the next wall (2026-11-01, open)
 
 Measured after item 177 landed. `WLR_BACKENDS=drm WLR_RENDERER=gles2 sway --debug` on the guest
@@ -8398,11 +8423,23 @@ with explicit modifiers, `Virtual-1` enabled, three transactions applied, IPC cl
 
 The compositing is not scan-out: every commit repeats `[backend/drm/fb.c:147] Failed to get DMA-BUF
 from buffer` then `[backend/drm/drm.c:792] connector Virtual-1: Failed to import buffer for
-scan-out`, with `[render/egl.c:189] EGL DMA-BUF format modifiers unsupported` earlier. So the
-kernel's own framebuffer path (kmscube, the paint gate) works and the route a client's GBM buffer
-takes does not; `fb.c:147` is `drmPrimeHandleToFD`, whose errno is the next measurement. Teardown
-also answers `ENOTTY` where wlroots expects an rmfb (`[backend/drm/fb.c:223] Failed to close FB:
-Not a tty`).
+scan-out` (36 and 36 lines in `build/scratch/swayd/sway.log`), with `[render/egl.c:189] EGL DMA-BUF
+format modifiers unsupported` earlier. So the kernel's own framebuffer path (kmscube, the paint
+gate) works and the route a client's GBM buffer takes does not.
+
+**The attribution above was wrong on first reading, and wlroots 0.20.1's source says where the wall
+really is.** `backend/drm/fb.c`'s `drm_fb_create` opens with
+`if (!wlr_buffer_get_dmabuf(buf, &attribs)) { wlr_log(WLR_DEBUG, "Failed to get DMA-BUF from
+buffer"); return NULL; }` - the failing call is **clientside**, in the compositor's own buffer
+abstraction, before any kernel door is reached. An instrumented `prime_handle_to_fd` in
+`src/drivers/drm/fb.rs` (a print on every `None`, plus the reason) confirmed it: the sway boot
+exported **2** handles (`PRIME export <- handle 1`, `handle 3`) and printed **0** refusal lines, so
+`drmPrimeHandleToFD` is not what answers.
+
+What is left as the next measurement is the buffer's own export path - Mesa's
+`gbm_bo_get_fd_for_plane` on this virgl/GBM stack - which is userspace and therefore outside the
+kernel's ABI again; the kernel-side route a compositor takes to scan-out is served (`ADDFB2`
+modifiers, test commit, page-flip events, three transactions applied).
 
 ### Item 177 - a private mapping of a file faults its pages in (2026-11-01, landed)
 

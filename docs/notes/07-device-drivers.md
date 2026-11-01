@@ -7616,3 +7616,50 @@ probe (`build/scratch/noudev/`, `build/scratch/qmove/`). `t-uevent-multi`
 remains the pin that the wake *works*, and it would go red if the new door were
 wired wrong — the lane's absence is a limitation of the instrument, recorded
 here rather than hidden behind a green run.
+
+### 7.4a Where the wlroots scan-out wall actually is — **MEASUREMENT**
+
+Item 178 recorded the DRM backend starting and every commit failing at `fb.c:147` with
+`Failed to get DMA-BUF from buffer`. The first reading of that line - "so our `drmPrimeHandleToFD`
+is refusing" - was wrong, and the wlroots 0.20.1 source says so plainly. `backend/drm/fb.c`'s
+`drm_fb_create` opens with
+
+```c
+struct wlr_dmabuf_attributes attribs;
+if (!wlr_buffer_get_dmabuf(buf, &attribs)) {
+    wlr_log(WLR_DEBUG, "Failed to get DMA-BUF from buffer");
+    return NULL;
+}
+```
+
+i.e. the failure is in the compositor's own `wlr_buffer` implementation, before any ioctl. The
+kernel-side confirmation: `src/drivers/drm/fb.rs`'s `prime_handle_to_fd` was instrumented for one
+boot to print a reason on every `None` (handle out of range, no such handle or no holders, no frames
+ensure). The sway boot exported exactly **two** handles (`handle 1`, `handle 3` - the framebuffer the
+compositor built itself) and printed **zero** refusal lines, so the prime door is not the one being
+asked. `drm_connector_state_update_primary_fb` (`backend/drm/drm.c`) hands `drm_fb_import` the
+`state->base->buffer` locked as is when the backend has no mgpu renderer, so the buffer is whatever
+the renderer's swapchain produced - Mesa's `gbm_bo_get_fd_for_plane` on this virgl/GBM stack, which
+is userspace and outside this kernel's ABI. The kernel's share of that route is served: `ADDFB2`
+with modifiers, a test commit, page-flip events and three applied transactions.
+
+The one real kernel gap the same run names is teardown: `backend/drm/fb.c` closes a framebuffer with
+`drmModeCloseFB` and falls back to `drmModeRmFB` **only** when the answer is `-EINVAL`
+
+```c
+int ret = drmModeCloseFB(drm->fd, fb->id);
+if (ret == -EINVAL) { ret = drmModeRmFB(drm->fd, fb->id); }
+if (ret != 0) { wlr_log_errno(WLR_ERROR, "Failed to close FB"); }
+```
+
+This card answers `-25` for `0xD0` (the request is not in the dispatch `match`), and `strerror(25)`
+is "Not a tty" - the two `[backend/drm/fb.c:223] Failed to close FB: Not a tty` lines at
+`00:00:38.80` in `build/scratch/swayd/sway.log`. `<drm.h>`'s own documentation of the request is
+what makes it worth serving rather than tolerating: `CLOSEFB` closes the framebuffer *without*
+disabling planes and keeps it alive while a plane still names it, which is precisely what a
+flicker-free transition needs. Work list item 179 carries the next measurement (Linux's answers for
+unknown, foreign, already-closed, still-on-a-plane, and `RMFB`-after) and the shape of the fix.
+
+Instrument note: the print was temporary and the untouched file is restored
+(`git diff --stat` clean at `8d81b62`); a boot costs ~11 minutes, so the diagnostic and the
+attribution fix land in the same round rather than a second boot.
