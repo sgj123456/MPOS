@@ -1,7 +1,8 @@
 use super::card::{DrmCard, create_dumb, map_dumb};
 use super::fb::{
-    BufferGone, add_fb, add_fb2, destroy_handle, drop_fb_hold, gamma_refused, get_fb, get_fb2,
-    hide_host_cursor, prime_fd_to_handle, prime_handle_to_fd, sequence_refused, tell_buffer_gone,
+    BufferGone, add_fb, add_fb2, close_fb, destroy_handle, drop_fb_hold, gamma_refused, get_fb,
+    get_fb2, hide_host_cursor, prime_fd_to_handle, prime_handle_to_fd, sequence_refused,
+    tell_buffer_gone,
 };
 use super::flip::{mode_cursor, page_flip};
 use super::master::{
@@ -229,10 +230,23 @@ pub fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         super::abi::NR_CRTC_GET_SEQUENCE | super::abi::NR_CRTC_QUEUE_SEQUENCE => sequence_refused(),
         NR_ADDFB => add_fb(arg, ofd),
         NR_ADDFB2 => add_fb2(arg, ofd),
+        // The close that leaves the plane alone: the framebuffer stops being
+        // findable at once, but a plane that still names it keeps its pixels
+        // until the plane moves on (`fb::drop_closed_fbs`).
+        super::abi::NR_CLOSEFB => close_fb(arg, ofd),
         NR_RMFB => {
             let id = unsafe { (arg as *const u32).read_unaligned() };
-            let (cursor_died, gone) = critical_section::with(|cs| {
+            let outcome = critical_section::with(|cs| {
                 let mut st = STATE.borrow(cs).borrow_mut();
+                // A framebuffer `MODE_CLOSEFB` already closed is out of reach, and
+                // Linux answers `ENOENT` for it - the same answer as an id that was
+                // never made (measured on 7.2.11).
+                let matches = |f: &Option<super::state::Framebuffer>| {
+                    f.as_ref().is_some_and(|f| f.id == id && !f.closed)
+                };
+                if !st.fbs.iter().any(matches) {
+                    return Err(-2); // ENOENT
+                }
                 // What the framebuffers being removed each held, read before they
                 // go: a handle the client released earlier stays alive only as long
                 // as a framebuffer names it, and this is one of the two doors that
@@ -241,12 +255,12 @@ pub fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
                 let held: Vec<u32> = st
                     .fbs
                     .iter()
+                    .filter(|f| matches(f))
                     .filter_map(|f| f.as_ref())
-                    .filter(|f| f.id == id)
                     .map(|f| f.handle)
                     .collect();
                 for fb in st.fbs.iter_mut() {
-                    if fb.as_ref().is_some_and(|f| f.id == id) {
+                    if matches(fb) {
                         *fb = None;
                     }
                 }
@@ -266,18 +280,23 @@ pub fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
                 } else {
                     None
                 };
-                (cursor_died, gone)
+                Ok((cursor_died, gone))
             });
-            // The pointer first, then the buffers: the cursor's binding is the
-            // thing that must not be left naming a resource the device has been
-            // told to drop.
-            if let Some((res, _)) = cursor_died {
-                hide_host_cursor(res);
+            match outcome {
+                Err(e) => e,
+                Ok((cursor_died, gone)) => {
+                    // The pointer first, then the buffers: the cursor's binding is
+                    // the thing that must not be left naming a resource the device
+                    // has been told to drop.
+                    if let Some((res, _)) = cursor_died {
+                        hide_host_cursor(res);
+                    }
+                    for gone in gone {
+                        tell_buffer_gone(gone);
+                    }
+                    0
+                }
             }
-            for gone in gone {
-                tell_buffer_gone(gone);
-            }
-            0
         }
         NR_PAGE_FLIP => page_flip(arg, card.lease()),
         // The cursor plane's legacy door. Both spellings carry the same request
@@ -380,8 +399,10 @@ pub(crate) fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         // `ENOTTY` without ever looking at the struct.
         super::abi::NR_CRTC_GET_SEQUENCE | super::abi::NR_CRTC_QUEUE_SEQUENCE => (24, true),
         NR_ADDFB => (28, false),
-        NR_ADDFB2 => (104, false),   // struct drm_mode_fb_cmd2
-        NR_RMFB => (4, false),       // struct drm_mode_rmfb
+        NR_ADDFB2 => (104, false), // struct drm_mode_fb_cmd2
+        NR_RMFB => (4, false),     // struct drm_mode_rmfb
+        // struct drm_mode_closefb: fb_id@0, pad@4 - both read, neither written.
+        super::abi::NR_CLOSEFB => (8, false),
         NR_PAGE_FLIP => (24, false), // struct drm_mode_crtc_page_flip
         // The lease family, at `drm_mode.h`'s own sizes, which are `sizeof` of
         // the structs and not the count of words this driver touches:

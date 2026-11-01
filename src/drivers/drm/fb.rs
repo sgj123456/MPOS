@@ -67,6 +67,7 @@ pub(crate) fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape, owner: u
         format: shape.format,
         modifier: shape.modifier,
         owner,
+        closed: false,
     }));
     Some(id)
 }
@@ -211,8 +212,13 @@ pub(crate) fn get_fb(arg: usize) -> isize {
             .filter_map(|f| f.as_ref())
             .find(|f| f.id == id)
         else {
-            return libc_einval();
+            // An id nobody made is `ENOENT` on Linux too (`build/scratch/cfb/unk.c`),
+            // not the `EINVAL` this door said for years.
+            return -2; // ENOENT
         };
+        if fb.closed {
+            return -2; // ENOENT
+        }
         unsafe {
             ((arg + 4) as *mut u32).write_unaligned(fb.width);
             ((arg + 8) as *mut u32).write_unaligned(fb.height);
@@ -263,8 +269,11 @@ pub(crate) fn get_fb2(arg: usize) -> isize {
             .filter_map(|f| f.as_ref())
             .find(|f| f.id == id)
         else {
-            return libc_einval();
+            return -2; // ENOENT - never made, or closed (measured on Linux)
         };
+        if fb.closed {
+            return -2; // ENOENT
+        }
         unsafe {
             let p = arg as *mut u8;
             let w32 = |off: usize, v: u32| (p.add(off) as *mut u32).write_unaligned(v);
@@ -285,6 +294,88 @@ pub(crate) fn get_fb2(arg: usize) -> isize {
         }
         0
     })
+}
+
+/// `MODE_CLOSEFB`: close a framebuffer without taking the picture away.
+///
+/// `<drm.h>` documents the difference from `RMFB` in terms a caller can observe:
+/// the framebuffer stops being findable, but "as long as the framebuffer is used
+/// by a plane, it's kept alive. When the plane no longer uses the framebuffer ...
+/// the framebuffer is cleaned up." So a close of the framebuffer the scan-out is
+/// drawn from marks it closed and leaves the pixels alone; a close of anything
+/// else releases it at once, which is exactly what `RMFB` does there.
+///
+/// Measured on Linux 7.2.11 (real card, unprivileged, no master): the first close
+/// answers 0, then a second close, `RMFB`, `GETFB` and `GETFB2` all answer
+/// `ENOENT`, as does a close sent from a second descriptor for an id the first
+/// one made; an unknown id is `ENOENT`; and a nonzero `pad` is `EINVAL` - the one
+/// field of the two the kernel reads beyond the id. The "while a plane names it"
+/// branch could not be measured there (a master-less opener cannot set a CRTC -
+/// `SETCRTC` answers `EACCES`), so it follows `<drm.h>`'s sentence and is pinned
+/// by the guest's own compositor teardown instead.
+pub(crate) fn close_fb(arg: usize, owner: u64) -> isize {
+    // struct drm_mode_closefb: fb_id@0, pad@4.
+    let id = unsafe { (arg as *const u32).read_unaligned() };
+    let pad = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    if pad != 0 {
+        return libc_einval();
+    }
+    let (answer, gone) = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let Some(idx) = st.fbs.iter().position(|f| {
+            f.as_ref()
+                .is_some_and(|f| f.id == id && f.owner == owner && !f.closed)
+        }) else {
+            // Closed, never made here, or made through another description:
+            // every one of those is `ENOENT` on Linux (measured).
+            return (-2, None);
+        };
+        // A plane still names it - the scan-out in flight, or the cursor the
+        // host pointer is drawn from. Closed for lookups, alive for pixels;
+        // `drop_closed_fbs` gives it back when another framebuffer takes over.
+        if id == st.current_fb || id == st.cursor_fb {
+            if let Some(fb) = st.fbs[idx].as_mut() {
+                fb.closed = true;
+            }
+            return (0, None);
+        }
+        let handle = st.fbs[idx].as_ref().map(|f| f.handle).unwrap_or(0);
+        st.fbs[idx] = None;
+        (0, drop_fb_hold(&mut st, cs, handle))
+    });
+    if let Some(gone) = gone {
+        tell_buffer_gone(gone);
+    }
+    answer
+}
+
+/// Give back every closed framebuffer no plane names any more - the other half
+/// of `MODE_CLOSEFB`. Called where the plane moves on (a page flip, a cursor
+/// rebind, a new `ADDFB2`): the ids stay out of reach for the client from the
+/// close onwards, so this is only the moment the pixels can be released.
+pub(crate) fn drop_closed_fbs(
+    st: &mut DrmState,
+    cs: critical_section::CriticalSection,
+) -> Vec<BufferGone> {
+    let (current, cursor) = (st.current_fb, st.cursor_fb);
+    let leaving: Vec<(usize, u32)> = st
+        .fbs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            f.as_ref()
+                .filter(|f| f.closed && f.id != current && f.id != cursor)
+                .map(|f| (i, f.handle))
+        })
+        .collect();
+    let mut gone = Vec::new();
+    for (i, handle) in leaving {
+        st.fbs[i] = None;
+        if let Some(g) = drop_fb_hold(st, cs, handle) {
+            gone.push(g);
+        }
+    }
+    gone
 }
 
 /// `MODE_GETGAMMA`/`MODE_SETGAMMA` - the legacy gamma pair - refused for a CRTC

@@ -19,18 +19,25 @@ pub(crate) fn page_flip(arg: usize, lease: Option<&LeaseSet>) -> isize {
     let flags = unsafe { ((arg + 8) as *const u32).read_unaligned() };
     let user_data = unsafe { ((arg + 16) as *const u64).read_unaligned() };
     let want_event = flags & PAGE_FLIP_EVENT != 0;
-    let rc = critical_section::with(|cs| {
+    let (rc, seq, gone) = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         let rc = copy_to_scanout(&st, fb_id);
         let mut seq = 0;
+        let mut gone = Vec::new();
         if rc == 0 {
             st.current_fb = fb_id;
             st.seq = st.seq.wrapping_add(1);
             seq = st.seq;
+            // The plane has moved on: a framebuffer a client closed with
+            // `MODE_CLOSEFB` while this one still showed is released here, and
+            // only here - it stayed alive for exactly this long.
+            gone = super::fb::drop_closed_fbs(&mut st, cs);
         }
-        (rc, seq)
+        (rc, seq, gone)
     });
-    let (rc, seq) = rc;
+    for g in gone {
+        super::fb::tell_buffer_gone(g);
+    }
     if rc == 0 {
         crate::drivers::video::render::request_flush_blocking();
         // The completion is queued *after* the frame has gone out, and carries

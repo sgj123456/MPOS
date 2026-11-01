@@ -7663,3 +7663,49 @@ unknown, foreign, already-closed, still-on-a-plane, and `RMFB`-after) and the sh
 Instrument note: the print was temporary and the untouched file is restored
 (`git diff --stat` clean at `8d81b62`); a boot costs ~11 minutes, so the diagnostic and the
 attribution fix land in the same round rather than a second boot.
+
+### 7.4b `MODE_CLOSEFB` served, and the two `ENOENT` answers that came with it — **MEASUREMENT**
+
+The sway probe of §7.4a left one kernel-side gap: `drmModeCloseFB` (`DRM_IOCTL_MODE_CLOSEFB`,
+`0xD0`, `struct drm_mode_closefb { __u32 fb_id; __u32 pad; }`) fell off the dispatch's `match` and
+answered `sequence_refused()`'s `-25`, which `strerror` prints as "Not a tty" — exactly the
+`[ERROR] [wlr] [backend/drm/fb.c:223] Failed to close FB: Not a tty` line of that log. wlroots only
+falls back to `drmModeRmFB` when the call answers `EINVAL`, so a compositor here could not release a
+framebuffer it closed.
+
+Linux's answers (7.2.11, the host's own `/dev/dri/card1`; `build/scratch/cfb/{cfb,q,unk,pad}.c`):
+the first close `0`; a second close `ENOENT`; a close from a second descriptor `ENOENT`; `GETFB`,
+`GETFB2` and `RMFB` of the closed id `ENOENT`; `CLOSEFB`/`GETFB`/`GETFB2`/`RMFB` of an id nobody
+made `ENOENT`; a nonzero `pad` `EINVAL` with the framebuffer untouched. The "still used by a plane"
+branch cannot be measured unprivileged (`SETCRTC` is `EACCES` there); it follows `<drm.h>`'s sentence
+("as long as the framebuffer is used by a plane, it's kept alive") and is exercised by the pin only
+through the closed-then-`GETFB2` claim.
+
+Two answers the tree had claimed for years are not Linux's, and moved with the measurement: an
+unknown id on `GETFB`/`GETFB2` was `EINVAL` (now `ENOENT`), and `RMFB` of an unknown id answered `0`
+(now `ENOENT`). `t-drm`'s "GETFB2 of an unknown framebuffer is EINVAL" claim moved to `ENOENT` in the
+same commit — the test was the thing that was wrong, and the measurement is in the commit body.
+
+Shape served: `Framebuffer::closed` marks the slot; `close_fb` answers `0` and keeps the pixels while
+`current_fb`/`cursor_fb` still name it, releasing at once otherwise; `page_flip`/`mode_cursor`'s
+critical sections call `drop_closed_fbs` after the new scan-out is installed, so a closed framebuffer
+stays alive exactly as long as a plane names it; `RMFB`, `GETFB` and `GETFB2` answer `ENOENT` for it.
+
+Instrument: `user/tests/src/bin/t-closedfb.rs` (16 claims; libc ioctls because rustix has no DRM
+wrapper — the crate's allowed third case; `MPOS_DRM_CARD` selects the card for the host reference).
+Three uapi traps cost a rebuild cycle each and are recorded in the pin's comments: `struct
+drm_mode_create_dumb` puts **height before width**; `DRM_FORMAT_XRGB8888` is `0x3432_5258` ('XR24'
+little-endian); and the request word's type byte is `'d'` (`0x64`), so `CREATE_DUMB` is
+`0xc02064b2`, not `0xc020b2b2`. Host reference run (Linux 7.2.11): `MPOS_DRM_CARD=/dev/dri/card1` —
+all 16 `ok:`, `PASS`.
+
+Counterfactual: the `0xD0` dispatch arm back to `sequence_refused()` reddens 8 of the 16 claims -
+the first close, the second close, the second-descriptor close, both `GETFB` spellings of the closed
+id, `RMFB` of the closed id, a close of an unknown id, and the `pad` refusal; the three unknown-id
+`ENOENT` claims stay green because they belong to the `GETFB` change, which `t-drm` pins.
+
+Gates: x86_64 `pass=251 fail=0` (13.58 s), aarch64 `pass=250 fail=0` (35.74 s), kunit 35 both.
+Flakes seen on the way and green on re-run: `t-ptrace-attach` (x86_64) and `t-seccomp` (aarch64),
+both documented families. The pin runs on **both** machines because every sweep lane attaches a
+`virtio-gpu` device (`xtask/src/qemu.rs`), which is also why it is a `t-*` program rather than the
+host-only decode test this item originally proposed.

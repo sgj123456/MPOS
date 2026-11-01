@@ -8388,7 +8388,7 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
-### Item 179 - the framebuffer-close request is missing, and wlroots only falls back on `EINVAL` (2026-11-01, open)
+### Item 179 - the framebuffer-close request is served, and wlroots's fallback path is never needed (2026-11-01, landed)
 
 Measured in the same sway run as item 178 (`build/scratch/swayd/sway.log`, two lines at
 `00:00:38.80`), and read out of wlroots 0.20.1's `backend/drm/fb.c`:
@@ -8412,6 +8412,41 @@ Next: measure Linux's answers for `0xD0` (unknown id, an id this file did not cr
 one still on a plane, and `RMFB` after `CLOSEFB`) on a Linux guest with virtio-gpu, then serve it -
 reuse only when the plane no longer names the fb, defer the release otherwise - and pin it at the
 decode level in a host test, since no sweep lane runs a compositor.
+
+**Landed** (`src/drivers/drm/{abi,fb,ioctl,flip,state}.rs`, pin `user/tests/src/bin/t-closedfb.rs`).
+Linux 7.2.11 was measured against a real card rather than a guest (the host's `/dev/dri/card1`;
+dumb buffers and `ADDFB2` are not master-gated, `SETCRTC` is `EACCES` there, so the "still on a
+plane" branch could not be measured unprivileged and follows `<drm.h>`'s sentence instead):
+
+| question | answer |
+|---|---|
+| the first `CLOSEFB(fb)` | `0` |
+| a second `CLOSEFB` of that id | `ENOENT` |
+| `CLOSEFB` of it from a second descriptor | `ENOENT` |
+| `GETFB`/`GETFB2`/`RMFB` of it after the close | `ENOENT` |
+| `CLOSEFB`/`GETFB`/`GETFB2`/`RMFB` of an id nobody made | `ENOENT` |
+| `CLOSEFB` with a nonzero `pad` | `EINVAL`, and the framebuffer is untouched |
+
+The last two rows changed two things the tree had claimed for a long time: an unknown id used to be
+`EINVAL` on `GETFB`/`GETFB2` (§`NR_GETFB2`'s comment said so), and `RMFB` of an unknown id answered
+`0`. Both are `ENOENT` on Linux - measured with `build/scratch/cfb/{q,unk,pad}.c` - so the tree and
+`t-drm`'s claim moved with the measurement, which the commit body carries.
+
+Served: `MODE_CLOSEFB` (`0xD0`, size 8) marks the slot closed and keeps the pixels while a plane
+names it (`current_fb`/`cursor_fb`), answering `0`; `page_flip`'s critical section now calls
+`drop_closed_fbs` after installing the new scan-out, releasing every closed framebuffer no plane
+names any more and telling the buffer's holders. `RMFB` and both `GETFB` spellings answer `ENOENT`
+for a closed id.
+
+Pin `t-closedfb` (16 claims, `t-drm`'s unknown-id claim updated): the guest run is green on both
+machines (x86_64 and aarch64 lanes both attach a `virtio-gpu` device, so a sweep lane *does* have the
+card after all - the "no lane runs a compositor" assumption was why this was going to be a host
+test only). Host reference run against Linux 7.2.11: `MPOS_DRM_CARD=/dev/dri/card1 ...` - all 16
+`ok:`, `PASS`. Counterfactual (the `0xD0` dispatch arm back to `sequence_refused()`): 8 of 16 claims
+red - every close claim, `RMFB`-of-closed, and the `pad` refusal; the three unknown-id `ENOENT`
+claims stay green because that is the separate `GETFB` change, which `t-drm` pins.
+Gates: x86_64 `pass=251 fail=0` (13.58 s), aarch64 `pass=250 fail=0` (35.74 s), kunit 35 both;
+flakes seen and re-run green: `t-ptrace-attach` (x86_64), `t-seccomp` (aarch64).
 
 ### Item 178 - the wlroots DRM backend starts; scan-out's dma-buf is the next wall (2026-11-01, open)
 

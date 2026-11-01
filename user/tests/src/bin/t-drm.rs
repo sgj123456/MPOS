@@ -1172,17 +1172,19 @@ fn main() {
         FORMAT_XRGB8888 as isize,
     );
 
-    // A framebuffer id the card never made: `EINVAL`, the same answer the
-    // legacy GETFB gives, so the two spellings of the question agree.
+    // A framebuffer id the card never made: `ENOENT`, the answer the legacy
+    // GETFB gives too - measured on Linux 7.2.11 (`build/scratch/cfb/unk.c`,
+    // both calls `errno=2`). This claim said `EINVAL` until MODE_CLOSEFB's
+    // measurement showed the two questions have one answer, not two.
     let mut g4 = FbCmd2 {
         fb_id: 0xffff,
         ..FbCmd2::default()
     };
     check_refused(
         &mut r,
-        "GETFB2 of an unknown framebuffer is EINVAL",
+        "GETFB2 of an unknown framebuffer is ENOENT",
         unsafe { ioctl(fd, ioc_d(NR_GETFB2, 104), (&raw mut g4) as *mut c_void) },
-        Errno::INVAL,
+        Errno::NOENT,
     );
 
     // --- the cursor plane ----------------------------------------------------

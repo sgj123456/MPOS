@@ -247,6 +247,13 @@ pub(crate) struct Framebuffer {
     /// owner this card's framebuffers outlive every session that made them,
     /// and `GETRESOURCES` then lists ids no client can account for.
     pub(crate) owner: u64,
+    /// Set by `MODE_CLOSEFB`: the framebuffer is closed for every lookup the
+    /// client makes (a second close, `GETFB`, `GETFB2` and `RMFB` all answer
+    /// `ENOENT`), but the scan-out plane keeps its pixels until a flip names
+    /// another framebuffer - which is what `<drm.h>` says the request is for:
+    /// "as long as the framebuffer is used by a plane, it's kept alive". The
+    /// deferred release is [`super::fb::drop_closed_fbs`].
+    pub(crate) closed: bool,
 }
 
 /// The identity record of one dma-buf this card has been involved with: the

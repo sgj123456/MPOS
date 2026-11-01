@@ -40,9 +40,7 @@ pub(crate) fn create_dumb(arg: usize, ofd: u64) -> isize {
             ((arg + 24) as *mut u64).write_unaligned(d.size());
         }
     });
-    crate::println!(
-        "mpos-dbg: CREATE_DUMB -> handle {handle} ({width}x{height} {bpp}bpp) ofd={ofd}"
-    );
+    crate::println!();
     0
 }
 

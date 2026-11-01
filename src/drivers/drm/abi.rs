@@ -173,6 +173,14 @@ pub(crate) const NR_GETPROPBLOB: u32 = 0xac;
 pub(crate) const NR_GETFB: u32 = 0xad;
 pub(crate) const NR_ADDFB: u32 = 0xae;
 pub(crate) const NR_RMFB: u32 = 0xaf;
+/// `MODE_CLOSEFB`: `<drm.h>`'s `DRM_IOWR(0xD0, struct drm_mode_closefb)`, the
+/// close that `RMFB` is not. Measured on Linux 7.2.11 against a real card
+/// (unprivileged, no master): the first close answers 0, and then every door
+/// answers `ENOENT` - a second close, `RMFB`, `GETFB` and a close sent from a
+/// second descriptor. `fb_id` unknown or made by another file is `ENOENT` too,
+/// and a nonzero `pad` is `EINVAL` (the one field the kernel does read beyond
+/// the id).
+pub(crate) const NR_CLOSEFB: u32 = 0xd0;
 pub(crate) const NR_PAGE_FLIP: u32 = 0xb0;
 /// The four requests §7.4's list names that this card answers by *refusing*
 /// rather than by falling off the end of the dispatch `match`, plus `GETFB2`.
