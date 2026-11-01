@@ -7664,6 +7664,30 @@ Instrument note: the print was temporary and the untouched file is restored
 (`git diff --stat` clean at `8d81b62`); a boot costs ~11 minutes, so the diagnostic and the
 attribution fix land in the same round rather than a second boot.
 
+### 7.4d The export doors answer; EGL on the card node does not initialize — **MEASUREMENT**
+
+§7.4c named the next instrument: a guest probe that exports a GBM buffer through both spellings.
+It was built from the image §7.4a used (`build/scratch/swayd/`, source `gbm.c` and `eglprobe.c`;
+`apk add gcc musl-dev mesa-dev` inside the guest), and it answers more than the question:
+
+| probe | result |
+|---|---|
+| dumb bo on `/dev/dri/card0` (no EGL): `gbm_bo_get_fd` | **6** (success) |
+| the same bo: `gbm_bo_get_fd_for_plane(0)` | **7** (success) |
+| the same bo: `gbm_bo_get_modifier` | `0x0` (`LINEAR`), stride 512 |
+| EGL on card0: `eglInitialize` | **0**, `eglGetError` `0x3001` (`EGL_NOT_INITIALIZED`) |
+| EGL on `renderD128`: `eglInitialize` | **1**, EGL 1.5, vendor `Mesa Project` |
+| full swapchain on `renderD128` (gbm_surface + GLES2 clear + `eglSwapBuffers` + `lock_front_buffer`): `gbm_bo_get_fd` / `_for_plane(0)` | **10 / 11** (both success), plane count 1, stride 1024 |
+
+So **the kernel's export path is not the wall**: both spellings succeed on a real rendered surface,
+with the modifier this device publishes (`LINEAR`). What the probe did find is a client-side split
+worth naming: **EGL cannot initialize on the card node at all** (`0x3001`), only on the render node -
+which is why wlroots' renderer ends up on `renderD128` while its scan-out buffers must come from the
+card's own `gbm_device`. Whether that split is where `wlr_buffer_get_dmabuf` fails is the next
+question, and the probe gives it two shapes to test: call `drmSetMaster` before `eglInitialize` on
+card0 (sway holds master, this probe did not), and run the card-node EGL path again with the kernel's
+`prime_handle_to_fd` instrumented so a refusal prints its reason.
+
 ### 7.4c The wall is the atomic swapchain's dma-buf export, not the prime door — **MEASUREMENT**
 
 §7.4a localized the failure to `wlr_buffer_get_dmabuf` and cleared the kernel's prime door. The

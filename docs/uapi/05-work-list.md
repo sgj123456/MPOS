@@ -8462,6 +8462,12 @@ scan-out` (36 and 36 lines in `build/scratch/swayd/sway.log`), with `[render/egl
 format modifiers unsupported` earlier. So the kernel's own framebuffer path (kmscube, the paint
 gate) works and the route a client's GBM buffer takes does not.
 
+**Narrowed again (§7.4d)**: the export doors answer both spellings - a rendered GBM surface on
+`renderD128` exports `gbm_bo_get_fd` = 10 and `_for_plane(0)` = 11 - while **EGL does not
+initialize on the card node** (`eglInitialize` 0, `eglGetError 0x3001`) and does on `renderD128`.
+So the renderer/scan-out split (render node for EGL, card node for scan-out buffers) is the next
+thing to test, not the prime door.
+
 **Narrowed again (§7.4c)**: the wall is the *atomic* swapchain's buffer, not scan-out in general. One
 boot varied what the backend may use (`build/scratch/swayd/aa-sway4.start`): `WLR_DRM_NO_MODIFIERS=1`
 still printed 17 `Failed to get DMA-BUF from buffer` / 17 `Failed to import buffer for scan-out`,
