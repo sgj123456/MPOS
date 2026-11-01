@@ -8624,4 +8624,17 @@ away, and is not Linux's answer anyway (Linux prints the path the descriptor was
 **Fixed**: the label is kept for `NodeKind::File` too, which also makes `/proc/self/fd/<n>` on a
 regular file answer the opened path rather than a tree search. **Pin**: the claim above, plus the
 whole file (68 claims) on both arms. Gates: x86_64 `pass=252`, aarch64 `pass=251`.
+## 184. An unlinked descriptor's name lacks ` (deleted)` (2026-11-02, named divergence)
+
+**Linux measured** (`build/scratch/del/del.c`, 7.2.11): `/proc/self/fd/3` and the `maps` line of the
+same file change from `/tmp/delprobe.5WhpiH` to `/tmp/delprobe.5WhpiH (deleted)` once the path is
+unlinked. Both doors here keep printing the bare path (item 183 made them print the path at all).
+
+**Why it is named and not implemented**: the suffix needs "this inode has no names left", and
+`Inode::nlink()` answers `0` for *not tracked* as well as for *no names* - `stat` turns that `0` into
+the kind's convention. Ramfs keeps a real count (`links` cell, `set_nlink` on link/unlink) and
+ext4 reads `i_links_count`; the rest do not.
+
+**Prerequisite**: a trait-level `name_is_gone()` beside `nlink()`, implemented where the count is
+real. Until then no door invents a suffix.
 

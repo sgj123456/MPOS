@@ -4553,3 +4553,29 @@ the claim above passes on both arms, and nothing else in the pin (which reads `f
 own claims and `t-maps`' remaining 67) moved.
 
 Full record: `docs/uapi/` §5.1 item 183.
+
+### 6.70 An unlinked descriptor's name lacks " (deleted)" — **a named divergence (2026-11-02)**
+
+Linux appends ` (deleted)` to a name once the path it was opened by is gone, and it does so on both
+doors (`build/scratch/del/del.c`, Linux 7.2.11):
+
+```
+/proc/self/fd/3 -> /tmp/delprobe.5WhpiH
+7f8441add000-7f8441adf000 rw-s 00000000 00:34 65483  /tmp/delprobe.5WhpiH
+/proc/self/fd/3 -> /tmp/delprobe.5WhpiH (deleted)
+7f8441add000-7f8441adf000 rw-s 00000000 00:34 65483  /tmp/delprobe.5WhpiH (deleted)
+```
+
+Neither door does here, and the reason is a missing answer rather than a missing print: the suffix
+needs "this inode has no names left", and `Inode::nlink()` answers **0 for "not tracked"** - every
+node whose filesystem keeps no count reports 0 and `stat` turns that into the kind's convention - so
+`nlink() == 0` cannot tell an unlinked file from an inode that never counted. Ramfs does keep a real
+count (`RamFile`/`RamDir`'s `links` cell, `set_nlink` on link/unlink), so a per-inode "the name is
+gone" answer is available for the memory filesystems and absent for the ones that do not count.
+
+Named, not stubbed: the doors print the path the descriptor was opened by (item 183) and stop there.
+The prerequisite for the suffix is a trait-level answer that distinguishes the two zeros - a
+`name_is_gone()` alongside `nlink()`, implemented by ramfs and by ext4's real count - and once it
+exists both doors print Linux's spelling. Nothing returns a made-up name in the meantime.
+
+Full record: `docs/uapi/` §5.1 item 184.

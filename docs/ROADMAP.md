@@ -647,6 +647,8 @@ In the order that keeps each step verifiable on its own:
 
   A regular file's descriptor now keeps the path it was opened by, so its mapping's line in
   `/proc/<pid>/maps` is named as Linux's is and `/proc/self/fd/<n>` answers the path (item 183).
+  Linux's ` (deleted)` suffix is a named divergence: the signal that would print it is missing, since
+  `nlink()` answers 0 for "not tracked" too (item 184).
   A generated procfs file is a snapshot for the length of one read: `/proc/<pid>/maps` re-rendered
   on every `read_at`, so a chunked reader of a file the process was growing printed a span twice
   (`insert_present`'s clipping fixed a second defect on the same path; item 182).
