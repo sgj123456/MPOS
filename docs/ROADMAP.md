@@ -658,6 +658,11 @@ every listener, parked or spinning, in one process or two (§7.9e, item 152, pin
 `t-uevent-multi`), and every receive door on a device-event socket answers the event - `recv(2)`
 and `read(2)` had answered `EBADF` while only `recvmsg(2)` worked (§7.9r, item 165, pinned by
 `t-uevent-doors`), because a listener's choice of door must not decide whether it hears a device.
+The compositor's twenty-second silence is measured out as well: a private mapping of a file copied
+the whole file *inside* `mmap(2)` (3.4 s for a 189 MB shared object, linear in the length), and the
+call now records an address range whose pages arrive on the fault that needs them - 0.0 ms at every
+size measured, with the I/O paid per page actually used (§10.15, item 177, pinned by
+`t-mmap-file-lazy`'s residency claims).
 Its options are Linux's table now, too: a device-event socket used to answer **zero** to every
 name it had not been told about - `SO_TYPE` included - and now answers `SOCK_RAW`/`AF_NETLINK`,
 the datagram buffer defaults with Linux's doubling, and `ENOPROTOOPT`/`EOPNOTSUPP`/`EPERM` where

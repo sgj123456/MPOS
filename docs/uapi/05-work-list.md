@@ -8388,7 +8388,35 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
-### Item 176 - a private file mapping copies the whole file inside `mmap(2)` (2026-11-01, open)
+### Item 177 - a private mapping of a file faults its pages in (2026-11-01, landed)
+
+The other half of item 176. `FilePages` (`src/sched/runtime/child_mm.rs`)
+implements `MappedObject::frame_at(index)` by filling a frame from
+`inode.read_at(index * PAGE_SIZE)`, so the fault path that already served
+anonymous, `memfd` and framebuffer mappings serves an ordinary file too;
+`handle_mmap_impl`'s ordinary-file arm sends `!shared` through
+`map_frames` with it, and `MAP_SHARED` keeps the eager copy (a copy *is* the
+semantics when there is no writeback).
+
+Measured, same probe and guest as item 176 (cold cache): `mmap(2)` is now
+0.1 ms/1 MiB, 0.0 ms/8-180 MiB (was 21.6 / 132 / 499 / 2 451 / 3 440 ms), and
+the I/O moved to the fault: first touch of every page 22.2 ms/1 MiB up to
+3 573 ms/180 MiB, i.e. read throughput unchanged and only pages a program
+actually uses are read. A compositor's ~500 MB of shared objects no longer
+costs ~15 s inside `mmap`.
+
+Pin `user/tests/src/bin/t-mmap-file-lazy.rs` (16 claims, behavioural, not a
+stopwatch): a file it creates, `fsync` + `posix_fadvise(POSIX_FADV_DONTNEED)`
+to make it cold, `mincore` before any touch says nothing is resident, after two
+reads the pages read are resident and under half the mapping is (Linux's
+fault-around window, measured with the same program on 7.2.11), a private write
+leaves the file's byte alone, and a mapping longer than the file reads zeros
+past its end. The eager copy fails the residency claims - the counterfactual.
+
+Divergence kept and named: `MAP_SHARED` of a plain file still copies at map
+time, because this kernel has no writeback path to honour sharing without it.
+
+### Item 176 - a private file mapping copies the whole file inside `mmap(2)` (2026-11-01, superseded by 177)
 
 Found via `sway`'s silent DRM startup (§7.4, item 175). Measured on the guest
 (`build/scratch/ipc/pf2.c`, cold page cache): `mmap(2)` of a file costs

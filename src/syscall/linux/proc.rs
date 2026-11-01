@@ -3766,11 +3766,29 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 name,
             );
         }
-        // An ordinary file: the bytes are read in now, because a mapping of a
-        // file this kernel does not page is a copy of what the file held and
-        // nothing tracks the file afterwards. That is the whole of a reader's
-        // `MAP_PRIVATE`, and what the dynamic linker maps a shared object with
-        // before `mprotect`ing the parts it wants writable.
+        // An ordinary file, mapped privately: the pages arrive on the faults
+        // that need them, so `mmap` is a statement about addresses again -
+        // measured, a 189 MB shared object cost 3.4 s *inside the call* while
+        // this was an eager copy (`docs/notes/` §10.15, item 176). `MAP_SHARED`
+        // keeps the copy below: sharing without writeback would alias a file
+        // this kernel cannot write back to.
+        Some(file) if !shared => {
+            let name = file
+                .label()
+                .map(|path| alloc::sync::Arc::from(path.as_str()));
+            crate::sched::map_frames(
+                base,
+                len,
+                mf,
+                crate::sched::FilePages::new(file.inode()),
+                offset,
+                false,
+                name,
+            );
+        }
+        // An ordinary file, shared or with no paging path: the bytes are read
+        // in now, because a mapping this kernel cannot page is a copy of what
+        // the file held and nothing tracks the file afterwards.
         Some(file) => {
             let inode = file.inode();
             for page in (base..base + len).step_by(PAGE_SIZE) {

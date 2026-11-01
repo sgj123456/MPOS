@@ -1718,7 +1718,7 @@ because nothing here generates OOB data. `select`'s impossible deadlines
 (`LLONG_MAX`) are saturated into a `u64` of milliseconds rather than kept exact;
 both shapes sleep "forever" either way.
 
-## §10.15 A private mapping of a file is a copy, and the copy costs seconds — open (2026-11-01)
+## §10.15 A private mapping of a file faults its pages in — closed (2026-11-01)
 
 Found while chasing why `sway` with `WLR_BACKENDS=drm` printed nothing for twenty seconds
 (§7.4's note, item 175). `strace -f` on that run shows the time inside **one `mmap(2)`**:
@@ -1755,5 +1755,34 @@ megabytes of shared objects, so startup blocks for ~15 s inside `mmap` - the twe
 silence, measured. The direction is to give a plain file the same fault path the frame-backed
 inodes have (the fault reads the page at the faulting offset from the inode, the VMA remembers the
 descriptor's inode), and to keep the eager copy only where a copy is the correct semantics
-(`MAP_SHARED` of a file this kernel cannot write back). Not landed; the numbers above are the
-"before" this entry will be closed against.
+(`MAP_SHARED` of a file this kernel cannot write back).
+
+**Landed (2026-11-01, item 177, `FilePages` in `src/sched/runtime/child_mm.rs`).** A private mapping
+of an ordinary file is now a VMA with a fault path, like the frame-backed inodes: `FilePages`
+implements `MappedObject::frame_at(index)` by handing the fault path a frame it fills from
+`inode.read_at(index * PAGE_SIZE)`, and `handle_mmap_impl`'s ordinary-file arm routes `!shared`
+through `map_frames` with it. The eager copy stays for `MAP_SHARED` only, where a copy *is* the
+semantics this kernel can honour (no writeback).
+
+The same probe, same guest, after the change:
+
+| mapping | `mmap(2)` itself | first touch of every page |
+|---:|---:|---:|
+| 1 MiB | 0.1 ms | 22.2 ms |
+| 8 MiB | 0.0 ms | 147.6 ms |
+| 32 MiB | 0.0 ms | 555.1 ms |
+| 128 MiB | 0.0 ms | 2 560.3 ms |
+| 180 MiB | 0.0 ms | 3 573.4 ms |
+
+The call is now a statement about addresses at any size, and the I/O is paid per page on the fault
+that needs it - which is also why a program that maps 190 MB and touches 10 MB of it now reads
+10 MB. Read throughput is unchanged (the touch column is the same ~55 MB/s per page).
+
+The pin is behavioural, not a stopwatch (`user/tests/src/bin/t-mmap-file-lazy.rs`): a file the
+program creates, `fsync` + `posix_fadvise(POSIX_FADV_DONTNEED)` so its pages are cold, then
+`mincore` **before** any touch answers "not resident", after two reads only those pages (and
+Linux's fault-around window, measured with the same program on 7.2.11: up to 16 pages per fault,
+so the claim is "the pages read are resident" and "fewer than half the mapping is"), a private
+write leaves the file's byte alone, and a mapping longer than the file reads zeros past its end.
+The eager copy fails the first and the third of those - which is what makes it a counterfactual
+rather than a timing comparison.

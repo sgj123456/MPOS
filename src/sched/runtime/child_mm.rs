@@ -482,6 +482,68 @@ pub fn map_anon(virt: usize, len: usize, flags: MapFlags) {
 /// what that file prints for this line, resolved from the descriptor *now*
 /// because resolving it later means walking the filesystem tree (see
 /// [`crate::vfs::File::display_name`]).
+/// A **private** mapping of an ordinary file, populated a page at a time.
+///
+/// The eager copy this replaces read the whole range inside `mmap(2)` - one
+/// frame and one 4 KiB `read_at` per page - so mapping a 189 MB shared object
+/// cost 3.4 s of the caller's system call (`docs/notes/` §10.15, item 176),
+/// and a compositor's loader spent ~15 s inside `mmap` before it printed its
+/// first line. Here the fault path calls [`MappedObject::frame_at`] for the
+/// page it needs and this object reads that page from the file then: one
+/// private copy per page, and `MAP_PRIVATE`'s promise (a write never reaches
+/// the file) holds because every page is this process's own frame.
+///
+/// `MAP_SHARED` of a plain file keeps the eager copy: sharing without
+/// writeback would alias a file this kernel cannot write back, and a write
+/// that silently vanished into a frame is worse than a copy.
+pub struct FilePages {
+    inode: Arc<dyn crate::vfs::Inode>,
+}
+
+impl FilePages {
+    /// Wrap the inode a private mapping reads from.
+    pub fn new(inode: Arc<dyn crate::vfs::Inode>) -> Arc<dyn crate::mm::vma::MappedObject> {
+        Arc::new(FilePages { inode })
+    }
+}
+
+impl crate::mm::vma::MappedObject for FilePages {
+    fn frame_at(&self, index: u64) -> Option<usize> {
+        let frame = mm::alloc_user_frame()?;
+        // A page past the end of the file keeps the zeros a short read leaves,
+        // which is POSIX's promise for the tail of a mapping.
+        let dest = unsafe {
+            core::slice::from_raw_parts_mut(
+                mm::phys_to_virt(frame) as *mut u8,
+                crate::mm::pframe::PAGE_SIZE,
+            )
+        };
+        dest.fill(0);
+        let start = (index as usize).checked_mul(PAGE_SIZE)?;
+        let mut done = 0;
+        while done < dest.len() {
+            match self.inode.read_at((start + done) as u64, &mut dest[done..]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                // A read that fails is Linux's `SIGBUS`, not a zero page: the
+                // fault refuses, and the refusal is the honest answer.
+                Err(_) => {
+                    crate::mm::free_frames(frame, 0);
+                    return None;
+                }
+            }
+        }
+        Some(frame)
+    }
+
+    fn identity(&self) -> ((u32, u32), u64) {
+        (
+            self.inode.rdev().unwrap_or((0, 0)),
+            self.inode.metadata().ino,
+        )
+    }
+}
+
 pub fn map_frames(
     virt: usize,
     len: usize,
