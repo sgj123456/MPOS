@@ -131,6 +131,94 @@ fn main() {
         libc::close(write_end);
     }
 
+    // ---- the count the wait is allowed to name ---------------------------
+    //
+    // Linux measures `nfds` against `RLIMIT_NOFILE` and answers `EINVAL` past
+    // it, *before* it reads a single entry - a second argument one past the
+    // limit is `EINVAL` even when the array is an address nothing maps
+    // (measured on the host, `build/scratch/pnfds/l7.c`: unmapped + over the
+    // limit -> `EINVAL`, unmapped + inside it -> `EFAULT`). The shape this
+    // pins is that a wait may name exactly as many descriptors as it is
+    // allowed to hold, and that the array is judged by the entries it reaches
+    // rather than by its size - which is the difference between a 4 MiB array
+    // being served and refused.
+    //
+    // The array is the two-entry one this program already owns: naming more
+    // descriptors than it holds must still answer 0 at a zero timeout where
+    // the entries below the count are reachable, because the wait never reads
+    // further than the array it was handed. That is Linux's own lazy shape
+    // (`build/scratch/pmax/s.c`: 524288 entries of a mapped array, 0 answered)
+    // and it is what a *size* check cannot express.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let got_limit =
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 && limit.rlim_cur > 0;
+    r.check("the machine answers its descriptor limit", got_limit);
+    if got_limit {
+        let over = (limit.rlim_cur as usize).saturating_add(1) as libc::nfds_t;
+        // An unmapped address and a count past the limit: the count is refused
+        // first, so this is `EINVAL` and not `EFAULT`.
+        let rc = unsafe { libc::poll(core::ptr::null_mut(), over, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        r.check(
+            "a count past the descriptor limit is refused with EINVAL",
+            rc == -1 && errno == libc::EINVAL,
+        );
+        // The same count *at* the limit, over an array that long and a zero
+        // timeout: every entry is reachable and names no descriptor, so the
+        // answer is 0. This is the shape a size check cannot serve - the
+        // array is `RLIMIT_NOFILE` entries, megabytes of it.
+        let at_limit = limit.rlim_cur as libc::nfds_t;
+        let mut room: Vec<libc::pollfd> = (0..at_limit)
+            .map(|_| libc::pollfd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            })
+            .collect();
+        let rc = unsafe { libc::poll(room.as_mut_ptr(), at_limit, 0) };
+        r.check(
+            "a count at the descriptor limit over an array that large is served",
+            rc == 0,
+        );
+        drop(room);
+        // And at the *hard* limit, which is where the size check actually
+        // bites: this machine's hard `RLIMIT_NOFILE` is 1048576, an array of
+        // 8 MiB - past the one-mebibyte window a single kernel copy is allowed
+        // (`MAX_IO`), and still a wait Linux serves for a caller allowed to
+        // hold that many descriptors. Pre-fix this was `EFAULT` for the size
+        // alone, which is the whole defect.
+        let mut raised = libc::rlimit {
+            rlim_cur: limit.rlim_max,
+            rlim_max: limit.rlim_max,
+        };
+        let raised_ok = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0;
+        r.check(
+            "the descriptor limit can be raised to its own maximum",
+            raised_ok,
+        );
+        if raised_ok {
+            let big = raised.rlim_cur as libc::nfds_t;
+            let mut wide: Vec<libc::pollfd> = (0..big)
+                .map(|_| libc::pollfd {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                })
+                .collect();
+            let rc = unsafe { libc::poll(wide.as_mut_ptr(), big, 0) };
+            r.check(
+                "a wait wider than one kernel copy window is still served",
+                rc == 0,
+            );
+            drop(wide);
+            raised.rlim_cur = limit.rlim_cur;
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) };
+        }
+    }
+
     // ---- the netlink door udevadm's settle monitors ----------------------
     //
     // `udevadm settle` opens the kernel's uevent netlink socket; a poll on it

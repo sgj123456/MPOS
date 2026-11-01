@@ -665,7 +665,15 @@ ended the machine — the buffer is now bounded by what `collect` can fill, the
 number by Linux's `INT_MAX / sizeof(struct epoll_event)`, and the caller's array
 checked as each record is written rather than all of it up front (§10.12, item
 168, pinned by `t-epoll`; the counterfactual is a 2 863 311 520-byte allocation
-and 30 programs lost).
+and 30 programs lost). Its sibling door is closed the same way: `poll(2)`/`ppoll(2)`
+bounded `nfds` by a memory window instead of by the caller's own `RLIMIT_NOFILE`,
+so a process allowed a million descriptors could not wait for them, and sized its
+watch list from the same `int` — the count is now measured against the limit and
+refused with `EINVAL` before any entry is read, each entry is validated as it is
+reached, and the list grows with the entries that pass (§10.13, item 169, pinned
+by `t-poll-wait`; the counterfactual reddens exactly the refusal and the wide
+wait, while the at-limit claim stays green because a 1024-entry array crossed no
+window — a green counterfactual is a measurement of what a claim cannot see).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

@@ -4251,6 +4251,17 @@ fn note_poll_spin(
 /// turned into the instant it names.
 fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     let (fds, nfds) = (args[0], args[1]);
+    // A wait names no more descriptors than it could ever hold: Linux measures
+    // the ceiling as `RLIMIT_NOFILE` and refuses past it with `EINVAL`, and it
+    // answers that *before* it looks at the array at all - a second argument
+    // one past the limit is `EINVAL` even when the array is an unmapped
+    // address (`build/scratch/pnfds/l7.c`: unmapped + over the limit ->
+    // `EINVAL`, unmapped + within it -> `EFAULT`). The count is the *only*
+    // thing this refusal reads, so it is checked before any byte of the
+    // caller's memory, which is also why it cannot be spelled as a size.
+    if nfds > crate::sched::current_fds().nofile() {
+        return err::EINVAL;
+    }
     let len = match nfds.checked_mul(POLLFD_SIZE) {
         Some(len) => len,
         None => return err::EINVAL,
@@ -4265,11 +4276,16 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     // argument zero) - so answering zero at once is a `pause()` that returns
     // immediately and a program idling that way spinning.
     //
-    // The array is validated only when there is one: a zero-length range needs
-    // no page, and the null `fds` the spelling above uses names none.
-    if len > 0 && !buffer_ok(fds, len, true, true) {
-        return err::EFAULT;
-    }
+    // The array is validated one entry at a time, as it is read, never as one
+    // range: a range is a *size*, and a size the caller chooses is not how
+    // Linux measures this call. Measured on the host: a wait at the descriptor
+    // limit with every entry reachable is served (`build/scratch/pmax/s.c`,
+    // 524288 entries, 4 MiB of array), while a hole anywhere the wait has to
+    // read is `EFAULT` when it reaches it (`build/scratch/pnfds/l6.c`). A
+    // whole-range check made the first shape impossible above `MAX_IO` (one
+    // mebibyte is 131072 entries, a quarter of that host's own limit) - the
+    // same defect `epoll_wait` carried until `eaef723`.
+    let _ = len;
 
     let me = crate::sched::current();
     // Ask every node to wake us before the first check: one that becomes ready
@@ -4278,9 +4294,19 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     // is what stops a caller waiting on a closed fd from sleeping forever. A
     // negative fd is not a closed one but a placeholder, and is skipped rather
     // than reported: the check below zero-answers it, so it never counts.
-    let mut nodes: Vec<Option<PollWatch>> = Vec::with_capacity(nfds);
+    // Grown entry by entry as they are validated, never sized by the count
+    // asked for: a wait that faults at its third entry allocates three slots,
+    // and a legal maximum allocates only what the caller's own descriptor
+    // ceiling already allows it to hold.
+    let mut nodes: Vec<Option<PollWatch>> = Vec::new();
     for index in 0..nfds {
         let at = fds + index * POLLFD_SIZE;
+        if !buffer_ok(at, POLLFD_SIZE, true, true) {
+            for watch in nodes.iter().flatten() {
+                watch.node.poll_unsubscribe(me);
+            }
+            return err::EFAULT;
+        }
         let fd = unsafe { (at as *const i32).read_unaligned() };
         let watch = crate::sched::current_fds()
             .clone_at(fd)

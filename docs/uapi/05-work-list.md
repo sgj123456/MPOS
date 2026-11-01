@@ -8148,3 +8148,44 @@ a **2 863 311 520-byte** allocation, the allocator panics, the machine stops and
 **30 of 246** programs fail with `memory allocation of 2863311520 bytes failed`
 — the defect, measured. `docs/notes/10-performance.md` §10.12; gates x86_64 246
 / aarch64 245, `mpos-kunit 35`.
+
+### Item 169 - a wait may name every descriptor it may hold, and the array is judged by what it reads (2026-11-01)
+
+`poll(2)`/`ppoll(2)` carried the same defect §10.12 fixed one call over, in the
+opposite direction:
+
+* **The bound was a size, not the caller's right.** `poll_wait` checked
+  `nfds * POLLFD_SIZE` against `MAX_IO` (1 MiB) as one range, so any `nfds` past
+  131072 was `EFAULT` — a process at this machine's hard `RLIMIT_NOFILE`
+  (1048576, an 8 MiB array) could not wait at all, and the refusal named memory
+  rather than the count. Linux's ceiling is the caller's **own limit**, measured
+  on 7.2.11: `RLIMIT_NOFILE=524288` serves `nfds=524288` and refuses 524289 with
+  `EINVAL`; lowering the soft limit to 4096 moves the ceiling to 4096, to
+  100000 to 100000 (`build/scratch/pmax/{p,q,r}`).
+* **The order is the count first.** An unmapped array named with `nfds` one
+  past the limit answers `EINVAL`; the same pointer inside the limit answers
+  `EFAULT` (`build/scratch/pnfds/l7`). So the refusal reads the number before
+  any byte of caller memory, and an exactly-at-limit count still validates the
+  array it names.
+* **The allocation.** `Vec::with_capacity(nfds)` sized a `Vec<Option<PollWatch>>`
+  (24 bytes/entry) from a caller-supplied `int` — 89478485 entries asked the
+  kernel heap for 2.1 GB while the loop can never register more than the
+  descriptors the process holds. Now `Vec::new()` grown by the entries that
+  pass validation.
+* **The validation is lazy.** Linux checks the array one entry at a time:
+  a hole in the middle answers `EFAULT` only when the read reaches it (512
+  entries before the hole served, 1024 reaching it `EFAULT`,
+  `build/scratch/pnfds/l1`/`l2`). `buffer_ok(at, POLLFD_SIZE, …)` now runs
+  immediately before each entry is read, and a rejected entry unsubscribes the
+  descriptors already registered.
+
+Pin: `t-poll-wait` gained four claims (the machine answers its descriptor
+limit, a count past it is `EINVAL`, a count at it over an array that large is
+served, a wait wider than one kernel copy window is still served) beside its
+fourteen. **Counterfactual** (old range check, `with_capacity(nfds)`, no
+ceiling): exactly the two claims that can distinguish the shapes go red — the
+`EINVAL` refusal and the wide wait — while the at-limit claim stays green,
+because a 1024-entry array never crossed `MAX_IO`; a green counterfactual on a
+claim is itself a measurement of what that claim cannot see.
+`docs/notes/10-performance.md` §10.13; gates x86_64 246 / aarch64 245,
+`mpos-kunit 35`.

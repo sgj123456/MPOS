@@ -1592,3 +1592,59 @@ self-test: 30 test(s) did not pass
 machine whose record is 16 bytes wide for exactly what it said. That is R.8's
 sentence made literal: a count a user names, an allocation the kernel makes, and
 a `panic = "abort"` machine that ends. Restored and re-gated green.
+
+### 10.13 A wait may name every descriptor it may hold, and the array is judged by what it reads — **DONE** (2026-11-01)
+
+§10.12 fixed `epoll_wait` and named the shape; this asks the same question of the
+other wait. `poll(2)`/`ppoll(2)` measured `nfds` against `MAX_IO` (one mebibyte,
+131072 entries at eight bytes) and answered `EFAULT` past it, and it sized its own
+bookkeeping `Vec` by the count the caller named. Both are the same two defects
+`epoll_wait` had, reached through a different door.
+
+**Linux's answer, measured** (`build/scratch/pmax/{p,q,r,s,u,v}.c`,
+`build/scratch/pnfds/{l6,l7}.c`, 7.2.11, host):
+
+- The ceiling is the caller's own descriptor limit, not a constant:
+  `nfds` = `RLIMIT_NOFILE` is served, `+1` is `EINVAL`. Lowering the soft limit
+  to 4096 moved the ceiling to 4096 and `4097` to `EINVAL`; lowering it to
+  100000 moved the ceiling to 100000. Raising the soft limit to the hard one
+  left 524288 as the largest served count — that host's `ulimit -n`.
+- The refusal comes **before** the array is touched: an unmapped pointer with
+  `nfds` one past the limit is `EINVAL`, while the same pointer inside the limit
+  is `EFAULT`. So the count is the first thing read, and the answer is not a
+  size question.
+- The array is validated lazily, entry by entry: a hole in the middle of the
+  range (`mprotect(PROT_NONE)` on the second of three pages) answers `EFAULT`,
+  and a count that stops before the hole is served (`l6.c`).
+- A legal maximum is a *large* array — 524288 entries is 4 MiB — and it is
+  served with a zero timeout answering 0.
+
+**What this kernel did.** `poll_wait` (`src/syscall/linux/fs/file.rs:4252`)
+checked `nfds * POLLFD_SIZE` against `MAX_IO` as one range, so any `nfds` past
+131072 was `EFAULT` regardless of the caller's limit — a quarter of this
+machine's own soft `RLIMIT_NOFILE` (1024) would have been fine, but a process
+at the hard limit (1048576, an 8 MiB array) could not wait at all. Its
+`Vec<Option<PollWatch>>` was `Vec::with_capacity(nfds)`, so the caller's number
+was the kernel's allocation.
+
+**Served now.** The count is checked against `crate::sched::current_fds().nofile()`
+first and refused with `EINVAL` past it; the range check is gone; each entry is
+validated with `buffer_ok(at, POLLFD_SIZE, …)` immediately before it is read,
+and a rejected entry unsubscribes the descriptors already registered; the node
+list is `Vec::new()` and grows with the entries that pass, so its size follows
+the work done rather than the number asked for.
+
+**Pin and counterfactual.** `user/tests/src/bin/t-poll-wait.rs` gained four
+claims — the machine answers its limit, a count past it is `EINVAL`, a count at
+it over an array that large is served, a wait wider than one copy window is
+still served — plus the existing fourteen. Host run: 18/18 `ok`. Gates:
+x86_64 `pass=246 fail=0`, aarch64 `pass=245 fail=0`, kunit 35 both. The
+counterfactual (old range check, `with_capacity(nfds)`, no limit) reddens
+exactly the two claims that can distinguish the shapes — the EINVAL refusal and
+the wide wait — while the at-limit claim stays green because a 1024-entry array
+never crossed `MAX_IO`; the run also carried two unrelated flakes (`t-ptrace`'s
+`PTRACE_SYSCALL`, `t-cgroupfs` exit 134) which passed on the re-run.
+
+**Named divergence.** Linux applies the caller's `RLIMIT_NOFILE`; this kernel
+does too, but its soft default is 1024 against the host's 524288, so the
+absolute counts differ. The *rule* is the same; the number is the caller's.
