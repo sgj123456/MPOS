@@ -8388,6 +8388,22 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 178 - the wlroots DRM backend starts; scan-out's dma-buf is the next wall (2026-11-01, open)
+
+Measured after item 177 landed. `WLR_BACKENDS=drm WLR_RENDERER=gles2 sway --debug` on the guest
+with `XDG_RUNTIME_DIR=/run/xdg`: 960 log lines (was 0 in 20 s, the stall item 176 measured), EGL on
+`/dev/dri/card0`, `ADDFB2 modifiers supported`, a 1280x800 XR24 `LINEAR` GBM buffer, a test commit
+with explicit modifiers, `Virtual-1` enabled, three transactions applied, IPC clients accepted -
+`sway` runs as a compositor on this kernel now.
+
+The compositing is not scan-out: every commit repeats `[backend/drm/fb.c:147] Failed to get DMA-BUF
+from buffer` then `[backend/drm/drm.c:792] connector Virtual-1: Failed to import buffer for
+scan-out`, with `[render/egl.c:189] EGL DMA-BUF format modifiers unsupported` earlier. So the
+kernel's own framebuffer path (kmscube, the paint gate) works and the route a client's GBM buffer
+takes does not; `fb.c:147` is `drmPrimeHandleToFD`, whose errno is the next measurement. Teardown
+also answers `ENOTTY` where wlroots expects an rmfb (`[backend/drm/fb.c:223] Failed to close FB:
+Not a tty`).
+
 ### Item 177 - a private mapping of a file faults its pages in (2026-11-01, landed)
 
 The other half of item 176. `FilePages` (`src/sched/runtime/child_mm.rs`)

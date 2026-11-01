@@ -3896,6 +3896,33 @@ renderer measures nothing about it.
 > first log line - a startup wait, and `strace -f /usr/bin/sway` on that run is the next
 > measurement. The old `user #PF at 0x4` NULL dereferences did not recur in either run.
 
+> **Re-measured 2026-11-01 (item 178), after a private file mapping became fault-backed
+> (§10.15, item 177): the DRM backend starts.** The same probe shape, same image, same QEMU line
+> (`build/scratch/swayd/aa-sway2.start`, `XDG_RUNTIME_DIR=/run/xdg`, `WLR_BACKENDS=drm
+> WLR_RENDERER=gles2`, 40 s timeout): the log is **960 lines** and the session gets all the way to a
+> live compositor - `Sway version 1.12` / `wlroots 0.20.1`, EGL opened on `/dev/dri/card0`, `ADDFB2
+> modifiers supported` (`backend/drm/drm.c:133`), a GBM buffer allocated `1280x800 XR24 modifier
+> LINEAR` (`render/allocator/gbm.c:118`), a test commit prepared with explicit modifiers
+> (`wlr_output_swapchain_manager.c:164`), the output `Virtual-1` enabled, three transactions
+> applied, and `sway/ipc-server.c:196` accepting clients. The stalling `mmap` was the whole
+> twenty-second silence: that earlier run's `strace -f` has the time between the entry and the
+> return of one `mmap(NULL, 189906944, PROT_READ, MAP_PRIVATE)`.
+>
+> **The next wall is scan-out's dma-buf, and the log names it**: the client buffer reaches the
+> renderer but the connector cannot import it -
+>
+>     [DEBUG] [wlr] [backend/drm/fb.c:147] Failed to get DMA-BUF from buffer
+>     [DEBUG] [wlr] [backend/drm/drm.c:792] connector Virtual-1: Failed to import buffer for scan-out
+>
+> repeated for every commit (five times in four seconds), with `[DEBUG] [render/egl.c:189] EGL
+> DMA-BUF format modifiers unsupported` earlier in the same run. The framebuffer path `kmscube`
+> and the paint gate exercise works; the path a *client's* GBM buffer takes does not. `fb.c:147` is
+> `drmPrimeHandleToFD` on the buffer's handle - the next door to measure, with the errno recorded
+> the way §7.9's uevent counters record theirs. The teardown then prints `[ERROR] [wlr]
+> [backend/drm/fb.c:223] Failed to close FB: Not a tty`: an `ioctl` on the DRM fd answered `ENOTTY`
+> where wlroots expected the rmfb call to answer 0 - a second shape to measure once scan-out's
+> import is served.
+
 The line carries no `: <strerror>` suffix — what `wlr_log_errno` appends when it has one — and the
 sequence it stands for is `unlink` of a stale path then `bind` of
 `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock` (`/run/user/0` exists, root, mode 0700). So the next
