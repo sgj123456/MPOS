@@ -4532,3 +4532,24 @@ The lesson, twice over: an intermittent report is diagnosed by pinning the invar
 assumes, and a file whose content changes under the reader must be a snapshot, not a live view.
 
 Full record: `docs/uapi/` §5.1 item 182.
+
+### 6.69 A regular file's descriptor kept no path, so its mapping had no name — **FIXED (2026-11-02)**
+
+The private-file claims of §6.68 left one column unchecked. `t-maps` grew "and its line names the
+file, as Linux's does" and it went red on a guest while the same claim passed on Linux: the mapping
+of `/t-maps-dup.bin` was listed with the right inode and offset and a **blank name column**.
+
+The label a descriptor records is the path it was opened by, and `open(2)` set it only for a
+directory (so `fchdir` then `getcwd` answers) and a character device (`ttyname` reads
+`/proc/self/fd/<n>`). An ordinary file kept none, and every door that needs the path fell back to
+`File::display_name`, which searches the filesystem tree for the inode - the right answer only while
+the name is still there, and never the answer Linux gives, since Linux prints the path the descriptor
+was opened by (with ` (deleted)` appended once it is unlinked). `mmap` takes the name column from
+`File::label()` for exactly this reason, so a private file mapping read as unnamed.
+
+The fix keeps the label for `NodeKind::File` as well, which also makes `/proc/self/fd/<n>` on a
+regular file answer the opened path instead of a tree search - Linux's shape for that door. Measured:
+the claim above passes on both arms, and nothing else in the pin (which reads `fd` links, `t-fd`'s
+own claims and `t-maps`' remaining 67) moved.
+
+Full record: `docs/uapi/` §5.1 item 183.

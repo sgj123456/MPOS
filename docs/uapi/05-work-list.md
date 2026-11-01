@@ -8609,4 +8609,19 @@ of a file the process was growing. `ProcFile` now keeps the text it rendered: a 
 zero re-renders, later chunks continue that snapshot (Linux's seq_file materialises once per open).
 Pinned by `a_chunked_read_of_a_generated_file_keeps_one_snapshot` plus `t-maps`' "no range is listed
 twice". Gates: x86_64 `pass=252`, aarch64 `pass=251`.
+## 183. A regular file's descriptor kept no path, so its mapping had no name (2026-11-02)
+
+**Measured**: `t-maps` grew "and its line names the file, as Linux's does" for a private file
+mapping; green on Linux 7.2.11, red on a guest — the line carried the right inode and offset and a
+blank name column.
+
+**Cause**: `open(2)` recorded the opened path only for `NodeKind::Dir` (`fchdir`/`getcwd`) and
+`NodeKind::CharDev` (`ttyname`). An ordinary file kept none, so every door that needs the path fell
+back to `File::display_name`'s tree search — which cannot answer for a file whose name was taken
+away, and is not Linux's answer anyway (Linux prints the path the descriptor was opened by, with
+` (deleted)` once unlinked). `mmap` takes its name column from `File::label()`.
+
+**Fixed**: the label is kept for `NodeKind::File` too, which also makes `/proc/self/fd/<n>` on a
+regular file answer the opened path rather than a tree search. **Pin**: the claim above, plus the
+whole file (68 claims) on both arms. Gates: x86_64 `pass=252`, aarch64 `pass=251`.
 

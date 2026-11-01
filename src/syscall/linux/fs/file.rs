@@ -411,12 +411,20 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // a later `fchdir` can give the cwd a name `getcwd` reads back. A
             // character device remembers too: libc's `ttyname` names the tty
             // by reading `/proc/self/fd/<n>`, and a nameless descriptor reads
-            // back as nothing at all.
+            // back as nothing at all. So does an ordinary file, for the same
+            // door and one more: Linux's `maps` names a file mapping by the
+            // path the descriptor was opened by, and the search-by-inode
+            // fallback `display_name` does cannot answer for a file whose name
+            // was taken away - measured on a guest, a private mapping of a
+            // regular file printed a blank name column where Linux prints the
+            // path (`docs/notes/` §6.68).
             if let Some(label) = label
                 && let Ok(file) = crate::sched::current_fds().clone_at(fd)
                 && matches!(
                     file.metadata().kind,
-                    crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::CharDev
+                    crate::vfs::NodeKind::Dir
+                        | crate::vfs::NodeKind::CharDev
+                        | crate::vfs::NodeKind::File
                 )
             {
                 file.set_label(label);

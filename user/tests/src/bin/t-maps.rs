@@ -541,6 +541,10 @@ fn main() {
                         "and its byte offset, as a file mapping's line has",
                         line.offset == b"00001000",
                     );
+                    r.check(
+                        "and its line names the file, as Linux's does",
+                        line.name.ends_with(b"t-maps-dup.bin"),
+                    );
                 }
                 None => r.check("a private file mapping is listed", false),
             }
