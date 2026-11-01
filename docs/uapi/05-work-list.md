@@ -8189,3 +8189,60 @@ because a 1024-entry array never crossed `MAX_IO`; a green counterfactual on a
 claim is itself a measurement of what that claim cannot see.
 `docs/notes/10-performance.md` §10.13; gates x86_64 246 / aarch64 245,
 `mpos-kunit 35`.
+
+### Item 170 - a wait's count is judged by the table it names, not by a libc constant (2026-11-01)
+
+`select(2)`/`pselect6(2)` had one refusal that was never a kernel rule and one
+number that was the wrong width:
+
+* **`FD_SETSIZE` is libc's, not the kernel's.** `select_inner` refused any
+  `nfds > 1024` with `EINVAL`. Linux serves 1024, 1025, 2048, 65536, 1048576,
+  1048577 and even 2^40 against a mapped set, and refuses only a **negative**
+  count (`build/scratch/sel/s.c`, raw `SYS_select`).
+* **What bounds it is the descriptor table's capacity, rounded up to a power of
+  two, minimum 64.** Measured by binary-searching the smallest mapped tail that
+  still succeeds against a guard page (`build/scratch/sel/t10.c`): 3 descriptors
+  open → the kernel reads 8 bytes; 65 open → 16; 253 → 32; 503 → 64; 1003 → 128;
+  2003 → 256; 3003 → 512. `RLIMIT_NOFILE` does not move it (soft 16 vs 524288,
+  same 8 bytes), and it does not shrink after descriptors are closed, so it
+  tracks the table's high-water mark. `FdTable::select_clamp` is that rule.
+* **Bits at or above the clamp are never read, never reported, never cleared.**
+  With three descriptors open, `select(2048, bit 2000 set)` answers 0 and leaves
+  byte 250 exactly as it arrived, while the same call with a closed descriptor
+  inside the clamp answers `EBADF` (`build/scratch/sel/s4.c`).
+* **The write-back width follows the clamp, not `nfds`**: `min(nfds, clamp)/8`
+  bytes, verified with markers planted past the clamp (`t31.c`).
+* **The timeout is judged before the count and before the sets**: `nfds=-1`
+  with an unmapped timeval is `EFAULT`, with `tv_sec=-1` it is `EINVAL`, and
+  only with a valid timeout does the count answer `EINVAL` (`t11`/`t12`).
+* **The two timeout shapes disagree about an over-unit field.** `select`
+  **folds** a `tv_usec` of a million or more into seconds (`{0, 2_000_000}`
+  parks 2.002 s); `pselect6` **refuses** a `tv_nsec` of a billion or more with
+  `EINVAL`; both refuse a negative field; neither has an upper bound (1e18 and
+  `LLONG_MAX` are accepted and simply never expire) (`t2`/`t3`/`t6`). The
+  millisecond fold now saturates instead of wrapping, so an eternity is not
+  turned into an instant.
+* **A signal writes the time back.** On `EINTR` Linux leaves the sets exactly
+  as they arrived but rewrites the remainder (`{3,0}` interrupted at 1 s
+  answers `{1, 999934}`), and in the caller's own unit - a `pselect6` caller
+  reads nanoseconds (`t17`/`t18`).
+
+**The write-back unit was a second defect.** The old tail wrote
+`remaining_ms % 1000 * 1000` into the sub-second field for both shapes, so a
+`pselect6` caller read microseconds through a `timespec`. `write_time_left` now
+takes the shape and divides by 1000 only for the `timeval`, and the `EINTR`
+path calls it before answering.
+
+Pin: `t-select.rs`, a new program - nothing in the suite exercised `select` at
+all - with 22 claims covering each line above, built on raw sets because libc's
+`fd_set` is 1024 bits and cannot state the larger counts. aarch64 has no
+`select` syscall number at all (asm-generic dropped it; `nr_aarch64.rs` records
+it as unreachable), so the program emulates it on `pselect6` exactly as libc
+does, and the one claim that is `select`'s own shape (the fold) is `cfg`-split
+to state what the emulation does instead.
+
+**Counterfactual** (the old `FD_SETSIZE` refusal and the caller-sized bytes):
+exactly four claims go red - a count past `FD_SETSIZE`, a count a million past
+the table, a bit far above the table, and a count far past the table needing
+only the table's bytes. `docs/notes/10-performance.md` §10.14; gates x86_64 247
+/ aarch64 246, kunit 35, host lib 720.

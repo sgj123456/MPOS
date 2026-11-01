@@ -2350,16 +2350,44 @@ pub(crate) fn ppoll_ms(sec: i64, nsec: i64) -> Result<u64, isize> {
 
 /// The millisecond duration a `select`/`pselect6` timeout names. `timespec`
 /// picks the shape: `pselect6` hands a `struct timespec` (nanoseconds),
-/// `select` a `struct timeval` (microseconds), and the sub-second field is
-/// validated against its own unit before it is folded in. Beyond a few
-/// centuries, or a fraction that does not fit its unit, is a corrupted
-/// timeout - Linux clamps; a bounded answer beats wrapping.
-pub(crate) fn select_timeout_ms(sec: u64, frac: u64, timespec: bool) -> Result<u64, isize> {
-    let unit = if timespec { 1_000_000 } else { 1_000 };
-    if sec >= (1 << 43) || frac >= unit * 1_000 {
+/// `select` a `struct timeval` (microseconds).
+///
+/// The two shapes disagree about an out-of-unit sub-second field, and the
+/// difference is measured rather than read off a man page (`build/scratch/sel/`
+/// `t2.c`, `t3.c`, `t6.c`, Linux 7.2.11):
+///
+/// * `pselect6` **refuses** `tv_nsec` outside `0..=999_999_999` - `EINVAL`,
+///   as the man page says.
+/// * `select` **folds** a `tv_usec` of a million or more into the seconds and
+///   sleeps that long: `{0, 2_000_000}` parks for 2.002 s and `{0, 4_000_000}`
+///   for 4.004 s. It is not an error, and there is no upper bound either - a
+///   `tv_sec` of `LLONG_MAX` and a `tv_usec` of 1e18 are both accepted (each
+///   interrupted by `alarm(1)` rather than refused).
+/// * Both refuse a **negative** field with `EINVAL` - a `tv_sec` of -1 and a
+///   `tv_usec` of -1 alike.
+///
+/// A duration past what a `u64` of milliseconds can hold is saturated rather
+/// than wrapped: `LLONG_MAX` seconds is "longer than the machine will live",
+/// and wrapping it would turn an eternity into an instant.
+pub(crate) fn select_timeout_ms(sec: i64, frac: i64, timespec: bool) -> Result<u64, isize> {
+    if sec < 0 || frac < 0 {
         return Err(err::EINVAL);
     }
-    Ok(sec * 1000 + frac.div_ceil(unit))
+    if timespec && frac > 999_999_999 {
+        return Err(err::EINVAL);
+    }
+    // `select`'s over-unit microseconds become seconds; the remainder is what
+    // the millisecond fold sees.
+    let (sec, frac) = if timespec {
+        (sec as u64, frac as u64)
+    } else {
+        (
+            (sec as u64).saturating_add((frac as u64) / 1_000_000),
+            (frac as u64) % 1_000_000,
+        )
+    };
+    let unit = if timespec { 1_000_000 } else { 1_000 };
+    Ok(sec.saturating_mul(1000).saturating_add(frac.div_ceil(unit)))
 }
 
 /// The `(value, interval)` milliseconds a `setitimer`'s `struct itimerval`
@@ -5258,32 +5286,47 @@ mod tests {
         );
     }
 
-    /// `select(2)`/`pselect6(2)`: the sub-second field is validated against
-    /// its own unit, and a clock that has gone wrong is refused rather than
-    /// wrapped into the past.
+    /// `select(2)`/`pselect6(2)`: the two shapes disagree about a sub-second
+    /// field that does not fit its own unit, and both were measured on Linux
+    /// 7.2.11 rather than taken from a man page (`build/scratch/sel/t2.c`,
+    /// `t3.c`, `t6.c`).
     #[test]
     fn select_timeouts_are_validated_against_their_own_unit() {
-        // pselect6 hands a timespec: nanoseconds.
+        // pselect6 hands a timespec: nanoseconds, and a full second's worth is
+        // the first refusal (`EINVAL`).
         assert_eq!(select_timeout_ms(2, 999_999_999, true), Ok(3000));
         assert_eq!(select_timeout_ms(0, 1, true), Ok(1));
         assert_eq!(
             select_timeout_ms(1, 1_000_000_000, true),
             Err(crate::syscall::err::EINVAL)
         );
-        // select hands a timeval: microseconds, and the ceiling is one
-        // second's worth of them - 999 µs folds into a millisecond, a
-        // million is the first refusal.
+        // select hands a timeval: microseconds, and an over-unit field is
+        // **folded into the seconds** rather than refused - `{0, 2_000_000}`
+        // parks for 2.002 s on Linux, and `{1, 1_000_000}` is two seconds.
         assert_eq!(select_timeout_ms(1, 500, false), Ok(1001));
-        assert_eq!(
-            select_timeout_ms(1, 1_000_000, false),
-            Err(crate::syscall::err::EINVAL)
-        );
+        assert_eq!(select_timeout_ms(1, 1_000_000, false), Ok(2000));
         assert_eq!(select_timeout_ms(1, 999_999, false), Ok(2000));
-        // Both refuse a timeout further out than a few centuries.
+        assert_eq!(select_timeout_ms(0, 2_000_000, false), Ok(2000));
+        assert_eq!(select_timeout_ms(0, 4_000_000, false), Ok(4000));
+        // Both refuse a negative field: Linux answers `EINVAL` for a negative
+        // `tv_sec` and for a negative `tv_usec`.
         assert_eq!(
-            select_timeout_ms(1 << 43, 0, true),
+            select_timeout_ms(-1, 0, false),
             Err(crate::syscall::err::EINVAL)
         );
+        assert_eq!(
+            select_timeout_ms(0, -1, false),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            select_timeout_ms(0, -1, true),
+            Err(crate::syscall::err::EINVAL)
+        );
+        // There is no upper bound: Linux accepts `LLONG_MAX` seconds and a
+        // `tv_usec` of 1e18, and the wait is simply unreachable. Saturate
+        // rather than wrap, or an eternity becomes an instant.
+        assert_eq!(select_timeout_ms(i64::MAX, 0, false), Ok(u64::MAX));
+        assert_eq!(select_timeout_ms(1 << 43, 0, true), Ok((1 << 43) * 1000));
         assert_eq!(
             select_timeout_ms((1 << 43) - 1, 0, false),
             Ok(((1 << 43) - 1) * 1000)

@@ -17,8 +17,8 @@ use crate::syscall::linux::abi;
 use crate::syscall::linux::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
-    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT,
-    O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS,
+    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY,
+    O_EXCL, O_NOFOLLOW, O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS,
     POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN, POLLNVAL, POLLOUT, StatTimes, normalize_path,
     write_stat,
 };
@@ -4550,23 +4550,51 @@ pub fn select(args: [usize; ARG_COUNT]) -> isize {
 fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     let (nfds_arg, readfds, writefds, exceptfds, tvp) =
         (args[0], args[1], args[2], args[3], args[4]);
-    if (nfds_arg as i64) < 0 || nfds_arg > FD_SETSIZE {
+
+    // The timeout is judged before the descriptor count and before the sets.
+    // Measured on 7.2.11 (`build/scratch/sel/t11.c`, `t12.c`): `nfds = -1` with
+    // an unmapped timeval is `EFAULT` (the pointer fault wins), and `nfds = -1`
+    // with a `tv_sec` of -1 is `EINVAL` (the value wins over the count); only a
+    // negative count with a *valid* timeout answers `EINVAL` for the count.
+    let deadline = if tvp == 0 {
+        None
+    } else {
+        if !buffer_ok(tvp, 16, true, true) {
+            return err::EFAULT;
+        }
+        // Both shapes lead with seconds and follow with a sub-second field:
+        // microseconds for `select`, nanoseconds for `pselect6`. The unit rules
+        // - and the fact that the two shapes disagree about an over-unit
+        // fraction - are spelled once in `abi`.
+        let (sec, frac) = unsafe {
+            let at = |offset: usize| (tvp + offset) as *const i64;
+            (at(0).read_unaligned(), at(8).read_unaligned())
+        };
+        let ms = match abi::select_timeout_ms(sec, frac, timespec) {
+            Ok(ms) => ms,
+            Err(e) => return e,
+        };
+        Some(deadline_in_ns(ms))
+    };
+
+    if (nfds_arg as i64) < 0 {
         return err::EINVAL;
     }
-    let nfds = nfds_arg;
 
-    // One word per 64 descriptors, rounded up; a set shorter than that is
-    // the caller's business, since only the bits below `nfds` are read.
+    // The count is **not** refused for being past `FD_SETSIZE` - that is a
+    // libc constant, not a kernel limit. Linux clamps it to the descriptor
+    // table's capacity and ignores everything above (`FdTable::select_clamp`
+    // carries the measurement); a caller naming a hundred million descriptors
+    // is served, and only the bytes below the clamp are read or written.
+    let nfds = nfds_arg.min(crate::sched::current_fds().select_clamp());
+
+    // One word per 64 descriptors, rounded up.
     let set_bytes = nfds.div_ceil(64) * 8;
     for set in [readfds, writefds, exceptfds] {
         if set != 0 && !buffer_ok(set, set_bytes, true, true) {
             return err::EFAULT;
         }
     }
-    if tvp != 0 && !buffer_ok(tvp, 16, true, true) {
-        return err::EFAULT;
-    }
-
     /// Read bit `fd` of a caller's set. `None` (no set) reads as clear.
     fn bit(set: usize, fd: usize) -> bool {
         if set == 0 {
@@ -4608,25 +4636,6 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
             node.poll_subscribe_client(watch.ofd, me);
         }
     }
-
-    let deadline = if tvp == 0 {
-        None
-    } else {
-        // Both shapes lead with seconds and follow with a sub-second field:
-        // microseconds for `select`, nanoseconds for `pselect6`. The unit
-        // check and the fold into milliseconds are the man page's contract,
-        // spelled once in `abi` - the resolution the wait below works in is
-        // what the milliseconds are for.
-        let (sec, frac) = unsafe {
-            let at = |offset: usize| (tvp + offset) as *const u64;
-            (at(0).read_unaligned(), at(8).read_unaligned())
-        };
-        let ms = match abi::select_timeout_ms(sec, frac, timespec) {
-            Ok(ms) => ms,
-            Err(e) => return e,
-        };
-        Some(deadline_in_ns(ms))
-    };
 
     // Readiness as of the last check, kept beside the watches so the
     // write-back does not have to ask the nodes twice.
@@ -4678,6 +4687,14 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         }
     }
     if count < 0 {
+        // A signal ends the wait. The sets stay exactly as they arrived -
+        // Linux leaves the interest untouched, garbage bytes past the clamp
+        // included (measured `build/scratch/sel/t17.c`) - but the **time left
+        // is rewritten anyway**, so a caller looping on `select` can see how
+        // much of its timeout the signal ate (`{3,0}` interrupted at 1 s
+        // answers `{1, 999934}`). Refusing to answer an event kind that has
+        // not arrived is the honest shape: `EINTR`, with the clock updated.
+        write_time_left(tvp, deadline, timespec);
         return err::EINTR;
     }
 
@@ -4711,27 +4728,43 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     }
 
     // Linux reports the time that was left, and callers that loop on a
-    // timeout compare it with zero to see whether they timed out. Both read
-    // it the same way after a zero write.
-    if tvp != 0 {
-        let remaining_ms = match deadline {
-            None => 0,
-            Some(end) => {
-                let now = crate::hal::since_boot_nanos();
-                if now >= end {
-                    0
-                } else {
-                    (end - now) / 1_000_000
-                }
-            }
-        };
-        unsafe {
-            let at = |offset: usize| (tvp + offset) as *mut u64;
-            at(0).write_unaligned(remaining_ms / 1000);
-            at(8).write_unaligned(remaining_ms % 1000 * 1000);
-        }
-    }
+    // timeout compare it with zero to see whether they timed out.
+    write_time_left(tvp, deadline, timespec);
     count
+}
+
+/// Write the timeout's remainder back in the caller's own shape: a
+/// `struct timeval` (seconds, microseconds) for `select`, a `struct timespec`
+/// (seconds, nanoseconds) for `pselect6`. Both are two 64-bit fields on both
+/// machines.
+///
+/// The sub-second unit is the whole reason this is one function and not two
+/// lines: writing microseconds into a `timespec` is off by a factor of a
+/// thousand, and a `pselect6` caller that loops on the remainder would then
+/// believe a nanosecond-scale wait had finished 999 999 times too early.
+/// Measured on 7.2.11 (`build/scratch/sel/t18.c`): `pselect6` interrupted at
+/// 1 s answers `{1, 999948210}` - nanoseconds, not microseconds.
+fn write_time_left(tvp: usize, deadline: Option<u64>, timespec: bool) {
+    if tvp == 0 {
+        return;
+    }
+    let remaining_ns = match deadline {
+        None => 0,
+        Some(end) => {
+            let now = crate::hal::since_boot_nanos();
+            end.saturating_sub(now)
+        }
+    };
+    let sub = if timespec {
+        remaining_ns % 1_000_000_000
+    } else {
+        (remaining_ns % 1_000_000_000) / 1_000
+    };
+    unsafe {
+        let at = |offset: usize| (tvp + offset) as *mut u64;
+        at(0).write_unaligned(remaining_ns / 1_000_000_000);
+        at(8).write_unaligned(sub);
+    }
 }
 
 // The `struct stat` writer lives in `abi`: the field offsets *and the length*

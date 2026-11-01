@@ -674,6 +674,16 @@ reached, and the list grows with the entries that pass (§10.13, item 169, pinne
 by `t-poll-wait`; the counterfactual reddens exactly the refusal and the wide
 wait, while the at-limit claim stays green because a 1024-entry array crossed no
 window — a green counterfactual is a measurement of what a claim cannot see).
+The third door in that family was judged by a constant that was never the
+kernel's: `select(2)` refused any count past libc's `FD_SETSIZE`, where Linux
+clamps to the descriptor table's own capacity and never reads a bit above it -
+and its `pselect6` sibling wrote the remainder back in microseconds through a
+`timespec`, off by a thousand. Both shapes now answer Linux's measured table:
+the count is a right and the clamp is the table's, the timeout is judged before
+the count, an over-unit `tv_usec` folds for `select` and is refused for
+`pselect6`, and a signal writes the remainder back in the caller's own unit
+(§10.14, item 170, pinned by `t-select`; four distinguishing claims red and
+eighteen green under the counterfactual).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

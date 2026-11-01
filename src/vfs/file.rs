@@ -806,6 +806,27 @@ impl FdTable {
         critical_section::with(|cs| self.slots.borrow(cs).borrow().len())
     }
 
+    /// The descriptor numbers this table can name, as `select(2)` counts them.
+    ///
+    /// This is *not* `RLIMIT_NOFILE` and it is not `FD_SETSIZE`: Linux's
+    /// `select` clamps a caller's `nfds` to the descriptor table's capacity,
+    /// the high-water mark of the slot vector rounded up to a power of two,
+    /// floored at one machine word's worth of bits. Measured on 7.2.11 by
+    /// hunting for the smallest mapped `fd_set` that still succeeds
+    /// (`build/scratch/sel/`): with three descriptors open the clamp is 64,
+    /// and it doubles as descriptors are handed out - 65 fds → 128, 253 → 256,
+    /// 1003 → 1024, 3003 → 4096.
+    ///
+    /// It never shrinks, because `close` frees a slot without truncating the
+    /// vector: closing all 3000 of those descriptors left the clamp at 512
+    /// bytes' worth. And the bits at or above it are **never read and never
+    /// cleared** - measured, `select(2048, set)` with three descriptors open
+    /// answers 0 and leaves a bit naming fd 2000 set, while the same shape
+    /// inside the clamp (a closed fd) answers `EBADF`.
+    pub fn select_clamp(&self) -> usize {
+        self.slot_count().next_power_of_two().max(64)
+    }
+
     /// Lift every description in `first..=last` out of the table, returning
     /// them so the caller can drop them where a wake is safe.
     ///

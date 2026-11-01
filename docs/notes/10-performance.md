@@ -1648,3 +1648,72 @@ never crossed `MAX_IO`; the run also carried two unrelated flakes (`t-ptrace`'s
 **Named divergence.** Linux applies the caller's `RLIMIT_NOFILE`; this kernel
 does too, but its soft default is 1024 against the host's 524288, so the
 absolute counts differ. The *rule* is the same; the number is the caller's.
+
+## §10.14 `select(2)`'s count is the table's, not a libc constant — DONE (2026-11-01)
+
+`select_inner` (`src/syscall/linux/fs/file.rs`) refused `nfds > FD_SETSIZE`
+(1024, a **libc** constant, `src/syscall/linux/abi.rs:248`) and then sized its
+copy from the caller's own number. Both halves are wrong, and the second one
+was hiding a real defect: the write-back wrote microseconds into a `timespec`.
+
+Measured on Linux 7.2.11 (`build/scratch/sel/`, static, `setvbuf(_IONBF)` — an
+alarmed probe's buffered output is otherwise lost):
+
+| what | Linux | this kernel, before |
+|---|---|---|
+| `nfds` past `FD_SETSIZE` | served (1024 … 2^40) | `EINVAL` |
+| `nfds` negative | `EINVAL` | `EINVAL` |
+| the real bound | table capacity, rounded to a power of two, min 64 | the caller's number |
+| `RLIMIT_NOFILE` | does not move it | — |
+| a bit at/above the clamp | never read, never reported, never cleared | `EFAULT` past 131072 entries |
+| write-back width | `min(nfds, clamp)/8` | `nfds/8` |
+| check order | timeout (EFAULT/EINVAL) → count (EINVAL) → sets (EFAULT) → bits (EBADF) | sets → timeout → count |
+| `select`'s over-unit `tv_usec` | folded into seconds (`{0,2e6}` sleeps 2.002 s) | `EINVAL` |
+| `pselect6`'s over-unit `tv_nsec` | `EINVAL` | `EINVAL` |
+| upper bound | none (`LLONG_MAX` accepted) | `EINVAL` past 2^43 s |
+| `EINTR` | sets untouched, **remainder written back** in the caller's unit | sets untouched, remainder never written |
+| `pselect6` remainder unit | nanoseconds | microseconds (wrong by 1000×) |
+
+The clamp was found by binary-searching the smallest mapped tail that still
+succeeds, with a `PROT_NONE` guard page placed **after** the set so a read past
+the interesting width faults (`t10.c`): 3 open → 8 bytes read, 65 → 16,
+253 → 32, 503 → 64, 1003 → 128, 2003 → 256, 3003 → 512. An early probe measured
+nothing because its guard page sat before the set, and two others reported
+`EBADF`/zero because their junk bits named descriptors the test itself had
+closed — the lesson is in the program's comments now.
+
+**Served shape.** `nfds < 0` → `EINVAL`; the count is clamped to
+`FdTable::select_clamp()` (`slot_count().next_power_of_two().max(64)`, a new
+door on the table); `set_bytes = min(nfds, clamp).div_ceil(64) * 8`; the timeout
+is judged first through `abi::select_timeout_ms(sec: i64, frac: i64, timespec)`,
+which now folds `select`'s over-unit microseconds, refuses `pselect6`'s and any
+negative field, and **saturates** rather than wrapping an unreachable deadline;
+`write_time_left(tvp, deadline, timespec)` converts the remainder to the
+caller's unit and is called both on the normal path and on `EINTR`.
+
+**Pin.** `user/tests/src/bin/t-select.rs`, 22 claims. It is a new program
+because nothing in the suite exercised `select` at all, and it rides raw sets
+(libc's `fd_set` is 1024 bits, too small to state any of the interesting
+counts). Host run: 22/22 `ok`. Gates: x86_64 `pass=247 fail=0`, aarch64
+`pass=246 fail=0`, kunit 35 both, host lib 720.
+
+**aarch64 has no `select` number** — the asm-generic table dropped it, which
+`src/syscall/linux/nr_aarch64.rs` already records as "unreachable on aarch64".
+libc emulates `select` over `pselect6` there, so the pin does the same, and the
+one claim that is `select`'s own shape (the over-unit fold) is `cfg`-split: on
+x86_64 it asserts the fold, on aarch64 it asserts that the emulation turns it
+into `pselect6`'s `EINVAL`. The first aarch64 gate failed on exactly that
+claim, which is how the divergence was found rather than assumed.
+
+**Counterfactual** (the old `FD_SETSIZE` refusal plus the caller-sized bytes):
+four claims red — a count past `FD_SETSIZE`, a count a million past the table,
+a bit far above the table, and a count far past the table needing only the
+table's bytes — and the other eighteen stay green, which is the measurement of
+what those eighteen cannot see.
+
+**Named divergences.** The clamp follows the fd table, so it is 1024 here where
+a host process with 3000 descriptors reports 4096; the rule is the same and the
+number is the caller's. `exceptfds` never reports a bit on either machine,
+because nothing here generates OOB data. `select`'s impossible deadlines
+(`LLONG_MAX`) are saturated into a `u64` of milliseconds rather than kept exact;
+both shapes sleep "forever" either way.
