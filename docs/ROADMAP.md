@@ -654,7 +654,9 @@ transactions, §7.4a; what it cannot do yet is scan out a client buffer - the wa
 failing before any kernel door is reached (§7.4a) - and its log's one kernel-side gap, the
 framebuffer-close request, is now served and pinned (`MODE_CLOSEFB`, item 179, §7.4b; the same
 measurement moved two `ENOENT` answers `GETFB`/`GETFB2`/`RMFB` had wrong) and closing the remaining
-ABI gaps below. The block layer's counters
+ABI gaps below. `/proc/<pid>/smaps_rollup` is a pinned contract now
+(`t-smaps-rollup`, 9 claims, item 180, §15.99), and writing it down found the two accounting files
+disagree: this kernel's `smaps` omits the three `Pss_*` lines its rollup prints. The block layer's counters
 now read on a desktop boot — the submit/retire pair and the mailbox agree at all 115 heartbeats of
 three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`
 (§7.9b, item 148). The kernel's half of it is now measured out: one uevent announcement reaches

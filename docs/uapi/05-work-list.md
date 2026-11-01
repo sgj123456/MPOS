@@ -8549,3 +8549,19 @@ the eager copy only where a copy is the right semantics (`MAP_SHARED` of a file
 with no writeback). Pinned as an observation by the numbers above, not by a
 `t-*` program: a timing claim is not a contract, and the semantics pin lands
 with the fault path.
+
+## item 180 — `/proc/<pid>/smaps_rollup`: the totals file is a pinned contract
+
+`smaps_rollup` was served (§15.73) and unpinned; the pin `t-smaps-rollup` now writes its promise
+down, measured on Linux 7.2.11 first: one header line covering the space with the name `[rollup]`
+and permission column `---p`, no per-mapping size lines, `smaps`' fields in `smaps`' order (plus
+Linux's three `Pss_*` lines, see the named divergence), one snapshot per open (a second `read(2)` is
+0, a fresh open answers), mode `0444`, size 0.
+
+**Named divergence**: this kernel's `smaps` omits `Pss_Anon`/`Pss_File`/`Pss_Shmem`, which its own
+rollup prints and Linux prints in both files — the two files disagree, and closing it is the next
+item (add the three lines to `format_smaps`, extend `t-smaps`' expected list).
+
+**Pin**: `user/tests/src/bin/t-smaps-rollup.rs` — 9 claims, green on a current host and on both
+machines. **Gate**: x86_64 `pass=252 fail=0`, aarch64 `pass=251 fail=0`. **Counterfactual** (a
+`Size:` line put back into the rollup): `pass=251 fail=2`, exactly the two claims named above.
