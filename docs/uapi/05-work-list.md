@@ -8448,7 +8448,7 @@ claims stay green because that is the separate `GETFB` change, which `t-drm` pin
 Gates: x86_64 `pass=251 fail=0` (13.58 s), aarch64 `pass=250 fail=0` (35.74 s), kunit 35 both;
 flakes seen and re-run green: `t-ptrace-attach` (x86_64), `t-seccomp` (aarch64).
 
-### Item 178 - the wlroots DRM backend starts; scan-out's dma-buf is the next wall (2026-11-01, open)
+### Item 178 - the wlroots DRM backend starts; scan-out's dma-buf is the next wall (2026-11-01, open, narrowed by 7.4c)
 
 Measured after item 177 landed. `WLR_BACKENDS=drm WLR_RENDERER=gles2 sway --debug` on the guest
 with `XDG_RUNTIME_DIR=/run/xdg`: 960 log lines (was 0 in 20 s, the stall item 176 measured), EGL on
@@ -8461,6 +8461,15 @@ from buffer` then `[backend/drm/drm.c:792] connector Virtual-1: Failed to import
 scan-out` (36 and 36 lines in `build/scratch/swayd/sway.log`), with `[render/egl.c:189] EGL DMA-BUF
 format modifiers unsupported` earlier. So the kernel's own framebuffer path (kmscube, the paint
 gate) works and the route a client's GBM buffer takes does not.
+
+**Narrowed again (§7.4c)**: the wall is the *atomic* swapchain's buffer, not scan-out in general. One
+boot varied what the backend may use (`build/scratch/swayd/aa-sway4.start`): `WLR_DRM_NO_MODIFIERS=1`
+still printed 17 `Failed to get DMA-BUF from buffer` / 17 `Failed to import buffer for scan-out`,
+while `WLR_DRM_NO_ATOMIC=1` printed **0** of each and kept driving the screen (the run was alive when
+the 20 s timeout killed it). `EGL DMA-BUF format modifiers unsupported` appears in **both**, so
+modifiers are not the variable. Next instrument: a guest GBM probe comparing `gbm_bo_get_fd` with
+`gbm_bo_get_fd_for_plane` - the latter is the spelling `wlr_gbm_buffer` answers through, while the
+former is the call that reaches the prime door this card already serves.
 
 **The attribution above was wrong on first reading, and wlroots 0.20.1's source says where the wall
 really is.** `backend/drm/fb.c`'s `drm_fb_create` opens with

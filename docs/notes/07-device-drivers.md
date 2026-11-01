@@ -7664,6 +7664,34 @@ Instrument note: the print was temporary and the untouched file is restored
 (`git diff --stat` clean at `8d81b62`); a boot costs ~11 minutes, so the diagnostic and the
 attribution fix land in the same round rather than a second boot.
 
+### 7.4c The wall is the atomic swapchain's dma-buf export, not the prime door — **MEASUREMENT**
+
+§7.4a localized the failure to `wlr_buffer_get_dmabuf` and cleared the kernel's prime door. The
+question left was *which* buffer fails to answer. One boot answered it by varying what wlroots'
+DRM backend is allowed to use (`build/scratch/swayd/aa-sway4.start`, image `sway4.img`, both runs
+`WLR_BACKENDS=drm WLR_RENDERER=gles2`, 20 s each, logs `/root/sw-nomod.log`, `/root/sw-noat.log`):
+
+| variant | `Failed to get DMA-BUF from buffer` | `Failed to import buffer for scan-out` |
+|---|---:|---:|
+| `WLR_DRM_NO_MODIFIERS=1` | **17** | **17** |
+| `WLR_DRM_NO_ATOMIC=1` | **0** | **0** |
+
+So the wall belongs to the **atomic** path's swapchain, not to scan-out in general: with atomic
+disabled wlroots imports its own dumb buffer and the screen is driven (that run was still alive when
+the 20 s timeout killed it - `rc=137` - i.e. it never wedged on scan-out at all). Disabling
+modifiers changes nothing, which fits the log's own line: `render/egl.c:189 EGL DMA-BUF format
+modifiers unsupported` is printed in **both** variants, and the atomic swapchain still asks each
+buffer for a dma-buf.
+
+The next instrument is therefore in the guest, not in this kernel: a GBM probe that creates a bo on
+`/dev/dri/card0` and calls `gbm_bo_get_fd` **and** `gbm_bo_get_fd_for_plane(bo, 0)` separately,
+printing `errno` for each, plus `gbm_bo_get_modifier`. wlroots' `wlr_gbm_buffer` answers
+`wlr_buffer_get_dmabuf` through `gbm_bo_get_fd_for_plane`; `gbm_bo_get_fd` is the call that reaches
+`DRM_IOCTL_PRIME_HANDLE_TO_FD`, which this card serves (two exports, zero refusals in §7.4a's
+instrument). If the `_for_plane` spelling is what fails, the client's answer is that this device
+publishes no modifier for the bo wholesale, and the fix belongs to the format/modifier surface of
+the renderer rather than to a missing request.
+
 ### 7.4b `MODE_CLOSEFB` served, and the two `ENOENT` answers that came with it — **MEASUREMENT**
 
 The sway probe of §7.4a left one kernel-side gap: `drmModeCloseFB` (`DRM_IOCTL_MODE_CLOSEFB`,
