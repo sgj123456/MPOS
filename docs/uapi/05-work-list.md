@@ -8111,3 +8111,40 @@ fields; a shorter `set` is `EINVAL`) and `tv_usec` outside `0..=999_999` is
 Pin `t-uevent-doors` (11 timeout claims, each blocking door in a bounded child);
 counterfactual reds the three doors by name. `docs/notes/07-device-drivers.md`
 §7.9t; gates x86_64 246 / aarch64 245.
+
+### Item 168 - a wait's buffer is sized by what can be filled, and validated as it is written (2026-11-01)
+
+`epoll_wait(2)` sized its own collect buffer from the caller's `maxevents`, and
+checked `maxevents * 12` bytes of the caller's array before waiting. Both are
+the caller's number doing kernel work it should not:
+
+* **The allocation.** A 1 GiB user buffer is a legal `maxevents` of 89 478 485,
+  which asked the global allocator for **2.1 GB** to report at most
+  `MAX_WATCHES` = 1024 entries — and the allocator panics when it cannot have
+  it, so a caller could end the machine by asking for a big wait
+  (R.8: a user-steerable allocation with no bound). Now
+  `vfs::epoll::collect_capacity` bounds the *buffer* at what `collect` can
+  actually push (`min(maxevents, MAX_WATCHES)`) while validating
+  `maxevents` against Linux's own ceiling: `INT_MAX / sizeof(struct
+  epoll_event)`, measured at the boundary on 7.2.11 — 178 956 970 served, 178
+  956 971 `EINVAL` on x86_64; the record is 16 bytes on aarch64, so the number
+  is the machine's.
+* **The validation.** Linux checks the caller's array **lazily**, one record at
+  a time as it writes: a one-record buffer announced as `maxevents=64` answers
+  0 when nothing is ready and 1 when one event is (`build/scratch/epmax/d`),
+  and a partially mapped array answers `EFAULT` only when the write reaches the
+  unmapped page (`build/scratch/epmax/q`: two ready records into a one-page
+  mapping whose page is gone -> `EFAULT`). Validating `maxevents * 12` up front
+  answered `EFAULT` to all of those, so `buffer_ok` now runs inside the write
+  loop, per record.
+
+Pin: `t-epoll` gained four claims (the ceiling served, the ceiling + 1
+refused, `INT_MAX` refused, and a hundred-million-event wait that survives and
+reports nothing); the host test
+`a_waits_collect_buffer_is_sized_by_what_can_be_filled_not_by_what_was_asked`
+pins the arithmetic. **Counterfactual**: with `collect_capacity` returning the
+caller's number again, the pin's own `maxevents` values make the kernel attempt
+a **2 863 311 520-byte** allocation, the allocator panics, the machine stops and
+**30 of 246** programs fail with `memory allocation of 2863311520 bytes failed`
+— the defect, measured. `docs/notes/10-performance.md` §10.12; gates x86_64 246
+/ aarch64 245, `mpos-kunit 35`.

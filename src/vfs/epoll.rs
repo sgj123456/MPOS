@@ -114,6 +114,35 @@ pub const EPOLL_EVENT_DATA: usize = crate::hal::EPOLL_EVENT_DATA;
 #[cfg(not(target_os = "none"))]
 pub const EPOLL_EVENT_DATA: usize = 4;
 
+/// The largest `maxevents` a wait accepts: `INT_MAX / sizeof(struct
+/// epoll_event)`, because above it the caller's own record array overflows a
+/// signed `int` of bytes. Measured at the boundary on Linux 7.2.11
+/// (`build/scratch/epmax/m`): 178 956 970 is served, 178 956 971 is `EINVAL`.
+pub const MAX_EVENTS: usize = i32::MAX as usize / EPOLL_EVENT_SIZE;
+
+/// How much room a wait's collect buffer needs, given the caller's
+/// `maxevents` - or the errno the call owes when that number is not one Linux
+/// would take.
+///
+/// Two different bounds meet here and they are not the same question. The
+/// *caller's* `maxevents` is validated against [`MAX_EVENTS`]: above it the
+/// call is `EINVAL`, whatever the buffer. The *kernel's* buffer is bounded by
+/// what [`Epoll::collect`] can fill instead - at most [`MAX_WATCHES`] entries -
+/// so a caller asking for a billion events does not get a billion-entry `Vec`
+/// built on its say-so. Before this, `maxevents` sized the allocation directly:
+/// a 1 GiB user buffer is a legal 89 478 485, which asked the global allocator
+/// for 2.1 GB to report at most 1024 events (`docs/notes/` §10.12).
+pub fn collect_capacity(maxevents: i64) -> Result<usize, isize> {
+    if maxevents <= 0 {
+        return Err(crate::err::EINVAL);
+    }
+    let asked = maxevents as usize;
+    if asked > MAX_EVENTS {
+        return Err(crate::err::EINVAL);
+    }
+    Ok(asked.min(MAX_WATCHES))
+}
+
 /// How many descriptors one interest list may hold. Linux bounds this with
 /// `/proc/sys/fs/epoll/max_user_watches` and answers ENOSPC when it is hit;
 /// a list that cannot grow without bound is the same promise here, made at
@@ -660,7 +689,7 @@ mod tests {
         EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLL_EVENT_DATA, EPOLL_EVENT_SIZE, EPOLLERR,
         EPOLLET, EPOLLEXCLUSIVE, EPOLLHUP, EPOLLIN, EPOLLMSG, EPOLLONESHOT, EPOLLOUT, EPOLLPRI,
         EPOLLRDBAND, EPOLLRDHUP, EPOLLRDNORM, EPOLLWAKEUP, EPOLLWRBAND, EPOLLWRNORM, Epoll,
-        MAX_WATCHES,
+        MAX_EVENTS, MAX_WATCHES, collect_capacity,
     };
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -1163,5 +1192,39 @@ mod tests {
             last_fd = fd;
         }
         first.expect("count is at least one")
+    }
+
+    /// The two bounds a `maxevents` meets are different questions, and the
+    /// expensive one is the kernel's own buffer. Linux refuses above
+    /// `INT_MAX / sizeof(struct epoll_event)` - measured at the boundary: 178
+    /// 956 970 served, 178 956 971 `EINVAL` (`build/scratch/epmax/m`) - while
+    /// this kernel used to size its collect buffer from the number itself, so a
+    /// 1 GiB user buffer (a legal 89 478 485 records) bought a 2.1 GB `Vec` to
+    /// report at most `MAX_WATCHES` entries.
+    #[test]
+    fn a_waits_collect_buffer_is_sized_by_what_can_be_filled_not_by_what_was_asked() {
+        assert_eq!(MAX_EVENTS, 178_956_970, "INT_MAX / 12");
+
+        // Linux's boundary, both sides: the number is the caller's, so past it
+        // the call is refused however small the buffer would have been.
+        assert_eq!(collect_capacity(MAX_EVENTS as i64), Ok(MAX_WATCHES));
+        assert_eq!(collect_capacity(MAX_EVENTS as i64 + 1), Err(err::EINVAL));
+        assert_eq!(collect_capacity(i32::MAX as i64), Err(err::EINVAL));
+
+        // Zero and negative are not "no events", they are a refused request.
+        assert_eq!(collect_capacity(0), Err(err::EINVAL));
+        assert_eq!(collect_capacity(-1), Err(err::EINVAL));
+
+        // Below the interest list's ceiling the answer is the caller's own
+        // number: a wait for 4 events collects into 4 slots, no more.
+        assert_eq!(collect_capacity(1), Ok(1));
+        assert_eq!(collect_capacity(4), Ok(4));
+        assert_eq!(collect_capacity(MAX_WATCHES as i64), Ok(MAX_WATCHES));
+
+        // Above it, the buffer stays at what `collect` can actually push - the
+        // whole point: this is the allocation, not the answer.
+        for asked in [MAX_WATCHES as i64 + 1, 89_478_485, MAX_EVENTS as i64] {
+            assert_eq!(collect_capacity(asked), Ok(MAX_WATCHES));
+        }
     }
 }

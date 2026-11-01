@@ -657,7 +657,15 @@ name it had not been told about - `SO_TYPE` included - and now answers `SOCK_RAW
 the datagram buffer defaults with Linux's doubling, and `ENOPROTOOPT`/`EOPNOTSUPP`/`EPERM` where
 the family refuses (§7.9s, item 166, pinned by `t-uevent-opts`), and its
 `SO_RCVTIMEO` now bounds the receive it used to only store (§7.9t, item 167,
-pinned by `t-uevent-doors`'s timeout section).
+pinned by `t-uevent-doors`'s timeout section). The allocation audit's last
+user-steerable count is closed too: `epoll_wait`'s collect buffer was sized by
+the caller's `maxevents`, so a large enough mapping asked the kernel for
+gigabytes to report at most 1024 events and the allocator's `panic = "abort"`
+ended the machine — the buffer is now bounded by what `collect` can fill, the
+number by Linux's `INT_MAX / sizeof(struct epoll_event)`, and the caller's array
+checked as each record is written rather than all of it up front (§10.12, item
+168, pinned by `t-epoll`; the counterfactual is a 2 863 311 520-byte allocation
+and 30 programs lost).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

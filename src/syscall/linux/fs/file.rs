@@ -6454,9 +6454,13 @@ pub fn handle_epoll_ctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// own borrow of it, where taking it again is not a thing.
 fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) -> isize {
     let (epfd, events, maxevents) = (args[0] as i32, args[1], args[2] as i64);
-    if maxevents <= 0 {
-        return err::EINVAL;
-    }
+    // The caller's number is validated against Linux's ceiling and the kernel's
+    // own buffer is sized by what `collect` can fill - two bounds, and
+    // `collect_capacity` is where they meet (`docs/notes/` §10.12).
+    let capacity = match crate::vfs::epoll::collect_capacity(maxevents) {
+        Ok(capacity) => capacity,
+        Err(e) => return e,
+    };
     let maxevents = maxevents as usize;
     let file = match crate::sched::current_fds().clone_at(epfd) {
         Ok(file) => file,
@@ -6466,19 +6470,20 @@ fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) 
     let Some(instance) = inode.as_epoll() else {
         return err::EINVAL;
     };
-    let len = match maxevents.checked_mul(crate::vfs::epoll::EPOLL_EVENT_SIZE) {
-        Some(len) => len,
-        None => return err::EINVAL,
-    };
-    if !buffer_ok(events, len, true, from_user) {
-        return err::EFAULT;
-    }
+    // The caller's array is *not* validated up front, and that is Linux's
+    // shape rather than an omission: only the records actually written need to
+    // be addressable. Measured (`build/scratch/epmax/d`): a one-record buffer
+    // announced as `maxevents=64` answers 0 when nothing is ready and 1 when one
+    // event is - a kernel checking `maxevents * 12` bytes first answers EFAULT
+    // to both, which is what this did. So the check moved to the write loop
+    // below, one record at a time.
+    let _ = maxevents;
 
     let fds = crate::sched::current_fds();
     // The collected reports live in a cell: the wait's condition is called
     // by the scheduler as an `Fn`, and a cell is how a condition keeps
     // state without claiming to be anything but a read.
-    let out_cell = core::cell::RefCell::new(alloc::vec::Vec::with_capacity(maxevents));
+    let out_cell = core::cell::RefCell::new(alloc::vec::Vec::with_capacity(capacity));
     let me = crate::sched::current();
     instance.subscribe_waits(me);
     // A watched node whose readiness cannot be announced - a `timerfd` the
@@ -6521,9 +6526,15 @@ fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) 
         crate::sched::WaitEnd::Deadline => return 0,
         crate::sched::WaitEnd::Condition => {}
     }
+    // One record at a time, checked as it is written - the lazy shape measured
+    // above. A record the caller did not map is EFAULT, the same answer the
+    // up-front check gave, but only for the entries that exist.
     for (index, report) in out.iter().enumerate() {
+        let at = events + index * crate::vfs::epoll::EPOLL_EVENT_SIZE;
+        if !buffer_ok(at, crate::vfs::epoll::EPOLL_EVENT_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
         unsafe {
-            let at = events + index * crate::vfs::epoll::EPOLL_EVENT_SIZE;
             (at as *mut u32).write_unaligned(report.events);
             ((at + crate::vfs::epoll::EPOLL_EVENT_DATA) as *mut u64).write_unaligned(report.data);
         }

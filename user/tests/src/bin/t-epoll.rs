@@ -297,6 +297,41 @@ fn main() {
         wait(epfd, &mut events, 8, 0) == 0,
     );
 
+    // The far end of the same question. Linux's ceiling on `maxevents` is
+    // `INT_MAX / sizeof(struct epoll_event)` - 178 956 970 twelve-byte records -
+    // because above it the caller's own byte count overflows a signed `int`:
+    // measured at the boundary on 7.2.11, 178 956 970 served and 178 956 971
+    // `EINVAL` (`build/scratch/epmax/m`). Both sides are claimed here because
+    // the boundary is what Linux's answer *is*; a kernel that refused every
+    // large number would pass a one-sided claim.
+    // The record's width is the machine's: 12 bytes on x86_64, 16 on aarch64
+    // (`Contexts::EPOLL_EVENT_BYTES`), so the ceiling is derived from the ABI
+    // this program was built against rather than written down as one machine's
+    // number - a constant 12 here made the aarch64 arm claim the wrong boundary.
+    const MAXEVENTS_CEILING: i32 = i32::MAX / core::mem::size_of::<libc::epoll_event>() as i32;
+    r.check(
+        "epoll_wait takes maxevents at INT_MAX / 12, serving nothing",
+        wait(epfd, &mut events, MAXEVENTS_CEILING, 0) == 0,
+    );
+    r.check(
+        "and one past it answers EINVAL",
+        wait(epfd, &mut events, MAXEVENTS_CEILING + 1, 0) == -libc::EINVAL as isize,
+    );
+    r.check(
+        "as does the largest number an int can carry",
+        wait(epfd, &mut events, i32::MAX, 0) == -libc::EINVAL as isize,
+    );
+    // The expensive half: `maxevents` above the interest list's ceiling used to
+    // buy a kernel buffer of that many records, so a caller with a big enough
+    // mapping could ask the kernel for gigabytes it could never fill
+    // (`docs/notes/` §10.12). The caller's buffer here is four records and the
+    // number says a hundred million: what the wait *reports* is bounded by both,
+    // and a machine that survived the call is the claim.
+    r.check(
+        "a wait asked for a hundred million events survives and reports none",
+        wait(epfd, &mut events, 100_000_000, 0) == 0,
+    );
+
     // Data arrives, and the wait wakes carrying the caller's data word.
     let wrote = write(unsafe { BorrowedFd::borrow_raw(wout) }, b"ping").is_ok_and(|n| n == 4);
     r.check("the pipe takes the bytes", wrote);

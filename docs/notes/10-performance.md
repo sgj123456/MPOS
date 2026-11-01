@@ -1512,3 +1512,83 @@ host's tuning.
 (`build/scratch/sysctl-gate4.log`); aarch64 x86_64 `all 236 user tests passed` / `mpos-kunit 34 passed, 0 failed` (verdict `pass=236 fail=0`, `X-EXIT=0`, `build/scratch/sysctl-gate5.log`); aarch64 `all 235 user tests passed` / `mpos-kunit 34 passed` (verdict `pass=235 fail=0`, `A-EXIT=0`, total 31.63 s, `build/scratch/sysctl-gate-a2.log`).
 
 **Counterfactual**: two, one per half. **The file is not the gate** — `max_map_count()` answering the compiled default again, which is the shape before this item — → `t-map-count-sysctl` alone red, `pass=235 fail=1` of 236 built, on exactly two claims: `FAIL: root may lower the ceiling to 1024` and `FAIL: the lowered ceiling is the one the next mmap is answered against (refused with 0, 1536 mapped, 1483 map rows now)` (`build/scratch/sysctl-cf1.log`). **The word is decorative again** — the `may_by_mode` call removed from `ProcCtl::write_at` — → exactly one claim red, `FAIL: an unprivileged writer cannot move the number (answered 100)`, the other seven green (`build/scratch/sysctl-cf2.log`); both stubs reverted before the final gate..
+
+### 10.12 A wait's buffer is sized by what can be filled, and validated as it is written — **DONE** (2026-11-01)
+
+R.8's remaining half was "the global allocator's `Vec` growth still panics", and
+§10.11's audit found every store bounded but one — reading `buffer_ok` as the
+answer for `poll`'s and `epoll_wait`'s arrays. It is not, and the reason is a
+distinction the audit collapsed: `buffer_ok` bounds the *caller's* array, while
+what the kernel allocates on its own side was sized from the same number.
+
+**The defect, in one line of arithmetic.** `epoll_wait`'s collect buffer was
+`Vec::with_capacity(maxevents.min(MAX_WATCHES))` after a fix that had already
+seen the ceiling — but before it, `Vec::with_capacity(maxevents)` where
+`maxevents` is the caller's `int`. A 1 GiB user mapping is a legal
+**89 478 485** records, which is a **2.1 GB** `Vec` (24 bytes per `Reported`
+against the caller's 12 per record) asked for in order to report at most
+`MAX_WATCHES` = 1024 entries. This kernel's global allocator panics on failure
+(`docs/notes/` §8.0), so a process could end the machine by asking for a large
+wait with nothing in its interest list.
+
+**Linux reference measured first** (7.2.11, `build/scratch/epmax/`).
+* The ceiling exists and is arithmetic: `INT_MAX / sizeof(struct epoll_event)`.
+  `m.c`: with a null array, `maxevents` 178 956 970 is **served** (0) and
+  178 956 971 is **`EINVAL`**; the same boundary with a real one-record buffer
+  and with a 1 GiB mapping (`m.c`'s last section, `maxevents=1GiB/12` served).
+  So the refusal is about the caller's *byte count* overflowing a signed `int`,
+  not about the kernel's own allocation.
+* The caller's array is validated **lazily**. `d.c`: a one-record buffer with
+  `maxevents=2` answers 0 when nothing is ready and **1** when one event is; a
+  one-record buffer with `maxevents=64` and one ready answers **1**. `q.c`:
+  two ready events copied into a one-page mapping whose page has been unmapped
+  answer **`EFAULT`** — so the check does happen, per record, when the write
+  reaches it.
+* `poll(2)`'s `nfds` has the same shape for the same reason: `c.c` shows the
+  array is read entry by entry (a huge `nfds` over a one-entry array blocks
+  rather than faulting, which is why that probe had to be killed — the entry it
+  could not read was never reached).
+
+**The change.** Two bounds that were one:
+* `vfs::epoll::MAX_EVENTS = i32::MAX / EPOLL_EVENT_SIZE` (the machine's record
+  width: 12 on x86_64, 16 on aarch64 — a fixed 12 reddened the aarch64 arm's
+  claim, which is how the width dependence was measured).
+* `vfs::epoll::collect_capacity(maxevents) -> Result<usize, isize>`: `EINVAL`
+  for `<= 0` and for `> MAX_EVENTS`, else `min(maxevents, MAX_WATCHES)`. This is
+  the buffer's size, and the reason it can be smaller than `maxevents` without
+  changing any answer is `collect`'s own `out.len() < capacity` push guard
+  against an interest list capped at `MAX_WATCHES`.
+* `epoll_wait` (`src/syscall/linux/fs/file.rs`) sizes the cell from
+  `collect_capacity` and calls `buffer_ok` **inside the write loop**, one record
+  at a time, instead of once over `maxevents * EPOLL_EVENT_SIZE` bytes.
+
+Both files' host halves compile (`epoll.rs` is host-tested, `file.rs` is not —
+which is why the arithmetic lives in `epoll.rs`).
+
+**Pin.** `t-epoll` (both machines) gained: the ceiling is served and reports
+nothing, the ceiling + 1 is `EINVAL`, `INT_MAX` is `EINVAL`, and a wait asking
+for a hundred million events survives and reports nothing. The last one is the
+defect stated as a claim: it is legal Linux and it used to be a 2.4 GB
+allocation. The host test
+`a_waits_collect_buffer_is_sized_by_what_can_be_filled_not_by_what_was_asked`
+pins `MAX_EVENTS`, both sides of it, the non-positive refusals and the
+clamping.
+
+**Gates**: x86_64 `verdict pass=246 fail=0`, `mpos-kunit 35 passed`
+(`build/scratch/epcap-gate3.log`); aarch64 `verdict pass=245 fail=0`, kunit 35
+(`build/scratch/epcap-gate-a2.log`); host lib 720.
+
+**Counterfactual**: `collect_capacity` returning the caller's number again
+(no ceiling, no clamp) did not merely fail a claim — the pin's own legal
+`maxevents` values took the kernel down:
+
+```
+KERNEL PANIC: panicked at library/alloc/src/alloc.rs:699:9:
+memory allocation of 2863311520 bytes failed
+self-test: 30 test(s) did not pass
+```
+
+2 863 311 520 bytes is `178 956 970 * 16` — the pin's ceiling claim asking a
+machine whose record is 16 bytes wide for exactly what it said. That is R.8's
+sentence made literal: a count a user names, an allocation the kernel makes, and
+a `panic = "abort"` machine that ends. Restored and re-gated green.
