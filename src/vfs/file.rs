@@ -230,7 +230,11 @@ impl File {
     /// socket, `anon:[ino]` for whatever else has no name anywhere.
     pub fn display_name(&self) -> alloc::string::String {
         if let Some(path) = self.label() {
-            return path;
+            return if self.inode.name_is_gone() {
+                alloc::format!("{path} (deleted)")
+            } else {
+                path
+            };
         }
         // An anonymous inode has a name but no path: `anon_inode:[pidfd]` is
         // the inode's own spelling, and a tree search could only ever miss it.
@@ -238,7 +242,11 @@ impl File {
             return name;
         }
         if let Some(path) = super::global().path_of(&self.inode) {
-            return path;
+            return if self.inode.name_is_gone() {
+                alloc::format!("{path} (deleted)")
+            } else {
+                path
+            };
         }
         let meta = self.inode.metadata();
         if self.inode.as_duplex().is_some() {
@@ -1091,6 +1099,30 @@ mod tests {
     use super::{FdTable, File, close, open, read, write};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, NodeKind, VfsError};
+
+    /// A name is what `/proc/<pid>/fd/<n>` prints, and a descriptor that outlives
+    /// it says so the way Linux does: ` (deleted)` after the path, once every
+    /// name that reached the file is gone. The question is its own door because
+    /// `nlink()`'s `0` is ambiguous - already true for ramfs, and the reason
+    /// `Inode::name_is_gone` exists at all (`docs/notes/` §6.70/§6.71).
+    #[test]
+    fn a_descriptor_outliving_its_name_says_so() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let inode = root.create("doomed", NodeKind::File, None).unwrap();
+
+        // The label is what makes the answer a path at all; without one the
+        // tree search would have to find a name that is about to be gone, and
+        // this filesystem is not mounted, so the fallback is the kind's
+        // spelling rather than a path.
+        let file = File::new(inode.clone());
+        file.set_label(alloc::string::String::from("/doomed"));
+        assert_eq!(file.display_name(), "/doomed");
+
+        root.unlink("doomed").unwrap();
+        assert!(inode.name_is_gone(), "the last name is gone");
+        assert_eq!(file.display_name(), "/doomed (deleted)");
+    }
 
     #[test]
     fn a_file_cursor_walks_what_it_writes_then_hits_eof() {

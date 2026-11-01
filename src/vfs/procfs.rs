@@ -2347,7 +2347,20 @@ fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
             }
         };
         let name = match &vma.name {
-            Some(name) => Some(String::from(&**name)),
+            // A mapping outlives the name it was made by, and Linux says so
+            // in the line: ` (deleted)` once every name that reached the file
+            // is gone. The question is asked of the object, because only it
+            // knows whether its filesystem keeps a link count at all
+            // (`Inode::name_is_gone`, `docs/notes/` §6.70).
+            Some(name) => {
+                let gone =
+                    matches!(&vma.kind, VmaKind::Frames { object, .. } if object.name_is_gone());
+                Some(if gone {
+                    alloc::format!("{name} (deleted)")
+                } else {
+                    String::from(&**name)
+                })
+            }
             None => heap_name(vma),
         };
         lines.push(SmapsLine {

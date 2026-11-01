@@ -542,6 +542,10 @@ impl crate::mm::vma::MappedObject for FilePages {
             self.inode.metadata().ino,
         )
     }
+
+    fn name_is_gone(&self) -> bool {
+        self.inode.name_is_gone()
+    }
 }
 
 pub fn map_frames(

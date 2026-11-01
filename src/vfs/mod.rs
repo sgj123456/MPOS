@@ -1180,6 +1180,18 @@ pub trait Inode: Send + Sync + core::any::Any {
         0
     }
 
+    /// Whether every name that reached this node is gone - the question
+    /// [`Self::nlink`]'s `0` cannot answer on its own, because `0` there means
+    /// "this filesystem does not track the count" as often as it means "no
+    /// names". A name is what `/proc/<pid>/fd/<n>` and `/proc/<pid>/maps` print,
+    /// and Linux appends ` (deleted)` to it once it is unlinked; printing a bare
+    /// path for a file that has none is naming something that is not there
+    /// (`docs/notes/` §6.70). The default is `false`: a filesystem that keeps no
+    /// count does not know, and "does not know" must not become "deleted".
+    fn name_is_gone(&self) -> bool {
+        false
+    }
+
     /// Record how many names reach this node - the writing half of
     /// [`Self::nlink`], and the bookkeeping [`Self::link`] owes.
     ///
@@ -1419,6 +1431,10 @@ impl crate::mm::vma::MappedObject for MappedInode {
 
     fn identity(&self) -> ((u32, u32), u64) {
         (self.0.rdev().unwrap_or((0, 0)), self.0.metadata().ino)
+    }
+
+    fn name_is_gone(&self) -> bool {
+        self.0.name_is_gone()
     }
 }
 

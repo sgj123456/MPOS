@@ -645,6 +645,9 @@ In the order that keeps each step verifiable on its own:
 
 ## Current Status
 
+  A mapping that outlives its name says so, as Linux's does: `Inode::name_is_gone()` now exists
+  beside the ambiguous `nlink()`, and a descriptor of an unlinked file reads as `<path> (deleted)`
+  (item 184, pinned host-side; the guest-side pin waits on an ext4 orphan list).
   A regular file's descriptor now keeps the path it was opened by, so its mapping's line in
   `/proc/<pid>/maps` is named as Linux's is and `/proc/self/fd/<n>` answers the path (item 183).
   Linux's ` (deleted)` suffix is a named divergence: the signal that would print it is missing, since

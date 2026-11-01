@@ -61,6 +61,15 @@ pub trait MappedObject {
     /// readers of that fact agreeing.
     fn identity(&self) -> ((u32, u32), u64);
 
+    /// Whether the object's name is gone, so `/proc/<pid>/maps` appends the
+    /// ` (deleted)` Linux prints for a mapping whose file was unlinked while it
+    /// stayed mapped. Default `false`, for the same reason the VFS default is:
+    /// an object that keeps no link count does not know, and a wrong suffix is
+    /// worse than a missing one.
+    fn name_is_gone(&self) -> bool {
+        false
+    }
+
     /// Which System V shared-memory segment this object is, for an object that
     /// is one.
     ///

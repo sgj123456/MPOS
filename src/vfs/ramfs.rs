@@ -514,6 +514,9 @@ macro_rules! counts_its_names {
         fn nlink(&self) -> u64 {
             critical_section::with(|cs| self.links.borrow(cs).get())
         }
+        fn name_is_gone(&self) -> bool {
+            critical_section::with(|cs| self.links.borrow(cs).get()) == 0
+        }
         fn set_nlink(&self, links: u64) {
             critical_section::with(|cs| self.links.borrow(cs).set(links));
         }

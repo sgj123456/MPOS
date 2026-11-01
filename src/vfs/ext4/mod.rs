@@ -1376,6 +1376,10 @@ impl Inode for Ext4Ino {
         self.fs.read_inode(self.ino).links as u64
     }
 
+    fn name_is_gone(&self) -> bool {
+        self.fs.read_inode(self.ino).links == 0
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         self.require_dir()?;
         let dir = self.fs.read_inode(self.ino);

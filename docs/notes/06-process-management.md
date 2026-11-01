@@ -4579,3 +4579,54 @@ The prerequisite for the suffix is a trait-level answer that distinguishes the t
 exists both doors print Linux's spelling. Nothing returns a made-up name in the meantime.
 
 Full record: `docs/uapi/` §5.1 item 184.
+### 6.71 A mapping that outlives its name says so — **FIXED, pinned host-side (2026-11-02)**
+
+§6.70 named the divergence: Linux appends ` (deleted)` to a descriptor's path and to a mapping's
+name column once every name that reached the file is gone, and this kernel could not, because
+`nlink()`'s `0` means "no names" *or* "this filesystem keeps no count". §6.70's prerequisite was the
+missing answer, and this section adds it.
+
+**Measured first** (`build/scratch/del/del.c`, Linux 7.2.11): opening `/tmp/delprobe.XXXXXX`, mapping
+it shared, then unlinking it gives
+
+```
+/proc/self/fd/3 -> /tmp/delprobe.5WhpiH
+… rw-s 00000000 00:34 65483   /tmp/delprobe.5WhpiH
+        (after unlink)
+/proc/self/fd/3 -> /tmp/delprobe.5WhpiH (deleted)
+… rw-s 00000000 00:34 65483   /tmp/delprobe.5WhpiH (deleted)
+```
+
+Both doors, the same suffix, appended *after* the path.
+
+**The answer, as a door of its own**: `Inode::name_is_gone()` — default `false`, because a
+filesystem that keeps no count does not know and "does not know" must never become "deleted". It is
+implemented where the count is real: ramfs (`links == 0`) and ext4 (`i_links_count == 0`). The
+memory-mapping side asks the same question through a new
+`mm::vma::MappedObject::name_is_gone()` (default `false`; `MappedInode` and the file-fault object
+`FilePages` both forward their inode's answer), so `/proc/<pid>/maps` can append the suffix without
+the address space ever naming the VFS.
+
+**Wired**: `File::display_name` (the descriptor's own path, whichever door supplied it) and
+`procfs::mapping_lines` (a `Frames` mapping's name column) both append ` (deleted)` when the answer is
+true.
+
+**Why the pin is a host test, and what the guest refused to pin.** The first attempt pinned the two
+claims in `t-maps` on the guest and produced a *partly* green, partly red pair that differed by arm
+(`x86_64`: the mapping's suffix green, the descriptor's red; `aarch64`: both red). The cause is the
+second divergence that measurement uncovered: this ext4 frees an inode's table entry at `unlink`
+(`ext4::unlink` calls `free_inode` when the count reaches zero, with no orphan list), so "is the name
+gone" is answered by re-reading an inode slot that may already name something else — the answer races
+with reuse, and a claim that depends on that race is a flaky claim, not a contract. Linux keeps the
+inode alive until the last reference closes (the orphan list), which is what makes its answer stable.
+
+So the landed pin is the host test `vfs::file::tests::a_descriptor_outliving_its_name_says_so`:
+a ramfs file with a label reads as its path, `unlink` makes `name_is_gone()` true, and the same
+descriptor reads as `<path> (deleted)`. Counterfactual: dropping the suffix in `display_name` makes
+exactly that test fail (measured). The guest-side behaviour is a named remainder, with its own
+prerequisite — an ext4 orphan list — recorded as the next item.
+
+Two further facts from the guest probe (`build/scratch/orphan/aa-orphan.start`, on an image built
+before this change): reading an unlinked-but-open ext4 file **still answers its bytes** ("hello
+world" after `unlink`), so the missing orphan list does not lose data today; and that kernel printed
+the descriptor as `anon:[12939]`, which is the pre-§6.69 behaviour the label work replaced.
