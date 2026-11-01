@@ -8570,3 +8570,20 @@ fail=2` - that asymmetry claim and `t-smaps`' field-order claim, nothing else.
 **Pin**: `user/tests/src/bin/t-smaps-rollup.rs` — 10 claims, green on a current host and on both
 machines. **Gate**: x86_64 `pass=252 fail=0`, aarch64 `pass=251 fail=0`. **Counterfactual** (a
 `Size:` line put back into the rollup): `pass=251 fail=2`, exactly the two claims named above.
+
+## 181. `/proc/<pid>/maps`' offset column is a byte offset (2026-11-01)
+
+**Measured first** (Linux 7.2.11, host): a file `mmap`ed at byte 4096 prints `00001000` in the offset
+column and one at 8192 prints `00002000`, against the mapping's own inode — the column is
+`vm_pgoff << PAGE_SHIFT`, not the page index.
+
+**Pinned**: `t-maps` gained a second `memfd` (`t-maps-off`, three pages) mapped `MAP_SHARED` at byte
+4096 and `MAP_PRIVATE` at 8192; six new claims assert each is listed, keeps its permissions, prints
+the byte offset (`00001000`/`00002000`) and names the memfd's inode. **Counterfactual** (the renderer
+printing `line.offset / 4096`): exactly those two offset claims red, nothing else; restored byte-exact.
+
+**Open, named here rather than fixed**: extending the same block to a private mapping of a real file
+made the pin red on a pre-existing claim, and a dump showed one `rw-s` range printed **twice** (an
+unnamed inode-`0` line above the named one). The dedupe attempt was reverted and the claim dropped -
+`docs/notes/06-process-management.md` carries the dump and the next instrument.
+

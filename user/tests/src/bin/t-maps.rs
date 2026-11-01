@@ -50,7 +50,7 @@
 
 use mpos_user_tests::{Report, host_run};
 use rustix::fd::AsFd;
-use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
+use rustix::fs::{MemfdFlags, fstat, ftruncate, memfd_create};
 use rustix::mm::{MapFlags, MprotectFlags, ProtFlags, mmap, mmap_anonymous, mprotect, munmap};
 
 /// Where the name column starts, measured on Linux 7.2.7 and re-measured on
@@ -403,6 +403,87 @@ fn main() {
                     );
                 }
                 None => r.check("the memfd mapping is listed", false),
+            }
+        }
+        Err(_) => r.check("the maps file still opens", false),
+    }
+
+    // --- the offset column is a byte offset, as Linux prints it ---
+    // `vm_pgoff` is the page index in the kernel's own bookkeeping, but the
+    // maps line prints `vm_pgoff << PAGE_SHIFT`: measured on the host, a
+    // mapping at byte 4096 reads `00001000`. A kernel that printed pages
+    // would be off by 4096 and every tool that reads the column with it.
+    let (shared_at, private_at, ino) = (|| -> Option<(usize, usize, u64)> {
+        let mfd = memfd_create("t-maps-off", MemfdFlags::empty()).ok()?;
+        r.check("a third memfd is created", true);
+        r.check(
+            "and sized to three pages",
+            ftruncate(mfd.as_fd(), 3 * 4096).is_ok(),
+        );
+        let ino = fstat(mfd.as_fd()).ok()?.st_ino;
+        let shared_at = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                4096,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                mfd.as_fd(),
+                4096,
+            )
+        }
+        .ok()? as usize;
+        let private_at = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                4096,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+                mfd.as_fd(),
+                8192,
+            )
+        }
+        .ok()? as usize;
+        Some((shared_at, private_at, ino))
+    })()
+    .unwrap_or((0, 0, 0));
+
+    match read_maps() {
+        Ok(maps) => {
+            for (at, want_offset, want_perms, listed) in [
+                (
+                    shared_at,
+                    b"00001000",
+                    b"rw-s",
+                    "a shared mapping at a one-page offset is listed",
+                ),
+                (
+                    private_at,
+                    b"00002000",
+                    b"rw-p",
+                    "a private mapping at a two-page offset is listed",
+                ),
+            ] {
+                match line_at(&maps, at) {
+                    Some(line) => {
+                        r.check(listed, true);
+                        r.check(
+                            "and it keeps the mapping's permissions",
+                            line.perms == want_perms,
+                        );
+                        r.check(
+                            "and its offset column is the byte offset, as Linux prints it",
+                            line.offset == want_offset,
+                        );
+                        r.check(
+                            "and its inode is the memfd's own, which a copy could not be",
+                            core::str::from_utf8(line.inode)
+                                .ok()
+                                .and_then(|text| text.parse::<u64>().ok())
+                                == Some(ino),
+                        );
+                    }
+                    None => r.check(listed, false),
+                }
             }
         }
         Err(_) => r.check("the maps file still opens", false),

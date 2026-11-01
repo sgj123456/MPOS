@@ -645,6 +645,8 @@ In the order that keeps each step verifiable on its own:
 
 ## Current Status
 
+  `t-maps` now also pins the maps offset column as the byte offset Linux prints, with the
+  memfd's own inode beside it (item 181).
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
