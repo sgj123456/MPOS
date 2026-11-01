@@ -8558,10 +8558,15 @@ and permission column `---p`, no per-mapping size lines, `smaps`' fields in `sma
 Linux's three `Pss_*` lines, see the named divergence), one snapshot per open (a second `read(2)` is
 0, a fresh open answers), mode `0444`, size 0.
 
-**Named divergence**: this kernel's `smaps` omits `Pss_Anon`/`Pss_File`/`Pss_Shmem`, which its own
-rollup prints and Linux prints in both files — the two files disagree, and closing it is the next
-item (add the three lines to `format_smaps`, extend `t-smaps`' expected list).
+**Not a divergence — measured, and the first draft of this item said it was one.** This kernel's
+`smaps` omits `Pss_Anon`/`Pss_File`/`Pss_Shmem` while its rollup prints them, and the guess was that
+Linux prints both. It does not: on Linux 7.2.11 `grep -c Pss_Anon /proc/self/smaps` is **0** and
+`grep -c Pss_Anon /proc/self/smaps_rollup` is **1**, and the same holds for the other two names —
+the split is the rollup's alone (`fs/proc/task_mmu.c`'s `show_smaps_rollup`). `t-smaps-rollup`
+therefore pins the asymmetry as Linux's shape; a `smaps` that grew those three lines would be
+*less* like Linux, not more. Counterfactual 2 (the `Pss_Anon` line added to `format_smaps`): `pass=251
+fail=2` - that asymmetry claim and `t-smaps`' field-order claim, nothing else.
 
-**Pin**: `user/tests/src/bin/t-smaps-rollup.rs` — 9 claims, green on a current host and on both
+**Pin**: `user/tests/src/bin/t-smaps-rollup.rs` — 10 claims, green on a current host and on both
 machines. **Gate**: x86_64 `pass=252 fail=0`, aarch64 `pass=251 fail=0`. **Counterfactual** (a
 `Size:` line put back into the rollup): `pass=251 fail=2`, exactly the two claims named above.

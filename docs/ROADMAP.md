@@ -655,8 +655,10 @@ failing before any kernel door is reached (§7.4a) - and its log's one kernel-si
 framebuffer-close request, is now served and pinned (`MODE_CLOSEFB`, item 179, §7.4b; the same
 measurement moved two `ENOENT` answers `GETFB`/`GETFB2`/`RMFB` had wrong) and closing the remaining
 ABI gaps below. `/proc/<pid>/smaps_rollup` is a pinned contract now
-(`t-smaps-rollup`, 9 claims, item 180, §15.99), and writing it down found the two accounting files
-disagree: this kernel's `smaps` omits the three `Pss_*` lines its rollup prints. The block layer's counters
+(`t-smaps-rollup`, 10 claims, item 180, §15.99); writing it down first suggested the two accounting
+files disagree — re-measured, they do not: the `Pss_Anon`/`Pss_File`/`Pss_Shmem` split belongs to
+`smaps_rollup` alone on Linux 7.2.11 too (`grep -c` is 0 on `smaps`, 1 on the rollup), and the pin
+keeps that asymmetry as a claim. The block layer's counters
 now read on a desktop boot — the submit/retire pair and the mailbox agree at all 115 heartbeats of
 three boots — and that boot's own identified two-minute wait is `udev-settle` in `poll(7)`
 (§7.9b, item 148). The kernel's half of it is now measured out: one uevent announcement reaches

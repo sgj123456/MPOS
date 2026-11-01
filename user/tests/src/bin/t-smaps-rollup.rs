@@ -159,6 +159,24 @@ fn main() {
         );
     }
 
+    // The `Pss` split is the rollup's alone. Measured on a current host (Linux
+    // 7.2.11): `grep -c Pss_Anon /proc/self/smaps` is 0 and
+    // `grep -c Pss_Anon /proc/self/smaps_rollup` is 1 - so a `smaps` that grew
+    // these three lines would be *less* like Linux, not more.
+    if let Some(smaps) = slurp("/proc/self/smaps") {
+        let smaps_labels = labels(&smaps);
+        let split_in_rollup = ["Pss_Anon:", "Pss_File:", "Pss_Shmem:"]
+            .iter()
+            .all(|l| labels_here.iter().any(|x| x == l));
+        let split_out_of_smaps = ["Pss_Anon:", "Pss_File:", "Pss_Shmem:"]
+            .iter()
+            .all(|l| !smaps_labels.iter().any(|x| x == l));
+        r.check(
+            "the Pss split belongs to the rollup alone, as on Linux",
+            split_in_rollup && split_out_of_smaps,
+        );
+    }
+
     // One snapshot per open.
     let mut f = std::fs::File::open("/proc/self/smaps_rollup").unwrap();
     let mut first = String::new();
