@@ -8246,3 +8246,39 @@ exactly four claims go red - a count past `FD_SETSIZE`, a count a million past
 the table, a bit far above the table, and a count far past the table needing
 only the table's bytes. `docs/notes/10-performance.md` §10.14; gates x86_64 247
 / aarch64 246, kunit 35, host lib 720.
+
+### Item 171 - a socket's timeout bounds its wait, on every family (2026-11-01)
+
+`SO_RCVTIMEO`/`SO_SNDTIMEO` were kept and read back and **steered nothing**: a
+`recv(2)` on a socket with a 0.2 s receive timeout parked until its peer spoke
+or a signal arrived — the value was a number the kernel stored and never
+consulted (the same "a shape that looks finished while doing less" `docs/
+ARCHITECTURE.md` §3 rule 5 names, one door over from §7.9s's option table).
+
+Linux's contract, measured first (`docs/notes/` §4.7): the option is a 16-byte
+`struct timeval` whose `tv_usec` is rounded **up to the next millisecond with
+carry** (`{0,999999}` -> `{1,0}`) and refused with **`EDOM`** outside
+`0..=999999`; `{0,0}` means *no bound*, not a zero-second one; it bounds
+`recv`/`read`/`recvfrom`/`recvmsg`, `accept`, **and** the send side; an answer
+that arrives inside the window wins; it is per socket (a second empty receive
+waits it out again); and an accepted socket **inherits** its listener's value.
+
+Served on all four shapes this kernel has: the IP family (`SockOpts.rcvtimeo`/
+`sndtimeo` + `park_with_timeout` in `src/net/socket.rs`, `EAGAIN` at expiry, the
+TCP send reporting a partial push, the UDP send bounded by
+`min(send, drain)`), the accepted socket (carried through `install_accepted`),
+the unix socket (`UnixState`'s pair, `wait_for_dgram`, and `AcceptStep::TimedOut`
+answering `EAGAIN`), and a `socketpair` (each `DuplexEnd` keeps its own pair,
+`wait_channel`/`channel_peek` bound by it).
+
+Named divergences: the rounding reuses `normalise_timeval` from item 166, so
+`EDOM` and the carry are shared; a peer's end-of-file still answers before the
+bound (the bound decides a *wait*, not an answer that already exists); and
+`SO_RCVTIMEO` on a raw ICMP socket is not claimed — it needs `CAP_NET_RAW`,
+which the host reference could not exercise either.
+
+Pin `t-sock-timeout` (25 claims, `user/tests/src/bin/t-sock-timeout.rs`); the
+distinguishing waits run in a bounded child so a regression answers within a
+second instead of being killed at the program's 120 s budget. Gates x86_64
+`pass=248` / aarch64 `pass=247`, kunit 35 both; the counterfactual reddens
+exactly the seven wait claims and leaves every storing claim green.

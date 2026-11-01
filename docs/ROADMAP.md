@@ -684,6 +684,13 @@ the count, an over-unit `tv_usec` folds for `select` and is refused for
 `pselect6`, and a signal writes the remainder back in the caller's own unit
 (§10.14, item 170, pinned by `t-select`; four distinguishing claims red and
 eighteen green under the counterfactual).
+One more wait was bounded the same way: a socket's `SO_RCVTIMEO`/`SO_SNDTIMEO` were stored
+and never consulted, so a `recv(2)` with a 200 ms bound parked forever. Linux's measured
+contract — a 16-byte `timeval`, `EDOM` outside its unit, a `tv_usec` rounded up with carry,
+`{0,0}` meaning no bound, the bound honoured by every receive door *and* `accept` *and* the
+send side, and inherited by an accepted socket — is now served on the IP family, a unix
+socket and a `socketpair`; the seven distinguishing claims go red under the counterfactual
+while every storing claim stays green (§4.7, item 171, pinned by `t-sock-timeout`).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,

@@ -142,6 +142,29 @@ pub(crate) fn self_cred() -> UCred {
 /// about. The connected channel delegates its whole byte face to the
 /// `DuplexEnd` it holds; the unconnected states answer what the man pages
 /// say an unconnected socket answers.
+/// A socket timeout as an absolute deadline, or `None` for "no bound".
+///
+/// `{0, 0}` is Linux's "no timeout" rather than a zero-second one (measured,
+/// `docs/notes/` §4.7), which is why the zero pair is the whole unbounded case.
+/// The same arithmetic `net::socket`'s IP family uses, kept here because a
+/// unix socket's parks live in this module.
+#[cfg(target_os = "none")]
+fn unix_deadline(tv: (i32, i32)) -> Option<u64> {
+    if tv.0 == 0 && tv.1 == 0 {
+        return None;
+    }
+    let nanos = (tv.0 as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((tv.1 as u64).saturating_mul(1_000));
+    Some(crate::hal::since_boot_nanos().saturating_add(nanos))
+}
+
+/// The host build has no scheduler, so it has no park to bound.
+#[cfg(not(target_os = "none"))]
+fn unix_deadline(_tv: (i32, i32)) -> Option<u64> {
+    None
+}
+
 pub struct UnixSock {
     id: usize,
     /// `SOCK_STREAM`, `SOCK_DGRAM` or `SOCK_SEQPACKET`, as `socket` was
@@ -264,6 +287,16 @@ struct UnixState {
     /// Whether the descriptor's `O_NONBLOCK` has reached the socket - the
     /// pipe's rule, carried by the same `F_SETFL`/`FIONBIO` sync.
     nonblocking: bool,
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` as `struct timeval`'s two fields, `{0, 0}`
+    /// meaning "no bound".
+    ///
+    /// Linux keeps them per socket on every family and this one is no
+    /// exception (measured, `docs/notes/` §4.7: an `AF_UNIX` stream with 0.2 s
+    /// answers `EAGAIN` at 257 ms, and a `SOCK_DGRAM` pair likewise). They live
+    /// beside `passcred` because they are the same kind of thing - per-socket
+    /// state `setsockopt` stores and the doors read.
+    rcvtimeo: (i32, i32),
+    sndtimeo: (i32, i32),
 }
 
 /// One received datagram: the bytes, the sender's name if it had a bound one
@@ -344,6 +377,8 @@ impl UnixSock {
                 read_waiters: Vec::new(),
                 dgram_peer: None,
                 nonblocking: false,
+                rcvtimeo: (0, 0),
+                sndtimeo: (0, 0),
             })),
         })
     }
@@ -368,6 +403,26 @@ impl UnixSock {
     /// `SCM_CREDENTIALS`.
     pub fn set_passcred(&self, on: bool) {
         critical_section::with(|cs| self.state.borrow(cs).borrow_mut().passcred = on);
+    }
+
+    /// `SO_RCVTIMEO`, as the pair `setsockopt` stored.
+    pub fn rcvtimeo(&self) -> (i32, i32) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().rcvtimeo)
+    }
+
+    /// Set `SO_RCVTIMEO` - the bound a blocking read on this socket honours.
+    pub fn set_rcvtimeo(&self, tv: (i32, i32)) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().rcvtimeo = tv);
+    }
+
+    /// `SO_SNDTIMEO`, as the pair `setsockopt` stored.
+    pub fn sndtimeo(&self) -> (i32, i32) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().sndtimeo)
+    }
+
+    /// Set `SO_SNDTIMEO` - the bound a blocking send on this socket honours.
+    pub fn set_sndtimeo(&self, tv: (i32, i32)) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().sndtimeo = tv);
     }
 
     /// Whether this is a datagram socket - the branch the *name* rules route
@@ -660,21 +715,15 @@ impl UnixSock {
                 st.read_waiters.push(me);
             }
         });
-        let end = crate::sched::block_until_interruptible(|| {
-            critical_section::with(|cs| {
-                let st = self.state.borrow(cs).borrow();
-                // A dead sequenced-packet peer makes the empty queue a final
-                // answer, not a reason to keep sleeping: `Drop` wakes the
-                // waiters it finds here, and the condition has to agree with
-                // the take's own end-of-file test or the wake parks again.
-                !st.recvq.is_empty()
-                    || (self.typ == SOCK_SEQPACKET
-                        && st
-                            .dgram_peer
-                            .as_ref()
-                            .is_some_and(|w| w.upgrade().is_none()))
-            })
-        });
+        // `SO_RCVTIMEO` bounds this park, and its expiry is `EAGAIN` - the
+        // same three answers the IP family's receive gives (measured,
+        // `docs/notes/` §4.7: an `AF_UNIX` `SOCK_DGRAM` pair answers `EAGAIN`
+        // at 257 ms with the option at 0.2 s).
+        let deadline = unix_deadline(self.rcvtimeo());
+        let end = match deadline {
+            None => crate::sched::block_until_interruptible(|| self.dgram_ready()),
+            Some(deadline) => crate::sched::block_until_nanos(|| self.dgram_ready(), deadline),
+        };
         critical_section::with(|cs| {
             self.state
                 .borrow(cs)
@@ -684,8 +733,31 @@ impl UnixSock {
         });
         match end {
             crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
-            _ => Ok(()),
+            // The socket's own bound ran out: Linux's answer for an expired
+            // `SO_RCVTIMEO` is `EAGAIN`, not a zero-byte read.
+            crate::sched::WaitEnd::Deadline => Err(VfsError::Again),
+            crate::sched::WaitEnd::Condition => Ok(()),
         }
+    }
+
+    /// The condition [`wait_for_dgram`] waits on, in one place so the bounded
+    /// and unbounded waits cannot disagree about it.
+    ///
+    /// A dead sequenced-packet peer makes the empty queue a final answer, not
+    /// a reason to keep sleeping: `Drop` wakes the waiters it finds here, and
+    /// the condition has to agree with the take's own end-of-file test or the
+    /// wake parks again.
+    #[cfg(target_os = "none")]
+    fn dgram_ready(&self) -> bool {
+        critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            !st.recvq.is_empty()
+                || (self.typ == SOCK_SEQPACKET
+                    && st
+                        .dgram_peer
+                        .as_ref()
+                        .is_some_and(|w| w.upgrade().is_none()))
+        })
     }
 
     /// The connected channel, if there is one - the downcast the file
@@ -1680,6 +1752,10 @@ pub(crate) fn accept_once(sock: &UnixSock, nonblock: bool) -> Result<Pending, is
             // program is waiting for a client is the program's own news, and
             // Linux's `accept` reports it rather than swallowing it.
             AcceptStep::Interrupted => return Err(crate::err::EINTR),
+            // The listener's `SO_RCVTIMEO` ran out with nothing queued: the
+            // same `EAGAIN` an empty non-blocking accept answers, which is
+            // Linux's own answer for the expired bound.
+            AcceptStep::TimedOut => return Err(crate::err::EAGAIN),
         }
     }
 }
@@ -1697,6 +1773,8 @@ enum AcceptStep {
     Woken,
     /// A catchable signal ended the wait, and nothing was consumed.
     Interrupted,
+    /// The listener's `SO_RCVTIMEO` ran out: `EAGAIN`, nothing consumed.
+    TimedOut,
 }
 
 /// Park until this listener's queue is nonempty, or until a catchable signal
@@ -1710,14 +1788,20 @@ fn accept_blocking_step(sock: &UnixSock) -> AcceptStep {
             st.accept_waiters.push(me);
         }
     });
-    let end = crate::sched::block_until_interruptible(|| sock.pending_nonempty());
+    // `SO_RCVTIMEO` bounds an accept on Linux (measured, `docs/notes/` §4.7:
+    // a listener set to 0.2 s with nothing queued answers `EAGAIN` at 207 ms).
+    let end = match unix_deadline(sock.rcvtimeo()) {
+        None => crate::sched::block_until_interruptible(|| sock.pending_nonempty()),
+        Some(deadline) => crate::sched::block_until_nanos(|| sock.pending_nonempty(), deadline),
+    };
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
         st.accept_waiters.retain(|&w| w != me);
     });
     match end {
         crate::sched::WaitEnd::Interrupted => AcceptStep::Interrupted,
-        _ => AcceptStep::Woken,
+        crate::sched::WaitEnd::Deadline => AcceptStep::TimedOut,
+        crate::sched::WaitEnd::Condition => AcceptStep::Woken,
     }
 }
 

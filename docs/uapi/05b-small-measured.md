@@ -5,6 +5,23 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A socket's timeout bounds the wait, and every family keeps it.** **Landed 2026-11-01**
+  (`docs/uapi/` §5.1 item 171, `docs/notes/` §4.7). `SO_RCVTIMEO`/`SO_SNDTIMEO` were stored,
+  read back, and consulted by nothing: a `recv` on a socket with a 200 ms bound parked until
+  the peer spoke. Measured on Linux 7.2.11 first (`build/scratch/rcvt/{a,b}.c`): a 16-byte
+  `struct timeval` whose `tv_usec` is rounded **up** to the next millisecond with carry
+  (`{0,999999}` -> `{1,0}`) and refused as **`EDOM`** outside its unit; `{0,0}` is *no bound*;
+  the bound ends an empty `recv`/`read`/`recvfrom`/`recvmsg` at 207-209 ms with `EAGAIN` and
+  yields to an arrival inside the window; it bounds `accept` (207 ms) and the accepted socket
+  **inherits** the listener's value; it bounds the send side (refused at 620 ms against a
+  peer that never reads); it is per socket (a second empty receive waits it out again); and
+  `AF_UNIX`/`socketpair` answer the same (257 ms). Served on all four shapes - IP, accepted,
+  unix, `socketpair` - by one `park_with_timeout` plus `UnixState`'s pair and each
+  `DuplexEnd`'s own. Pin **`t-sock-timeout`, 25 claims**; the distinguishing waits run in a
+  bounded child, because a wait that never expires is killed at the program's 120 s budget
+  and names no claim. Gates x86_64 `pass=248` / aarch64 `pass=247`, kunit 35 both; the
+  counterfactual reddens exactly the seven wait claims and leaves every storing claim green.
+
 - **A child inherits its parent's signal table, and `exec` resets only the caught slots.**
   **Landed 2026-10-21** (`docs/uapi/` §5.1 item 96) - `fork`/`clone` started every process
   at `SIG_DFL`, which is why `clone3`'s `CLONE_CLEAR_SIGHAND` was refused `EOPNOTSUPP`;

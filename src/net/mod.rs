@@ -378,6 +378,20 @@ pub(crate) struct SockOpts {
     pub linger_sec: i32,
     pub rcvbuf: u32,
     pub sndbuf: u32,
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO`, as `struct timeval`'s two fields.
+    ///
+    /// Linux's contract, measured on 7.2.11 (`docs/notes/` §4.7): the value is
+    /// per *socket*, not per call; `{0, 0}` is "no bound" and not a zero-second
+    /// one; a field outside its unit is `EDOM` on `set`; a valid one is rounded
+    /// **up** to the whole millisecond with a carry, so `{0, 1}` stores as
+    /// `{0, 1000}` and `{0, 999999}` as `{1, 0}`; and the read-back is 16
+    /// bytes, truncated to the caller's capacity with `optlen` reporting
+    /// `min(cap, 16)`.
+    ///
+    /// Zero here means "no bound", which is why the fields start at zero: a
+    /// caller that never asks for one gets the unbounded park it always had.
+    pub rcvtimeo: (i32, i32),
+    pub sndtimeo: (i32, i32),
 }
 
 /// The two sizes a fresh socket of each family reports before anyone asks.
@@ -429,6 +443,11 @@ impl SockOpts {
             linger_sec: 0,
             rcvbuf,
             sndbuf,
+            // `{0, 0}` is Linux's "no bound" - the unbounded park this kernel
+            // had before the option existed, which is why a fresh socket costs
+            // nothing for carrying it.
+            rcvtimeo: (0, 0),
+            sndtimeo: (0, 0),
         }
     }
 }

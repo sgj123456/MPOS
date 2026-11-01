@@ -492,15 +492,40 @@ fn on_channel<T>(file: &Arc<crate::vfs::File>, f: impl FnOnce(&DuplexEnd) -> T) 
 fn wait_channel(file: &Arc<crate::vfs::File>) -> isize {
     let ready =
         || file.inode().poll_ready().read || on_channel(file, |c| c.scm_due()).unwrap_or(false);
-    while !ready() {
-        if crate::sched::has_deliverable_signal() {
-            return err::EINTR;
+    // A channel end carries `SO_RCVTIMEO` (a socketpair's `DuplexEnd` and a
+    // connected unix socket both do), and Linux's `AF_UNIX` receive honours it
+    // - measured at 257 ms for a 0.2 s option on both a stream and a datagram
+    // pair, `docs/notes/` §4.7.
+    let deadline = channel_recv_deadline(file);
+    loop {
+        while !ready() {
+            if crate::sched::has_deliverable_signal() {
+                return err::EINTR;
+            }
+            let woke = park_with_timeout(ready, deadline);
+            if woke == err::EAGAIN {
+                return err::EAGAIN;
+            }
+            if woke == err::EINTR {
+                return err::EINTR;
+            }
         }
-        if park_until(ready) == err::EINTR {
-            return err::EINTR;
-        }
+        return 0;
     }
-    0
+}
+
+/// The `SO_RCVTIMEO` a channel end carries, as a deadline.
+///
+/// Both shapes a channel comes in keep the pair - a `socketpair`'s own inode
+/// (its `DuplexEnd`) and a connected unix socket's copied-out one - so this
+/// asks each and takes the first that answers.
+fn channel_recv_deadline(file: &Arc<crate::vfs::File>) -> Option<u64> {
+    if let Some(d) = file.inode().as_duplex() {
+        return timeval_deadline(d.rcvtimeo());
+    }
+    file.inode()
+        .unix_end()
+        .and_then(|s| timeval_deadline(s.rcvtimeo()))
 }
 
 /// One `MSG_PEEK` on a channel end: copy the bytes a read would hand back and
@@ -537,8 +562,9 @@ fn channel_peek(
                     if crate::sched::has_deliverable_signal() {
                         return Err(err::EINTR);
                     }
-                    if park_until(ready) == err::EINTR {
-                        return Err(err::EINTR);
+                    let woke = park_with_timeout(ready, channel_recv_deadline(file));
+                    if woke != 0 {
+                        return Err(woke);
                     }
                 }
             }
@@ -878,6 +904,87 @@ fn park_until(ready: impl Fn() -> bool) -> isize {
         crate::sched::WaitEnd::Interrupted => err::EINTR,
         crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => 0,
     }
+}
+
+/// The absolute deadline a socket's `struct timeval` option asks for, or
+/// `None` when it asks for no bound.
+///
+/// `{0, 0}` is Linux's "no timeout" rather than a zero-second one (measured,
+/// `docs/notes/` §4.7: the door parks, it does not answer `EAGAIN` at once),
+/// which is why the zero pair is the whole of the unbounded case. The value is
+/// read once, at the call that blocks - a caller that changes the option
+/// between two calls sees the change on the second, which is Linux's
+/// per-*socket* not per-*call* rule (the same probe: a `{1, 0}` socket is still
+/// `{1, 0}` after a successful receive, and its next empty one answers
+/// `EAGAIN` at 1039 ms).
+/// Read a `struct timeval` option off the caller, normalising it the way
+/// `setsockopt` must: 16 bytes wide, `EDOM` reported through `None`'s sibling
+/// (the caller maps a refusal), and the pair rounded up to whole milliseconds
+/// with a carry.
+///
+/// Returns `None` both for a malformed argument and for a refused one; the two
+/// callers in this file answer `EINVAL`/the error `normalise_timeval` names,
+/// and keeping one door means the unix and socketpair families cannot drift
+/// apart from the IP one on their width or their rounding.
+fn read_timeval(_fd: i32, optval: usize, optlen: usize, from_user: bool) -> Option<(i32, i32)> {
+    if optval == 0 || optlen < 16 || !crate::uaccess::buffer_ok(optval, 16, false, from_user) {
+        return None;
+    }
+    let secs = unsafe { (optval as *const i64).read_unaligned() };
+    let usecs = unsafe { ((optval + 8) as *const i64).read_unaligned() };
+    crate::uevent::normalise_timeval(secs, usecs).ok()
+}
+
+fn timeval_deadline(opt: (i32, i32)) -> Option<u64> {
+    let (secs, usecs) = opt;
+    if secs == 0 && usecs == 0 {
+        return None;
+    }
+    // The option is normalised on the way in (`crate::uevent::normalise_timeval`
+    // rounds up to the whole millisecond), so the multiplication cannot lose a
+    // fraction here that the caller could observe.
+    let nanos = (secs as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usecs as u64).saturating_mul(1_000));
+    Some(crate::hal::since_boot_nanos().saturating_add(nanos))
+}
+
+/// Park until `ready`, honouring a socket timeout: `EINTR` for a signal,
+/// `EAGAIN` when the bound ran out first, zero otherwise.
+///
+/// This is the door every blocking receive, send and accept goes through when
+/// the socket carries `SO_RCVTIMEO`/`SO_SNDTIMEO`. `None` keeps the unbounded
+/// park it had, so a socket without the option is charged nothing new.
+fn park_with_timeout(ready: impl Fn() -> bool, deadline: Option<u64>) -> isize {
+    match deadline {
+        None => park_until(ready),
+        Some(deadline) => {
+            let me = crate::sched::current();
+            super::subscribe(me);
+            let end = crate::sched::block_until_nanos(ready, deadline);
+            super::unsubscribe(me);
+            match end {
+                crate::sched::WaitEnd::Interrupted => err::EINTR,
+                crate::sched::WaitEnd::Condition => 0,
+                // Linux's answer for an expired socket timeout (measured,
+                // `docs/notes/` §4.7): `EAGAIN`, not zero bytes and not
+                // `ETIMEDOUT`.
+                crate::sched::WaitEnd::Deadline => err::EAGAIN,
+            }
+        }
+    }
+}
+
+/// The receive timeout of the socket behind `handle`, as a deadline.
+fn recv_deadline(handle: usize) -> Option<u64> {
+    let opt = super::with(handle, |_, entry| entry.opts.rcvtimeo).unwrap_or((0, 0));
+    timeval_deadline(opt)
+}
+
+/// The send timeout of the socket behind `handle`, as a deadline.
+fn send_deadline(handle: usize) -> Option<u64> {
+    let opt = super::with(handle, |_, entry| entry.opts.sndtimeo).unwrap_or((0, 0));
+    timeval_deadline(opt)
 }
 
 /// [`park_until`] with a clock on the wait: the same registration, the same
@@ -2428,24 +2535,31 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
         // Park until there is room for the rest, or a signal ends the send.
         // A partial push already reported is a completed send: the park is
         // only for the bytes still owed.
-        let e = park_until(|| {
-            super::with(handle, |stack, entry| {
-                let Channel::Tcp {
-                    home,
-                    handle: sock_handle,
-                    ..
-                } = &entry.channel
-                else {
-                    return true;
-                };
-                stack
-                    .sockets_mut(*home)
-                    .get_mut::<tcp::Socket>(*sock_handle)
-                    .can_send()
-            })
-            .unwrap_or(true)
-        });
-        if e == err::EINTR {
+        // `SO_SNDTIMEO` bounds this park (measured: a peer that never reads
+        // makes `send(65536)` answer `EAGAIN` at 620 ms once the window is
+        // full), and its expiry has the same two faces every send has - what
+        // already went out is a completed send, and nothing out is `EAGAIN`.
+        let e = park_with_timeout(
+            || {
+                super::with(handle, |stack, entry| {
+                    let Channel::Tcp {
+                        home,
+                        handle: sock_handle,
+                        ..
+                    } = &entry.channel
+                    else {
+                        return true;
+                    };
+                    stack
+                        .sockets_mut(*home)
+                        .get_mut::<tcp::Socket>(*sock_handle)
+                        .can_send()
+                })
+                .unwrap_or(true)
+            },
+            send_deadline(handle),
+        );
+        if e == err::EINTR || e == err::EAGAIN {
             return if sent > 0 { sent as isize } else { e };
         }
     }
@@ -2514,8 +2628,17 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
     // doc above says what each turn costs and why the condition has to ask
     // both of `enqueue`'s questions. The deadline is taken once, before the
     // first attempt, so a wait that has to end ends on the whole call.
-    let deadline =
+    let drain_deadline =
         crate::hal::since_boot_nanos().saturating_add(DRAIN_WAIT_MS.saturating_mul(1_000_000));
+    // Two bounds meet here and the earlier one wins: the egress-drain bound
+    // above (this kernel's own, because smoltcp keeps a datagram its egress
+    // never dispatched - a state Linux's device drops out of) and the caller's
+    // `SO_SNDTIMEO`, which is the caller's own number and therefore the one
+    // that must not be exceeded.
+    let deadline = match send_deadline(handle) {
+        Some(socket) => socket.min(drain_deadline),
+        None => drain_deadline,
+    };
     loop {
         let sent = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -3795,7 +3918,14 @@ fn tcp_recv(
                 Err(err::EINTR)
             };
         }
-        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+        // A receive is the door `SO_RCVTIMEO` bounds: the bound is the
+        // socket's, read once here, and its expiry is `EAGAIN` (Linux's
+        // answer, measured - `docs/notes/` §4.7).
+        let woke = park_with_timeout(|| super::socket_ready(handle).read, recv_deadline(handle));
+        if woke == err::EAGAIN {
+            return Err(err::EAGAIN);
+        }
+        if woke == err::EINTR {
             return if empty {
                 Ok(RecvAnswer {
                     copied: 0,
@@ -3909,7 +4039,11 @@ fn udp_recv(
         if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
-        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+        let woke = park_with_timeout(|| super::socket_ready(handle).read, recv_deadline(handle));
+        if woke == err::EAGAIN {
+            return Err(err::EAGAIN);
+        }
+        if woke == err::EINTR {
             return Err(err::EINTR);
         }
     }
@@ -4220,7 +4354,11 @@ fn raw_recv(
         // The park ends on the stack's own wakeup call - every poll wakes
         // the registered waiters - so the reply is noticed when it arrives,
         // not when the next clock tick happens to fall.
-        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+        let woke = park_with_timeout(|| super::socket_ready(handle).read, recv_deadline(handle));
+        if woke == err::EAGAIN {
+            return Err(err::EAGAIN);
+        }
+        if woke == err::EINTR {
             return Err(err::EINTR);
         }
     }
@@ -4781,16 +4919,22 @@ fn accept_tcp(
         // bit is what lets a restart take the port back from the `TIME-WAIT`
         // 4-tuple this very connection will leave behind (see
         // `install_accepted` and `net::Stack::tcp_name_taken`).
+        // `SO_RCVTIMEO` comes out with the connection too: Linux copies it onto
+        // the accepted socket (measured, `docs/notes/` §4.7 - a listener set to
+        // 0.3 s hands the accepted descriptor 0.300000, and its first empty
+        // receive answers `EAGAIN` at 304 ms), which is the same inheritance
+        // `SO_REUSEADDR` already gets here.
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
             (
                 stack.listener_take(id),
                 entry.opts.reuseaddr,
                 entry.opts.rcvbuf,
+                entry.opts.rcvtimeo,
             )
         });
         match step {
-            Some((Some((home, sock_handle)), reuse, rcvbuf)) => {
+            Some((Some((home, sock_handle)), reuse, rcvbuf, rcvtimeo)) => {
                 return install_accepted(
                     home,
                     sock_handle,
@@ -4800,9 +4944,10 @@ fn accept_tcp(
                     nonblock,
                     reuse,
                     rcvbuf,
+                    rcvtimeo,
                 );
             }
-            Some((None, _, _)) => {
+            Some((None, ..)) => {
                 if nonblock {
                     return err::EAGAIN;
                 }
@@ -4819,7 +4964,13 @@ fn accept_tcp(
             })
             .unwrap_or(true)
         };
-        if park_until(arrived) == err::EINTR {
+        // `SO_RCVTIMEO` bounds an accept too (measured: a listener set to
+        // 0.2 s with no connection answers `EAGAIN` at 207 ms).
+        let woke = park_with_timeout(arrived, recv_deadline(handle));
+        if woke == err::EAGAIN {
+            return err::EAGAIN;
+        }
+        if woke == err::EINTR {
             return err::EINTR;
         }
     }
@@ -4836,6 +4987,7 @@ fn install_accepted(
     nonblock: bool,
     reuseaddr: bool,
     rcvbuf: u32,
+    rcvtimeo: (i32, i32),
 ) -> isize {
     // The peer's address is read *before* the socket becomes an entry: it is
     // the connection's own fact, and the entry hands the same socket to
@@ -4872,6 +5024,7 @@ fn install_accepted(
         super::SockOpts {
             reuseaddr,
             rcvbuf,
+            rcvtimeo,
             ..super::SockOpts::new(SOCK_STREAM)
         },
     ) {
@@ -5636,6 +5789,23 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
+        // The socket timeouts come first because they are the one pair a unix
+        // socket takes as a `struct timeval` rather than a word, and they are
+        // not bookkeeping here: they bound this family's parks the way they
+        // bound the IP family's (measured: an `AF_UNIX` stream and a
+        // `SOCK_DGRAM` pair both answer `EAGAIN` at 257 ms with the option at
+        // 0.2 s).
+        if matches!(optname, SO_RCVTIMEO | SO_SNDTIMEO) {
+            let Some(pair) = read_timeval(fd, optval, optlen, from_user) else {
+                return err::EINVAL;
+            };
+            if optname == SO_RCVTIMEO {
+                sock.set_rcvtimeo(pair);
+            } else {
+                sock.set_sndtimeo(pair);
+            }
+            return 0;
+        }
         if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
             return err::EINVAL;
         }
@@ -5662,6 +5832,17 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
+        }
+        if matches!(optname, SO_RCVTIMEO | SO_SNDTIMEO) {
+            let Some(tv) = read_timeval(fd, optval, optlen, from_user) else {
+                return err::EINVAL;
+            };
+            if optname == SO_RCVTIMEO {
+                pair.set_rcvtimeo(tv);
+            } else {
+                pair.set_sndtimeo(tv);
+            }
+            return 0;
         }
         if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
             return err::EINVAL;
@@ -5696,16 +5877,33 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         Ok(handle) => handle,
         Err(e) => return e,
     };
-    // An int-valued option is 4 bytes; `struct linger` is two ints.
-    let need = if (level, optname) == (SOL_SOCKET, SO_LINGER) {
-        8
-    } else {
-        4
+    // An int-valued option is 4 bytes; `struct linger` is two ints; the two
+    // socket timeouts are a `struct timeval`, whose fields are 64 bits each -
+    // the same 16-byte width the device-event family's table already serves,
+    // and Linux refuses a shorter one `EINVAL` (measured, `docs/notes/` §4.7).
+    let need = match (level, optname) {
+        (SOL_SOCKET, SO_LINGER) => 8,
+        (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => 16,
+        _ => 4,
     };
     if optval == 0 || optlen < need || !crate::uaccess::buffer_ok(optval, need, false, from_user) {
         return err::EINVAL;
     }
     let val = unsafe { (optval as *const i32).read_unaligned() };
+    // The timeval pair is read whole before the store: `normalise_timeval`
+    // owns the range check (`EDOM` on a field outside its unit) and the
+    // rounding to whole milliseconds, and it has to see both fields at once to
+    // carry `{0, 999999}` into `{1, 0}`.
+    let timeval = if need == 16 {
+        let secs = unsafe { (optval as *const i64).read_unaligned() };
+        let usecs = unsafe { ((optval + 8) as *const i64).read_unaligned() };
+        match crate::uevent::normalise_timeval(secs, usecs) {
+            Ok(pair) => Some(pair),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
     super::with(handle, |stack, entry| {
         // The smoltcp socket behind this channel, when it is a TCP one. Two of
         // the options below actually steer the stack and so are applied here,
@@ -5807,6 +6005,24 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 }
             }
             (SOL_IP, IP_RECVTTL) => entry.opts.recv_ttl = val != 0,
+            // The two socket timeouts. They bound the waits the receive, send
+            // and accept doors park in, which is what Linux does with them on
+            // every family (measured: a UDP receive answers `EAGAIN` at 207 ms
+            // with the option at 0.2 s, a TCP send at 620 ms once the peer's
+            // window is full, and an accept at 207 ms with nothing queued).
+            // Storing them here is the whole of the option's job: the deadline
+            // is computed at each call, because a timeout bounds a *call* and
+            // the value belongs to the *socket*.
+            (SOL_SOCKET, SO_RCVTIMEO) => {
+                if let Some(pair) = timeval {
+                    entry.opts.rcvtimeo = pair;
+                }
+            }
+            (SOL_SOCKET, SO_SNDTIMEO) => {
+                if let Some(pair) = timeval {
+                    entry.opts.sndtimeo = pair;
+                }
+            }
             // An option this stack does not model is accepted and forgotten, the
             // way a lenient kernel lets a caller set an exotic one and ignore it.
             _ => {}
@@ -5916,15 +6132,27 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             inode
                 .as_any()
                 .downcast_ref::<UnixSock>()
-                .map(|s| (s.peer_cred().unwrap_or_default(), s.passcred()))
+                .map(|s| {
+                    (
+                        s.peer_cred().unwrap_or_default(),
+                        s.passcred(),
+                        s.rcvtimeo(),
+                        s.sndtimeo(),
+                    )
+                })
                 .or_else(|| {
                     inode.as_duplex().map(|d| {
                         let (pid, uid, gid) = d.peer_cred();
-                        (crate::net::unix::UCred { pid, uid, gid }, d.passcred())
+                        (
+                            crate::net::unix::UCred { pid, uid, gid },
+                            d.passcred(),
+                            d.rcvtimeo(),
+                            d.sndtimeo(),
+                        )
                     })
                 })
         });
-    if let Some((c, passcred)) = channel {
+    if let Some((c, passcred, rcvtimeo, sndtimeo)) = channel {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
@@ -5935,6 +6163,34 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             return err::EFAULT;
         }
         let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() } as usize;
+        // A unix socket's two timeouts are a `struct timeval`, 16 bytes wide,
+        // truncated to the caller's capacity with `optlen = min(cap, 16)` -
+        // Linux's rule on every family (measured, `docs/notes/` §4.7).
+        if matches!(optname, SO_RCVTIMEO | SO_SNDTIMEO) {
+            let pair = if optname == SO_RCVTIMEO {
+                rcvtimeo
+            } else {
+                sndtimeo
+            };
+            let copy = cap.min(16);
+            if copy > 0 && !crate::uaccess::buffer_ok(optval, copy, true, from_user) {
+                return err::EFAULT;
+            }
+            let words: [i32; 4] = [pair.0, 0, pair.1, 0];
+            let mut done = 0usize;
+            for word in words {
+                if done >= copy {
+                    break;
+                }
+                let take = (copy - done).min(4);
+                for (i, byte) in word.to_le_bytes().iter().enumerate().take(take) {
+                    unsafe { ((optval + done + i) as *mut u8).write_volatile(*byte) };
+                }
+                done += take;
+            }
+            unsafe { (optlen_ptr as *mut u32).write_volatile(copy as u32) };
+            return 0;
+        }
         // (value length, is-cred). Everything else is a 4-byte int.
         let (need, cred) = match optname {
             SO_PEERCRED => (UCREN_LEN, true),
@@ -6028,6 +6284,52 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     }
     let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() };
     // `SO_LINGER` answers a `struct linger { int l_onoff; int l_linger; }`, so
+    // The two socket timeouts are a `struct timeval`: 16 bytes on the wire,
+    // and a short buffer is *truncated* with `optlen` answering
+    // `min(cap, 16)` rather than refused (measured, `docs/notes/` §4.7: cap 2
+    // copies the leading zero words, cap 12 copies twelve bytes and reports
+    // twelve, cap 20 copies sixteen and leaves the caller's tail untouched).
+    if (level, optname) == (SOL_SOCKET, SO_RCVTIMEO)
+        || (level, optname) == (SOL_SOCKET, SO_SNDTIMEO)
+    {
+        if optval == 0 || optlen_ptr == 0 {
+            return err::EFAULT;
+        }
+        if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() } as usize;
+        let pair = super::with(handle, |_, entry| {
+            if optname == SO_RCVTIMEO {
+                entry.opts.rcvtimeo
+            } else {
+                entry.opts.sndtimeo
+            }
+        })
+        .unwrap_or((0, 0));
+        let copy = cap.min(16);
+        if copy > 0 && !crate::uaccess::buffer_ok(optval, copy, true, from_user) {
+            return err::EFAULT;
+        }
+        // Field by field, little-endian, so a buffer that ends inside a field
+        // takes the bytes that fit - the same shape the device-event family's
+        // table serves.
+        let words: [i32; 4] = [pair.0, 0, pair.1, 0];
+        let mut done = 0usize;
+        for word in words {
+            if done >= copy {
+                break;
+            }
+            let take = (copy - done).min(4);
+            let bytes = word.to_le_bytes();
+            for (i, byte) in bytes.iter().enumerate().take(take) {
+                unsafe { ((optval + done + i) as *mut u8).write_volatile(*byte) };
+            }
+            done += take;
+        }
+        unsafe { (optlen_ptr as *mut u32).write_volatile(copy as u32) };
+        return 0;
+    }
     // it is the one option eight bytes wide.
     if (level, optname) == (SOL_SOCKET, SO_LINGER) {
         if cap < 8 || !crate::uaccess::buffer_ok(optval, 8, true, from_user) {

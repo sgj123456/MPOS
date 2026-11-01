@@ -19,7 +19,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
@@ -1063,6 +1063,16 @@ pub struct DuplexEnd {
     peer: (u32, u32, u32),
     /// `SO_PASSCRED`: whether a read should attach the peer's credentials.
     passcred: AtomicBool,
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` as `struct timeval`'s two fields - the
+    /// bound a blocking read or write on this end honours, `{0, 0}` meaning
+    /// none.
+    ///
+    /// A socketpair is two `DuplexEnd`s sharing nothing but the pipe halves, so
+    /// each end carries its own pair - Linux's per-socket rule. The fields are
+    /// atomics for the same reason `passcred` is: each end is read and written
+    /// from whichever task holds its descriptor.
+    rcvtimeo_bits: AtomicU64,
+    sndtimeo_bits: AtomicU64,
 }
 
 impl DuplexEnd {
@@ -1082,6 +1092,9 @@ impl DuplexEnd {
                 write,
                 peer: creator,
                 passcred: AtomicBool::new(false),
+                // `{0, 0}` packed: Linux's "no bound".
+                rcvtimeo_bits: AtomicU64::new(0),
+                sndtimeo_bits: AtomicU64::new(0),
             })
         };
         let a = end(a_read, a_write);
@@ -1098,6 +1111,30 @@ impl DuplexEnd {
     /// `SO_PASSCRED` as read.
     pub fn passcred(&self) -> bool {
         self.passcred.load(Ordering::Relaxed)
+    }
+
+    /// `SO_RCVTIMEO` as the pair it was set to.
+    pub fn rcvtimeo(&self) -> (i32, i32) {
+        let bits = self.rcvtimeo_bits.load(Ordering::Relaxed);
+        (bits as u32 as i32, (bits >> 32) as u32 as i32)
+    }
+
+    /// Set `SO_RCVTIMEO` - the bound a blocking read on this end honours.
+    pub fn set_rcvtimeo(&self, tv: (i32, i32)) {
+        let bits = (tv.0 as u32 as u64) | ((tv.1 as u32 as u64) << 32);
+        self.rcvtimeo_bits.store(bits, Ordering::Relaxed);
+    }
+
+    /// `SO_SNDTIMEO` as the pair it was set to.
+    pub fn sndtimeo(&self) -> (i32, i32) {
+        let bits = self.sndtimeo_bits.load(Ordering::Relaxed);
+        (bits as u32 as i32, (bits >> 32) as u32 as i32)
+    }
+
+    /// Set `SO_SNDTIMEO` - the bound a blocking write on this end honours.
+    pub fn set_sndtimeo(&self, tv: (i32, i32)) {
+        let bits = (tv.0 as u32 as u64) | ((tv.1 as u32 as u64) << 32);
+        self.sndtimeo_bits.store(bits, Ordering::Relaxed);
     }
 
     /// `SO_PASSCRED` as set.

@@ -1695,3 +1695,118 @@ are the two above: 65 507 on a 65 536-byte loopback, `EMSGSIZE` where a link's
 MTU would have to be fragmented, and `IP_MTU_DISCOVER`/`IP_MTU` still refused
 (named in `docs/uapi/` §5.1 item 58; the refusal is Linux's no-fragment shape,
 not an invented limit).
+
+## 4.7 A socket's receive and send timeout bounds the wait — **DONE** (2026-11-01)
+
+`SO_RCVTIMEO`/`SO_SNDTIMEO` were stored and read back on every family, and
+**steered no wait at all**: `recv(2)` on a socket with a 0.2 s receive timeout
+parked forever instead of answering `EAGAIN` at 200 ms. The value was a number
+the kernel kept and never consulted — the same shape as the option tables
+§7.9s had to fix one door over. This section records Linux's contract, measured
+before anything was written, and the four parks that now honour it.
+
+### What Linux does (7.2.11, measured on the host)
+
+`build/scratch/rcvt/a.c` and `b.c`, unbuffered stdout, every answer timed with
+`CLOCK_MONOTONIC` around the call.
+
+**A bound on every door of the family.** `SO_RCVTIMEO` `{0, 200000}` on an
+empty UDP socket: `recv(2)` answers `EAGAIN` (11) at 207 ms, `read(2)` at
+209 ms, `recvfrom(2)` at 207 ms, `recvmsg(2)` at 208 ms. An arrival at 150 ms
+wins the race and is returned (2 bytes) — so the option bounds the wait without
+stealing an answer that comes in time.
+
+**The value is a 16-byte `struct timeval`.** Two 64-bit fields on this
+machine: `setsockopt` with `optlen` 4 or 8 is `EINVAL`; `getsockopt` with a
+short buffer is **truncated** and reports `optlen = min(cap, 16)` — cap 0 copies
+nothing and answers 0, cap 2/4/8 give the leading zero words, cap 12 gives 12
+bytes (`400d0300` = 200000 little-endian), cap 20 copies 16 and leaves
+`55555555` past the width untouched.
+
+**Rounding and refusals, all on `set`.** `{0,1}` reads back `{0,1000}`,
+`{0,4999}` -> `{0,5000}`, `{0,5001}` -> `{0,6000}`, `{0,999999}` -> `{1,0}`,
+`{2,500000}` unchanged: a `tv_usec` is rounded **up to the next whole
+millisecond, with carry into the seconds**. `{0,1000000}` is `EDOM` (33), and
+so are `{0,-1}` and `{0,5000000}`; a negative second alone (`{-1,0}`) is
+**accepted** and stores `{0,0}` — "no bound". A refused set leaves the old
+value in place. `{0,0}` itself is not a zero-second timeout: the door parks.
+
+**Per socket, not per call.** A successful receive leaves the value; the next
+empty receive waits the same second out again (1039 ms measured with `{1,0}`).
+
+**Inherited by an accepted socket.** A listener set to 0.3 s: `accept(2)` with
+nothing queued answers `EAGAIN` at 207 ms, and the socket it returns reads back
+`{0,300000}` — its own reads then answer `EAGAIN` at 304 ms.
+
+**`SO_SNDTIMEO` bounds the send side the same way.** A TCP socket whose peer
+never reads: `send(65536)` is refused with `EAGAIN` at 620 ms after 2 720 256
+bytes went out under `{0,0}`'s blocking shape; `{1,250000}` reads back
+verbatim.
+
+**`AF_UNIX` shares the contract.** A stream pair with nothing sent answers
+`EAGAIN` at 257 ms with a 0.2 s option; so does a `socketpair(AF_UNIX,
+SOCK_DGRAM)`.
+
+Not measured: `SO_RCVTIMEO` on a raw ICMP socket (needs `CAP_NET_RAW`; the host
+refused), and the same option on a device-event socket, which §7.9t already
+covers on its own terms.
+
+### What this kernel now does
+
+Four parks gained a deadline, and the deadline is Linux's answer rather than a
+new policy:
+
+* `src/net/socket.rs` — `fn timeval_deadline(opt: (i32, i32)) -> Option<u64>`
+  turns the stored pair into an absolute deadline (`{0,0}` -> `None`), and
+  `fn park_with_timeout(ready, deadline) -> isize` is the one park every
+  receive uses: no deadline -> `park_until`, a deadline -> subscribe,
+  `block_until_nanos`, unsubscribe, with `WaitEnd::Deadline` answering
+  `EAGAIN`. The four receive parks and the `accept(2)` park call it. The TCP
+  send park is bounded by `send_deadline` and, on expiry, reports the bytes it
+  did move (a partial push is a completed `send(2)`, Linux's own rule); the UDP
+  send takes `min(send_deadline, drain_deadline)`.
+* `src/net/socket.rs`'s `install_accepted` takes the listener's
+  `entry.opts.rcvtimeo` — the inheritance above, carried rather than assumed.
+* `src/net/unix.rs` — `UnixState`/`UnixSock` keep the pair,
+  `fn unix_deadline(tv) -> Option<u64>` is the same arithmetic for this
+  module's parks, `wait_for_dgram` is bounded (`VfsError::Again` on expiry),
+  and `AcceptStep` gained `TimedOut` so a listener's exhausted bound answers
+  `EAGAIN` rather than `EINTR`.
+* `src/vfs/pipe.rs` — a `socketpair`'s `DuplexEnd` keeps its own two pairs in
+  `AtomicU64`s (each end is its own socket, Linux's per-socket rule), and
+  `wait_channel`/`channel_peek` bound their parks by them.
+
+Named divergences, all in the direction of refusing less than Linux does: the
+rounding is applied by the same `normalise_timeval` §7.9t introduced (so
+`EDOM` and the carry are shared, not re-derived), and a `SO_RCVTIMEO` on a
+socket whose peer is gone still answers end-of-file before the bound — the
+bound decides a wait, not an answer that already exists.
+
+### Pin, gates, counterfactual
+
+`user/tests/src/bin/t-sock-timeout.rs` — 25 claims: the fresh default, the
+sub-millisecond set and its read-back, four explicit-bounded receives with a
+`150..1100 ms` window (`EAGAIN`, the timing, a datagram inside the window, the
+second wait), the 4-byte refusal, the truncated get with `len == 8`,
+`{0,1000000}` -> `EDOM`, `{0,999999}` -> `{1,0}`, `{0,0}` reads back unset, the
+loopback listener+client+accept trio, the send timeout's 16-byte value and its
+`EAGAIN` at expiry, the listener's accept timeout, and the inheritance. Host
+reference `MPOS_ON_HOST=1 ./target/x86_64-unknown-linux-gnu/debug/t-sock-timeout`
+-> 25/25, `PASS`.
+
+Gates: x86_64 `verdict pass=248 fail=0`, `mpos-kunit 35 passed, 0 failed`,
+`X-EXIT=0`; aarch64 `verdict pass=247 fail=0`, kunit 35, `A-EXIT=0`. Host lib
+720, `cargo test -p mpos-xtask` 146, `cargo xtask depgraph` within the ratchet,
+`cargo fmt --all -- --check` clean.
+
+The counterfactual (`park_with_timeout` ignoring the deadline, and the unix
+parks back to `block_until_interruptible`) reddens exactly **seven** claims and
+no others: the three receive claims, the two send claims and the two accept
+claims — while every storing claim (`read-back`, `EDOM`, the rounding, the
+truncation, the inheritance) stays green, which is the split this item is
+about. A first attempt at the counterfactual could not be read at all: a wait
+that never expires parks the program until its own 120 s budget kills it, so it
+reports as `=== FAIL t-sock-timeout timeout=120s` with no claim named. The
+distinguishing claims therefore run inside a **bounded child**
+(`blocking_answer(f, bound_ms)`, the `t-uevent-doors` shape) so a regression
+answers `EAGAIN`-or-nothing within a second and names itself.
