@@ -5,6 +5,20 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A socket's option names answer what the socket is, or refuse the name.** **Landed
+  2026-11-01** (`docs/uapi/` §5.1 item 172, `docs/notes/` §4.8). `getsockopt(2)` on an IP
+  socket ended in `_ => 0`, so an unmodelled name answered zero - a claim that the socket had
+  been told a value nobody stored. Measured on Linux 7.2.11 first
+  (`build/scratch/sockopt2/{o,g,m,l,t}.c`): the socket answers what it *is* (`SO_TYPE` 2/1,
+  `SO_DOMAIN` 2, `SO_PROTOCOL` 17/6, `SO_ACCEPTCONN` 0 until it listens, `SO_ERROR` 0), and
+  an unmodelled name is refused by whether the socket's protocol stack has that level -
+  `ENOPROTOOPT` when it does, `EOPNOTSUPP` when it does not; the `set` door is `ENOPROTOOPT`
+  for both, and refuses a read-only identity name. Served by four identity rows plus
+  `unknown_option_answer`/`unknown_level_is_unsupported`; named divergence: `set` of an
+  unknown name under a level the socket *has* is still accepted, because a partial allow-list
+  would be stricter than Linux for the real names it omits. Pin **`t-sockopt-names`, 23
+  claims**; counterfactual reddens exactly seven.
+
 - **A socket's timeout bounds the wait, and every family keeps it.** **Landed 2026-11-01**
   (`docs/uapi/` §5.1 item 171, `docs/notes/` §4.7). `SO_RCVTIMEO`/`SO_SNDTIMEO` were stored,
   read back, and consulted by nothing: a `recv` on a socket with a 200 ms bound parked until

@@ -1810,3 +1810,76 @@ reports as `=== FAIL t-sock-timeout timeout=120s` with no claim named. The
 distinguishing claims therefore run inside a **bounded child**
 (`blocking_answer(f, bound_ms)`, the `t-uevent-doors` shape) so a regression
 answers `EAGAIN`-or-nothing within a second and names itself.
+
+## §4.8 A socket's option names answer what the socket is, or refuse the name — DONE (2026-11-01)
+
+`getsockopt(2)` on an IP socket ended in `_ => 0`: every name this stack did not
+model answered **zero**. That is the same violation §7.9s fixed on the
+device-event socket one door over — *a shape that looks finished while doing
+less*: a zero is a claim that the socket was told a value, and nobody stored
+one. A caller that asks `SO_DOMAIN` and reads 0 learns the socket is
+`AF_UNSPEC`, which is not a domain it can use.
+
+### What Linux 7.2.11 answers (measured; `build/scratch/sockopt2/`)
+
+The value a *modelled* name reports, on a `SOCK_DGRAM` socket:
+
+| name | answer | note |
+|---|---|---|
+| `SO_TYPE` | 2 (`SOCK_DGRAM`) | 1 on a stream socket |
+| `SO_DOMAIN` | 2 (`AF_INET`) | 16 for a netlink socket (§7.9s) |
+| `SO_PROTOCOL` | 17 (`IPPROTO_UDP`) | 6 (`IPPROTO_TCP`) on a stream socket |
+| `SO_ACCEPTCONN` | 0 | 1 only once the socket listens |
+| `SO_ERROR` | 0 | true: nothing is pending |
+
+The refusal rule is one question — *does this socket's protocol stack have this
+level?* — answered per door (`m.c`, `l.c`):
+
+| level | datagram socket | stream socket |
+|---|---|---|
+| `SOL_SOCKET` (1), unknown name | `ENOPROTOOPT` | `ENOPROTOOPT` |
+| `SOL_IP` (0), unknown name | `ENOPROTOOPT` | `ENOPROTOOPT` |
+| `SOL_UDP` (17), unknown name | `ENOPROTOOPT` | `EOPNOTSUPP` |
+| `SOL_TCP` (6), unknown name | `EOPNOTSUPP` | `ENOPROTOOPT` |
+| an unused level (999), unknown name | `EOPNOTSUPP` | `EOPNOTSUPP` |
+
+The `set(2)` door answers `ENOPROTOOPT` for **both** classes — a foreign level
+included — which is the one place the two doors differ. `set(2)` of a read-only
+identity name (`SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_ACCEPTCONN`,
+`SO_ERROR`) is `ENOPROTOOPT` on every socket.
+
+### Served shape
+
+`handle_getsockopt`'s IP branch grew the four identity rows (`SO_DOMAIN` from
+the entry's `family`, `SO_PROTOCOL` from its `protocol`, `SO_ACCEPTCONN` from
+whether the channel is a listener) and `unknown_option_answer(level,
+unknown_level_is_unsupported(typ, level))` as its tail — `ENOPROTOOPT` when the
+socket has the level, `EOPNOTSUPP` when it does not. `handle_setsockopt` refuses
+the five read-only identity names and a foreign level before the store, both
+`ENOPROTOOPT` (the `set` door's own asymmetric answer).
+
+### Named divergence
+
+`set(2)` of an **unknown name under a level the socket does have** still answers
+0 (accepted and forgotten), where Linux answers `ENOPROTOOPT`. Making it strict
+would need Linux's whole per-level name table: a partial allow-list is *stricter*
+than Linux for every real name it failed to list, and that is the failure that
+stops a program's setup — `SO_TIMESTAMP`, `SO_RCVLOWAT`, `SO_OOBINLINE` and the
+`SOL_IP`/`SOL_TCP` tuning names are all real. The read door is strict, so a name
+accepted here is never read back as a stored value; the leniency has one
+direction and no false claim. Pinned as a divergence by absence, with the reason
+written at the claim site.
+
+### Pin, gates, counterfactual
+
+`user/tests/src/bin/t-sockopt-names.rs` (23 claims) — the identity rows on both
+socket types, the two refusal classes on both doors, a modelled name still
+answering, and a stream socket's own transport level refusing an unknown name.
+Host run 23/23 `ok` against Linux 7.2.11.
+
+Gates: x86_64 `verdict pass=249 fail=0`, aarch64 `pass=248 fail=0`, `mpos-kunit
+35 passed, 0 failed` on both. Counterfactual (the identity rows back to zero and
+the tail back to `_ => 0`): exactly **seven** distinguishing claims red — the
+datagram domain, the `SOL_SOCKET` and `SOL_IP` refusals, both `EOPNOTSUPP`
+classes, the stream socket's own-level refusal, and the unused level — with the
+modelled-name claim still green. Restored byte-exact (`diff -q`).

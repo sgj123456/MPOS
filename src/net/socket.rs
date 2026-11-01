@@ -5904,6 +5904,28 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     } else {
         None
     };
+    // Two classes are refused before the store, because accepting them would be
+    // a claim rather than a record: a name that is **read-only by definition**
+    // (a socket cannot be told its own type, domain or pending error), and a
+    // **level this socket's protocol stack does not have** (the `SOL_TCP`
+    // class on a datagram socket). Both are Linux's own answers, measured on
+    // 7.2.11 across every name of the three levels: the `set(2)` side answers
+    // `ENOPROTOOPT` for *both* classes - a foreign level included, which is the
+    // one place the two doors differ, since the `get(2)` side answers
+    // `EOPNOTSUPP` there (`unknown_level_is_unsupported`).
+    if matches!(
+        (level, optname),
+        (
+            SOL_SOCKET,
+            SO_TYPE | SO_ERROR | SO_DOMAIN | SO_PROTOCOL | SO_ACCEPTCONN
+        )
+    ) {
+        return err::ENOPROTOOPT;
+    }
+    let sock_typ = super::with(handle, |_, entry| entry.typ).unwrap_or(0);
+    if unknown_level_is_unsupported(sock_typ, level) {
+        return err::ENOPROTOOPT;
+    }
     super::with(handle, |stack, entry| {
         // The smoltcp socket behind this channel, when it is a TCP one. Two of
         // the options below actually steer the stack and so are applied here,
@@ -6029,6 +6051,41 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         }
     });
     0
+}
+
+/// Whether an unknown option name at `level` is `EOPNOTSUPP` rather than
+/// `ENOPROTOOPT` for a socket of this type.
+///
+/// Linux routes an option by its level to the protocol that owns it, and each
+/// level class is either present on the socket or absent. Measured on 7.2.11
+/// for an unnamed name (`9999`): on a **datagram** socket, `SOL_SOCKET` (1),
+/// `SOL_IP` (0) and `SOL_UDP` (17) answer `ENOPROTOOPT` while `SOL_TCP` (6),
+/// `132` and `999` answer `EOPNOTSUPP`; on a **stream** socket `SOL_TCP`
+/// answers `ENOPROTOOPT` and `17`/`0`/`999` answer `EOPNOTSUPP`. So the rule
+/// is "is this level's protocol on this socket", not a fixed list.
+fn unknown_level_is_unsupported(typ: u16, level: usize) -> bool {
+    let stream = typ == SOCK_STREAM as u16;
+    match level {
+        // The socket layer itself is on every socket.
+        1 => false,
+        // The IP layer is on an AF_INET socket of either type.
+        0 => false,
+        // The transport layer belongs to the socket's own type.
+        6 => !stream,
+        17 => stream,
+        // A protocol this socket never had.
+        _ => true,
+    }
+}
+
+/// The refusal an unmodelled option name gets - Linux's answer, not a zero.
+fn unknown_option_answer(level: usize, unsupported: bool) -> isize {
+    let _ = level;
+    if unsupported {
+        err::EOPNOTSUPP
+    } else {
+        err::ENOPROTOOPT
+    }
 }
 
 /// `getsockopt(fd, level, optname, optval, optlen)`.
@@ -6349,6 +6406,10 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     if cap < 4 || !crate::uaccess::buffer_ok(optval, 4, true, from_user) {
         return err::EINVAL;
     }
+    // The socket's own type decides which level classes it has (see
+    // `unknown_level_is_unsupported`), and `SO_TYPE` has already been answered
+    // from the same place, so one lookup serves both.
+    let ty = super::with(handle, |_, entry| entry.typ).unwrap_or(0);
     let value = match (level, optname) {
         (SOL_SOCKET, SO_TYPE) => super::with(handle, |_, entry| entry.typ as i32).unwrap_or(0),
         // Errors are reported by the calls that hit them, so a query reads
@@ -6372,9 +6433,33 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         (SOL_IP, IP_RECVTTL) => {
             super::with(handle, |_, entry| entry.opts.recv_ttl as i32).unwrap_or(0)
         }
-        // An unmodelled option reads as unset (zero), matching the permissive
-        // `setsockopt` above rather than answering ENOPROTOOPT.
-        _ => 0,
+        // The names a socket answers that are *its own identity* rather than
+        // a value somebody set: a protocol stack cannot be told them (Linux
+        // refuses the set with ENOPROTOOPT) and a query must answer the truth
+        // the socket was made with. Measured on 7.2.11 - a `SOCK_DGRAM`
+        // socket reads `SO_TYPE` 2, `SO_DOMAIN` 2 and `SO_PROTOCOL` 17, a
+        // `SOCK_STREAM` one reads 1/2/6, and `SO_ACCEPTCONN` is 0 until the
+        // socket listens.
+        (SOL_SOCKET, SO_DOMAIN) => super::with(handle, |_, entry| entry.family as i32).unwrap_or(0),
+        (SOL_SOCKET, SO_PROTOCOL) => {
+            super::with(handle, |_, entry| entry.protocol as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_ACCEPTCONN) => {
+            let listening = super::with(handle, |_, entry| {
+                matches!(entry.channel, Channel::TcpListen { .. })
+            })
+            .unwrap_or(false);
+            listening as i32
+        }
+        // A name this stack does not model is a name it cannot answer: Linux
+        // answers `ENOPROTOOPT` for an unknown `SOL_SOCKET` name and
+        // `EOPNOTSUPP` for a level class this socket does not have (measured:
+        // on a datagram socket an unknown name under `SOL_TCP`, `132` or `999`
+        // is `EOPNOTSUPP`, while under `SOL_SOCKET`, `SOL_IP` or `SOL_UDP` it
+        // is `ENOPROTOOPT`; a `SOCK_STREAM` socket has the `SOL_TCP` class and
+        // answers `ENOPROTOOPT` there). Answering zero was a claim that the
+        // socket had been told a value nobody stored.
+        _ => return unknown_option_answer(level, unknown_level_is_unsupported(ty, level)),
     };
     unsafe {
         (optval as *mut i32).write_volatile(value);

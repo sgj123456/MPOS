@@ -8282,3 +8282,39 @@ distinguishing waits run in a bounded child so a regression answers within a
 second instead of being killed at the program's 120 s budget. Gates x86_64
 `pass=248` / aarch64 `pass=247`, kunit 35 both; the counterfactual reddens
 exactly the seven wait claims and leaves every storing claim green.
+
+### Item 172 - a socket's option names answer what the socket is, or refuse the name (2026-11-01)
+
+`getsockopt(2)` on an IP socket ended in `_ => 0`: an option name this stack did
+not model answered **zero**, which is a claim that the socket had been told a
+value nobody stored - `SO_DOMAIN` read as 0 is `AF_UNSPEC`, a domain the caller
+cannot use. The same violation §7.9s fixed on the device-event socket, one door
+over.
+
+Linux's rule was measured first (`docs/notes/` §4.8, `build/scratch/sockopt2/`):
+a socket answers the values it *is* (`SO_TYPE` 2/1, `SO_DOMAIN` 2,
+`SO_PROTOCOL` 17/6 on datagram/stream, `SO_ACCEPTCONN` 0 until it listens,
+`SO_ERROR` 0), and every unmodelled name is refused by one question - does this
+socket's protocol stack have this level? `ENOPROTOOPT` when it does (an unknown
+`SOL_SOCKET`/`SOL_IP` name on either socket, an unknown `SOL_TCP` name on a
+stream, an unknown `SOL_UDP` name on a datagram socket), `EOPNOTSUPP` when it
+does not (`SOL_TCP` on a datagram socket, an unused level anywhere). The
+`set(2)` door answers `ENOPROTOOPT` for both classes, and refuses a read-only
+identity name (`SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_ACCEPTCONN`,
+`SO_ERROR`) the same way.
+
+Served: the four identity rows in `handle_getsockopt`'s IP branch plus
+`unknown_option_answer(level, unknown_level_is_unsupported(typ, level))` as its
+tail; `handle_setsockopt` refuses the five read-only names and a foreign level
+before the store. Named divergence: `set(2)` of an unknown name under a level
+the socket *has* still answers 0 - a strict answer needs Linux's whole
+per-level name table, and a partial allow-list would be *stricter* than Linux
+for the real names it failed to list (`SO_TIMESTAMP`, `SO_RCVLOWAT`,
+`SO_OOBINLINE`, the `SOL_IP`/`SOL_TCP` tuning names), which is the failure that
+stops a program's setup. The read door is strict, so a name accepted there is
+never read back as a stored value.
+
+Pin `t-sockopt-names` (23 claims, `user/tests/src/bin/t-sockopt-names.rs`).
+Gates x86_64 `pass=249` / aarch64 `pass=248`, kunit 35 both; the counterfactual
+(identity rows back to zero, tail back to `_ => 0`) reddens exactly the seven
+distinguishing claims and leaves the modelled-name claim green.

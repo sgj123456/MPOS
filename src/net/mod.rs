@@ -347,6 +347,14 @@ pub(crate) struct Entry {
     #[allow(dead_code)]
     pub family: u16,
     pub typ: u16,
+    /// The transport protocol the caller asked for - `SO_PROTOCOL`'s answer
+    /// and the number a raw socket's frames are filtered by.
+    ///
+    /// A stream is TCP (6) and a datagram UDP (17) whatever word the caller
+    /// passed, because the channel behind them is one of those; a raw socket
+    /// keeps the caller's own number, which is what `SO_PROTOCOL` reports
+    /// back (measured: a `SOCK_DGRAM` socket reads 17, a `SOCK_STREAM` one 6).
+    pub protocol: u16,
     pub channel: Channel,
     /// The socket options `setsockopt` stored and `getsockopt` reads back. Kept
     /// per-socket so a set is not visible on its neighbours, and a query answers
@@ -1771,9 +1779,19 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             (socket::AF_INET, _) => return Err(crate::err::EPROTONOSUPPORT),
             _ => return Err(crate::err::EAFNOSUPPORT),
         };
+        // The protocol the channel actually is, not the word the caller may
+        // have repeated back: a stream is TCP and a datagram UDP (a caller
+        // passing 0 asks for "the default one", and Linux answers the same
+        // number either way).
+        let spoken = match typ {
+            socket::SOCK_STREAM => 6,
+            socket::SOCK_DGRAM => 17,
+            _ => protocol as u16,
+        };
         let entry = Entry {
             family,
             typ,
+            protocol: spoken,
             channel: owned,
             opts: SockOpts::new(typ),
         };
@@ -1817,6 +1835,8 @@ pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result
         let entry = Entry {
             family: socket::AF_INET,
             typ,
+            // An accepted connection is TCP: it came off a listener.
+            protocol: 6,
             channel,
             opts,
         };

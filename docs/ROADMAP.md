@@ -691,6 +691,16 @@ contract — a 16-byte `timeval`, `EDOM` outside its unit, a `tv_usec` rounded u
 send side, and inherited by an accepted socket — is now served on the IP family, a unix
 socket and a `socketpair`; the seven distinguishing claims go red under the counterfactual
 while every storing claim stays green (§4.7, item 171, pinned by `t-sock-timeout`).
+The socket's *option names* answered the same way: an unmodelled name read back **zero**, a
+claim that the socket had been told a value nobody stored — `SO_DOMAIN` as 0 is `AF_UNSPEC`.
+Linux's rule is measured and served now: the socket answers what it *is* (`SO_TYPE`,
+`SO_DOMAIN`, `SO_PROTOCOL`, `SO_ACCEPTCONN`, `SO_ERROR`), an unmodelled name is
+`ENOPROTOOPT` under a level the socket's stack has and `EOPNOTSUPP` under one it does not,
+and the `set` door refuses a read-only identity name and a foreign level before the store
+(§4.8, item 172, pinned by `t-sockopt-names`; seven distinguishing claims red under the
+counterfactual — the one leniency left, `set` of an unknown name under a level the socket
+*has*, is a named divergence because a partial allow-list would be stricter than Linux for
+the real names it omits).
 What remains of the bus is how the image's `udevd` binds and reads. Two items left this list
 on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
