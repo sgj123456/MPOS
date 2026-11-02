@@ -1495,6 +1495,7 @@ pub(crate) fn mode_atomic(arg: usize) -> isize {
     let counts = unsafe { ((arg + 16) as *const u64).read_unaligned() } as *const u32;
     let props = unsafe { ((arg + 24) as *const u64).read_unaligned() } as *const u32;
     let values = unsafe { ((arg + 32) as *const u64).read_unaligned() } as *const u64;
+    let reserved = unsafe { ((arg + 40) as *const u64).read_unaligned() };
     const KNOWN_FLAGS: u32 =
         PAGE_FLIP_EVENT | 0x2 | ATOMIC_TEST_ONLY | ATOMIC_NONBLOCK | ATOMIC_ALLOW_MODESET;
     // An unknown flag is a request this card cannot honour; a rehearsal that
@@ -1504,17 +1505,30 @@ pub(crate) fn mode_atomic(arg: usize) -> isize {
     {
         return libc_einval();
     }
-    if count_objs == 0 || objs.is_null() || counts.is_null() || props.is_null() || values.is_null()
-    {
+    // `reserved` is Linux's own word and must be zero: measured, a commit with
+    // it set answers `EINVAL` whatever else it carries (`docs/notes/` §7.4f).
+    if reserved != 0 {
         return libc_einval();
+    }
+    // An empty commit is a commit, and Linux serves it - measured on 7.2.11
+    // with vkms: `count_objs` 0 with every pointer NULL answers 0, and so does
+    // one object whose property count is 0. It is what a compositor's teardown
+    // reaches when the state it would restore is already the state the card is
+    // in, and refusing it made this card's first `EINVAL` a lie about a
+    // request that asked for nothing. What an *unreadable* pointer answers is
+    // separate: a null one with a nonzero count is `EFAULT`, because the count
+    // says the array will be read.
+    if count_objs != 0 && (objs.is_null() || counts.is_null()) {
+        return -14; // EFAULT
     }
     // The two per-object arrays are read `count_objs` times each, so they are
     // checked for that many elements before the first read: this request is
     // the one a compositor makes sixty times a second with a plan built out of
     // the caller's own memory, and a stale `objs_ptr` from a freed commit read
     // from kernel mode is a page fault with nothing left to report.
-    if !user_array(objs as usize, count_objs, 4, false)
-        || !user_array(counts as usize, count_objs, 4, false)
+    if count_objs != 0
+        && (!user_array(objs as usize, count_objs, 4, false)
+            || !user_array(counts as usize, count_objs, 4, false))
     {
         return -14; // EFAULT
     }
@@ -1533,7 +1547,9 @@ pub(crate) fn mode_atomic(arg: usize) -> isize {
         }
         sum
     };
-    if !user_array(props as usize, total, 4, false) || !user_array(values as usize, total, 8, false)
+    if total != 0
+        && (!user_array(props as usize, total, 4, false)
+            || !user_array(values as usize, total, 8, false))
     {
         return -14; // EFAULT
     }

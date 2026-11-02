@@ -79,6 +79,8 @@ const NR_ADDFB2: u32 = 0xb8;
 const NR_OBJ_GETPROPERTIES: u32 = 0xb9;
 const NR_OBJ_SETPROPERTY: u32 = 0xba;
 const NR_CREATE_DUMB: u32 = 0xb2;
+/// `DRM_IOCTL_MODE_ATOMIC`, `sizeof` 56.
+const NR_MODE_ATOMIC: u32 = 0xbc;
 
 /// The connector, CRTC and planes this card has, and the object-type tags.
 const CONNECTOR_ID: u32 = 35;
@@ -334,6 +336,27 @@ const _: () = assert!(offset_of!(CreateBlob, data) == 0);
 const _: () = assert!(offset_of!(CreateBlob, length) == 8);
 const _: () = assert!(offset_of!(CreateBlob, blob_id) == 12);
 
+/// `struct drm_mode_atomic`, `sizeof` 56 - four pointers plus the two the
+/// caller never sets (`reserved`, `user_data`).
+#[repr(C)]
+#[derive(Default)]
+struct ModeAtomic {
+    flags: u32,
+    count_objs: u32,
+    objs_ptr: u64,
+    count_props_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    reserved: u64,
+    user_data: u64,
+}
+
+const _: () = assert!(size_of::<ModeAtomic>() == 56);
+const _: () = assert!(offset_of!(ModeAtomic, objs_ptr) == 8);
+const _: () = assert!(offset_of!(ModeAtomic, count_props_ptr) == 16);
+const _: () = assert!(offset_of!(ModeAtomic, props_ptr) == 24);
+const _: () = assert!(offset_of!(ModeAtomic, prop_values_ptr) == 32);
+
 const _: () = assert!(size_of::<DestroyBlob>() == 4);
 const _: () = assert!(size_of::<ObjSetProperty>() == 24);
 const _: () = assert!(offset_of!(ObjSetProperty, value) == 0);
@@ -429,6 +452,113 @@ fn check_true(r: &mut Report, name: &str, ok: bool) {
         r.check(name, true);
     } else {
         r.check(name, false);
+    }
+}
+
+/// One-object atomic commit: the whole request shape a compositor hands the card,
+/// with one property on it. `flags` is the caller's own - the pins below use
+/// `ATOMIC_TEST_ONLY` so a rehearsal never changes the card.
+fn atomic_one(fd: i32, obj: u32, obj_type: u32, prop: u32, value: u64, flags: u32) -> isize {
+    let mut objs = [obj];
+    let mut counts = [1u32];
+    let mut props = [prop];
+    let mut values = [value];
+    let mut arg = ModeAtomic {
+        flags,
+        count_objs: 1,
+        ..ModeAtomic::default()
+    };
+    arg.objs_ptr = objs.as_mut_ptr() as u64;
+    arg.count_props_ptr = counts.as_mut_ptr() as u64;
+    arg.props_ptr = props.as_mut_ptr() as u64;
+    arg.prop_values_ptr = values.as_mut_ptr() as u64;
+    let _ = obj_type;
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_ATOMIC, size_of::<ModeAtomic>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
+    }
+}
+
+/// An atomic commit with no object at all - every pointer NULL, as Linux's own
+/// callers build it when the state they would restore is the state they are in.
+fn atomic_none(fd: i32, flags: u32) -> isize {
+    let mut arg = ModeAtomic {
+        flags,
+        count_objs: 0,
+        ..ModeAtomic::default()
+    };
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_ATOMIC, size_of::<ModeAtomic>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
+    }
+}
+
+/// One object whose property count is 0: the commit shape that asks the card to
+/// judge one object and set nothing on it.
+fn atomic_zero_props(fd: i32, obj: u32, flags: u32) -> isize {
+    let mut objs = [obj];
+    let mut counts = [0u32];
+    let mut arg = ModeAtomic {
+        flags,
+        count_objs: 1,
+        ..ModeAtomic::default()
+    };
+    arg.objs_ptr = objs.as_mut_ptr() as u64;
+    arg.count_props_ptr = counts.as_mut_ptr() as u64;
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_ATOMIC, size_of::<ModeAtomic>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
+    }
+}
+
+/// A commit that names one object with no properties and sets the `reserved`
+/// word, which Linux refuses. The object is there so that `reserved` is the
+/// *only* thing wrong with the request: with `count_objs` 0 this claim could not
+/// tell the word's refusal from the empty-commit one, and a counterfactual that
+/// restored only the latter left it green - the shape was measuring nothing.
+fn atomic_reserved(fd: i32, flags: u32) -> isize {
+    let mut objs = [CONNECTOR_ID];
+    let mut counts = [0u32];
+    let mut arg = ModeAtomic {
+        flags,
+        count_objs: 1,
+        reserved: 1,
+        ..ModeAtomic::default()
+    };
+    arg.objs_ptr = objs.as_mut_ptr() as u64;
+    arg.count_props_ptr = counts.as_mut_ptr() as u64;
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_ATOMIC, size_of::<ModeAtomic>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
+    }
+}
+
+/// A commit whose `count_objs` is one and whose object array is NULL: the count
+/// says the array will be read, so this is `EFAULT` and not `EINVAL`.
+fn atomic_null_objs(fd: i32, flags: u32) -> isize {
+    let mut arg = ModeAtomic {
+        flags,
+        count_objs: 1,
+        ..ModeAtomic::default()
+    };
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_ATOMIC, size_of::<ModeAtomic>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
     }
 }
 
@@ -1803,6 +1933,139 @@ fn main() {
         "a property id the card never issued is refused",
         set_property(fd, 0, 0xdead_beef, CONNECTOR_ID, OBJECT_CONNECTOR),
         Errno::INVAL,
+    );
+
+    // --- an immutable property is refused *in a commit*, as Linux refuses it --------
+    //
+    // Measured on Linux 7.2.11 with `vkms` as root holding master, then reproduced
+    // here (`docs/notes/` §7.4f): `drm_atomic_set_property` refuses on the property's
+    // `DRM_MODE_PROP_IMMUTABLE` flag **before** it compares values, so there is no
+    // "write it back unchanged and it is a no-op" exemption - an immutable property
+    // answers `EINVAL` for its own current value exactly as for a changed one, while
+    // a mutable property on the same object takes the same shape and is served.
+    //
+    // This is the pair a compositor's teardown meets: smithay snapshots every
+    // property of every object when it opens the card and replays the snapshot when
+    // it drops the device, EDID included, and logs the failure. On Linux that
+    // teardown answers `EINVAL` too - so the refusal is the contract, and the pin
+    // exists so a "be permissive, accept anything" change cannot land quietly.
+    //
+    // `ATOMIC_TEST_ONLY` keeps every commit here a rehearsal; on this card that flag
+    // is honoured (`props.rs`'s validation pass runs and nothing is programmed).
+    const ATOMIC_TEST_ONLY: u32 = 1 << 0;
+    // An empty commit is a commit: measured on Linux 7.2.11 + vkms, `count_objs`
+    // 0 with every pointer NULL answers 0, and so does one object carrying no
+    // properties. This is the shape a compositor's teardown reaches, and this
+    // card refused it before the pin existed.
+    check_is(
+        &mut r,
+        "an atomic commit naming no object at all is served",
+        atomic_none(fd, ATOMIC_TEST_ONLY),
+        0,
+    );
+    check_is(
+        &mut r,
+        "and one naming an object with no properties is served",
+        atomic_zero_props(fd, CONNECTOR_ID, ATOMIC_TEST_ONLY),
+        0,
+    );
+    // A `reserved` word that is not zero is Linux's own `EINVAL`, whatever else
+    // the request carries.
+    check_is(
+        &mut r,
+        "a commit with a nonzero reserved word is refused",
+        atomic_reserved(fd, ATOMIC_TEST_ONLY),
+        refused(Errno::INVAL),
+    );
+    // The pointers a count says will be read are read: an empty commit may hand
+    // NULL, a commit naming an object may not.
+    check_is(
+        &mut r,
+        "a commit naming an object with a null object array is refused EFAULT",
+        atomic_null_objs(fd, ATOMIC_TEST_ONLY),
+        refused(Errno::FAULT),
+    );
+
+    let bpc = property_id(fd, CONNECTOR_ID, OBJECT_CONNECTOR, b"max bpc");
+    let edid = property_id(fd, CONNECTOR_ID, OBJECT_CONNECTOR, b"EDID");
+    match (bpc, edid) {
+        (Some((bpc_id, bpc_now)), Some((edid_id, edid_now))) => {
+            // The control first: if this one is refused, every claim below is
+            // vacuous - a card refusing the whole commit tells an immutable
+            // property nothing.
+            check_is(
+                &mut r,
+                "a mutable connector property written with the value it has is served",
+                atomic_one(
+                    fd,
+                    CONNECTOR_ID,
+                    OBJECT_CONNECTOR,
+                    bpc_id,
+                    bpc_now,
+                    ATOMIC_TEST_ONLY,
+                ),
+                0,
+            );
+            check_is(
+                &mut r,
+                "an immutable connector property is refused in a commit",
+                atomic_one(
+                    fd,
+                    CONNECTOR_ID,
+                    OBJECT_CONNECTOR,
+                    edid_id,
+                    edid_now,
+                    ATOMIC_TEST_ONLY,
+                ),
+                refused(Errno::INVAL),
+            );
+            check_is(
+                &mut r,
+                "a changed value on that immutable property is refused the same way",
+                atomic_one(
+                    fd,
+                    CONNECTOR_ID,
+                    OBJECT_CONNECTOR,
+                    edid_id,
+                    edid_now + 1,
+                    ATOMIC_TEST_ONLY,
+                ),
+                refused(Errno::INVAL),
+            );
+            // The refusal is per property, not per commit: the mutable one is still
+            // served after it, so an immutable name in the request does not poison
+            // the card for the next caller.
+            check_is(
+                &mut r,
+                "and the mutable property is still served after that refusal",
+                atomic_one(
+                    fd,
+                    CONNECTOR_ID,
+                    OBJECT_CONNECTOR,
+                    bpc_id,
+                    bpc_now,
+                    ATOMIC_TEST_ONLY,
+                ),
+                0,
+            );
+        }
+        _ => check_true(&mut r, "the connector publishes max bpc and EDID", false),
+    }
+    // The other half of the same rule: an id the card never issued is refused even
+    // though every object above was real. This is what keeps the two claims above
+    // from passing on a commit path that answers `EINVAL` to everything.
+    check_is(
+        &mut r,
+        "an atomic commit naming a property the card never issued is refused",
+        atomic_one(
+            fd,
+            CONNECTOR_ID,
+            OBJECT_CONNECTOR,
+            0xdead_beef,
+            0,
+            ATOMIC_TEST_ONLY,
+        ),
+        refused(Errno::INVAL),
     );
 
     r.finish();

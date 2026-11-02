@@ -653,9 +653,12 @@ In the order that keeps each step verifiable on its own:
   carries a generation, `alloc_inode` bumps it, and a stale handle answers `ESTALE` while its bytes
   stay readable until the number is reused.
   A regular file's descriptor now keeps the path it was opened by, so its mapping's line in
-  `/proc/<pid>/maps` is named as Linux's is and `/proc/self/fd/<n>` answers the path (item 183).
-  Linux's ` (deleted)` suffix is a named divergence: the signal that would print it is missing, since
-  `nlink()` answers 0 for "not tracked" too (item 184).
+  `/proc/<pid>/maps` is named as Linux's is and `/proc/self/fd/<n>` answers the path (item 183),
+  with Linux's ` (deleted)` suffix once the name is gone (items 184, 186).
+  An atomic commit is judged in Linux's order - flags, then `reserved`, then the pointers - so an
+  empty commit (what a compositor's teardown sends) is served and a null array behind a nonzero count
+  is `EFAULT`, both measured on 7.2.11 + `vkms` (item 187, §7.4f). The immutable-property refusal that
+  a niri log opened the question with is Linux's own answer.
   A generated procfs file is a snapshot for the length of one read: `/proc/<pid>/maps` re-rendered
   on every `read_at`, so a chunked reader of a file the process was growing printed a span twice
   (`insert_present`'s clipping fixed a second defect on the same path; item 182).

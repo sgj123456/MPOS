@@ -8388,6 +8388,38 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 187 - an empty atomic commit is served, and `reserved` is checked (2026-11-02, landed)
+
+Found by writing a pin, not by reading: `t-drm-props` had no atomic-commit claim at all, and the
+first one added - an empty commit, which is what a compositor's teardown sends - came back `EINVAL`
+from this card.
+
+The Linux table (`docs/notes/` §7.4f) is nine shapes measured on 7.2.11 + `vkms` as root with
+master, and it decides three things this kernel had wrong or missing:
+
+| shape | Linux | was here |
+|---|---|---|
+| `count_objs` 0 (NULL or real pointers), `TEST_ONLY` or not | **0** | `EINVAL` |
+| one object, property count 0, `props`/`values` NULL | **0** | `EINVAL` |
+| `count_objs` 1 with `objs_ptr` or `counts_ptr` NULL | **`EFAULT`** | `EINVAL` |
+| `reserved` != 0 | **`EINVAL`** | **0** |
+| `TEST_ONLY \| PAGE_FLIP_EVENT`, unknown flag bit | `EINVAL` | `EINVAL` |
+
+Order: flags, then `reserved`, then the pointers - and a **total of zero** means no array is read at
+all, which is why NULL is fine there and `EFAULT` one level up. `Commit::record`'s refusal of an
+immutable property in a commit (`EDID`, `non-desktop`, `vrr_capable`) was **confirmed** against the
+same instrument rather than changed: Linux refuses those by the `IMMUTABLE` flag before comparing
+values, so the niri line that opened this (`obj=35 prop=87 value=0x40000001: -22`) is Linux's own
+answer, written by smithay's device-drop snapshot restore.
+
+Pins in `t-drm-props`: empty commit served, one object with no properties served, nonzero `reserved`
+refused, null object array refused `EFAULT`. The `reserved` claim carries one object with zero
+properties on purpose - at `count_objs` 0 it could not be distinguished from the empty-commit claim,
+and the "restore only the other half" counterfactual left it green. Gates x86_64 `pass=252`,
+aarch64 `pass=251`.
+
+Divergence kept: none. The refusals this round touched are now all Linux's, measured.
+
 ### Item 179 - the framebuffer-close request is served, and wlroots's fallback path is never needed (2026-11-01, landed)
 
 Measured in the same sway run as item 178 (`build/scratch/swayd/sway.log`, two lines at

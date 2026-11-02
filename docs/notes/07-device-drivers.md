@@ -7690,6 +7690,75 @@ boot with `prime_handle_to_fd` printing **every** call - not only the refusals, 
 instrument already showed to be zero - so the log says whether the 17 failing commits reach the
 door at all.
 
+### 7.4f An empty atomic commit is served, and `reserved` is Linux's own `EINVAL` — **MEASUREMENT + FIX**
+
+niri 26.04's boot log carried `mpos-dbg: commit refused at parse: obj=35 prop=87 value=1073741825: -22`.
+`obj=35` is `CONNECTOR_ID`, `prop=87` is `PROP_EDID`, and `1073741825` is `0x4000_0001`, which is the
+blob id this card publishes as that connector's *own* EDID value - so the request wrote a property
+back with the value it already had, and this kernel refused it.
+
+Linux's answer was measured before anything was changed, because "the value did not change" is the
+kind of rule a reader invents. Host kernel 7.2.11 + `vkms`, booted as root holding master
+(`build/scratch/imm/probe.c` - a static `/init` that mounts devtmpfs, `finit_module`s a decompressed
+`vkms.ko`, then drives the card):
+
+| request | Linux | this kernel, before |
+|---|---|---|
+| immutable `non-desktop` (flags `0x6`), current value | **`EINVAL`** | `EINVAL` |
+| immutable `non-desktop`, changed value | **`EINVAL`** | `EINVAL` |
+| immutable `TILE` (flags `0x14`), current value | **`EINVAL`** | `EINVAL` |
+| mutable `link-status`, current value | **0** | 0 |
+| mutable `CRTC_ID`, current value | **0** | 0 |
+
+So Linux has no "unchanged write-back is a no-op" exemption: `drm_atomic_set_property` refuses on
+`DRM_MODE_PROP_IMMUTABLE` before it compares values. **The refusal in `Commit::record` is Linux's own
+answer and stays** - and the writer is not niri's own code either: smithay 0.6.0 (`AtomicDrmDevice::new`,
+`src/backend/drm/device/atomic.rs:126-129`) snapshots *every* property of every object through
+`fd.get_properties(..)` - EDID included - and replays the snapshot in `Drop` (`:240-278`), logging the
+failure. It is a teardown, tolerated on both kernels.
+
+Two probe bugs cost two rebuild cycles and are written down because both produce a **wrong table that
+looks like a measurement**: `GETRESOURCES` with a null `crtc_id_ptr` and a nonzero `count_crtcs` answers
+`EFAULT`; and `SET_CLIENT_CAP` takes `struct drm_set_client_cap { __u64 capability; __u64 value; }` and not
+a bare value - the bare form fails **silently**, after which every atomic commit answers `EINVAL`, and
+that is indistinguishable from the immutable refusal the probe was asking about. The shape control that
+catches it is an empty atomic commit, which must answer 0.
+
+Which is how the *next* defect was found, by writing the pin rather than by reading: **this card refused
+an empty commit.** Measured on the same vkms boot (`build/scratch/imm/probe4..6.c`; `errno` captured
+inside the call, not through `printf`'s argument order):
+
+| shape | Linux | this kernel, before | now |
+|---|---|---|---|
+| `count_objs` 0, every pointer NULL, `TEST_ONLY` | **0** | `EINVAL` | 0 |
+| `count_objs` 0, real pointers, a real commit | **0** | `EINVAL` | 0 |
+| one object, property count 0, `props`/`values` NULL | **0** | `EINVAL` | 0 |
+| `count_objs` 1, `objs_ptr` NULL | **`EFAULT`** | `EINVAL` | `EFAULT` |
+| `count_objs` 1, `counts_ptr` NULL | **`EFAULT`** | `EINVAL` | `EFAULT` |
+| `count_objs` `0xffffffff`, pointers NULL | **`EFAULT`** | `EINVAL` | `EFAULT` |
+| `reserved` 1, otherwise a valid one-object request | **`EINVAL`** | **0** | `EINVAL` |
+| `TEST_ONLY` \| `PAGE_FLIP_EVENT` | **`EINVAL`** | `EINVAL` | `EINVAL` |
+| an unknown flag bit | **`EINVAL`** | `EINVAL` | `EINVAL` |
+
+The check order is Linux's too, and it is what decides the errnos: **flags, then `reserved`, then the
+pointers** - a count that says an array will be read makes a null one `EFAULT`, while a total of zero
+means nothing is read and NULL is fine. `src/drivers/drm/props.rs::mode_atomic` now reads and refuses a
+nonzero `reserved`, serves `count_objs == 0`, guards the two per-object arrays only for a nonzero count,
+and skips the `props`/`values` check when the total is zero.
+
+Pinned in `user/tests/src/bin/t-drm-props.rs` (four claims, this card's own fd): empty commit served, one
+object with no properties served, nonzero `reserved` refused `EINVAL`, a null object array refused
+`EFAULT`. The `reserved` claim names an object with no properties so that the word is the only thing
+wrong with the request - the first version sent `count_objs` 0, and a counterfactual that restored only
+the empty-commit refusal left it **green**, i.e. it was measuring the other claim. Verified after the
+change with `reserved=0` -> 0 and `reserved=1` -> `EINVAL` on the same request.
+
+Counterfactuals, one per half: emptying the `reserved` check reddens exactly `a commit with a nonzero
+reserved word is refused` (`got 0, want -22`); restoring the empty-commit refusal reddens exactly `an
+atomic commit naming no object at all is served` (`got -22, want 0`). Both restored byte-exact. Gates:
+x86_64 `pass=252 fail=0`, aarch64 `pass=251 fail=0`; the `t-ptrace-attach` flake appeared twice and was
+re-run green both times.
+
 ### 7.4d The export doors answer; EGL on the card node does not initialize — **MEASUREMENT**
 
 §7.4c named the next instrument: a guest probe that exports a GBM buffer through both spellings.
