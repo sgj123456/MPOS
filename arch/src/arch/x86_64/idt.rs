@@ -629,9 +629,22 @@ fn pf_diag(addr: usize, rip: usize, rsp: usize) {
                 break;
             }
         }
+        // The run is printed as a range of *mapped* pages, so an empty answer
+        // has to say so: with neither neighbour mapped, `lo`/`hi` still bracket
+        // the faulting page, and `mapped=[0x73650000..0x73651000)` then reads as
+        // "this page is mapped and its neighbours are not" - the opposite of
+        // what was measured. A panic beside that range was read as a one-page
+        // hole in a live mapping when in fact nothing around it was mapped at
+        // all, which is a userland pointer into memory that is gone.
+        let empty = lo == page && hi == page + page_size;
         crate::hal::kernel::kprintln!(
-            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x} mapped=[{lo:#x}..{hi:#x}) bytes={:02x?}{}",
+            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x} mapped={} bytes={:02x?}{}",
             crate::hal::kernel::current(),
+            if empty {
+                alloc::string::String::from("none around the page")
+            } else {
+                alloc::format!("[{lo:#x}..{hi:#x})")
+            },
             &code[..code_len],
             if code_len == 0 {
                 " (empty: the page holding rip is the absent one)"
@@ -639,6 +652,47 @@ fn pf_diag(addr: usize, rip: usize, rsp: usize) {
                 ""
             }
         );
+        // And the one fact that decides between the two stories an absent page
+        // tells: a page whose address the process never mapped is the process's
+        // own wild pointer, and a page inside a mapping the process *does* hold
+        // is a page this kernel failed to bring in when something asked for it.
+        // The present-page branch has always printed the VMA; the absent branch
+        // printing only the hole left exactly that question unanswered, and it
+        // is the question a real report was read for (udevd's `at 0x73650010`
+        // beside `mapped=[0x73650000..0x73651000)` - one page wide, or the whole
+        // surrounding region gone?).
+        //
+        // Both accessors only read the VMA table; the name is the one thing here
+        // that allocates, and it is what the present branch prints too, at the
+        // same four-per-boot budget.
+        match crate::hal::kernel::vma_prot_at(page) {
+            Some(prot) => crate::hal::kernel::kprintln!(
+                "PFDIAG vma={:#x} ({}{}{}) kind={} - the page is inside a mapping, so nothing brought it in",
+                prot.bits(),
+                if prot.contains(mpos_vm::MapFlags::READ) {
+                    "r"
+                } else {
+                    "-"
+                },
+                if prot.contains(mpos_vm::MapFlags::WRITE) {
+                    "w"
+                } else {
+                    "-"
+                },
+                if prot.contains(mpos_vm::MapFlags::EXEC) {
+                    "x"
+                } else {
+                    "-"
+                },
+                crate::hal::kernel::vma_kind_at(page).unwrap_or("?"),
+            ),
+            None => crate::hal::kernel::kprintln!(
+                "PFDIAG vma=none - no mapping of this process covers the page"
+            ),
+        }
+        if let Some(name) = crate::hal::kernel::mapping_name_at(page) {
+            crate::hal::kernel::kprintln!("PFDIAG fault_in={name}");
+        }
         return;
     };
 

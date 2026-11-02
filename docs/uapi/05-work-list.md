@@ -8388,6 +8388,28 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 191 - a private file mapping crosses a `fork` private (2026-11-02, landed)
+
+`MAP_PRIVATE` promises the child's stores are its own. Between `4930158` and this item they were
+not, for a private mapping of a **file**: the fork loop collected every `VmaKind::Frames` range as a
+shared object and never read the `shared` field inside it, so the child mapped its parent's file
+pages writable and unmarked (no COW bit on either side) and both processes wrote the same frames.
+
+| shape | Linux 7.2.11 | this kernel before |
+|---|---|---|
+| private file mapping, parent fills `'A'`, child writes `'C'`, parent re-reads | `A` | `C` (`YES (BROKEN)`) |
+| the same after the fix | `A` | `A` |
+
+Same binary both sides (`build/scratch/frk/pf.c`); the fix is `Frames { shared: true, .. }` in the
+filter. `udevd`'s mallocng `#PF at 0x10`/`0x30` was the symptom: a forked child overwriting its
+parent's heap metadata. Pin: three claims at the end of `t-mmap-file-lazy` (21 total), the third
+being `a child's writes to a private file mapping do not reach the parent`. Recorded in
+`docs/notes/06-process-management.md` §6.75.
+
+Also corrected there: the file's older "past the end of the file" claim asserted zeros for a page
+wholly past EOF, which Linux answers with `SIGBUS` (`build/scratch/frk/tail.c`); the claim now grows
+the file into the page and asserts the byte past its data, which is the value this kernel can answer.
+
 ### Item 190 - an exec from a worker thread ends the group, and the frames wait for its last member (2026-11-02, landed)
 
 `execve(2)` from a worker emptied the old image's frame list without ending the siblings still

@@ -653,6 +653,14 @@ In the order that keeps each step verifiable on its own:
   it answered 2 for the one-thread process an exec leaves. Pinned by `t-exec-threads`, whose host
   reference runs on Linux for seven claims, and whose counterfactual reddens the thread count while
   saying so honestly about the sibling claim that happened to stay green.
+  A private mapping of a **file** crosses a `fork` private: the fork loop treated every
+  `VmaKind::Frames` range as a shared object and never read the `shared` field, so between
+  `4930158` and this item a child inherited its parent's file pages writable and unmarked and both
+  wrote the same frames - measured as `child's writes visible to the parent: YES (BROKEN)` on the
+  machine where Linux answers `no (correct)` (item 191, §6.75). That is the regression the user's
+  bisect named, and the shape udevd's `mallocng` `#PF at 0x10`/`0x30` took: a forked child
+  overwriting its parent's heap metadata. Pinned by three claims at the end of
+  `t-mmap-file-lazy`.
   A userland fault's report names the program that faulted, not a task slot: `<comm>[<tid>]:
   segfault at <addr> ip <ip> sp <sp> error <word> in <module>[<off>,<base>+<len>]`, and
   `traps: <comm>[<tid>] general protection fault ...` for a trap (item 189, §6.73). The shape is

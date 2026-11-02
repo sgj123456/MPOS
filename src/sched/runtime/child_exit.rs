@@ -1139,9 +1139,21 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // the fork mapped writable and marked nothing. The ranges are collected
         // here, alongside the pages, so the two loops below agree about which
         // pages are which.
+        //
+        // The `shared` field is the whole question and not a decoration: after
+        // `VmaKind::Frames` grew a demand-paged private mapping of a file
+        // (item 177), `Frames { shared: false }` is an ordinary `MAP_PRIVATE`
+        // mapping whose pages are a copy, not an object two processes watch
+        // together. Matching the variant alone put those ranges in this list,
+        // so a forked child mapped its parent's file pages *shared* and had its
+        // writes land in the parent's memory - `MAP_PRIVATE` semantics broken
+        // by the very mechanism meant to keep sharing. Measured on the machine
+        // (`build/scratch/frk/f.img`): a `MAP_PRIVATE` file mapping filled with
+        // 'A', forked, the child overwriting it with 'C', read back 'C' in the
+        // parent - where Linux 7.2.11 reads 'A'.
         let shared: Vec<(usize, usize)> = parent_vmas
             .iter()
-            .filter(|vma| matches!(vma.kind, VmaKind::Frames { .. }))
+            .filter(|vma| matches!(vma.kind, VmaKind::Frames { shared: true, .. }))
             .map(|vma| (vma.start, vma.end))
             .collect();
 

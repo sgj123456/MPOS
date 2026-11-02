@@ -217,10 +217,73 @@ fn main() {
         tail != libc::MAP_FAILED,
     );
     if tail != libc::MAP_FAILED {
-        let past = unsafe { ((tail as usize + BYTES) as *const u8).read() };
-        r.check("the tail past the end of the file reads zero", past == 0);
+        // A page lying *wholly* past the end of the file is `SIGBUS` on Linux,
+        // not zeros - measured on 7.2.11 (`build/scratch/frk/tail.c`): a read
+        // of a page wholly beyond EOF kills the reader with `Bus error`, while
+        // a byte inside the file's last partial page past its data reads zero.
+        // The claim is the second one, because it is a value this kernel can
+        // answer; a `SIGBUS` claim would belong to a fault the machine has to
+        // raise, and that is its own item.
+        let grown = unsafe { libc::ftruncate(fd, (BYTES + 200) as i64) };
+        r.check("the file can grow into the mapping's last page", grown == 0);
+        if grown == 0 {
+            let past = unsafe { ((tail as usize + BYTES + 200) as *const u8).read() };
+            r.check(
+                "a byte past the file's data in its last page reads zero",
+                past == 0,
+            );
+        }
         unsafe { libc::munmap(tail, BYTES + 2 * PAGE) };
     }
+
+    // --- a private mapping is private across a fork ---
+    //
+    // The point of `MAP_PRIVATE` is that the child's writes are its own. This
+    // kernel got it wrong for a while: `fork` collected every `VmaKind::Frames`
+    // range as a *shared object*, and after a private file mapping became
+    // frame-backed the child mapped its parent's pages writable and marked
+    // nothing - so the parent watched the child's stores appear in its own
+    // memory. Linux 7.2.11 answers the other way, and a compositor's heap is
+    // exactly such a mapping: a child writing over its parent's metadata is a
+    // NULL where a pointer belongs, which is what udevd's crash looked like.
+    let priv_map = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            BYTES,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    if priv_map == libc::MAP_FAILED {
+        r.check("a writable private mapping of the file succeeds", false);
+        unsafe { libc::munmap(map, BYTES) };
+        unsafe { libc::close(fd) };
+        unsafe { libc::unlink(path().as_ptr()) };
+        r.finish();
+    }
+    r.check("a writable private mapping of the file succeeds", true);
+    unsafe { core::ptr::write_bytes(priv_map as *mut u8, b'A', BYTES) };
+
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // The child overwrites every page and leaves; nothing it wrote may be
+        // visible to the parent.
+        unsafe {
+            core::ptr::write_bytes(priv_map as *mut u8, b'C', BYTES);
+            libc::_exit(0);
+        }
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    let first = unsafe { (priv_map as *const u8).read() };
+    let middle = unsafe { ((priv_map as usize + BYTES / 2) as *const u8).read() };
+    r.check(
+        "a child's writes to a private file mapping do not reach the parent",
+        first == b'A' && middle == b'A',
+    );
+    unsafe { libc::munmap(priv_map, BYTES) };
 
     unsafe { libc::munmap(map, BYTES) };
     unsafe { libc::close(fd) };

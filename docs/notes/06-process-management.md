@@ -4915,3 +4915,76 @@ which is why the counterfactual is quoted against that one.
 `src/syscall/linux/proc.rs`'s `clone` doc comment still claimed `CLONE_THREAD` was refused with
 `ENOSYS` and that these address spaces are "owned by one task". Threads have been served for
 several rounds (`spawn_thread` shares the parent's `Mm`); the comment was wrong about its own code.
+
+## §6.75 A `fork` hands a private file mapping over private - MEASUREMENT + FIX
+
+`MAP_PRIVATE` means the child's stores are the child's. This kernel broke that rule for exactly one
+kind of mapping: a private mapping of a **file**, the kind item 177 made frame-backed. A child
+inherited it writable and unhardened, so parent and child wrote the same physical frames - which is
+what a heap pointer that reads back as zero looks like from the outside.
+
+### The defect
+
+`src/sched/runtime/child_exit.rs`'s fork loop collects the ranges that cross the fork as **shared
+objects** (the pages a second process watches together, mapped writable with no COW bit):
+
+```rust
+let shared: Vec<(usize, usize)> = parent_vmas
+    .iter()
+    .filter(|vma| matches!(vma.kind, VmaKind::Frames { .. }))
+    .map(|vma| (vma.start, vma.end))
+    .collect();
+```
+
+It matched the **variant** and never looked at the field inside it. `VmaKind::Frames` carries
+`shared: bool`, and since item 177 `Frames { shared: false }` is an ordinary `MAP_PRIVATE` mapping
+whose pages are a *copy*, not an object two processes share. Every such range therefore entered the
+shared list: the child mapped its parent's file pages through `map_shared`, and the parent's pages
+were never hardened with `set_cow_bit_quietly`. Both processes then wrote the same frames.
+
+The same commit that introduced it is the one the user's `git bisect` named (`4930158`), and the
+symptom it produced was `udevd`'s threads dying inside musl's `mallocng` with `#PF at 0x10` /
+`#PF at 0x30` - a metadata word reading back as zero, because a forked child had overwritten the
+parent's heap.
+
+### The measurement (`build/scratch/frk/pf.c`, `musl-gcc -static`)
+
+Creates a four-page file, maps it `PROT_READ|PROT_WRITE, MAP_PRIVATE`, fills it with `'A'`, forks,
+the child overwrites every page with `'C'` and exits, the parent re-reads.
+
+| | `[0]` | `[8192]` | verdict |
+|---|---|---|---|
+| Linux 7.2.11 (host) | `A` | `A` | `child's writes visible to the parent: no (correct)` |
+| this kernel, `4930158`..`fa7e5cd` (`build/scratch/frk/f.img`) | `C` | `C` | `child's writes visible to the parent: YES (BROKEN)` |
+
+Same binary, opposite answer. The guest boot's `/root/frk.txt` carries `rc=1`.
+
+### The fix
+
+```rust
+.filter(|vma| matches!(vma.kind, VmaKind::Frames { shared: true, .. }))
+```
+
+One word: whether the mapping is an object two processes watch together. A private file mapping is
+not, so it now takes the ordinary COW path every anonymous page takes - the child gets its own copy
+on its first store, which is what Linux does.
+
+### The pin (`user/tests/src/bin/t-mmap-file-lazy.rs`, 21 claims)
+
+Three claims added at the end of the file, on a writable private mapping of the same file: it
+succeeds, the child overwrites every page and exits, and
+`a child's writes to a private file mapping do not reach the parent` checks the first byte and the
+middle page are still `'A'`. Host reference run (`MPOS_ON_HOST=1 MPOS_TEST_DIR=…`) is green on
+7.2.11; the claim's whole point is that it answers differently on a kernel that gets it wrong.
+
+**Counterfactual**: with the filter back to `matches!(vma.kind, VmaKind::Frames { .. })`, that claim
+is red and everything else stays green (recorded with the run below).
+
+### A claim corrected while writing it
+
+The same file's older "past the end of the file" claim asserted a page **wholly** past EOF reads
+zero. Measured on Linux 7.2.11 (`build/scratch/frk/tail.c`): a read of a page wholly beyond EOF kills
+the reader with `SIGBUS` (`Bus error`), while a byte inside the file's last partial page past its
+data reads zero. The claim now grows the file into the page and asserts the second shape, because
+that is what Linux answers - the `SIGBUS` shape belongs to a fault the machine has to raise, which is
+its own item.
