@@ -8388,6 +8388,39 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 189 - a userland fault's report names the program, as Linux's does (2026-11-02, landed)
+
+The machine printed `user #PF at 0x10 code=PageFaultErrorCode(USER_MODE) rip=…` and `PFDIAG page=0x0
+NOT MAPPED task=10` — a **task slot number**, which is reused the moment the task dies (a boot's slot
+10 was `/sbin/udevd` in one run and `/usr/bin/weston` in the next). Linux files one line naming the
+program: `m[37799]: segfault at 7fad640ec000 ip 000055d747093210 sp 00007fff76b1ae50 error 4 in
+m[1210,55d747093000+1000]`.
+
+Measured on Linux 7.2.11 (`build/scratch/segv/`, six shapes) and then implemented:
+`Kernel::report_user_fault(addr, ip, sp, error)` and `Kernel::report_user_trap(ip, sp, error)` in
+`arch/src/hal/kernel.rs`, implemented in `src/kernel_services.rs` as
+`<comm>[<tid>]: segfault at <addr> ip <ip> sp <sp> error <word> in <module>[<off>,<base>+<len>]` and
+`traps: <comm>[<tid>] general protection fault ip:<ip> sp:<sp> error:<word>`; the module clause comes
+from the new `sched::mapping_span_at(ip)`, which answers only when the ip is in a **named** range
+(Linux prints no clause for an anonymous page). Called from `arch/src/arch/x86_64/idt.rs` (page fault
+and `user_fault_or_die`) and `arch/src/arch/aarch64/vectors.rs`; `PFDIAG` and the first-only `#GP
+code … bytes at rip` dump stay as the deeper instrument behind it.
+
+**The defect found on the way**: the two report sites filed their lines into the kernel log ring
+**without a trailing newline** — the ring is a byte stream, so the next writer's text was glued on and
+`syslog(2)` answered two entries as one. Both now carry `"\n"`.
+
+Named divergences: the `error` word is the machine's own vocabulary (x86_64's page-fault code; aarch64
+passes the fault status code, so the pin claims the column's presence there, not a number), and the
+`traps:` shape exists on x86_64 alone — AArch64 has no general-protection class (EL0 `brk` is
+SIGTRAP, an undefined instruction SIGILL). Both are `#[cfg]`-scoped in the pin, with the reason at the
+claim site.
+
+Pin: `user/tests/src/bin/t-fault-report.rs` (7 claims on x86_64, 5 on aarch64). Counterfactual: the
+slot-shaped identity reddens exactly four claims. Gates: x86_64 `pass=253 fail=0`, aarch64
+`pass=252 fail=0`, `mpos-kunit 35 passed`. Measured and recorded in `docs/notes/06-process-management.md`
+§6.73.
+
 ### Item 188 - a syscall may read a page of a private file mapping that has not been touched (2026-11-02, landed)
 
 A regression from item 177, found by the user's `git bisect` (`4930158` is the first bad commit)

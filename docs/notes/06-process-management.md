@@ -4722,3 +4722,96 @@ reads the new file's bytes through the old handle (that is the defect, reproduce
 **Guest pins restored**: `t-maps` regained "a mapping of an unlinked file is listed", "and its name
 carries the suffix Linux prints" and "and the descriptor's own path says so too"; the host reference
 passes on Linux 7.2.11, and both arms of the gate are green.
+passes on Linux 7.2.11, and both arms of the gate are green.
+
+## §6.73 A userland fault's report names the program, as Linux's does — MEASUREMENT + FIX
+
+The machine already printed a fault. It printed the wrong identity: `user #PF at 0x10
+code=PageFaultErrorCode(USER_MODE) rip=0x7e276355cc53`, `PFDIAG page=0x0 NOT MAPPED task=10`, and
+`user #GP/#SS/#NP at rip 0x7e27ca342986 cs 0x23`. `task=10` is a **slot in the task table**, not
+something a person or a log reader can act on: the number is reused the moment the task dies, and a
+boot's slot 10 was `/sbin/udevd` in one run and `/usr/bin/weston` in the next.
+
+### What Linux files (7.2.11, `build/scratch/segv/`, `dmesg -C` before each run)
+
+Six fault shapes, one line each, quoted from the boot's own dmesg:
+
+```
+m[37799]: segfault at 7fad640ec000 ip 000055d747093210 sp 00007fff76b1ae50 error 4 in m[1210,55d747093000+1000] likely on CPU 8 (core 0, socket 0)
+m[37799]: segfault at 7fad640ec000 ip 000055d747093210 sp 00007fff76b1ae50 error 6 in m[1210,55d747093000+1000] likely on CPU 8 (core 0, socket 0)
+m[37801]: segfault at 123456789000 ip 000055d747093210 sp 00007ffc48f6b9d8 error 4
+m[37803]: segfault at 123456789000 ip 00000000123456789000 sp ... error 14
+m[37804]: segfault at 55d747093000 ip 000055d747093000 sp ... error 15 in m[1210,55d747093000+1000]
+traps: m[37806] general protection fault ip:55d747093000 sp:7ffd1e2c9a40 error:0
+```
+
+Read off that table: the first word is `comm[tid]`; `at` is the **faulting address**; `ip`/`sp` are
+the frame; `error` is the architecture's page-fault code (bit 0 present, bit 1 write, bit 2 user,
+bit 4 instruction fetch — `4` = a user read of an absent page, `6` = a user write, `14` = a user
+instruction fetch, `15` = a fetch into a present but non-executable page); and the `in
+<module>[<offset>,<base>+<len>]` clause names the module holding the **ip**, present only when the
+ip has a named mapping (absent for an anonymous page and for the absent-address cases). A trap
+(`hlt` in ring 3, an undefined instruction) has no faulting address at all and takes the second
+shape.
+
+### What this kernel printed, and what it prints now
+
+| field | before | now |
+|---|---|---|
+| identity | `task=10` (a slot number) | `tfaultchild[10]` (`comm` + thread id) |
+| address | `at 0x10` | `at 0x10` (unchanged — the address was already right) |
+| frame | `rip=…` | `ip … sp …` (both words) |
+| fault word | `code=PageFaultErrorCode(USER_MODE)` | `error 4` |
+| the module | `mapping_name_at` in the rate-limited `PFDIAG` dump | `in <path>[<offset>,<base>+<len>]` on the same line |
+| a trap | `user #GP/#SS/#NP at rip …` | `traps: <comm>[<tid>] general protection fault ip:… sp:… error:0` |
+
+The `in …` clause comes from `sched::mapping_span_at(ip)` (`src/sched/runtime/child_mm.rs`), which
+answers from the eager ranges the interpreter recorded (the image and every library it mapped) and
+then from the VMA's own name — and answers `None` for an anonymous page, which is why the clause is
+absent exactly where Linux's is.
+
+### The defect found on the way: a ring line with no newline
+
+`src/kernel_services.rs` filed each of these lines with `self.log_line(format_args!("{line}"))` and
+no `\n`. The kernel log is a **byte stream** — `log_bytes` appends and `dmesg_snapshot` returns the
+whole buffer — so the next writer's text was glued onto the fault line, and `syslog(2)` then answered
+two faults' worth of words as one entry. The pin caught it as `FAIL: … and it carries no invented
+faulting address`, because the glued line contained a stray ` at ` from the *previous* entry. Same
+class as the `src/syscall/linux/fs/file.rs` `mpos: poll spin` newline defect. Both sites now carry
+`"\n"`.
+
+### The pin (`user/tests/src/bin/t-fault-report.rs`)
+
+Raw `syslog(2)` (this kernel's `dmesg` ring, read with `kind = READ_ALL`), a forked child that sets
+`PR_SET_NAME` to `tfaultchild` so the searched name is one the test invented, then:
+the child dies of SIGSEGV; the ring names `tfaultchild[<pid>]`; the line has Linux's shape
+(`segfault at … ip … sp … error `); a read carries `error 4` and a store `error 6` on x86_64.
+
+Two claims were made per-machine after the second arm reddened them:
+
+1. `error 4`/`error 6` are **x86_64's** words. On aarch64 this kernel passes the fault status code
+   (0x06/0x46 → `0`/`1`), so the aarch64 claims require the column to be present and a store's word
+   to differ from a read's, not a specific number. The aarch64 vector entry now reports
+   `report_user_fault(addr, frame.pc, frame.sp, ((esr >> 6) & 0x3f) as usize)`; that column is that
+   machine's vocabulary, and pinning it to the other machine's number is how a report starts lying in
+   a shape that reads correct.
+2. The `traps:` shape is x86_64's alone — a ring-3 `hlt` is a `#GP` there, while AArch64 has no
+   general-protection class at all (an EL0 `brk` is SIGTRAP, an undefined instruction SIGILL). The
+   block is `#[cfg(target_arch = "x86_64")]` and the other arm prints a note saying so.
+
+One claim was **withdrawn**: "a handler that swallows a fault files nothing". Measured on Linux, a
+returning SIGSEGV handler re-faults forever (the probe hung for 60 s), so Linux files nothing because
+the process never dies — not because a caught fault is unfiled. Claiming it would be claiming
+something Linux does not do.
+
+### Counterfactual
+
+`fault_identity()` replaced by `(format!("task{}", self.current()), 0)` — the old slot-shaped
+identity — reddens exactly four claims: `the kernel log names the program that faulted, and its
+thread`, `and files the fault in Linux's shape: at, ip, sp, error`, `and the error column says user,
+read, not present (4)`, `and the error column says user, write, not present (6)`, with
+`=== FAIL t-fault-report`. Restored byte-exact.
+
+### Gates
+
+x86_64 `verdict pass=253 fail=0`; aarch64 `verdict pass=252 fail=0`, `mpos-kunit 35 passed`.

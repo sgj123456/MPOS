@@ -375,7 +375,17 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // user address: a ring-0 dereference of a bad user pointer is a kernel bug,
     // not a signal to deliver.
     if rip < (1 << 47) {
-        crate::hal::kernel::kprintln!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
+        // Linux's own line, in Linux's shape (`docs/notes/` §6.73): the program
+        // and the thread that took the fault, then the address, the
+        // instruction, the stack and the machine's fault word. The machine
+        // layer supplies nothing but the numbers - which program is running is
+        // the kernel's answer, not this port's.
+        crate::hal::kernel::report_user_fault(
+            addr,
+            rip,
+            frame.stack_pointer.as_u64() as usize,
+            code.bits() as usize,
+        );
         pf_diag(addr, rip, frame.stack_pointer.as_u64() as usize);
         // Still extends the stack when the fault is a push past the mapped
         // end - the same call, moved here so its answer can be printed with
@@ -871,10 +881,10 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
             );
             crate::hal::kernel::kprintln!("  bytes at rip: {:02x?}", bytes);
         }
-        crate::hal::kernel::kprintln!(
-            "user #GP/#SS/#NP at rip {:#x} cs {:#x}",
+        crate::hal::kernel::report_user_trap(
             rip,
-            frame.code_segment.0
+            frame.stack_pointer.as_u64() as usize,
+            code as usize,
         );
         crate::hal::kernel::send_signal(11); // SIGSEGV
         if crate::hal::kernel::disposition_is_default(11) {

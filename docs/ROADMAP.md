@@ -645,6 +645,13 @@ In the order that keeps each step verifiable on its own:
 
 ## Current Status
 
+  A userland fault's report names the program that faulted, not a task slot: `<comm>[<tid>]:
+  segfault at <addr> ip <ip> sp <sp> error <word> in <module>[<off>,<base>+<len>]`, and
+  `traps: <comm>[<tid>] general protection fault ...` for a trap (item 189, §6.73). The shape is
+  Linux's, measured on 7.2.11 across six fault kinds; the `in ...` clause appears only when the ip
+  is in a named mapping, as Linux's does. Two things a compositor boot taught on the way: the
+  reports named only a task slot, and their ring lines were filed without a newline, so `syslog(2)`
+  answered two entries as one.
   A mapping that outlives its name says so, as Linux's does: `Inode::name_is_gone()` now exists
   beside the ambiguous `nlink()`, and a descriptor of an unlinked file reads as `<path> (deleted)`
   (item 184, pinned host-side). The guest-side pin taught what was really missing there, and it was

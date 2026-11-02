@@ -1206,6 +1206,17 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
             // printed because a fault 16 bytes below it is a stack push and one
             // far from it is a wild pointer, and telling those apart from the
             // address alone is guesswork.
+            // Linux's own line, in Linux's shape (`docs/notes/` §6.73). The
+            // `error` column is `ESR_EL1`'s fault status field on this machine,
+            // which is what Linux's arm64 port prints there too: the two
+            // machines' fault words are different vocabularies and the column
+            // is the machine's, not a shared code.
+            crate::hal::kernel::report_user_fault(
+                addr,
+                frame.pc as usize,
+                frame.sp as usize,
+                ((esr >> 6) & 0x3f) as usize,
+            );
             crate::hal::kernel::kprintln!(
                 "user fault at {addr:#x} (ESR {esr:#x}, pc {:#x}, sp {:#x})",
                 frame.pc,

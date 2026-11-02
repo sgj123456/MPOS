@@ -70,6 +70,50 @@ pub trait Kernel: Sync {
     /// and this boundary is the reason a machine never sees it.
     fn current(&self) -> usize;
 
+    /// The running task's program name, as `PR_GET_NAME` would answer it.
+    ///
+    /// A fault report that names only the task *slot* leaves the reader where
+    /// they started: `task=10` says which row of the scheduler's table died and
+    /// nothing about which program that row was. Linux names the program in the
+    /// same line (`udevd[312]: segfault at …`), and the bytes are already here -
+    /// `comm`, 16 of them NUL-padded, which `/proc/<pid>/comm` serves too.
+    fn current_comm(&self) -> [u8; 16];
+
+    /// File one line into the kernel log ring, the way a `/dev/kmsg` writer
+    /// does.
+    ///
+    /// The ring is `syslog(2)`'s `READ_ALL` answer and what `klogd`/`dmesg`
+    /// drain; the console is the kernel's own voice. Linux keeps a userland
+    /// fault in the ring and *off* the console. This machine's report goes to
+    /// both for now: the console line is what a boot log shows, and the ring
+    /// line is what a program can pin.
+    fn log_line(&self, args: core::fmt::Arguments<'_>);
+
+    /// Report a userland fault the way Linux's `show_signal_msg` does.
+    ///
+    /// Linux files exactly one line, and its shape is load-bearing: the *program*
+    /// comes first (`udevd[312]`), so a reader whose log is a screenful of
+    /// `[ ok ]` can tell which program died without cross-referencing a
+    /// scheduler table they do not have. `comm` is what `PR_GET_NAME` answers,
+    /// the same 16 bytes `/proc/<pid>/comm` serves; the number in brackets is
+    /// the *thread* id, not the process id, so the line names the one thread
+    /// that took the fault.
+    ///
+    /// `error` is the machine's own fault word. On x86_64 that is the page-fault
+    /// error code; on aarch64 it is the `ESR_EL1` fault status field, which is
+    /// what Linux's arm64 port prints in the same column. The two machines'
+    /// words are therefore not comparable to each other, exactly as on Linux.
+    fn report_user_fault(&self, addr: usize, ip: usize, sp: usize, error: usize);
+
+    /// Report a userland trap that has no faulting address - a ring-3 `#GP` on
+    /// x86_64 (a `hlt`, an `int` the process may not issue, a bad descriptor).
+    ///
+    /// Linux has a second line shape for that class and it is not a formatting
+    /// accident: `traps: comm[tid] general protection fault ip:… sp:… error:0`
+    /// carries no `at <address>` because there is none, and printing a borrowed
+    /// address beside it would be an invention.
+    fn report_user_trap(&self, ip: usize, sp: usize, error: usize);
+
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
 
@@ -477,6 +521,32 @@ pub(crate) use kprintln;
 #[inline]
 pub fn print_line(args: core::fmt::Arguments<'_>) {
     registered().print_line(args)
+}
+
+/// File a formatted line into the kernel log ring. See [`Kernel::log_line`].
+#[inline]
+pub fn log_line(args: core::fmt::Arguments<'_>) {
+    registered().log_line(args)
+}
+
+/// Report a userland fault in Linux's shape. See
+/// [`Kernel::report_user_fault`].
+#[inline]
+pub fn report_user_fault(addr: usize, ip: usize, sp: usize, error: usize) {
+    registered().report_user_fault(addr, ip, sp, error)
+}
+
+/// Report a userland trap with no faulting address. See
+/// [`Kernel::report_user_trap`].
+#[inline]
+pub fn report_user_trap(ip: usize, sp: usize, error: usize) {
+    registered().report_user_trap(ip, sp, error)
+}
+
+/// The running task's `comm`. See [`Kernel::current_comm`].
+#[inline]
+pub fn current_comm() -> [u8; 16] {
+    registered().current_comm()
 }
 
 /// Pull the console back onto the serial wire. See [`Kernel::force_serial`].

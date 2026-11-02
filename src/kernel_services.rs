@@ -36,6 +36,70 @@ impl Kernel for Services {
         sched::current().0
     }
 
+    fn current_comm(&self) -> [u8; 16] {
+        sched::current_comm_bytes()
+    }
+
+    fn log_line(&self, args: core::fmt::Arguments<'_>) {
+        // A `Vec` because the ring takes slices: the line is formatted once,
+        // then filed. This runs on the fault path, where the allocator is the
+        // one thing that can still answer - a fault handler that could not
+        // allocate would have to print nothing at all.
+        use core::fmt::Write as _;
+        let mut line = alloc::string::String::new();
+        let _ = line.write_fmt(args);
+        console::log_bytes(line.as_bytes());
+    }
+
+    fn report_user_fault(&self, addr: usize, ip: usize, sp: usize, error: usize) {
+        // Linux's `show_signal_msg`, in its measured shape
+        // (`docs/notes/` §6.73): the program first, the thread in brackets,
+        // then `at`/`ip`/`sp` in hex and `error` as the machine's fault word.
+        //
+        // The `in <module>[<offset>,<base>+<len>]` clause is Linux's own way of
+        // saying *which* file the faulting instruction came from, and it names
+        // the module holding the *ip* - not the one holding the faulting
+        // address, which is usually a different mapping and, when the address
+        // is a wild pointer, no mapping at all. A fault whose ip sits in an
+        // anonymous executable page gets no clause on Linux either, so an
+        // unmapped ip is the same absence rather than a second format.
+        let (comm, tid) = fault_identity();
+        let line = match sched::mapping_span_at(ip) {
+            Some((name, start, end)) => alloc::format!(
+                "{comm}[{tid}]: segfault at {addr:x} ip {ip:016x} sp {sp:016x} error {error:x} \
+                 in {name}[{:x},{start:x}+{:x}]",
+                ip.wrapping_sub(start),
+                end.saturating_sub(start)
+            ),
+            None => alloc::format!(
+                "{comm}[{tid}]: segfault at {addr:x} ip {ip:016x} sp {sp:016x} error {error:x}"
+            ),
+        };
+        // The newline is part of the *ring* line, not decoration: the ring
+        // is a byte stream, and a line filed without it is glued to whatever
+        // the next writer files - which is how a `traps:` line came to carry
+        // a `segfault` line\'s address (`docs/notes/` §6.73).
+        self.log_line(format_args!("{line}\n"));
+        console::print_args(format_args!("{line}\n"));
+    }
+
+    fn report_user_trap(&self, ip: usize, sp: usize, error: usize) {
+        // The `traps:` shape, which carries no `at <address>` because the
+        // machine did not name one: a ring-3 `hlt` or a `#GP` is a trap the
+        // process took, not an address it touched. Printing a borrowed address
+        // beside it would report a page that had nothing to do with the fault.
+        let (comm, tid) = fault_identity();
+        let line = alloc::format!(
+            "traps: {comm}[{tid}] general protection fault ip:{ip:x} sp:{sp:x} error:{error:x}"
+        );
+        // The newline is part of the *ring* line, not decoration: the ring
+        // is a byte stream, and a line filed without it is glued to whatever
+        // the next writer files - which is how a `traps:` line came to carry
+        // a `segfault` line\'s address (`docs/notes/` §6.73).
+        self.log_line(format_args!("{line}\n"));
+        console::print_args(format_args!("{line}\n"));
+    }
+
     fn current_stack_range(&self) -> Option<(usize, usize)> {
         sched::current_stack_range()
     }
@@ -186,6 +250,38 @@ impl Kernel for Services {
         // null or the gate's own frame for the calling task.
         unsafe { syscall::linux_dispatch(nr, args, from_user, frame) }
     }
+}
+
+/// The program name and the thread id a fault report puts in front of its line.
+///
+/// The pair is Linux's `comm[tid]`, and both halves are already the kernel's own
+/// answers: `current_comm_bytes` is what `PR_GET_NAME` and `/proc/<pid>/comm`
+/// serve, and `current_pid_number` is the thread id `gettid(2)` answers - the
+/// number of the *thread* that took the fault, not of its group, because a
+/// thread is what dies.
+///
+/// The name is truncated at the first NUL (`comm` is 16 bytes, NUL-padded) and
+/// anything that is not printable becomes `?`: a `comm` may hold any bytes a
+/// program wrote with `PR_SET_NAME`, and a report that one of them could steer
+/// - a newline, an escape sequence - would corrupt the very line an operator is
+/// reading.
+fn fault_identity() -> (alloc::string::String, u32) {
+    let raw = sched::current_comm_bytes();
+    let mut name = alloc::string::String::new();
+    for &b in raw.iter() {
+        if b == 0 {
+            break;
+        }
+        if (0x20..0x7f).contains(&b) {
+            name.push(b as char);
+        } else {
+            name.push('?');
+        }
+    }
+    if name.is_empty() {
+        name.push('?');
+    }
+    (name, sched::current_pid_number())
 }
 
 /// The one value [`register`] hands over.

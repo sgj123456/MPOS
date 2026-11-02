@@ -973,6 +973,47 @@ pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
     })
 }
 
+/// The `(name, start, end)` of the mapping holding `addr`, for Linux's
+/// `in <module>[<offset>,<base>+<len>]` clause of a fault report.
+///
+/// Deliberately narrower than [`mapping_name_at`], which is a diagnostic dump:
+/// this answers only when the range has a *name* - an anonymous page names
+/// nothing, and Linux prints no clause for one rather than inventing a name for
+/// "somewhere in the heap". The bounds matter for the same reason they do in
+/// the dump: `<offset>` and `<len>` are what let a reader map the faulting
+/// instruction back to a source file, and a length taken from the wrong
+/// mapping would misreport every fault inside the right one.
+///
+/// The ip is looked up, not the faulting address: Linux's clause names the
+/// module the *instruction* came from. A wild pointer read by code in `libc`
+/// is a fault `in libc`, and asking about the address instead would answer
+/// "no name" for exactly the faults most worth reporting.
+pub fn mapping_span_at(addr: usize) -> Option<(alloc::string::String, usize, usize)> {
+    let page = pframe::align_down(addr, PAGE_SIZE);
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        let mm = &t.task(owner).mm;
+        // Eager ranges first: the program image and every library the
+        // interpreter mapped are eager, and those are the ranges a faulting
+        // instruction actually comes from. A VMA over the same page is the
+        // anonymous wrapper `mmap` put around a segment (`mmap` of a
+        // `PROT_EXEC` file is the loader's own pattern), so the named one is
+        // the answer.
+        for range in mm.eager_ranges() {
+            if page >= range.start && page < range.end {
+                if let Some(name) = range.name.as_deref() {
+                    return Some((alloc::string::String::from(name), range.start, range.end));
+                }
+            }
+        }
+        mm.vma_at(page).and_then(|vma| {
+            vma.name
+                .as_deref()
+                .map(|name| (alloc::string::String::from(name), vma.start, vma.end))
+        })
+    })
+}
+
 /// The VMAs covering `virt..virt + len` in the current process, clipped to the
 /// range, with the table left empty there - and their pages *left alone*.
 ///
