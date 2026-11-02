@@ -8665,3 +8665,21 @@ number checked at `read_inode`) so every method answers about the file it was op
 once the number belongs to a newer one. An ext4 orphan list keeps the number from being recycled
 while a description is open and is one way to close the unlinked case; it does not help a handle that
 outlives a `rename` over its name.
+
+## 186. A handle names an incarnation, not a number (2026-11-02)
+
+Closes item 185. `Ext4Ino` is `(fs, ino, generation)`: the generation is captured when `handle()` makes
+the handle, `alloc_inode` bumps it for the number it hands out, and every `self.ino` read goes through
+`Ext4Ino::data()` which answers `ESTALE` (new `VfsError::Stale`, `err::ESTALE = -116`) once the number
+belongs to a newer incarnation. `unlink` now writes the zero-link header before releasing the entry,
+so `name_is_gone()` is true without taking an open description's block pointers away; and
+`name_is_gone()` also answers true when the generation has moved on, which is what made the earlier
+`t-maps` claim race with allocation order.
+
+**Pins**: `vfs::ext4::tests::an_unlinked_file_keeps_its_bytes_while_the_number_is_its_own` and
+`a_recycled_inode_number_refuses_the_old_handle` (host), plus `t-maps`'s three restored guest claims
+("a mapping of an unlinked file is listed", "…suffix Linux prints", "…descriptor's own path says so
+too"). Host lib 726. Gates: x86_64 `pass=252`, aarch64 `pass=251`.
+
+**Not used**: the on-disk `i_generation` at offset 100 - it is ext4's checksum/rename cookie and says
+nothing about reuses within this mount.

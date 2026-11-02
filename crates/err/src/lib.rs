@@ -28,6 +28,9 @@ pub const ESRCH: isize = -3;
 /// spells both - and a debugger distinguishes them from `EFAULT`, which
 /// means the *caller's* pointer was bad.
 pub const EIO: isize = -5;
+/// ESTALE: a file handle named an incarnation that no longer exists (the
+/// inode number was reused). Linux's answer for a stale handle.
+pub const ESTALE: isize = -116;
 pub const ENXIO: isize = -6;
 /// ECANCELED: the operation was undone by something outside it. The
 /// one user is a `TFD_TIMER_CANCEL_ON_SET` timer whose real-time clock

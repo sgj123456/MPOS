@@ -51,6 +51,11 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         // for the same reason Linux reports it - a caller can be told, and a
         // machine that stops on one bad directory entry cannot tell anyone.
         VfsError::Corrupt => err::EIO,
+        // ESTALE: a file handle named an incarnation of an inode number that
+        // no longer exists - the number was reused for a different file. Not a
+        // damage report (`EIO`), which would say the disk is wrong: the disk is
+        // fine, the handle is old, and Linux's own answer is ESTALE.
+        VfsError::Stale => err::ESTALE,
         // EXDEV: a hard link whose two ends live on different filesystems.
         VfsError::CrossDevice => err::EXDEV,
         // EAGAIN, which is also EWOULDBLOCK: they are one errno here.

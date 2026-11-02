@@ -46,6 +46,28 @@ pub(crate) const INODE_EXTENTS_FL: u32 = 1 << 19;
 /// which never moves an entry between leaves. Only insertion cares.
 pub(crate) const INODE_INDEX_FL: u32 = 1 << 12;
 
+impl InodeData {
+    /// An all-zero header: what a handle whose number has been recycled reports
+    /// through the doors whose signature carries no error (the stat/timestamp
+    /// getters). Zero is not a plausible inode - a live one has a mode - so a
+    /// caller sees "nothing here" rather than another file's numbers.
+    pub(crate) const EMPTY: InodeData = InodeData {
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        flags: 0,
+        size: 0,
+        dir_acl: 0,
+        links: 0,
+        blocks: 0,
+        block: [0; 15],
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+        generation: 0,
+    };
+}
+
 /// The inode fields this driver reads and writes, decoded out of the table.
 #[derive(Clone, Copy)]
 pub(crate) struct InodeData {

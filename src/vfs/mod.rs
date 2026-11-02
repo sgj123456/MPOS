@@ -339,6 +339,13 @@ pub enum VfsError {
     Unsupported,
     /// A write to a filesystem that was mounted read-only.
     ReadOnly,
+    /// ESTALE: the handle names an incarnation of an inode number that no
+    /// longer exists - the number was handed back to the allocator and reused
+    /// for a different file. Linux's answer for exactly this (`ESTALE`, which
+    /// NFS uses for a file handle that outlived its file), and the honest one
+    /// here: the alternative is describing somebody else's file, which is what
+    /// a bare `(fs, ino)` handle did before items 185/186.
+    Stale,
     /// EIO: the filesystem says something that cannot be true - a directory
     /// entry pointing at an inode with no links left, say. Linux's answer for
     /// damage it can see but cannot repair, and a better one than either

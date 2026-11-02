@@ -289,7 +289,21 @@ struct Core {
     sb: Super,
     groups: u32,
     cache: Mutex<RefCell<Cache>>,
-    inodes: Mutex<RefCell<BTreeMap<u32, Arc<dyn Inode>>>>,
+    inodes: Mutex<RefCell<BTreeMap<(u32, u32), Arc<dyn Inode>>>>,
+    /// The incarnation of every inode number this mount has handed out a
+    /// handle for. A handle is `(ino, generation)`, and a lookup asks whether
+    /// the number still holds the generation the handle was made with - which
+    /// is the question a bare `(fs, ino)` could not answer.
+    ///
+    /// The need was measured, not designed: `unlink` puts an inode number
+    /// straight back into the bitmap, so the next `create` of the same name
+    /// gets it, and a descriptor still open from before then answers about the
+    /// new file - `/proc/self/fd/<n>` read `/t-a.bin` instead of
+    /// `/t-a.bin (deleted)`, and whether it did depended on allocation order
+    /// (`docs/notes/` §6.71a). The generation is bumped on allocation, so a
+    /// handle that outlived its name is refused instead of answering about its
+    /// replacement.
+    generations: Mutex<RefCell<BTreeMap<u32, u32>>>,
     /// Whether this filesystem was mounted read-only. It lives here, on the
     /// one piece of state every inode of the mount shares, because "read-only"
     /// is a property of the mount and not of a file - and because it has to be
@@ -298,6 +312,62 @@ struct Core {
 }
 
 impl Core {
+    /// A handle to the incarnation of `ino` that is current now.
+    ///
+    /// `self: &Arc<Self>` because a handle holds the mount alive: the inode
+    /// cache and the generation table are the mount's, and a handle that
+    /// outlived them would be asking a table that no longer exists.
+    fn handle(self: &Arc<Self>, ino: u32) -> Arc<dyn Inode> {
+        critical_section::with(|cs| {
+            let generation = self.generation_of_locked(cs, ino);
+            let mut inodes = self.inodes.borrow(cs).borrow_mut();
+            if let Some(cached) = inodes.get(&(ino, generation)) {
+                return cached.clone();
+            }
+            let inode = Arc::new(Ext4Ino {
+                fs: self.clone(),
+                ino,
+                generation,
+            });
+            inodes.insert((ino, generation), inode.clone());
+            inode
+        })
+    }
+
+    /// The generation a fresh handle for `ino` carries.
+    ///
+    /// An inode the mount has never handed out starts at 0. There is no
+    /// on-disk generation to read: ext2's inode records carry no such word
+    /// (ext4's `i_version`/`i_generation` are not what this driver reads, and
+    /// reading one would be a format change, not a rename), so the counter is
+    /// the mount's own memory - which is exactly the lifetime the question
+    /// needs, since a handle cannot outlive the mount that made it either.
+    /// The generation `ino` is at now, for a handle asking whether it is still
+    /// the current incarnation of its number.
+    fn generation_of(&self, ino: u32) -> u32 {
+        critical_section::with(|cs| self.generation_of_locked(cs, ino))
+    }
+
+    fn generation_of_locked(&self, cs: critical_section::CriticalSection, ino: u32) -> u32 {
+        let mut gens = self.generations.borrow(cs).borrow_mut();
+        *gens.entry(ino).or_insert(0)
+    }
+
+    /// Start a new incarnation of `ino`: called where an inode number is
+    /// handed back to the allocator, so every handle made before this call is
+    /// refused from now on.
+    fn bump_generation(&self, ino: u32) {
+        critical_section::with(|cs| {
+            let mut gens = self.generations.borrow(cs).borrow_mut();
+            let entry = gens.entry(ino).or_insert(0);
+            // Wrapping at `u32::MAX` is not a practical hazard (it would take
+            // four billion reuses of one number between two reads), but a
+            // collision there would be the same defect again, so the counter
+            // stops one short of the wrap and keeps counting from 1.
+            *entry = if *entry == u32::MAX { 1 } else { *entry + 1 };
+        });
+    }
+
     /// Refuse a write to a filesystem mounted read-only.
     ///
     /// `mount -o ro` is a promise the filesystem keeps, not a hint: an
@@ -381,6 +451,7 @@ impl Core {
             groups,
             cache: Mutex::new(RefCell::new(Cache::new())),
             inodes: Mutex::new(RefCell::new(BTreeMap::new())),
+            generations: Mutex::new(RefCell::new(BTreeMap::new())),
         };
         // Checksummed volumes are verified at mount, the way the kernel's
         // initial-group-descriptor check is: a descriptor table whose own
@@ -1167,47 +1238,56 @@ impl Ext4Fs {
     }
 
     pub fn inode_of(&self, ino: u32) -> Arc<dyn Inode> {
-        critical_section::with(|cs| {
-            let mut inodes = self.core.inodes.borrow(cs).borrow_mut();
-            if let Some(cached) = inodes.get(&ino) {
-                return cached.clone();
-            }
-            let inode = Arc::new(Ext4Ino {
-                fs: self.core.clone(),
-                ino,
-            });
-            inodes.insert(ino, inode.clone());
-            inode
-        })
+        self.core.handle(ino)
     }
 }
 
-/// One inode of one ext2 mount: a pure handle. The on-disk header is read
-/// through the cache on every operation, so two handles to the same inode
-/// can never disagree, and there is nothing here to go stale.
+/// One inode of one ext2 mount: a handle to a *specific incarnation* of an
+/// inode number.
+///
+/// The on-disk header is read through the cache on every operation, so two
+/// handles to the same inode cannot disagree - and `generation` is what keeps
+/// that sentence true when the number is recycled. An inode number is put back
+/// into the bitmap the moment its last name goes (`unlink`), so the next
+/// `create` can be handed the same number for a different file; a bare
+/// `(fs, ino)` handle would then answer about the replacement. The generation
+/// is captured when the handle is made and every read checks it, which turns
+/// "answer about somebody else's file" into an honest refusal (`ESTALE`, the
+/// answer Linux gives a handle it can no longer vouch for).
 pub struct Ext4Ino {
     fs: Arc<Core>,
     ino: u32,
+    generation: u32,
 }
 
 impl Ext4Ino {
     fn wrap(&self, ino: u32) -> Arc<dyn Inode> {
-        critical_section::with(|cs| {
-            let mut inodes = self.fs.inodes.borrow(cs).borrow_mut();
-            if let Some(cached) = inodes.get(&ino) {
-                return cached.clone();
-            }
-            let inode = Arc::new(Ext4Ino {
-                fs: self.fs.clone(),
-                ino,
-            });
-            inodes.insert(ino, inode.clone());
-            inode
-        })
+        self.fs.handle(ino)
+    }
+
+    /// This handle's inode header, or `ESTALE` if the number now belongs to a
+    /// newer incarnation.
+    ///
+    /// Every `self.ino` read goes through here. The alternative - reading the
+    /// slot and hoping - is what made a live descriptor answer `/t-a.bin` after
+    /// its name was gone and the number was reused; a refusal is the answer
+    /// that cannot describe somebody else's file.
+    fn data(&self) -> VfsResult<InodeData> {
+        if self.generation != self.fs.generation_of(self.ino) {
+            return Err(VfsError::Stale);
+        }
+        Ok(self.fs.read_inode(self.ino))
+    }
+
+    /// The same read, for the doors whose signature has no error to carry: the
+    /// metadata/timestamp getters `stat` fills in, where a stale handle answers
+    /// zeroes rather than a wrong file. Documented at each one.
+    fn data_or_empty(&self) -> InodeData {
+        self.data().unwrap_or(InodeData::EMPTY)
     }
 
     fn require_dir(&self) -> VfsResult<()> {
-        if self.fs.read_inode(self.ino).kind() == NodeKind::Dir {
+        if self.data()?.kind() == NodeKind::Dir {
             Ok(())
         } else {
             Err(VfsError::NotDir)
@@ -1217,7 +1297,7 @@ impl Ext4Ino {
 
 impl Inode for Ext4Ino {
     fn metadata(&self) -> Metadata {
-        let data = self.fs.read_inode(self.ino);
+        let data = self.data_or_empty();
         let kind = data.kind();
         Metadata {
             ino: self.ino as Ino,
@@ -1237,7 +1317,7 @@ impl Inode for Ext4Ino {
     }
 
     fn mode(&self) -> u32 {
-        (self.fs.read_inode(self.ino).mode as u32) & 0o7777
+        (self.data_or_empty().mode as u32) & 0o7777
     }
 
     /// Every ext4 inode carries a mode, so a zero here is `chmod 000` rather
@@ -1247,7 +1327,7 @@ impl Inode for Ext4Ino {
     }
 
     fn owner(&self) -> (u32, u32) {
-        let data = self.fs.read_inode(self.ino);
+        let data = self.data_or_empty();
         (data.uid as u32, data.gid as u32)
     }
 
@@ -1256,7 +1336,7 @@ impl Inode for Ext4Ino {
     /// dropped: a filesystem that cannot hold the whole number should still
     /// answer with something the caller recognises.
     fn set_owner(&self, uid: u32, gid: u32) {
-        let mut data = self.fs.read_inode(self.ino);
+        let Ok(mut data) = self.data() else { return };
         data.uid = uid as u16;
         data.gid = gid as u16;
         self.fs.write_inode(self.ino, &data);
@@ -1273,7 +1353,7 @@ impl Inode for Ext4Ino {
     /// on. The bits above the twelve are the node's *kind*, which the inode
     /// already carries and this must not disturb.
     fn set_mode(&self, mode: u32) {
-        let mut data = self.fs.read_inode(self.ino);
+        let Ok(mut data) = self.data() else { return };
         data.mode = (data.mode & !0o7777) | (mode as u16 & 0o7777);
         self.fs.write_inode(self.ino, &data);
     }
@@ -1283,7 +1363,7 @@ impl Inode for Ext4Ino {
     /// file this driver creates carries the extent bit, so `lsattr` shows the
     /// `e` that tells a reader the blocks are a tree.
     fn flags(&self) -> VfsResult<u32> {
-        Ok(self.fs.read_inode(self.ino).flags)
+        Ok(self.data()?.flags)
     }
 
     /// Move them, refusing anything this kernel cannot keep.
@@ -1302,7 +1382,7 @@ impl Inode for Ext4Ino {
     fn set_flags(&self, flags: u32) -> VfsResult<()> {
         // A read-only mount refuses the write, as it refuses every other one.
         self.fs.writable()?;
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         data.flags = crate::vfs::apply_flag_change(
             data.flags,
             flags,
@@ -1317,7 +1397,7 @@ impl Inode for Ext4Ino {
     /// time here rather than taken from the caller - exactly what Linux does,
     /// and what makes `ls -lc` show the touch and not the file's age.
     fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         data.atime = atime as u32;
         data.mtime = mtime as u32;
         data.ctime = now();
@@ -1337,7 +1417,7 @@ impl Inode for Ext4Ino {
     /// as a mount's `noatime`: this one is a promise about *this file*, made by
     /// whoever set it, and it holds wherever the filesystem is mounted.
     fn touch_atime(&self, now: u64) -> VfsResult<()> {
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         const DAY: u32 = 86_400;
         let stamp = now as u32;
         if data.flags & crate::vfs::FS_NOATIME_FL == 0
@@ -1355,34 +1435,43 @@ impl Inode for Ext4Ino {
     /// judges a cached index by, and the one `make` compares against its
     /// sources.
     fn mtime(&self) -> u64 {
-        self.fs.read_inode(self.ino).mtime as u64
+        self.data_or_empty().mtime as u64
     }
 
     /// The read and metadata-change clocks, off the on-disk inode. ext2 keeps
     /// all three; a `stat` that reported mtime for them threw away the ctime
     /// the disk already had.
     fn atime(&self) -> u64 {
-        self.fs.read_inode(self.ino).atime as u64
+        self.data_or_empty().atime as u64
     }
 
     fn ctime(&self) -> u64 {
-        self.fs.read_inode(self.ino).ctime as u64
+        self.data_or_empty().ctime as u64
     }
 
     /// `i_links_count`: how many names reach this inode. This is the whole
     /// point of a hard link as `stat` sees it - after `ln a b`, both names
     /// report two, and the file is only freed when the count reaches zero.
     fn nlink(&self) -> u64 {
-        self.fs.read_inode(self.ino).links as u64
+        self.data_or_empty().links as u64
     }
 
+    /// Whether every name that reached *this* file is gone.
+    ///
+    /// Two ways to know, and the second is the one a recycled number taught us
+    /// to ask (§6.71a): the slot says no names are left, or the number has been
+    /// handed to a newer incarnation - which means this handle's file lost its
+    /// last name, whatever the slot holds now. Answering from the slot alone
+    /// made this door race with allocation order: it read `/t-a.bin` after the
+    /// name was gone, because a filler had already taken the number.
     fn name_is_gone(&self) -> bool {
-        self.fs.read_inode(self.ino).links == 0
+        self.generation != self.fs.generation_of(self.ino)
+            || self.fs.read_inode(self.ino).links == 0
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         self.require_dir()?;
-        let dir = self.fs.read_inode(self.ino);
+        let dir = self.data()?;
         let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
         Ok(self.wrap(child))
     }
@@ -1432,7 +1521,7 @@ impl Inode for Ext4Ino {
             return Err(VfsError::Unsupported);
         }
         self.require_dir()?;
-        let mut dir = self.fs.read_inode(self.ino);
+        let mut dir = self.data()?;
         if self.fs.dir_lookup(&dir, name)?.is_some() {
             return Err(VfsError::Exists);
         }
@@ -1462,7 +1551,7 @@ impl Inode for Ext4Ino {
     fn unlink(&self, name: &str) -> VfsResult<()> {
         self.fs.writable()?;
         self.require_dir()?;
-        let mut dir = self.fs.read_inode(self.ino);
+        let mut dir = self.data()?;
         // Looked up before anything is touched, so a refusal leaves the
         // directory exactly as it was.
         let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
@@ -1490,6 +1579,16 @@ impl Inode for Ext4Ino {
 
         data.links -= 1;
         if data.links == 0 {
+            // The slot says "no names left" before the blocks go, and that
+            // write is what makes a descriptor that outlives the name able to
+            // say so: `name_is_gone()` reads this header, and a header still
+            // carrying `links = 1` is why `/proc/self/fd/<n>` used to print a
+            // bare path after the file was unlinked (§6.71). The file's block
+            // pointers are left in place, so an open description keeps reading
+            // its bytes until the number is recycled - which is the next
+            // section's subject (`alloc_inode` bumps the generation, and a
+            // handle from before then answers `ESTALE`).
+            self.fs.write_inode(child, &data);
             self.fs.free_inode(child);
         } else {
             self.fs.write_inode(child, &data);
@@ -1509,7 +1608,7 @@ impl Inode for Ext4Ino {
     fn rmdir(&self, name: &str) -> VfsResult<()> {
         self.fs.writable()?;
         self.require_dir()?;
-        let mut dir = self.fs.read_inode(self.ino);
+        let mut dir = self.data()?;
         let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
         let data = self.fs.read_inode(child);
         if data.kind() != NodeKind::Dir {
@@ -1549,7 +1648,7 @@ impl Inode for Ext4Ino {
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
         self.fs.writable()?;
         self.require_dir()?;
-        let mut dir = self.fs.read_inode(self.ino);
+        let mut dir = self.data()?;
         if self.fs.dir_lookup(&dir, name)?.is_some() {
             return Err(VfsError::Exists);
         }
@@ -1590,7 +1689,7 @@ impl Inode for Ext4Ino {
     fn link(&self, name: &str, target: &Arc<dyn Inode>) -> VfsResult<()> {
         self.fs.writable()?;
         self.require_dir()?;
-        let mut dir = self.fs.read_inode(self.ino);
+        let mut dir = self.data()?;
         if self.fs.dir_lookup(&dir, name)?.is_some() {
             return Err(VfsError::Exists);
         }
@@ -1614,7 +1713,7 @@ impl Inode for Ext4Ino {
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
         self.require_dir()?;
-        let dir = self.fs.read_inode(self.ino);
+        let dir = self.data()?;
         self.fs.dir_entries(&dir)
     }
 
@@ -1624,7 +1723,7 @@ impl Inode for Ext4Ino {
     /// hold a few hundred names, all of them links to one busybox or one
     /// loader. Resolution is what follows them; this is what says where.
     fn readlink(&self) -> VfsResult<String> {
-        let data = self.fs.read_inode(self.ino);
+        let data = self.data()?;
         if data.kind() != NodeKind::Symlink {
             return Err(VfsError::Invalid);
         }
@@ -1661,7 +1760,7 @@ impl Inode for Ext4Ino {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         // `mut` for one reason: a read may move the access time (see the
         // `relatime` block at the end), and nothing else here touches the inode.
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         let kind = data.kind();
         if kind != NodeKind::File {
             // A directory is a directory; a link is a name, and reading
@@ -1724,7 +1823,7 @@ impl Inode for Ext4Ino {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         self.fs.writable()?;
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         let kind = data.kind();
         if kind != NodeKind::File {
             // The same refusal as a read, for the same reason: a link's block
@@ -1783,7 +1882,7 @@ impl Inode for Ext4Ino {
     /// costs nothing extra.
     fn truncate(&self, len: u64) -> VfsResult<()> {
         self.fs.writable()?;
-        let mut data = self.fs.read_inode(self.ino);
+        let mut data = self.data()?;
         match data.kind() {
             NodeKind::File => {}
             NodeKind::Dir => return Err(VfsError::IsDir),
@@ -2113,6 +2212,59 @@ mod tests {
         let n = inode.read_at(0, &mut buf).expect("read_at works");
         buf.truncate(n);
         buf
+    }
+
+    /// A number handed back to the allocator is a new incarnation, and a
+    /// handle from before it is refused rather than asked to describe the new
+    /// file. Measured shape: `unlink` puts the number straight back into the
+    /// bitmap, so the next `create` of the same name gets it
+    /// (`docs/notes/` §6.71a).
+    #[test]
+    fn a_recycled_inode_number_refuses_the_old_handle() {
+        let fs = Arc::new(mounted(Arc::new(format())));
+        let root = fs.root();
+
+        let old = root.create("bins", NodeKind::File, None).expect("create");
+        old.write_at(0, b"first incarnation").expect("write");
+        let freed = old.number();
+        assert!(old.name_is_gone().eq(&false), "it has a name at first");
+
+        // The name goes, and with it the table entry; the file's bytes stay
+        // readable through the handle that still holds it.
+        root.unlink("bins").expect("unlink");
+        assert!(old.name_is_gone(), "the last name is gone");
+        let mut buf = [0u8; 7];
+        assert_eq!(old.read_at(0, &mut buf).expect("read"), 7);
+        assert_eq!(&buf, b"first i");
+
+        // The same number comes back for a different file.
+        let new = root.create("bins", NodeKind::File, None).expect("create");
+        assert_eq!(new.number(), freed, "the allocator reuses the number");
+        new.write_at(0, b"SECOND").expect("write the new file");
+
+        // The old handle now names nothing: every door that can carry an error
+        // says the incarnation is gone, and none of them describes the new file.
+        assert_eq!(old.read_at(0, &mut buf), Err(VfsError::Stale));
+        assert_eq!(old.nlink(), 0, "and the infallible ones say nothing at all");
+        assert_eq!(old.metadata().size, 0);
+        assert!(new.read_at(0, &mut buf).is_ok(), "the new handle is fine");
+    }
+
+    /// The file a descriptor was opened on keeps its bytes after `unlink`,
+    /// even once the number is recycled - the old handle's block pointers are
+    /// its own, and the descriptor still names the current incarnation of its
+    /// number until that number is handed out again.
+    #[test]
+    fn an_unlinked_file_keeps_its_bytes_while_the_number_is_its_own() {
+        let fs = Arc::new(mounted(Arc::new(format())));
+        let root = fs.root();
+        let file = root.create("bytes", NodeKind::File, None).expect("create");
+        file.write_at(0, b"survives").expect("write");
+        root.unlink("bytes").expect("unlink");
+
+        let mut buf = [0u8; 8];
+        assert_eq!(file.read_at(0, &mut buf).expect("read"), 8);
+        assert_eq!(&buf, b"survives");
     }
 
     #[test]

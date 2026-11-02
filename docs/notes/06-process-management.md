@@ -4674,3 +4674,51 @@ live handle answer about the new file.** The orphan list makes the rename smalle
 number from being recycled at all while the description is open, which is Linux's cheaper answer),
 but the identity hole is the defect; the orphan list is one way to hide it for the unlinked case and
 does not help a handle that outlives `rename` over its name either.
+
+### 6.72 A handle names an incarnation, not a number — **FIXED (2026-11-02)**
+
+§6.71a left the defect named and this section closes it: `Ext4Ino` was `(fs, ino)`, so once `unlink`
+put the number back into the bitmap, the next `create` of the same name inherited every handle still
+open on the old file. `/proc/self/fd/<n>` read `/t-a.bin` instead of `/t-a.bin (deleted)`, and
+whether it did depended on allocation order - which is why the same claim came back green on one
+arm and red on the other in one gate.
+
+**Where the answer belongs.** Not at `unlink`. A descriptor that outlives its name still reads its
+bytes (measured, §6.71a: 256 KiB intact through 64 fillers that force block reuse), and it can only
+do that while the handle is still the current incarnation of its number. So the two events are
+separated:
+
+- **`unlink` writes the zero-link header** (`write_inode(child, &data)` before `free_inode`), which is
+  what makes `name_is_gone()` true for every door, without taking the block pointers away;
+- **`alloc_inode` bumps the incarnation** when the number comes back out of the bitmap, which is the
+  moment an old handle must stop answering - and the moment a live descriptor's bytes stop being
+  reachable, which is Linux's own rule too (its orphan list keeps the number from being recycled
+  until the last reference goes; without one, the reuse is what ends access).
+
+**The generation is the mount's memory.** `Core` gained `generations: Mutex<RefCell<BTreeMap<u32,
+u32>>>`; `handle(ino)` captures it, `Ext4Ino::data()` refuses with `ESTALE` when the number has moved
+on, and every `self.ino` read goes through that door (26 sites; the four that cannot carry an error -
+`metadata`, `mode`, `owner`, `atime`/`mtime`/`ctime`, `nlink` - answer `InodeData::EMPTY`, zeroes,
+rather than another file's numbers). `name_is_gone()` now answers **generation moved on, or the slot
+says zero links**: the first means "this handle's file lost its last name whatever the slot holds",
+which is the fact the door was always trying to ask. The inode cache is keyed by `(ino,
+generation)`, so a new incarnation never resolves to a stale handle.
+
+The on-disk `i_generation` (offset 100) is deliberately **not** used: it is ext4's checksum/rename
+cookie, written back unchanged by this driver, and it says nothing about how many times a number has
+been reused in this mount.
+
+**Pins** (host tests, in `vfs::ext4::tests`, where the fixture's `MemDev` can be driven):
+
+- `an_unlinked_file_keeps_its_bytes_while_the_number_is_its_own` - read after `unlink` still answers
+  the bytes, so `unlink` did not take the mapping away;
+- `a_recycled_inode_number_refuses_the_old_handle` - the same number is handed to a new `create`,
+  the old handle's `read_at` answers `ESTALE`, its infallible getters answer zero, and the new handle
+  is unaffected.
+
+Both would be green-on-red without the change: with `free_inode`'s immediate release the second test
+reads the new file's bytes through the old handle (that is the defect, reproduced).
+
+**Guest pins restored**: `t-maps` regained "a mapping of an unlinked file is listed", "and its name
+carries the suffix Linux prints" and "and the descriptor's own path says so too"; the host reference
+passes on Linux 7.2.11, and both arms of the gate are green.

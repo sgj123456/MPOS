@@ -251,7 +251,15 @@ impl Core {
                 found.is_some()
             });
             if let Some(ino) = found {
-                // The bitmap offered a number the volume says it does not have.
+                // A number that comes back out of the bitmap is a new
+                // incarnation: every handle made before this call belongs to
+                // whatever file held the number last, and must be refused
+                // rather than answer about this one (§6.71a). The bump belongs
+                // *here* and not in `free_inode`, because a descriptor that
+                // outlives `unlink` still reads its bytes -
+                // `docs/notes/` §6.71a measured them intact - and it can only
+                // do that while its handle is still the current incarnation.
+                self.bump_generation(ino as u32);
                 // Both words are disk data and neither is authoritative over
                 // the other, so the honest answer is that the volume is
                 // inconsistent: refuse the allocation and leave the bit set -
@@ -375,6 +383,7 @@ impl Core {
         if !self.inode_is_live(ino) {
             return;
         }
+
         self.free_blocks_of(&self.read_inode(ino));
         let g = (ino - 1) / self.sb.inodes_per_group;
         let index = (ino - 1) % self.sb.inodes_per_group;

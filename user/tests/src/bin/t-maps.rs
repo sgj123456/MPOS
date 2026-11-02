@@ -50,8 +50,9 @@
 
 use mpos_user_tests::{Report, host_run};
 use rustix::fd::AsFd;
-use rustix::fs::{MemfdFlags, fstat, ftruncate, memfd_create};
+use rustix::fs::{MemfdFlags, fstat, ftruncate, memfd_create, readlink, unlink};
 use rustix::mm::{MapFlags, MprotectFlags, ProtFlags, mmap, mmap_anonymous, mprotect, munmap};
+use std::os::fd::IntoRawFd;
 
 /// Where the name column starts, measured on Linux 7.2.7 and re-measured on
 /// this sandbox's host (`.workbuddy/probe_maps.c`).
@@ -564,6 +565,74 @@ fn main() {
         }
         Err(_) => r.check("the maps file still opens", false),
     }
+
+    // --- a mapping that outlives its name ---
+    // Linux prints ` (deleted)` in both doors once every name that reached the
+    // file is gone: the descriptor's path and the mapping's name column
+    // (`docs/notes/` §6.70). The first attempt at these two claims was red on
+    // one arm and green on the other because the answer raced with allocation
+    // order - this ext4 reused the inode number at once (§6.71a). The handle
+    // now carries an incarnation and `unlink` records `links = 0`, so the
+    // answer no longer depends on who allocated what first.
+    let gone = (|| -> Option<(usize, i32)> {
+        let path = if host_run() {
+            "/tmp/t-maps-del.bin"
+        } else {
+            "/t-maps-del.bin"
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        file.set_len(2 * 4096).ok()?;
+        let at = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                4096,
+                ProtFlags::READ,
+                MapFlags::PRIVATE,
+                file.as_fd(),
+                0,
+            )
+        }
+        .ok()? as usize;
+        let fd = file.into_raw_fd();
+        unlink(path).ok()?;
+        Some((at, fd))
+    })()
+    .unwrap_or((0, -1));
+
+    match read_maps() {
+        Ok(maps) => match line_at(&maps, gone.0) {
+            Some(line) => {
+                r.check("a mapping of an unlinked file is listed", true);
+                r.check(
+                    "and its name carries the suffix Linux prints",
+                    line.name.ends_with(b"t-maps-del.bin (deleted)"),
+                );
+            }
+            None => r.check("a mapping of an unlinked file is listed", false),
+        },
+        Err(_) => r.check("a mapping of an unlinked file is listed", false),
+    }
+
+    let link_ok = if gone.1 >= 0 {
+        let mut buf = [0u8; 256];
+        readlink(std::format!("/proc/self/fd/{}", gone.1), &mut buf)
+            .ok()
+            .map(|target| {
+                target
+                    .to_string_lossy()
+                    .ends_with("t-maps-del.bin (deleted)")
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    r.check("and the descriptor's own path says so too", link_ok);
 
     // --- a private file mapping, and the two calls that rewrite it ---
     // A `MAP_PRIVATE` mapping of a file is what `record_eager_range` exists for:

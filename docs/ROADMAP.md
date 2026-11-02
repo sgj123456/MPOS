@@ -647,10 +647,11 @@ In the order that keeps each step verifiable on its own:
 
   A mapping that outlives its name says so, as Linux's does: `Inode::name_is_gone()` now exists
   beside the ambiguous `nlink()`, and a descriptor of an unlinked file reads as `<path> (deleted)`
-  (item 184, pinned host-side). The guest-side pin taught what is really missing there, and it is
-  not an orphan list: `Ext4Ino` is `(fs, ino)` with no incarnation, so a number recycled while a
-  descriptor is open makes that descriptor answer about the new file (item 185, named gap; measured
-  that the bytes themselves survive block reuse).
+  (item 184, pinned host-side). The guest-side pin taught what was really missing there, and it was
+  not an orphan list: `Ext4Ino` was `(fs, ino)` with no incarnation, so a number recycled while a
+  descriptor was open made that descriptor answer about the new file. Fixed in item 186 - the handle
+  carries a generation, `alloc_inode` bumps it, and a stale handle answers `ESTALE` while its bytes
+  stay readable until the number is reused.
   A regular file's descriptor now keeps the path it was opened by, so its mapping's line in
   `/proc/<pid>/maps` is named as Linux's is and `/proc/self/fd/<n>` answers the path (item 183).
   Linux's ` (deleted)` suffix is a named divergence: the signal that would print it is missing, since
