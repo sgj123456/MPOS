@@ -1535,18 +1535,54 @@ pub fn exec_replace(
 
     with_table(|t| {
         let id = t.current;
+        // Linux's `de_thread`: an `exec` from any thread ends the group's other
+        // threads before the image changes. Measured on Linux 7.2.11
+        // (`build/scratch/execthr/`, kernel 7.2.14): a worker's `execv` leaves
+        // `Threads: 1`, a sibling parked in a futex never runs again, and every
+        // number the process had is unchanged - `Tgid` is still the number the
+        // group leader was born with, not the execing thread's tid.
+        //
+        // Leaving them running is what made the teardown below fatal: the old
+        // image's pages went back to the allocator while a sibling was still
+        // executing on them. Measured on the machine
+        // (`build/scratch/execthr/s.log`): the sibling died with
+        // `t-s[17]: segfault at 40715c ip 000000000040715c sp ... error 14` -
+        // error 14 is an instruction fetch, at an address inside the *old*
+        // image's `.text`, a page that had already been handed to a new owner.
+        // udevd (multi-threaded), `openrc-run.sh` and `ebegin` all fork+exec
+        // heavily and died of exactly that shape: a pointer that should have
+        // been written read back zero - `udevd[10]: segfault at 30 ip ... error
+        // 4 in /sbin/udevd`, `at 10 ... error 4 in /lib/ld-musl-x86_64.so.1`.
+        {
+            let tgid = t.task(id).tgid;
+            end_group_siblings(t, id, tgid);
+        }
         let task = t.task_mut(id);
 
+        // The group's memory is kept until its last thread is gone. A sibling
+        // ended above holds the same `Mm` (`spawn_thread` shares it) and counts
+        // itself out in its own release pass; only the thread that leaves
+        // **last** may give the frames back. Doing it unconditionally here -
+        // which is what this did - emptied a list the survivors were still
+        // running on.
+        let old_mm = task.mm.clone();
+
         // --- Tear down old address space ---
-        // Drop the old AddressSpace (frees lower-half page tables).
+        // Drop the old AddressSpace (frees lower-half page tables). Every
+        // sibling is retired now, so none of them can run on those tables
+        // again; a thread that is not its group's leader owns no space to
+        // drop, and the leader's slot hands its own over when it is freed.
         if let Some(old_space) = task.space.take() {
             drop(old_space);
         }
-        // Give every page the old image owned back. `free_frames` does the
-        // reference-count half itself, so a page a `fork` shared is only
-        // returned to the allocator by whichever process drops the last claim.
-        for frame in task.mm.take_frames() {
-            crate::mm::free_frames(frame, 0);
+        if old_mm.leave() {
+            // Give every page the old image owned back. `free_frames` does the
+            // reference-count half itself, so a page a `fork` shared is only
+            // returned to the allocator by whichever process drops the last
+            // claim.
+            for frame in old_mm.take_frames() {
+                crate::mm::free_frames(frame, 0);
+            }
         }
         // The task is about to be a *new* program: it is no longer a fork child
         // waiting to resume its parent's call, and a fresh image starts with no

@@ -8388,6 +8388,36 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 190 - an exec from a worker thread ends the group, and the frames wait for its last member (2026-11-02, landed)
+
+`execve(2)` from a worker emptied the old image's frame list without ending the siblings still
+executing on those pages. Linux ends them (`de_thread`) and keeps the **group leader's** numbers.
+Measured on 7.2.11 (`build/scratch/execthr/`): a worker's exec leaves `Tgid`/`Pid` at the leader's
+tid and `Threads: 1`; the machine's own report named the cost - `t-s[17]: segfault at 40715c ip
+000000000040715c error 14`, an instruction fetch inside the old `.text`.
+
+Landed: `exec_replace` calls `end_group_siblings` before it touches the address space, and hands the
+old space and frames back only `if old_mm.leave()`; `reap`'s census also counts a thread's slot under
+its `tgid` (Linux's `delay_group_leader`), so an exec'd process cannot name a slot no lookup opens;
+`/proc/<pid>/status`'s `Threads:` is counted from the live members of the table rather than read off
+`mm.live`, which answered 2 for a one-thread process while the ended leader's object still held the
+old `Mm`.
+
+| shape | Linux 7.2.11 | this kernel, before | now |
+|---|---|---|---|
+| `Threads:` after a worker execs | 1 | 2 | 1 |
+| `Tgid`/`Pid` after a worker execs | the leader's tid | the leader's (already right) | unchanged |
+| a sibling parked in a futex | never runs again | executes the old image's recycled pages | ended |
+| frames of the old image | freed once the last thread is gone | freed immediately | freed once the last thread is gone |
+
+Pin `user/tests/src/bin/t-exec-threads.rs` (7 claims, host reference green on Linux first; the
+environment is inherited across the exec because a first draft that handed over only `MPOS_ET_PHASE`
+also dropped `MPOS_TEST_DIR`). Counterfactual (sibling end removed, frames freed unconditionally):
+exactly `and the group has one thread afterwards` red. Recorded honestly in §6.74: the sibling
+claims stayed green in the counterfactual because the page happened not to be recycled inside the
+observation window. Gates: x86_64 `pass=254 fail=0`, aarch64 `pass=253 fail=0`, `mpos-kunit 35
+passed`. `docs/notes/06-process-management.md` §6.74.
+
 ### Item 189 - a userland fault's report names the program, as Linux's does (2026-11-02, landed)
 
 The machine printed `user #PF at 0x10 code=PageFaultErrorCode(USER_MODE) rip=…` and `PFDIAG page=0x0

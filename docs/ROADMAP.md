@@ -645,6 +645,14 @@ In the order that keeps each step verifiable on its own:
 
 ## Current Status
 
+  An exec from a worker thread ends the group, as Linux's `de_thread` does, and the old image's
+  frames wait for the last member: before, the exec emptied the frame list while a sibling was still
+  fetching instructions from those pages (`t-s[17]: segfault ... error 14`, an instruction fetch
+  inside the old `.text`) - which is also the shape udevd, `openrc-run.sh` and `ebegin` died of
+  (item 190, §6.74). `/proc/<pid>/status`'s `Threads:` is counted from the live members now, too:
+  it answered 2 for the one-thread process an exec leaves. Pinned by `t-exec-threads`, whose host
+  reference runs on Linux for seven claims, and whose counterfactual reddens the thread count while
+  saying so honestly about the sibling claim that happened to stay green.
   A userland fault's report names the program that faulted, not a task slot: `<comm>[<tid>]:
   segfault at <addr> ip <ip> sp <sp> error <word> in <module>[<off>,<base>+<len>]`, and
   `traps: <comm>[<tid>] general protection fault ...` for a trap (item 189, §6.73). The shape is

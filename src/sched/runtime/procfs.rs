@@ -309,7 +309,22 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .fs
             .cwd_path()
             .unwrap_or_else(|| alloc::string::String::from("/")),
-        threads: task.mm.live.load(core::sync::atomic::Ordering::Relaxed),
+        // Threads, counted from the table rather than read off the group's
+        // counter: the two disagree exactly when a thread has ended but its
+        // slot has not been released, and Linux counts what is alive. Measured
+        // by `t-exec-threads`: a worker's `exec` ends its siblings, the execing
+        // thread takes a fresh `Mm` whose counter says 1, and the *ended*
+        // leader's task object still holds the old one counting 2 - so reading
+        // the counter answered `Threads: 2` for a process Linux calls single.
+        // A zombie is the one case the table cannot answer (every task of the
+        // group has exited) and Linux still prints 1 for it.
+        threads: t
+            .tasks
+            .iter()
+            .flatten()
+            .filter(|sibling| sibling.tgid == task.tgid && !sibling.exited)
+            .count()
+            .max(1),
         rss_pages,
         exit_signal: task.exit_signal,
     }

@@ -2466,8 +2466,29 @@ impl Table {
         // naming a pid the shell had already buried: `there is no task 10`.
         // Its siblings took `user #PF` on the pages the freed space had owned.
         let mut named = [0u32; MAX_TASKS];
-        for task in self.tasks.iter().flatten() {
+        for (slot, task) in self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(s, t)| Some((s, t.as_ref()?)))
+        {
             named[task.mm.leader().0] += 1;
+            // A **thread's** slot is also its group's number: `getpid` answers
+            // the leader's slot from every member, so the leader cannot be
+            // freed while one is alive - Linux's `delay_group_leader`, and the
+            // half of this count that `exec` needs. An `exec` from a worker
+            // ends its siblings (`end_group_siblings`) but the process keeps
+            // the leader's number, exactly as Linux's `de_thread` does
+            // (measured: a worker's `execv` leaves `Tgid` = the leader's
+            // number, not the worker's tid); freeing that slot here would leave
+            // the surviving task naming a slot no lookup can open.
+            //
+            // A process that is its own group leader counts once, through the
+            // `mm` above - counting it twice would make every exited child
+            // unreapable.
+            if task.tgid != task.mm.leader() {
+                named[task.tgid.0] += 1;
+            }
         }
         let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64))> = alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {

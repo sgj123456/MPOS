@@ -2080,11 +2080,10 @@ fn tell_tracer_of_child(regs_ptr: *mut ()) {
 /// A process-shaped request - anything without `CLONE_THREAD` - is built here in
 /// full: the child returns from the call with 0 in `rax` on the stack the caller
 /// chose, with the tid writes and the TLS the flags name. `CLONE_THREAD` asks for
-/// a thread, and the scheduler refuses that one with `ENOSYS`: a shared address
-/// space needs reference counting this kernel's owned-by-one-task address spaces
-/// do not have, and a child that only *looks* like a thread would be worse than
-/// an honest refusal. `CLONE_VM` without `CLONE_THREAD` is the spawn shape and is
-/// honoured - see [`crate::sched::clone`].
+/// a thread and is served: the scheduler gives it the parent's `Mm` (a counted
+/// share of one address space, `spawn_thread`), which is the reference counting
+/// this comment used to say was missing. `CLONE_VM` without `CLONE_THREAD` is the
+/// spawn shape - see [`crate::sched::clone`].
 #[allow(clippy::too_many_lines)]
 pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     handle_clone_impl(args, regs_ptr)

@@ -4815,3 +4815,103 @@ read, not present (4)`, `and the error column says user, write, not present (6)`
 ### Gates
 
 x86_64 `verdict pass=253 fail=0`; aarch64 `verdict pass=252 fail=0`, `mpos-kunit 35 passed`.
+
+## §6.74 An `exec` from a worker thread ends the group - MEASUREMENT + FIX
+
+`execve(2)` from a worker ends every other thread of the process on Linux, and the group keeps the
+number its **leader** was born with. This kernel ended nothing: it emptied the old image's frame
+list out from under the threads still running on it, which is a page handed to a new owner while
+somebody is still fetching instructions from it.
+
+### The measured crash (`build/scratch/execthr/s.img`, kernel `89e1fa7`)
+
+Probe `s.c` (`musl-gcc -O1 -static -pthread`): the leader forks once, the child starts a sibling that
+fills a private page and reports over the inherited fd 1, and a worker that `execve`s `/bin/sh`. The
+child's output:
+
+```
+P0 start
+P1 sibling ready, execing now
+SSSSSSSSSSSSEXECED
+Tgid:	17
+Pid:	17
+Threads:	1
+DONE-SLEEP
+rc=7
+```
+
+and the machine's own serial, now that §6.73 names the program:
+
+```
+t-s[17]: segfault at 40715c ip 000000000040715c sp 00007e3a891b3e00 error 14
+```
+
+`error 14` is an instruction fetch. The address is inside the **old** image's `.text`, so the sibling
+was not "still running" in any useful sense - it was executing a page that had gone back to the
+allocator and been handed to somebody else. The same shape is what udevd, `openrc-run.sh` and
+`ebegin` died of: two different programs reading a pointer that should have been written and finding
+zero (`udevd[10]: segfault at 30 … error 4 in /sbin/udevd`, `at 10 … error 4 in
+/lib/ld-musl-x86_64.so.1`), which is what a recycled-and-zeroed page looks like from the inside.
+
+### Linux's identity rule (7.2.11 / 7.2.14, `build/scratch/execthr/`)
+
+- `id.c`: main tid 72987, a **worker** execs → `sh` reports `own pid=72987`, `Tgid 72987`, `Pid
+  72987`. The numbers are the leader's.
+- `tid.c`, three runs: main tid 73156 / worker 73157 execs → `Tgid: 73156`, `Pid: 73156`, `Threads:
+  1`. Never the worker's tid, and never two.
+- `y.c`/`z.c`: a sibling parked in a futex when the exec lands never runs again (`MAIN-SURVIVED`
+  never printed), and `h.c` shows a sibling's append counter stops at the exec (19 → 19).
+
+### The fix
+
+1. `src/sched/runtime/child_exit.rs`'s `exec_replace` now runs `end_group_siblings(t, id, tgid)`
+   **before** touching the address space, then hands the old space and the old frames back only
+   `if old_mm.leave()` - the last thread out. A sibling ended here never runs its own exit path,
+   which is why the "only the last one frees" rule is enforced at the counter rather than at each
+   sibling's exit.
+2. `src/sched/runtime/task.rs`'s `reap` census now counts a thread's slot under its `tgid` as well
+   as under `mm.leader()`: a thread's slot *is* its group's number, so the leader's slot cannot be
+   freed while a member still lives (Linux's `delay_group_leader`). Without it an exec'd process
+   named a slot no lookup could open.
+3. `src/sched/runtime/procfs.rs`'s `snapshot_of` counts `Threads:` from the **table** (live members
+   of the group, floor 1) instead of reading `mm.live`. Counterfactual evidence that this is not
+   cosmetic: with the sibling ending fixed but the counter still read, `/proc/self/status` said
+   `Threads: 2` for the single-threaded process the exec left, because the ended leader's task
+   object still held the old `Mm`. Linux counts what is alive.
+
+### The pin: `user/tests/src/bin/t-exec-threads.rs`
+
+A phase-2 re-exec of `/proc/self/exe` (the environment is inherited and `MPOS_ET_PHASE=2` is added,
+because a first draft that handed over only that one word also dropped `MPOS_TEST_DIR` and the host
+reference run could not find its own output file). Claims, all green on Linux 7.2.11 first:
+
+- a worker thread's `exec` ran the new image;
+- and the group has one thread afterwards, as Linux's `de_thread` leaves it;
+- and the group kept the number its leader had, not the execing thread's;
+- the sibling was running before the exec (its beat file was growing);
+- and the exec ended it, as Linux's `de_thread` does (the file stops growing);
+- and it was not left running on a recycled page (no `CORRUPT` in that file);
+- and no fault was filed against the sibling the exec ended (from `syslog(2)`, when readable).
+
+### Counterfactual
+
+With `end_group_siblings` removed from the exec path and the frames handed back unconditionally
+(`if !true || old_mm.leave()`), `cargo xtask test --arch x86_64` answers `FAIL: and the group has one
+thread afterwards` - and **only** that claim. The sibling claims stayed green, which is worth
+recording rather than hiding: this kernel's allocator handed that page back without anyone touching
+it in the observation window, so "the sibling died quietly" is a claim the pin makes only about the
+runs where recycling actually happens. The claim that fails deterministically is the thread count,
+which is why the counterfactual is quoted against that one.
+
+### Gates
+
+- x86_64: `verdict pass=254 fail=0` (`build/scratch/gate-execthr-x3.log`), kunit 35.
+- aarch64: `verdict pass=253 fail=0` (`build/scratch/gate-execthr-a1.log`), kunit 35.
+- `cargo fmt --all -- --check` clean, `cargo xtask depgraph` within the ratchet, `cargo test -p
+  mpos-xtask` 146, host lib 726.
+
+### Also fixed in passing
+
+`src/syscall/linux/proc.rs`'s `clone` doc comment still claimed `CLONE_THREAD` was refused with
+`ENOSYS` and that these address spaces are "owned by one task". Threads have been served for
+several rounds (`spawn_thread` shares the parent's `Mm`); the comment was wrong about its own code.
