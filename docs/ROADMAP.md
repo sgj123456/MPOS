@@ -671,6 +671,12 @@ In the order that keeps each step verifiable on its own:
   file mapping, whose bytes come from the filesystem rather than from the card whose lock a DRM
   ioctl already holds - and populates it *before* the caller's copy, because that copy runs inside
   the filesystem's own borrow (item 188, §10.15a).
+  That refusal was the display wall, not only a mmap bug: on kernel `3f6bd02` weston 16's DRM backend
+  reports `EGL version: 1.5`, `GL renderer: virgl (AMD Radeon 780M ...)`, `Using GL renderer` and
+  `Output 'Virtual-1' enabled`, then paints - the serial shows it scanning out two alternating
+  resources. Before the fix the same boot ended at `EGL error state: EGL_NOT_INITIALIZED (0x3001)`.
+  Card-node EGL was never a DRM door refusing it and never Mesa's loader choice; it was a syscall
+  reading an untouched page of a private file mapping (§7.4g).
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  

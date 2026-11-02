@@ -7856,3 +7856,36 @@ Flakes seen on the way and green on re-run: `t-ptrace-attach` (x86_64) and `t-se
 both documented families. The pin runs on **both** machines because every sweep lane attaches a
 `virtio-gpu` device (`xtask/src/qemu.rs`), which is also why it is a `t-*` program rather than the
 host-only decode test this item originally proposed.
+
+## §7.4g The EGL wall was the mapping one: card-node `eglInitialize` works once a syscall may read an untouched page — MEASUREMENT
+
+§7.4e recorded that `eglInitialize` on `/dev/dri/card0` answered `EGL_NOT_INITIALIZED (0x3001)`
+while the same call on `/dev/dri/renderD128` succeeded, and left the reason open. It was not a DRM
+door and not Mesa's loader choice: it was item 188 (`docs/notes/10-performance.md` §10.15a), the
+private file mapping whose untouched pages answered `EFAULT` to a syscall.
+
+Two independent clients failed there and both now get past it. On kernel `3f6bd02`, a boot of the
+normal image with `-device virtio-gpu-gl-pci -vga none -display egl-headless,gl=on`:
+
+**weston 16.0.0, `--backend=drm`,** in the same boot that failed before the fix:
+```
+[09:12:14.019] Loading module '/usr/lib/libweston-16/gl-renderer.so'
+[09:12:14.086] EGL version: 1.5
+[09:12:14.087] EGL vendor: Mesa Project
+[09:12:14.137] GL renderer: virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...)
+[09:12:14.657] Using GL renderer
+[09:12:14.724] Chosen EGL config details: id:  61 rgba: 8 8 8 0 buf: 24 ... XRGB8888
+[09:12:14.731] Output 'Virtual-1' enabled with head(s) Virtual-1
+```
+and it then reaches its main loop and paints: the serial shows `virtio-gpu: scanning out the
+compositor's resource` alternating between two resources (7 and 14, i.e. a real double buffer), and
+`weston:disk$0` threads parked in `block_until_nanos`/`block_until_on` where a wedged compositor
+would have shown a single spin.
+
+Before the fix the same script ended at `EGL error state: EGL_NOT_INITIALIZED (0x3001)` /
+`failed to initialize egl` / `fatal: failed to create compositor backend`.
+
+**What is still open on this machine** (measured, not inferred): weston does not leave its main loop
+when a client asks - `kill -TERM` at 25 s logs `caught signal 15` and the process stays in
+`park 1 (block_until_on)`. So §7.4's scan-out row is past the EGL wall and the next defect is the
+compositor's own shutdown path, which is a separate round.
