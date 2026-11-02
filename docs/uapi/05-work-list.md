@@ -8643,3 +8643,25 @@ not a contract (the first `t-maps` attempt was partly green, partly red, and dif
 remainder: an ext4 orphan list (§6.71).
 
 Gates: x86_64 `pass=252`, aarch64 `pass=251`, host lib 724, depgraph within the ratchet, fmt clean.
+
+## 185. `Ext4Ino` has no incarnation — a live handle answers about a recycled inode (2026-11-02, named gap)
+
+Found while trying to pin item 184 on the guest, and it is why that pin could not be written.
+
+**Measured** (`build/scratch/orph2/orph.c`, guest on `5a8fb24` and the host's ext4): after `unlink`
+of a file whose descriptor stays open, the bytes are **INTACT** even after 64 same-size fillers force
+block reuse (`first_mismatch=-1`), because the open description reads through the handle it was
+opened with and the block pointers are still the numbers it wrote. So the orphan list is not what is
+missing for data.
+
+**What is missing**: the inode number goes straight back into the bitmap, so the next `create` of the
+same name gets it, and `Ext4Ino` is `(fs, ino)` — nothing else. `/proc/self/fd/<n>` then reads
+`/t-a.bin` rather than `/t-a.bin (deleted)`, because `name_is_gone()` asks the slot and the slot is
+somebody else's now. Whether it happens depends on allocation order: the same claim was green on one
+arm and red on the other in one gate.
+
+**Prerequisite**: an incarnation in the handle (the `InodeData` it was created with, or a generation
+number checked at `read_inode`) so every method answers about the file it was opened as, and refuses
+once the number belongs to a newer one. An ext4 orphan list keeps the number from being recycled
+while a description is open and is one way to close the unlinked case; it does not help a handle that
+outlives a `rename` over its name.

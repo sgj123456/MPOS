@@ -4630,3 +4630,47 @@ Two further facts from the guest probe (`build/scratch/orphan/aa-orphan.start`, 
 before this change): reading an unlinked-but-open ext4 file **still answers its bytes** ("hello
 world" after `unlink`), so the missing orphan list does not lose data today; and that kernel printed
 the descriptor as `anon:[12939]`, which is the pre-§6.69 behaviour the label work replaced.
+
+#### 6.71a The orphan list is not what is missing — the next open of the same name is
+
+The plan this section ended with was an ext4 orphan list (Linux's answer: keep an unlinked-but-open
+inode's table entry and its blocks until the last reference goes). Two measurements say that plan
+addresses the wrong thing, and both were made before anything was written.
+
+**1. The bytes survive today, even after the space is reused.** `build/scratch/orph2/orph.c` writes
+256 KiB with a known pattern, `unlink`s the file while keeping the descriptor open, then creates 64
+fillers of the same size to force block reuse, and reads the descriptor back. On this kernel (built
+from `5a8fb24`, run in the guest as `/t-orph` through a `musl-gcc -static` binary) and on the host's
+ext4: `fillers=64 read=262144 first_mismatch=-1` — **INTACT**. The bytes are not lost, because
+`ext4::unlink` frees an inode's *blocks* and its table entry, but the open description never asks for
+them again: it reads through the same `Inode` handle it was opened with, and that handle's block
+pointers are still the numbers the file was written at.
+
+**2. What is actually wrong is the next caller's answer about a *different, new* file.** Because the
+inode number goes straight back into the inode bitmap, the next `create` of the same name gets the
+same number. The open description's `Inode` handle is a `(fs, ino)` pair, so it answers with whatever
+the slot holds now. Two doors show it:
+
+- `/proc/self/fd/<n>`: after `unlink`, the link reads `/t-a.bin` — not `/t-a.bin (deleted)`, because
+  `name_is_gone()` asks the slot, and the slot no longer says zero. A pin asserted that and was red
+  on both arms in the same run where the mapping's suffix claim was green on x86_64 and red on
+  aarch64: the answer depends on whether a filler happened to land on the number first, which is a
+  race, not a contract.
+- The mapping's name column has the same exposure for the same reason.
+
+So the honest order is: **an `Inode` handle cannot be `(fs, ino)` alone if the number can be
+recycled while a handle is alive.** Linux's identity for that is the inode's incarnation — the table
+entry stays allocated (orphan list) or the handle carries what it read — and here `Ext4Ino` carries
+nothing, so every question it answers after a recycle is a question about somebody else's file.
+
+That is a change to `Ext4Ino`'s identity, not to `unlink`: it needs the handle to keep the
+`InodeData` it was created with (or a generation/incarnation number checked on every read, which is
+the same idea with more device traffic) and every method to answer from that, refusing once the
+filesystem says the number belongs to a newer incarnation. `read_inode` already goes through one
+door, so the check has one place to live.
+
+Named remainder, and the next item: **`Ext4Ino` has no incarnation — a recycled inode number makes a
+live handle answer about the new file.** The orphan list makes the rename smaller (it keeps the
+number from being recycled at all while the description is open, which is Linux's cheaper answer),
+but the identity hole is the defect; the orphan list is one way to hide it for the unlinked case and
+does not help a handle that outlives `rename` over its name either.
