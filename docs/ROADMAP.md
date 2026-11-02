@@ -664,6 +664,13 @@ In the order that keeps each step verifiable on its own:
   (`insert_present`'s clipping fixed a second defect on the same path; item 182).
   `t-maps` now also pins the maps offset column as the byte offset Linux prints, with the
   memfd's own inode beside it (item 181).
+  The fault path item 177 introduced left its admission rule behind: a syscall reading a page of a
+  private file mapping the process had not touched yet answered `EFAULT` where Linux faults it in,
+  which is what made both compositors die far from the call that was refused. `MappedObject` now
+  answers whether the kernel may populate a page on the caller's behalf - `true` only for a private
+  file mapping, whose bytes come from the filesystem rather than from the card whose lock a DRM
+  ioctl already holds - and populates it *before* the caller's copy, because that copy runs inside
+  the filesystem's own borrow (item 188, §10.15a).
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  

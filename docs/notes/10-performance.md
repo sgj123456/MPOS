@@ -1786,3 +1786,67 @@ so the claim is "the pages read are resident" and "fewer than half the mapping i
 write leaves the file's byte alone, and a mapping longer than the file reads zeros past its end.
 The eager copy fails the first and the third of those - which is what makes it a counterfactual
 rather than a timing comparison.
+
+## §10.15a A syscall may read a page of a private file mapping it has not touched — item 188
+
+§10.15's fault path was right and its *admission rule* was left behind. `4930158` turned a private
+mapping of an ordinary file into a faulting one, but `kernel_lazy_accessible` — the question
+`buffer_ok` asks before a syscall does a raw copy into or out of a caller's buffer — still admitted
+only `VmaKind::Anon`. So a page of such a mapping that the process had not touched yet answered
+**`EFAULT`**, where Linux's `copy_from_user` faults it in exactly as a ring-3 load does.
+
+Measured on the guest (kernel `9a0e0e6`, probe `build/scratch/egl/cold.c` -> `/t-cold`, image
+`build/scratch/egl/n3.img`; the probe creates its own 8 MiB file, maps it `PROT_READ MAP_PRIVATE`,
+never touches the page it then hands to `write(2)`):
+
+```
+file /tmp/coldprobe.bin size=8388608 mapped at 0x7e3a87701000 (no page of it touched)
+write(4 bytes from an untouched page at +4194304) = -1 errno=14
+direct read of the same page = 90
+write again = 4 errno=0
+```
+
+Linux 7.2.11, the same program: `= 4 errno=0`. The second write succeeding is the tell: the page was
+legal all along, the first call simply refused to bring it in.
+
+This is what broke both compositors. weston and niri hand EGL/GBM buffers of their own mapped
+objects to syscalls before touching every byte, and the failure surfaces far away from the call
+that was refused (§7.4e's `eglInitialize` on the card node answering `EGL_NOT_INITIALIZED`
+is that far-away symptom, not a Mesa loader choice).
+
+The fix is the one word the object itself should have been saying: `MappedObject::lazy_populatable`
+(`src/mm/vma.rs`, default `false`), `FilePages` answering `true`, and `kernel_lazy_accessible`
+asking the object for a `VmaKind::Frames` page instead of refusing every frame-backed one. The
+default stays `false` for a reason that is a lock order, not a policy: a dumb buffer, a dma-buf, the
+framebuffer and a shared memfd are populated by calling into the node that owns them, and the DRM
+ioctl path validates a caller's array **while holding the card's lock** — a page that needed the
+card to answer a fault would be a lock taken twice. A private file mapping is read from the
+filesystem, which no syscall holds a lock across, which is why it is the one object allowed here.
+
+Pin: `t-mmap-file-lazy` gained three claims — the page handed to `write(2)` is not resident
+(`mincore`), the call returns the byte count, and the kernel faulted that page in to do it. Host
+reference green on 7.2.11 with `MPOS_TEST_DIR` naming the directory (`/tmp` there is tmpfs, whose
+fault-around window made the "not resident yet" claim false — the reference run needs a real
+file-backed directory, so the program takes one from the environment rather than assuming).
+
+### The second half: the page is brought in *before* the copy, not under the filesystem's borrow
+
+The admission rule above is necessary and not sufficient, and the aarch64 sweep is what said so:
+`t-mmap-file-lazy` did not answer `EFAULT` there, it panicked —
+
+```
+KERNEL PANIC: panicked at src/vfs/ext4/mod.rs:558:55:
+RefCell already borrowed
+```
+
+The copy that follows `buffer_ok` runs **inside the filesystem's own borrows**: `ext4`'s
+`write_at`/`read_at` hold the block cache's `RefCell` across the transfer (`ensure_block`'s
+`critical_section` borrow is live when the device is asked for the block). A page whose populate
+re-enters `ext4` therefore meets the borrow it is already holding. `EFAULT` was the gentler face of
+the same defect — aarch64 answered it lazily where x86_64's cache happened to be warm.
+
+So `kernel_lazy_accessible` now *does* the work rather than granting permission for someone else to
+fault: it reads the VMA under one `with_table`, drops that borrow, and for a page whose object says
+`lazy_populatable` calls `populate_user_page_at` — `populate_in` with the table taken again — before
+the caller's copy starts. Anonymous pages are left to the copy's own fault (a frame, no filesystem),
+which is the state they were in before this item and costs the fast path nothing.

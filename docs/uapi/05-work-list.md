@@ -8388,6 +8388,53 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 188 - a syscall may read a page of a private file mapping that has not been touched (2026-11-02, landed)
+
+A regression from item 177, found by the user's `git bisect` (`4930158` is the first bad commit)
+and pinned down with a probe rather than by reading.
+
+`4930158` turned a private mapping of an ordinary file into a faulting one, but the question
+`buffer_ok` asks before a syscall copies into or out of a caller's buffer -
+`kernel_lazy_accessible` - still admitted only `VmaKind::Anon`. A page of such a mapping that the
+process had not touched therefore answered `EFAULT` where Linux faults it in.
+
+Measured on the guest (kernel `9a0e0e6`, probe `build/scratch/egl/cold.c`, which creates its own
+8 MiB file and never touches the page it hands to `write(2)`):
+
+```
+write(4 bytes from an untouched page at +4194304) = -1 errno=14
+direct read of the same page = 90
+write again = 4 errno=0
+```
+
+Linux 7.2.11, same program: `= 4 errno=0`. Both compositors hit it: weston and niri hand buffers of
+their own mapped objects to syscalls before touching every byte, and the symptom surfaced far away -
+`eglInitialize` on the card node answering `EGL_NOT_INITIALIZED` (§7.4e), which read like a Mesa
+loader choice until this.
+
+Fix: `MappedObject::lazy_populatable` (`src/mm/vma.rs`, default `false`), `FilePages` answering
+`true`, and `kernel_lazy_accessible` asking the object instead of refusing every frame-backed page.
+The default stays `false` for a lock-order reason: populating a dumb buffer / dma-buf / framebuffer /
+shared memfd calls into the node that owns it, and the DRM ioctl path validates a caller's array
+**while holding the card's lock**. A private file mapping is read from the filesystem, which no
+syscall holds a lock across.
+
+It took two rounds to be right, and the aarch64 sweep is what found the second half: admitting the
+page is not enough, because the copy that follows runs *inside* the filesystem's borrow (`ext4` holds
+its cache's `RefCell` across the transfer). A lazily-answered fault there re-enters `ext4` and the
+machine panics - measured: `KERNEL PANIC: RefCell already borrowed` at `src/vfs/ext4/mod.rs:558`.
+So `kernel_lazy_accessible` populates the page **itself**, before the caller's copy and outside every
+borrow, rather than granting permission for a fault that will arrive under one.
+
+Pin: three claims in `t-mmap-file-lazy` (the page is not resident per `mincore`, the `write(2)`
+returns its byte count, and the fault happened). Counterfactual (`FilePages::lazy_populatable` back
+to `false`): exactly `FAIL: a syscall may read a page this process has not touched`, rest green.
+Recorded in `docs/notes/10-performance.md` §10.15a.
+
+The pin's paths are host-aware: the reference run on 7.2.11 needs a file-backed directory
+(`MPOS_TEST_DIR`), because `/tmp` is tmpfs and its fault-around window makes the "not resident yet"
+claim false - the program takes the directory from the environment rather than assuming.
+
 ### Item 187 - an empty atomic commit is served, and `reserved` is checked (2026-11-02, landed)
 
 Found by writing a pin, not by reading: `t-drm-props` had no atomic-commit claim at all, and the

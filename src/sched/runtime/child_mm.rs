@@ -381,27 +381,58 @@ pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
 /// touch, because a VMA backs it and the access is permitted.
 ///
 /// `buffer_ok` asks this before a syscall does a raw copy, so a range the
-/// process has legally mapped but not touched is not refused as `EFAULT`. The
-/// answer is restricted to anonymous ranges on purpose: populating one costs
-/// nothing but a frame, while populating a frame-backed page calls into the
-/// node that owns it - and the DRM ioctl path validates a caller's array
-/// *while holding the card's lock*, then writes through it, so a page that
-/// needed the card to answer a fault would be a lock taken twice. A
-/// frame-backed page must be present before the kernel will look at it, which
-/// is the rule the eager mapping this replaces enforced by never leaving one
-/// absent.
+/// process has legally mapped but not touched is not refused as `EFAULT`.
+///
+/// Three answers, and the difference between the last two is where the page is
+/// brought in rather than whether:
+///
+/// - **anonymous**: admitted, and nothing is done here. Populating it costs a
+///   frame and touches no filesystem, so the copy's own fault can answer it.
+/// - **a frame-backed object that says `lazy_populatable`** (a private mapping
+///   of a file, and nothing else): the page is brought in **now**, before the
+///   caller takes any lock. This is the load-bearing case. The copy that follows
+///   runs *inside* the filesystem's own borrows - `ext4`'s `write_at` holds its
+///   cache's `RefCell` across the transfer - so a fault answered lazily under
+///   that borrow re-enters `ext4` and dies of `RefCell already borrowed`
+///   (measured on aarch64: `src/vfs/ext4/mod.rs:558`, `t-mmap-file-lazy`).
+///   Before this rule the kernel answered `EFAULT` instead of dying, which is
+///   the gentler half of the same defect (`docs/notes/` §10.15a).
+/// - **anything else**: refused. Populating those calls into the node that owns
+///   the object, and the DRM ioctl path validates a caller's array while
+///   holding the card's lock, so a page that needed the card to answer a fault
+///   would be a lock taken twice.
 pub fn kernel_lazy_accessible(virt: usize, write: bool) -> bool {
+    /// What the VMA table says about this page, decided under the borrow the
+    /// populate below must not be inside.
+    enum Admission {
+        No,
+        Already,
+        Populate,
+    }
     let root = hal::active_root();
-    with_table(|t| {
+    let page = pframe::align_down(virt, PAGE_SIZE);
+    let admission = with_table(|t| {
         let Some(owner) = owner_of_root(t, root) else {
-            return false;
+            return Admission::No;
         };
         let owner = t.space_owner(owner);
-        match t.task(owner).mm.vma_at(pframe::align_down(virt, PAGE_SIZE)) {
-            Some(vma) => matches!(&vma.kind, VmaKind::Anon) && vma.permits(write),
-            None => false,
+        match t.task(owner).mm.vma_at(page) {
+            Some(vma) if !vma.permits(write) => Admission::No,
+            Some(vma) => match &vma.kind {
+                VmaKind::Anon => Admission::Already,
+                VmaKind::Frames { object, .. } if object.lazy_populatable() => Admission::Populate,
+                VmaKind::Frames { .. } => Admission::No,
+            },
+            None => Admission::No,
         }
-    })
+    });
+    match admission {
+        Admission::No => false,
+        Admission::Already => true,
+        // The borrow above is dead before this runs, which is the whole point:
+        // `populate_user_page_at` takes the table again and reads the file.
+        Admission::Populate => populate_user_page_at(root, page, write),
+    }
 }
 
 /// Whether `page` is present in the address space `root` names.
@@ -545,6 +576,13 @@ impl crate::mm::vma::MappedObject for FilePages {
 
     fn name_is_gone(&self) -> bool {
         self.inode.name_is_gone()
+    }
+
+    /// A private file mapping's pages come from the filesystem, so a syscall
+    /// validating a buffer may bring one in - which is what keeps `write(2)`
+    /// on a page this process has not touched yet from answering `EFAULT`.
+    fn lazy_populatable(&self) -> bool {
+        true
     }
 }
 

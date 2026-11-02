@@ -97,6 +97,26 @@ pub trait MappedObject {
     fn same_as(&self, other: &dyn MappedObject) -> bool {
         self.identity() == other.identity()
     }
+
+    /// Whether the kernel may bring one of this object's pages in *on the
+    /// caller's behalf*, while a syscall validates a buffer.
+    ///
+    /// Default `false`, and the default is the load-bearing half: populating a
+    /// frame-backed page calls into the node that owns the object, and the DRM
+    /// ioctl path validates a caller's array **while holding the card's lock**,
+    /// so a page that needed the card to answer a fault would be a lock taken
+    /// twice. A dumb buffer, a dma-buf, the framebuffer and a shared memfd
+    /// therefore stay `false`.
+    ///
+    /// A private mapping of a file is the one object that says `true`, because
+    /// populating it reads the *filesystem* - which no syscall holds a lock
+    /// across - and because a page of such a mapping is not something the
+    /// process has failed to touch: Linux's `copy_to_user` faults it in exactly
+    /// as a ring-3 access does, so refusing it here would answer `EFAULT` for
+    /// memory the caller legally mapped (`docs/notes/` §10.15a, item 188).
+    fn lazy_populatable(&self) -> bool {
+        false
+    }
 }
 
 /// What is behind a range's pages.

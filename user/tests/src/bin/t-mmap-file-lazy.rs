@@ -16,14 +16,33 @@
 //! The file is one this program creates itself, so the test does not depend on
 //! what an image happens to ship.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, host_run};
 
 const PAGE: usize = 4096;
 /// 512 pages: large enough that an eager copy is unmistakable in `mincore`,
 /// small enough to write in one pass on the slowest lane.
 const PAGES: usize = 512;
 const BYTES: usize = PAGES * PAGE;
-const PATH: &str = "/t-mmap-file-lazy.bin";
+/// The guest's root is writable; the host reference run has no `/`, so it
+/// uses `/tmp`. Both spell the same claims.
+fn path() -> std::ffi::CString {
+    if host_run() {
+        let dir = std::env::var("MPOS_TEST_DIR").unwrap_or_else(|_| "/tmp".into());
+        std::ffi::CString::new(format!("{dir}/t-mmap-file-lazy.bin")).unwrap()
+    } else {
+        c"/t-mmap-file-lazy.bin".into()
+    }
+}
+
+/// The file the syscall-buffer claim writes into.
+fn out_path() -> std::ffi::CString {
+    if host_run() {
+        let dir = std::env::var("MPOS_TEST_DIR").unwrap_or_else(|_| "/tmp".into());
+        std::ffi::CString::new(format!("{dir}/t-mmap-file-lazy.out")).unwrap()
+    } else {
+        c"/t-mmap-file-lazy.out".into()
+    }
+}
 const FILL: u8 = 0x5a;
 
 /// A page's bytes say which page they are, so a wrong page is visible.
@@ -38,7 +57,7 @@ fn main() {
     // --- the file, written and read back before anything is mapped ---
     let fd = unsafe {
         libc::open(
-            c"/t-mmap-file-lazy.bin".as_ptr(),
+            path().as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
             0o644,
         )
@@ -147,6 +166,41 @@ fn main() {
         got == 1 && back[0] == page_byte(3),
     );
 
+    // --- a syscall reading an untouched page is served, not refused ---
+    //
+    // The page is one this process has never touched (`mincore` says so), and
+    // it is handed to `write(2)` as the *source* buffer. Linux's `copy_from_user`
+    // faults such a page in exactly as a ring-3 load does, so the call returns
+    // the byte count; a kernel that only admits pages that are already present
+    // answers `EFAULT` for memory the caller legally mapped
+    // (`docs/notes/` §10.15a, item 188 - measured on 7.2.11 with this program).
+    let last = PAGES - 1;
+    let probe = base + last * PAGE;
+    let vec3 = vec![0u8; PAGES];
+    let mc = unsafe { libc::mincore(base as *mut _, BYTES, vec3.as_ptr() as *mut u8) };
+    r.check("mincore before the syscall answers 0", mc == 0);
+    r.check(
+        "the page handed to the syscall is not resident yet",
+        vec3[last] & 1 == 0,
+    );
+    let out = unsafe { libc::open(out_path().as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+    r.check("a second file to write into is open", out >= 0);
+    if out >= 0 {
+        let n = unsafe { libc::pwrite(out, probe as *const _, 4, 0) };
+        r.check(
+            "a syscall may read a page this process has not touched",
+            n == 4,
+        );
+        let mut vec4 = vec![0u8; PAGES];
+        let mc = unsafe { libc::mincore(base as *mut _, BYTES, vec4.as_mut_ptr() as *mut u8) };
+        r.check(
+            "and the kernel faulted that page in to do it",
+            mc == 0 && vec4[last] & 1 != 0,
+        );
+        unsafe { libc::close(out) };
+        unsafe { libc::unlink(out_path().as_ptr()) };
+    }
+
     // --- past the end of the file: zeros, as a short read leaves them ---
     let tail = unsafe {
         libc::mmap(
@@ -170,7 +224,6 @@ fn main() {
 
     unsafe { libc::munmap(map, BYTES) };
     unsafe { libc::close(fd) };
-    unsafe { libc::unlink(c"/t-mmap-file-lazy.bin".as_ptr()) };
-    let _ = PATH;
+    unsafe { libc::unlink(path().as_ptr()) };
     r.finish();
 }
