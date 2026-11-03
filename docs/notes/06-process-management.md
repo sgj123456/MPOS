@@ -5127,3 +5127,24 @@ the diagnostic could not read the target's name from the slot it printed (the fi
 instrument is therefore narrower: print, inside `block_until_nanos`'s loop, the pending-but-not-blocked
 set of the task for every pass (once per task), and print whether `t.sched.wake(id)` found the target in
 its sleep queue - one boot then says whether the wake found a task to requeue at all.
+
+Two further readings, one of them a defect in the instrument itself:
+
+```
+mpos-dbg: dispatch sig=9 tid=18 sleeping_before=0 sleeping_after=0 pending=0x100
+mpos-dbg: nanos tid=17 pending=0x0 blocked=0x0
+mpos-dbg: nanos tid=18 pending=0x0 blocked=0x0
+mpos-dbg: nanos tid=19 pending=0x0 blocked=0x0
+```
+
+- `pending=0x100` is bit 8, signal 9: the SIGKILL **is** in the target's pending set. `sleeping_before=0`
+  is not a lost wake - the sender and the target are the same task, which is *running* inside its own
+  `kill(2)`, so there is nothing to requeue.
+- The `nanos` lines are the first `block_until_nanos` pass of each of the probe's tasks, and they are the
+  **pre-kill** passes (`pending=0x0`): the second child, the one that kills itself, never printed, so it
+  never reached a park that the instrument could see.
+- `comm=` was empty on every delivery line, which is the instrument's own bug
+  (`task.mm.comm_name_bytes()` is not the running task's `comm`), and that is also why the `t-fx` gate
+  silenced the second child's prints: a gate that reads an empty name matches nothing. The next
+  instrument gates on the task id, not on a name, and prints **every** pass whose pending set is not
+  empty.
