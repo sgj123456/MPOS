@@ -122,7 +122,16 @@ enum SerialSink {
 /// to be the console, so its wire stays on the launcher's terminal in every mode
 /// (`machine.toml`'s `[aarch64]` names no window backend at all, and the PL011
 /// session is what a person watches).
-fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
+///
+/// `card` is the device the *machine* attaches, and it is a parameter rather
+/// than `config.gpu` because on the second machine those are two different
+/// words: `virt_machine_args` attaches a fixed `virtio-gpu-device` (its
+/// transport is how that machine finds the card at all, not a choice), while
+/// `config.gpu` is inherited from `[default]` and names the first machine's GL
+/// card. Deriving the display backend from `config.gpu` on a machine that never
+/// attached that card asked QEMU for a host GL context nothing needed - and
+/// `egl-headless,gl=on` with no render node is a lane that never starts at all.
+fn wiring(console: &Console, config: &QemuConfig, card: &str, build_dir: &Path) -> Wiring {
     // A missing `display` is `sdl` for a mode that wants a window - the
     // interactive default - and `none` for a boot that renders nowhere.
     let configured = config.display.clone().unwrap_or_else(|| "sdl".to_string());
@@ -133,9 +142,9 @@ fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
             // card refuses `none` outright, so a `terminal` boot of one has to
             // name the headless GL backend instead.
             let display = if mode.has_window() {
-                gl_for_card(&configured, &config.gpu)
+                gl_for_card(&configured, card)
             } else {
-                windowless_display(&config.gpu)
+                windowless_display(card)
             };
             let window_shows_the_console = *mode == RunMode::Gui && display != "none";
             let serial = if window_shows_the_console {
@@ -154,7 +163,7 @@ fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
             Wiring { display, serial }
         }
         Console::File(log) => Wiring {
-            display: windowless_display(&config.gpu),
+            display: windowless_display(card),
             serial: SerialSink::File(PathBuf::from(log)),
         },
     }
@@ -428,6 +437,9 @@ pub fn machine_args(
     let wiring = wiring(
         console,
         config,
+        // This machine attaches the card `machine.toml` names, so that *is* the
+        // card the display backend has to answer for.
+        &config.gpu,
         share_dir
             .parent()
             .expect("the share lives under the build directory"),
@@ -683,6 +695,20 @@ pub fn find_firmware(arch: Arch) -> Result<Firmware> {
     )
 }
 
+/// The card the second machine attaches, named once because two things have to
+/// agree about it: the `-device` line below, and the display wiring that asks
+/// QEMU for a GL context exactly when this card needs one.
+///
+/// It is *not* `machine.toml`'s `qemu.gpu`. That key is the first machine's
+/// choice of card; here the transport decides, and it has to be the MMIO form
+/// this machine's virtio probe finds by walking its own device tree. The
+/// distinction became visible as a bug: `wiring` used to derive the display
+/// backend from `config.gpu`, which on this machine inherited `[default]`'s
+/// `virtio-gpu-gl-pci`, so every headless aarch64 boot asked the host for a GL
+/// render node it had attached no card to use - `egl-headless,gl=on` and
+/// `egl: no drm render node available`, a lane that never starts.
+pub const AARCH64_CARD: &str = "virtio-gpu-device";
+
 /// The `qemu-system-aarch64` command line, as data.
 ///
 /// Here rather than beside the commands that boot it, for the same reason
@@ -880,7 +906,7 @@ pub fn virt_machine_args(
         // monitor and the driver builds its headless fallback shape; the scanout
         // is set either way, which is what `/dev/fb0` reads.
         "-device".into(),
-        "virtio-gpu-device".into(),
+        AARCH64_CARD.into(),
     ];
 
     // The second disk, on a *PCI* controller - the one device on this machine
@@ -932,9 +958,14 @@ pub fn virt_machine_args(
     // mode that asks for a window still draws none - and the wire therefore
     // stays on the launcher's terminal in every mode, which is what keeps the
     // session watchable.
+    //
+    // The card is this machine's own (`AARCH64_CARD`), not `config.gpu`: the
+    // display backend has to answer for the device actually attached, and here
+    // those are different words.
     let wiring = wiring(
         console,
         config,
+        AARCH64_CARD,
         share
             .parent()
             .expect("the share lives under the build directory"),
@@ -1649,6 +1680,51 @@ mod tests {
         // The machine's own `extra_args` come last, the way the first machine's
         // wiring puts them.
         assert_eq!(args[args.len() - 2..], ["-vga", "none"]);
+    }
+
+    /// The second machine's display backend answers for the card *it* attached,
+    /// not for the one `machine.toml` names for the first.
+    ///
+    /// A `[default]` key is inherited by both sections, so this machine reads
+    /// `qemu.gpu = "virtio-gpu-gl-pci"` out of the baseline while
+    /// `virt_machine_args` attaches the fixed, non-GL `virtio-gpu-device`. When
+    /// the backend was derived from `config.gpu`, every headless aarch64 boot
+    /// asked the host for a GL render node and no card needed it: QEMU answered
+    /// `egl: no drm render node available` and the lane never started, which is
+    /// a host without `/dev/dri` losing the whole second arm of the gate. The
+    /// counterfactual is this assertion's card: flip `AARCH64_CARD` back to a
+    /// `-gl` name and the display word must follow it, so what the test pins is
+    /// that the two travel together.
+    #[test]
+    fn the_second_machines_display_answers_for_the_card_it_attached() {
+        let mut config = config("256", 1, &[]);
+        // The baseline's card, inherited exactly as `machine.toml` hands it over.
+        config.gpu = "virtio-gpu-gl-pci".to_string();
+
+        let args = aarch64_args(&config);
+        assert_eq!(
+            after(&args, "-display").as_deref(),
+            Some("none"),
+            "a card this machine never attached decided its display: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == AARCH64_CARD),
+            "the assertion above is only meaningful beside the card it names: {args:?}"
+        );
+
+        // A session's boot draws no window either, and for the same reason.
+        let terminal = virt_machine_args(
+            &config,
+            &firmware(),
+            Path::new("/build/AAVMF_VARS.fd"),
+            Path::new("/build/aarch64-disk.img"),
+            Path::new("/build"),
+            Path::new("/build/aarch64-blk.img"),
+            &Console::Run(RunMode::Terminal),
+            Path::new("/build/aarch64-9p-share"),
+            false,
+        );
+        assert_eq!(after(&terminal, "-display").as_deref(), Some("none"));
     }
 
     /// The test machine carries one PCIe function whose extended configuration
