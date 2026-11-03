@@ -8871,6 +8871,9 @@ weston's log for `Output 'Virtual-1' enabled` before sending `SIGTERM`:
 - the heartbeat in that window reads `blk-busy=false`, `blk-waiter=none`, `submits=20020 retires=20020`
   with that task parked at site 4, so no transfer is outstanding while it sits at the wait.
 
-Two candidate mechanisms are named in §7.4h (a completion consumed by someone else; the group's exit
-retiring the sibling inside the wait) and the next instrument is an iteration counter plus
-`token`/`completed()`/`busy()`/`holder_slot()` at that loop's threshold. Not yet run.
+Two candidate mechanisms were named in §7.4h and both have now been narrowed by measurement in the
+same section's second half: (a) a group **does** die with a thread mid-block-transfer
+(`build/scratch/exfg/p.c`: reaped after ~152 ms on two files), so the group's bookkeeping is not what
+stalls; and (b) the wait loop's body **never runs** - an instrumented kernel's fourth-pass print and an
+`end_group_siblings` holder print both fired zero times in a reproducing boot. The next instrument is
+one line before the first park and one after it returns, not an iteration counter.

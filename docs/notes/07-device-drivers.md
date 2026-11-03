@@ -7955,3 +7955,37 @@ The discriminating print is one iteration counter plus `token`/`completed()`/`bu
 and the used head, emitted when the count passes a threshold in that loop — not run in this round.
 
 Logged in the work list as item 193; the ROADMAP's display row points here.
+
+### §7.4h, second half: the group is not what stalls, and the wait's loop body never runs
+
+Two follow-ups measured on the same image (`build/scratch/wsig2/`, `build/scratch/exfg/`), both
+narrowing §7.4h's two candidates:
+
+1. **A group does die with a thread mid-block-transfer.** `build/scratch/exfg/p.c` forks a child whose
+   thread `pread`s a 189 MiB file in a tight loop while the main thread calls `_exit(0)` 150 ms later;
+   the parent reaps with `WNOHANG` in a 5 s bound. Twice, on two different files:
+
+   ```
+   file /usr/lib/libLLVM.so.23.1 size=189132768
+   child reaped after ~152 ms (status=0, exited=1 code=0)
+   RESULT: the group died with a thread in the block layer
+   file /usr/lib/libgallium-26.2.6.so size=44895312
+   child reaped after ~153 ms (status=0, exited=1 code=0)
+   ```
+
+   So `end_group_siblings` retiring a sibling that is parked in the block layer does **not** hold its
+   group open - §7.4h's second candidate is wrong in the shape that matters, and the shutdown stall is
+   about the surviving thread itself, not the group's bookkeeping.
+
+2. **The completion wait's loop body never runs.** An instrumented kernel printed a line at the fourth
+   pass of `transfer`'s wait loop (`src/drivers/virtio/blk.rs`'s `while !blk_irq::completed()`), naming
+   `me`, the token, the used head, `completed()`, `busy()` and the holder; and an identical boot with a
+   second print at `end_group_siblings` when the retiring slot is the mailbox's holder. Both prints
+   fired **zero** times across a boot that reproduced the stall (`alive after TERM: yes`, log ending at
+   `caught signal 15`, the surviving thread `R` at park site 4). So the task is not going round the
+   deadline loop: the first park at that site is where it stops, and the `peek_used()` spin that
+   follows the loop is the other place it can be.
+
+The next instrument is therefore one line **before** the first park and one **after** it returns (token,
+`completed()`, `busy()`, holder), not an iteration counter; the two diagnostics that produced these
+negatives were reverted and the tree is clean.
