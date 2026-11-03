@@ -8868,6 +8868,11 @@ nothing about reuses within this mount.
 `§7.4h` in `docs/notes/07-device-drivers.md`. Two boots of the same image, with the probe polling
 weston's log for `Output 'Virtual-1' enabled` before sending `SIGTERM`:
 
+The fourth boot measured the exact state instead: one `slot 17 name=/usr/bin/weston park 2
+(block_until_nanos) syscall 202 parks=6831`, the same count on every heartbeat, with its stderr log
+stopping right after `EGL features:` - the process's only thread asleep in one `futex(2)` wait with no
+waker (§7.4h's fourth reading).
+
 - the stall reproduces (`alive after TERM: yes`, log ending at `caught signal 15`);
 - `/proc/<pid>/stat` goes from `S threads: 2` before the kill to `R threads: 1` after it, and the
   surviving thread's last park site is **4** — the block layer's completion wait

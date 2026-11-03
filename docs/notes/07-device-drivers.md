@@ -8060,3 +8060,27 @@ The probe cannot tell (1) from (3) by liveness alone, which is why its next vers
 child's **exit status and stderr** as well as the log - the assert message is written to stderr, and the
 `caught signal 15` line is the only thing that separates "handled the signal and kept looping" from
 "never got there".
+
+### §7.4h, the state the machine actually reaches: weston asleep on a futex with nothing to wake it
+
+A probe that records the child's exit status and its stderr (`aa-wsig4.start`; weston writes its log to
+**stderr**, so `>/root/wset.log 2>/root/wset.err` puts everything in the second file) and polls for
+`Output 'Virtual-1' enabled` produced the fourth combination in one boot:
+
+- `waited 120 s` - the output never came up;
+- `alive after TERM: yes` - `SIGTERM` did not end it;
+- `/root/wset.err` is **45 lines** and stops after `EGL features:` (`context priority: no`, `buffer age:
+  yes`, ...), i.e. between the renderer's EGL set-up and the output creation;
+- the heartbeat shows one task: `slot 17 pid 17 name=/usr/bin/weston park 2 (block_until_nanos)
+  syscall 202 parks=6831`, and **`parks=6831` is identical on every sample** - the main thread is asleep
+  in one `futex(2)` wait and is never woken. No second thread of the process appears in the census.
+
+So the state is not "the compositor is looping"; it is "the compositor's only thread is parked on a
+futex whose waker does not exist (it exited, or never started), or whose value nobody sets". That also
+explains why `SIGTERM` does nothing: the signal's handler is installed by the Wayland loop, which this
+process has not reached, and this kernel's futex wait is not interrupted by a handled signal either
+(`docs/notes/` §6.76 measured `EINTR` for `epoll_wait`/`read`, not for a futex park).
+
+The next instrument is on the futex side, not the display side: record `(uaddr, expected value, tid)`
+for every `futex(2)` wait and every wake the process makes, and print the wait's owner when the
+heartbeat first sees it frozen. That names the mutex or condvar the compositor is sitting on.
