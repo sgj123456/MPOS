@@ -4988,3 +4988,71 @@ the reader with `SIGBUS` (`Bus error`), while a byte inside the file's last part
 data reads zero. The claim now grows the file into the page and asserts the second shape, because
 that is what Linux answers - the `SIGBUS` shape belongs to a fault the machine has to raise, which is
 its own item.
+
+## §6.76 A handled signal ends a parked wait with `EINTR` - MEASUREMENT + PIN
+
+weston was recorded parked after `caught signal 15` (`park 1 block_until_on`, §7.4g), and the first
+question about any such stall is whether the signal path can end a park at all. It can, and the
+shape is a claim now.
+
+### Linux 7.2.11 (`build/scratch/sigpark/{e,p}.c`, `musl-gcc -static`)
+
+A child parks, the parent sends `SIGTERM` 300 ms later, and the child prints its call's answer:
+
+```
+CHILD epoll_wait -> -1 errno=4 (Interrupted system call) handler_ran=1     (3 runs)
+CHILD read -> -1 errno=4 (Interrupted system call) handler_ran=1           (2 runs)
+```
+
+So an interruptible wait answers `-1`/`EINTR` and the handler has run by the time it returns - for
+the `epoll_wait(2)` of an empty set with `-1` and for a `read(2)` of a pipe nobody writes.
+
+### This machine (`build/scratch/wsig/`, one boot)
+
+The same `epoll_wait` probe on the guest prints the identical line, `rc=0`. The same boot also ran
+weston and `kill -TERM`ed it 20 s in: weston was **gone** (`alive after TERM: no`, `state=Z`), so
+what §7.4g recorded as a shutdown stall did not reproduce in that shape - the log's last line was
+still the connector census, i.e. the kill landed while weston was inside its own startup. A lost
+interrupt in the park is therefore not what that reading was; the shutdown question stays open as its
+own item, with this pin removing the cheapest explanation.
+
+### The pin (`user/tests/src/bin/t-signal-park.rs`, 7 claims)
+
+`epoll_wait` and `read` each in a forked child that parks, with the parent sending `SIGTERM` 300 ms
+in; the child reports `(rc, errno, handler_ran)` back through a pipe. A call that never returns is the
+failure mode, so the parent waits four seconds, `SIGKILL`s the child and reports `FAIL` under the
+claim's name - the bounded-child shape `t-sock-timeout` established. The fourth claim is the other
+half of the rule: a `SIG_IGN` disposition is not an interruption, so the child must stay parked and
+the parent's deadline must be the one that ends it.
+
+Host reference run (`MPOS_ON_HOST=1`): all seven green on 7.2.11.
+
+### Counterfactual
+
+Swallowing the interrupt inside the epoll door (`WaitEnd::Interrupted => {}` in `file.rs`'s
+`epoll_wait`, so the call answers its ready set - none - instead of `EINTR`) reddens exactly the two
+claims that describe it, and nothing else:
+
+```
+FAIL:  a parked epoll_wait is ended by a handled signal
+FAIL:  and epoll_wait's call answers EINTR
+ok:    and the handler had run by then
+ok:    a parked read of a pipe is ended by a handled signal
+ok:    and read's call answers EINTR
+ok:    and the handler had run by then
+ok:    an ignored signal does not end the park
+FAILED
+```
+
+That run was taken on a counterfactual kernel booted with the pin staged into the image
+(`build/scratch/sigpark/cf2.img`, `/root/sigpark.txt`): the pipe door keeps its `EINTR` because the
+counterfactual touched only the epoll arm, which is exactly the discrimination wanted. A coarser counterfactual - removing
+the interruption check from `block_until_nanos` entirely - makes *lane 0 of the sweep hang* (its
+serial's last line is `=== RUN t-signal-park`, the lane dies of its 900 s bound): the interruption is
+load-bearing well beyond this pin, which is worth knowing but is not a named-red run.
+
+### Gates
+
+x86_64 `verdict pass=255 fail=0`, `mpos-kunit 35 passed`; aarch64 `verdict pass=254 fail=0`,
+`mpos-kunit 35 passed` (a first aarch64 run died on the documented `EXCEPTION: synchronous` boot
+check, `EC 0x25`, and was re-run green). Host reference run of the pin on 7.2.11: seven claims green.

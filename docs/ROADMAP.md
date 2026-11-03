@@ -661,6 +661,13 @@ In the order that keeps each step verifiable on its own:
   bisect named, and the shape udevd's `mallocng` `#PF at 0x10`/`0x30` took: a forked child
   overwriting its parent's heap metadata. Pinned by three claims at the end of
   `t-mmap-file-lazy`.
+  A handled signal ends a parked wait with `EINTR`: measured on 7.2.11 and on this machine for a
+  parked `epoll_wait(-1)` and a parked pipe `read(2)`, with the handler already run when the call
+  returns; a `SIG_IGN` disposition is not an interruption and does not end it. Pinned by
+  `t-signal-park`, whose seven claims each run their parked call in a bounded child so a lost
+  interrupt fails under a name instead of spending the program's budget (item 192, §6.76). It also
+  clears the cheapest explanation for weston's post-`SIGTERM` park, which did not reproduce when the
+  signal landed during startup.
   A userland fault's report names the program that faulted, not a task slot: `<comm>[<tid>]:
   segfault at <addr> ip <ip> sp <sp> error <word> in <module>[<off>,<base>+<len>]`, and
   `traps: <comm>[<tid>] general protection fault ...` for a trap (item 189, §6.73). The shape is

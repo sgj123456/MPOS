@@ -8388,6 +8388,17 @@ Recorded in `docs/notes/07-device-drivers.md` §7.4 (a note above the old
 transcript, so the superseded reading stays visible) and in the ROADMAP's
 display row.
 
+### Item 192 - a handled signal ends a parked wait with `EINTR` (2026-11-03, pin)
+
+`weston` was recorded parked after `caught signal 15`, and the cheapest explanation for a stall of
+that shape is a park that cannot be interrupted. Measured on Linux 7.2.11 and on the machine
+(`build/scratch/sigpark/{e,p}.c`, `build/scratch/wsig/`): a caught `SIGTERM` ends a parked
+`epoll_wait(-1)` and a parked pipe `read(2)` with `-1`/`EINTR`, and the handler has run by the time
+the call returns. A `SIG_IGN` disposition is not an interruption and must not end the wait. Pinned by
+`t-signal-park` (7 claims, each parked call in a bounded child). The weston shutdown stall itself did
+not reproduce in the shape measured - the kill landed during weston's startup and it exited - so that
+question stays open as its own item. Recorded in `docs/notes/06-process-management.md` §6.76.
+
 ### Item 191 - a private file mapping crosses a `fork` private (2026-11-02, landed)
 
 `MAP_PRIVATE` promises the child's stores are its own. Between `4930158` and this item they were
