@@ -5067,3 +5067,35 @@ network and `seatd` started and the uevent settle completed (`Starting udev ...`
 transfers. The boot was cut at its 780 s bound before the desktop came up, so this measures the phase
 the deaths happened in (udev's device processing), not the whole session - the session-length reading
 is still the one a full boot gives.
+
+### §6.77 a fatal signal ends only the thread that took it, not the group
+
+The compositor's stalls (§7.4h) left a worker thread parked on a futex after the main thread was gone.
+A minimal probe (`build/scratch/fx/p.c`, host build with glibc, guest with `musl-gcc -static -pthread`)
+makes the same shape without any display code: fork a child; the child starts a thread that parks on
+`futex(FUTEX_WAIT)` on a word nobody will ever change, waits 100 ms, then either `exit_group(0)` or
+`sends SIGKILL to its own group`; the parent waits up to 4 s and reports.
+
+Linux 7.2.11 (the same binary):
+
+```
+mode 0 (exit_group): reaped, status=0
+mode 1 (SIGKILL): reaped, status=0
+```
+
+This kernel (image `build/scratch/fx/f.img`, kernel `c39bf49`):
+
+```
+mode 0 (exit_group): reaped, status=0
+```
+
+and then the program **never finishes**: the parent is `slot 17 pid 17 name=/t-fx park 2
+(block_until_nanos) syscall 61` (61 = `wait4`, `parks=109` and climbing), the killed child is `gone
+slot 18 pid 18 name=/t-fx parent=17 park 2 syscall 62 released=true retired=false`, and the child's
+parked worker is still there: `slot 19 pid 19 name=/t-fx park 2 (block_until_nanos) syscall 202
+(futex) parks=2`.
+
+So `exit_group(2)` does end a futex-parked sibling (`end_group_siblings`, item 190's machinery), while
+a **fatal signal does not**: the killed thread ends, its sibling stays parked for ever, the group never
+retires (`retired=false`), and every `wait4` on it hangs. That is exactly the shape the compositor
+reaches - and it also means a `SIGKILL` cannot clean up a process whose thread is parked on a futex.
