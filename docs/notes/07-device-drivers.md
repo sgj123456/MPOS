@@ -8036,3 +8036,27 @@ shows. The honest reading is now: the stall is real and reproducible in the call
 (`alive after TERM: yes` twice), and the primitive returns normally in a boot where the stall did not
 occur - so the next step is to catch both in the *same* boot (instrument the primitive, then force the
 reproduction), not to treat "never returns" as established.
+
+### §7.4h, the outcome is not one shape: weston on this machine has three
+
+The same probe (`aa-wsig2.start`: start `weston --backend=drm`, poll its log for `Output 'Virtual-1'
+enabled` up to 120 s, sleep, `SIGTERM`, sleep, report) produced three different endings across boots:
+
+1. **paints, then ignores `SIGTERM`** - `waited 2 s for the output`, `alive after TERM: yes`, log ends
+   `caught signal 15` (twice; §7.4g/§7.4h);
+2. **paints, then exits on `SIGTERM`** - `alive after TERM: no`, `state=Z`;
+3. **never reaches the output** - `waited 120 s for the output`, and the log's last lines are the
+   connector census (`Supported color formats: AUTO`), i.e. weston died before enabling the output.
+   The heartbeat in that boot shows it: `gone slot 17 pid 17 name=weston:disk$0 parent=1 park 8
+   syscall 318 released=true retired=false fds=18`, with `/proc/<pid>/stat` answering `Z` - weston
+   exited on its own, and one `weston:disk$0` thread was left behind.
+
+So "the compositor's shutdown stall" is one outcome of a machine state that is not deterministic, and
+the startup failure in (3) is a separate defect the same probe already caught - an earlier boot of it
+recorded `Assertion failed: wl_list_empty(&compositor->head_list) (../libweston/compositor.c:
+weston_compositor_destroy: 11025)` followed by `Aborted (core dumped)`.
+
+The probe cannot tell (1) from (3) by liveness alone, which is why its next version must record the
+child's **exit status and stderr** as well as the log - the assert message is written to stderr, and the
+`caught signal 15` line is the only thing that separates "handled the signal and kept looping" from
+"never got there".
