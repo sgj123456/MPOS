@@ -7989,3 +7989,24 @@ narrowing §7.4h's two candidates:
 The next instrument is therefore one line **before** the first park and one **after** it returns (token,
 `completed()`, `busy()`, holder), not an iteration counter; the two diagnostics that produced these
 negatives were reverted and the tree is clean.
+
+### §7.4h, third half: the park itself never returns
+
+A second instrumented kernel put three prints inside `transfer`'s wait
+(`src/drivers/virtio/blk.rs`): one at the wait's entry when `busy()` is false or the holder is not the
+waiter, one after the park returns without a completion, and one at the `peek_used()` spin when the
+head is not the token. A boot that reproduced the stall again (`alive after TERM: yes`, log ending at
+`caught signal 15`) produced **zero** of the three.
+
+Combined with §7.4h's earlier zero-firing of the fourth-pass print, the reading is now: the task enters
+`block_until_uninterruptible_until(4, blk_irq::completed, deadline)` and **never returns from it** -
+neither with the completion, nor at the deadline that call carries. Its own loop body, the
+`peek_used()` spin and the retire path are all unreachable in that state, which is why every print
+placed after the park stays silent.
+
+That points the next instrument at the primitive itself rather than at its caller:
+`block_until_uninterruptible_until` (`src/sched/runtime/task.rs:3164`) should print, once per task, its
+site, the deadline it was given and `hal::since_boot_nanos()` at entry and at every re-check - so a park
+that never returns names where it stopped and whether its clock moved. The two candidate mechanisms
+that remain are the ones §6.24 closed once already (a wait whose deadline is armed against a clock the
+park does not answer) and a lost wake with a frozen timer assertion; the instrument above answers which.

@@ -8875,5 +8875,8 @@ Two candidate mechanisms were named in §7.4h and both have now been narrowed by
 same section's second half: (a) a group **does** die with a thread mid-block-transfer
 (`build/scratch/exfg/p.c`: reaped after ~152 ms on two files), so the group's bookkeeping is not what
 stalls; and (b) the wait loop's body **never runs** - an instrumented kernel's fourth-pass print and an
-`end_group_siblings` holder print both fired zero times in a reproducing boot. The next instrument is
-one line before the first park and one after it returns, not an iteration counter.
+`end_group_siblings` holder print both fired zero times in a reproducing boot. The follow-up instrument
+(one line before the first park, one after it returns, one at the spin head) fired zero times too: the
+task enters `block_until_uninterruptible_until(4, ...)` and never returns from it, not even at the
+deadline that call carries. The instrument now belongs inside the primitive - site, deadline and
+`hal::since_boot_nanos()` at entry and at every re-check, once per task (§7.4h's third half).
