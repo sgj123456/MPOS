@@ -8010,3 +8010,29 @@ site, the deadline it was given and `hal::since_boot_nanos()` at entry and at ev
 that never returns names where it stopped and whether its clock moved. The two candidate mechanisms
 that remain are the ones §6.24 closed once already (a wait whose deadline is armed against a clock the
 park does not answer) and a lost wake with a frozen timer assertion; the instrument above answers which.
+
+### §7.4h, a correction: the park does return
+
+An instrument inside `block_until_uninterruptible_until` itself - one line before every `schedule` and
+one after the wait returns, for `weston` tasks only - ran in a boot of the instrumented kernel. Every
+line it printed was a **pair**, and every pair shows the wait ending:
+
+```
+mpos-dbg: until site=4 id=17 sleep now=15924289317 deadline=15928285726 first=1
+mpos-dbg: until site=4 id=17 RETURNED now=15924516917 deadline=15928285726
+mpos-dbg: until site=4 id=19 sleep now=15937174588 deadline=15941169170 first=1
+mpos-dbg: until site=4 id=19 RETURNED now=15937427958 deadline=15941169170
+```
+
+No print lacked its `RETURNED`, so in **that** boot no task entered the wait and failed to leave it. The
+same boot also failed to reproduce the shutdown stall (`alive after TERM: no`; the probe gave up after
+120 s because weston's log never reached `Output 'Virtual-1' enabled` in that time). So the two facts
+stand together: the stall did not happen, and the wait behaved.
+
+That corrects the third half above: "the park never returns" was the reading of a boot that **did**
+reproduce the stall (three separate prints inside the caller fired zero times), but the primitive's own
+instrument has not reproduced that state, and a park that never returns is not something this boot
+shows. The honest reading is now: the stall is real and reproducible in the caller's shape
+(`alive after TERM: yes` twice), and the primitive returns normally in a boot where the stall did not
+occur - so the next step is to catch both in the *same* boot (instrument the primitive, then force the
+reproduction), not to treat "never returns" as established.
