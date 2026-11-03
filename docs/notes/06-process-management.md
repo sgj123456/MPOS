@@ -5099,3 +5099,31 @@ So `exit_group(2)` does end a futex-parked sibling (`end_group_siblings`, item 1
 a **fatal signal does not**: the killed thread ends, its sibling stays parked for ever, the group never
 retires (`retired=false`), and every `wait4` on it hangs. That is exactly the shape the compositor
 reaches - and it also means a `SIGKILL` cannot clean up a process whose thread is parked on a futex.
+
+### §6.77a the signal reaches the leader, and the leader never takes it
+
+An instrument on the delivery door (`send_signal_info`, printing `sig`, target tid, target's recorded
+park site, and whether the wake was held) and on `take_fatal_signal` (printing every fatal it takes),
+run in a boot of the same probe:
+
+```
+mpos-dbg: signal 15 -> tid=9 tgid=9 comm= park=2 held=0
+mpos-dbg: signal 15 -> tid=8 tgid=8 comm= park=2 held=0
+mpos-dbg: signal 15 -> tid=7 tgid=7 comm= park=2 held=0
+mpos-dbg: signal 12 -> tid=12 tgid=12 comm= park=2 held=0
+mpos-dbg: signal 11 -> tid=11 tgid=11 comm= park=2 held=0
+mpos-dbg: signal 9 -> tid=18 tgid=18 comm= park=2 held=0     <- the probe's child
+```
+
+and **no** `take fatal` line for tid 18. The probe's own output is the same as before
+(`mode 0 (exit_group): reaped`, then nothing), the child's slot is `gone ... park 2 syscall 62
+released=true retired=false`, and its futex-parked sibling is still `slot 19 ... park 2
+(block_until_nanos) syscall 202 parks=2`.
+
+So the signal **is** queued to the leader and `t.sched.wake(18)` **is** called (`held=0`), yet the
+leader never runs `take_fatal_signal`: the `comm=` column reads empty for every line, which also says
+the diagnostic could not read the target's name from the slot it printed (the field is the target's
+`mm`, and a slot whose group has already released its address space reports nothing). The next
+instrument is therefore narrower: print, inside `block_until_nanos`'s loop, the pending-but-not-blocked
+set of the task for every pass (once per task), and print whether `t.sched.wake(id)` found the target in
+its sleep queue - one boot then says whether the wake found a task to requeue at all.
