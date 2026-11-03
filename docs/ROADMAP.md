@@ -660,7 +660,8 @@ In the order that keeps each step verifiable on its own:
   machine where Linux answers `no (correct)` (item 191, §6.75). That is the regression the user's
   bisect named, and the shape udevd's `mallocng` `#PF at 0x10`/`0x30` took: a forked child
   overwriting its parent's heap metadata. Pinned by three claims at the end of
-  `t-mmap-file-lazy`.
+  `t-mmap-file-lazy`. A boot of the fixed kernel printed **no** user-fault line at all through udev's
+  device processing, where the baseline was five `udevd[..]` deaths per boot (§6.75a).
   A handled signal ends a parked wait with `EINTR`: measured on 7.2.11 and on this machine for a
   parked `epoll_wait(-1)` and a parked pipe `read(2)`, with the handler already run when the call
   returns; a `SIG_IGN` disposition is not an interruption and does not end it. Pinned by

@@ -5056,3 +5056,14 @@ load-bearing well beyond this pin, which is worth knowing but is not a named-red
 x86_64 `verdict pass=255 fail=0`, `mpos-kunit 35 passed`; aarch64 `verdict pass=254 fail=0`,
 `mpos-kunit 35 passed` (a first aarch64 run died on the documented `EXCEPTION: synchronous` boot
 check, `EC 0x25`, and was re-run green). Host reference run of the pin on 7.2.11: seven claims green.
+
+### §6.75a the boot after the fix: no fault lines at all
+
+The baseline this item was opened on was five `udevd[..]` fault lines per boot (three `#PF` at NULL
+plus the two `#GP`s at musl's `a_crash()`). A boot of the kernel carrying §6.74 and §6.75, with the
+network and `seatd` started and the uevent settle completed (`Starting udev ...` then
+`Waiting for uevents to be processed ...` then `Starting seatd ...`), printed **zero** lines matching
+`traps:`, `segfault at`, or `general protection` in 3546 serial lines covering 9445 retired block
+transfers. The boot was cut at its 780 s bound before the desktop came up, so this measures the phase
+the deaths happened in (udev's device processing), not the whole session - the session-length reading
+is still the one a full boot gives.

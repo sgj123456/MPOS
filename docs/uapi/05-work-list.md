@@ -8406,6 +8406,10 @@ not, for a private mapping of a **file**: the fork loop collected every `VmaKind
 shared object and never read the `shared` field inside it, so the child mapped its parent's file
 pages writable and unmarked (no COW bit on either side) and both processes wrote the same frames.
 
+The follow-up boot (§6.75a) printed **zero** fault lines - no `traps:`, no `segfault at`, no `general
+protection` - across the whole of udev's device processing, where the baseline was five `udevd[..]`
+deaths per boot.
+
 | shape | Linux 7.2.11 | this kernel before |
 |---|---|---|
 | private file mapping, parent fills `'A'`, child writes `'C'`, parent re-reads | `A` | `C` (`YES (BROKEN)`) |
