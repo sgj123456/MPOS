@@ -6784,19 +6784,35 @@ with no handler whose default action terminates, wherever in the group it was
 taken. This kernel had the rule for `exit_group` and for a dying pid-namespace
 init only.
 
-Served by `end_group_siblings` (`src/sched/runtime/child_exit.rs`, the loop
-`exit_group` already used, extracted) called from `take_fatal_signal` once it has
-taken a terminating signal: siblings are marked `exited` and retired, so nothing
-the picker holds can reach them, and the group's death is then recorded by the
-dying task's own `exit`. The named divergence is the one `exit_group`'s siblings
-already carry: a sibling ended here does not run its own exit path, so its
-`CLONE_CHILD_CLEARTID` word is not cleared.
+Served by one door, `die_of_fatal_signal` (`src/sched/runtime/child_exit.rs`),
+which walks `end_group_siblings` (the loop `exit_group` already used, extracted)
+and then `exit`s with the signal's number: siblings are marked `exited` and
+retired, so nothing the picker holds can reach them, and the group's death is
+then recorded by the dying task's own `exit`. The named divergence is the one
+`exit_group`'s siblings already carry: a sibling ended here does not run its own
+exit path, so its `CLONE_CHILD_CLEARTID` word is not cleared.
 
-Pinned by `t-kill-ends-group` (both machines): a re-exec fixture with a worker in
-`FUTEX_WAIT`, a `SIGKILL`, and a `WNOHANG` poll so a hang reports as a false claim
-instead of a harness timeout. Host Linux is the reference (`MPOS_ON_HOST=1`, 4/4
-ok); the sweep is `pass=229 fail=0`, and without the call
-`pass=228 fail=1` with exactly those claims red (§6.37).
+The door exists because there were two. Having `take_fatal_signal` end the group
+made the group's fate depend on *where* the signal was taken: a task that was
+parked when the signal arrived took it inside a blocking wait and the group died,
+but a task that killed **itself** took it at that `kill` call's own syscall-exit
+gate (`deliver_signal`'s `Terminate` arm), which called a bare `exit` — one
+thread died, the parked sibling outlived it, `group_dead` was never true, and the
+parent's `wait` still parked forever. Measured: `gone slot 18 pid 18 ... syscall
+62 released=true retired=false`, syscall 62 being `kill` (§6.77b). Linux answers
+"process or thread?" at generation, in `complete_signal`; here it is answered at
+one death site instead, so there is exactly one.
+
+Pinned by `t-kill-ends-group` (both machines) with two fixtures: a re-exec child
+killed from **outside** (the original shape — the signal is taken inside a
+blocking wait) and one that `kill(getpid(), SIGKILL)`s **itself** (the shape that
+reaches the syscall-exit gate). Each has a worker in `FUTEX_WAIT`, and the parent
+polls `WNOHANG` so a hang reports as a false claim instead of a harness timeout.
+Host Linux is the reference (`MPOS_ON_HOST=1`, both fixtures 6/6 ok).
+Counterfactual, measured on the unfixed kernel: the two self-kill claims are RED
+(`exit=1`) while both outside-kill claims stay green — precisely the asymmetry the
+old single-fixture pin could not see. Full sweep after the change: `pass=255
+fail=0` (x86_64) and `pass=254 fail=0` (aarch64) (§6.77b, §6.37).
 
 ## item 124 — an eventfd's write wakes the pollers parked on it
 

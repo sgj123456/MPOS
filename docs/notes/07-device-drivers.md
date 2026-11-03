@@ -7946,7 +7946,7 @@ named here so the question does not drift:
 
 1. the completion **was** taken by someone else (`finish_request` ran while this task still waited, so
    `completed()` stays false and the used head is no longer its token), or
-2. the group's exit retired the sibling (`end_group_siblings`, `src/sched/runtime/child_exit.rs:2188`)
+2. the group's exit retired the sibling (`end_group_siblings`, `src/sched/runtime/child_exit.rs:2219`)
    while it was inside that wait, so the waiting task is no longer scheduleable but still holds the
    mailbox's claim — which the heartbeat's `blk-busy=false` does not show, because `busy()` reads the
    claim's holder and a retired task reads as not alive.
@@ -8115,3 +8115,15 @@ The second shape is the sharper defect: a thread outlives the exit of the thread
 process cannot finish. The questions it leaves are (a) whether that exit was `exit(2)` or
 `exit_group(2)` and what `end_group_siblings` saw, and (b) whether a `SIGTERM` to the group reaches a
 sibling parked on a futex - item 192 measured `EINTR` for `epoll_wait` and `read`, not for this door.
+
+**Question (a) is answered, and the answer is neither of those two calls** (§6.77b). The group-death
+rule had two doors: `take_fatal_signal` walked `end_group_siblings`, and the syscall-exit gate's
+`Terminate` arm (`src/syscall/linux/proc.rs`) called a bare `exit`. A task that kills *itself* is
+running when the signal is queued, so nothing wakes it and the signal is still pending when `kill`
+returns — it is taken at that call's own exit gate, which was the second door. One thread died, the
+parked sibling was never retired, `group_dead` stayed false and the parent's `wait4` parked. That is
+the `retired=false` in shape 2 above, and the proof is the park dump's own syscall number for the
+`gone` slot: `62` (`kill`), not `34` (`pause`). Both doors are now one, `child_exit::die_of_fatal_signal`,
+pinned by `t-kill-ends-group`'s self-kill fixture. What is still owed on this section is item 193's own
+confirmation: weston's boot reaching a reaped group, which no boot has yet shown.
+

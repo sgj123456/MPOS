@@ -12,7 +12,7 @@ use super::TABLE;
 use super::USER_STACK_TOP;
 use super::child_exit::{drop_retired, exit_code_pending, task_entry};
 
-use super::child_exit::{exit, exit_code};
+use super::child_exit::{die_of_fatal_signal, exit, exit_code};
 use super::child_mm::{Mm, populate_in, split_cow};
 use super::child_signal::{queue_signal, table_has_deliverable, take_fatal_signal};
 
@@ -2834,7 +2834,7 @@ fn sleep_until(deadline: u64) {
     let clock = || hal::since_boot_nanos();
     loop {
         if let Some(sig) = take_fatal_signal() {
-            exit(-(sig as isize));
+            die_of_fatal_signal(sig);
         }
         if clock() >= deadline {
             return;
@@ -2878,7 +2878,7 @@ pub fn block_until_code(id: TaskId) {
     note_park_current(5);
     loop {
         if let Some(sig) = take_fatal_signal() {
-            exit(-(sig as isize));
+            die_of_fatal_signal(sig);
         }
         if exit_code(id).is_some() {
             return;
@@ -2914,7 +2914,7 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
         // Signals are checked before the condition on every pass, so a fatal
         // signal kills a blocked task even if what it waited for also arrived.
         if let Some(sig) = take_fatal_signal() {
-            exit(-(sig as isize));
+            die_of_fatal_signal(sig);
         }
         if with_table(|t| cond(t)) {
             return;
@@ -2946,7 +2946,7 @@ pub(crate) fn block_until_on_interruptible(cond: impl Fn(&Table) -> bool) -> Wai
         // As in `block_until_on`: a fatal signal is taken before the condition,
         // so a task that is killing itself does not first collect a child event.
         if let Some(sig) = take_fatal_signal() {
-            exit(-(sig as isize));
+            die_of_fatal_signal(sig);
         }
         if with_table(|t| cond(t)) {
             return WaitEnd::Condition;
@@ -3019,7 +3019,7 @@ pub fn block_until_nanos(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
     note_park_current(2);
     loop {
         if let Some(sig) = take_fatal_signal() {
-            exit(-(sig as isize));
+            die_of_fatal_signal(sig);
         }
         if cond() {
             return WaitEnd::Condition;
@@ -3476,7 +3476,7 @@ fn preempt_now() {
 /// means.
 pub fn deliver_pending_signal() {
     if let Some(sig) = take_fatal_signal() {
-        exit(-(sig as isize));
+        die_of_fatal_signal(sig);
     }
 }
 

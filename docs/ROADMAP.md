@@ -28,8 +28,10 @@ One-glance status of the whole roadmap.
   `kill(-1)` every process the caller may signal, one copy per process for a group
   (§2.10, item 106), `SIGCONT`'s session door (§2.6), one handler table shared by a
   thread group under `CLONE_SIGHAND` (§2.7) and a fatal signal ending the **whole**
-  group - a sibling parked in a futex is retired with it, so `timeout(1)`'s `wait`
-  answers (§6.37, item 123); the named residues are the kernel-spawned
+  group through one door (`die_of_fatal_signal`) whichever way it arrives - a kill
+  from outside, a self-kill at the `kill` gate's own exit, or a task's own pending
+  set - so a sibling parked in a futex is retired with it and `timeout(1)`'s `wait`
+  answers (§6.37, §6.77b, item 123); the named residues are the kernel-spawned
   program path's `SIG_DFL` start and the alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
@@ -794,7 +796,7 @@ on 2026-10-25: the block layer's completion path (completions interrupt-driven, 
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).
 
-The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at the block layer's completion wait, so the group is never reaped.
+The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at a wait, so the group is never reaped. Half of the mechanism is now named and closed: the group-death rule had **two** doors and only one of them ended the group, so a task that killed itself died alone and left its parked sibling alive (`syscall 62` at the `kill` gate, `retired=false`) — the one door is `die_of_fatal_signal`, pinned by `t-kill-ends-group`'s self-kill fixture (§6.77b, item 123). What still stands open is the composition's own ending: whether that survivor is weston's own thread at a futex nobody wakes (§7.4h's fourth and fifth readings, both measured with `retired=false`) rather than a group that could not die. The confirmation still owed is weston's own boot reaching a reaped group.
 
 ---
 

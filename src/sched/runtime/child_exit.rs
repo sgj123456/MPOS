@@ -2132,6 +2132,37 @@ pub fn exit_group(code: isize) -> ! {
     exit(code)
 }
 
+/// Die of a fatal signal, taking the whole thread group with it.
+///
+/// This is the **one** door a fatal signal ends a task through, and it exists
+/// because the same question - "does this kill the process or this thread?" -
+/// was being answered in two places, one of them wrong.
+///
+/// Linux answers it at the signal's *generation*: `complete_signal` sets
+/// `SIGNAL_GROUP_EXIT` for a signal with no handler whose default action
+/// terminates, and every member of the group ends because of it. Here the
+/// decision is made at the moment a task dies of the signal instead, and for
+/// that to be the same answer for every way of dying there must be one door.
+/// There were two: a task parked in a blocking wait took its signal through
+/// `take_fatal_signal`, which ended the group; a task that killed **itself**
+/// took it at its `kill` call's own syscall-exit gate (`deliver_signal`), which
+/// called `exit` directly and so ended only itself. The second shape is a
+/// process whose leader outlives its own group: the parked sibling is never
+/// ended, `exit` never sees the group dead, no `Retired` record is written, the
+/// parent's `wait` never returns, and the machine keeps a thread that nothing
+/// can reclaim (`docs/notes/` §7.4h measured it on weston's shutdown, §6.77b on
+/// the minimal fixture).
+///
+/// The group walk belongs here rather than in `take_fatal_signal` because only
+/// the death site knows the group is over; a function that merely *takes* a
+/// signal from the pending set should not also decide who dies.
+pub fn die_of_fatal_signal(sig: u8) -> ! {
+    let me = current();
+    let tgid = current_tgid();
+    with_table(|t| end_group_siblings(t, me, tgid));
+    exit(-(sig as isize))
+}
+
 /// The machine has no frame left for the running task's own fault: end the
 /// process the way Linux's OOM killer does, and never return.
 ///

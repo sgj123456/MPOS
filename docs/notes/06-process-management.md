@@ -4452,32 +4452,48 @@ pid-namespace init's zap, but not for a fatal signal — so `kill(pid, SIGKILL)`
 reached exactly the one task the number named and left the rest of the group
 running, which is a shape Linux never produces.
 
-**Served.** `take_fatal_signal` (`src/sched/runtime/child_signal.rs`) now calls
-`end_group_siblings` (`src/sched/runtime/child_exit.rs`) once it has taken a
-terminating signal. The helper is the loop `exit_group` used, extracted rather
-than copied: a sibling is marked `exited` and retired, so it is in no queue the
-picker can reach and its slot is freed by the release pass, and its children are
-handed to init. The dying task then runs its own `exit`, sees `group_dead`, and
-records the process's death — so the parent's `wait` answers instead of parking.
-A thread parked in an interruptible wait needs no special case: being retired is
-stronger than being woken, and `exit_group`'s own siblings have been ended this
-way since it landed.
+**Served.** One door ends a task of a fatal signal now:
+`die_of_fatal_signal` (`src/sched/runtime/child_exit.rs`) walks
+`end_group_siblings` and then runs the dying task's own `exit`. The helper is the
+loop `exit_group` used, extracted rather than copied: a sibling is marked
+`exited` and retired, so it is in no queue the picker can reach and its slot is
+freed by the release pass, and its children are handed to init. The dying task
+then sees `group_dead` and records the process's death — so the parent's `wait`
+answers instead of parking. A thread parked in an interruptible wait needs no
+special case: being retired is stronger than being woken, and `exit_group`'s own
+siblings have been ended this way since it landed.
+
+The door exists because there were two, and the second one was found later
+(§6.77b). Having `take_fatal_signal` end the group put the group's fate in the
+hands of *where* the signal was taken: a parked task took it inside a blocking
+wait and the group died, but a task that killed **itself** took it at that `kill`
+call's own syscall-exit gate, whose `Terminate` arm called a bare `exit` — one
+thread died, the parked sibling outlived it, `group_dead` was never true and the
+parent's `wait4` still parked. `take_fatal_signal` now only takes the number; the
+group walk belongs to the death site, so every caller ends through the one door.
+Linux reaches the same place from the other end, deciding at `complete_signal`
+time with `SIGNAL_GROUP_EXIT`.
 
 One divergence is named rather than papered over: a sibling ended by the group's
 fatal signal never runs its own exit path, so its `CLONE_CHILD_CLEARTID` word is
 not cleared and its `SEM_UNDO` list is dropped with `Arc` count 1 — exactly the
 shape `exit_group`'s siblings already have.
 
-**Pinned** by `t-kill-ends-group` (new, both machines): the child is a re-exec of
-the same binary with one word, so the fixture's parked worker is a real
-`FUTEX_WAIT` on a word nobody wakes; the parent waits 700 ms for that park, sends
-`SIGKILL`, then polls `wait4` with `WNOHANG` for 10 s — a hang is not an answer
-this pin can report. The reference is Linux: `MPOS_ON_HOST=1` runs 4/4 ok and
-`PASS` against 7.2.11. On the machine the whole sweep is `pass=229 fail=0`, and
-the counterfactual — `end_group_siblings` not called — is
-`pass=228 fail=1 (229 built)` with exactly the two new claims red
-(`the process is reaped even though a thread was parked in a futex`,
-`the death is the signal that killed it`); nothing else moved.
+**Pinned** by `t-kill-ends-group` (both machines) with **two** fixtures: the
+child is a re-exec of the same binary with one word, so the fixture's parked
+worker is a real `FUTEX_WAIT` on a word nobody wakes; the first fixture is killed
+from outside (the original shape, signal taken inside a blocking wait) and the
+second kills **itself** (`kill(getpid(), SIGKILL)`), which is the shape that
+reaches the syscall-exit gate. Each parent waits 700 ms for the park, then polls
+`wait4` with `WNOHANG` for 10 s — a hang is not an answer this pin can report.
+The reference is Linux: `MPOS_ON_HOST=1` runs 6/6 ok and `PASS` against 7.2.11.
+On the machine the whole sweep is `pass=255 fail=0` (x86_64) and `pass=254
+fail=0` (aarch64) after the change, and the counterfactual — the door's call
+sites reverted to bare `exit`s on the shipped `take_fatal_signal`-ends-the-group
+code — reddens exactly the two **self-kill** claims (`a process that kills itself
+is reaped though its thread is parked in a futex`, `a self-kill is still the
+signal that is reported as the cause`) while both outside-kill claims stay green:
+the asymmetry the single-fixture pin could not see (§6.77b).
 
 Full record: `docs/uapi/` §5.1 item 123.
 
@@ -5148,3 +5164,87 @@ mpos-dbg: nanos tid=19 pending=0x0 blocked=0x0
   silenced the second child's prints: a gate that reads an empty name matches nothing. The next
   instrument gates on the task id, not on a name, and prints **every** pass whose pending set is not
   empty.
+
+### §6.77b there were two doors, and only one of them ended the group - **FIXED (2026-11-04)**
+
+The next instrument gates on the task id, as §6.77a's own closing line asked. It printed, for the
+second child - the one that kills itself:
+
+```
+mpos-dbg: handle_kill args=[18, 9]
+mpos-dbg: signal 9 -> tid=18 tgid=18 park=2 held=0
+mpos-dbg: dispatch sig=9 tid=18 sleeping_before=0 sleeping_after=0 pending=0x100
+```
+
+and no `take fatal` line for tid 18, ever. The reason is not a lost wake: `kill(getpid(), SIGKILL)`
+is a signal whose sender *is* its target, so the target is running, `sleeping_before=0`, and
+`send_signal_info`'s `t.sched.wake(id)` has nothing to requeue. The signal is taken later, in the
+*same syscall* - `src/syscall/mod.rs` calls `linux::deliver_signal` on the way out of every syscall,
+and its `DefaultAction::Terminate` arm ended the task with a bare `crate::sched::exit(-(sig as
+isize))`.
+
+That is the second door. `take_fatal_signal` (`src/sched/runtime/child_signal.rs`) called
+`end_group_siblings` before returning; `deliver_signal` did not. So the group's fate depended on
+*where* the signal was taken:
+
+- killed from **outside** while parked: `send_signal_info` wakes the target, the blocking wait's loop
+  takes the signal through `take_fatal_signal`, the group ends - the shape the old pin covered;
+- killed by **itself**: the pending bit is still there when `kill` returns, so the signal is taken at
+  that call's own syscall-exit gate, one thread exits, the parked sibling is never retired,
+  `group_dead` is false and the parent's `wait4` parks for ever.
+
+The proof is the park dump's own syscall number: `gone slot 18 pid 18 parent=17 park 2 syscall 62
+released=true retired=false` - 62 is `kill` on x86_64, not 34 (`pause`), so the leader died at the
+`kill` gate and never reached the `pause` after it.
+
+**The fix** is one door and no second reading of the same rule:
+`child_exit::die_of_fatal_signal(sig)` walks `end_group_siblings` and then `exit`s with the number.
+`take_fatal_signal` now only *takes* the signal, and every fatal-death site routes through the door:
+its six callers in `src/sched/runtime/task.rs` (`:2837`, `:2881`, `:2917`, `:2949`, `:3022`, `:3479`),
+`deliver_signal`'s `Terminate` arm and its frame-build fallback, and `rt_sigtimedwait`'s poll loop.
+Linux decides the same question earlier, at `complete_signal` time (`SIGNAL_GROUP_EXIT`); this kernel
+decides it at the death site, which is why there can be only one death site. The seccomp arms
+(`src/syscall/linux/mod.rs:106`, `:213`) deliberately stay outside: their own comments say a
+kernel-initiated end is not a delivery, so pid-namespace init protection does not apply.
+
+**The pin had to grow a second fixture.** `t-kill-ends-group`'s existing fixture kills its child from
+the parent's side after a 700 ms wait - exactly the shape that already worked. The new one,
+`self_killed_process`, has the same parked worker and calls `kill(getpid(), SIGKILL)` itself; neither
+fixture parks the leader in `pause(2)`, which would take the signal inside a wait and re-test the old
+path.
+
+Counterfactual, measured with the fix's call sites reverted to bare `exit`s on the shipped
+`take_fatal_signal`-ends-the-group code, one test booted alone (`build/probe/oneshot/serial.log`):
+
+```
+=== RUN t-kill-ends-group
+ok:    the fixture process starts
+ok:    the process is reaped even though a thread was parked in a futex
+ok:    the death is the signal that killed it
+ok:    the self-killing fixture process starts
+FAIL:  a process that kills itself is reaped though its thread is parked in a futex
+FAIL:  a self-kill is still the signal that is reported as the cause
+=== t-kill-ends-group exit=1
+```
+
+and on the fixed kernel the same boot reads six `ok:` and `exit=0`. Both outside-kill claims stay
+green in the counterfactual - the asymmetry the single-fixture pin could not see. Full sweep after the
+change: x86_64 `pass=255 fail=0 (255 built)`, aarch64 `pass=254 fail=0 (254 built)`, host 1224 tests
+0 failed (`build/gate-both5.log`).
+
+**A trap that cost an hour, recorded so the next session does not pay it again.** The UEFI loader
+carries the kernel *inside its own image* (`boot/src/lib.rs:176`,
+`PACKED_KERNEL = include_bytes!(concat!(env!("OUT_DIR"), "/kernel.deflate"))`). Rebuilding
+`-p mpos` alone changes nothing a boot can see: `.workbuddy/one-test-boot.sh` copies
+`target/x86_64-unknown-uefi/release/mpos-boot.efi`, which still holds the previous kernel. Two
+"counterfactual" boots at 23:48 and 23:55 reported the pin green because they were running the 23:09
+loader; the reading was of the *fixed* kernel both times. Every hand-verification of a kernel change
+must rebuild both:
+
+```bash
+cargo build --target x86_64-unknown-none --release
+MPOS_KERNEL_ELF=$PWD/target/x86_64-unknown-none/release/mpos \
+    cargo build -p mpos-boot --release --target x86_64-unknown-uefi
+```
+
+A marker `println!` in the boot flow is the cheap check that the booted kernel is the one just built.

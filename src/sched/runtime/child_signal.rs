@@ -1978,6 +1978,16 @@ pub fn take_signal_in_set(
 /// every signal this kernel names is to die of it. A signal with a handler is
 /// left pending - it needs the register frame on the way out of a syscall to
 /// run on, and a task sitting in a blocking call has not reached one yet.
+///
+/// It only **takes** the signal; it does not die of it. Every caller must end
+/// the task through `child_exit::die_of_fatal_signal`, which is the one place
+/// that knows a fatal signal takes the whole thread group with it. This
+/// function used to end the group itself, and that put the group's fate in the
+/// hands of whichever thread happened to reach a blocking wait: a leader that
+/// killed itself was ended at its `kill` call's own syscall-exit gate, which
+/// called `exit` directly, so the parked sibling outlived it and the parent's
+/// `wait` never returned (`docs/notes/` §7.4h, §6.77b, pinned by
+/// `t-kill-ends-group`'s self-kill fixture).
 pub fn take_fatal_signal() -> Option<u8> {
     with_table(|t| {
         let id = t.current;
@@ -2007,20 +2017,6 @@ pub fn take_fatal_signal() -> Option<u8> {
             }
             found
         };
-        if sig.is_some() {
-            // A fatal signal ends the whole thread group, not the one thread
-            // that took it: Linux's `complete_signal` sets `SIGNAL_GROUP_EXIT`
-            // for a signal with no handler whose default action terminates,
-            // wherever in the group it was taken. Without it a group keeps a
-            // thread parked in a blocking wait forever - that thread never
-            // reaches a syscall-exit gate that would read its pending set, and
-            // nothing else ever wakes it. Pinned by `t-kill-ends-group`: a
-            // killed process whose second thread is parked in a futex is reaped
-            // within the kill, where before the parent's `wait` parked on a
-            // group that could not die.
-            let tgid = t.task(id).tgid;
-            super::child_exit::end_group_siblings(t, id, tgid);
-        }
         sig
     })
 }

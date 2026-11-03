@@ -241,7 +241,14 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
         // be in, "no handler" and "dies of it" really were the same thing.
         match crate::sched::signal::default_action(sig) {
             crate::sched::signal::DefaultAction::Terminate => {
-                crate::sched::exit(-(sig as isize));
+                // The one door a fatal signal ends a task through, and the
+                // reason it is not a bare `exit`: a signal with no handler
+                // takes the whole thread group, as Linux's `complete_signal`
+                // does when it sets `SIGNAL_GROUP_EXIT`. A direct `exit` here
+                // ended only this thread, so a leader that killed itself left
+                // its parked sibling alive and the parent's `wait` parked
+                // forever (`docs/notes/` §6.77b, §7.4h).
+                crate::sched::die_of_fatal_signal(sig);
             }
             crate::sched::signal::DefaultAction::Ignore => return false,
             // Arriving at a task that is *running*: it is already going, so the
@@ -276,7 +283,7 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number
         // in the exit code so the parent can tell which one it was.
-        crate::sched::exit(-(sig as isize));
+        crate::sched::die_of_fatal_signal(sig);
     }
     true
 }
@@ -3261,7 +3268,7 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
             return sig as isize;
         }
         if let Some(sig) = crate::sched::take_fatal_signal() {
-            crate::sched::exit(-(sig as isize));
+            crate::sched::die_of_fatal_signal(sig);
         }
         if let Some(end) = deadline
             && crate::hal::since_boot_nanos() >= end

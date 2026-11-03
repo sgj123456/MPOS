@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-10-24, the two-clocks freeze fix §6.24):** x86_64
+**Latest measured gate (2026-11-04, one door for a fatal signal §6.77b):** stage 1
+`1224 tests, 0 failed` (16.18 s); x86_64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35
+passed, 0 failed`, exit 33; aarch64 `pass=254 fail=0 (254 built)`, `mpos-kunit 35
+passed, 0 failed`, `=== END` on every lane; `total 45.90 s` (`build/gate-both6.log`).
+Both machines are still the default sweep (`cargo xtask test`), and this run's
+aarch64 lanes are the first since the second machine's display backend was told to
+answer for the card it attaches instead of `machine.toml`'s baseline card (§15.100)
+— before that fix every headless aarch64 lane asked QEMU for `egl-headless,gl=on`
+and a host without `/dev/dri` never started one.
+
+**Measured gate before it (2026-10-24, the two-clocks freeze fix §6.24):** x86_64
 `=== SUMMARY pass=205 fail=0 (218 built)`, `mpos-kunit 32 passed, 0 failed`,
 exit 33; aarch64 `=== SUMMARY pass=203 fail=0 (203 built)`, `mpos-kunit 32
 passed, 0 failed`, `=== END` on every lane — the first aarch64 figure since
