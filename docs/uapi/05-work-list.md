@@ -8873,6 +8873,11 @@ The fourth boot measured the exact state instead: one `slot 17 name=/usr/bin/wes
 stopping right after `EGL features:` - the process's only thread asleep in one `futex(2)` wait with no
 waker (§7.4h's fourth reading).
 
+A futex-door instrument then measured the wait itself: the whole boot printed exactly one
+`futex wait tid=19 addr=0x7ecbaeb90654 exp=2` and **no** end line, while the main thread was already
+`gone ... released=true retired=false` - a thread parked on a futex nobody wakes, outliving the thread
+that made it (§7.4h).
+
 - the stall reproduces (`alive after TERM: yes`, log ending at `caught signal 15`);
 - `/proc/<pid>/stat` goes from `S threads: 2` before the kill to `R threads: 1` after it, and the
   surviving thread's last park site is **4** — the block layer's completion wait

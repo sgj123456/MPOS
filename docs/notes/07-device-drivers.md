@@ -8084,3 +8084,34 @@ process has not reached, and this kernel's futex wait is not interrupted by a ha
 The next instrument is on the futex side, not the display side: record `(uaddr, expected value, tid)`
 for every `futex(2)` wait and every wake the process makes, and print the wait's owner when the
 heartbeat first sees it frozen. That names the mutex or condvar the compositor is sitting on.
+
+### §7.4h, the futex that is never woken
+
+An instrument on the futex door (`src/sched/futex.rs::wait_bitset`, printing the address, expected
+value and bitset on entry and how the wait ended, for `weston` tasks only) ran in a boot where the
+compositor **did** paint (`waited 2 s for the output`) and then exited by itself (`gone before TERM`).
+
+The whole boot printed exactly **one** line:
+
+```
+mpos-dbg: futex wait tid=19 addr=0x7ecbaeb90654 exp=2 bits=0xffffffff now=14502539716
+```
+
+- there is **no** matching end line, so that wait never ended - the thread (tid 19) is still inside it
+  when the boot is cut at 780 s;
+- the heartbeat agrees: `slot 19 pid 19 name=weston:disk$0 park 2 (block_until_nanos) syscall 202
+  parks=4`, the count frozen on every sample;
+- the main thread is `gone slot 17 pid 17 ... released=true retired=false fds=18`, with its last park
+  site 8 = `ext4_scratch_wait` (`src/sched/runtime/task.rs:43`'s vocabulary).
+
+So two shapes now stand side by side, and both are "a thread asleep on a futex nobody wakes":
+
+1. the earlier boot: the process's **only** thread (`/usr/bin/weston`) parked at `syscall 202` with
+   `parks=6831` frozen, its log stopping after `EGL features:`;
+2. this boot: the main thread **exited**, leaving `weston:disk$0` (tid 19) parked at a futex that is
+   never woken, and the slot's own record says `retired=false`.
+
+The second shape is the sharper defect: a thread outlives the exit of the thread that made it, so the
+process cannot finish. The questions it leaves are (a) whether that exit was `exit(2)` or
+`exit_group(2)` and what `end_group_siblings` saw, and (b) whether a `SIGTERM` to the group reaches a
+sibling parked on a futex - item 192 measured `EINTR` for `epoll_wait` and `read`, not for this door.
