@@ -7889,3 +7889,69 @@ Before the fix the same script ended at `EGL error state: EGL_NOT_INITIALIZED (0
 when a client asks - `kill -TERM` at 25 s logs `caught signal 15` and the process stays in
 `park 1 (block_until_on)`. So §7.4's scan-out row is past the EGL wall and the next defect is the
 compositor's own shutdown path, which is a separate round.
+
+## §7.4h The compositor's shutdown leaves one thread spinning in a block wait — MEASUREMENT
+
+`§7.4g` ended on an open line: weston logged `caught signal 15` and stayed alive. `§6.76`'s pin
+(`t-signal-park`) then removed the cheapest explanation — a caught signal **does** end a parked
+`epoll_wait(-1)` and a parked pipe `read(2)` with `-1`/`EINTR` on this machine — so the next question
+was when the kill lands. Measured twice on the same image (`build/scratch/wsig2/`, boot line
+`-device virtio-gpu-gl-pci -vga none -display egl-headless,gl=on`), with the script polling weston's
+own log for `Output 'Virtual-1' enabled` before killing it:
+
+```
+waited 2 s for the output
+alive after TERM: yes
+--- log tail ---
+[04:15:33.281] Loading module '/usr/lib/weston/desktop-shell.so'
+[04:15:33.299] launching '/usr/libexec/weston-desktop-shell'
+[04:15:36.472] caught signal 15
+=== end ===
+```
+
+So the stall **is** real in the shape §7.4g recorded, once the signal lands after the compositor's
+main loop is up (its startup shape exits cleanly: `§6.76`). The next boot asked the process itself,
+`/proc/<pid>/stat` field 3 and field 20, and `/proc/<pid>/task`:
+
+```
+pid=17 before TERM
+stat before: S threads: 2
+after TERM:
+stat after: R threads: 1
+task dir:
+17
+  *: R 4
+```
+
+Reading: the group had **two** threads before the kill (`S`, the main loop parked) and has **one**
+after it — the main thread exited and **the surviving thread is running (`R`) with its last park
+site 4**, which is the block layer's completion wait
+(`src/drivers/virtio/blk.rs:216`, `block_until_uninterruptible_until(4, blk_irq::completed, deadline)`;
+site 4 has no other caller). The scheduler therefore never reaps the group, `kill(2)`/`kill -0` still
+finds the pid, and the shutdown looks like a hang.
+
+The heartbeat during the same window rules out "waiting on a live transfer":
+
+```
+mpos: heartbeat ... blk-busy=false blk-waiter=none blk submits=20020 retires=20020 -- live slots:
+mpos:   slot 17 pid 17 name=weston:disk$0 park 4 (block_until_uninterruptible) syscall 11 parks=7238  <-- running
+mpos:   slot 19 pid 19 name=weston:disk$0 park 2 (block_until_nanos) syscall 202 parks=3
+```
+
+`submits == retires` and `blk-busy=false` mean the mailbox is idle and no submission is outstanding,
+while the task is at the completion wait's site and its park count is large — i.e. it is going round
+the wait's own loop (`until` → `peek_used()` → re-arm the deadline) rather than sleeping on a device
+that owes it a completion. Two candidate mechanisms, neither measured yet, and the next instrument is
+named here so the question does not drift:
+
+1. the completion **was** taken by someone else (`finish_request` ran while this task still waited, so
+   `completed()` stays false and the used head is no longer its token), or
+2. the group's exit retired the sibling (`end_group_siblings`, `src/sched/runtime/child_exit.rs:2188`)
+   while it was inside that wait, so the waiting task is no longer scheduleable but still holds the
+   mailbox's claim — which the heartbeat's `blk-busy=false` does not show, because `busy()` reads the
+   claim's holder and a retired task reads as not alive.
+
+The discriminating print is one iteration counter plus `token`/`completed()`/`busy()`/`holder_slot()`
+and the used head, emitted when the count passes a threshold in that loop — not run in this round.
+
+Logged in the work list as item 193; the ROADMAP's display row points here.

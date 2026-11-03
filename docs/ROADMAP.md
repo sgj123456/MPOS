@@ -793,6 +793,8 @@ on 2026-10-25: the block layer's completion path (completions interrupt-driven, 
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).
 
+The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at the block layer's completion wait, so the group is never reaped.
+
 ---
 
 

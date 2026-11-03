@@ -8858,3 +8858,19 @@ too"). Host lib 726. Gates: x86_64 `pass=252`, aarch64 `pass=251`.
 
 **Not used**: the on-disk `i_generation` at offset 100 - it is ext4's checksum/rename cookie and says
 nothing about reuses within this mount.
+
+### Item 193 - the compositor's shutdown leaves one thread spinning in a block wait (2026-11-03, open)
+
+`§7.4h` in `docs/notes/07-device-drivers.md`. Two boots of the same image, with the probe polling
+weston's log for `Output 'Virtual-1' enabled` before sending `SIGTERM`:
+
+- the stall reproduces (`alive after TERM: yes`, log ending at `caught signal 15`);
+- `/proc/<pid>/stat` goes from `S threads: 2` before the kill to `R threads: 1` after it, and the
+  surviving thread's last park site is **4** — the block layer's completion wait
+  (`src/drivers/virtio/blk.rs:216`) — so the main thread exited and one thread is still running;
+- the heartbeat in that window reads `blk-busy=false`, `blk-waiter=none`, `submits=20020 retires=20020`
+  with that task parked at site 4, so no transfer is outstanding while it sits at the wait.
+
+Two candidate mechanisms are named in §7.4h (a completion consumed by someone else; the group's exit
+retiring the sibling inside the wait) and the next instrument is an iteration counter plus
+`token`/`completed()`/`busy()`/`holder_slot()` at that loop's threshold. Not yet run.
