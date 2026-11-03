@@ -92,14 +92,44 @@ fn self_killed_process() -> ! {
     }
 }
 
+/// The same process again, but the leader **faults** instead of being signalled.
+///
+/// The third way to die of a fatal signal, and the one that never passes through
+/// the signal machinery at all in this kernel: a faulting instruction cannot
+/// wait for a syscall boundary, so the machine's own fault handler asks the
+/// disposition and ends the process where it faulted. That is a third place a
+/// fatal default action ends a task, and it owes the group the same answer - on
+/// Linux a `SIGSEGV` with no handler kills the *process*, so its parked thread
+/// goes with it and the parent's `wait` reads `WIFSIGNALED`/`SIGSEGV`.
+fn faulted_process() -> ! {
+    let _worker = spawn_parker();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // A `std` program does not start with `SIG_DFL` for `SIGSEGV`: the runtime
+    // installs its stack-overflow guard, which is a handler. Restoring the
+    // default is what makes this a *fatal* default action, and it is also what
+    // an ordinary C program or a shell would have without asking for one.
+    // SAFETY: no pointer argument; `SIG_DFL` is the value the kernel starts with.
+    unsafe { libc::signal(libc::SIGSEGV, libc::SIG_DFL) };
+    // An address nothing maps, kept opaque so the compiler cannot fold the
+    // store away or turn a known-null write into a trap instruction: the pin is
+    // about the machine's page fault, not about a guard the optimiser inserted.
+    let bad = std::hint::black_box(0xdead_0000 as *mut u8);
+    // SAFETY: this store is the whole test. It must fault.
+    unsafe { std::ptr::write_volatile(bad, 1) };
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
 /// Spawn one fixture, wait for its worker to park, and report what became of it.
 ///
 /// `kill_it` is the difference between the two shapes: `Some(sig)` sends that
 /// signal from **here**, after the park, which is the outside-kill path;
 /// `None` leaves the fixture to kill itself, which is the syscall-gate path.
-/// Returns whether the death was reaped and whether it was the signal asked
-/// for, so `main` can turn each into its own claim.
-fn run_fixture(arg: &str, kill_it: Option<libc::c_int>) -> Option<(bool, bool)> {
+/// Returns whether the death was reaped and which signal the kernel named as the
+/// cause (`None` when it exited by code, or never answered), so `main` can turn
+/// each into its own claim.
+fn run_fixture(arg: &str, kill_it: Option<libc::c_int>) -> Option<(bool, Option<libc::c_int>)> {
     let child = Command::new(std::env::current_exe().expect("own path"))
         .arg(arg)
         .spawn();
@@ -119,13 +149,13 @@ fn run_fixture(arg: &str, kill_it: Option<libc::c_int>) -> Option<(bool, bool)> 
     // that never returns, and a hang is not an answer this pin can report.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut reaped = false;
-    let mut signalled = false;
+    let mut killed_by = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 use std::os::unix::process::ExitStatusExt;
                 reaped = true;
-                signalled = status.signal() == Some(libc::SIGKILL);
+                killed_by = status.signal();
                 break;
             }
             Ok(None) => {
@@ -142,7 +172,7 @@ fn run_fixture(arg: &str, kill_it: Option<libc::c_int>) -> Option<(bool, bool)> 
         // machine rather than with this program's exit.
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    Some((reaped, signalled))
+    Some((reaped, killed_by))
 }
 
 fn main() -> ! {
@@ -151,6 +181,7 @@ fn main() -> ! {
     match std::env::args().nth(1).as_deref() {
         Some("child") => parked_process(),
         Some("selfkill") => self_killed_process(),
+        Some("fault") => faulted_process(),
         _ => {}
     }
 
@@ -160,12 +191,15 @@ fn main() -> ! {
     // in a timed sleep, so it is taken inside that wait.
     let child = run_fixture("child", Some(libc::SIGKILL));
     report.check("the fixture process starts", child.is_some());
-    let (reaped, signalled) = child.unwrap_or((false, false));
+    let (reaped, killed_by) = child.unwrap_or((false, None));
     report.check(
         "the process is reaped even though a thread was parked in a futex",
         reaped,
     );
-    report.check("the death is the signal that killed it", signalled);
+    report.check(
+        "the death is the signal that killed it",
+        killed_by == Some(libc::SIGKILL),
+    );
 
     // Shape two: the leader kills itself, so the death is taken at the `kill`
     // call's own exit gate rather than inside a wait. Same group, same question.
@@ -174,14 +208,29 @@ fn main() -> ! {
         "the self-killing fixture process starts",
         selfkill.is_some(),
     );
-    let (reaped, signalled) = selfkill.unwrap_or((false, false));
+    let (reaped, killed_by) = selfkill.unwrap_or((false, None));
     report.check(
         "a process that kills itself is reaped though its thread is parked in a futex",
         reaped,
     );
     report.check(
         "a self-kill is still the signal that is reported as the cause",
-        signalled,
+        killed_by == Some(libc::SIGKILL),
+    );
+
+    // Shape three: the leader takes a fault with `SIG_DFL`, so the machine's own
+    // fault handler ends it - no syscall gate, no blocking wait, and the same
+    // question about the parked sibling.
+    let faulted = run_fixture("fault", None);
+    report.check("the faulting fixture process starts", faulted.is_some());
+    let (reaped, killed_by) = faulted.unwrap_or((false, None));
+    report.check(
+        "a process whose thread faults is reaped though its thread is parked in a futex",
+        reaped,
+    );
+    report.check(
+        "the death is the fault that thread took",
+        killed_by == Some(libc::SIGSEGV),
     );
 
     report.finish()

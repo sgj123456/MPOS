@@ -399,9 +399,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         // forever, with the signal never leaving the pending set. A SIGSEGV
         // with no handler is death - end the task here, the way the delivery
         // path at a syscall exit would, with the signal number in the exit
-        // code for the parent's `wait` to read.
+        // code for the parent's `wait` to read. The whole group dies with it
+        // (`die_of_fatal_signal`): a `SIGSEGV` with no handler kills the
+        // *process* on Linux, not one thread of it, and ending only this thread
+        // leaves a sibling parked with nobody to wake it (`docs/notes/` §6.77b).
         if crate::hal::kernel::disposition_is_default(11) {
-            crate::hal::kernel::exit(-11);
+            crate::hal::kernel::die_of_fatal_signal(11);
         }
         // A task that *installed* a handler needs the signal-frame machinery,
         // and that machinery is written against the syscall gate's frame - a
@@ -420,7 +423,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                  the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
                 crate::hal::kernel::current()
             );
-            crate::hal::kernel::exit(-11);
+            crate::hal::kernel::die_of_fatal_signal(11);
         }
         crate::hal::kernel::preempt();
         return;
@@ -942,7 +945,7 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
         );
         crate::hal::kernel::send_signal(11); // SIGSEGV
         if crate::hal::kernel::disposition_is_default(11) {
-            crate::hal::kernel::exit(-11);
+            crate::hal::kernel::die_of_fatal_signal(11);
         }
         if fault_repeats(rip) {
             crate::hal::kernel::kprintln!(
@@ -950,7 +953,7 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
                  the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
                 crate::hal::kernel::current()
             );
-            crate::hal::kernel::exit(-11);
+            crate::hal::kernel::die_of_fatal_signal(11);
         }
         crate::hal::kernel::preempt();
         return true;

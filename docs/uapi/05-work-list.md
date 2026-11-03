@@ -6801,18 +6801,35 @@ thread died, the parked sibling outlived it, `group_dead` was never true, and th
 parent's `wait` still parked forever. Measured: `gone slot 18 pid 18 ... syscall
 62 released=true retired=false`, syscall 62 being `kill` (§6.77b). Linux answers
 "process or thread?" at generation, in `complete_signal`; here it is answered at
-one death site instead, so there is exactly one.
+one death site instead, so there is exactly one — and, since 2026-11-04, one door
+*per seam*: the same walk is reachable from the arch layer, which cannot name
+`sched`, through `hal::kernel::die_of_fatal_signal` (§6.77c).
 
-Pinned by `t-kill-ends-group` (both machines) with two fixtures: a re-exec child
-killed from **outside** (the original shape — the signal is taken inside a
-blocking wait) and one that `kill(getpid(), SIGKILL)`s **itself** (the shape that
-reaches the syscall-exit gate). Each has a worker in `FUTEX_WAIT`, and the parent
-polls `WNOHANG` so a hang reports as a false claim instead of a harness timeout.
-Host Linux is the reference (`MPOS_ON_HOST=1`, both fixtures 6/6 ok).
+Pinned by `t-kill-ends-group` (both machines) with **three** fixtures: a re-exec
+child killed from **outside** (the original shape — the signal is taken inside a
+blocking wait), one that `kill(getpid(), SIGKILL)`s **itself** (the shape that
+reaches the syscall-exit gate), and one whose leader takes a **page fault** with
+`SIG_DFL`. Each has a worker in `FUTEX_WAIT`, and the parent polls `WNOHANG` so a
+hang reports as a false claim instead of a harness timeout. Host Linux is the
+reference (`MPOS_ON_HOST=1`, three fixtures 9/9 ok).
 Counterfactual, measured on the unfixed kernel: the two self-kill claims are RED
 (`exit=1`) while both outside-kill claims stay green — precisely the asymmetry the
 old single-fixture pin could not see. Full sweep after the change: `pass=255
 fail=0` (x86_64) and `pass=254 fail=0` (aarch64) (§6.77b, §6.37).
+
+The **third** door is behind the arch seam, and it is the same rule one layer
+down: a faulting instruction cannot wait for a syscall boundary, so the machine's
+own fault handler answers the disposition itself and the arch crate cannot reach
+`sched` at all. Seven sites (`idt.rs`'s four on x86_64, `vectors.rs`'s three on
+aarch64) answered `hal::kernel::exit(-11)`/`exit(-4)` — one thread died, a parked
+sibling lived, `wait` parked forever. The door is on the `Kernel` trait now
+(`die_of_fatal_signal`, implemented by `src/kernel_services.rs` behind
+`sched::die_of_fatal_signal`), every fault site calls it, and `kernel::exit` has
+no caller left outside the hal. Counterfactual for this one: with the four x86
+fault sites reverted, the three fault claims go RED (`exit=1`) while the six
+signal-door claims stay green — `FAIL: a process whose thread faults is reaped
+though its thread is parked in a futex` and `FAIL: the death is the fault that
+thread took` (§6.77c).
 
 ## item 124 — an eventfd's write wakes the pollers parked on it
 

@@ -4464,7 +4464,8 @@ special case: being retired is stronger than being woken, and `exit_group`'s own
 siblings have been ended this way since it landed.
 
 The door exists because there were two, and the second one was found later
-(§6.77b). Having `take_fatal_signal` end the group put the group's fate in the
+(§6.77b, and §6.77c for the same rule at the arch's own fault handlers). Having
+`take_fatal_signal` end the group put the group's fate in the
 hands of *where* the signal was taken: a parked task took it inside a blocking
 wait and the group died, but a task that killed **itself** took it at that `kill`
 call's own syscall-exit gate, whose `Terminate` arm called a bare `exit` — one
@@ -5248,3 +5249,102 @@ MPOS_KERNEL_ELF=$PWD/target/x86_64-unknown-none/release/mpos \
 ```
 
 A marker `println!` in the boot flow is the cheap check that the booted kernel is the one just built.
+
+**The doors this one did not close.** The fix above routed every death through the *signal* machinery.
+The arch's own fault handlers do not pass through it: they answer the disposition themselves, so the
+same defect lived there in seven sites, one layer down and behind the `hal::kernel` seam. Closed the
+same day by carrying the door across that seam - `hal::kernel::die_of_fatal_signal` (§6.77c).
+
+### §6.77c the same two doors, one layer down: the machine's own fault handler - **FIXED (2026-11-04)**
+
+§6.77b closed every *signal* door. It left one family open, and the audit that found the fix's
+shape named it: the arch's fault handlers end a task without going through `sched::exit` at all.
+There were seven of them, and every one answered `-11` (SIGSEGV) or `-4` (SIGILL) by calling
+`crate::hal::kernel::exit(code)` - a door that marks the faulting task exited and nothing else. So a
+process whose *leader* faults with `SIG_DFL` left a parked sibling alive for exactly the reason
+§6.77b's self-kill did, and its parent's `wait` parked forever:
+
+- x86_64, `arch/src/arch/x86_64/idt.rs` - the page fault's `disposition_is_default(11)` arm and its
+  `fault_repeats(rip)` arm, and `user_fault_or_die`'s two arms of the same pair (four sites).
+- aarch64, `arch/src/arch/aarch64/vectors.rs` - `el0_sync`'s `Sys64Answer::Segv` arm, its residual
+  fault arm, and the unhandled-sysreg arm that answers `-4` (three sites).
+
+The fix is the door carried across the arch seam, because the arch layer cannot reach `sched` (it is
+a `no_std`, downward-only crate that talks to the kernel through `hal::kernel`'s `Kernel` trait):
+
+```rust
+// arch/src/hal/kernel.rs, on the trait, beside `exit`
+fn die_of_fatal_signal(&self, sig: u8) -> !;
+
+// and the free forward every arch module calls
+#[inline]
+pub fn die_of_fatal_signal(sig: u8) -> ! { registered().die_of_fatal_signal(sig) }
+```
+
+`src/kernel_services.rs` is the trait's only implementor and answers with
+`sched::die_of_fatal_signal(sig)`, so **the arch's `-11` now means what the signal number means
+everywhere else**: the group ends, then the task exits with `-(sig)`. All seven sites call it, and
+`grep -rn "kernel::exit(" arch/src/` has no caller left outside the hal's own definition.
+
+Why the fault sites cannot simply call `exit(-11)` and then have `exit` do the walk: `exit` decides
+`group_dead` by asking whether any task of the group is still alive, and a parked sibling always is -
+that decision is *correct* for a caller that is the last one leaving and wrong for one that is
+leaving first. The walk has to happen before the decision, which is why it is a door and not a
+branch inside `exit`.
+
+**Pinned** by `t-kill-ends-group`'s third fixture (`user/tests/src/bin/t-kill-ends-group.rs`). It
+spawns the same `FUTEX_WAIT` parker, sleeps 300 ms so the worker is parked, then restores `SIG_DFL`
+for `SIGSEGV` and stores through an unmapped address:
+
+```rust
+unsafe { libc::signal(libc::SIGSEGV, libc::SIG_DFL) };
+let bad = std::hint::black_box(0xdead_0000 as *mut u8);
+unsafe { std::ptr::write_volatile(bad, 1) };
+```
+
+The `signal(SIGSEGV, SIG_DFL)` is load-bearing and was measured the hard way: a Rust `std` program
+starts with the runtime's stack-overflow handler installed, so the first version of this fixture took
+the `fault_repeats` arm instead of the default-action arm and the kernel printed
+
+```
+task 6 died of SIGSEGV it could not be handed: 0xdead0000 (PageFaultErrorCode(CAUSED_BY_WRITE |
+USER_MODE)) at 0x445bb9, the same fault 3 times over, and a handler is installed
+```
+
+That is a *correct* answer to a question the pin was not asking. `black_box` is load-bearing for the
+same class of reason: a store through a constant address can be folded into a trap instruction, and
+the pin is about the machine's page fault.
+
+The three claims are "the faulting fixture process starts", "a process whose thread faults is reaped
+though its thread is parked in a futex", and "the death is the fault that thread took"
+(`killed_by == Some(SIGSEGV)`; `run_fixture` returns `status.signal()` now, so a fixture that died of
+the *wrong* signal fails rather than passing as "reaped"). Host Linux is the reference: all nine
+claims `ok:` and `PASS` under `MPOS_ON_HOST=1` (three fixtures x three claims).
+
+**Counterfactual, measured.** With the four x86 fault sites reverted to `kernel::exit(-11)` (kernel
+*and* loader rebuilt - see §6.77b's trap), the pin reports
+
+```
+t-kill-ends-gro[6]: segfault at dead0000 ip 0000000000445bc5 sp 000000003fa3dbb0 error 6
+FAIL:  a process whose thread faults is reaped though its thread is parked in a futex
+FAIL:  the death is the fault that thread took
+=== t-kill-ends-group exit=1
+```
+
+with the six signal-door claims still green. Restored, the same boot prints all nine `ok:` and
+`=== t-kill-ends-group exit=0`, with a marker `println!` in the boot flow
+(`mpos-dbg: marker-B fault door kernel`) proving the booted kernel was the one just built.
+
+**The gate** (`build/gate-faultdoor3.log`, both arms): stage 1 `1224 tests, 0 failed` (15.97 s);
+x86_64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33, `total 16.20 s`;
+aarch64 `pass=254 fail=0 (254 built)`, `mpos-kunit 35 passed, 0 failed`, every lane `ok` on
+`=== END`, `total 49.30 s`. `t-kill-ends-group` is the heaviest program on x86_64 lane 4 (2.18 s) and
+on aarch64 lane 5 (2.35 s), which is its three fixtures' sleep budget, not a stall.
+
+Two runs before that one failed on **unrelated, already-known ground**: a stage-1 red whose captured
+tail held compiler warnings and no failing test (`build/gate-faultdoor.log` - the standalone rerun of
+the gate's own cargo command is 726 + every leaf crate green), and one `FAIL t-ptrace-attach` on
+`a detach leaves a stop the user asked for alone` in `build/test-lane-x86_64-5/serial.log`, the
+same claim whose 20x10 ms poll was tightened for budget in §15.93. Both re-ran green without a change
+to this work; the readings are recorded so the next red is compared against them rather than
+re-litigated.

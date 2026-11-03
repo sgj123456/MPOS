@@ -160,7 +160,28 @@ pub trait Kernel: Sync {
     fn disposition_is_default(&self, sig: u8) -> bool;
 
     /// End the running task with `code`. Never returns.
+    ///
+    /// Only one thread ends. A task that a *fatal signal* kills takes its whole
+    /// thread group with it ([`die_of_fatal_signal`](Self::die_of_fatal_signal)):
+    /// Linux answers "process or thread?" when the signal is generated, and
+    /// every member dies of it. A machine that calls this where the process is
+    /// what died leaves a sibling parked in a blocking wait with nobody left to
+    /// wake it - which is how the weston shutdown stall of `docs/notes/` §7.4h
+    /// got its `retired=false`.
     fn exit(&self, code: isize) -> !;
+
+    /// End the running task **and its whole thread group** of a fatal signal
+    /// `sig`: the one door a signal whose default action terminates ends a task
+    /// through. Never returns.
+    ///
+    /// The parent's `wait` reads the cause back as `WIFSIGNALED`/`sig`, exactly
+    /// as [`exit`](Self::exit)`(-(sig as isize))` would write it. This exists
+    /// beside `exit` rather than replacing it because the two answer different
+    /// questions: a seccomp kill and the pid-namespace init's own fault are the
+    /// kernel ending *this task*, while a signal Linux's `complete_signal` would
+    /// have turned into `SIGNAL_GROUP_EXIT` is the kernel ending the *process*
+    /// (`docs/notes/` §6.77b).
+    fn die_of_fatal_signal(&self, sig: u8) -> !;
 
     /// The machine has no frame for the running task's own fault: end the
     /// process the way Linux's OOM killer does, and never return.
@@ -444,6 +465,13 @@ pub fn disposition_is_default(sig: u8) -> bool {
 #[inline]
 pub fn exit(code: isize) -> ! {
     registered().exit(code)
+}
+
+/// End the running task and its thread group of a fatal signal. See
+/// [`Kernel::die_of_fatal_signal`].
+#[inline]
+pub fn die_of_fatal_signal(sig: u8) -> ! {
+    registered().die_of_fatal_signal(sig)
 }
 
 /// End the process that used up the machine's memory. See

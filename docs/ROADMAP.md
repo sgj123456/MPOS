@@ -29,10 +29,12 @@ One-glance status of the whole roadmap.
   (§2.10, item 106), `SIGCONT`'s session door (§2.6), one handler table shared by a
   thread group under `CLONE_SIGHAND` (§2.7) and a fatal signal ending the **whole**
   group through one door (`die_of_fatal_signal`) whichever way it arrives - a kill
-  from outside, a self-kill at the `kill` gate's own exit, or a task's own pending
-  set - so a sibling parked in a futex is retired with it and `timeout(1)`'s `wait`
-  answers (§6.37, §6.77b, item 123); the named residues are the kernel-spawned
-  program path's `SIG_DFL` start and the alternate-stack pin's shape, not a missing rule
+  from outside, a self-kill at the `kill` gate's own exit, a task's own pending
+  set, or a fault the machine's handler answers itself (§6.77c, behind
+  `hal::kernel`) - so a sibling parked in a futex is retired with it and
+  `timeout(1)`'s `wait` answers (§6.37, §6.77b, §6.77c, item 123); the named
+  residues are the kernel-spawned program path's `SIG_DFL` start and the
+  alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  

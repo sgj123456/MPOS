@@ -144,6 +144,10 @@ impl Kernel for Services {
         sched::exit(code)
     }
 
+    fn die_of_fatal_signal(&self, sig: u8) -> ! {
+        sched::die_of_fatal_signal(sig)
+    }
+
     fn out_of_memory(&self) -> ! {
         sched::out_of_memory()
     }

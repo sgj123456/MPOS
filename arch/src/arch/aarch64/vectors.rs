@@ -1119,8 +1119,9 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // (a libc's larger stack, its thread arena, a `fork`'s COW page) can grow its
     // memory the way the 142 x86 musl tests already do. Any fault left after them
     // is the program's own error; Linux's answer is `SIGSEGV`, whose default action
-    // is death - delivered here as the task exiting with `-11`, which is what the
-    // aarch64 signal-frame path would end at anyway, so it is the honest answer,
+    // is death - delivered here as the process exiting with `-11` through
+    // `die_of_fatal_signal`, which is what the aarch64 signal-frame path would
+    // end at anyway, so it is the honest answer,
     // not a stub that resumes into the same fault forever. Before `sched::started()`
     // (the bring-up EL0 probe) there is no task or VMA to resolve against, so those
     // traps stay fatal.
@@ -1149,7 +1150,9 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                              (pc {:#x}, ESR {esr:#x})",
                             frame.pc
                         );
-                        crate::hal::kernel::exit(-11);
+                        // The process, not this thread: Linux's `SIGSEGV` with
+                        // no handler ends the whole group (`docs/notes/` §6.77b).
+                        crate::hal::kernel::die_of_fatal_signal(11);
                     }
                     // `SIGILL`, Linux's answer to a trap its own table has no
                     // row for (`do_el0_sys` falls through to `do_el0_undef`) -
@@ -1166,7 +1169,9 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                             sys64_register(esr),
                             frame.pc
                         );
-                        crate::hal::kernel::exit(-4);
+                        // `SIGILL`'s default action is death, and it is the
+                        // process that dies (`docs/notes/` §6.77b).
+                        crate::hal::kernel::die_of_fatal_signal(4);
                     }
                 }
             }
@@ -1222,7 +1227,7 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                 frame.pc,
                 frame.sp
             );
-            crate::hal::kernel::exit(-11);
+            crate::hal::kernel::die_of_fatal_signal(11);
         }
         let mut out = pl011::Writer;
         let _ = writeln!(out, "\nEXCEPTION: from EL0, and not a system call");
