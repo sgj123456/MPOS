@@ -292,6 +292,13 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
+**Latest measured gate (2026-11-04, the seccomp stop's queued-signal pin §6.85):** x86_64
+`pass=258 fail=0 (258 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33 (`build/gate-regs1.log`);
+aarch64 `pass=257 fail=0 (257 built)`, `mpos-kunit 35 passed, 0 failed`, every lane on `=== END`
+(`build/gate-regs3.log`). The first aarch64 attempt lost lane 4 at the recorded EL0 boot check
+(`ESR_EL1 0x96000047`, EC 0x25, `FAR_EL1 0x221000`, the lane's serial log only 6591 bytes) and is not a
+reading of the sweep; the re-run is the one quoted.
+
 **Latest measured gate (2026-11-04, one both-arm run with all three stages green —
 `build/gate-sigfutex3.log`, a process-directed signal's thread (§2.12) and `t-ns-cgroup`'s own groups
 (§3.28)):** stage 1 `1224 tests, 0 failed` (30.60 s); x86_64 `pass=256 fail=0 (256 built)`,
