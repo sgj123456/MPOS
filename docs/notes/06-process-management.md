@@ -5631,3 +5631,56 @@ already-recorded flake, not this change's.
 **What is left of the family**: `out_of_memory` (`src/sched/runtime/child_exit.rs`) still does its
 own `end_group_siblings` + `exit` rather than calling the door. It is *correct* - it walks the group
 - and it is duplication rather than a defect, so it is named here and not carried as an open bug.
+
+### §6.78a a `ptrace` claim read a clock where it should have read a state - **FIXED (2026-11-04)**
+
+`t-ptrace-attach`'s "a detach leaves a stop the user asked for alone" went red in gate runs on
+2026-11-04, twice on the aarch64 arm and once on the x86_64 arm, each time alone on its lane and each
+time re-running green. It was carried as a load-dependent flake, and the poll it failed in **is**
+tight: a 20 × 10 ms `waitpid(WNOHANG)` window (200 ms) against a child whose own sleep is 100 ms, after
+the program's budgets were shortened from 2000/1000/800 ms to 100/50/100 ms (§15.93). Re-running it
+eight times in one boot — the shape that makes a budget claim show itself — was 8/8 green, so the
+window was not obviously the whole story.
+
+**The claim was asking a question a window cannot answer.** What a debugger depends on is the state a
+detach leaves the tracee in: a process the user stopped is **`T`** afterwards, and one a detach wrongly
+handed back running is `R`/`S` (or gone, if it reached its exit inside the window). The old check
+observed only "nothing was collected in 200 ms", which a busy machine can produce for a process that
+*is* running — and equally for one that is still parked, which is why the reds were load-shaped and
+not reproducible.
+
+**The reading, instrumented on the machine** (`build/probe/oneshot/serial.log`):
+
+```
+mpos-dbg: ptrace detach state="T" gone=false
+ok:    a detach leaves a stop the user asked for alone
+```
+
+`T` with nothing collected — the kernel's answer was right in every run measured; the flake was the
+*check's* confidence, not the behaviour.
+
+**The fix** makes the claim its own promise: read field 3 of `/proc/<pid>/stat` and assert the state
+letter, keeping the window as a second half rather than the whole test.
+
+```rust
+let state = stat_field(&format!("/proc/{stopped}/stat"), 3).unwrap_or_default();
+r.check(
+    &format!("a detach leaves a stop the user asked for alone (state {state:?})"),
+    !gone && state == "T",
+);
+```
+
+`stat_field` is the helper `t-tid-dir` already owns the shape of (field 2 is inside `comm`, which may
+contain `)`), copied here rather than shared because the test crate has no room for a third opinion
+about a one-field read.
+
+**Measured after the fix.** Eight sequential runs in one boot, all `ok:` with `state "T"`; the host
+reference (`MPOS_ON_HOST=1`) `ok:` and `PASS`; the both-arm gate
+(`build/gate-ptrace.log`) green on all three stages — stage 1 `1224 tests, 0 failed` (15.05 s),
+`verdict pass=256 fail=0` + kunit 35/0 for the first machine, `verdict pass=255 fail=0` + kunit 35/0
+for the second.
+
+**Rule for the next claim built on a poll:** if the property is a state the kernel reports, assert the
+state and use the poll only to establish that nothing was *collected*. A poll alone cannot distinguish
+"still waiting" from "wrong", and the load that makes the two look alike is exactly the load a gate
+runs under.

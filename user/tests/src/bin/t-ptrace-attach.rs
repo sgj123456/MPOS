@@ -112,6 +112,21 @@ fn wait_for_attach_stop(r: &mut Report, pid: libc::pid_t, what: &str) {
     );
 }
 
+/// Field `n` (1-based, as proc(5) numbers them) out of a `stat`-shaped file.
+///
+/// Field 1 is before the parenthesised `comm`, field 2 is inside it, and the
+/// rest are separated by spaces after the **last** `)` - the delimiter `comm`
+/// may itself contain. Copied from `t-tid-dir`, which pins the shape; here it
+/// only answers field 3, the state letter.
+fn stat_field(path: &str, n: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let close = text.rfind(')')?;
+    text[close + 1..]
+        .split_whitespace()
+        .nth(n - 3)
+        .map(str::to_string)
+}
+
 fn sleep_ms(ms: i64) {
     let req = Timespec {
         tv_sec: ms / 1000,
@@ -370,7 +385,18 @@ fn main() {
                 break;
             }
         }
-        r.check("a detach leaves a stop the user asked for alone", !gone);
+        // The claim is a *state*, not an elapsed time: a process the user stopped
+        // is `T` after a detach, and one a detach handed back running is `R`/`S`
+        // here (or gone, if it reached its exit inside the window). Reading the
+        // state is what makes the answer independent of how busy the machine is -
+        // the window alone cannot tell "still parked" from "not collected yet",
+        // which is how this claim turned flaky on a lane running six of these at
+        // once (`docs/notes/` §6.78a).
+        let state = stat_field(&format!("/proc/{stopped}/stat"), 3).unwrap_or_default();
+        r.check(
+            &format!("a detach leaves a stop the user asked for alone (state {state:?})"),
+            !gone && state == "T",
+        );
         unsafe { libc::kill(stopped, libc::SIGCONT) };
         for _ in 0..20 {
             sleep_ms(10);
