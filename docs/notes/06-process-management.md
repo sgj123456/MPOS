@@ -6210,3 +6210,13 @@ is the one running", so a ready entry for the running task is the same task runn
 scheduler wedges rather than merely loses something. The next fix is therefore `hold` being idempotent
 (`if !is_sleeping(id) { push }`, and the ready-band prune kept), and the check is the same pair: the witness
 must read `Ok(0)` and those four waits must not hang.
+
+**Idempotent `hold` does not save the loop (measured 2026-11-04).** The `hold` above was made idempotent
+(`if !is_sleeping(id) { sleep }`) and the re-park loop retried on a full aarch64 arm. It hung three
+programs on their budgets instead of four (`=== FAIL t-waitid timeout=120s`, `=== FAIL t-sysv-msg
+timeout=120s`, `=== FAIL t-timer-create timeout=120s`, `build/gate-stopwake4.log`), so the duplicate-entry
+suspect is wrong too, and the loop shape itself is what wedges: a task that a stray wake has already run
+once will be re-held by the loop, and whatever state `park` returns into - a signal-delivery path that
+believed it had a stopped task - is not a state the loop can put back. Both halves were reverted again.
+**What is left is not a tweak:** the stop has to be owned by one object that both the park and the resume
+can see, instead of "a flag plus a queue entry that either side may or may not find".
