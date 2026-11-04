@@ -707,9 +707,21 @@ pub(crate) struct Retired {
 /// for reuse the moment it is reaped, but the code it exited with can still be
 /// wanted - a milestone check reads it one tick later, and `wait` reads it
 /// once. Reading it takes it: a code belongs to the one caller that collects
-/// it, and anything left over is dropped oldest-first when the cap is reached.
+/// it.
+///
+/// The cap is the table's own width, not a smaller number, and the difference
+/// is a lost death rather than a tidier store. A record is removed the moment
+/// its slot is handed to a new tenant ([`drop_retired`] runs on every allocation
+/// path), so at most one record per slot can be waiting - `MAX_TASKS` entries is
+/// every death this machine can owe at once, and a record dropped before that
+/// point is a death nobody can collect: `wait` for it answers `ECHILD` for ever,
+/// and a caller already parked on it sleeps for ever. Measured before the cap
+/// was raised (`.build/scratch/retired/t-retired.c`, 40 children exited while
+/// the parent slept, then one `waitpid` each): this kernel heard `32 of 40
+/// deaths`, Linux `40 of 40`, and the eight it had forgotten were exactly the
+/// ones evicted (`docs/notes/` §6.81).
 pub(crate) static RETIRED: Mutex<RefCell<Vec<Retired>>> = Mutex::new(RefCell::new(Vec::new()));
-pub(crate) const RETIRED_CAP: usize = 32;
+pub(crate) const RETIRED_CAP: usize = MAX_TASKS;
 
 /// Descriptions an exited process held, waiting to be dropped.
 ///

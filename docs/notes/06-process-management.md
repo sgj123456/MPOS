@@ -5807,3 +5807,53 @@ one side of a pipe happens to die is not a fixture.
 **What is still open is §6.80's own question**: which `busybox` loop the lane leaves one of per program,
 which is what makes this limit reachable inside a single lane's sweep. Fixing the answer's *shape* does
 not fix the leak.
+
+## §6.82 A death was dropped when the store of deaths was full (LANDED 2026-11-04)
+
+The `EAGAIN` fix's pin is what walked into this one. `t-fork-limit` made 57 children, closed their pipe,
+and then hung: two claims printed, then nothing, with the parent parked in `wait4` (`parks=11`) while
+every child read `released=true retired=true` in the stall dump. The children had died and their records
+were gone.
+
+The record store was the cause (`src/sched/runtime/task.rs`):
+
+```rust
+pub(crate) const RETIRED_CAP: usize = 32;
+…
+if retired.len() == RETIRED_CAP { retired.remove(0); }   // in record_retired
+```
+
+A record is removed otherwise only by `drop_retired(id)` when its slot is handed to a new tenant - so one
+record per slot is the most this machine can ever owe at once, and the slot count is 64. The cap was
+half the table, and the eviction dropped the **oldest** uncollected death. Measured with a forty-line
+probe (`build/scratch/retired/t-retired.c`: forty children `_exit` while the parent sleeps, then one
+`waitpid` each):
+
+```
+Linux 7.2.11   heard 40 of 40 deaths
+this kernel    heard 32 of 40 deaths        (waitpid answered -1 for the eight)
+```
+
+That is worse than a lost exit code, which is why it is not a nit. `wait` for an evicted child answers
+`ECHILD` for ever, and a caller **already parked** on it in `block_until_child_event` can never be
+released at all: its predicate is `exit_code(id).is_some() || child_event_in(...)`, the record is gone,
+and the child is gone. The parked parent in `t-fork-limit` was that case.
+
+**Served.** `RETIRED_CAP` is `MAX_TASKS`, with the reasoning written where the constant is: one death per
+slot cannot be exceeded, because the only other way a record leaves is the slot being reused, which calls
+`drop_retired` first.
+
+**Pinned** by `user/tests/src/bin/t-wait-many.rs`: forty children are made *one at a time, 25 ms apart*,
+each `_exit`ing with its own index, so each frees its slot while its record stays; then the parent
+collects all forty and checks each code. Claims: *enough children died at once to fill the old store
+(40 of 40)*, *every death is still there to be collected (40 of 40)*, *and each one is the child it
+belongs to (40 of 40)*. `MPOS_ON_HOST=1` answers 3/3.
+
+**Counterfactual** (cap back to 32, kernel and loader both rebuilt): `FAIL:  every death is still there
+to be collected (32 of 40)` and `FAIL:  and each one is the child it belongs to (25 of 40)`, `FAILED`.
+
+The pin's first shape is the lesson: it forked forty children at once, like the probe, and in a lane
+where §6.80's leak already holds most of the table it read `FAIL:  enough children died at once to fill
+the old store (9 of 40)` on one arm and `(7 of 40)` on the other - a red that said nothing about the
+store. Spacing the forks so each child's slot is recycled made the fixture need two slots instead of
+forty, which is the shape a pin has to have: it must be able to run on the machine it will run on.

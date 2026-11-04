@@ -9119,3 +9119,23 @@ with the panic restored the machine dies at `all 64 task slots are in use` befor
 
 **Not fixed by this:** why one lane's sweep reaches the limit at all (one `busybox` looper per program) -
 §6.80's open question.
+
+### Item 199 - a dead child's status is kept until it is collected, however many died (2026-11-04, landed)
+
+**Linux's answer, measured** (`build/scratch/retired/t-retired.c`: forty children `_exit` while the
+parent sleeps, then one `waitpid` each): `heard 40 of 40 deaths`. A status is owed until `wait` takes it.
+
+**This kernel had** a store of exit records capped at 32 while the task table is 64, and its eviction
+dropped the oldest uncollected death (`record_retired`'s `if retired.len() == RETIRED_CAP {
+retired.remove(0); }`). The same probe read `heard 32 of 40 deaths` here, `waitpid` answering `-1` for
+the eight it had forgotten. Worse than a lost code: `wait` answers `ECHILD` for ever, and a caller
+already parked in `block_until_child_event` can never be released - its predicate cannot come true and
+the child is gone (`t-fork-limit`'s parent hung exactly there).
+
+**Served by** `RETIRED_CAP = MAX_TASKS`: a record leaves only when its slot is reused, and every
+allocation path calls `drop_retired` first, so one record per slot is the most that can be owed at once.
+
+**Pinned** by `t-wait-many`: forty children made 25 ms apart so each frees its slot while its record
+stays, each `_exit`ing with its own index; *every death is still there to be collected (40 of 40)*, and
+*each one is the child it belongs to (40 of 40)*; `MPOS_ON_HOST=1` 3/3. Counterfactual with the cap back
+at 32: `(32 of 40)` and `(25 of 40)`. `docs/notes/` §6.82.

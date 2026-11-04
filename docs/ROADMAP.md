@@ -117,6 +117,10 @@ One-glance status of the whole roadmap.
   fork after the crowd is collected works again (`t-fork-limit`; §6.81, item 198). What still
   stands open is why one lane's serial sweep reaches the limit at all: it leaves one `busybox`
   looper per program parked in `nanosleep` (§6.80, open)
+- [x] a dead child's status is kept until it is collected — the store of exit records is as wide
+  as the task table (one record per slot can be owed), so forty children dying while the parent
+  is not looking are all still there to be waited for, and a caller parked on one of them is
+  released (`t-wait-many`; §6.82, item 199)
 - [x] a pidfd names a process, not a number — `pidfd_open` records the slot **and** its tenant
   generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
   its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,
