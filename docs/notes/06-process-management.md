@@ -6343,3 +6343,34 @@ the poll still gets nothing: the remaining question is not the queue, not the re
 adoption - it is what `waitid`'s non-blocking path does with a child whose stop is live, which is the one
 door neither patch touched (`handle_wait`'s `no_hang` arm and the `WNOHANG` predicate it builds). Reverted;
 that arm is the next place to print.
+
+**With instruments on, the stop/resume section passes and the wedge moves later (measured 2026-11-04).**
+`park` adopting a published stop and holding until it is cleared, with a print on entry, on each re-hold
+and on exit, plus one on the `SIGCONT` clear, gave the whole stop/resume section of `t-waitid` green for the
+first time:
+
+```
+ok:    a child that stops itself was forked
+mpos-dbg: PARKIN id=7 sig=19 group=true publish=true
+ok:    a stopped child is reported by WSTOPPED
+ok:    si_code says a stop
+ok:    si_status is the stopping signal
+ok:    si_uid is the stopped child's uid
+mpos-dbg: CONT-CLEAR id=7
+ok:    a resumed child is reported by WCONTINUED
+ok:    with the continuing signal as its status
+ok:    si_uid is the resumed child's uid
+mpos-dbg: PARKOUT id=7
+ok:    and it still exits with its own code
+```
+
+- no `PARKHOLD`: the loop never re-held the child, and the `SIGCONT` clear ended its park exactly once. So
+  the adopt-and-hold shape is *right for a group stop*, and the earlier "hang" readings were the
+  `child_event_in` readable-stop change, not this one (that combination hung at the same place - it made a
+  cleared-then-reported group stop readable again to a parent whose `waitid(WEXITED)` then kept answering
+  it, which is the opposite of what the blocking wait needs).
+- what is left hangs **later** in the same program (`=== FAIL t-waitid timeout=120s` after
+  `ok:    and leaves the caller's rusage record untouched`) and a second program reddened that had not
+  before (`=== FAIL t-rename timeout=120s`, `pass=255 fail=2`), so this shape still wedges a *blocking*
+  wait somewhere after a resume - the next print is `block_until_child_event`'s own predicates for the
+  post-resume sections, not the stop.
