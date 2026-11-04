@@ -6120,3 +6120,21 @@ fixture that does reach its stop and the one that does not are: which call is ju
 `getppid` here), the blocked `SIGUSR1`, and the `PR_SET_NO_NEW_PRIVS` promise this one has to make before
 its install succeeds. The next measurement is a bisect on those three - judge `getpid` first, since the
 older fixture differs in exactly that and nothing else it would notice.
+
+**It is the fixture's position, not its shape (2026-11-04).** Bisecting the three remaining differences
+removed all of them: judging `getpid` instead of `getppid` still answered `ENOSYS`, dropping the blocked
+signal changed nothing, and dropping the `PR_SET_NO_NEW_PRIVS` promise changed nothing either. The one
+thing that does change the reading is **where in the program the claim runs**: moved up to sit immediately
+after `seccomp_stop_reaches_a_tracer`, the same fixture gets its stop
+
+```
+ok:    BISECT judged getpid: stop reached the tracer (status 0x7057f: stopped=true exit=5)
+```
+
+and at the end of `main` the same code gets `status 0xf00` / exit 15. So something the program does between
+those two points leaves the machine unable to hand a `RET_TRACE` filter's call to a tracer: the candidates
+are the claims that install filters **on top of** a previous one and the claim that makes the
+`PR_SET_NO_NEW_PRIVS` promise - both change what a later fork inherits. That is the same class of finding
+as the cgroup tree outliving its mounts (§3.28): a claim that leaves process-wide state behind, measured by
+a later claim that reads it. The next measurement is a bisect over those claims, and the `SETREGS` claim
+goes in only once a fixture can reach its stop at the position it needs to occupy.
