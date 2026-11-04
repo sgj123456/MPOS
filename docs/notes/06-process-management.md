@@ -6257,3 +6257,14 @@ wedged three waits, so one of the four clears in the tree (`child_exit.rs:543` t
 does *not* end with a wake, or `park` can be entered a second time for a stop that is already published -
 the second `park` would publish a second stop object and sleep with nobody told about it. That is now the
 one question to answer with a print, and it is a question about `park` being re-entered, not about the queue.
+
+**Adopting a published stop helps, and is still not it (measured 2026-11-04).** `park` was changed to
+skip publishing when a stop was already published for the task (carrying on with the same object), and to
+re-hold until that object was cleared; whether the tracer and parent were re-woken on the second entry
+made no difference. On a full aarch64 arm this took the loop's hangs from three (`t-waitid`, `t-sysv-msg`,
+`t-timer-create`) to **one**: `t-waitid` alone, with the parent in `waitid` (`syscall 95` on this
+machine) `parks=278` and a sibling in `syscall 130` `parks=4` (`build/gate-stopwake5.log`,
+`build/gate-stopwake6.log`). So two of the three hangs were the second-stop object, exactly as suspected,
+and the third is a different shape: a parent woken 278 times in `waitid` and never seeing what it waits
+for - a wake that carries no event, which is the wait side of the same "one object, two readers" problem
+the group stop has. Reverted; the next experiment is `waitid`'s own event queue with the loop in place.
