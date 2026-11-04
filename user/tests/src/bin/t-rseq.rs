@@ -201,6 +201,81 @@ fn armed_child() -> (bool, Option<i32>, Option<i32>) {
     (signaled, signal, code)
 }
 
+/// The same probe in a child whose thread group also has a thread parked in a
+/// futex, reported as `(reaped, signal)`.
+///
+/// The signal alone cannot tell the two doors apart: a bare `exit(-11)` ends the
+/// faulting thread with `SIGSEGV` exactly as the group-taking door does. What
+/// differs is whether the *group* is reaped — with only the faulting thread gone
+/// the parked sibling keeps the group alive, `exit` answers `group_dead == false`,
+/// nothing is recorded as retired, and the parent's `wait` never returns. So the
+/// fork is followed by a **bounded** poll rather than a blocking wait: a
+/// counterfactual run must fail a claim, not hang the lane (`docs/notes/` §6.77f).
+fn armed_child_with_parked_thread() -> (bool, Option<i32>) {
+    let area = area_of(unsafe { &*core::ptr::addr_of!(AREA) });
+    let _ = unregister(area, 32, RSEQ_SIG);
+    assert_eq!(register(area), Ok(0), "the parent's registration");
+
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // A word of the child's own, so the park is this group's and nothing
+        // else can wake it.
+        let word = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        } as *mut u32;
+        if word.is_null() || word as isize == -1 {
+            unsafe { libc::_exit(70) };
+        }
+        unsafe { std::ptr::write(word, 2) };
+        let address = word as usize;
+        std::thread::spawn(move || unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                address as *mut u32,
+                128u32, // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+                2u32,
+                0usize,
+                0usize,
+                0usize,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let code = unsafe { rseq_arm_and_spin(core::ptr::addr_of_mut!(AREA)) };
+        unsafe { libc::_exit(code) };
+    }
+
+    let mut status = 0;
+    let mut reaped = false;
+    for _ in 0..300 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if got == pid {
+            reaped = true;
+            break;
+        }
+    }
+    if !reaped {
+        // Leave nothing behind: a survivor from the unfixed shape would
+        // otherwise outlive this program and run under the next one's name.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+    }
+    let signal = if reaped && libc::WIFSIGNALED(status) {
+        Some(libc::WTERMSIG(status))
+    } else {
+        None
+    };
+    let _ = unregister(area, 32, RSEQ_SIG);
+    (reaped, signal)
+}
+
 fn main() {
     println!("t-rseq");
     let mut r = Report::new();
@@ -324,6 +399,18 @@ fn main() {
         r.check(
             "a tick inside an armed section ends it: the task dies of SIGSEGV, never resuming mid-span",
             signaled && signal == Some(libc::SIGSEGV),
+        );
+    }
+
+    // And the same death with a sibling parked: a fault is a *process*'s death
+    // on Linux, so the group must go with it. The signal cannot tell the two
+    // doors apart - `exit(-11)` sends the same `SIGSEGV` - so the claim is about
+    // the group being reaped at all (`docs/notes/` §6.77f).
+    if !host_run() {
+        let (reaped, faulted) = armed_child_with_parked_thread();
+        r.check(
+            "a tick inside an armed section reaps the whole process, parked sibling and all",
+            reaped && faulted == Some(libc::SIGSEGV),
         );
     }
 

@@ -273,7 +273,10 @@ One-glance status of the whole roadmap.
   resets the ids, a `fork` child inherits it while a thread starts with none, and
   the clock **does not preempt a task inside an armed critical section** (the tick
   is spent; a span still armed on the next tick ends the task with `SIGSEGV`, since
-  this machine cannot rewind the trap frame's resume address the way Linux does).
+  this machine cannot rewind the trap frame's resume address the way Linux does, and
+  that death takes the whole thread group because a fault is a **process's** death -
+  it goes through the fatal-signal door like the machine's own fault handlers (§6.35,
+  §6.77f, item 120)).
   The v2 area (`len > 32`) is served too, with its extra words answered honestly
   rather than copied: 64-byte aligned lengths 33+ are accepted, `node_id` is 0
   (one node), `mm_cid` is 0 (one CPU — valid under a contract that only needs

@@ -3442,7 +3442,7 @@ pub fn preempt_at(ip: usize) {
     match crate::sched::rseq::tick(ip) {
         crate::sched::rseq::Tick::Preempt => {}
         crate::sched::rseq::Tick::Defer => return,
-        crate::sched::rseq::Tick::Kill => exit(-11),
+        crate::sched::rseq::Tick::Kill => die_of_fatal_signal(crate::sched::signal::SIGSEGV),
     }
     preempt_now()
 }

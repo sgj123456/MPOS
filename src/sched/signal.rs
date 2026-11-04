@@ -40,6 +40,14 @@ pub const SIGKILL: u8 = 9;
 /// Fatal by default - a session that wants to keep its display must install a
 /// handler, which is the agreement `VT_SETMODE` makes.
 pub const SIGUSR1: u8 = 10;
+/// A bad memory reference. Userspace reaches it through the machine's own fault
+/// handlers, which is why this list did not need the number for a long time -
+/// but the kernel raises it too, for the one case where *it* decides a task's
+/// memory is unusable rather than the mmu: a `rseq` registration whose block
+/// this machine can no longer read, or a task still inside its armed span on a
+/// second tick (`crate::sched::rseq`'s `Tick::Kill`, Linux's own answer to an
+/// unreadable section, `docs/notes/` §6.35).
+pub const SIGSEGV: u8 = 11;
 pub const SIGUSR2: u8 = 12;
 /// Write on a pipe with no one left to read it.
 pub const SIGPIPE: u8 = 13;

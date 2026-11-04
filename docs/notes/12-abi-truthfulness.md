@@ -292,7 +292,19 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-04, `KILL_PROCESS` and `KILL_THREAD` split §6.77d):** stage 1
+**Latest measured gate (2026-11-04, `rseq`'s kill takes the group §6.77f), taken as two runs
+because the second machine's six concurrent TCG lanes kept tripping the EL0 exception
+`AGENTS.md` §5 records:** the first machine alone (`build/gate-rseq4.log`) — stage 1 `1224
+tests, 0 failed` (15.09 s), `pass=256 fail=0 (256 built)`, `mpos-kunit 35 passed, 0 failed`,
+exit 33, `total 15.28 s`; the second alone (`build/gate-rseq-a.log`) — `pass=255 fail=0 (255
+built)`, `mpos-kunit 35 passed, 0 failed`, `no process exit: the lanes ended on === END`,
+`total 30.04 s`. Both-arm runs of the same tree (`build/gate-rseq.log`,
+`build/gate-rseq2.log`, `build/gate-rseq3.log`) each lost programs to flakes already in
+`AGENTS.md` §5 (`t-ptrace-attach`'s 200 ms poll, `t-cgroupfs`'s `EEXIST`, `t-seccomp`'s tracer
+claims) and to the EL0 exception — every one of them re-ran green alone, and `t-rseq` passed
+on both arms in all of them.
+
+**Measured gate before it (2026-11-04, `KILL_PROCESS` and `KILL_THREAD` split §6.77d):** stage 1
 `1224 tests, 0 failed` (29.93 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35
 passed, 0 failed`, exit 33, `total 30.12 s`; aarch64 `pass=255 fail=0 (255 built)`,
 `mpos-kunit 35 passed, 0 failed`, every lane `ok` on `=== END`, `total 74.99 s`

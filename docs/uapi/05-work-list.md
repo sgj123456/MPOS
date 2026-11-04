@@ -6663,12 +6663,18 @@ is handed the interrupted user address (`Kernel::preempt_at`, called from both
 machines' clock paths), a tick inside an armed span is spent instead of
 switching, and a task still inside it on the next tick is ended with `SIGSEGV`
 — a named divergence from Linux's rewind, chosen because this machine's clock
-return path cannot rewrite the interrupted resume address.
+return path cannot rewrite the interrupted resume address. That death goes
+through the fatal-signal door (`die_of_fatal_signal`), so it takes the whole
+thread group: a fault is a **process's** death on Linux, and a bare `exit(-11)`
+here left a parked sibling alive with the group never reaped (§6.77f).
 
 **Pinned** by `t-rseq` (the measured error table, the id words, fork/thread
-inheritance, the armed-section death, and the guest-only v2 refusal). The same
-binary under `MPOS_ON_HOST=1` passes **20/20** against Linux, where its armed
-child exits `7` — Linux's own fixup — the reference direction.
+inheritance, the armed-section death, that same death reaping a process whose
+other thread is parked in a futex, and the guest-only v2 refusal). The same
+binary under `MPOS_ON_HOST=1` passes **29/29** against Linux, where its armed
+child exits `7` — Linux's own fixup — the reference direction; the one claim a
+host cannot make (the group's death under a parked sibling, because Linux's
+rewind means the fault never happens there) is the guest-only one.
 
 **Counterfactual** — the dispatch arm removed: `CF-EXIT=1`, `pass=224 fail=1
 (225 built)`, only `t-rseq` red through `_ => ENOSYS`.

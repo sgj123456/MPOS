@@ -5559,3 +5559,75 @@ boot prints all twelve `ok:` and `=== t-kill-numbers exit=0`, and on a current L
 here on the resolution side only - the group's `Retired` record still has to exist for `kill` to
 find anything, which is `exit`'s job and unchanged; and `kill(-1)`/`kill(0)`/`kill(-pgid)` were
 already group-shaped and are untouched.
+
+### §6.77f the last `-11`: `rseq`'s kill decided the task's fate, not its group's - **FIXED (2026-11-04)**
+
+§6.77c closed the arch's own fault handlers and, in its last line, named two sites it had not
+touched: `out_of_memory` (which already walks the group) and `rseq`'s `Tick::Kill`, whose exit code
+`-11` claimed a `SIGSEGV` death while ending only the faulting thread. The audit had put it on the
+"do not change" list for the wrong reason - its *comment* says `SIGSEGV` is Linux's answer to an
+unreadable section, which is true, and the code then delivered one thread's worth of it.
+
+`crate::sched::rseq::tick(ip)` answers `Tick::Kill` for two shapes, both of them the kernel deciding
+a task's memory is unusable rather than the mmu taking a fault: a registration whose block
+`read_user` can no longer reach, and a task still inside its armed span on a second tick (a span is
+instructions, never a millisecond - §6.35). Either way the task must die of `SIGSEGV`, and **a fault
+is a process's death on Linux**, so the group goes with it.
+
+The site (`src/sched/runtime/task.rs`, `preempt_at`) now calls the door instead of exiting:
+
+```rust
+crate::sched::rseq::Tick::Kill => die_of_fatal_signal(crate::sched::signal::SIGSEGV),
+```
+
+`src/sched/signal.rs` gained `pub const SIGSEGV: u8 = 11` for it - this list had never needed the
+number, because userspace reached `SIGSEGV` only through the machine's fault handlers, and the
+kernel now raises it itself in this one place. Its doc comment says exactly that, so the constant's
+presence is recorded rather than looking like an omission somebody filled in.
+
+**The pin could not be the existing one.** `t-rseq` already claimed
+
+```
+ok:    a tick inside an armed section ends it: the task dies of SIGSEGV, never resuming mid-span
+```
+
+and a bare `exit(-11)` satisfies it - the signal is identical, which is why this site sat unnoticed
+through three earlier fixes. What differs is the **group**: with the faulting thread gone and a
+sibling parked, `exit` answers `group_dead == false`, records nothing as retired, never wakes the
+parent, so its `wait` never returns. So `t-rseq` gained a second fixture,
+`armed_child_with_parked_thread()`: a child that maps a private futex word, parks a
+`std::thread` on it, arms the rseq descriptor in the same span the existing probe uses, and dies in
+it; the parent polls `waitpid(WNOHANG)` 300x10 ms rather than blocking, so the unfixed shape fails a
+claim instead of hanging the lane (the lesson §6.77e paid for), and kills and reaps on the survivor's
+path so nothing outlives the program.
+
+```
+ok:    a tick inside an armed section reaps the whole process, parked sibling and all
+```
+
+**Counterfactual, measured** (the site back to `exit(-11)`, kernel *and* loader rebuilt - §6.77b's
+trap):
+
+```
+ok:    a tick inside an armed section ends it: the task dies of SIGSEGV, never resuming mid-span
+FAIL:  a tick inside an armed section reaps the whole process, parked sibling and all
+=== t-rseq exit=1
+```
+
+The old claim stays green in both worlds. That is the whole reason this defect survived three
+sweeps: the signal was right and the survivor was invisible.
+
+**Gate**, taken as two runs because this host's six concurrent TCG aarch64 lanes kept tripping the
+EL0 `EXCEPTION: synchronous` flake recorded in `AGENTS.md` §5 (`build/gate-rseq.log` had x86_64 green
+with `t-ptrace-attach` and `t-cgroupfs` red on aarch64, `build/gate-rseq2.log` and
+`build/gate-rseq4.log` each lost a lane or two to it): the first machine alone,
+`build/gate-rseq4.log` - stage 1 `1224 tests, 0 failed` in 15.09 s, `pass=256 fail=0 (256 built)`,
+`mpos-kunit 35 passed, 0 failed`, exit 33, `total 15.28 s`; the second alone,
+`build/gate-rseq-a.log` - `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`,
+`no process exit: the lanes ended on === END`, `total 30.04 s`. `=== PASS t-rseq` appears in the
+lane logs of both arms; every one of the failures above was re-run to green and each is the
+already-recorded flake, not this change's.
+
+**What is left of the family**: `out_of_memory` (`src/sched/runtime/child_exit.rs`) still does its
+own `end_group_siblings` + `exit` rather than calling the door. It is *correct* - it walks the group
+- and it is duplication rather than a defect, so it is named here and not carried as an open bug.
