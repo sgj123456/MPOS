@@ -2584,12 +2584,29 @@ mod tests {
         file.touch_atime(first + 10).unwrap();
         assert_eq!(file.atime(), first, "nothing changed, so nothing moved");
 
-        // A write re-opens the gap (it moves mtime and ctime), and the next read
-        // answers it.
+        // A write re-opens the gap - it moves mtime and ctime - and the next
+        // read answers it because the atime is no longer newer than either.
+        //
+        // The stamp that read is handed is built from the clocks the write
+        // itself left behind, and the atime is first put back behind them. Both
+        // halves are load-bearing, and they are here because this test used to
+        // be order-dependent: the host has no real clock, so `inode::now()` is a
+        // counter that starts at a fixed value (`src/vfs/ext4/inode.rs`), and a
+        // stamp like `first + 20` - derived from a number this test invented -
+        // outran every mtime a write could produce here, which meant the rule's
+        // `atime <= mtime` clause never fired. The test passed in the full suite
+        // only because ~700 neighbours had advanced that counter first, and
+        // failed on its own every time; the same shape as the `rand` and devpts
+        // flakes in AGENTS.md §5. Asking the write for its own clock makes the
+        // claim true at any position in the run.
         file.write_at(0, b"payload").unwrap();
-        file.touch_atime(first + 20).unwrap();
-        assert!(
-            file.atime() > first,
+        let written = file.mtime().max(file.ctime());
+        assert!(written >= born, "the write moved the metadata clocks");
+        file.set_times(born, written).unwrap();
+        file.touch_atime(written + 1).unwrap();
+        assert_eq!(
+            file.atime(),
+            written + 1,
             "a read after a write moves the clock again"
         );
 

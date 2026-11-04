@@ -1690,3 +1690,74 @@ pre-item behaviour) -> `1 of 241`, `t-proc-modes` alone, red on exactly
 `and O_RDWR is refused the same way (got 4, errno 1)`; the unprivileged half
 stayed green, which is the point — a mode-only kernel refuses the user and hands
 root a descriptor.
+
+### 3.26 The `relatime` test was order-dependent, so stage 1 was green by luck — **FIXED** (2026-11-04)
+
+The gate's stage 1 kept going red on `vfs::ext4::tests::relatime_moves_atime_only_when_something_has_happened`
+and nowhere else, and the reading written down twice (here and in §6.77c) called it an "unexplained
+concurrency transient" because the standalone rerun of the gate's own cargo command was always green.
+That reading was wrong, and the measurement that replaces it is unambiguous:
+
+```
+$ .../mpos-faf2fc10fb146839 relatime_moves_atime_only_when_something_has_happened --test-threads=1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 725 filtered out
+$ .../mpos-faf2fc10fb146839 vfs::ext4::tests:: --test-threads=1
+test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 670 filtered out
+$ cargo test -p mpos --lib --target x86_64-unknown-linux-gnu
+test result: ok. 726 passed; 0 failed      (12 runs in a row, and 3 more under load)
+```
+
+**It fails every time it runs alone and passes only behind ~700 neighbours.** The mechanism is the
+host clock. `src/vfs/ext4/inode.rs` answers `now()` from a real clock on the machine and from a
+process-global counter on the host:
+
+```rust
+#[cfg(not(target_os = "none"))]
+pub(crate) fn now() -> u32 {
+    static HOST_NOW: AtomicU32 = AtomicU32::new(1_700_000_000);
+    HOST_NOW.fetch_add(1, Ordering::Relaxed)
+}
+```
+
+The test created a file (three draws), invented `first` from its own stamps, wrote 9 bytes (which
+stamps `mtime`/`ctime` from `now()`), and then asked for `touch_atime(first + 20)` and asserted
+`atime() > first`. `touch_atime` (`src/vfs/ext4/mod.rs:1419`) moves the clock only when
+
+```rust
+data.atime <= data.mtime || data.atime <= data.ctime || stamp.saturating_sub(data.atime) >= DAY
+```
+
+and in isolation `first + 20` outran every mtime a three-draw write could produce, so none of the
+three clauses fired, `touch_atime` did nothing, and the assert `a read after a write moves the clock
+again` fired. In the full suite ~700 other tests had advanced `HOST_NOW` far enough that the write's
+own stamps were ahead of `first`, and the test passed. Two days of gate reds were this, and the
+concurrency story was a coincidence of *when* the ext4 module happened to be scheduled.
+
+Same shape as the two AGENTS.md §5 entries that were already written down (the `rand` generator and
+the devpts option tests): **a module global read or written by parallel tests**.
+
+**The fix** makes the claim true at any position in the run by asking the write for its own clocks
+instead of inventing one:
+
+```rust
+file.write_at(0, b"payload").unwrap();
+let written = file.mtime().max(file.ctime());
+assert!(written >= born, "the write moved the metadata clocks");
+file.set_times(born, written).unwrap();
+file.touch_atime(written + 1).unwrap();
+assert_eq!(file.atime(), written + 1, "a read after a write moves the clock again");
+```
+
+`set_times(born, written)` is the load-bearing half: without it the atime is still ahead of the
+write's clocks, so the rule's `atime <= mtime` clause is unreachable and the same assert fails at a
+different line (measured: a first attempt that only moved the stamp ahead of the write still failed
+at `src/vfs/ext4/mod.rs:2605`).
+
+**Pinned by the existing test, counterfactually.** Alone before the fix: `FAILED. 0 passed; 1 failed`,
+ten runs out of ten. Alone after: `ok. 1 passed`, five runs out of five. The module filter went from
+`55 passed; 1 failed` to `56 passed; 0 failed`, and the full suite stayed `726 passed; 0 failed` on
+four consecutive runs.
+
+**Rule for the next test that reads a clock:** a test asserting a *relationship* between two stamps
+must derive both from what the code produced, never from numbers the test itself made up — the host
+clock is a counter whose position depends on how many other tests ran first.
