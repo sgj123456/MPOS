@@ -5949,3 +5949,62 @@ red says *which* way it was wrong instead of only that it was. Under `MPOS_ON_HO
 the fixture cannot drop to `nobody` (a host run is not root), so the claim asserts the
 entry exists and names the invoking user's ids — the machine's own form is the one the
 gate exercises.
+
+## §6.84 The task table was smaller than the machine's own runner (LANDED 2026-11-04)
+
+§6.80 left one question open - *which* `busybox` was in a one-second loop, and why the lane keeps one per
+program - and the answer is: none of the kernel's business. It is `busybox timeout`'s own **watchdog**.
+
+Measured on the first machine with the smallest boot that shows it (`build/scratch/watchdog-init.sh`, one
+`busybox timeout -s KILL 5 /bin/true` and three `ls /proc` dumps around it):
+
+```
+=== before
+TASK 1 cmd=[/bin/sh /init ]
+timeout exit=0
+=== immediately after
+TASK 1 cmd=[/bin/sh /init ]
+TASK 7 cmd=[/bin/busybox timeout -s KILL 5 /bin/true ]
+=== 3 s later
+TASK 1 cmd=[/bin/sh /init ]
+TASK 7 cmd=[/bin/busybox timeout -s KILL 5 /bin/true ]
+=== 8 s later
+TASK 1 cmd=[/bin/sh /init ]
+```
+
+Twelve wrappers in a row (`build/scratch/leak-init.sh`) leave twelve of them, each its own session leader
+(`stat` reads `pgrp=pid`, `session=pid`) and each reparented to init, and each gone once its own deadline
+passed. So `timeout` forks a watcher that sleeps until the budget expires and then kills the program's
+group; when the program finishes early - which is the normal case for a test - the watcher still has the
+whole budget to serve. With the shipped `tests.toml` budgets that is **120 s per program**, so one slot
+per program is held for two minutes after the program it watched is done.
+
+A lane is ~50 programs and `MAX_TASKS` was 64. That is the whole of §6.80's ladder: the lane fills the
+table while it is still sweeping, and from then on `busybox timeout` cannot fork at all:
+
+```
+=== RUN t-closedfb
+timeout: fork: Resource temporarily unavailable
+=== FAIL t-closedfb exit=1
+```
+
+- which is §6.81's honest `EAGAIN` reaching a caller that can name it, instead of §6.80's panic. The
+sweep became visible as red programs rather than a dead machine, and that is what let the ladder be read.
+
+The harness could not kill the watcher it cannot see (it is a grandchild, reparented to init), and a runner
+that waits for a 120 s watcher after every program is a runner that has not bounded anything. The table was
+the thing that was wrong: `MAX_TASKS` is 256 now (`src/sched/runtime/task.rs`), with the measured chain in
+its doc comment. The cost is the stacks - `256 × 32 KiB = 8 MiB` of the machines' 2 GiB - plus the table's
+own statics; the design (a hard limit, not a grown collection) does not change. Linux's limit is memory; a
+machine whose limit is a table should at least be wider than a normal runner's playground.
+
+**Pinned** by `t-fork-limit`'s new first claim, `the machine has room for more than a hundred tasks at once
+(N made)`: it forks until the machine refuses, so it reads 57 at 64 slots and ~249 at 256. The claim fails
+on the old width by construction (the counterfactual is the constant, which is why the doc comment carries
+the measurement).
+
+**Verified** after the change: `cargo xtask test --arch x86_64` → `pass=258 fail=0 (258 built)`,
+`mpos-kunit 35 passed, 0 failed`; `--arch aarch64` → `pass=257 fail=0 (257 built)`, `mpos-kunit 35 passed,
+0 failed`, every lane `=== END`, and the boot line reads `scheduler up: 256 slots, running task
+TaskId(0)`. Before it, the same two arms were `pass=224 fail=34` and worse, all of it `fork: Resource
+temporarily unavailable`.

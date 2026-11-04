@@ -9139,3 +9139,19 @@ allocation path calls `drop_retired` first, so one record per slot is the most t
 stays, each `_exit`ing with its own index; *every death is still there to be collected (40 of 40)*, and
 *each one is the child it belongs to (40 of 40)*; `MPOS_ON_HOST=1` 3/3. Counterfactual with the cap back
 at 32: `(32 of 40)` and `(25 of 40)`. `docs/notes/` §6.82.
+
+### Item 200 - the task table is wider than the machine's own runner needs (2026-11-04, landed)
+
+`MAX_TASKS` is a static table, not a count the machine grows, and it was 64 - which the shipped test
+runner could not live inside. `busybox timeout -s KILL <budget> <program>` forks a watchdog child that
+sleeps until the budget expires and then kills the program's group, so it outlives a program that finishes
+early, by design; measured with twelve wrappers and a 5 s budget the twelve watchers were still there at
++3 s and gone by +8 s, and with `tests.toml`'s 120 s budgets one slot per program is held for two minutes.
+A lane is ~50 programs, so the lane filled the table and every program after that answered
+`timeout: fork: Resource temporarily unavailable` - honest `EAGAIN` (item 198) rather than the panic of
+`docs/notes/` §6.80, which is how the ladder became readable.
+
+Linux's limit is memory; a machine whose limit is a table should be wider than a normal runner's
+playground. The table is 256 now, at `256 × 32 KiB = 8 MiB` of stacks. Pinned by `t-fork-limit`'s *the
+machine has room for more than a hundred tasks at once* - it reads 57 at 64 slots and ~249 at 256. Both
+arms green after: `pass=258 fail=0` and `pass=257 fail=0`. `docs/notes/` §6.84.

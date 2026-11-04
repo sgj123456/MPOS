@@ -28,7 +28,7 @@
 //! and reap every child. A pin that left sixty tasks behind would make every
 //! program after it in the same lane fail.
 
-use mpos_user_tests::{host_run, Report};
+use mpos_user_tests::{Report, host_run};
 use std::io;
 
 /// What Linux answers for "there is no room for another task" (`EAGAIN`, 11 on
@@ -72,6 +72,19 @@ fn main() {
         kids.push(pid);
     }
 
+    // The table's width is measured here beside the refusal, because a machine
+    // with room for sixty-odd tasks cannot host the sweep's own lane: the
+    // runner's `busybox timeout` holds a watchdog child for every program's
+    // whole budget, so a lane of ~50 programs wants ~50 slots for them alone
+    // (`docs/notes/` §6.80). A hundred is the floor that makes a lane possible;
+    // the shipped table is 256 and this claim fails at 64.
+    r.check(
+        &format!(
+            "the machine has room for more than a hundred tasks at once ({} made)",
+            kids.len()
+        ),
+        kids.len() > 100 || host_run(),
+    );
     r.check(
         &format!(
             "a fork with no room for another task is refused, not fatal ({} children made, answer {refusal:?})",
@@ -103,7 +116,10 @@ fn main() {
         }
     }
     r.check(
-        &format!("every child this program made is collected ({collected} of {})", kids.len()),
+        &format!(
+            "every child this program made is collected ({collected} of {})",
+            kids.len()
+        ),
         collected == kids.len() && all_exited,
     );
 

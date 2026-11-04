@@ -18,7 +18,28 @@ use super::child_signal::{queue_signal, table_has_deliverable, take_fatal_signal
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.
-pub const MAX_TASKS: usize = 64;
+///
+/// **The number is a workload's, not a round number's.** It was 64, and 64 was
+/// too small for the machine's own test runner: the sweep starts every program
+/// as `busybox timeout -s KILL <budget> <program>`, and busybox's `timeout`
+/// forks a *watchdog* child that sleeps until the budget expires and then kills
+/// the program's group - so it outlives the program, by design, whenever the
+/// program finishes early. Measured on the first machine with 12 wrappers and a
+/// 5 s budget (`build/scratch/watchdog-init.sh`): every wrapper returned 0, and
+/// a `busybox timeout` child sat as its own session leader, reparented to init,
+/// for the whole budget - still there 3 s after the program ended and gone 8 s
+/// after a 5 s deadline. With the shipped 120 s budgets that is one held slot
+/// per program for two minutes, so a lane of ~50 programs filled every slot,
+/// and the sweep then answered `timeout: fork: Resource temporarily
+/// unavailable` on every program after it - the honest `EAGAIN` of §6.81 rather
+/// than the panic of §6.80, which is how the shape finally became visible.
+///
+/// 256 leaves room for that (a lane's worth of watchdogs, a program's own
+/// threads, and a hand run's shells) without a grown collection: the cost is the
+/// stacks, `256 × 32 KiB = 8 MiB` of the machines' 2 GiB, and the table's own
+/// statics. Linux's limit is its memory; a machine whose limit is its table
+/// should at least be bigger than a normal runner's playground.
+pub const MAX_TASKS: usize = 256;
 
 /// Where each task last went to sleep, for `/proc/<pid>/stat`'s `wchan` word.
 ///

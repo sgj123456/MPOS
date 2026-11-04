@@ -80,11 +80,17 @@ fn main() {
         }
     }
     r.check(
-        &format!("every death is still there to be collected ({heard} of {})", kids.len()),
+        &format!(
+            "every death is still there to be collected ({heard} of {})",
+            kids.len()
+        ),
         heard == kids.len(),
     );
     r.check(
-        &format!("and each one is the child it belongs to ({right_code} of {})", kids.len()),
+        &format!(
+            "and each one is the child it belongs to ({right_code} of {})",
+            kids.len()
+        ),
         right_code == kids.len(),
     );
 

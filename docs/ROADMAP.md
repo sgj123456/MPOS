@@ -114,9 +114,11 @@ One-glance status of the whole roadmap.
   (§15.86)
 - [x] a machine with no room for another task refuses, it does not die — `alloc_slot` answers
   `Option`, both spawn doors return `EAGAIN` the way `clone(2)` does at Linux's own limit, and a
-  fork after the crowd is collected works again (`t-fork-limit`; §6.81, item 198). What still
-  stands open is why one lane's serial sweep reaches the limit at all: it leaves one `busybox`
-  looper per program parked in `nanosleep` (§6.80, open)
+  fork after the crowd is collected works again (`t-fork-limit`; §6.81, item 198). One lane's
+  sweep reached that limit because the table was too small for the runner itself: `busybox
+  timeout -s KILL <budget>` forks a watchdog that lives for the program's whole budget, so a
+  lane of ~50 programs held ~50 slots for two minutes at a time — `MAX_TASKS` is 256 now, at
+  8 MiB of stacks (`t-fork-limit`'s width claim; §6.80/§6.84, item 200)
 - [x] a dead child's status is kept until it is collected — the store of exit records is as wide
   as the task table (one record per slot can be owed), so forty children dying while the parent
   is not looking are all still there to be waited for, and a caller parked on one of them is
@@ -839,11 +841,15 @@ the first wake of any kind, so the park comes back with the stop still recorded 
 stop_now=true`), and the re-park loop written for it was **not shipped** — the claim that would pin it passes with
 and without the loop, which pins nothing (§3 rule 4). The stop itself holds on both machines through a stopped
 process's own `nanosleep` deadline and its own interval timer, so those are not the interleaving either. **A
-one-lane sweep exhausted the 64 task slots**: the panic is closed (the caller now gets Linux's `EAGAIN`), and the
-leak behind it is measured but unexplained — 53 of the 64 slots were `busybox` children of init, one left per
-program by that program's own `timeout` wrapper, forked by the program's slot, never exec'd, parked in aarch64's
-`nanosleep` in a one-second loop that does return (§6.80). Both are owed a diagnosis and a pin, and the stop's
-park is owed the interleaving that ends it.
+one-lane sweep exhausted the 64 task slots** — both halves of that are now closed: the caller gets Linux's
+`EAGAIN` (§6.81, item 198), and the "leak" was the runner's own arithmetic, since `busybox timeout -s KILL
+<budget>` keeps a watchdog child alive for the whole budget, one slot per program for two minutes, so a lane
+of ~50 programs filled the table and `MAX_TASKS` is 256 now (§6.80/§6.84, item 200). What is still owed is the
+stop's own interleaving: the failing detach run is caught in the act (`GROUPSTOP` then a `PARKWAKE` that
+leaves `trace.stop` set, no `DETACH-CLEAR`, no `RESUME`, no `SIGCONT-CLEAR`, then the child runs to its exit),
+and the two halves of a fix were written and reverted twice because neither could be pinned — a park whose
+sleep leaves its task in the ready queue has to be taken out of it, and a wake that is not a resume has to be
+re-parked, but every bare-stop shape this file could build stayed green without either (§6.79).
 
 ---
 
