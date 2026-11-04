@@ -6332,3 +6332,14 @@ parent polls and never gets a record (not correct, and §6.86's `CE-REPORTED` li
 blocking - which is why it burns the whole budget. Next: with the adopt-and-hold patch in, print
 `child_event_in`'s answer (not just `reported`) for that `P_PID` subject on every poll, and compare with
 what `take_stop_report` cleared.
+
+**The combination still hangs, and the dump names the two ends (measured 2026-11-04).** With both halves in
+- `park` adopting a published stop and holding until it is cleared, and a group stop staying readable to a
+parent that asks for stops - a one-lane aarch64 arm still ended `=== FAIL t-waitid timeout=120s`
+(`pass=256 fail=1`, `build/gate-stopwake10.log`). Its stall dump has the parent in `syscall 95` (waitid)
+`parks=280` - the 400-poll loop - and the child in `syscall 130` (tgkill) `parks=4`, both in
+`park 2 (block_until_nanos)`. So the child *is* held where it raised its stop, the parent *is* polling, and
+the poll still gets nothing: the remaining question is not the queue, not the report flag and not the
+adoption - it is what `waitid`'s non-blocking path does with a child whose stop is live, which is the one
+door neither patch touched (`handle_wait`'s `no_hang` arm and the `WNOHANG` predicate it builds). Reverted;
+that arm is the next place to print.
