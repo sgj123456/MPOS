@@ -5724,6 +5724,51 @@ hung its lane before the program ran).
 **Owed:** catch the failing shape with the detach instrument, then decide between "one stop object per
 task" and Linux's separate group-stop accounting.
 
+#### What the stop's own park does with a wake (measured 2026-11-04, still not a diagnosis)
+
+Reading `trace::park` (`src/sched/runtime/trace.rs`) turned up a mechanism that would be enough to explain
+the observation and is *not* the same thing as the hypothesis above: **the stop park sleeps once and
+returns on the first wake of any kind**, and it does not ask on the way out whether the stop is over.
+Instrumented with one print after the sleep, on a child held in a `SIGSTOP` while its own 200 ms
+`setitimer(ITIMER_REAL)` kept firing:
+
+```
+mpos-dbg: PARKWAKE id=6 stop_now=true
+```
+
+so the park does return while `trace.stop` is still set — the interval timer's `check_itimers` wake
+(`src/sched/runtime/task.rs`'s `self.sched.wake(TaskId(i))`) is enough to take a stopped task out of the
+park and back into the signal-delivery path. A stop that is ended by a wake rather than by a *resume* is
+the shape Linux does not have, and it is what a later spurious wake plus a cleared record could turn into
+`collected true`.
+
+The two probes were written to make that differential visible and **both shapes hold on this machine as
+they do on Linux**, so neither is a pin for it:
+
+* Linux first (`build/scratch/stoptimer/p2.c`, `gcc -O1`): a child asking for 2500 ms of `nanosleep` and
+  `SIGSTOP`ped 150 ms in is `T` 2600 ms later — a second past the deadline it had already armed — with
+  nothing collected, and `SIGCONT` is what gets it running again. The same shape on the machine's own
+  probe (`build/scratch/stoptimer/t-stoptimer.c`, musl static, booted by `.workbuddy/one-test-boot.sh`)
+  reads `reported stopped = 1` / `after four of its own ticks inside the stop: state=T collected=0` /
+  `collected after SIGCONT = no`.
+* Linux's interval-timer shape (`build/scratch/stoptimer/p3.c`): `state=T collected=0` after four of the
+  child's own 200 ms ticks fire inside the stop. The machine answers the same, with the `PARKWAKE` line
+  above sitting between the stop and the reading.
+* The claim written for it (`t-signal-park`'s "a stopped process stays stopped while its own timer
+  expires", phase-free: a single 2500 ms sleep, stop at 150 ms, read at 2600 ms) **passed with and
+  without a re-park loop in `park`** — so it satisfies Linux's answer and pins nothing about the fix.
+  It was therefore not shipped: `AGENTS.md` §3 rule 4 refuses a claim that is green either way, and a
+  fix whose pin cannot be made to fail is a fix nobody has measured.
+
+A re-park loop (`while trace.stop.is_some() { sleep again }`, with the check under the same lock as the
+sleep so a resumer's clear-then-wake cannot be missed) was written, built for both machines, and reverted
+unshipped, for that reason alone. The record of it is here so the next attempt starts from the
+measurement instead of the guess.
+
+**Owed now:** catch a failing detach run with the `PARKWAKE` print *and* a print on whichever path clears
+`trace.stop`, so the observation's interleaving is read rather than reasoned; the re-park loop is the
+candidate fix and its pin has to be the failing interleaving, not a stationary stop.
+
 ### 6.80 A one-lane sweep ran out of the 64 task slots — observation, not yet a diagnosis (2026-11-04)
 
 The first full sweep attempted on a single lane (`MPOS_TEST_LANES=1 cargo xtask test --arch aarch64`,
@@ -5739,14 +5784,30 @@ immediately after `=== RUN t-stdspawn` / `t-stdspawn: a std program is running` 
 `ok:   /bin/true ran and exited 0`. The same run also reported `the sweep staged t-netstats but its
 NETSTAT line never reached the log` and `no summary line - the run did not get to the end`.
 
-`alloc_slot` (`src/sched/runtime/task.rs:2156`) panics rather than refusing, so the answer the *caller*
-would have got is a dead machine where Linux answers `EAGAIN` from `clone`/`fork` at its own task limit.
-Two candidates, neither measured: a slot leak across the lane's ~200 programs, or a recycling delay that
-only shows when one lane runs everything back to back. The six-lane default never reaches it, which is
-why it took until a serial run to see it.
+`alloc_slot` (`src/sched/runtime/task.rs:2156`) panicked rather than refusing, so the answer the *caller*
+got was a dead machine where Linux answers `EAGAIN` from `clone`/`fork` at its own task limit.
 
-**Owed:** count live slots across a lane's programs (an instrument in `alloc_slot`/`release`), then either
-fix the leak or give the limit Linux's errno instead of a panic.
+**The panic is closed** (2026-11-04): `alloc_slot` now answers `Option<usize>`, every spawn door returns
+`crate::err::EAGAIN` at the limit, and `spawn_user`'s `SpawnError::NoSlot` maps to the same errno — with
+`t-fork-limit` asserting Linux's pair (`forked 196 children before it refused: errno=11` / `after reaping
+them all, fork answers 208`). `docs/notes/` §6.81 and item 198 carry it.
+
+**The leak itself is measured but not explained.** Counting live slots across a one-lane sweep
+(`MPOS_TEST_LANES=1 cargo xtask test --arch aarch64`, six runs) shows the table filling at about one slot
+per program until the limit: 53 of the 64 slots at the panic are `comm=busybox`, `ex=0`,
+`parent=Some(1)`, parked in aarch64's **`nanosleep` (`nr=101`)** with `parks` counts climbing. One is left
+per program by that program's own `busybox timeout -s KILL …` wrapper (the runner's shape in
+`xtask/src/selftest.rs`'s `TEST_INIT`); each is forked by the program's slot (`clone child=N parent=7
+flags=0x0` or `0x7d0f00`), is reparented to init when its forker exits, and **never execs** — the only
+`exec` line for a leaked slot is the runner's own `/usr/bin/tr`. Their `mpos-dbg: long sleep id=N
+ms=1000 at=…` timestamps rise by ~1.004 s per iteration, so the `nanosleep` itself returns and it is the
+loop around it that never ends. On Linux the same `busybox timeout -s KILL 120 /bin/true` returns in
+3 ms, and on this kernel's **x86_64** arm the same three wrapper shapes answer at once
+(`build/scratch/to-boot.sh`: `=== A exit=0`, `=== B exit=1` — the program's own argv rule — `=== C
+exit=137`), so the loop is aarch64-only and is not the wrapper's normal path.
+
+**Owed:** the aarch64 `busybox timeout` loop's own mechanism — read what the wrapper does after its child
+dies on that machine (`build/scratch/` probes and the six `build/gate-slots*.log` runs are the record).
 
 ## §6.81 A machine with no room for another task answers `EAGAIN`, not a panic (LANDED 2026-11-04)
 

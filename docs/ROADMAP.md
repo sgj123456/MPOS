@@ -834,10 +834,16 @@ second machine's six-lane sweep, once with the collected evidence `(state "", co
 a child the user had `SIGSTOP`ped — and it will not reproduce alone (8/8 green in one x86_64 boot, and green on the
 same fix in a control run). The suspect is that `PTRACE_ATTACH` injects its stop as the same `SIGSTOP` bit a user's
 `kill -STOP` sets, and a task has one stop object, so `detach_traced`'s "drop the attach's stop" clears the user's
-too (§6.79). **A one-lane sweep exhausts the 64 task slots**: `MPOS_TEST_LANES=1 cargo xtask test --arch aarch64`
-panicked `all 64 task slots are in use` at `alloc_slot` right after `t-stdspawn`'s first claim, where the caller
-should have got Linux's `EAGAIN`; either a leak or a recycling delay, unmeasured (§6.80). Both are owed a diagnosis
-and a pin.
+too (§6.79). A stopped tracee's own wake is the newest reading there: `trace::park` sleeps once and returns on
+the first wake of any kind, so the park comes back with the stop still recorded (`mpos-dbg: PARKWAKE id=6
+stop_now=true`), and the re-park loop written for it was **not shipped** — the claim that would pin it passes with
+and without the loop, which pins nothing (§3 rule 4). The stop itself holds on both machines through a stopped
+process's own `nanosleep` deadline and its own interval timer, so those are not the interleaving either. **A
+one-lane sweep exhausted the 64 task slots**: the panic is closed (the caller now gets Linux's `EAGAIN`), and the
+leak behind it is measured but unexplained — 53 of the 64 slots were `busybox` children of init, one left per
+program by that program's own `timeout` wrapper, forked by the program's slot, never exec'd, parked in aarch64's
+`nanosleep` in a one-second loop that does return (§6.80). Both are owed a diagnosis and a pin, and the stop's
+park is owed the interleaving that ends it.
 
 ---
 
