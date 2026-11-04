@@ -850,6 +850,12 @@ leaves `trace.stop` set, no `DETACH-CLEAR`, no `RESUME`, no `SIGCONT-CLEAR`, the
 and the two halves of a fix were written and reverted twice because neither could be pinned — a park whose
 sleep leaves its task in the ready queue has to be taken out of it, and a wake that is not a resume has to be
 re-parked, but every bare-stop shape this file could build stayed green without either (§6.79).
+**Two reds sit beside it, both seen once and neither diagnosed** (2026-11-04, the first aarch64 arm runs
+after the task table widened): `t-seccomp`'s "the tracer can rewrite the syscall number at the seccomp stop"
+— a bare `PTRACE_SETREGS` answering something other than 0, while the same program's cancel-the-call claim,
+which makes the same call, passed — and a lane that ran past its 900 s budget with no summary. Both are
+one-offs under a host running the whole sweep's TCG machines, and neither has a reading yet; the shape to
+catch them in is the one §6.79's owed instrument uses.
 
 ---
 
