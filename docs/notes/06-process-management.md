@@ -6111,3 +6111,12 @@ the two fixtures is the action word itself: the old one installs `SECCOMP_RET_TR
 bare `SECCOMP_RET_TRACE`. That is the next measurement - and if the bare word is what loses the stop, it is
 a finding of its own (Linux answers both the same), not a fixture detail. The claim stays out of the tree
 until then.
+
+**The data word is not the difference (2026-11-04).** With the action spelled exactly as the older
+fixture spells it (`SECCOMP_RET_TRACE | 0x1234`), the machine still answered `status 0xf00:
+stopped=false event=0` / `the step it reached instead (exit 15)`: the judged call came back `ENOSYS` and no
+stop reached the tracer. So the action word is ruled out, and the remaining differences between the
+fixture that does reach its stop and the one that does not are: which call is judged (`getpid` there,
+`getppid` here), the blocked `SIGUSR1`, and the `PR_SET_NO_NEW_PRIVS` promise this one has to make before
+its install succeeds. The next measurement is a bisect on those three - judge `getpid` first, since the
+older fixture differs in exactly that and nothing else it would notice.
