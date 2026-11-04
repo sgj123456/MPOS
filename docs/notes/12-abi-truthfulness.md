@@ -292,12 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-04, the door carried across the arch seam §6.77c):** stage 1
+**Latest measured gate (2026-11-04, a number names a process or a thread §6.77e):** stage 1
+`1224 tests, 0 failed` (27.20 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35
+passed, 0 failed`, exit 33, `total 27.39 s`; aarch64 `pass=255 fail=0 (255 built)`,
+`mpos-kunit 35 passed, 0 failed`, every lane `ok` on `=== END`, `total 70.03 s`
+(`build/gate-pidnum3.log`). The new `t-kill-numbers` runs and passes on both arms. This is
+the first run in which **stage 1 is green for a reason rather than by luck**: the ext4
+`relatime` test had been order-dependent since it was written (§3.26), and its red had been
+recorded here as an "unexplained concurrency transient" for two days.
+
+**Measured gate before it (2026-11-04, the door carried across the arch seam §6.77c):** stage 1
 `1224 tests, 0 failed` (15.97 s); x86_64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35
 passed, 0 failed`, exit 33, `total 16.20 s`; aarch64 `pass=254 fail=0 (254 built)`,
 `mpos-kunit 35 passed, 0 failed`, every lane `ok` on `=== END`, `total 49.30 s`
 (`build/gate-faultdoor3.log`). `t-kill-ends-group` is the heaviest program on x86_64 lane 4
-(2.18 s) and aarch64 lane 5 (2.35 s) — its three fixtures' sleep budget.
+(2.18 s) and aarch64 lane 5 (2.35 s) — its three fixtures' sleep budget. That run's stage 1
+was green at 15.97 s and would have gone red on another day; the reason was not found
+until §6.77e.
 
 **Measured gate before it (2026-11-04, one door for a fatal signal §6.77b):** stage 1
 `1224 tests, 0 failed` (16.18 s); x86_64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35

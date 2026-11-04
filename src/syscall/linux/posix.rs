@@ -1521,6 +1521,12 @@ pub fn handle_rt_sigpending(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// that does not exist is ESRCH, and a live thread whose group is not
 /// the one named is ESRCH too — the caller named a process the thread
 /// does not belong to.
+///
+/// The thread half resolves through [`crate::sched::named_thread`], not a
+/// bare slot: a dead leader's number still names its group (Linux answers 0 and
+/// delivers nothing), while a dead worker's number is nobody's - measured on a
+/// current host before this was written
+/// (`.workbuddy/probe_kill_leaderless.c`, Linux 7.2.11, `docs/notes/` §6.77e).
 pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     let (tgid, tid, sig) = (args[0] as isize, args[1] as isize, args[2]);
     if sig > crate::sched::signal::MAX_SIGNAL as usize {
@@ -1530,22 +1536,32 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     // and the group it must belong to. Resolving each first is what makes a
     // number from another namespace `ESRCH` rather than a signal to whichever
     // task wears that slot.
-    let (Some(tid), Some(tgid)) = (super::proc::pid_task(tid), super::proc::pid_task(tgid)) else {
+    let (Some(tid), Some(tgid)) = (
+        crate::sched::named_thread(tid as u32),
+        super::proc::pid_task(tgid),
+    ) else {
         return err::ESRCH;
     };
-    let Some(snap) = crate::sched::snapshot(tid.0) else {
+    // The group the named thread belongs to, which the second name has to be:
+    // a thread of another group is a process the caller did not name.
+    let Some(leader) = crate::sched::thread_group_of(tid.slot()) else {
         return err::ESRCH;
     };
-    if snap.pid != tgid.0 {
+    if leader != tgid {
         return err::ESRCH;
     }
-    if !crate::sched::may_signal(sig as u8, tid) {
+    if !crate::sched::may_signal(sig as u8, tid.slot()) {
         return err::EPERM;
     }
-    if crate::sched::send_signal(tid, sig as u8) {
-        0
-    } else {
-        err::ESRCH
+    match tid {
+        crate::sched::Named::Gone(_) => 0,
+        crate::sched::Named::Thread(target) => {
+            if crate::sched::send_signal(target, sig as u8) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
     }
 }
 
@@ -1575,13 +1591,16 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     }
     let si_errno = unsafe { ((uinfo + 4) as *const i32).read_unaligned() };
     let si_code = unsafe { ((uinfo + 8) as *const i32).read_unaligned() };
-    let target = super::proc::pid_task(tgid);
+    // A process number, like `kill`'s positive arm: the same resolution rule,
+    // so a group whose leader has exited still answers for its live worker
+    // rather than `ESRCH` (`docs/notes/` §6.77e).
+    let target = crate::sched::named_process(tgid as u32);
     // `si_code` at or above zero is the kernel's own ground, and `SI_TKILL` is
     // the one negative code a caller may not forge either: both are `EPERM`
     // when the target is somebody else. Measured on a current host
     // (`.workbuddy/probe_qinfo.c`, Linux 7.2.11): -1, -2, -7, -8 and -100 are
     // accepted; 0, +1 and -6 are `EPERM`.
-    if target != Some(crate::sched::current_tgid())
+    if target.map(crate::sched::Named::slot) != Some(crate::sched::current_tgid())
         && (si_code >= 0 || si_code == crate::sched::signal::SI_TKILL)
     {
         return err::EPERM;
@@ -1593,9 +1612,17 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // the code check (which is about what the record says) and before the send.
     // Measured on a current host: a caller outside the target's ids and without
     // `CAP_KILL` in its namespace is `EPERM` here exactly as it is at `kill`.
-    if !crate::sched::may_signal(sig as u8, target) {
+    if !crate::sched::may_signal(sig as u8, target.slot()) {
         return err::EPERM;
     }
+    let Some(target) = (match target {
+        crate::sched::Named::Thread(id) => Some(id),
+        // Nothing left to take a copy: Linux answers 0 for a number that is
+        // still owned, and queues nothing.
+        crate::sched::Named::Gone(_) => None,
+    }) else {
+        return 0;
+    };
     // The caller's record is the contract, not the sender's identity: Linux
     // copies `si_pid`, `si_uid`, `si_errno` and `si_value` verbatim (measured,
     // `.workbuddy/probe_qinfo.c`: 4242/4242 and the value arrive unchanged, and

@@ -1632,6 +1632,110 @@ pub fn send_signal_every_process(sig: u8) -> GroupSend {
     answer
 }
 
+/// What a number written to a `kill`-family door names, resolved in the
+/// caller's namespace.
+///
+/// Two answers, because Linux has two: a live thread the signal can be put on,
+/// or a number that is still *owned* with nothing left to take anything - a
+/// zombie process, or a group leader that exited under a group that still
+/// exists. Both are successes to the sender and only "no such number" is
+/// `ESRCH`; the difference is whether a copy is queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// A live thread, which is where the copy goes.
+    Thread(TaskId),
+    /// The number is owned but its thread has exited: nothing is delivered and
+    /// the sender still hears success.
+    Gone(TaskId),
+}
+
+impl Named {
+    /// The slot the number resolved to, which is the one the permission
+    /// question is asked about - a zombie's credentials are still its own.
+    pub fn slot(self) -> TaskId {
+        match self {
+            Named::Thread(id) | Named::Gone(id) => id,
+        }
+    }
+}
+
+/// Resolve a number to the **process** it names, which is what `kill` signals.
+///
+/// A number in a `kill` names a process, and a process outlives the thread
+/// that carries its number: Linux keeps a thread group's `struct pid` alive
+/// while any of its threads is, so `kill(<pid>)` reaches the surviving worker
+/// after the leader has exited (`group_send_sig_info` broadcasts to the whole
+/// group). Measured on a current host before this walk was written
+/// (`.workbuddy/probe_kill_leaderless.c`, Linux 7.2.11): a child whose leader
+/// thread `pthread_exit`ed under a parked worker answers `kill(pid, 0)` **0**,
+/// and a real signal to that number runs the *worker's* handler.
+///
+/// Resolving to the named slot instead answers `ESRCH` for that whole shape -
+/// the leader has exited and [`send_signal_info`] refuses an exited target -
+/// which is what this machine measured as `kill(6, 0) = -1 errno=3` where Linux
+/// answers 0, and it is why a program that `kill`s its own leaderless group
+/// could not be reaped (`docs/notes/` §6.77e).
+///
+/// A **worker's** number is different: it dies with the thread, so once that
+/// thread has exited the number names nobody. Measured the same way
+/// (`probe_kill_leaderless.c`): `kill(<dead worker's tid>, 0)` is `ESRCH` on
+/// Linux even while the group is alive - whereas `kill(<dead leader's pid>, 0)`
+/// is 0 - which is why the leader test below is on the slot itself.
+pub fn named_process(number: u32) -> Option<Named> {
+    let (slot, tgid, named_exited) = with_table(|t| {
+        let slot = t.task(t.current).pid_ns.task_of(number)?;
+        let task = t.tasks.get(slot)?.as_ref()?;
+        Some((slot, task.tgid, task.exited))
+    })?;
+    // A number that names a worker names that thread: once it has exited there
+    // is no process left behind its number, even if the group lives on.
+    if named_exited && slot != tgid.0 {
+        return None;
+    }
+    let members = process_members(tgid);
+    // The leader when it is alive, because that is the task `/proc` and the
+    // ABI's other numbers rest on; a worker after it, which is what Linux's
+    // shared pending set does without choosing (`docs/notes/` §15.86).
+    if let Some(leader) = members.iter().copied().find(|id| *id == tgid) {
+        return Some(Named::Thread(leader));
+    }
+    match members.first().copied() {
+        Some(worker) => Some(Named::Thread(worker)),
+        // No live thread: the group is a zombie, and its number still names it.
+        None => Some(Named::Gone(tgid)),
+    }
+}
+
+/// Resolve a number to the **thread** it names, which is what `tkill` and
+/// `tgkill` signal.
+///
+/// The difference from [`named_process`] is measured, not stylistic: a
+/// `tkill` aimed at a dead leader answers 0 and delivers nothing, because a
+/// leader's number *is* its group's number and outlives the thread, while the
+/// same call aimed at a dead worker is `ESRCH` because that number died with
+/// it. Both readings on a current host
+/// (`.workbuddy/probe_kill_leaderless.c`, Linux 7.2.11): `tkill(<dead leader>,
+/// 0)` = 0 with the worker's handler never running, `tkill(<dead worker>, 0)`
+/// = -1 `ESRCH` whether that thread waits to be joined or has been.
+pub fn named_thread(number: u32) -> Option<Named> {
+    with_table(|t| {
+        let slot = t.task(t.current).pid_ns.task_of(number)?;
+        let task = t.tasks.get(slot)?.as_ref()?;
+        if !task.exited {
+            return Some(Named::Thread(TaskId(slot)));
+        }
+        // A leader's number is its group's number and stays owned while the
+        // group does; a worker's number goes with the thread.
+        (task.tgid.0 == slot).then_some(Named::Gone(TaskId(slot)))
+    })
+}
+
+/// The group a slot belongs to, whatever state that slot is in: `tgkill`'s
+/// second name is checked against this, and a zombie's group is still its own.
+pub fn thread_group_of(id: TaskId) -> Option<TaskId> {
+    with_table(|t| Some(t.tasks.get(id.0)?.as_ref()?.tgid))
+}
+
 /// The live tasks of one thread group: the process that a pid names.
 pub fn process_members(tgid: TaskId) -> alloc::vec::Vec<TaskId> {
     with_table(|t| {

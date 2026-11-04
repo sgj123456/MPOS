@@ -346,7 +346,7 @@ pub unsafe fn dispatch(
         nr::NANOSLEEP => proc::handle_nanosleep(args, from_user),
         nr::CLOCK_NANOSLEEP => proc::handle_clock_nanosleep(args, from_user),
         nr::KILL => proc::handle_kill(args),
-        nr::TKILL => proc::handle_kill(args),
+        nr::TKILL => proc::handle_tkill(args),
         // `ptrace` and its bulk-memory relatives: one task observing another.
         // They are in `proc` because everything they need - the task table, the
         // register frames, the stops - is the process machinery's. All of them

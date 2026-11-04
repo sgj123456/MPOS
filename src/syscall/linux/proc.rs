@@ -2363,8 +2363,10 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
     number
 }
 
-/// Send a signal to a process, or to a whole process group. Used by `kill` and
-/// `tkill`.
+/// Send a signal to a process, or to a whole process group. Used by `kill`.
+///
+/// `tkill` has its own door ([`handle_tkill`]): it names a thread and this one
+/// names a process, and the two numbers outlive their threads differently.
 ///
 /// Linux reads the id's *sign*: a positive value names one process, -1 names
 /// every process the caller may signal, any other negative value names a
@@ -2400,16 +2402,74 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
         }
         0 => kill_group(crate::sched::current_pgid(), sig),
         n => {
-            let Some(target) = pid_task(n) else {
+            // A positive number names a **process**, and a process outlives the
+            // thread that carries its number: `named_process` answers the live
+            // thread to put the copy on, or `Gone` when the group is a zombie
+            // whose number is still owned. Resolving the slot and then asking
+            // `send_signal` is what made this door answer `ESRCH` for a
+            // leaderless group whose worker was parked - the shape that left a
+            // program unable to kill the group it had just orphaned, measured
+            // as `kill(6, 0) = -1 errno=3` where Linux answers 0
+            // (`docs/notes/` §6.77e).
+            let Some(named) = crate::sched::named_process(n as u32) else {
                 return err::ESRCH;
             };
             // Who may signal whom is one rule, shared with `tgkill`'s other
             // half and with the two doors that carry a record. Measured on a
             // current host first (`.workbuddy/probe_killperm.c`): uid 1000's
-            // `kill(1, 0)` is `EPERM`, while its own child's is 0.
-            if !crate::sched::may_signal(sig as u8, target) {
+            // `kill(1, 0)` is `EPERM`, while its own child's is 0. Asked about
+            // the slot the number resolved to, because a zombie's credentials
+            // are still its own.
+            if !crate::sched::may_signal(sig as u8, named.slot()) {
                 return err::EPERM;
             }
+            match named {
+                // The number is owned and nothing is left to take a copy: a
+                // success to the sender, which is Linux's answer for a zombie
+                // (`kill(<zombie>, 0) = 0`, measured) and for a group leader
+                // that exited under a live group.
+                crate::sched::Named::Gone(_) => 0,
+                crate::sched::Named::Thread(target) => {
+                    if crate::sched::send_signal(target, sig as u8) {
+                        0
+                    } else {
+                        err::ESRCH
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `tkill(tid, sig)` — a signal to one thread, named by its own number.
+///
+/// The same two arguments as `kill`, and a different question: `kill` names a
+/// process and reaches whichever thread of it can take the copy, while `tkill`
+/// names a thread and a thread's number dies with the thread - except when that
+/// thread leads the group, whose number is the group's number and outlives it.
+/// Both halves are measured on a current host
+/// (`.workbuddy/probe_kill_leaderless.c`, Linux 7.2.11): `tkill(<dead leader>,
+/// 0)` = 0 with the surviving worker's handler never running, `tkill(<dead
+/// worker>, 0)` = -1 `ESRCH` whether that thread waits to be joined or has been.
+///
+/// It is a separate door from `kill`'s for exactly that reason. Sharing one
+/// made this machine answer `ESRCH` for a dead leader's number where Linux
+/// answers 0, and - worse - would have delivered a thread-aimed copy to a
+/// sibling the caller did not name (`docs/notes/` §6.77e).
+pub(super) fn handle_tkill(args: [usize; ARG_COUNT]) -> isize {
+    let (tid, sig) = (args[0] as isize, args[1]);
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
+        return err::EINVAL;
+    }
+    let Some(named) = crate::sched::named_thread(tid as u32) else {
+        return err::ESRCH;
+    };
+    if !crate::sched::may_signal(sig as u8, named.slot()) {
+        return err::EPERM;
+    }
+    match named {
+        crate::sched::Named::Gone(_) => 0,
+        crate::sched::Named::Thread(target) => {
             if crate::sched::send_signal(target, sig as u8) {
                 0
             } else {

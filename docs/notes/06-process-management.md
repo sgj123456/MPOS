@@ -5348,3 +5348,140 @@ the gate's own cargo command is 726 + every leaf crate green), and one `FAIL t-p
 same claim whose 20x10 ms poll was tightened for budget in §15.93. Both re-ran green without a change
 to this work; the readings are recorded so the next red is compared against them rather than
 re-litigated.
+
+### §6.77e a number names a process or a thread, and this machine had one answer for both - **FIXED (2026-11-04)**
+
+Found while pinning §6.77d: the new `t-seccomp` claims reached
+`ok: KILL_PROCESS reaps a process whose other thread is parked in a futex` and then the boot hung
+with a stall dump whose three lines say everything -
+
+```
+mpos:   slot 5 pid 5 name=/bin/t-seccomp   park 2 (block_until_nanos) syscall 61 parks=63
+mpos:   gone slot 6 pid 6 name=/bin/t-seccomp   parent=5 park 2 syscall 317 released=true retired=false fds=3
+mpos:   slot 7 pid 7 name=/bin/t-seccomp   park 2 (block_until_nanos) syscall 202 parks=2
+```
+
+- slot 5 is the test's own blocking `wait4`;
+- slot 6 died at its own **`seccomp` call gate** (317) with `retired=false` - the KILL_THREAD
+  fixture's leader, ended by `SECCOMP_RET_KILL_THREAD`, which is correct;
+- slot 7 is that fixture's parked worker, alive, which is also correct.
+
+The hang was the **cleanup**: the parent's next `kill(kid, SIGKILL)` - aimed at the number of a
+process whose leader has exited and whose worker still lives - answered `ESRCH`, and the `waitpid`
+after it had no bound. So the pin was not measuring the seccomp gate at all; it was measuring what a
+pid number means.
+
+**Measured on Linux first** (`.workbuddy/probe_kill_leaderless.c`, Linux 7.2.11, merged from the
+four scratch probes `build/scratch/zombiekill/p{,2,3,4,6,7,8}.c`; a `static` flag is *not* shared
+across `fork`, so the worker's handler result is published through a `MAP_SHARED` page - that detail
+cost the first probe its reading, `p5.c`):
+
+```
+kill(leaderless 9, 0)           = 0 errno=0
+tkill(exited leader 9, 0)       = 0 errno=0
+tgkill(9, 9, 0)                = 0 errno=0
+tkill(exited leader 9, SIGUSR1) = 0 errno=0
+  worker handler ran? no
+kill(leaderless 9, SIGUSR1)     = 0 errno=0
+  worker handler ran? YES
+kill(leaderless 9, SIGKILL)     = 0 errno=0
+  waitpid=9 status=0x0
+kill(zombie 11, 0)              = 0 errno=0
+tkill(zombie 11, 0)             = 0 errno=0
+kill(reaped 11, 0)              = -1 errno=3
+tkill(reaped 11, 0)             = -1 errno=3
+tkill(dead worker 13, 0)        = -1 errno=3
+kill(dead worker 13, 0)         = -1 errno=3
+```
+
+Two rules, and they differ:
+
+- **A `kill` number names a process.** It stays owned while any thread of the group lives, so
+  `kill(<dead leader>, 0)` is 0 and a real signal reaches the *surviving worker* (its handler ran).
+  A zombie's number is still owned too. Only once the whole group is reaped does the number die
+  (`ESRCH`).
+- **A `tkill`/`tgkill` number names a thread.** `tkill(<dead leader>, 0)` is 0 and delivers
+  **nothing** - the number is the group's, so it outlives the thread - while `tkill(<dead
+  worker>, 0)` is `ESRCH` whether that thread has been joined or not. A worker's number dies with
+  the thread.
+
+**This machine had one answer for both**, and it was the thread's: `kill`, `tkill`, `tgkill` and
+`rt_sigqueueinfo` each resolved a number through `sched::resolve_pid` to a **slot**, and
+`send_signal_info` answers `Sent::NoTask` for an exited task, so every door said `ESRCH`. Measured
+on the guest (`build/scratch/zombiekill/t-zkall.c`, booted with the kernel and loader both rebuilt):
+
+```
+kill(leaderless 6, 0)       = -1 errno=3
+tkill(exited leader 6, 0)   = -1 errno=3
+tgkill(6, 6, 0)            = -1 errno=3
+kill(leaderless 6, SIGKILL) = -1 errno=3
+kill(zombie 6, 0)           = -1 errno=3
+tkill(zombie 6, 0)          = -1 errno=3
+```
+
+Four *wrong* answers in the first five lines (Linux answers 0 to all four), and the same shape meant
+a process that killed its own leaderless group could never be reaped - which is what stalled
+`timeout(1)`-shaped code and, here, the pin.
+
+**The fix** is the two resolution rules written down where the numbers are resolved
+(`src/sched/runtime/child_signal.rs`, beside `process_members`):
+
+```rust
+pub enum Named {
+    /// A live thread, which is where the copy goes.
+    Thread(TaskId),
+    /// The number is owned but its thread has exited: nothing is delivered and
+    /// the sender still hears success.
+    Gone(TaskId),
+}
+
+pub fn named_process(number: u32) -> Option<Named>   // kill, rt_sigqueueinfo
+pub fn named_thread(number: u32) -> Option<Named>    // tkill, tgkill
+pub fn thread_group_of(id: TaskId) -> Option<TaskId> // tgkill's second name
+```
+
+`named_process` resolves the number to its group and answers the live **leader** if there is one, a
+surviving worker if the leader is gone, and `Gone` when the group has no live thread left (a zombie
+whose number is still owned); `named_thread` answers the slot itself when it is alive and `Gone`
+only when the dead thread *is* the group's leader. `Gone` is a success to the sender with nothing
+queued, `None` is `ESRCH`, and the permission question (`may_signal`) is asked about
+`Named::slot()` - a zombie's credentials are still its own.
+
+Every door was rewired to it: `handle_kill`'s positive arm (`src/syscall/linux/proc.rs`),
+`tkill` split out into its own `handle_tkill` (it had been dispatching to `handle_kill`, which is
+why the thread rule had nowhere to live), `handle_tgkill` (whose group check now compares
+`thread_group_of(tid.slot())` against the named group rather than reading `snapshot().pid`), and
+`handle_rt_sigqueueinfo`. `resolve_pid` keeps its own users (`ptrace`, `process_vm_*`, the priority
+and affinity pairs) - a **slot** is the right answer for those, and this change is about what a
+*name* means, not about how a slot is found.
+
+**The pin** is `user/tests/src/bin/t-kill-numbers.rs` (12 claims, four shapes: a leaderless group, a
+zombie, a reaped number, and a dead worker's tid published through a pipe). Its two shapes worth
+naming: the leader ends itself with a raw `exit(2)` so the group survives the leader deliberately
+(`pthread_exit` would be the same shape, less obviously), and every `wait` is a **bounded**
+`WNOHANG` poll - the counterfactual run proved why, because a blocking one hung the whole lane.
+
+**Counterfactual, measured.** With the four doors reverted (loader rebuilt too - §6.77b's trap), the
+boot reports
+
+```
+kill(6,0) = -1 errno=3
+tkill(6,0) = -1 errno=3
+tgkill(6,6,0) = -1 errno=3
+kill(6,SIGKILL) = -1 errno=3
+```
+
+four claims red, and then the run **hangs** on the unbounded `waitpid` (stall dump: the parent at
+`syscall 61`, the leader `gone ... retired=false`, the worker at `syscall 230`). Restored, the same
+boot prints all twelve `ok:` and `=== t-kill-numbers exit=0`, and on a current Linux host
+`MPOS_ON_HOST=1` gives the same twelve.
+
+**Gate** (`build/gate-pidnum3.log`, both arms, first run green on all three stages): stage 1
+`1224 tests, 0 failed` (27.20 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35 passed,
+0 failed`, exit 33, `total 27.39 s`; aarch64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed,
+0 failed`, every lane `ok` on `=== END`, `total 70.03 s`. `t-kill-numbers` runs and passes on both.
+
+**What this does not fix**, named rather than implied: a *zombie*'s number being owned is answered
+here on the resolution side only - the group's `Retired` record still has to exist for `kill` to
+find anything, which is `exit`'s job and unchanged; and `kill(-1)`/`kill(0)`/`kill(-pgid)` were
+already group-shaped and are untouched.

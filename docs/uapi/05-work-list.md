@@ -8927,3 +8927,41 @@ stalls; and (b) the wait loop's body **never runs** - an instrumented kernel's f
 task enters `block_until_uninterruptible_until(4, ...)` and never returns from it, not even at the
 deadline that call carries. The instrument now belongs inside the primitive - site, deadline and
 `hal::since_boot_nanos()` at entry and at every re-check, once per task (§7.4h's third half).
+
+### Item 194 - a number names a process or a thread, and this machine had one answer for both (2026-11-04, landed)
+
+Found while pinning the seccomp split (item 195): a `kill` aimed at a process whose leader had exited
+answered `ESRCH`, so a program cleaning up its own leaderless group could not be reaped and its
+`wait` parked forever.
+
+**Measured on Linux 7.2.11 first** (`.workbuddy/probe_kill_leaderless.c`): two rules, and they
+differ. `kill(<dead leader>, 0)` = **0** and a real signal to that number runs the *surviving
+worker's* handler; a zombie's number is owned too; only a fully reaped group's number is `ESRCH`.
+`tkill(<dead leader>, 0)` = **0** with nothing delivered (a leader's number is the group's, so it
+outlives the thread), while `tkill(<dead worker>, 0)` = `ESRCH` whether that thread waits to be
+joined or not.
+
+**This machine had the thread's answer for both** — every door resolved the number to a slot and
+`send_signal_info` refuses an exited target — measured
+(`build/scratch/zombiekill/t-zkall.c`): `kill(leaderless 6, 0) = -1 errno=3`,
+`tkill(exited leader 6, 0) = -1 errno=3`, `tgkill(6, 6, 0) = -1 errno=3`,
+`kill(leaderless 6, SIGKILL) = -1 errno=3`, `kill(zombie 6, 0) = -1 errno=3`,
+`tkill(zombie 6, 0) = -1 errno=3` — four wrong answers where Linux answers 0.
+
+**Served now by the two rules, written where numbers are resolved**
+(`src/sched/runtime/child_signal.rs`): `named_process(number) -> Option<Named>` for `kill` and
+`rt_sigqueueinfo` (the live leader, else a surviving worker, else `Gone` for a zombie group whose
+number is still owned), `named_thread(number) -> Option<Named>` for `tkill`/`tgkill` (the slot
+itself when alive, `Gone` only when the dead thread is the group's leader), and
+`thread_group_of(id) -> Option<TaskId>` for `tgkill`'s second name. `Gone` is success with nothing
+queued, `None` is `ESRCH`, and the permission question is asked about the slot the number resolved
+to. `tkill` gained its own handler (`handle_tkill`) — it had been dispatching to `handle_kill`,
+which is why the thread rule had nowhere to live. `resolve_pid` keeps its own users: a *slot* is the
+right answer for `ptrace`, `process_vm_*` and the priority/affinity pairs, and this item is about
+what a *name* means.
+
+**Pin**: `user/tests/src/bin/t-kill-numbers.rs`, 12 claims over four shapes (a leaderless group, a
+zombie, a reaped number, a dead worker's tid published through a pipe). Both machines. Counterfactual
+measured: with the four doors reverted the new claims go red with the four `errno=3` lines above and
+the run then hangs on an unbounded `waitpid` — which is why the pin's every `wait` is a bounded
+`WNOHANG` poll. Recorded in `docs/notes/06-process-management.md` §6.77e.

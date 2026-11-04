@@ -39,6 +39,13 @@ One-glance status of the whole roadmap.
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
   them (§2.6, item 91)
+- [x] a number names a process or a thread, as the door says — a `kill` number names the
+  **process** (a live leader, else the surviving worker, else a zombie group whose number is
+  still owned, because Linux keeps a group's `struct pid` while any thread lives and
+  broadcasts to it), while a `tkill`/`tgkill` number names the **thread** (a dead leader's
+  number answers 0 and delivers nothing, a dead worker's is `ESRCH`) — one door for both had
+  answered `ESRCH` to a leaderless group, so a program could not reap the group it had just
+  orphaned (§6.77e, item 194)
 - [x] a child inherits its parent's signal dispositions — `fork`/`clone` copies the
   parent's handler table and alternate stack, `clone3`'s `CLONE_CLEAR_SIGHAND` serves
   the `SIG_DFL` table instead with `CLEAR|SIGHAND` `EINVAL`, and `exec` resets only the
