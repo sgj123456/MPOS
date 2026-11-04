@@ -6303,3 +6303,18 @@ blocking `waitid` will never see it, and no amount of re-publishing in `park` fi
 be re-issued where the *wait* is, not where the stop is. The print to take next is therefore one line in
 `child_event_in`'s stop branch (`id`, `me`, `stop.signal`, `stop.reported`, `stops`) plus the same line
 from `unreported_stop` for the wildcard door, with the adopt-and-hold patch restored.
+
+**The number, measured (2026-11-04).** With the adopt-and-hold patch in place and a print in
+`child_event_in`'s stop branch, the surviving hang produced exactly one line:
+`mpos-dbg: CE-REPORTED id=8 me=6 sig=19 traced=false` - a *group* stop (`sig=19`, `SIGSTOP`) belonging to
+child 8, asked about by parent 6 with `stops` set, whose `reported` was **already true**. So an earlier
+claim in the same program had consumed the report and the blocking `waitid` could never see it.
+
+Allowing a group stop to stay readable to a parent that asks for stops (`(!stop.reported || !stop.traced)`
+in the branch) removed a second hang that the same run had shown (`t-sched-getaffinity`, gone:
+`pass=256 fail=1` from `pass=255 fail=2`) and left `t-waitid` alone. That points the last step at the
+*resume* rather than the report: a `SIGSTOP`ped child is held by `park` until its stop is cleared, and if
+nothing sends the `SIGCONT` that clears a group stop, the parent's next `waitid` (for the exit) waits on a
+child that is waiting to be resumed - a stopped task waiting on a stopped task, exactly the shape §6.86
+predicted. The next measurement is whether `t-waitid` ever sends `SIGCONT` to the child it stopped, and what
+Linux does with a self-stopped child that the parent only ever `waitid`s on.
