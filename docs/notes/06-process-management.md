@@ -6138,3 +6138,26 @@ are the claims that install filters **on top of** a previous one and the claim t
 as the cgroup tree outliving its mounts (§3.28): a claim that leaves process-wide state behind, measured by
 a later claim that reads it. The next measurement is a bisect over those claims, and the `SETREGS` claim
 goes in only once a fixture can reach its stop at the position it needs to occupy.
+
+**A fixture that reaches its stop, and what it measured (2026-11-04).** The claim is now in the tree as
+`t-seccomp`'s `claim_a_stop_survives_a_queued_signal`. Two things had to be fixed for it to get there, and
+both are lessons in their own right:
+
+1. **The judged call must be one no earlier claim judges.** The filter-stacking claim in this program
+   installs two filters on the **main process** and a `seccomp` filter cannot be removed, so every child
+   forked afterwards inherits them: `getpid` answers `EPERM` and `getppid` `ENOSYS` from those filters
+   before a later fixture's own filter can speak. That is what all four earlier readings had been - the
+   `exit 15` was an inherited filter's `ENOSYS`, not a lost tracer - and it is the same shape as the cgroup
+   tree outliving its mounts (§3.28): a claim that leaves process-wide state behind, measured by a later
+   claim that reads it. Judging `getuid`, which neither inherited filter touches, makes the question
+   askable at the end of `main`.
+2. **The install needs `PR_SET_NO_NEW_PRIVS`** on a host (and on any guest that is not root): `EACCES`
+   without it, `build/scratch/nsig/p.c`.
+
+Measured on both machines with that shape: the stop arrives (`status 0x7057f: stopped=true event=7`), a
+blocked `SIGUSR1` can be queued to the stopped tracee, `PTRACE_SETREGS` answers **`Ok(0)`**, and the tracee
+then runs to its exit - Linux's answers. So this shape does **not** reproduce the `ESRCH` that the gate saw
+once, which means the loss is a rarer interleaving than "a signal was queued to a stopped tracee". The
+claim is worth keeping as the promise it states; the `ESRCH` witness is still owed, and `trace::park`'s
+single sleep is still the suspect: a stop recorded at a task's own syscall-exit gate while that task is
+still ready is the one shape this fixture cannot force.
