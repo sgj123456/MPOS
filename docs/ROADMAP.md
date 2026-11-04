@@ -112,6 +112,11 @@ One-glance status of the whole roadmap.
 - [x] a group's death is its last thread's — a worker's `exit_group` is reaped as the leader, a
   leader's own exit is a zombie until its group ends, and the death carries the leader's byte
   (§15.86)
+- [x] a machine with no room for another task refuses, it does not die — `alloc_slot` answers
+  `Option`, both spawn doors return `EAGAIN` the way `clone(2)` does at Linux's own limit, and a
+  fork after the crowd is collected works again (`t-fork-limit`; §6.81, item 198). What still
+  stands open is why one lane's serial sweep reaches the limit at all: it leaves one `busybox`
+  looper per program parked in `nanosleep` (§6.80, open)
 - [x] a pidfd names a process, not a number — `pidfd_open` records the slot **and** its tenant
   generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
   its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,

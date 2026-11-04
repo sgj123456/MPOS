@@ -614,6 +614,12 @@ pub enum SpawnError {
     /// binary - and the path it named is not on the filesystem, or is not an
     /// image that can be loaded.
     NoInterpreter,
+    /// The task table is full. Linux answers its own task limit the same way -
+    /// `EAGAIN`, measured on a current host: a process forked 196 children
+    /// before it was refused with errno 11, and after reaping them a fork
+    /// answered again (`.build/scratch/forklimit/p.c`), because the limit is a
+    /// live count rather than a permanent exhaustion.
+    NoSlot,
 }
 
 /// Where a descriptor taken from the starter's table goes in the child's:
@@ -2150,17 +2156,15 @@ impl Table {
 
     /// Slot 1 is left free on purpose - it is init's pid - and the top slot is
     /// the scheduler's. Everything between them is first come, first served.
-    pub(crate) fn alloc_slot(&mut self) -> usize {
-        let slot = (FIRST_ALLOC_SLOT..MAX_TASKS - 1)
-            .find(|&slot| self.tasks[slot].is_none())
-            .unwrap_or_else(|| panic!("all {MAX_TASKS} task slots are in use"));
+    pub(crate) fn alloc_slot(&mut self) -> Option<usize> {
+        let slot = (FIRST_ALLOC_SLOT..MAX_TASKS - 1).find(|&slot| self.tasks[slot].is_none())?;
         // The new tenant's identity. Bumping here rather than on release means
         // a freed slot keeps the dead tenant's number until somebody takes it,
         // so a pidfd that outlives the task reads "gone" either way - the slot
         // is empty, or its number is not the one the descriptor recorded.
         self.generations[slot] = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
-        slot
+        Some(slot)
     }
 
     /// Allocate a slot, a stack and a bootstrap context for a kernel task. The
@@ -2172,7 +2176,9 @@ impl Table {
         priority: Priority,
         interruptible: bool,
     ) -> TaskId {
-        let slot = self.alloc_slot();
+        let slot = self
+            .alloc_slot()
+            .expect("the kernel's own task creation has a slot at boot");
         self.create_at(slot, body, priority, interruptible)
     }
 

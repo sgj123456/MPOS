@@ -9093,3 +9093,29 @@ Recorded in `docs/notes/02-signal-delivery.md` §2.12; the shutdown stall this i
 **The named remainder.** The copy still sits on the task the pick chose, so a thread that blocks it
 *after* being picked keeps it until it unblocks; Linux's shared group pending set lets another thread
 take it first. Nothing in the sweep depends on that yet.
+
+### Item 198 - a machine with no room for another task refuses with `EAGAIN` (2026-11-04, landed)
+
+**Linux's answer, measured** (`build/scratch/forklimit/p.c`, Linux 7.2.11: children park on a pipe read,
+the parent counts until `fork` fails, then kills and reaps them all and forks again):
+`forked 196 children before it refused: errno=11 (Resource temporarily unavailable)` and
+`after reaping them all, fork answers 208`. The limit is a live count and its answer is `-1`/`EAGAIN`.
+
+**This kernel had** a panic: `alloc_slot` (`src/sched/runtime/task.rs`) ended
+`.unwrap_or_else(|| panic!("all 64 task slots are in use"))`, so a full table took the machine with it
+(`docs/notes/` §6.80 recorded the sweep's own way of reaching it).
+
+**Served by** `alloc_slot -> Option<usize>` and four callers that answer the errno: both spawn doors in
+`src/sched/runtime/child_exit.rs` return `crate::err::EAGAIN`, `spawn_user` returns
+`SpawnError::NoSlot` answered as `EAGAIN` in both of `src/syscall/linux/proc.rs`'s matches, and the
+kernel's own `create` keeps an `.expect` (a kernel task at boot has a slot). `clone(2)`'s trailing
+`hand_down_keyrings`/`hand_down_rseq` both start `if child <= 0 { return; }`, so a negative answer flows
+out with nothing to unwind.
+
+**Pinned** by `t-fork-limit`: refused-not-fatal, `EAGAIN`, every child collected, and a fork after them
+works again (`57 children made, answer Some(11)` on this machine, `MPOS_ON_HOST=1` 4/4). Counterfactual:
+with the panic restored the machine dies at `all 64 task slots are in use` before the first claim.
+`docs/notes/` §6.81.
+
+**Not fixed by this:** why one lane's sweep reaches the limit at all (one `busybox` looper per program) -
+§6.80's open question.

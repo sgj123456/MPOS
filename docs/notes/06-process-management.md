@@ -5747,3 +5747,63 @@ why it took until a serial run to see it.
 
 **Owed:** count live slots across a lane's programs (an instrument in `alloc_slot`/`release`), then either
 fix the leak or give the limit Linux's errno instead of a panic.
+
+## §6.81 A machine with no room for another task answers `EAGAIN`, not a panic (LANDED 2026-11-04)
+
+§6.80 left a panic and two candidates, and said the answer the *caller* would have got was a dead
+machine where Linux answers `EAGAIN`. That half needed no further measurement to act on, so it landed
+first and the leak stayed named. Linux's own answer, measured on this host before the fix
+(`build/scratch/forklimit/p.c`, `gcc -O1 -o p p.c`: every child parks on a pipe read, the parent counts
+until `fork()` fails, then kills and reaps them all and forks once more):
+
+```
+forked 196 children before it refused: errno=11 (Resource temporarily unavailable)
+after reaping them all, fork answers 208
+```
+
+So the limit is a *live* count and its answer is `-1`/`EAGAIN`; nothing is permanent about it.
+`alloc_slot` (`src/sched/runtime/task.rs`) had the opposite shape:
+
+```rust
+(FIRST_ALLOC_SLOT..MAX_TASKS - 1)
+    .find(|&slot| self.tasks[slot].is_none())
+    .unwrap_or_else(|| panic!("all {MAX_TASKS} task slots are in use"))
+```
+
+**Served.** `alloc_slot` answers `Option<usize>` now, and each of its callers answers the errno a caller
+can recover from:
+
+| caller | before | now |
+|---|---|---|
+| `spawn_copy` (`child_exit.rs`, the fork-shaped `clone`) | panicked | `let Some(child_id) = child else { return crate::err::EAGAIN; }` |
+| `spawn_thread` (`child_exit.rs`, `CLONE_THREAD`) | panicked | the same |
+| `spawn_user` (`load.rs`) | panicked | `SpawnError::NoSlot`, answered `EAGAIN` by both of `src/syscall/linux/proc.rs`'s matches |
+| `create` (`task.rs`, the kernel's own tasks) | panicked | `.expect("the kernel's own task creation has a slot at boot")` — boot-time, and a kernel task at boot has one |
+
+`clone`'s own shape is what makes the negative return safe to thread through: after the spawn function it
+calls `hand_down_keyrings` and `hand_down_rseq`, and both start `if child <= 0 { return; }`. So an
+`-EAGAIN` flows out of `clone(2)` the way Linux's `-1`/`EAGAIN` does, with no error-cleanup path to unwind.
+
+**Pinned** by `user/tests/src/bin/t-fork-limit.rs`: a pipe whose read end the children park on, then
+`fork` until it is refused, then the claims *a fork with no room for another task is refused, not fatal*,
+*and the refusal is EAGAIN, the answer Linux gives at its own task limit*, *every child this program made
+is collected*, and *a fork after them works again*. `MPOS_ON_HOST=1` answers 4/4 (`300` children on the
+host's much larger table, no refusal). On this machine: `(57 children made, answer Some(11))`,
+`(57 of 57)` collected, `(answer 6, collected 6)`, `PASS`.
+
+**Counterfactual.** With the panic put back inside `alloc_slot` (and every caller left alone), the same
+boot dies before the first claim prints:
+
+```
+KERNEL PANIC: panicked at src/sched/runtime/task.rs:2174:32:
+all 64 task slots are in use
+```
+
+The pin's own first shape hung on the host, and the reason is worth keeping: every child inherited the
+pipe's *write* end, so closing the parent's copy left the read end with a writer and no child ever saw
+`EOF`. A child must close the write end it inherited before it parks. A fixture that only works because
+one side of a pipe happens to die is not a fixture.
+
+**What is still open is §6.80's own question**: which `busybox` loop the lane leaves one of per program,
+which is what makes this limit reachable inside a single lane's sweep. Fixing the answer's *shape* does
+not fix the leak.

@@ -798,7 +798,7 @@ pub fn try_spawn_user(
         initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
-        let slot = t.alloc_slot();
+        let slot = t.alloc_slot().ok_or(SpawnError::NoSlot)?;
         drop_retired(TaskId(slot));
         // Its namespace is where its starter's children go, by reference, and
         // it is registered there and at every level above - which is what lets

@@ -1058,8 +1058,8 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
     }
 
     // Phase 2: Allocate a slot and build the child state.
-    let child_id = with_table(|t| {
-        let slot = t.alloc_slot();
+    let child = with_table(|t| {
+        let slot = t.alloc_slot()?;
         drop_retired(TaskId(slot));
         // Which namespace this child is born into - and, under
         // `CLONE_NEWPID`, the namespace it *is*: Linux's `copy_process` puts
@@ -1507,9 +1507,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             t.sched.push_ready(child_id, parent_priority);
         }
         t.sched.wake(parent_id);
-        child_id
+        Some(child_id)
     });
 
+    let Some(child_id) = child else {
+        return crate::err::EAGAIN;
+    };
     child_id.0 as isize
 }
 
@@ -1823,7 +1826,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         return crate::err::EINVAL;
     }
 
-    let child_id = with_table(|t| {
+    let child = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
         // Read before the slot is taken: the task literal that follows is built
@@ -1925,7 +1928,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // The creator's *live* base, not its record: see `running_tls`.
         let parent_tls = running_tls(parent);
 
-        let slot = t.alloc_slot();
+        let slot = t.alloc_slot()?;
         drop_retired(TaskId(slot));
         // A thread is its process, so it is a member of the namespace the
         // process is in - not of the one the process's *children* go to, which
@@ -2100,9 +2103,12 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         } else {
             t.sched.push_ready(child_id, priority);
         }
-        child_id
+        Some(child_id)
     });
 
+    let Some(child_id) = child else {
+        return crate::err::EAGAIN;
+    };
     child_id.0 as isize
 }
 

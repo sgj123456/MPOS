@@ -1818,6 +1818,7 @@ pub(super) fn handle_execve(
     // paths can never disagree about what a script is.
     let (bytes, argv) = match crate::sched::resolve_script(bytes, argv, Some(cwd.clone()), &path) {
         Ok(r) => r,
+        Err(crate::sched::SpawnError::NoSlot) => return err::EAGAIN,
         Err(crate::sched::SpawnError::Loop) => return err::ELOOP,
         // Linux reports a missing interpreter as "the file was not found",
         // not as a malformed executable: the script itself was fine, and it
@@ -1880,6 +1881,7 @@ pub(super) fn handle_execve(
             }
             0 // execve succeeds; the frame patches make it "not return"
         }
+        Err(crate::sched::SpawnError::NoSlot) => err::EAGAIN,
         Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
         Err(crate::sched::SpawnError::ArgsTooBig) => err::E2BIG,
         Err(crate::sched::SpawnError::BadFd) => err::EBADF,
