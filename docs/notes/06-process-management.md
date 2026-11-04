@@ -6220,3 +6220,16 @@ once will be re-held by the loop, and whatever state `park` returns into - a sig
 believed it had a stopped task - is not a state the loop can put back. Both halves were reverted again.
 **What is left is not a tweak:** the stop has to be owned by one object that both the park and the resume
 can see, instead of "a flag plus a queue entry that either side may or may not find".
+
+**The lock is not the problem either (read 2026-11-04).** `with_table` and `schedule` both run inside
+`critical_section::with` over the same `TABLE`, so a resumer's clear-and-wake cannot interleave with a
+park's publish-and-sleep, and the lost-wake window is ruled out by construction. What remains is the
+*return*: `park` hands control back to `deliver_signal`'s `Stop` arm, which returns "the call was not
+delivered" - i.e. the task continues the syscall it was stopped in. A loop that keeps a task in `park`
+until the stop clears therefore re-enters that same gate whenever a stray wake released it, and a tracee
+whose tracer is no longer waiting on a stop is a task stopped with nobody to report it: the three waits that
+hang (`t-waitid`, `t-sysv-msg`, `t-timer-create`) are all programs with a tracer-shaped or signal-shaped
+wait in them. The next attempt has to answer that return, not the queueing: either `park` re-enters the
+delivery path on a stop that is still published (so a spurious stop is reported to the tracer), or the wake
+that does not resume is not allowed to return at all - and both are a change to the stop's *interface*, not
+to `policy`.
