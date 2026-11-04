@@ -5684,3 +5684,66 @@ for the second.
 state and use the poll only to establish that nothing was *collected*. A poll alone cannot distinguish
 "still waiting" from "wrong", and the load that makes the two look alike is exactly the load a gate
 runs under.
+
+### 6.79 A detach handed back a tracee the user had stopped — observation, not yet a diagnosis (2026-11-04)
+
+`t-ptrace-attach`'s "a detach leaves a stop the user asked for alone" reddened twice in one afternoon on
+the **second** machine's six-lane sweep, and the evidence the claim now prints says the two readings are
+not the same event:
+
+```
+FAIL:  a detach leaves a stop the user asked for alone (state "", collected true)
+```
+
+`collected true` is the sharp one: `waitpid(WNOHANG)` collected the child inside the 200 ms window, so
+the detach resumed a tracee the user had stopped with `kill -STOP`. `state ""` is the weaker one — the
+`/proc/<pid>/stat` read itself failed, which can also happen because the pid was already gone.
+
+What is measured so far:
+
+* **not reproducible alone, on either machine.** Eight sequential runs in one x86_64 boot: 8/8
+  `ok:    a detach leaves a stop the user asked for alone (state "T", collected false)`. The same claim
+  is green on both arms of every full gate run in the session that was not one of these two.
+* **not caused by the signal fix that happened to be in the tree.** A control run with that fix stashed
+  (`build/gate-control.log`) was green here and red on the futex claims the fix is meant to flip.
+* the shape the kernel reports for a *green* detach of a user-stopped task, from the instrumented serial
+  run (`build/gate-dbg-serial.log`): `mpos-dbg: detach id=7 sig=0 stop=true group=Some(true)
+  delivering=None pending=0x40000 blocked=0xfffffffffffbfeff` — kept, not cleared, no wake.
+
+The suspect, by reading rather than by measurement: **`PTRACE_ATTACH` injects its stop as the same
+`SIGSTOP` bit a user's `kill -STOP` sets** (`src/syscall/linux/proc.rs`'s attach path does
+`set_tracer(id, me)` then `send_signal(id, SIGSTOP)`), and a task has **one** stop object. `detach_traced`
+(`src/sched/runtime/trace.rs`) drops the attach's stop by clearing the pending `SIGSTOP`/`SIGTSTP`/
+`SIGTTIN`/`SIGTTOU` bits and then waking the task when no stop object is left — so if the attach's stop
+overwrote a user's group stop, or the user's stop was still only *pending*, the detach clears the user's
+stop too and the task runs. The Linux-shaped fix candidate is to make an attach to an already-stopped
+task *report that stop to the tracer* instead of queuing a second `SIGSTOP`, so nothing needs clearing.
+That is a hypothesis; a failing run has not yet been caught with the instrument in place (the one attempt
+hung its lane before the program ran).
+
+**Owed:** catch the failing shape with the detach instrument, then decide between "one stop object per
+task" and Linux's separate group-stop accounting.
+
+### 6.80 A one-lane sweep ran out of the 64 task slots — observation, not yet a diagnosis (2026-11-04)
+
+The first full sweep attempted on a single lane (`MPOS_TEST_LANES=1 cargo xtask test --arch aarch64`,
+the shape a serial debugging run wants) died in the kernel:
+
+```
+KERNEL PANIC: panicked at src/sched/runtime/task.rs:2156:32:
+all 64 task slots are in use
+  kernel stack: sp 0xffff80008c5ad960 of [0xffff80008c5a9000..0xffff80008c5b1000), 13984 bytes in use, 18784 bytes to spare
+```
+
+immediately after `=== RUN t-stdspawn` / `t-stdspawn: a std program is running` /
+`ok:   /bin/true ran and exited 0`. The same run also reported `the sweep staged t-netstats but its
+NETSTAT line never reached the log` and `no summary line - the run did not get to the end`.
+
+`alloc_slot` (`src/sched/runtime/task.rs:2156`) panics rather than refusing, so the answer the *caller*
+would have got is a dead machine where Linux answers `EAGAIN` from `clone`/`fork` at its own task limit.
+Two candidates, neither measured: a slot leak across the lane's ~200 programs, or a recycling delay that
+only shows when one lane runs everything back to back. The six-lane default never reaches it, which is
+why it took until a serial run to see it.
+
+**Owed:** count live slots across a lane's programs (an instrument in `alloc_slot`/`release`), then either
+fix the leak or give the limit Linux's errno instead of a panic.

@@ -819,6 +819,17 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at a wait, so the group is never reaped. Half of the mechanism is now named and closed: the group-death rule had **two** doors and only one of them ended the group, so a task that killed itself died alone and left its parked sibling alive (`syscall 62` at the `kill` gate, `retired=false`) — the one door is `die_of_fatal_signal`, pinned by `t-kill-ends-group`'s self-kill fixture (§6.77b, item 123). The second half is named and closed too: the copy that killed the wrong thread was **process-directed but delivered to one task**, and Linux hands such a signal to a thread that may take it - measured as a parked worker's `FUTEX_WAIT` answering `EINTR` where this kernel's left the handler unrun and both threads parked (§2.12, item 197, pinned by `t-signal-park`'s third shape). What still stands open is the composition's own ending: weston's survivor may be a thread at a futex nobody wakes for a different reason (§7.4h's fourth and fifth readings, both measured with `retired=false`), and the confirmation still owed is weston's own boot reaching a reaped group.
 
+Two more observations were named on 2026-11-04 and neither is diagnosed yet. **A detach can hand back a tracee the
+user had stopped**: `t-ptrace-attach`'s "a detach leaves a stop the user asked for alone" reddened twice on the
+second machine's six-lane sweep, once with the collected evidence `(state "", collected true)` — the detach resumed
+a child the user had `SIGSTOP`ped — and it will not reproduce alone (8/8 green in one x86_64 boot, and green on the
+same fix in a control run). The suspect is that `PTRACE_ATTACH` injects its stop as the same `SIGSTOP` bit a user's
+`kill -STOP` sets, and a task has one stop object, so `detach_traced`'s "drop the attach's stop" clears the user's
+too (§6.79). **A one-lane sweep exhausts the 64 task slots**: `MPOS_TEST_LANES=1 cargo xtask test --arch aarch64`
+panicked `all 64 task slots are in use` at `alloc_slot` right after `t-stdspawn`'s first claim, where the caller
+should have got Linux's `EAGAIN`; either a leak or a recycling delay, unmeasured (§6.80). Both are owed a diagnosis
+and a pin.
+
 ---
 
 
