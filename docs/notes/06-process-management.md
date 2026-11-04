@@ -6198,3 +6198,15 @@ something, so a task lost this way shows up exactly as a hung wait. The shape to
 one critical section shared by both sides: the stop published together with the hold, and the stop cleared
 together with the wake, with the resumer checking that the sleeper is there before it drops the lock. The
 witness (`answer Some(Err(3))`) and the four timeouts are the two ends of the check.
+
+**A sharper suspect, read out of the policy (2026-11-04, not yet measured).** Both sides of the stop are
+already atomic: `resume_traced` clears `trace.stop` and calls `wake` inside one `with_table` closure, and
+`park` publishes the stop and sleeps inside one `schedule` closure. So the lost-wake window above is
+narrower than the loop suggested - but `sleep` pushes a `Sleeper` **unconditionally** (`policy.rs`: one more
+heap entry per call, no dedupe) and `wake` pops **one** entry per call. A loop that re-holds therefore
+stacks entries, and a second wake - a timer plus a resume, say - can pop a stale one and push the task into
+a ready band *while the task is running*: `pick`'s own doc says "a task in neither queue has been picked and
+is the one running", so a ready entry for the running task is the same task runnable twice, which is how a
+scheduler wedges rather than merely loses something. The next fix is therefore `hold` being idempotent
+(`if !is_sleeping(id) { push }`, and the ready-band prune kept), and the check is the same pair: the witness
+must read `Ok(0)` and those four waits must not hang.
