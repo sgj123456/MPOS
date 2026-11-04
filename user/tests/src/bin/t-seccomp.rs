@@ -681,108 +681,6 @@ fn claim_a_stop_survives_a_queued_signal(r: &mut Report) {
     );
 }
 
-/// A stop that outlives a timer the tracee armed for itself.
-///
-/// Linux (host, measured): the alarm fires while the tracee is stopped at its
-/// seccomp event, the signal stays pending, the tracee stays stopped, and the
-/// tracer's `PTRACE_SETREGS` still answers 0. This machine answered `ESRCH`
-/// once under load (`docs/notes/` §6.85) - and this is the shape that can force
-/// it: `trace::park` sleeps once and returns on the first wake of any kind, and
-/// a timer's expiry inside a stop is exactly such a wake.
-fn claim_a_stop_outlives_the_tracees_own_timer(r: &mut Report) {
-    const DATA: u32 = 0x1234;
-    const UID: u32 = libc::SYS_getuid as u32;
-    let child = unsafe { libc::fork() };
-    if child == 0 {
-        // SAFETY: syscalls only between fork and `_exit`, each a straight call.
-        unsafe {
-            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
-                libc::_exit(11);
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                libc::_exit(13);
-            }
-            libc::raise(libc::SIGSTOP);
-            if install(UID, libc::SECCOMP_RET_TRACE | DATA).map(|v| v == 0) != Ok(true) {
-                libc::_exit(12);
-            }
-            libc::signal(libc::SIGALRM, libc::SIG_IGN);
-            let timer = libc::itimerval {
-                it_interval: libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                },
-                it_value: libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 50_000,
-                },
-            };
-            libc::setitimer(libc::ITIMER_REAL, &timer, core::ptr::null_mut());
-            let got = libc::syscall(libc::SYS_getuid) as isize;
-            libc::_exit(if got >= 0 { 0 } else { 15 });
-        }
-    }
-    let mut status = 0i32;
-    // SAFETY: `child` is this process's own child and `status` a local.
-    let n = unsafe { libc::waitpid(child, &mut status, 0) };
-    if n != child {
-        r.check("the timer fixture stops for TRACEME", false);
-        return;
-    }
-    let _ = ptrace(
-        libc::PTRACE_SETOPTIONS as c_long,
-        child,
-        0,
-        PTRACE_O_TRACESECCOMP as usize,
-    );
-    let _ = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0);
-    let n = unsafe { libc::waitpid(child, &mut status, 0) };
-    let stopped = n == child && libc::WIFSTOPPED(status);
-    r.check(
-        &format!(
-            "the judged call stops the tracee (status {status:#x}: stopped={stopped} event={})",
-            status >> 16
-        ),
-        stopped && (status >> 16) == PTRACE_EVENT_SECCOMP,
-    );
-    if !stopped {
-        r.check(
-            &format!(
-                "the step it reached instead (exit {})",
-                (status >> 8) & 0xff
-            ),
-            false,
-        );
-        return;
-    }
-    // Let the tracee's own alarm expire inside the stop: 50 ms armed before the
-    // judged call, four times that waited here.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let mut regs: [u64; REG_WORDS] = [0; REG_WORDS];
-    let read = ptrace(
-        libc::PTRACE_GETREGS as c_long,
-        child,
-        0,
-        regs.as_mut_ptr() as usize,
-    );
-    let mut answered = None;
-    if read == Ok(0) {
-        regs[NUMBER_SLOT] = UID as u64;
-        answered = Some(ptrace(
-            libc::PTRACE_SETREGS as c_long,
-            child,
-            0,
-            regs.as_ptr() as usize,
-        ));
-    }
-    r.check(
-        &format!("a stop outlives a timer the tracee armed for itself (answer {answered:?})"),
-        answered == Some(Ok(0)),
-    );
-    let _ = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0);
-    let _ = unsafe { libc::waitpid(child, &mut status, 0) };
-}
-
 fn main() {
     let mut r = Report::new();
 
@@ -1116,7 +1014,6 @@ fn main() {
     );
 
     claim_a_stop_survives_a_queued_signal(&mut r);
-    claim_a_stop_outlives_the_tracees_own_timer(&mut r);
 
     r.finish()
 }

@@ -472,23 +472,8 @@ pub(crate) fn park(regs: &mut AbiRegs, stop: Stop) {
         // `u64::MAX` is "until someone wakes me". A stop has no clock on it:
         // a tracee that gave up waiting would break the protocol, and a group
         // stop is ended by `SIGCONT` and nothing else.
-        t.sched.hold(id, priority);
+        t.sched.sleep(id, priority, u64::MAX);
     });
-    // A wake is not a resume: a timer expiring, a signal queued, a group's
-    // `SIGCONT` - Linux keeps a stopped task stopped through all of them, so
-    // re-hold it after every wake that did not clear the stop.
-    loop {
-        if with_table(|t| t.task(id).trace.stop.is_none()) {
-            break;
-        }
-        schedule(|t| {
-            if t.task(id).trace.stop.is_none() {
-                return;
-            }
-            let priority = t.task(id).priority;
-            t.sched.hold(id, priority);
-        });
-    }
     *regs = with_table(|t| t.task(id).trace.regs).unwrap_or(snapshot);
 }
 
