@@ -6279,3 +6279,15 @@ pins the last shape down to one thing to print next: whether the child's stop re
 *event* the parent reads is taken from the stop object, and a parent that consumed the first report and
 then re-parks needs the second entry to publish a fresh one). With the adopt-and-hold patch restored, that
 print is the whole next session's work.
+
+**Re-reporting the adopted stop does not fix the last hang either (measured 2026-11-04).** `park` was
+retried with the stop object adopted on a second entry *and* its `reported` flag reset to `false` so the
+next waiter would be told again. On a full aarch64 arm only **`t-waitid`** hung
+(`build/gate-stopwake7.log`: lane 0 `=== SUMMARY pass=0 fail=1` from `=== FAIL t-waitid timeout=120s`,
+lanes 1/2/3/5 `pass=40/53/53/55 fail=0`, lane 4 the recorded EL0 boot flake); the other two waits that
+hung with the bare loop (`t-sysv-msg`, `t-timer-create`) did not. So the "second stop object" part of the
+diagnosis holds - it fixes two of the three - and `t-waitid`'s wedge is not the report either. What is left
+is a `waitid` that watches a group stop raised through the child's own `tgkill` gate: the child is held
+where it raised the stop, and the parent is woken but never sees `CLD_STOPPED`. The next print is on
+`child_event_in`'s stop branch for a P_ALL/P_PID subject whose child is the one held in `park`, with the
+adopt-and-hold patch back in the tree.
