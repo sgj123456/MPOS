@@ -6187,3 +6187,14 @@ reverting `9bddb0d`). A task held out of the ready queue that nothing resumes is
 task lost, and the re-hold loop turns a lost wake into a wedge. What is still needed: the resume path must
 find the held task under the same lock that clears the stop, instead of re-holding after the fact - then
 this witness and those four timeouts are the check.
+
+**Where the wedge is, as a hypothesis to test (2026-11-04, not measured).** The reverted loop's failure is
+consistent with a lost wake, not with a task that is merely held: `park` publishes `trace.stop` and then
+sleeps the task, while a resumer clears `trace.stop` and *then* calls `sched.wake(id)` - and `wake` only
+finds a task that is already in the sleep queue. Any window in which the clear-and-wake lands before the
+sleep does is a wake nothing will repeat, and the task stays out of every ready band forever; the four
+timeouts (`t-waitid`, `t-blk-sleep`, `t-exec-threads`, `t-drm-sync`) are all programs that wait on
+something, so a task lost this way shows up exactly as a hung wait. The shape to build next is therefore
+one critical section shared by both sides: the stop published together with the hold, and the stop cleared
+together with the wake, with the resumer checking that the sleeper is there before it drops the lock. The
+witness (`answer Some(Err(3))`) and the four timeouts are the two ends of the check.
