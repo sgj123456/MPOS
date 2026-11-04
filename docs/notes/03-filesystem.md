@@ -1825,3 +1825,55 @@ entry means.
 **Rule:** when two readers of the same map are documented to agree, the *shape* of the agreement is part of
 the rule — a generation test folded into the arm's body with `&&` answers a third thing (neither this node
 nor any other) that nobody wrote down.
+
+### 3.28 The cgroup tree outlives its mounts, so a program's groups are still there for the next program (LANDED 2026-11-04)
+
+Two programs in the sweep each make a group called `grp`. They got away with it until a lane happened to
+place them next to each other, and then `t-cgroupfs` died of `mkdir grp: Os { code: 17, kind:
+AlreadyExists }` with its first six claims green — a shape that reads like a stale dentry in the kernel
+and was recorded as one in `AGENTS.md` §5 for two days.
+
+**Measured, in the order that fails.** `build/scratch/ns-then-cg-init.sh` boots once and runs
+`/bin/t-ns-cgroup` then `/bin/t-cgroupfs`, which is what a lane does when the two land together:
+
+```
+--- before the fix
+=== ns exit=0
+=== first exit=134        <- t-cgroupfs's create_dir(grp) answered EEXIST
+--- after
+ok:    the groups this program made are gone from the machine's tree
+=== ns exit=0
+=== first exit=0
+=== second exit=0
+```
+
+**Why the group survives.** `src/vfs/cgroupfs.rs` keeps **one** machine-wide hierarchy
+(`static TREE: Mutex<RefCell<Option<Arc<CgDir>>>>`, `the_tree()`), and a mount is a view of it, not a
+copy. `t-ns-cgroup` unmounted its own mount and moved itself back to the root, which leaves the tree
+empty of *members* — but `grp` and `grp/sub` are still children of the root, and the next mount is a view
+of the same tree. Linux answers the same way: `cgroup2`'s root is refcounted and only destroyed when its
+last mount is gone **and it has no children**, so a child keeps the group visible to the next mount. The
+kernel is not wrong here; the program's tail comment was. It said "leave the tree as it was found" and
+did half of it.
+
+**The fix** is in `user/tests/src/bin/t-ns-cgroup.rs`'s tail: after moving itself back to the root,
+`std::fs::remove_dir` the two groups it made, then assert the **state** the kernel reports rather than the
+two calls' returns —
+
+```rust
+let _ = std::fs::remove_dir(format!("{AT}/grp/sub"));
+let _ = std::fs::remove_dir(format!("{AT}/grp"));
+r.check(
+    "the groups this program made are gone from the machine's tree",
+    !std::path::Path::new(&format!("{AT}/grp/sub")).exists()
+        && !std::path::Path::new(&format!("{AT}/grp")).exists(),
+);
+```
+
+**Counterfactual** (the two `remove_dir` lines deleted, program rebuilt, same two-program boot):
+`FAIL:  the groups this program made are gone from the machine's tree`, `=== ns exit=1`, and the
+downstream `=== first exit=134` — the collision back in the same shape.
+
+**Rule:** a hierarchy that is the machine's is shared by every mount of it, so "unmount" is not how a test
+gives its groups back. A program that makes a group removes it, and the claim for that is the tree's
+state, not the call's answer.

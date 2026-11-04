@@ -211,7 +211,28 @@ fn main() {
     }
 
     // ---- leave the tree as it was found ----
+    //
+    // The unmount is not what empties the hierarchy. The tree is the
+    // machine's - one hierarchy every mount of it points at - so a group
+    // this program made is still there for the next mount and the next
+    // program. Measured: `t-cgroupfs`, which makes a `grp` of its own,
+    // died of `mkdir grp: AlreadyExists` when this program ran first in the
+    // same lane (`docs/notes/` §3.28). Linux keeps it too: the root is only
+    // destroyed when its last mount goes *and* it has no children, so one
+    // child makes the next mount show the group again. Removing what was
+    // made is therefore the program's job, and "as it was found" is a
+    // claim, not a comment.
     put(&format!("{AT}/cgroup.procs"), &format!("{pid}\n"));
+    let _ = std::fs::remove_dir(format!("{AT}/grp/sub"));
+    let _ = std::fs::remove_dir(format!("{AT}/grp"));
+    // The claim reads the tree's state, not the two calls' returns: a
+    // `remove_dir` that answers 0 and leaves the entry behind would satisfy
+    // "it was removed" and fail a later program (`docs/notes/` §6.78a's rule).
+    r.check(
+        "the groups this program made are gone from the machine's tree",
+        !std::path::Path::new(&format!("{AT}/grp/sub")).exists()
+            && !std::path::Path::new(&format!("{AT}/grp")).exists(),
+    );
     let _ = unmount(AT, UnmountFlags::empty());
     r.finish()
 }
