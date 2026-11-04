@@ -6374,3 +6374,26 @@ ok:    and it still exits with its own code
   before (`=== FAIL t-rename timeout=120s`, `pass=255 fail=2`), so this shape still wedges a *blocking*
   wait somewhere after a resume - the next print is `block_until_child_event`'s own predicates for the
   post-resume sections, not the stop.
+
+**The blocking wait that is left, measured (2026-11-04).** With the adopt-and-hold patch in the tree and one
+print per `child_event` answer (the predicate every blocking wait reads), the last two lines before
+`t-waitid`'s timeout are
+
+```
+mpos-dbg: CE me=6 id=7 stops=false cont=false -> false
+mpos-dbg: CE me=6 id=7 stops=false cont=false -> false
+ok:    and leaves the caller's rusage record untouched
+```
+
+- `stops=false, cont=false` means a plain `WEXITED` wait: the parent is waiting for child 7 to *exit*, and
+  `child_event_in` says there is no event - so the wait parks, which is correct **if** the child is still
+  alive. It is not: the child was already collected earlier by `and it still exits with its own code`
+  (`waitid(..., WEXITED)` on the same id), so slot 7 is either a corpse with no retired record left or a
+  reused slot whose `kind_visible`/`is_child` answers "a child" that will never produce an event.
+- That is the last door: `handle_wait`'s blocking path asks `is_child` (still true) and then waits for an
+  event that `take_retired_current` has already handed over once. Linux's answer for "the child is gone and
+  collected" is `ECHILD`, and the shape that would give it here is: a blocking wait must re-check
+  `take_retired_current`/`has_matching_children` inside its own park predicate, not only before it parks.
+- The adopt-and-hold patch itself is validated by this run: with it in, the stop/resume section passes and
+  only this wait is left (`=== FAIL t-waitid timeout=120s`, one lane, `pass=256 fail=1`); `t-rename`'s
+  earlier red did not recur without the debug prints.
