@@ -6268,3 +6268,14 @@ machine) `parks=278` and a sibling in `syscall 130` `parks=4` (`build/gate-stopw
 and the third is a different shape: a parent woken 278 times in `waitid` and never seeing what it waits
 for - a wake that carries no event, which is the wait side of the same "one object, two readers" problem
 the group stop has. Reverted; the next experiment is `waitid`'s own event queue with the loop in place.
+
+**Where the last hang is, from the numbers already in hand (2026-11-04).** `t-waitid` says in its own
+header that its subject is the raw `SYS_waitid` - "247 here, 95 on the second machine" - and the stall
+dump of the surviving hang names the parent in `syscall 95` (waitid) and the *child* in `syscall 130`
+(`tgkill`, which is how a task raises `SIGSTOP` on itself). So the child is held inside the syscall gate
+it raised its own stop from, and the parent is woken 278 times without receiving the stop event. That
+pins the last shape down to one thing to print next: whether the child's stop reached
+`child_event_in`/`take_stop_report` before it was held (the group-stop publish wakes the parent, but the
+*event* the parent reads is taken from the stop object, and a parent that consumed the first report and
+then re-parks needs the second entry to publish a fresh one). With the adopt-and-hold patch restored, that
+print is the whole next session's work.
