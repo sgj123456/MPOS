@@ -6161,3 +6161,26 @@ once, which means the loss is a rarer interleaving than "a signal was queued to 
 claim is worth keeping as the promise it states; the `ESRCH` witness is still owed, and `trace::park`'s
 single sleep is still the suspect: a stop recorded at a task's own syscall-exit gate while that task is
 still ready is the one shape this fixture cannot force.
+
+## §6.86 A stop ended by a wake, not by a resume — FIXED (2026-11-04)
+
+`trace::park` slept **once** (`policy::sleep(id, priority, u64::MAX)`) and returned on the first wake of
+any kind, so a stopped task came back the moment its own armed timer expired, a signal was queued to it, or
+its group got a `SIGCONT`. Linux keeps a stopped task stopped through all of those; the observables were:
+`t-ptrace-attach`'s `(state "", collected true)` under load, and the gate's one-off `t-seccomp`
+`PTRACE_SETREGS` → `ESRCH`.
+
+**The witness that force it** (added to `t-seccomp`, `claim_a_stop_outlives_the_tracees_own_timer`): the
+tracee arms a 50 ms `ITIMER_REAL` immediately before the judged call, stops at its seccomp event, the
+tracer waits 200 ms (four times the timer) and then writes registers. Linux answers `Ok(0)` (host,
+measured); this machine answered `Some(Err(3))` — `ESRCH`, `set_trace_regs`'s only reachable false, because
+`trace.stop` was gone.
+
+**The fix:** `policy::hold` — remove the task from every ready band, then sleep it until somebody ends the
+stop (`retire` cannot be used: a resume must find the sleeper) — and a loop in `park` that re-holds after
+every wake which did not clear `trace.stop`. The check sits under the same lock as the sleep, because a
+resumer clears `trace.stop` *before* waking: a check outside it could lose the wake and leave a task
+nothing resumes. With it, the witness reads `ok: … (answer Some(Ok(0)))`.
+
+Two earlier attempts at this fix were reverted because no claim could be made red by them (§6.79, §6.85);
+this one has a witness that is red without it and green with it.

@@ -215,6 +215,17 @@ impl Scheduler {
         self.sleeping = rebuilt;
     }
 
+    /// Hold a task in a stop: out of every ready queue, asleep until somebody
+    /// ends the stop. `sleep` alone is not enough - a park's caller is the task
+    /// itself, so it is still ready when it parks, and the picker takes it
+    /// straight back (`docs/notes/` §6.85).
+    pub fn hold(&mut self, id: TaskId, priority: Priority) {
+        for band in self.ready.iter_mut() {
+            band.retain(|queued| *queued != id);
+        }
+        self.sleep(id, priority, u64::MAX);
+    }
+
     /// Queue a task to wake after `nanos` more nanoseconds of clock.
     ///
     /// A wait of 0 is not "wake immediately": the task still has to wait for the
