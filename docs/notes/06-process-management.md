@@ -6318,3 +6318,17 @@ nothing sends the `SIGCONT` that clears a group stop, the parent's next `waitid`
 child that is waiting to be resumed - a stopped task waiting on a stopped task, exactly the shape §6.86
 predicted. The next measurement is whether `t-waitid` ever sends `SIGCONT` to the child it stopped, and what
 Linux does with a self-stopped child that the parent only ever `waitid`s on.
+
+**The shape of the last hang, from the pin itself (read 2026-11-04).** `t-waitid`'s stop section forks a
+child that `raise(SIGSTOP)`s itself and learns about it through `fn await_event(kid, options)`, which
+loops **400 times of `waitid(P_PID, kid, &mut info, options | WNOHANG)` with a 5 ms sleep between** and
+returns the first record whose `si_pid` is the child - for the stop (`WSTOPPED`) and then, after
+`kill(kid, SIGCONT)`, for the resume (`WCONTINUED`). The stall dump's `parks=278` on the parent in
+`syscall 95` is therefore the *polling loop*: 2 s of five-millisecond polls is ~400 wake-and-park cycles,
+which is what `parks` counts, not a blocking wait. The child is in `tgkill` (`syscall 130`), i.e. held
+inside the gate it raised its own stop from. So the surviving hang is: the child is held (correct), the
+parent polls and never gets a record (not correct, and §6.86's `CE-REPORTED` line says the stop's
+`reported` flag was already true), and the program then falls through its `None` arms rather than
+blocking - which is why it burns the whole budget. Next: with the adopt-and-hold patch in, print
+`child_event_in`'s answer (not just `reported`) for that `P_PID` subject on every poll, and compare with
+what `take_stop_report` cleared.
