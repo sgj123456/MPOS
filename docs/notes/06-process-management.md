@@ -6071,3 +6071,31 @@ what the existing three-claim program already uses, and it waits for `TRACEME` f
 The claim was reverted rather than shipped red; the next attempt starts from the existing
 `seccomp_stop_reaches_a_tracer` shape (which does reach its stop on both machines) and adds only the
 blocked signal between the stop and the `SETREGS`.
+
+**A second attempt, with the reference running (2026-11-04).** The pin was rewritten from
+`seccomp_stop_reaches_a_tracer` and run on this host first. Measuring the fixture rather than assuming it
+paid twice on the way: `seccomp(SECCOMP_SET_MODE_FILTER)` answers `EACCES` unless the caller has already
+made the `PR_SET_NO_NEW_PRIVS` promise (`build/scratch/nsig/p.c`: `install without nnp: r=-1 errno=13`,
+`nnp: 0`, `install with nnp: r=0 errno=0`), which is what the first attempt's `status 0xc00` had been - the
+child's own `_exit(12)`, not a stop. With the promise made, the host run reached the question:
+
+```
+ok:    a tracee that blocks a signal stops for TRACEME first
+ok:    the tracer of it asks for PTRACE_O_TRACESECCOMP
+ok:    and resumes it from its own stop
+ok:    the judged call stops the tracee (status 0x7057f: stopped=true event=7)
+ok:    a signal it blocks can be queued to a stopped tracee (sent=true)
+ok:    and its registers can still be written (answer Some(Ok(0)))
+ok:    the tracee then runs to its exit (status 0x0: exited=true)
+```
+
+Linux answers `PTRACE_SETREGS` with 0 there, so the claim's target reading exists. On this machine the same
+claim failed one step earlier - `FAIL:  the judged call stops the tracee (status 0xe00: stopped=false
+event=0)`, the child exiting 14 - and **the three claims of `seccomp_stop_reaches_a_tracer` passed in the
+same boot**, including the stop itself (`status 0x7057f: stopped=true event=7`). So the seccomp stop does
+hold in that fixture and not in this one, before any signal is queued: the difference between the two is
+the fixture, not yet the kernel, and a claim cannot be pointed at the park until it can say which of the
+two it is looking at. The `policy::hold` + re-park loop was written and built a second time to test it and
+did not change this reading, and both were reverted unshipped with the claim. Next: make the new fixture
+report the child's own last step (13/14/15 for the filter's answer and `getppid`'s), so the claim can tell
+"the stop never happened" from "the stop was released", then re-ask.
