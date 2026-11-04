@@ -6099,3 +6099,15 @@ two it is looking at. The `policy::hold` + re-park loop was written and built a 
 did not change this reading, and both were reverted unshipped with the claim. Next: make the new fixture
 report the child's own last step (13/14/15 for the filter's answer and `getppid`'s), so the claim can tell
 "the stop never happened" from "the stop was released", then re-ask.
+
+**The third attempt reads the child's own last step, and the answer is `ENOSYS` (2026-11-04).** The child
+now reports through its exit code, and on this machine the tracer's second `waitpid` came back
+`status 0xf00: stopped=false event=0`, i.e. `FAIL:  the step it reached instead (exit 15)` - the judged
+`getppid` answered `ENOSYS`, which is what a `SECCOMP_RET_TRACE` filter's syscall answers when the kernel
+delivers it no tracer. So the stop of this fixture is not "released": it **never reached the tracer**,
+even though `PTRACE_SETOPTIONS` with `PTRACE_O_TRACESECCOMP` answered 0 in the same boot and the older
+fixture's stop (`status 0x7057f: stopped=true event=7`) did arrive. The one remaining difference between
+the two fixtures is the action word itself: the old one installs `SECCOMP_RET_TRACE | 0x1234` and this one
+bare `SECCOMP_RET_TRACE`. That is the next measurement - and if the bare word is what loses the stop, it is
+a finding of its own (Linux answers both the same), not a fixture detail. The claim stays out of the tree
+until then.
