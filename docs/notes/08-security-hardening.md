@@ -241,8 +241,8 @@ asked for nothing, and a tracer that asked for the event:
 | `ALLOW`, `LOG` | the call proceeds | same | same |
 | `ERRNO\|d` | returns `-d` — and `d == 0` is a *successful* 0 | same | same |
 | `TRAP` | no handler: killed by `SIGSYS`. With one: the handler runs, the call never happens, and the caller reads its own `rax` back (`getppid` answered 110, `getpid` 39 — the number, not a value) | `SIGSYS`, then `-ENOSYS` | `SIGSYS`, then `nr` |
-| `KILL_THREAD` | killed by **`SIGSYS`**, not `SIGKILL` | `SIGKILL` | `SIGSYS` |
-| `KILL_PROCESS` | killed by **`SIGSYS`** | `SIGKILL` | `SIGSYS` |
+| `KILL_THREAD` | killed by **`SIGSYS`**, not `SIGKILL` — and only the calling thread: a parked sibling keeps the process alive | `SIGKILL` | `SIGSYS`, the thread (item 195, §6.77d) |
+| `KILL_PROCESS` | killed by **`SIGSYS`**, the whole group | `SIGKILL` | `SIGSYS`, the group (item 195, §6.77d) |
 | `TRACE`, nobody tracing | the call fails with **`ENOSYS`** | allowed | `ENOSYS` |
 | `TRACE`, tracer set nothing | the call fails with **`ENOSYS`** | allowed | `ENOSYS` |
 | `TRACE`, tracer set `TRACESECCOMP` | a seccomp stop first — `SIGTRAP`, event **7**, the answer's data half in `PTRACE_GETEVENTMSG` — then the call runs | bit refused `EINVAL`; call allowed | the stop, then the call |

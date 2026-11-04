@@ -193,24 +193,35 @@ pub unsafe fn dispatch(
                 // listener fails the call with `ENOSYS`, so refusing it is not
                 // a fallback but the answer for the machine it is running on.
                 sc::RET_USER_NOTIF => return err::ENOSYS,
-                // The kills, and any value not recognised above: all of them
-                // end the task with **`SIGSYS`**, which is what Linux's
-                // `RET_KILL_THREAD` and `RET_KILL_PROCESS` actually deliver -
-                // `SIGKILL` was this kernel's answer before it was measured,
-                // and would have been the wrong signal to hang the change on.
-                // An unrecognised action falling here is deliberate too: the
-                // man page says Linux treats those as `KILL_PROCESS`, and a
-                // filter returning an invented action was seen to kill the
-                // process with SIGSYS. Allowing instead would have been the
-                // one direction a sandbox cannot survive being wrong in.
+                // `KILL_PROCESS` and `KILL_THREAD` are **not the same call**,
+                // and the difference is measurable on any Linux: with a thread
+                // parked in a futex and a filter that kills on `getpid`,
+                // `KILL_THREAD` leaves the process alive (the caller's thread
+                // dies, the parked one is the group's survivor, and the parent's
+                // `wait` blocks) while `KILL_PROCESS` reaps the whole thing with
+                // `SIGSYS` (measured, `docs/notes/` §6.77d). Both end with
+                // **`SIGSYS`** - `SIGKILL` was this kernel's answer before it
+                // was measured and would have been the wrong signal to hang the
+                // change on.
                 //
-                // Ended by `exit`, not by queueing the signal: Linux delivers
-                // these two with `do_exit(SIGSYS)`, and the difference shows on
-                // a **pid namespace's init**, whose protection discards the
-                // signals its own members send (§6.3) - a filter's own decision
-                // being droppable would be a sandbox that lets a program through
-                // the door its own filter locked.
-                _ => crate::sched::exit(-(SIGSYS as isize)),
+                // Ended by the exit door rather than by queueing the signal:
+                // Linux delivers these with `do_exit(SIGSYS)`, and the
+                // difference shows on a **pid namespace's init**, whose
+                // protection discards the signals its own members send (§6.3) -
+                // a filter's own decision being droppable would be a sandbox
+                // that lets a program through the door its own filter locked.
+                // Only `KILL_PROCESS` takes the group with it, because that is
+                // the whole content of the word: `KILL_THREAD` is a thread's
+                // death and the group outlives it.
+                sc::RET_KILL_PROCESS => crate::sched::die_of_fatal_signal(SIGSYS),
+                sc::RET_KILL_THREAD => crate::sched::exit(-(SIGSYS as isize)),
+                // Any value not recognised above ends the process, which is
+                // deliberate: the man page says Linux treats an unknown action
+                // as `KILL_PROCESS`, and a filter returning an invented action
+                // was seen to kill the process with SIGSYS. Allowing instead
+                // would have been the one direction a sandbox cannot survive
+                // being wrong in.
+                _ => crate::sched::die_of_fatal_signal(SIGSYS),
             }
         }
     }

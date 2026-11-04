@@ -241,6 +241,85 @@ fn a_child_ends_with(action: u32) -> i32 {
     status
 }
 
+/// A child that installs one kill action and reaches for the judged call while a
+/// **second thread of its group is parked** in a futex.
+///
+/// This is the only shape in which `KILL_THREAD` and `KILL_PROCESS` can be told
+/// apart, and telling them apart is the whole of what the two words mean:
+/// measured on Linux first (`docs/notes/` §6.77d), `KILL_THREAD` ends the
+/// *calling thread* and the process lives on with its parked one, so the
+/// parent's `wait` blocks - while `KILL_PROCESS` reaps the whole group with
+/// `SIGSYS`. A kernel that treats both the same is right about the signal and
+/// wrong about the survivor, which is the failure mode that looks green.
+///
+/// The child parks the worker on a futex word of its own, waits until the worker
+/// has had time to get there, installs the filter and makes the judged call.
+/// Returns `(reaped, signal)` after polling `WNOHANG` for a second - and it
+/// kills the child before returning, so a `KILL_THREAD` survivor does not leak
+/// into the rest of the sweep.
+fn a_child_with_a_parked_thread(action: u32) -> (bool, Option<i32>) {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        // A word of its own: a private mapping, so the park is this child's and
+        // nothing else can wake it.
+        let word = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        } as *mut u32;
+        if word.is_null() || word as isize == -1 {
+            unsafe { libc::_exit(70) };
+        }
+        unsafe { std::ptr::write(word, 2) };
+        // The worker parks in `FUTEX_WAIT` forever; the join handle is dropped
+        // deliberately, because nothing here waits for it.
+        let address = word as usize;
+        std::thread::spawn(move || unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                address as *mut u32,
+                128u32, // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+                2u32,
+                0usize,
+                0usize,
+                0usize,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if install(getpid_nr(), action).map(|v| v == 0) != Ok(true) {
+            unsafe { libc::_exit(70) };
+        }
+        let absent = denied(raw_getpid(), libc::ENOSYS);
+        // Not reached under either kill action; a survivor from `KILL_THREAD`
+        // reaches it and says so by not being in the status the parent reads.
+        unsafe { libc::_exit(if absent { 40 } else { 41 }) };
+    }
+    let mut reaped = false;
+    let mut signal = None;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let mut status = 0i32;
+        let got = unsafe { libc::waitpid(kid, &mut status, libc::WNOHANG) };
+        if got == kid {
+            reaped = true;
+            let sig = died_of(status);
+            signal = if sig == 0 { None } else { Some(sig) };
+            break;
+        }
+    }
+    if !reaped {
+        unsafe { libc::kill(kid, libc::SIGKILL) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(kid, &mut status, 0) };
+    }
+    (reaped, signal)
+}
+
 /// The `TRACE` case a tracer turns on: the event the kernel owes a tracer that
 /// asked for `PTRACE_O_TRACESECCOMP`.
 ///
@@ -611,8 +690,29 @@ fn main() {
         died_of(a_child_ends_with(libc::SECCOMP_RET_KILL_PROCESS)) == libc::SIGSYS,
     );
     r.check(
-        "KILL_THREAD kills with SIGSYS too (no threads here to tell them apart)",
+        "KILL_THREAD kills the caller with SIGSYS",
         died_of(a_child_ends_with(libc::SECCOMP_RET_KILL_THREAD)) == libc::SIGSYS,
+    );
+    // And the half that makes the two words different: with a thread parked in
+    // a futex, `KILL_PROCESS` reaps the group and `KILL_THREAD` does not. Both
+    // answer `SIGSYS`; what differs is whether there is a surviving thread -
+    // measured on Linux first, where the `KILL_THREAD` parent's `wait` blocks
+    // until the survivor is killed (§6.77d).
+    let (process_reaped, process_signal) =
+        a_child_with_a_parked_thread(libc::SECCOMP_RET_KILL_PROCESS);
+    check_with(
+        &mut r,
+        "KILL_PROCESS reaps a process whose other thread is parked in a futex",
+        process_reaped && process_signal == Some(libc::SIGSYS),
+        (process_reaped, process_signal),
+    );
+    let (thread_reaped, thread_signal) =
+        a_child_with_a_parked_thread(libc::SECCOMP_RET_KILL_THREAD);
+    check_with(
+        &mut r,
+        "KILL_THREAD leaves a process whose other thread is parked in a futex alive",
+        !thread_reaped,
+        (thread_reaped, thread_signal),
     );
     // The one Linux learned the hard way: an action it has never heard of must
     // not be treated as permission.

@@ -5349,6 +5349,80 @@ same claim whose 20x10 ms poll was tightened for budget in §15.93. Both re-ran 
 to this work; the readings are recorded so the next red is compared against them rather than
 re-litigated.
 
+### §6.77d `KILL_PROCESS` and `KILL_THREAD` are not the same word, and this machine had one answer - **FIXED (2026-11-04)**
+
+The audit that produced §6.77b and §6.77c left one naming on its risk list: the seccomp gate's
+`_ => crate::sched::exit(-(SIGSYS as isize))` arm served **both** `SECCOMP_RET_KILL_PROCESS` and
+`SECCOMP_RET_KILL_THREAD`. Its own comment argued they were the same call. They are not, and the
+difference is the whole content of the two words: one is a thread's death, the other a process's.
+
+**Measured on Linux first** (`build/scratch/sckill/p.c`, gcc -O1 -pthread). The probe forks per mode;
+the child parks a `pthread_create`d worker in `futex(word, FUTEX_WAIT|FUTEX_PRIVATE_FLAG, 2)` on a
+`MAP_SHARED|MAP_ANONYMOUS` word, sleeps 200 ms, installs a filter answering the mode's action for
+`SYS_getpid`, then makes that call. The parent polls `waitpid(WNOHANG)` for 6 s:
+
+```
+mode 0 (KILL_THREAD):  STILL ALIVE after 6 s
+mode 1 (KILL_PROCESS): reaped, signal=31
+```
+
+31 is `SIGSYS`. So both actions end with the same signal - and that is what had made them look
+alike - while `KILL_THREAD` leaves the group alive behind its parked worker and `KILL_PROCESS` reaps
+it. A parent waiting on the `KILL_THREAD` process blocks until that survivor is killed.
+
+**This machine behaved as `KILL_THREAD` for both**, which is the direction that looks green: the
+signal was right, the survivor was wrong, and no test in the tree had a second thread in the child to
+see it with.
+
+**The fix** (`src/syscall/linux/mod.rs`, the seccomp gate's action match) gives each word its own
+arm, and routes the process one through §6.77b's door:
+
+```rust
+sc::RET_KILL_PROCESS => crate::sched::die_of_fatal_signal(SIGSYS),
+sc::RET_KILL_THREAD => crate::sched::exit(-(SIGSYS as isize)),
+_ => crate::sched::die_of_fatal_signal(SIGSYS),
+```
+
+An unrecognised action still ends the process, which is deliberate and unchanged - the man page says
+Linux treats an unknown action as `KILL_PROCESS`, and a filter returning an invented action was
+measured killing the process with `SIGSYS` (§8.2). The two "ended by the exit door, not by queueing a
+signal" paragraphs survive as they were: a filter's own decision must not be droppable by a pid
+namespace's init protection.
+
+**The pin** is `user/tests/src/bin/t-seccomp.rs`'s `a_child_with_a_parked_thread(action)`: one child
+per action, a private futex word, a worker parked on it, the filter installed, the judged call, and a
+`WNOHANG` poll for a second - with a `kill(SIGKILL)` and a reap on the survivor's path so a
+`KILL_THREAD` survivor does not leak into the rest of the sweep. The old claim
+`"KILL_THREAD kills with SIGSYS too (no threads here to tell them apart)"` is now
+`"KILL_THREAD kills the caller with SIGSYS"` beside two new ones:
+
+```
+ok:    KILL_PROCESS reaps a process whose other thread is parked in a futex
+ok:    KILL_THREAD leaves a process whose other thread is parked in a futex alive
+```
+
+All seven kill claims pass on **both** machines and on a current Linux host with `MPOS_ON_HOST=1`.
+
+**Counterfactual, measured** (the two arms merged back into one, kernel *and* loader rebuilt -
+§6.77b's trap):
+
+```
+FAIL:  KILL_PROCESS reaps a process whose other thread is parked in a futex (got (false, None))
+ok:    KILL_THREAD leaves a process whose other thread is parked in a futex alive
+=== t-seccomp exit=1
+```
+
+Only the process claim flips; the thread claim stays green either way, which is exactly the
+asymmetry - a one-arm kernel is a correct `KILL_THREAD` and a lying `KILL_PROCESS`.
+
+**Gate** (`build/gate-seccomp.log`, both arms, `TMPDIR=$PWD/build/tmp`): stage 1 `1224 tests,
+0 failed` (29.93 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33,
+`total 30.12 s`; aarch64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`, every lane
+`ok` on `=== END`, `total 74.99 s`, heaviest `t-oom-kill 15.15 s`.
+
+**Not fixed here, and named**: the *strict* mode's `SIGKILL` (§8.2's first arm) is a different
+promise and stays `exit`; and the three arch fault sites of §6.77c are untouched by this section.
+
 ### §6.77e a number names a process or a thread, and this machine had one answer for both - **FIXED (2026-11-04)**
 
 Found while pinning §6.77d: the new `t-seccomp` claims reached

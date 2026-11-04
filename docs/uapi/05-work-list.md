@@ -8965,3 +8965,29 @@ zombie, a reaped number, a dead worker's tid published through a pipe). Both mac
 measured: with the four doors reverted the new claims go red with the four `errno=3` lines above and
 the run then hangs on an unbounded `waitpid` — which is why the pin's every `wait` is a bounded
 `WNOHANG` poll. Recorded in `docs/notes/06-process-management.md` §6.77e.
+
+### Item 195 - `KILL_PROCESS` and `KILL_THREAD` are not the same word (2026-11-04, landed)
+
+`socket`-side filter actions are one row each in §8.2's table, and two of them had one answer here:
+`SECCOMP_RET_KILL_PROCESS` and `SECCOMP_RET_KILL_THREAD` both fell into the gate's
+`_ => crate::sched::exit(-(SIGSYS))` arm. Their comment said they were the same call. They are not:
+the signal is the same and the *survivor* is not, which is the half a one-thread child cannot see.
+
+**Measured on Linux 7.2.11 first** (`build/scratch/sckill/p.c`): a child whose group has a thread
+parked in `futex(FUTEX_WAIT)` and a filter killing on `getpid`. `KILL_THREAD` leaves the process
+**alive** - the calling thread dies, the parked one is the survivor, and the parent's `wait` blocks
+until it is killed - while `KILL_PROCESS` reaps the whole group. Both with **`SIGSYS`** (31).
+
+**Served now, one arm each** (`src/syscall/linux/mod.rs`): `RET_KILL_PROCESS` goes through
+`die_of_fatal_signal(SIGSYS)` (the §6.77b door, so the group ends), `RET_KILL_THREAD` stays
+`exit(-(SIGSYS))` (one thread's death, the group outlives it), and an unrecognised action ends the
+process as before - the man page's "treated as `KILL_PROCESS`", measured in §8.2.
+
+**Pin**: `user/tests/src/bin/t-seccomp.rs`, `a_child_with_a_parked_thread(action)` - one child per
+action with a private futex word and a parked worker, plus a `WNOHANG` poll so a `KILL_THREAD`
+survivor is reaped and does not leak into the sweep. Claims: "KILL_THREAD kills the caller with
+SIGSYS", "KILL_PROCESS reaps a process whose other thread is parked in a futex", "KILL_THREAD leaves
+a process whose other thread is parked in a futex alive". Counterfactual measured: with the arms
+merged back, the process claim flips to `(false, None)` and the thread claim stays green - the
+one-arm kernel is a *correct* `KILL_THREAD` and a lying `KILL_PROCESS`. Recorded in
+`docs/notes/06-process-management.md` §6.77d.

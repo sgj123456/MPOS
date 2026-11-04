@@ -292,7 +292,15 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-04, a number names a process or a thread §6.77e):** stage 1
+**Latest measured gate (2026-11-04, `KILL_PROCESS` and `KILL_THREAD` split §6.77d):** stage 1
+`1224 tests, 0 failed` (29.93 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35
+passed, 0 failed`, exit 33, `total 30.12 s`; aarch64 `pass=255 fail=0 (255 built)`,
+`mpos-kunit 35 passed, 0 failed`, every lane `ok` on `=== END`, `total 74.99 s`
+(`build/gate-seccomp.log`). Stage 1 stayed green on its own merits for the second run
+running, which is what §3.26 bought. Slowest program on both arms is `t-oom-kill`
+(15.15 s aarch64, lane 0).
+
+**Measured gate before it (2026-11-04, a number names a process or a thread §6.77e):** stage 1
 `1224 tests, 0 failed` (27.20 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35
 passed, 0 failed`, exit 33, `total 27.39 s`; aarch64 `pass=255 fail=0 (255 built)`,
 `mpos-kunit 35 passed, 0 failed`, every lane `ok` on `=== END`, `total 70.03 s`
