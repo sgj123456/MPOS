@@ -6161,3 +6161,29 @@ once, which means the loss is a rarer interleaving than "a signal was queued to 
 claim is worth keeping as the promise it states; the `ESRCH` witness is still owed, and `trace::park`'s
 single sleep is still the suspect: a stop recorded at a task's own syscall-exit gate while that task is
 still ready is the one shape this fixture cannot force.
+
+## §6.86 A stop is ended by a resume, not by any wake — witness found, fix not shipped (2026-11-04)
+
+`trace::park` slept **once** (`policy::sleep(id, priority, u64::MAX)`) and returned on the first wake of any
+kind, so a stopped task came back the moment its own armed timer expired, a signal was queued to it, or its
+group got a `SIGCONT`. Linux keeps a stopped task stopped through all of those. The two observables were
+`t-ptrace-attach`'s `(state "", collected true)` under load and the gate's one-off `t-seccomp`
+`PTRACE_SETREGS` → `ESRCH`.
+
+**The witness** (written into `t-seccomp` as `claim_a_stop_outlives_the_tracees_own_timer`, measured and
+then removed with the fix): the tracee arms a 50 ms `ITIMER_REAL` immediately before the judged call, stops
+at its seccomp event, the tracer waits 200 ms (four times the timer) and then writes registers. Linux
+answers `Ok(0)` (host, measured: `ok:    a stop outlives a timer the tracee armed for itself (answer
+Some(Ok(0)))`); this machine answered `FAIL:  a stop outlives a timer the tracee armed for itself (answer
+Some(Err(3)))` - `ESRCH`, `set_trace_regs`'s only reachable false, because `trace.stop` was gone.
+
+**The fix that made it green, and why it is not shipped.** `policy::hold` (out of every ready band, then
+sleep until somebody ends the stop - `retire` is unusable, a resume must find the sleeper) plus a loop in
+`park` re-holding after every wake that did not clear the stop, with the check under the same lock as the
+sleep. With it the witness read `ok: … (answer Some(Ok(0)))`. A full both-arm sweep then hung four programs
+on their own budgets (`=== FAIL t-waitid timeout=120s`, `=== FAIL t-blk-sleep timeout=120s` on x86_64;
+`t-waitid`, `t-exec-threads`, `t-drm-sync`, `t-blk-sleep` on aarch64), so it was reverted (`fc3bf67`,
+reverting `9bddb0d`). A task held out of the ready queue that nothing resumes is indistinguishable from a
+task lost, and the re-hold loop turns a lost wake into a wedge. What is still needed: the resume path must
+find the held task under the same lock that clears the stop, instead of re-holding after the fact - then
+this witness and those four timeouts are the check.
