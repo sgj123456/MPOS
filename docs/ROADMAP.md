@@ -854,8 +854,10 @@ re-parked, but every bare-stop shape this file could build stayed green without 
 after the task table widened): `t-seccomp`'s "the tracer can rewrite the syscall number at the seccomp stop"
 — a bare `PTRACE_SETREGS` answering something other than 0, while the same program's cancel-the-call claim,
 which makes the same call, passed — and a lane that ran past its 900 s budget with no summary. Both are
-one-offs under a host running the whole sweep's TCG machines, and neither has a reading yet; the shape to
-catch them in is the one §6.79's owed instrument uses.
+one-offs under a host running the whole sweep's TCG machines; the first now has a mechanism — its bare
+`PTRACE_SETREGS` fell to `ESRCH` because `set_trace_regs` needs `trace.stop.is_some()`, i.e. the same park
+that returns on any wake (§6.85) — and a cheaper pin shape than the detach's, a blocked signal sent between
+the stop and the `SETREGS`. The second has no reading yet.
 
 ---
 

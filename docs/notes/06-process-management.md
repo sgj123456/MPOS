@@ -6008,3 +6008,52 @@ the measurement).
 0 failed`, every lane `=== END`, and the boot line reads `scheduler up: 256 slots, running task
 TaskId(0)`. Before it, the same two arms were `pass=224 fail=34` and worse, all of it `fork: Resource
 temporarily unavailable`.
+
+## §6.85 The seccomp stop's `SETREGS` answered `ESRCH` once — the same park, a cheaper witness
+
+**An observation with a mechanism, not a diagnosis (2026-11-04).** One aarch64 arm run, on the first
+`t-seccomp` after the task table widened, reddened on two claims in a row:
+
+```
+ok:    the tracer can read the tracee's registers at the seccomp stop
+FAIL:  the tracer can rewrite the syscall number at the seccomp stop
+FAIL:  the redirected call runs, and the tracee exits normally
+ok:    the cancel tracee stops for TRACEME first
+…
+ok:    the tracer cancels the judged call by writing -1 at the seccomp stop
+ok:    the cancelled call does not run, and the tracee exits normally
+```
+
+The first claim is a bare `PTRACE_SETREGS` compared against `Ok(0)` (`user/tests/src/bin/t-seccomp.rs:436`),
+and the *same* call shape — `PTRACE_SETREGS` writing the number slot at a seccomp stop — passed twice
+later in the same program for the cancel tracee. So the answer that failed is
+`src/syscall/linux/proc.rs:1166`'s `abi::PTRACE_SETREGS` arm falling to `err::ESRCH`:
+
+```rust
+abi::PTRACE_SETREGS => {
+    if !buffer_ok(data, abi::uregs::BYTES, false, from_user) { return err::EFAULT; }
+    if crate::sched::set_trace_regs(id, &abi::read_user_regs(data)) { 0 } else { err::ESRCH }
+}
+```
+
+and `set_trace_regs` (`src/sched/runtime/trace.rs:121`) answers `false` for exactly one reason that a
+stopped tracee can reach: `task.trace.stop.is_some()` is false. A tracee whose stop is gone is also a
+tracee that can run to its exit, which is what the next claim saw.
+
+**That is §6.79's mechanism seen from the tracer's side.** A stop is recorded at the task's own
+syscall-exit gate while the task is *running*, so the task is in the ready queue when `trace::park` sleeps;
+`policy::sleep` only pushes a heap entry, the picker takes the ready entry, and the park returns at once —
+"a park whose sleep happens while the task is still ready is a no-op". Any wake that arrives for another
+reason (its own armed timer, an interval timer, a signal being *queued*) takes it out of the stop, and the
+tracer's next `SETREGS` meets a task with no stop.
+
+**The pin this suggests, and why it is cheaper than the detach one.** No timer and no race is needed: a
+tracer can wake the tracee *itself* between the stop and the `SETREGS`, with a signal the tracee blocks
+(`SIGUSR1` behind `sigprocmask`) so nothing is delivered and nothing else changes. Linux answers 0 for
+`SETREGS` on a tracee that is still stopped; if this kernel answers `ESRCH` there, the claim fails
+without the fix and the fix becomes pinnable — which is exactly what §6.79's re-park loop could not do.
+Shape: fork the tracee, install the `TRACE` filter, `PTRACE_ATTACH`, take the seccomp stop, send the
+blocked signal, `PTRACE_SETREGS`, assert `Ok(0)`, then `PTRACE_CONT` and read the tracee's exit status.
+
+**Not yet run.** It is written down because the observation is otherwise lost in a lane's serial log, and
+because it is the first time the park's no-op sleep has a witness outside `t-ptrace-attach`'s detach.
