@@ -393,8 +393,14 @@ fn main() {
         // which is how this claim turned flaky on a lane running six of these at
         // once (`docs/notes/` §6.78a).
         let state = stat_field(&format!("/proc/{stopped}/stat"), 3).unwrap_or_default();
+        // Both words go in the message: an empty `state` is a *different*
+        // finding from a state that is not `T` - the first says the `/proc`
+        // read itself failed (the task was collected), the second says the
+        // detach handed a stopped task back running (`docs/notes/` §6.78a).
         r.check(
-            &format!("a detach leaves a stop the user asked for alone (state {state:?})"),
+            &format!(
+                "a detach leaves a stop the user asked for alone (state {state:?}, collected {gone})"
+            ),
             !gone && state == "T",
         );
         unsafe { libc::kill(stopped, libc::SIGCONT) };
