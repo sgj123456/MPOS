@@ -8997,3 +8997,58 @@ a process whose other thread is parked in a futex alive". Counterfactual measure
 merged back, the process claim flips to `(false, None)` and the thread claim stays green - the
 one-arm kernel is a *correct* `KILL_THREAD` and a lying `KILL_PROCESS`. Recorded in
 `docs/notes/06-process-management.md` §6.77d.
+
+### Item 196 - a stale cgroup membership entry left its slot in *no* group (2026-11-04, landed)
+
+**The claim.** A task that has never been moved into a cgroup2 group is in the **root**, and the
+root's `cgroup.procs` lists it. A membership entry outlives the task that made it: the tree is one
+machine-wide hierarchy (`static TREE`, `src/vfs/cgroupfs.rs`) that every mount binds and no program's
+exit tears down, and an entry is keyed by the task *slot* with the slot's generation stored beside it.
+When a cgrouped task exits and the next tenant takes that slot, the entry is **stale** - and
+`src/vfs/cgroupfs.rs`'s own header states what a stale entry means: "a lookup whose generation has
+moved on is a stale entry for a reused pid, and reads as *root*".
+
+**What this machine did.** `group_of` implemented that (`Some((tenant, node)) if Some(*tenant) ==
+generation => node.clone(), _ => the_tree()`), and `members_of` did not - it tested the generation
+inside the arm with `&&`:
+
+```rust
+Some((tenant, at)) => tasks::generation_of(tid) == Some(*tenant) && Arc::ptr_eq(at, node),
+None => node.is_root,
+```
+
+so a stale entry compared **false for every node**: the new tenant belonged to no group at all and
+disappeared from the root's `cgroup.procs`. Two readers of one map, documented to agree, disagreeing
+about a third answer nobody wrote down.
+
+**How it was measured.** `t-cgroupfs` alone on a fresh boot passed three times over - the isolated
+shape was fine, which is why AGENTS.md §5 carried the gate's occasional `t-cgroupfs` red as "an
+observed flake, not a diagnosis" through 2026-10-30 and 2026-10-31. Running the program **twice in one
+boot** (a bespoke `/init`, `build/scratch/cg-boot.sh` + `build/scratch/cg-init.sh`) showed it in one
+line: first run `=== first exit=0`, second run
+
+```
+FAIL:  the root's cgroup.procs lists this program
+=== second exit=1
+```
+
+with every other claim green. The `mkdir grp: AlreadyExists` (`exit=134`) the gate reported is a
+*second* symptom of that same first failure, from the cleanup a failed claim skips. The gate saw it
+occasionally because two cgroup programs (`t-cgroupfs`, `t-ns-cgroup`) sharing a lane is what makes a
+slot get reused inside one boot's lifetime.
+
+**The fix.** The generation as a guard on the arm, which is `group_of`'s shape:
+
+```rust
+Some((tenant, at)) if tasks::generation_of(tid) == Some(*tenant) => Arc::ptr_eq(at, node),
+_ => node.is_root,
+```
+
+**Pinned by two claims in `t-cgroupfs`** (so the gate runs the shape from now on): "a forked child
+moves itself into the group" and "a slot a cgrouped task left behind still reads as root for its new
+tenant" - the second forks a child into `grp`, reaps it, then forks again so the new leader takes the
+slot the cgrouped child released, and asks whether the root's `cgroup.procs` lists it. Counterfactual
+on a single boot with the old arm restored (kernel *and* loader rebuilt): `FAIL:  a slot a cgrouped
+task left behind still reads as root for its new tenant`, `=== t-cgroupfs exit=1`; with the fix, both
+`ok:` and `exit=0`. The two-run boot went `=== second exit=1` → `=== second exit=0`.
+Recorded in `docs/notes/03-filesystem.md` §3.27.

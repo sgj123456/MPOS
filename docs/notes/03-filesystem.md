@@ -1761,3 +1761,67 @@ four consecutive runs.
 **Rule for the next test that reads a clock:** a test asserting a *relationship* between two stamps
 must derive both from what the code produced, never from numbers the test itself made up — the host
 clock is a counter whose position depends on how many other tests ran first.
+
+### 3.27 A stale membership entry left its slot in *no* group, so the second cgrouped program in a boot was missing from the root — **FIXED** (2026-11-04)
+
+AGENTS.md §5 had carried this as an **observed flake, not a diagnosis**: `cargo xtask test` going red on
+`t-cgroupfs`'s `mkdir grp: Os { code: 17, kind: AlreadyExists }` (`=== FAIL t-cgroupfs exit=134`), twice,
+both times re-running green. The isolated shape was fine — `t-cgroupfs` alone on a fresh boot passed three
+times over — which is exactly the reading that kept it a flake. What settled it was running the program
+**twice in one boot** (`build/scratch/cg-boot.sh` boots the same OVMF/QEMU wiring as
+`.workbuddy/one-test-boot.sh` with an `/init` that runs `/bin/t-cgroupfs` twice, `build/scratch/cg-init.sh`):
+
+```
+=== first exit=0
+FAIL:  the root's cgroup.procs lists this program
+=== second exit=1
+```
+
+Every claim passed on the second run except that one, and it is the first membership claim in the program.
+The `EEXIST` the gate reported is a *later* symptom of the same thing: the program leaves its group behind
+when an earlier claim has already failed in a way that skips its cleanup.
+
+**The rule was written down and not implemented.** `src/vfs/cgroupfs.rs`'s header says what a stale entry
+means: "The generation beside the node is the slot's tenant when the write was made: a lookup whose
+generation has moved on is a stale entry for a reused pid, and reads as *root*". `group_of` implements it
+(the generation is a **guard** on the arm, so a moved-on entry falls to `_ => the_tree()`), and `members_of`
+did not:
+
+```rust
+Some((tenant, at)) => tasks::generation_of(tid) == Some(*tenant) && Arc::ptr_eq(at, node),
+None => node.is_root,
+```
+
+A stale entry therefore compared false for **every** node — the tenant belonged to no group at all, so it
+was missing from the root's `cgroup.procs` (and from every group's). The tree is one machine-wide hierarchy
+(`static TREE`) that outlives every program that mounts it, and memberships are keyed by the task **slot**
+with the slot's generation stored beside them; `TaskTable::alloc_slot` (`src/sched/runtime/task.rs:2153`)
+bumps that generation on every allocation, so the first program to exit a cgroup hands its slot to the next
+one as a stale entry. That is why it took a *second* run in the same boot to see it: the gate's lanes each
+boot fresh, and two cgroup programs sharing a lane is the shape that makes the slot get reused.
+
+**The fix** puts the generation back where it belongs — in the match arm, as a guard:
+
+```rust
+Some((tenant, at)) if tasks::generation_of(tid) == Some(*tenant) => Arc::ptr_eq(at, node),
+_ => node.is_root,
+```
+
+which is the same shape `group_of` already had. The two readers can no longer disagree about what a stale
+entry means.
+
+**Pinned, twice over.**
+
+1. The two-run boot: before, `=== second exit=1` with the claim above red; after, `=== first exit=0` and
+   `=== second exit=0`.
+2. Two claims added to `t-cgroupfs` (so the gate itself runs the shape from now on): "a forked child moves
+   itself into the group" and "a slot a cgrouped task left behind still reads as root for its new tenant"
+   — the second forks a child into `grp`, waits for it, then forks again so the new leader takes the slot
+   the cgrouped child released, and asks whether the root's `cgroup.procs` lists it. Counterfactual on a
+   single boot with the old arm restored (`src/vfs/cgroupfs.rs` backed up, both kernel and loader rebuilt):
+   `FAIL:  a slot a cgrouped task left behind still reads as root for its new tenant`, `FAILED`,
+   `=== t-cgroupfs exit=1`; with the fix, both `ok:` and `=== t-cgroupfs exit=0`.
+
+**Rule:** when two readers of the same map are documented to agree, the *shape* of the agreement is part of
+the rule — a generation test folded into the arm's body with `&&` answers a third thing (neither this node
+nor any other) that nobody wrote down.

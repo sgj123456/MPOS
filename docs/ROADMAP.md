@@ -230,7 +230,13 @@ One-glance status of the whole roadmap.
   only (controller-less, measured on a current host before it was built), the
   namespace's whole state is the view-root a `/proc/<pid>/cgroup` path renders from,
   and `t-ns-cgroup` walks the move, the fork, the ns identity and the `setns` back
-  (§6.25)
+  (§6.25). The tree behind those views is one machine-wide hierarchy that outlives
+  every mount, so its membership entries are keyed by task *slot* and carry the
+  slot's generation: a slot reused after a cgrouped task exits leaves a stale
+  entry, and both readers now agree that a stale entry means **the root** - one of
+  them had tested the generation with `&&` inside its arm instead, which put the
+  new tenant in no group at all and hid it from the root's own `cgroup.procs`
+  (fixed 2026-11-04, `t-cgroupfs`'s two new claims, §3.27, item 196)
 - [x] the kernel keyring — `add_key` (248), `request_key` (249) and `keyctl` (250)
   served on a host measurement: a serial handle over a key store, a permission word
   with four classes, keyrings that hold serials, recursive `SEARCH`, the

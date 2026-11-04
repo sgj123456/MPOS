@@ -181,6 +181,42 @@ fn main() {
             == Some("nr_descendants 0\nnr_dying_descendants 0\n"),
     );
 
+    // ---- a slot a cgrouped task left behind reads as root for its tenant ----
+    //
+    // The tree outlives every program that mounts it (`src/vfs/cgroupfs.rs`'s
+    // one hierarchy), and a membership entry is keyed by the task *slot*, with
+    // the slot's generation stored beside it. When a cgrouped task exits and
+    // the next tenant takes its slot, that entry is stale - and a stale entry
+    // means the new task is in the **root**, because it never moved anywhere.
+    // Reading it as "no group at all" instead hid the new tenant from the
+    // root's own `cgroup.procs`: the second run of this program in one boot
+    // failed exactly that claim (`docs/notes/` §3.27).
+    let cgrouped_child = match unsafe { libc::fork() } {
+        0 => {
+            let mine = std::process::id();
+            let moved = write_path(&grp("cgroup.procs"), &format!("{mine}\n"));
+            unsafe { libc::_exit(if moved { 0 } else { 1 }) }
+        }
+        kid => wait_pid(kid).unwrap_or(-1),
+    };
+    r.check(
+        "a forked child moves itself into the group",
+        cgrouped_child == 0,
+    );
+    // The next tenant of that slot: its leader slot is the one the child above
+    // released, because the slot allocator takes the lowest free one.
+    match unsafe { libc::fork() } {
+        0 => {
+            let mine = std::process::id() as u64;
+            let listed = pid_of_file(&root("cgroup.procs")).contains(&mine);
+            unsafe { libc::_exit(if listed { 0 } else { 1 }) }
+        }
+        kid => r.check(
+            "a slot a cgrouped task left behind still reads as root for its new tenant",
+            wait_pid(kid).unwrap_or(-1) == 0,
+        ),
+    }
+
     // ---- the membership moves ----
     r.check(
         "writing this pid moves this process into the group",

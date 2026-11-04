@@ -400,10 +400,19 @@ fn members_of(node: &Arc<CgDir>) -> Vec<(usize, usize)> {
         let member = critical_section::with(|cs| {
             let members = MEMBERS.borrow(cs).borrow();
             match members.get(&tid) {
-                Some((tenant, at)) => {
-                    tasks::generation_of(tid) == Some(*tenant) && Arc::ptr_eq(at, node)
+                Some((tenant, at)) if tasks::generation_of(tid) == Some(*tenant) => {
+                    Arc::ptr_eq(at, node)
                 }
-                None => node.is_root,
+                // No entry, or one a *previous* tenant of this slot left
+                // behind: a task that never moved is in the root, and the
+                // stale entry must not hide it from the root's own
+                // `cgroup.procs`. The match-arm order is the whole rule -
+                // testing the generation inside the arm with `&&` put a stale
+                // tenant in *no* group at all, so a slot reused after a
+                // cgrouped task exited vanished from every membership file
+                // (the second run of `t-cgroupfs` in one boot failed exactly
+                // that claim, `docs/notes/` §3.27).
+                _ => node.is_root,
             }
         });
         if member {
