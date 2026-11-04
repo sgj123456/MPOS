@@ -1416,12 +1416,21 @@ fn group_signal_targets(pgid: TaskId) -> alloc::vec::Vec<TaskId> {
     })
 }
 
-/// Send `sig` to every member of a process group. Answers whether it reached
-/// anyone, which is what `kill` reports for a group.
+/// Send `sig` to every **process** of a process group, one delivery each, to the
+/// member of each that may take it. Answers whether it reached anyone, which is
+/// what `kill` reports for a group.
+///
+/// A process group is a set of processes, not of threads: Linux's `kill_pgrp`
+/// hands each process one copy on its thread group's shared pending set, where
+/// `complete_signal` picks a thread that does not block it. This kernel's
+/// pending set is per task, so the member is chosen per process here
+/// ([`process_signal_target`]) - the shape the old `send_signal` fan-out got
+/// wrong twice over: a thread that had blocked the signal kept the only copy,
+/// and a parked sibling never saw it (`docs/notes/` §2.12).
 pub fn send_signal_group(pgid: TaskId, sig: u8) -> bool {
     let mut delivered = false;
     for id in group_signal_targets(pgid) {
-        delivered |= send_signal(id, sig);
+        delivered |= send_signal_process(thread_group_of(id).unwrap_or(id), sig);
     }
     delivered
 }
@@ -1506,7 +1515,10 @@ pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
             permitted = true;
             // The signal itself may be discarded by the target's disposition
             // or namespace init rule; that is still Linux's 0, not a refusal.
-            let _ = send_signal(id, sig);
+            // One copy per **process**, on the thread that may take it
+            // (`process_signal_target`), not on the thread `group_signal_targets`
+            // happened to name.
+            let _ = send_signal_process(thread_group_of(id).unwrap_or(id), sig);
         }
     }
     if permitted {
@@ -1536,7 +1548,10 @@ pub fn send_signal_group_info(
     for id in members {
         if may_signal(sig, id) {
             permitted = true;
-            let _ = send_signal_info(id, sig, info);
+            // The record is the caller's and does not change per member; what
+            // changes is which thread of each process receives it
+            // (`process_signal_target`).
+            let _ = send_signal_process_info(thread_group_of(id).unwrap_or(id), sig, info);
         }
     }
     if permitted {
@@ -1625,7 +1640,11 @@ pub fn send_signal_every_process(sig: u8) -> GroupSend {
         if !may_signal(sig, id) {
             continue;
         }
-        if !send_signal(id, sig) {
+        // One copy per process, on the thread of it that may take it - the
+        // `target` here answered "which task represents this process", which is
+        // a different question once a thread's mask is part of the answer
+        // (`process_signal_target`, `docs/notes/` §2.12).
+        if !send_signal_process(thread_group_of(id).unwrap_or(id), sig) {
             answer = GroupSend::NoGroup;
         }
     }
@@ -1868,9 +1887,10 @@ pub fn pidfd_live_member(id: TaskId, generation: u64) -> Option<TaskId> {
     }
 }
 
-/// Linux's `kill_pid(vc->vt_pid, sig, 1)`: hand `sig` to one *process* - every
-/// live thread of the group `tgid` leads - and answer the question the console
-/// layer actually acts on: whether that process still exists at all.
+/// Linux's `kill_pid(vc->vt_pid, sig, 1)`: hand `sig` to one *process* - the
+/// thread of the group `tgid` leads that may take it
+/// ([`process_signal_target`]) - and answer the question the console layer
+/// actually acts on: whether that process still exists at all.
 ///
 /// The answer matters more than the delivery. `VT_SETMODE`'s `VT_PROCESS` is a
 /// promise made by a process, and Linux's `change_console` and `vt_acquire` send
@@ -1884,11 +1904,88 @@ pub fn pidfd_live_member(id: TaskId, generation: u64) -> Option<TaskId> {
 /// that made it is worse still: it kills whichever session happens to be in the
 /// foreground when the signal goes out.
 pub fn send_signal_process(tgid: TaskId, sig: u8) -> bool {
-    let mut delivered = false;
-    for id in process_members(tgid) {
-        delivered |= send_signal(id, sig);
-    }
-    delivered
+    let (pid, uid) = with_table(|t| {
+        let cur = t.task(t.current);
+        (cur.tgid.0 as i32, cur.identity.ruid as i32)
+    });
+    send_signal_process_info(
+        tgid,
+        sig,
+        crate::sched::signal::SigInfo::user(sig, pid, uid),
+    ) != Sent::NoTask
+}
+
+/// The thread of `tgid` a **process-directed** signal is handed to: Linux's
+/// `wants_signal`, asked of every live thread of the group.
+///
+/// A `kill`, a `kill(-pgid)`, a `kill(-1)`, an `rt_sigqueueinfo` and a
+/// `pidfd_send_signal` all name a **process**, and Linux does not put a
+/// process-directed signal on a thread that has blocked it: the copy waits on
+/// the thread group's *shared* pending set, `complete_signal` walks the group
+/// and the first thread whose mask lets the signal through takes it — and if
+/// every thread blocks it, it stays on the shared set until one unblocks.
+/// Measured on a current host (`.workbuddy/probe_futex_signal.c`, Linux
+/// 7.2.11): a process whose leader blocks `SIGTERM` while its only worker
+/// unblocks it and parks in `FUTEX_WAIT` has the handler run **on the worker**
+/// (`handler ran=1 on tid 9`, the main thread being tid 2), and that worker's
+/// futex call returns `-1`/`EINTR` — while a `tgkill` at the leader's tid,
+/// which names a *thread*, runs nothing at all.
+///
+/// This kernel's pending set is **per task**, so the member Linux's shared set
+/// would have found has to be chosen here. The choice is the one the itimer
+/// path already makes for its process-directed expiry (`src/sched/runtime/`
+/// `task.rs`'s `TimerNotify::Signal` arm): the leader when its mask allows it,
+/// because the leader is the task the ABI's other numbers rest on; otherwise
+/// the first live thread that may take it; and when every thread blocks it,
+/// the leader again — not a refusal, because a blocked signal is *pending*, and
+/// the leader is where a later `rt_sigprocmask` would have found it on Linux.
+///
+/// Handing the copy to one thread is also what makes a standard signal one
+/// delivery: the group has one pending copy on Linux, and a fan-out to every
+/// member would run a handler once per thread instead. Answers `None` only
+/// when the group has no live thread at all.
+pub fn process_signal_target(tgid: TaskId, sig: u8) -> Option<TaskId> {
+    with_table(|t| {
+        let bit = crate::sched::signal::bit(sig);
+        let mut taker = None;
+        let mut leader = None;
+        let mut live = None;
+        for (slot, entry) in t.tasks.iter().enumerate() {
+            let Some(task) = entry.as_ref() else {
+                continue;
+            };
+            if task.tgid != tgid || task.exited {
+                continue;
+            }
+            let id = TaskId(slot);
+            live.get_or_insert(id);
+            if id == tgid {
+                leader = Some(id);
+            }
+            if task.blocked & bit == 0 {
+                if id == tgid {
+                    return Some(id);
+                }
+                taker.get_or_insert(id);
+            }
+        }
+        taker.or(leader).or(live)
+    })
+}
+
+/// [`send_signal_process`] carrying the caller's `siginfo_t` instead of minting
+/// an `SI_USER` record, so a process-directed `rt_sigqueueinfo` and a
+/// `pidfd_send_signal` reach the member [`process_signal_target`] chose rather
+/// than a number's slot.
+pub fn send_signal_process_info(
+    tgid: TaskId,
+    sig: u8,
+    info: crate::sched::signal::SigInfo,
+) -> Sent {
+    let Some(target) = process_signal_target(tgid, sig) else {
+        return Sent::NoTask;
+    };
+    send_signal_info(target, sig, info)
 }
 
 /// `setpgid(pid, pgid)` — put a task into a process group, creating the group

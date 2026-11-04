@@ -765,3 +765,91 @@ it waits there, whereas Linux's shared group set lets the first thread that
 unblocks take it. `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` stay
 `EOPNOTSUPP` (no per-task accounting) and `TIMER_ABSTIME` stays `EINVAL` (one
 clock, no absolute domain), both as before, both in `docs/uapi/` item 128.
+
+### 2.12 A process-directed signal goes to a thread that may take it (LANDED 2026-11-04)
+
+Every process-directed door named one task and one task only, and it was the
+*wrong* task whenever the leader happened to be blocking that signal. This is
+the mechanism behind item 193's shutdown stall (`docs/notes/` §7.4h's still
+open question (b)): weston's group is sent `SIGTERM`, the copy lands on a
+thread whose mask blocks it, the one thread that would have taken it stays
+parked in a futex, and nothing in the group ever runs a handler.
+
+**Measured on a current host before anything was changed** (Linux 7.2.11;
+`build/scratch/futexsig/p.c` and `p2.c`, `gcc -O1 -pthread`):
+
+* `p.c` - the mask untouched, the handler installed, a worker parked in
+  `syscall(SYS_futex, word, FUTEX_WAIT, 2, NULL, NULL, 0)`, then
+  `kill(getpid(), SIGTERM)`: `kill(self, SIGTERM) = 0 errno=0`,
+  `handler ran=1 (on tid 2)` - the **main** thread - and `worker is STILL
+  parked after 3 s`. So the copy goes to the leader, and a probe that stops
+  here learns nothing about the parked thread;
+* `p2.c` - the main thread blocks `SIGTERM` with `pthread_sigmask` **before**
+  `pthread_create` (the worker inherits the mask) and the worker unblocks it
+  itself before parking: `kill(self, SIGTERM) = 0 errno=0`,
+  `handler ran=1 (on tid 9)` - the **worker** - and
+  `worker futex returned ret=-1 errno=4 (Interrupted system call)`.
+
+Linux's answer, then: a process-directed signal is handed to a thread that
+may take it, and that thread's park ends with `EINTR` (`complete_signal` /
+`wants_signal` pick the member; the group's shared pending set means the
+copy is not tied to the thread that was chosen first).
+
+**Measured on this machine** (`build/scratch/futexsig/t-futexsig.c`, musl
+static, booted with `MEM=3072`; `build/probe/oneshot/serial.log`):
+
+```
+t-futexsig
+futex: kill(self) = 0 errno=0
+  handler ran=0 on tid=0 (main is 5)
+  park is STILL there after 3 s
+```
+
+and the stall dump that followed: `slot 5 … park 2 (block_until_nanos)
+syscall 202 parks=316` (the leader, in the futex) beside `slot 6 … park 2
+(block_until_nanos) syscall 202 parks=1` (the worker, also in 202). The
+handler never ran at all: the copy sat pending on the masked leader, which
+answered "I am not taking it" once, and the only thread that could take it
+was never woken.
+
+**The mechanism.** `handle_kill`'s positive arm resolved one task -
+`named_process`, leader first, else `members.first()` - and sent to it;
+`send_signal_info` never looks at `task.blocked`, because a mask is a
+*delivery* question and it only answers the *enqueue* one. Every
+process-directed door had the same shape: `kill`, `kill(-pgid)`/`kill(0)`
+through `send_signal_group`, `kill(-1)` through `send_signal_every_process`,
+`rt_sigqueueinfo`, `pidfd_send_signal`, and the tty's job control.
+
+**The fix.** `sched::process_signal_target(tgid, sig)` (in
+`src/sched/runtime/child_signal.rs`) is Linux's `wants_signal`: the leader
+when `task.blocked & signal::bit(sig) == 0`, else the first live member that
+does not block it, else any live member (a group whose threads all block it
+still gets the copy, and drops it with the group, which is Linux's answer
+too). `send_signal_process_info` sends to that member and answers the `Sent`
+outcome; `send_signal_process` mints the `SI_USER` record and keeps its bool.
+Every group-shaped door now loops its groups and calls the process door, so
+one copy lands per thread group, on a thread that can take it - the fan-out
+the old `send_signal_process` did would have run a handler once per thread.
+
+**Pinned** by `user/tests/src/bin/t-signal-park.rs`'s third shape,
+"whose park a process-directed signal ends": a leader that blocks `SIGTERM`
+before forking its worker, a worker that unblocks it and parks in
+`FUTEX_WAIT`, and the three claims "a process-directed signal reaches a
+futex waiter whose sibling blocks it", "and that futex_wait call answers
+EINTR", "and the handler ran on the parked thread, not the masked leader".
+`MPOS_ON_HOST=1` on Linux 7.2.11: 10 of 10 claims `ok:`, `PASS`.
+
+**Counterfactual** (only `handle_kill`'s positive arm reverted to
+`send_signal(target, …)`, kernel *and* loader rebuilt): the six pre-existing
+claims stay `ok:` and exactly the three new ones flip -
+`FAIL:  a process-directed signal reaches a futex waiter whose sibling blocks
+it`, `FAIL:  and that futex_wait call answers EINTR`,
+`FAIL:  and the handler ran on the parked thread, not the masked leader`,
+`=== t-signal-park exit=1`.
+
+**Named remainders.** The copy still sits on the one task the pick chose, so
+a thread that blocks the signal *after* being picked keeps it there until it
+unblocks; Linux's shared group pending set would let another thread take it
+first. And the pick is `wants_signal` without its "prefer a thread not
+already handling it" half - one copy, one handler run is what the pin's
+third claim reads, and nothing in the sweep depends on the finer choice yet.

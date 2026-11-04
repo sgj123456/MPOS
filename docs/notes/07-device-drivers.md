@@ -8124,6 +8124,18 @@ returns — it is taken at that call's own exit gate, which was the second door.
 parked sibling was never retired, `group_dead` stayed false and the parent's `wait4` parked. That is
 the `retired=false` in shape 2 above, and the proof is the park dump's own syscall number for the
 `gone` slot: `62` (`kill`), not `34` (`pause`). Both doors are now one, `child_exit::die_of_fatal_signal`,
-pinned by `t-kill-ends-group`'s self-kill fixture. What is still owed on this section is item 193's own
-confirmation: weston's boot reaching a reaped group, which no boot has yet shown.
+pinned by `t-kill-ends-group`'s self-kill fixture.
+
+**Question (b) is answered too, and the answer was "Linux does, this kernel did not"** (§2.12). A
+process-directed signal is not a message to one task: Linux hands it to a thread that may take it, so a
+leader whose mask blocks `SIGTERM` does not keep the copy while the only thread that would take it
+sleeps on a futex. Measured on Linux 7.2.11 with a leader that blocks before forking its worker and a
+worker that unblocks and parks (`build/scratch/futexsig/p2.c`): `handler ran=1 (on tid 9)`, and
+`worker futex returned ret=-1 errno=4 (Interrupted system call)`. Measured here before the fix
+(`build/scratch/futexsig/t-futexsig.c`): `handler ran=0 on tid=0 (main is 5)`, `park is STILL there
+after 3 s`, with the park dump showing both threads at `syscall 202`. So a `SIGTERM` to weston's group
+did reach a futex door's *neighbourhood* and not the door itself: the copy was on the wrong thread.
+`sched::process_signal_target` now picks the member Linux would pick, pinned by `t-signal-park`'s third
+shape. What is still owed on this section is item 193's own confirmation: weston's boot reaching a
+reaped group, which no boot has yet shown.
 

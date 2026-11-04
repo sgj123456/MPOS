@@ -32,7 +32,10 @@ One-glance status of the whole roadmap.
   from outside, a self-kill at the `kill` gate's own exit, a task's own pending
   set, or a fault the machine's handler answers itself (§6.77c, behind
   `hal::kernel`) - so a sibling parked in a futex is retired with it and
-  `timeout(1)`'s `wait` answers (§6.37, §6.77b, §6.77c, item 123); the named
+  `timeout(1)`'s `wait` answers (§6.37, §6.77b, §6.77c, item 123) - and a
+  process-directed signal handed to a thread that may take it, so a copy that
+  lands on a thread whose mask blocks it is not stuck there while the only
+  thread that could take it stays parked (§2.12, item 197); the named
   residues are the kernel-spawned program path's `SIG_DFL` start and the
   alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
@@ -814,7 +817,7 @@ on 2026-10-25: the block layer's completion path (completions interrupt-driven, 
 parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(7)` served,
 §6.25) and `clone3`'s last unserved word (`CLONE_INTO_CGROUP`, §6.26).
 
-The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at a wait, so the group is never reaped. Half of the mechanism is now named and closed: the group-death rule had **two** doors and only one of them ended the group, so a task that killed itself died alone and left its parked sibling alive (`syscall 62` at the `kill` gate, `retired=false`) — the one door is `die_of_fatal_signal`, pinned by `t-kill-ends-group`'s self-kill fixture (§6.77b, item 123). What still stands open is the composition's own ending: whether that survivor is weston's own thread at a futex nobody wakes (§7.4h's fourth and fifth readings, both measured with `retired=false`) rather than a group that could not die. The confirmation still owed is weston's own boot reaching a reaped group.
+The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at a wait, so the group is never reaped. Half of the mechanism is now named and closed: the group-death rule had **two** doors and only one of them ended the group, so a task that killed itself died alone and left its parked sibling alive (`syscall 62` at the `kill` gate, `retired=false`) — the one door is `die_of_fatal_signal`, pinned by `t-kill-ends-group`'s self-kill fixture (§6.77b, item 123). The second half is named and closed too: the copy that killed the wrong thread was **process-directed but delivered to one task**, and Linux hands such a signal to a thread that may take it - measured as a parked worker's `FUTEX_WAIT` answering `EINTR` where this kernel's left the handler unrun and both threads parked (§2.12, item 197, pinned by `t-signal-park`'s third shape). What still stands open is the composition's own ending: weston's survivor may be a thread at a futex nobody wakes for a different reason (§7.4h's fourth and fifth readings, both measured with `retired=false`), and the confirmation still owed is weston's own boot reaching a reaped group.
 
 ---
 

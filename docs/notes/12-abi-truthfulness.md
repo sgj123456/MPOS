@@ -293,13 +293,22 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
 **Latest measured gate (2026-11-04, one both-arm run with all three stages green —
+`build/gate-sigfutex3.log`, a process-directed signal's thread (§2.12) and `t-ns-cgroup`'s own groups
+(§3.28)):** stage 1 `1224 tests, 0 failed` (30.60 s); x86_64 `pass=256 fail=0 (256 built)`,
+`mpos-kunit 35 passed, 0 failed`, exit 33, `all 256 user tests passed … (15 not run)`, `total 30.80 s`;
+aarch64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`, every lane `ok` on
+`=== END` (`no process exit: the lanes ended on === END`), `all 255 user tests passed … (16 not run)`,
+`total 79.18 s`. `t-signal-park`'s third shape passed on both arms, and `t-cgroupfs` shared a boot with
+`t-ns-cgroup` without the `EEXIST` the collision used to give it.
+
+**Measured gate before it (2026-11-04, one both-arm run with all three stages green —
 `build/gate-ptrace.log`, the `t-ptrace-attach` state claim §6.78a):** stage 1 `1224 tests, 0
 failed` (15.05 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33,
 `total 15.24 s`; aarch64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`, every lane
 `ok` on `=== END`, `total 49.31 s`. `t-ptrace-attach` passed on both arms with its claim now
 reporting the state it asserted — `a detach leaves a stop the user asked for alone (state "T")`.
 
-**Measured gate before it (2026-11-04, one both-arm run with all three stages green —
+**Measured gate before that (2026-11-04, one both-arm run with all three stages green —
 `build/gate-cgroup.log`, the cgroupfs stale-entry fix §3.27):** stage 1 `1224 tests, 0 failed`
 (30.14 s); x86_64 `pass=256 fail=0 (256 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33,
 `total 30.33 s`; aarch64 `pass=255 fail=0 (255 built)`, `mpos-kunit 35 passed, 0 failed`, every

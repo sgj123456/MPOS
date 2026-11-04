@@ -9052,3 +9052,44 @@ on a single boot with the old arm restored (kernel *and* loader rebuilt): `FAIL:
 task left behind still reads as root for its new tenant`, `=== t-cgroupfs exit=1`; with the fix, both
 `ok:` and `exit=0`. The two-run boot went `=== second exit=1` → `=== second exit=0`.
 Recorded in `docs/notes/03-filesystem.md` §3.27.
+
+### Item 197 - a process-directed signal names a process, so it may land on any of its threads (2026-11-04, landed)
+
+**Linux's answer, measured** (Linux 7.2.11; `build/scratch/futexsig/p.c` and `p2.c`): a process-directed
+signal is handed to a thread that may take it. With the mask untouched it is taken by the main thread
+(`handler ran=1 (on tid 2)`) and a worker parked in `FUTEX_WAIT` stays parked. With the main thread
+blocking `SIGTERM` before `pthread_create` and the worker unblocking it itself, the handler runs **on
+the parked worker** (`handler ran=1 (on tid 9)`) and its wait ends `ret=-1 errno=4 (Interrupted system
+call)`.
+
+**This kernel's answer, measured before the fix** (`build/scratch/futexsig/t-futexsig.c`, booted):
+
+```
+futex: kill(self) = 0 errno=0
+  handler ran=0 on tid=0 (main is 5)
+  park is STILL there after 3 s
+```
+
+The handler never ran: the copy sat on the masked leader (which answered "not mine" once) and the only
+thread that could take it was never woken. `handle_kill` resolved **one** task - `named_process`,
+leader first - and `send_signal_info` never reads `task.blocked`, because a mask is a *delivery*
+question and it only answers the *enqueue* one. Every process-directed door had that shape: `kill`,
+`kill(-pgid)`/`kill(0)`, `kill(-1)`, `rt_sigqueueinfo`, `pidfd_send_signal`, the tty's job control.
+
+**The fix.** `sched::process_signal_target` (Linux's `wants_signal`): the leader when it does not block
+the signal, else the first live member that does not, else any live member - so one copy lands per
+thread group, on a thread that can take it. `send_signal_process_info` sends to that member;
+`send_signal_process` mints the `SI_USER` record and keeps its bool; every group-shaped door loops its
+groups and calls the process door.
+
+**Pinned** by `t-signal-park`'s third shape - three claims: "a process-directed signal reaches a futex
+waiter whose sibling blocks it", "and that futex_wait call answers EINTR", "and the handler ran on the
+parked thread, not the masked leader". `MPOS_ON_HOST=1` on Linux: 10 of 10 `ok:`, `PASS`.
+Counterfactual (only `handle_kill`'s positive arm reverted, kernel and loader rebuilt): the six
+pre-existing claims stay `ok:` and exactly those three flip red, `=== t-signal-park exit=1`.
+Recorded in `docs/notes/02-signal-delivery.md` §2.12; the shutdown stall this is the mechanism for:
+`docs/notes/07-device-drivers.md` §7.4h question (b).
+
+**The named remainder.** The copy still sits on the task the pick chose, so a thread that blocks it
+*after* being picked keeps it until it unblocks; Linux's shared group pending set lets another thread
+take it first. Nothing in the sweep depends on that yet.

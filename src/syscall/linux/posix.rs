@@ -1616,7 +1616,12 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         return err::EPERM;
     }
     let Some(target) = (match target {
-        crate::sched::Named::Thread(id) => Some(id),
+        // The thread the copy is put on is `process_signal_target`'s question,
+        // not this door's: an `rt_sigqueueinfo` names a **process**, and a
+        // process-directed copy goes to a thread that may take it - asking a
+        // leader that blocks the signal would queue the record where nobody
+        // reads it while a parked sibling waits (`docs/notes/` §2.12).
+        crate::sched::Named::Thread(id) => Some(crate::sched::thread_group_of(id).unwrap_or(id)),
         // Nothing left to take a copy: Linux answers 0 for a number that is
         // still owned, and queues nothing.
         crate::sched::Named::Gone(_) => None,
@@ -1637,7 +1642,7 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         )
     };
     let info = crate::sched::signal::SigInfo::signed(sig as u8, si_errno, si_code, pid, uid, value);
-    match crate::sched::send_signal_info(target, sig as u8, info) {
+    match crate::sched::send_signal_process_info(target, sig as u8, info) {
         crate::sched::Sent::NoTask => err::ESRCH,
         // Linux's `send_sigqueue` answer when the target's queued-signal
         // budget (`RLIMIT_SIGPENDING`) is full. This is the door that reports

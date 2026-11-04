@@ -2430,7 +2430,17 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
                 // that exited under a live group.
                 crate::sched::Named::Gone(_) => 0,
                 crate::sched::Named::Thread(target) => {
-                    if crate::sched::send_signal(target, sig as u8) {
+                    // `send_signal` would put the copy on `target`'s own pending
+                    // set whatever its mask says - and `target` is the *leader*
+                    // whenever the leader is alive, so a leader that blocks the
+                    // signal kept the only copy while a worker parked in a futex
+                    // was never woken (measured on this machine: the handler
+                    // never ran and both threads stayed parked,
+                    // `docs/notes/` §2.12). A `kill` names a process, and Linux
+                    // hands a process-directed signal to a thread that may take
+                    // it.
+                    let group = crate::sched::thread_group_of(target).unwrap_or(target);
+                    if crate::sched::send_signal_process(group, sig as u8) {
                         0
                     } else {
                         err::ESRCH
@@ -3001,22 +3011,26 @@ pub(super) fn handle_pidfd_send_signal(args: [usize; ARG_COUNT], from_user: bool
     if !crate::sched::may_signal(sig as u8, id) {
         return err::EPERM;
     }
-    let target = if flags & THREAD != 0 {
-        // The named thread alone. An exited leader is a valid target that will
-        // never read the signal, which Linux answers 0 for.
-        if !crate::sched::pidfd_task_alive(id, generation) {
-            return 0;
-        }
-        id
-    } else {
-        match crate::sched::pidfd_live_member(id, generation) {
-            Some(member) => member,
+    if flags & THREAD == 0 {
+        // A **process**-directed send, and the thread it lands on is
+        // `process_signal_target`'s question: a copy handed to a leader that
+        // blocks the signal waits where a parked sibling never reads it
+        // (`docs/notes/` §2.12). `pidfd_live_member` answered "which task
+        // represents this process", which is a different question.
+        return match crate::sched::send_signal_process_info(id, sig as u8, info) {
             // The process is a zombie: there is nobody to take it, and Linux
             // still reports the send as having happened.
-            None => return 0,
-        }
-    };
-    match crate::sched::send_signal_info(target, sig as u8, info) {
+            crate::sched::Sent::NoTask => 0,
+            crate::sched::Sent::QueueFull => err::EAGAIN,
+            crate::sched::Sent::Taken => 0,
+        };
+    }
+    // The named thread alone. An exited leader is a valid target that will
+    // never read the signal, which Linux answers 0 for.
+    if !crate::sched::pidfd_task_alive(id, generation) {
+        return 0;
+    }
+    match crate::sched::send_signal_info(id, sig as u8, info) {
         crate::sched::Sent::NoTask => err::ESRCH,
         crate::sched::Sent::QueueFull => err::EAGAIN,
         crate::sched::Sent::Taken => 0,
