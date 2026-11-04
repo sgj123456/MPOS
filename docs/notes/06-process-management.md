@@ -6233,3 +6233,12 @@ wait in them. The next attempt has to answer that return, not the queueing: eith
 delivery path on a stop that is still published (so a spurious stop is reported to the tracer), or the wake
 that does not resume is not allowed to return at all - and both are a change to the stop's *interface*, not
 to `policy`.
+
+**The next experiment, spelled out so it needs no re-derivation (2026-11-04).** With the loop in place,
+the only way a task can be held with nobody to wake it is if the *resumer* never reaches its
+clear-and-wake. Both resumers are tasks that park themselves - `wait4` for the tracer, `pause`/`nanosleep`
+for the group-stop case - so the first thing to instrument is not `park` but **the resumer's own park**:
+print the tracer's task id at entry to and exit from its `wait4` park, and the same for `SIGCONT`'s
+delivery, around the loop. If the tracer never leaves its own park while the tracee sits held, the wedge is
+a stopped task waiting on a stopped task, and the answer is that a stop must be reported to the tracer
+*before* the tracee is held out of the ready queue (the report is the tracer's wake), not after.
