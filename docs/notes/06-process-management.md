@@ -6242,3 +6242,18 @@ print the tracer's task id at entry to and exit from its `wait4` park, and the s
 delivery, around the loop. If the tracer never leaves its own park while the tracee sits held, the wedge is
 a stopped task waiting on a stopped task, and the answer is that a stop must be reported to the tracer
 *before* the tracee is held out of the ready queue (the report is the tracer's wake), not after.
+
+**The `SIGCONT` path is not a lost wake either (read 2026-11-04).** The one place a task's state is
+changed from outside itself is `send_signal_info`'s `SIGCONT` block: it cancels the four queued stop
+signals, clears a group stop (`task.trace.stop = None; task.trace.continued = true;`), and then the
+function's own tail computes `let held = stops_by_default(SIGCONT) && task.trace.stop.is_some_and(|s|
+s.group); if !held { t.sched.wake(id); }` - and `stops_by_default(SIGCONT)` is false, so the wake is
+issued. So the group-stop resumer does wake its tracee, and the wedge in that direction is out too.
+
+What is left, precisely: a stop is *published* by the tracee (`park`'s first closure wakes the tracer and
+the parent) and *cleared* by the tracer (`resume_traced`) or by `SIGCONT`; both clears wake. The loop still
+wedged three waits, so one of the four clears in the tree (`child_exit.rs:543` tracer death,
+`child_signal.rs:396` SIGCONT, `trace.rs:882` resume, `trace.rs:927` detach) must be reached by a path that
+does *not* end with a wake, or `park` can be entered a second time for a stop that is already published -
+the second `park` would publish a second stop object and sleep with nobody told about it. That is now the
+one question to answer with a print, and it is a question about `park` being re-entered, not about the queue.
