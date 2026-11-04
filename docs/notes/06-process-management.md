@@ -6291,3 +6291,15 @@ is a `waitid` that watches a group stop raised through the child's own `tgkill` 
 where it raised the stop, and the parent is woken but never sees `CLD_STOPPED`. The next print is on
 `child_event_in`'s stop branch for a P_ALL/P_PID subject whose child is the one held in `park`, with the
 adopt-and-hold patch back in the tree.
+
+**`child_event_in`'s stop branch, read (2026-11-04).** A parent hears a stop only when all of these hold
+(`src/sched/runtime/child_exit.rs`, `fn child_event_in`): the child is visible to it by kind
+(`kind_visible`), `task.trace.stop` is `Some`, **`!stop.reported`**, and - for a group stop - the caller
+asked for stops (`WUNTRACED`/`WSTOPPED`), or for a traced stop that the tracer is the caller. So the one
+number that decides the surviving hang is `stop.reported` **at the moment the parked parent re-checks**.
+`t-waitid` runs many scenarios in one program, and the report is consumed once (`take_stop_report` sets
+`reported = true`); if an earlier claim's `waitid` consumed the report for this same child slot, the later
+blocking `waitid` will never see it, and no amount of re-publishing in `park` fixes that - the report must
+be re-issued where the *wait* is, not where the stop is. The print to take next is therefore one line in
+`child_event_in`'s stop branch (`id`, `me`, `stop.signal`, `stop.reported`, `stops`) plus the same line
+from `unreported_stop` for the wildcard door, with the adopt-and-hold patch restored.
