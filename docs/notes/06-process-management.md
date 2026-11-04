@@ -6057,3 +6057,17 @@ blocked signal, `PTRACE_SETREGS`, assert `Ok(0)`, then `PTRACE_CONT` and read th
 
 **Not yet run.** It is written down because the observation is otherwise lost in a lane's serial log, and
 because it is the first time the park's no-op sleep has a witness outside `t-ptrace-attach`'s detach.
+
+**A first attempt at that pin, and why it is not in the tree (2026-11-04).** The shape above was written
+into `user/tests/src/bin/t-seccomp.rs` as `claim_a_stop_survives_a_queued_signal` and run on this host
+first, as the repo requires. It did not reach the question: the parent's second `waitpid` returned with
+`status 0xc00` - not a stop at all - so the tracee never showed the tracer its seccomp event, and the claim
+would have measured the fixture rather than the kernel. Two neighbouring claims of that program also
+reddened on this host (`the most restrictive of several filters decides`, and one before it), which is a
+sign the fixture's own setup is what broke rather than the rule: the child raises `SIGSTOP`, then installs
+the filter, then makes the judged call, and a `PTRACE_TRACEME` tracee that has already stopped once is
+exactly where a `SIGSTOP`-then-filter sequence can go wrong (Linux's own answer to the same sequence is
+what the existing three-claim program already uses, and it waits for `TRACEME` first *without* raising).
+The claim was reverted rather than shipped red; the next attempt starts from the existing
+`seccomp_stop_reaches_a_tracer` shape (which does reach its stop on both machines) and adds only the
+blocked signal between the stop and the `SETREGS`.
