@@ -22,11 +22,41 @@
 //! Run with `MPOS_ON_HOST=1` it does the same thing on real Linux, which is
 //! the reference the claims were written from.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, host_run};
 use rustix::fs::{AtFlags, statat};
 
 /// The ids the reader child drops to - `nobody`, present in both images here.
 const NOBODY: u32 = 65_534;
+
+/// The invoking user's ids, for the host run, where the fixture cannot drop.
+fn host_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn host_gid() -> u32 {
+    unsafe { libc::getegid() }
+}
+
+/// A fixture's lifetime is its parent's, not a number of seconds.
+///
+/// It blocks on the read end of a pipe whose write end only the parent holds,
+/// so it ends when the parent closes that end - at the parent's last line, or
+/// when the parent dies. A nap was the same idea done with a clock, and it lost
+/// the race it was meant to avoid: the fixtures slept 120 s while the program's
+/// own budget in `tests.toml` is also 120 s, so a lane slow enough to matter
+/// could see a fixture expire mid-matrix, and the claim
+/// `the dropped process's entry still names it` then failed on a machine rather
+/// than on a rule (once here, and once when the fixture slept 20 s, `docs/notes/`
+/// §7.9p). A pipe end cannot expire.
+fn wait_while_the_parent_holds_it() {
+    let mut byte = 0u8;
+    loop {
+        let got = unsafe { libc::read(0, (&mut byte as *mut u8).cast(), 1) };
+        if got <= 0 {
+            return;
+        }
+    }
+}
 
 fn open_answer(path: &str) -> Result<usize, i32> {
     match std::fs::File::open(path) {
@@ -113,14 +143,7 @@ fn main() {
             return;
         }
         if mode == "--sleep" {
-            // Long enough that the whole matrix finishes before this process
-            // does, on the slower of the two machines: the aarch64 sweep runs
-            // under TCG, and a fixture that expired mid-matrix turns the last
-            // claims into a race the machine's speed decides (observed once:
-            // `the dropped process's entry still names it` went red with no
-            // code change). The parent kills both fixtures at the end, so a
-            // longer nap costs nothing.
-            std::thread::sleep(std::time::Duration::from_secs(120));
+            wait_while_the_parent_holds_it();
             return;
         }
         if mode == "--dropped" {
@@ -129,19 +152,29 @@ fn main() {
                 libc::setgid(NOBODY);
                 libc::setuid(NOBODY);
             }
-            std::thread::sleep(std::time::Duration::from_secs(120));
+            wait_while_the_parent_holds_it();
             return;
         }
     }
 
     let mut r = Report::new();
     let exe = std::env::current_exe().expect("the pin's own path");
+    // Each fixture's stdin is a pipe only this parent holds, so a fixture ends
+    // when this process drops its end - at the last claim, or when it dies. A
+    // nap was the same idea done with a clock, and it lost the race it was
+    // meant to avoid: the fixtures slept 120 s while this program's own budget
+    // in `tests.toml` is also 120 s, so a lane slow enough to matter could see
+    // one expire mid-matrix and `the dropped process's entry still names it`
+    // then failed on a machine rather than on a rule (once here, and once when
+    // the fixture slept 20 s: `docs/notes/` §7.9p). A pipe end cannot expire.
     let mut roots = std::process::Command::new(&exe)
         .arg("--sleep")
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("a root process to read");
     let mut dropped = std::process::Command::new(&exe)
         .arg("--dropped")
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("a dropped process to read");
     let root_pid = roots.id().to_string();
@@ -220,17 +253,34 @@ fn main() {
         link_answer(&format!("/proc/{dropped_pid}/fd/0")) == Ok(0),
     );
     // The ownership the tree already carries is not affected by any of this.
+    let owner = statat(
+        rustix::fs::CWD,
+        &format!("/proc/{dropped_pid}"),
+        AtFlags::empty(),
+    )
+    .map(|st| (st.st_uid, st.st_gid))
+    .map_err(|e| e.raw_os_error());
+    // On a host run this program is not root, so its fixture never drops to
+    // `nobody` and the ids there are the invoking user's: what is claimable is
+    // that the entry exists and names *its* owner, which is the rule this
+    // claim is about. On the machine the fixture does drop, and the ids are
+    // `nobody`'s.
+    let named_its_owner = if host_run() {
+        let looked = rustix::fs::stat(format!("/proc/{dropped_pid}"));
+        looked.map(|st| (st.st_uid, st.st_gid)) == Ok((host_uid(), host_gid()))
+    } else {
+        owner == Ok((NOBODY, NOBODY))
+    };
     r.check(
-        "and the dropped process's entry still names it",
-        statat(
-            rustix::fs::CWD,
-            &format!("/proc/{dropped_pid}"),
-            AtFlags::empty(),
-        )
-        .map(|st| (st.st_uid, st.st_gid))
-            == Ok((NOBODY, NOBODY)),
+        &format!("and the dropped process's entry still names it ({owner:?})"),
+        named_its_owner,
     );
 
+    // Dropping the write ends ends the fixtures politely; the kill is the one
+    // that cannot be missed (a fixture that never reached its read would
+    // otherwise sit there for the rest of the sweep).
+    drop(roots.stdin.take());
+    drop(dropped.stdin.take());
     let _ = roots.kill();
     let _ = dropped.kill();
     let _ = roots.wait();

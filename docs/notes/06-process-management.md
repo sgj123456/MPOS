@@ -5857,3 +5857,34 @@ where §6.80's leak already holds most of the table it read `FAIL:  enough child
 the old store (9 of 40)` on one arm and `(7 of 40)` on the other - a red that said nothing about the
 store. Spacing the forks so each child's slot is recycled made the fixture need two slots instead of
 forty, which is the shape a pin has to have: it must be able to run on the machine it will run on.
+
+## §6.83 A test fixture's lifetime is its parent's, not a clock (LANDED 2026-11-04)
+
+`t-proc-access` starts two processes it holds for the length of the program: one whose
+`/proc` entry it reads, and one that `setuid(65534)`s itself so the entry names `nobody`.
+Both used to `std::thread::sleep(120 s)` and the program's own budget in
+`assets/configs/tests.toml` is `timeout = 120`, so the fixture and the budget expired at
+the same instant. On a busy lane the machine then answered `FAIL:  and the dropped
+process's entry still names it` — the fixture had exited between two of the program's own
+steps, which is what the program's comment had already recorded once before
+(`docs/notes/07-device-drivers.md` §7.9p raised the fixtures from 20 s to 120 s for exactly
+that reason; the budget had caught up with them since).
+
+A duration is a guess about how long the parent will take. The parent knows, so the
+fixture waits for the parent to let it go instead: `fn wait_while_the_parent_holds_it()`
+reads one byte from fd 0 until the read answers `<= 0`, the two spawns take
+`.stdin(Stdio::piped())`, and the program drops both write ends where it used to finish —
+so the fixtures cannot outlive the steps they exist for, whatever the lane's load.
+
+The shape took three tries, and the failures are the lesson: a `libc::pipe` +
+`Stdio::from_raw_fd` version handed the *same* descriptor to the second spawn, which got
+`Os { code: 9, message: "Bad file descriptor" }` because `Stdio` takes ownership, and
+`libc::dup`-ing the first read end answered `assertion failed: second_read_end >= 0`.
+`Stdio::piped()` is the shape; the second read end comes from the second spawn's own pipe.
+
+The claim now also carries its evidence: the message prints the entry's
+`(uid, gid)` as the kernel answers it (`Ok((65534, 65534))` on the machine), so the next
+red says *which* way it was wrong instead of only that it was. Under `MPOS_ON_HOST=1`
+the fixture cannot drop to `nobody` (a host run is not root), so the claim asserts the
+entry exists and names the invoking user's ids — the machine's own form is the one the
+gate exercises.
