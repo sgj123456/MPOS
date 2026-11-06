@@ -52,7 +52,7 @@
 //! `probe-clone-timens.c`, `probe-timens-links.sh`), which is how the shape was
 //! known before it was built rather than discovered by building it.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::{Report, Rusage, Timeval, host_run};
 use rustix::fd::AsFd;
 use rustix::fs::{CWD, Mode, OFlags, openat};
 use rustix::io::{Errno, read, write};
@@ -73,6 +73,16 @@ const BOOTTIME_SECS: i64 = 3600;
 /// The offsets [`join_the_children_slot`] writes, far enough from the ones above
 /// that a reading can only be explained by one of them.
 const JOINED_SECS: i64 = 111;
+
+/// The machine's timer tick, in nanoseconds (250 Hz on both machines): the
+/// granularity the two CPU clocks are charged at, so it is the slack two doors
+/// over the same counter are allowed to differ by.
+const TICK_NS: i64 = 4_000_000;
+
+/// `CLOCK_PROCESS_CPUTIME_ID`: the one row of [`CLOCKS`] whose reading is not a
+/// scale the parent also reads, and so the one judged by `getrusage` instead of
+/// by [`bracketed`].
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 
 /// The clocks this program brackets, as `(id, offset, name)`.
 ///
@@ -177,6 +187,40 @@ fn split_link(text: &str) -> Option<(&str, &str)> {
 /// after the child has already spoken and its first before the child existed.
 fn bracketed(ok: bool, child: i64, before: i64, after: i64, offset: i64) -> bool {
     ok && child != i64::MIN && child - after <= offset && offset <= child - before
+}
+
+/// This process's CPU, user plus system, in microseconds - the same number
+/// `CLOCK_PROCESS_CPUTIME_ID` reads in nanoseconds, by another door.
+///
+/// The CPU clock cannot be bracketed the way [`bracketed`] brackets a reading of
+/// uptime, and the first version of this program learned that from the gate: a
+/// bracket is two samples of *one* scale one offset apart, while a CPU clock
+/// counts the work of the process that reads it, so a **forked** child's reading
+/// is its own CPU and not the parent's (`build/scratch/forkcpu/f.c`, measured on
+/// a current host: the parent's `242041816 ns` of CPU against its child's
+/// `12794 ns` at entry, `47711431 ns` after a 50 ms burn). So the child reports
+/// this number beside its clocks and the cputime row is judged by the sibling
+/// call that answers the same question - which is also the only shape that would
+/// notice the clock reporting the machine's age again (§6.99).
+fn rusage_self_us() -> i64 {
+    let mut ru = Rusage {
+        ru_utime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        ru_stime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        counters: [0; 14],
+    };
+    // SAFETY: `Rusage` is this crate's spelling of `struct rusage` (144 bytes, two
+    // `timeval`s then fourteen longs) and the call writes all of it.
+    let raw = &mut ru as *mut Rusage as *mut libc::rusage;
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, raw) } != 0 {
+        return i64::MIN;
+    }
+    ru.ru_utime.micros() + ru.ru_stime.micros()
 }
 
 fn main() {
@@ -330,10 +374,15 @@ fn main() {
     if child == 0 {
         drop(report_r);
         let mine = all_clocks();
+        // The eighth number is this child's own CPU by the *other* door - see
+        // `rusage_self_us`. It is read after the clocks because both count the
+        // child's work and the pair has to be one sample apart at most.
+        let cpu = rusage_self_us();
         let mut line = String::new();
         for v in mine {
             line.push_str(&format!("{v} "));
         }
+        line.push_str(&format!("{cpu}"));
         let _ = write(&report_w, line.as_bytes());
         drop(report_w);
         // The child must not run the rest of this program: `Report` would be
@@ -355,8 +404,8 @@ fn main() {
         .filter_map(|w| w.parse::<i64>().ok())
         .collect();
     r.check(
-        "the child reports every clock it was asked for",
-        parsed.len() == CLOCKS.len(),
+        "the child reports every clock it was asked for, and its own CPU",
+        parsed.len() == CLOCKS.len() + 1,
     );
 
     let in_ns = readlink(&format!("/proc/{child}/ns/time"));
@@ -364,8 +413,29 @@ fn main() {
         "...and the child is in the new namespace, its own slot",
         in_ns.is_some() && in_ns == children_after,
     );
-    for (slot, (_, offset, name)) in CLOCKS.iter().enumerate() {
+    for (slot, (id, offset, name)) in CLOCKS.iter().enumerate() {
         let got = parsed.get(slot).copied().unwrap_or(i64::MIN);
+        if *id == CLOCK_PROCESS_CPUTIME_ID {
+            // A CPU clock is not a reading of the machine's uptime, so it cannot
+            // be bracketed by the parent's two readings of that uptime: it counts
+            // the child's own work, which starts again at zero when the child is
+            // forked. The subject "did the namespace move this clock" is answered
+            // by the sibling call: inside the namespace the CPU clock still says
+            // the child used the CPU `getrusage` says it used, and 42 s of offset
+            // would show as 42 s of CPU nobody spent.
+            let rusage = parsed.get(CLOCKS.len()).copied().unwrap_or(i64::MIN);
+            let apart = got.saturating_sub(rusage * 1_000);
+            r.check(
+                &format!(
+                    "{name} still reads the child's own CPU inside the namespace ({} us against RUSAGE_SELF's {} us, {} us apart)",
+                    got / 1_000,
+                    rusage,
+                    apart.abs()
+                ),
+                got != i64::MIN && rusage != i64::MIN && apart.abs() <= 2 * TICK_NS,
+            );
+            continue;
+        }
         r.check(
             &format!(
                 "{name} is {} by {offset} s in the child and unmoved here",

@@ -7451,3 +7451,99 @@ reader is asking: "the machine is idle" and "the machine has this much load" are
 and a zero that never moves is not the second one. And when one Linux array feeds two doors, both
 doors read the array - a `sysinfo` that fills its own copy of a number the file prints from is the
 divergence waiting to happen.
+
+## §6.99 `CLOCK_PROCESS_CPUTIME_ID` was machine uptime wearing a CPU clock's name (LANDED 2026-11-07)
+
+**What Linux answers.** The two cputime clocks are not clocks that run with the machine: they report
+CPU time, so they stand still while the task sleeps and cover only what the machine charged to it.
+`build/scratch/cpuclock/p.c` (musl static pthread, Linux 7.2.14) on a process 46.4 ms old:
+
+```
+process before: cpu=46409 us   rusage_self=46410 us
+sleep 300 ms:   cpu grew 9 us              (rusage self 46420 us)
+burn 400 ms:    cpu=445005 us  rusage_self=445006 us
+granularity:    19988 of 20000 back-to-back reads moved, min step 9 ns
+worker thread:  thread_cpu grew 298617 us for a 298 ms burn
+                main thread_cpu=450391 us, process_cpu=753138 us   (450 + 298)
+clock_getres(PROCESS_CPUTIME_ID / THREAD_CPUTIME_ID) = 1 ns
+```
+
+So: the process clock equals `RUSAGE_SELF`'s user+system (children excluded, as `RUSAGE_SELF` excludes
+them); the thread clock is that thread's own share; sleeping does not touch either; and the resolution
+is `1 ns` because Linux charges CPU in nanoseconds.
+
+**What this kernel answered.** Both ids were in the monotonic list, so `handle_clock_gettime` filled
+them from `hal::since_boot_nanos()` - **machine uptime** - and `clock_getres` answered the counter's
+`1 ns` beside it. The same probe on the machine before the fix:
+
+```
+uptime by clock: MONOTONIC=1110 ms
+process before:  cpu=1113219 us   rusage_self=4000 us       <- 1113 ms "CPU" for a process 1.1 s old
+sleep 300 ms:    cpu grew 301038 us                          <- CPU time advanced by the sleep
+worker thread:   thread_cpu grew 300140 us                   <- the sibling's burn
+main thread:     thread_cpu=2142078 us process_cpu=2142070 us <- identical: both are uptime
+granularity:     19998 of 20000 reads moved, min step 683 ns
+clock_getres(PROCESS_CPUTIME_ID) = 1 ns
+```
+
+A profile that asks "how much CPU has this process used" was told the age of the machine, and a
+sleeping process accrued CPU time while it did nothing. Nothing fails visibly, which is why this
+survived: a `timespec` came back and its fields looked like time.
+
+**The fix.** The two ids leave the `since_boot_nanos` path and read the counters `getrusage` and
+`/proc/<pid>/stat` already answer from - `sched::current_cpu_ticks()`'s `utime + stime` for the process
+(`cutime` stays out, the way `RUSAGE_SELF` leaves children out) and
+`sched::current_thread_cpu_ticks()` for the thread - times `ns_per_tick()`. Both are tick-granular, so
+`handle_clock_getres` answers `ns_per_tick()` for these two ids as it already did for the coarse pair:
+a resolution is a promise about the readings (`§6.97`), and `1 ns` beside a counter that steps in 4 ms
+is that defect written the other way round. The time namespace still does not touch them, which the
+offset table already said.
+
+**Pin.** `user/tests/src/bin/t-cpuclock.rs`, 5 claims: the process clock agrees with `RUSAGE_SELF`
+within two ticks; it does not advance across a 300 ms sleep; it does advance across a 300 ms burn; a
+sibling's burn lands in the process's clock and not in this thread's; and `clock_getres` states the
+granularity the counter moves in. Fixed kernel (`build/boot-cpuclock-fix2.log`):
+`ok: CLOCK_PROCESS_CPUTIME_ID and RUSAGE_SELF agree about this process's CPU (8000 us against 8000 us,
+0 us apart)`, `ok: and it does not run while the process sleeps (grew 0 us over a 300 ms sleep)`,
+`ok: and it moves when this thread burns CPU (300000 us for a 300 ms burn)`,
+`ok: a sibling's CPU is the process's, not this thread's (this thread grew 4000 us while the process
+grew 204000 us …)`, `ok: clock_getres states the granularity of the CPU counters (4000000 ns)`,
+`PASS`. On the host the same five read `1 us apart`, `10 us`, `297748 us`, `65 us against 186754 us`,
+`1 ns` - the program is `PASS` on both machines.
+
+Counterfactually (`build/boot-cpuclock-cf1.log`, `src/syscall/linux/proc.rs` reverted):
+`FAIL: CLOCK_PROCESS_CPUTIME_ID and RUSAGE_SELF agree about this process's CPU (310002 us against
+8000 us, 302002 us apart)`, `FAIL: and it does not run while the process sleeps (grew 300276 us over a
+300 ms sleep)`, `FAIL: a sibling's CPU is the process's, not this thread's (this thread grew 205931 us
+while the process grew 205940 us …)`, `FAIL: clock_getres states the granularity of the CPU counters
+(1 ns)`, `=== t-cpuclock exit=1`. The one claim that passes without the fix is "it moves when this
+thread burns CPU" - any running counter satisfies it, which is exactly why the other four are the pin.
+
+**The gate found a fixture that had been written against the old answer.** The first two-arm run of
+this change was green on 265 of 266 programs on x86_64 and 264 of 265 on aarch64, both red on the same
+claim: `t-ns-time`'s `FAIL:  CLOCK_PROCESS_CPUTIME_ID is unmoved by 0 s in the child and unmoved here`
+(`build/gate-cpuclock.log`, `build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-0/`). That
+claim brackets a child's reading between the parent's two readings of **the same scale** -
+`child - after <= offset <= child - before` - which is exact for the four uptime readings and was
+never exact for this one: a CPU clock counts the work of the process that reads it, and Linux
+**starts a forked child's at zero**. Measured for this repair (`build/scratch/forkcpu/f.c`, musl
+static, Linux 7.2.14):
+
+```
+parent before burn:   242041816 ns      (242 ms of CPU before the fork)
+parent after:         242143085 ns      (+101 us: the child's work is the child's)
+child reported:         12794 ns  -> 47711431 ns   (at entry, then after a 50 ms burn)
+```
+
+So the old bracket passed only while the "CPU" clock was the machine's uptime - both processes read
+one rising number. The repair gives the child an eighth number in its report, `getrusage`'s
+user+system, and judges this one row by the sibling call instead
+(`CLOCK_PROCESS_CPUTIME_ID still reads the child's own CPU inside the namespace (0 us against
+RUSAGE_SELF's 0 us, 0 us apart)`, `build/boot-nstime-fix1.log`) - a namespace offset of 42 s, or the
+machine's age, would read as CPU nobody spent. The other six rows keep the exact bracket, which is
+still what proves the namespace moved them and not the caller.
+
+**The rule.** "Clock" is not one promise: an id whose name says *CPU time* must be CPU time, and the
+two ids Linux derives from the CPU counters must be derived from them here - agreeing with the sibling
+call that reports the same number (`getrusage`) is the check that catches this class. And when the
+reading moves in tick steps, the advertised resolution has to be the tick.

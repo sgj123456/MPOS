@@ -292,7 +292,28 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, the load average §6.98):** stage 1 `1231 tests, 0 failed`
+**Latest measured gate (2026-11-07, the two CPU-time clocks §6.99):** stage 1 `1231 tests, 0 failed`
+(54.44 s); x86_64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35 passed, 0 failed`, `total 54.77 s
+(previous green run 99.22 s, -44.8%)`; aarch64 `pass=265 fail=0 (265 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 152.83 s (previous green run 187.39 s, -18.4%)` (`build/gate-cpuclock2.log`), both
+arms in one command with the lane count forced to two. `GATE EXIT=0`. The new pin is `=== PASS` on both
+arms - `CLOCK_PROCESS_CPUTIME_ID and RUSAGE_SELF agree about this process's CPU (8000 us against
+8000 us, 0 us apart)`, `and it does not run while the process sleeps (grew 0 us over a 300 ms sleep)`,
+`clock_getres states the granularity of the CPU counters (4000000 ns)` - and `t-ns-time`'s repaired row
+reads `CLOCK_PROCESS_CPUTIME_ID still reads the child's own CPU inside the namespace (0 us against
+RUSAGE_SELF's 0 us, 0 us apart)` on both arms.
+
+**The run before it was red on both arms, and the red was the fixture's bracket.** `build/gate-cpuclock.log`
+read x86_64 `pass=265 fail=1 (266 built)` and aarch64 `pass=264 fail=1 (265 built)`, both on the same
+claim: `FAIL:  CLOCK_PROCESS_CPUTIME_ID is unmoved by 0 s in the child and unmoved here`
+(`build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-0/serial.log`). That fixture brackets
+a child's reading between the parent's two readings of **one** scale - exact for an uptime reading,
+and never exact for CPU time, which Linux restarts at zero in the fork
+(`build/scratch/forkcpu/f.c`: parent `242041816 ns`, child `12794 ns`). The row is judged by `getrusage`
+in the child now, and the CPU-clock defect itself is counterfactually pinned by `t-cpuclock`
+(`build/boot-cpuclock-cf1.log`, four of five claims red).
+
+**Measured gate before it (2026-11-07, the load average §6.98):** stage 1 `1231 tests, 0 failed`
 (98.88 s); x86_64 `pass=265 fail=0 (265 built)`, `mpos-kunit 35 passed, 0 failed`, `total 99.22 s
 (previous green run 110.48 s, -10.2%)`; aarch64 `pass=264 fail=0 (264 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 187.39 s (previous green run 294.53 s, -36.4%)` (`build/gate-loadavg2.log`), both

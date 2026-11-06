@@ -4638,6 +4638,38 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     let coarse = matches!(clk_id, CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE);
     let elapsed = if coarse {
         crate::hal::ticks().saturating_mul(crate::hal::ns_per_tick())
+    } else if matches!(clk_id, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
+        // The two cputime clocks are not clocks at all in the sense the others
+        // are: they report **CPU time**, which stands still while the task
+        // sleeps and covers only what the machine charged to it. This kernel
+        // answered them with `since_boot_nanos` - machine uptime - which every
+        // caller reads as its own CPU time and is wildly wrong: measured on the
+        // probe (`build/scratch/cpuclock/p.c`, `§6.99`), a process 1.1 s into a
+        // boot read `cpu=1113219 us` where Linux reads `46409 us`, and the
+        // number advanced 301 ms across a 300 ms sleep where Linux advanced
+        // 9 us. They also stayed in step with the machine rather than with the
+        // task, so two threads of one process reported the same CPU.
+        //
+        // The counters to read are the ones `getrusage` and `/proc/<pid>/stat`
+        // already answer from: the group's `utime + stime` for the process
+        // clock (children's CPU is `cutime` and does **not** belong in it, the
+        // way `RUSAGE_SELF` does not fold children either), and the current
+        // thread's own pair for the thread clock. Their granularity is the
+        // tick, which `clock_getres` now says for these two ids (`§6.97`'s rule
+        // - a resolution is a promise about the readings).
+        //
+        // The time namespace touches neither: CPU time is not a clock anybody
+        // re-bases, which is the comment below's own claim, and the offset table
+        // already leaves these two ids out.
+        let (utime, stime) = if clk_id == CLOCK_PROCESS_CPUTIME_ID {
+            let (utime, stime, _cutime, _cstime) = crate::sched::current_cpu_ticks();
+            (utime, stime)
+        } else {
+            crate::sched::current_thread_cpu_ticks()
+        };
+        utime
+            .saturating_add(stime)
+            .saturating_mul(crate::hal::ns_per_tick())
     } else {
         crate::hal::since_boot_nanos()
     };
@@ -5407,6 +5439,8 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
 /// `CLOCK_BOOTTIME_ALARM` is boot-relative, measured on the host as equal to
 /// their bases to within the read (`build/scratch/batch/m.c`).
 pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
+    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_THREAD_CPUTIME_ID: usize = 3;
     const CLOCK_REALTIME_COARSE: usize = 5;
     const CLOCK_MONOTONIC_COARSE: usize = 6;
     let (clk_id, res) = (args[0], args[1]);
@@ -5421,8 +5455,17 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
         if !buffer_ok(res, 16, true, true) {
             return err::EFAULT;
         }
+        // Three ids answer the tick, not the counter's quantum: the two coarse
+        // clocks because that is the reading they *are*, and the two cputime
+        // clocks because the counters they read are charged once per tick - a
+        // resolution finer than the step the value moves in would be the §6.97
+        // defect written the other way round. The rest divide the free-running
+        // counter and answer its quantum.
         let nanos = match clk_id {
-            CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => crate::hal::ns_per_tick(),
+            CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID => crate::hal::ns_per_tick(),
             _ => crate::hal::clock_resolution_nanos(),
         };
         unsafe {

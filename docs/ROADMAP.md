@@ -218,6 +218,20 @@ One-glance status of the whole roadmap.
   whole ticks; `t-clock-getres` pins all of it, six claims red without the fix, and its two
   timing-shaped claims were then re-anchored to the run they measure - an emulated aarch64 read them as
   the host's speed rather than as the clock's face (`§6.97`, item 210)
+- [x] the two CPU-time clocks are CPU time, not machine uptime — `CLOCK_PROCESS_CPUTIME_ID` and
+  `CLOCK_THREAD_CPUTIME_ID` sat in the monotonic list and were filled from `since_boot_nanos()`, so a
+  process 1.1 s into a boot read `cpu=1113219 us` where `RUSAGE_SELF` said `4000 us`, the "CPU time"
+  advanced `301038 us` across a 300 ms sleep, and two threads of one process read the same number
+  (both were the machine's age). Measured on the host: the process clock equals `RUSAGE_SELF`'s
+  user+system (`46409` vs `46410 us`), a 300 ms sleep moves it `9 us`, a sibling's burn lands in the
+  process's clock and not the thread's, and the resolution is `1 ns` because Linux charges CPU in
+  nanoseconds. Both ids now read this kernel's own counters (`utime + stime`, children out;
+  the thread's own pair) scaled by `ns_per_tick()`, and `clock_getres` answers that tick for them - a
+  resolution is a promise about the readings (§6.97). `t-cpuclock` pins it, four of five claims red
+  without the fix, and the gate then caught `t-ns-time` bracketing this clock between two uptime
+  readings - a bracket a CPU clock Linux restarts at zero in the fork cannot fall inside (parent
+  `242041816 ns` against child `12794 ns`), so that row is judged by `getrusage` in the child now
+  (`§6.99`, item 212)
 - [x] `/proc/loadavg` and `sysinfo.loads` report the load average Linux computes — both doors printed
   zeros, and `/proc/loadavg` was a literal string (`0.00 0.00 0.00 1/<processes>`) under a
   `docs/uapi/` row saying the file was served, so a caller reading "the machine is idle" was told a

@@ -9544,3 +9544,39 @@ the unfixed kernel - `FAIL: one sample lifts the one-minute average off zero (0 
 (`build/boot-loadavg3.log`: `(6/10)`, `(32 hundredths)`, `loads[0] = 20992`, `exit=0`); the same program
 is `PASS` on the host. Host unit tests pin the arithmetic without a machine
 (`sched::loadavg::tests`, five cases). Mechanism and the full reading: `docs/notes/` §6.98.
+
+### Item 212 - the two CPU-time clocks report CPU time, not machine uptime (2026-11-07, landed)
+
+`clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` answered
+`hal::since_boot_nanos()` - the age of the machine - so a process 1.1 s into a boot read
+`cpu=1113219 us`, a sleeping process accrued CPU, and two threads of one process read the same number.
+`clock_getres` answered the counter's `1 ns` beside them.
+
+| | Linux (host, 7.2.14) | this kernel, before |
+|---|---|---|
+| process clock vs `RUSAGE_SELF` | `46409 us` vs `46410 us` (agree) | `1113219 us` vs `4000 us` |
+| what a 300 ms sleep does to it | `+9 us` | `+301038 us` |
+| a sibling thread's burn | process clock only (753138 vs 450391) | both (2142078 vs 2142070, both uptime) |
+| `clock_getres(CLOCK_PROCESS_CPUTIME_ID)` | `1 ns` (CPU charged in ns) | `1 ns` (beside 683 ns steps of uptime) |
+
+**Landed.** Both ids leave the `since_boot_nanos` path: the process clock reads
+`current_cpu_ticks()`'s `utime + stime` (children stay out, as they stay out of `RUSAGE_SELF`), the
+thread clock reads `current_thread_cpu_ticks()`, and both scale by `ns_per_tick()`. `clock_getres`
+answers `ns_per_tick()` for these two ids, the way §6.97 already made it answer the tick for the coarse
+pair. Owner: `src/syscall/linux/proc.rs`.
+
+Pin: `user/tests/src/bin/t-cpuclock.rs`, 5 claims (agrees with `RUSAGE_SELF` within two ticks; stands
+still across a 300 ms sleep; moves across a burn; a sibling's CPU is the process's and not this
+thread's; the resolution is the granularity the counter moves in). Red on the unfixed kernel - four of
+the five, including `(grew 300276 us over a 300 ms sleep)`
+(`build/boot-cpuclock-cf1.log`, `=== t-cpuclock exit=1`), green with it
+(`build/boot-cpuclock-fix2.log`, `(8000 us against 8000 us, 0 us apart)`, `(4000000 ns)`, `exit=0`);
+`PASS` on the host too. The first two-arm run of the change was red on `t-ns-time`'s
+`CLOCK_PROCESS_CPUTIME_ID is unmoved by 0 s in the child and unmoved here` on **both** arms, and the
+claim was the part that was wrong: it bracketed the child's reading between the parent's two readings
+of one scale, which holds for an uptime reading and not for a CPU clock Linux restarts at zero in the
+fork (`build/scratch/forkcpu/f.c`: parent `242041816 ns` against child `12794 ns`). The row is judged by
+`getrusage` in the child now
+(`CLOCK_PROCESS_CPUTIME_ID still reads the child's own CPU inside the namespace (0 us against
+RUSAGE_SELF's 0 us, 0 us apart)`, `build/boot-nstime-fix1.log`). Mechanism and the full reading:
+`docs/notes/` §6.99.
