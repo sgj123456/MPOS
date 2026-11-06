@@ -1539,6 +1539,15 @@ pub struct Process {
     pub cpu: (u64, u64, u64, u64),
     /// See [`crate::sched::TaskSnapshot::cpu_own`].
     pub cpu_own: (u64, u64),
+    /// See [`crate::sched::TaskSnapshot::pending`] - `/proc/<pid>/stat`'s
+    /// field 31.
+    pub pending: u64,
+    /// See [`crate::sched::TaskSnapshot::blocked`] - field 32.
+    pub blocked: u64,
+    /// See [`crate::sched::TaskSnapshot::ignored`] - field 33.
+    pub ignored: u64,
+    /// See [`crate::sched::TaskSnapshot::caught`] - field 34.
+    pub caught: u64,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1711,10 +1720,14 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         Cow::Borrowed("0"),                          // startstack
         Cow::Borrowed("0"),                          // kstkesp
         Cow::Borrowed("0"),                          // kstkeip
-        Cow::Borrowed("0"),                          // signal
-        Cow::Borrowed("0"),                          // blocked
-        Cow::Borrowed("0"),                          // sigignore
-        Cow::Borrowed("0"),                          // sigcatch
+        // The four signal words: this task's pending and blocked sets, then
+        // the group's two disposition sets. All four are `signal::Pending`
+        // (a `u64`, signal n in bit n-1), which is the shape Linux prints -
+        // measured, `build/scratch/sigfield/p.c`, `docs/notes/` §6.102.
+        Cow::Owned(alloc::format!("{}", task.pending)), // signal
+        Cow::Owned(alloc::format!("{}", task.blocked)), // blocked
+        Cow::Owned(alloc::format!("{}", task.ignored)), // sigignore
+        Cow::Owned(alloc::format!("{}", task.caught)),  // sigcatch
         // wchan: which wait the task last slept in, as a number the way
         // Linux's field is one (an address there). 0 is "never parked"; the
         // values name `sched::task::PARK_SITES`' entries, so a stuck task can
@@ -5823,6 +5836,10 @@ mod tests {
             exit_signal: 17,
             cpu: (0, 0, 0, 0),
             cpu_own: (0, 0),
+            pending: 0,
+            blocked: 0,
+            ignored: 0,
+            caught: 0,
         }
     }
 

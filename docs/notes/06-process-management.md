@@ -7709,3 +7709,80 @@ fixed kernel   (build/boot-nicefield2.log)      ok:   priority is 20 + its nice 
 **The rule.** A field a reader formats is answered from the kernel's own record of that thing, not
 from the default value of the thing: two literals look like an answer because the common case is nice
 0, and the case that is not the common case is the one a monitor exists to show.
+
+## §6.102 `/proc/<pid>/stat`'s four signal words were zeros (LANDED 2026-11-07)
+
+Fields 31-34 of `/proc/<pid>/stat` are `signal`, `blocked`, `sigignore` and `sigcatch`: what is
+pending **on this task**, what it has blocked, and the two disposition sets of its **process**. This
+kernel printed `0` for all four. That is the §6.101 shape again, and it has the same tell - the
+common case is a quiet process, so a `ps` with extra columns, a debugger or a supervisor asking "the
+signal was sent and has not arrived, why" reads four zeros that look like the answer.
+
+All four were already in the table: `Task::signals` and `Task::blocked` are the pending and blocked
+words (`signal::Pending`, a `u64` with signal *n* in bit *n-1*), and the group's dispositions sit in
+`Task::dispositions` (`Arc<SignalHand>`, shared across the threads by `CLONE_SIGHAND`).
+
+Measured first (`build/scratch/sigfield/p.c`, Linux 7.2.14), one call at a time so the layout is a
+reading rather than a guess:
+
+```
+baseline                           sigpnd=0 blocked=0 ignore=16781312 catch=0
+after blocking SIGUSR1 (10)        sigpnd=0 blocked=512 ignore=16781312 catch=0
+after SIG_IGN SIGUSR2 (12)         sigpnd=0 blocked=512 ignore=16783360 catch=0
+after a SIGTERM (15) handler       sigpnd=0 blocked=512 ignore=16783360 catch=16384
+after raising a blocked SIGWINCH   sigpnd=134217728 blocked=134218240 ignore=16799744 catch=0
+after unblocking (default ignore)  sigpnd=0 blocked=134217728 ignore=16799744 catch=0
+```
+
+Three facts in that block are the implementation: the bit is `1 << (n - 1)` (`SIGUSR1` is 10 and
+adds 512, `SIGWINCH` is 28 and adds `1 << 27`); a disposition is `SIG_IGN` *or* a handler and never
+both (replacing the `SIGTERM` handler with `SIG_IGN` moved the same bit from field 34 to field 33);
+and the two disposition words are the process's while the two signal words are the task's - the
+probe's worker thread blocking `SIGUSR1` changed its own `task/<tid>/stat` and left the leader's word
+where it was. The baseline is not zero even on Linux: the libc or the launcher ignores `SIGPIPE`
+(`16781312` is `SIGPIPE | SIGXFSZ`), which is why every claim in the pin is a *relation*.
+
+**The fix.** `TaskSnapshot` carries `pending`, `blocked`, `ignored`, `caught`
+(`src/sched/runtime/procfs.rs`), filled in `snapshot_of`; the last two from a
+`fn disposition_sets(actions: signal::Actions)` walk over `1..=MAX_SIGNAL`. It takes
+`SignalHand::snapshot()` rather than the shared handle on purpose: a disposition is read by every
+thread of the group, so walking the shared `Arc` sixty-four times would hold its lock across the
+walk while another thread may be in `sigaction`. `stat_line` (`src/vfs/procfs.rs:1727`) formats the
+four words as decimal numbers.
+
+**The pin** is `user/tests/src/bin/t-stat-signal-fields.rs`, nine claims, each a *movement* against
+what the process did to itself rather than a constant (the baseline is not the same on the two
+machines - Linux's is `16781312`, this kernel's is `4096`, both of them `SIGPIPE`):
+blocking `SIGUSR1` adds exactly its bit to `blocked`; `SIG_IGN` on `SIGUSR2` adds exactly its bit to
+`sigignore`; a `SIGTERM` handler adds exactly its bit to `sigcatch` and moves nothing in `sigignore`;
+raising a blocked `SIGWINCH` adds exactly its bit to `pending` and nothing to `blocked`; unblocking
+delivers the default (discard) and clears `pending`; and this thread's `task/<tid>/stat` carries the
+leader's `blocked` word.
+
+```
+unfixed kernel (build/boot-sigfield-cf1.log)  ok:   the four signal words read as numbers (… 0, 0, 0, 0)
+                                              FAIL: blocking SIGUSR1 puts its bit in the blocked word (0 -> 0 …)
+                                              FAIL: ignoring SIGUSR2 puts its bit in the ignore word (0 -> 0 …)
+                                              FAIL: a handled SIGTERM puts its bit in the catch word (0 -> 0 …)
+                                              FAIL: a blocked signal that is raised shows in the pending word
+                                              === t-stat-signal-fields exit=1
+fixed kernel   (build/boot-sigfield2.log)     all nine ok, PASS, exit=0
+```
+
+**Two claims in `t-times` were reshaped by this gate, and neither was this change's doing.** The
+aarch64 arm reddened on two readings §6.96 had written: first `/proc/self/stat`'s utime against a
+`RUSAGE_SELF` record taken *before* the forked child and the burn loops (`110000 us against
+88000 us` - the file honestly counted CPU the stale record predated), then the thread spelling
+demanded `thread < group` where both read `5` ticks because this thread was the one that burned
+(`build/gate-sigfield.log`, `build/gate-sigfield3.log`). Both are the same mistake as §6.97's
+`5 steps`/`1603792 ns apart`: a claim comparing two doors must bracket them around the read
+(two `RUSAGE_SELF`/`RUSAGE_THREAD` reads with one tick of slack each way) and state a monotone
+relation separately, rather than demand two separately-taken numbers agree to a constant. The
+unfixed-kernel red cited above (§6.96's `0 us against 40000 us`) still holds for the bracketed
+form: `0 + 10000 >= 40000` is false, which is what `build/boot-procstat-cf.log` measured.
+
+**The rule.** A word a reader subtracts, masks or prints is answered from the kernel's own set, and
+a set field has a second obligation a scalar does not: the *layout* is part of the contract. Here it
+is the wire `sigset_t`'s (signal *n* in bit *n-1*), which is why no conversion sits between
+`Task::blocked` and the file - and why the pin could be written as "moved by exactly this bit"
+before either machine was touched.

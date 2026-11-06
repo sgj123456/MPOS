@@ -263,6 +263,12 @@ One-glance status of the whole roadmap.
       `20 + nice` and `nice` where they used to be the constants `20`/`0`, so a `ps` on a reniced
       process no longer prints nice 0 (measured: nice 19 reads `39`/`19` on a current host; the
       machine's own process set to 3 reads `23`/`3`, `20`/`0` without the fix — `§6.101`, item 214).
+- [x] `/proc/<pid>/stat`'s four signal words are the kernel's sets - fields 31-34 (`signal`,
+      `blocked`, `sigignore`, `sigcatch`) printed `0` while `Task::signals`, `Task::blocked` and the
+      group's dispositions held every one of them; blocking `SIGUSR1` now moves field 32 by `1 << 9`,
+      a `SIGTERM` handler puts `1 << 14` in field 34, a raised-and-blocked `SIGWINCH` puts `1 << 27`
+      in field 31, and the two disposition words partition (measured on a current host first, because
+      neither machine starts at a zero word: both ignore `SIGPIPE` - `§6.102`, item 215).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

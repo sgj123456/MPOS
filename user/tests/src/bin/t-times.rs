@@ -450,17 +450,37 @@ fn main() {
         // (0.030 s) - the process file carries the *group's* CPU. A kernel that
         // never counted, or that printed the raw timer ticks, is the shape
         // `ps`/`top` shows as `0:00` for a process that has been busy.
+        // The two numbers come from two doors read at two instants, and the
+        // group's CPU keeps accruing between them: this process burned chunks
+        // above, and on an emulated aarch64 even a handful of syscalls is
+        // milliseconds of CPU. So the file's reading is **bracketed** - it must
+        // lie between a `RUSAGE_SELF` read taken before the file and one taken
+        // after it, each with one tick of slack for the field's truncation
+        // toward zero. The shape this replaced compared against `self_after`,
+        // a record read before the forked child and the burn loops, and the
+        // second machine reddened by the CPU the file had honestly counted and
+        // the stale record had not (`110000 us against 88000 us`).
+        let mut bracketing: Rusage = unsafe { core::mem::zeroed() };
+        let before_us = if getrusage(libc::RUSAGE_SELF, &mut bracketing).is_ok() {
+            micros(bracketing.ru_utime)
+        } else {
+            self_after
+        };
         match stat_cpu("/proc/self/stat") {
             Some((utime, _stime, cutime, _cstime)) => {
                 let shown_us = utime as i64 * USER_HZ_TICK_US;
-                // One tick of slack in each direction: the record was read
-                // before this line and the field truncates toward zero, so the
-                // two cannot agree to the microsecond by construction.
+                let mut bracketed: Rusage = unsafe { core::mem::zeroed() };
+                let after_us = if getrusage(libc::RUSAGE_SELF, &mut bracketed).is_ok() {
+                    micros(bracketed.ru_utime)
+                } else {
+                    before_us
+                };
                 r.check(
                     &format!(
-                        "/proc/self/stat's utime is the group CPU getrusage reports ({shown_us} us against {self_after} us)"
+                        "/proc/self/stat's utime is the group CPU getrusage reports ({shown_us} us, bracketed by {before_us}..{after_us} us)"
                     ),
-                    (shown_us - self_after).abs() <= 2 * USER_HZ_TICK_US,
+                    shown_us + USER_HZ_TICK_US >= before_us
+                        && shown_us <= after_us + USER_HZ_TICK_US,
                 );
                 let child_us = cutime as i64 * USER_HZ_TICK_US;
                 r.check(
@@ -471,22 +491,51 @@ fn main() {
                 );
                 // The thread spelling is the other half of Linux's `whole`
                 // flag: `/proc/<pid>/task/<tid>/stat` carries *this thread's*
-                // own CPU, so it must be the smaller of the two here (the
-                // spinner did the burning). The host this suite also runs on
-                // (`MPOS_ON_HOST=1`) hides thread directories, so the claim is
-                // the machine's alone and skipping it there is stated rather
-                // than silent.
+                // own CPU. It is checked against `RUSAGE_THREAD` rather than by
+                // being smaller than the group's number: when this thread is
+                // the one that burned the CPU the two agree to the tick, and a
+                // claim demanding `thread < group` reddened on the emulated
+                // aarch64 arm for exactly that reason (`5 ticks against the
+                // group's 5`, an honest reading failing a shape assertion).
+                // Bracket it the way the group's number is bracketed, with the
+                // monotone relation stated separately. The host this suite also
+                // runs on (`MPOS_ON_HOST=1`) hides thread directories, so the
+                // claim is the machine's alone and skipping it there is stated
+                // rather than silent.
                 if !host_run() {
                     let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                    let mut before_thread: Rusage = unsafe { core::mem::zeroed() };
+                    let before_own = if getrusage(libc::RUSAGE_THREAD, &mut before_thread).is_ok() {
+                        micros(before_thread.ru_utime)
+                    } else {
+                        thread_after
+                    };
                     match stat_cpu(&format!("/proc/self/task/{tid}/stat")) {
-                        Some((thread_utime, _ts, _tc, _tcs)) => r.check(
-                            &format!(
-                                "and the thread spelling carries this thread's own ({thread_utime} ticks against the group's {utime})"
-                            ),
-                            thread_utime < utime,
-                        ),
+                        Some((thread_utime, _ts, _tc, _tcs)) => {
+                            let mut after_thread: Rusage = unsafe { core::mem::zeroed() };
+                            let after_own =
+                                if getrusage(libc::RUSAGE_THREAD, &mut after_thread).is_ok() {
+                                    micros(after_thread.ru_utime)
+                                } else {
+                                    before_own
+                                };
+                            let thread_us = thread_utime as i64 * USER_HZ_TICK_US;
+                            r.check(
+                                &format!(
+                                    "and the thread spelling carries this thread's own CPU ({thread_us} us, bracketed by {before_own}..{after_own} us)"
+                                ),
+                                thread_us + USER_HZ_TICK_US >= before_own
+                                    && thread_us <= after_own + USER_HZ_TICK_US,
+                            );
+                            r.check(
+                                &format!(
+                                    "and never more than its group's ({thread_utime} ticks against {utime})"
+                                ),
+                                thread_utime <= utime,
+                            );
+                        }
                         None => r.check(
-                            "and the thread spelling carries this thread's own (its stat file did not open)",
+                            "and the thread spelling carries this thread's own CPU (its stat file did not open)",
                             false,
                         ),
                     }

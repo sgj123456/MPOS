@@ -9642,3 +9642,27 @@ starts every process at nice 19 and `RLIMIT_NICE` is `0/0`, so the host cannot m
 claim is about). Red on the unfixed kernel (`build/boot-nicefield-cf1.log`, `20/0`, `=== t-priority
 exit=1`), green with it (`build/boot-nicefield2.log`, `23/3`, `exit=0`). Reading and rule:
 `docs/notes/` §6.101.
+
+### Item 215 - `/proc/<pid>/stat`'s four signal words are the kernel's sets (2026-11-07, landed)
+
+| field | Linux | this kernel, before | this kernel, now |
+|---|---|---|---|
+| 31 `signal` (pending) | `task->pending`, `1 << (n-1)` | literal `0` | `Task::signals` |
+| 32 `blocked` | `task->blocked` | literal `0` | `Task::blocked` |
+| 33 `sigignore` | dispositions that are `SIG_IGN` | literal `0` | `Task::dispositions`, walked |
+| 34 `sigcatch` | dispositions that are a handler | literal `0` | the same walk, the other arm |
+| blocking `SIGUSR1` (10), measured | field 32 `512` | `0` | `512` |
+| `SIG_IGN` `SIGUSR2` (12), measured | field 33 `+2048` | `0` | `+2048` |
+| `SIGTERM` (15) handler, measured | field 34 `16384` | `0` | `16384` |
+| raised, blocked `SIGWINCH` (28) | field 31 `1 << 27` | `0` | `1 << 27` |
+
+**Landed.** `TaskSnapshot` carries `pending`/`blocked`/`ignored`/`caught`
+(`src/sched/runtime/procfs.rs`), the last two from `disposition_sets` walking
+`SignalHand::snapshot()`, and `stat_line` (`src/vfs/procfs.rs:1727`) formats the four words. Owner:
+`src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-stat-signal-fields.rs`, nine claims, each a movement against what the
+process did to itself (the baseline word is not zero on either machine - both ignore `SIGPIPE`).
+Red on the unfixed kernel (`build/boot-sigfield-cf1.log`, four claims `0 -> 0`, `=== t-stat-signal-
+fields exit=1`), green with it (`build/boot-sigfield2.log`, nine ok, `exit=0`). Reading and rule:
+`docs/notes/` §6.102.

@@ -7,6 +7,7 @@ use crate::mm::pframe;
 use crate::mm::vm::MapFlags;
 use crate::mm::vma::{MappedRange, VmaTable};
 use crate::sched::policy::TaskId;
+use crate::sched::signal;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -295,6 +296,57 @@ pub struct TaskSnapshot {
     /// CPU this **task** has burned, `(utime, stime)`, in the kernel's ticks.
     /// The `task/<tid>/stat` spelling's numbers; the group's are [`Self::cpu`].
     pub cpu_own: (u64, u64),
+    /// Signals pending on **this task**, in the [`signal::Pending`] layout -
+    /// `/proc/<pid>/stat`'s field 31.
+    ///
+    /// Measured on a current host (`build/scratch/sigfield/p.c`, Linux 7.2.14):
+    /// a `SIGWINCH` (28) raised while blocked read the field as `134217728` =
+    /// `1 << 27`, i.e. signal *n* in bit *n-1*, and unblocking the default
+    /// action (ignore) cleared it again.
+    pub pending: signal::Pending,
+    /// The signals this task has blocked with `rt_sigprocmask` - field 32.
+    /// Measured in the same run: `SIG_BLOCK` of `SIGUSR1` (10) moved the field
+    /// to `512` = `1 << 9`, and the pending block above added its own bit.
+    pub blocked: signal::Pending,
+    /// The signals whose disposition is `SIG_IGN` - field 33, and a *group*
+    /// question because a disposition is shared (`CLONE_SIGHAND`). Measured:
+    /// `signal(SIGUSR2, SIG_IGN)` added `2048` = `1 << 11`, and installing a
+    /// `SIGTERM` handler afterwards left it there.
+    pub ignored: signal::Pending,
+    /// The signals whose disposition is a handler - field 34.
+    ///
+    /// A signal is in this set or [`Self::ignored`], never both: `SIG_DFL` is
+    /// 0, `SIG_IGN` is 1, and every handler address is above both. Measured:
+    /// `sigaction(SIGTERM, handler)` read `16384` = `1 << 14`, and replacing it
+    /// with `SIG_IGN` moved the same bit into field 33.
+    pub caught: signal::Pending,
+}
+
+/// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
+///
+/// One walk of the table rather than two, because the sets partition it: a
+/// slot is ignored, caught, or default, and a signal that is `SIG_DFL` belongs
+/// to neither word. The loop covers `1..=MAX_SIGNAL`, which is the whole table
+/// (`Actions` holds `SIGNALS` entries indexed by number) and the whole word.
+///
+/// It takes a **snapshot** rather than the shared `SignalHand`, and that is
+/// deliberate: a disposition is shared with every thread of the group, so
+/// reading it through the `Arc` means holding its lock across sixty-four
+/// reads while another thread may be in `sigaction`. `SignalHand::snapshot`
+/// copies under one borrow, and the copy is what the report was always going
+/// to be - one file's worth of one instant.
+fn disposition_sets(actions: signal::Actions) -> (signal::Pending, signal::Pending) {
+    let mut ignored = 0;
+    let mut caught = 0;
+    for sig in 1..=signal::MAX_SIGNAL {
+        let action = actions.get(sig);
+        if action.is_ignore() {
+            ignored |= signal::bit(sig);
+        } else if action.is_handler() {
+            caught |= signal::bit(sig);
+        }
+    }
+    (ignored, caught)
 }
 
 /// The facts about `task`, in the shape `/proc` reports them.
@@ -317,6 +369,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         'R'
     };
     let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
+    let (ignored, caught) = disposition_sets(task.dispositions.snapshot());
     TaskSnapshot {
         tid: id.0,
         pid: task.tgid.0,
@@ -357,6 +410,10 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             task.cpu_user.load(core::sync::atomic::Ordering::Relaxed),
             task.cpu_system.load(core::sync::atomic::Ordering::Relaxed),
         ),
+        pending: task.signals,
+        blocked: task.blocked,
+        ignored,
+        caught,
     }
 }
 

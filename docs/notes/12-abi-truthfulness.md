@@ -292,7 +292,29 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s nice pair §6.101):** stage 1 `1233 tests,
+**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s four signal words §6.102):** stage 1 `1233
+tests, 0 failed` (55.20 s / 94.17 s); x86_64 `pass=268 fail=0 (268 built)`, `mpos-kunit 35 passed, 0
+failed`, `total 55.59 s (previous green run 55.39 s, +0.4%)` (`build/gate-sigfield-x.log`, `X=0`);
+aarch64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total 94.54 s (previous
+green run 227.98 s, -58.5%)` (`build/gate-sigfield-a.log`, `A=0`), each arm run **alone** with the
+lane count forced to two. The new pin is `=== PASS` on both arms with the same movement on each:
+`blocking SIGUSR1 puts its bit in the blocked word (0 -> 512, expected +512)`, `ignoring SIGUSR2 puts
+its bit in the ignore word (4096 -> 6144, expected +2048)`, `a handled SIGTERM puts its bit in the
+catch word (1088 -> 17472, expected +16384)`, `a blocked signal that is raised shows in the pending
+word (0 -> 134217728, expected +134217728)` (`build/test-lane-x86_64-1/serial.log`,
+`build/test-lane-aarch64-0/serial.log`) - and note `ignored: 4096` in the baseline on both machines,
+`SIGPIPE`, which is why every claim is a movement.
+
+**Three combined runs before those were red, and none of the reds was this change's mechanism.** Two
+were §12.4a's contention shape in the kernel's own timing suite - `sched.alternating FAILED: two tasks
+at the same priority did not take turns: [0, 1, 1, 0, 1, 0, 1, 1, 0, 0]` on one arm and `[0, 1, 0, 0,
+1, 1, 0, 0, 1, 1]` on the other (`build/gate-sigfield.log`, `build/gate-sigfield4.log`), each time with
+the sibling lane green in the same boot - and the third was `t-times`, twice, in the two claims this
+gate reshaped (`110000 us against 88000 us`, then `5 ticks against the group's 5`); both are stated in
+`§6.102` with the bracket that replaced them. A red here that names `sched.alternating` under
+`--all-targets` on this one-core host is a statement about the host; re-run the arms alone.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/stat`'s nice pair §6.101):** stage 1 `1233 tests,
 0 failed` (92.16 s); x86_64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total
 92.51 s (previous green run 99.46 s, -7.0%)`; aarch64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35
 passed, 0 failed`, `total 232.67 s (previous green run 236.29 s, -1.5%)` (`build/gate-nicefield.log`),
