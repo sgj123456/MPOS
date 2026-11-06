@@ -104,6 +104,13 @@ struct Sleeper {
     deadline: u64,
     priority: Priority,
     id: TaskId,
+    /// Whether this wait ignores signals - Linux's `TASK_UNINTERRUPTIBLE`, the
+    /// `D` a block transfer parks in while its buffers are lent to a device
+    /// (`docs/notes/` §6.98). It does not change the order of the queue: two
+    /// sleepers with the same deadline and priority are still tie-broken by id.
+    /// The load average is the only reader, and it asks the queue for it once
+    /// every five seconds rather than per tick.
+    uninterruptible: bool,
 }
 
 impl Ord for Sleeper {
@@ -221,13 +228,45 @@ impl Scheduler {
     /// next [`advance`](Self::advance), which is what makes a sleep a scheduling
     /// point rather than a no-op.
     pub fn sleep(&mut self, id: TaskId, priority: Priority, nanos: u64) {
+        self.push_sleeper(id, priority, nanos, false);
+    }
+
+    /// Sleep that a signal may not end - Linux's `TASK_UNINTERRUPTIBLE`.
+    ///
+    /// The caller is the one that must keep signals pending and act on them
+    /// after its in-flight operation retires (`block_until_uninterruptible`'s
+    /// header says why a transfer cannot unwind); this function only records
+    /// the state, so that the load average can count it the way Linux's
+    /// `nr_uninterruptible` does. Measured on the host
+    /// (`build/scratch/loadavg/p.c`): the three averages include a task that is
+    /// in `D`, and a kernel that counted only `R` would report less load than
+    /// Linux while a disk was busy.
+    pub fn sleep_uninterruptible(&mut self, id: TaskId, priority: Priority, nanos: u64) {
+        self.push_sleeper(id, priority, nanos, true);
+    }
+
+    fn push_sleeper(&mut self, id: TaskId, priority: Priority, nanos: u64, uninterruptible: bool) {
         self.sleeping.push(Reverse(Sleeper {
             // Saturating so u64::MAX is "until someone wakes me": a plain add
             // would wrap the deadline into the past.
             deadline: self.now.saturating_add(nanos),
             priority,
             id,
+            uninterruptible,
         }));
+    }
+
+    /// How many sleepers are in an uninterruptible wait right now.
+    ///
+    /// Walked rather than counted on every park: the queue is short (one entry
+    /// per task at most) and this is asked once per five seconds by the tick
+    /// that takes the load-average sample, so the walk costs two comparisons
+    /// per sleeping task per five seconds and buys a counter that cannot drift.
+    pub fn uninterruptible_count(&self) -> usize {
+        self.sleeping
+            .iter()
+            .filter(|sleeper| sleeper.0.uninterruptible)
+            .count()
     }
 
     /// Take a task out of the ready queues without touching its sleep entry.
@@ -330,6 +369,30 @@ mod tests {
 
     fn task(n: usize) -> TaskId {
         TaskId(n)
+    }
+
+    /// The load average's `active` counts a `D`-state sleeper and nothing else
+    /// does: an ordinary sleep is `S`, and `ps` distinguishes them. Measured on
+    /// the host (`build/scratch/loadavg/p.c`): the three averages include tasks
+    /// in an uninterruptible wait, so the queue must be able to name them.
+    #[test]
+    fn an_uninterruptible_sleeper_is_counted_apart_from_an_interruptible_one() {
+        let mut sched = Scheduler::new();
+        sched.sleep(task(1), Priority::NORMAL, 100);
+        sched.sleep_uninterruptible(task(2), Priority::NORMAL, u64::MAX);
+        sched.sleep_uninterruptible(task(3), Priority::LOW, 100);
+
+        assert_eq!(sched.sleeping_count(), 3);
+        assert_eq!(sched.uninterruptible_count(), 2);
+
+        // A wake takes the task out of the queue, and the count follows it.
+        assert!(sched.wake(task(2)));
+        assert_eq!(sched.uninterruptible_count(), 1);
+
+        // The clock expiring the last one is the other way out.
+        sched.advance(100);
+        assert_eq!(sched.sleeping_count(), 0);
+        assert_eq!(sched.uninterruptible_count(), 0);
     }
 
     #[test]

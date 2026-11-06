@@ -9,6 +9,10 @@ pub mod exit;
 pub mod fs;
 pub mod futex;
 pub mod keys;
+/// The load average: `avenrun`'s fixed-point arithmetic, host-compiled because
+/// it is integers, and the one sampling hook the tick handler calls. Its
+/// readers are `/proc/loadavg` and `sysinfo`, which must report one value.
+pub mod loadavg;
 pub mod policy;
 pub mod rseq;
 pub mod signal;
@@ -91,7 +95,7 @@ pub use runtime::{
     record_eager_range, register_membarrier, release_controlling_tty, release_pid,
     release_user_frames, reset_disposition, resident_pages, resolve_anon_fault, resolve_cow_fault,
     resolve_pid, resolve_script, resolve_stack_growth, resume_traced, rlimits_of, robust_head,
-    root_ns, run_owner, run_seccomp_filters, seal_user_range, send_signal,
+    root_ns, run_owner, run_seccomp_filters, runnable_count, seal_user_range, send_signal,
     send_signal_every_process, send_signal_group, send_signal_group_checked,
     send_signal_group_info, send_signal_info, send_signal_process, send_signal_process_info,
     session_of, session_of_tty, set_brk_base, set_child_subreaper, set_clear_tid,
@@ -559,6 +563,15 @@ pub fn current_cpu_ticks() -> (u64, u64, u64, u64) {
 #[cfg(not(target_os = "none"))]
 pub fn current_thread_cpu_ticks() -> (u64, u64) {
     (0, 0)
+}
+
+/// The host build has one task and it is always the caller, so the runnable
+/// count is one - the same answer [`runnable_count`] gives on a machine with
+/// nothing else to run, and the number `/proc/loadavg`'s fourth field prints
+/// beside it.
+#[cfg(not(target_os = "none"))]
+pub fn runnable_count() -> usize {
+    1
 }
 
 /// The host build's one process, so one slot stands for "the running task's

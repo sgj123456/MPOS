@@ -4556,6 +4556,16 @@ pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
         core::ptr::write_bytes(buf as *mut u8, 0, SYSINFO_SIZE);
         let word = |offset: usize| (buf + offset) as *mut u64;
         word(0).write_unaligned(ticks / hz); // uptime
+        // `loads[3]` at offsets 8/16/24: Linux's `get_avenrun(loads, 0,
+        // SI_LOAD_SHIFT - FSHIFT)`, the same fixed-point averages
+        // `/proc/loadavg` prints - one sample, two doors, and they must agree
+        // (`build/scratch/loadavg/p.c`: `1.94` in the file beside
+        // `loads[0] = 127456`, which is `3983 << 5`). Leaving these zero
+        // answered "nothing has ever wanted the CPU", which is a fact only an
+        // idle machine can state (`docs/notes/` §6.98).
+        for (i, average) in crate::sched::loadavg::AVENRUN.get().into_iter().enumerate() {
+            word(8 + i * 8).write_unaligned(crate::sched::loadavg::sysinfo_load(average));
+        }
         word(32).write_unaligned(stats.total as u64 * page); // totalram
         word(40).write_unaligned(stats.free as u64 * page); // freeram
         (buf as *mut u16)

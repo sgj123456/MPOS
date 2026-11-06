@@ -218,6 +218,18 @@ One-glance status of the whole roadmap.
   whole ticks; `t-clock-getres` pins all of it, six claims red without the fix, and its two
   timing-shaped claims were then re-anchored to the run they measure - an emulated aarch64 read them as
   the host's speed rather than as the clock's face (`§6.97`, item 210)
+- [x] `/proc/loadavg` and `sysinfo.loads` report the load average Linux computes — both doors printed
+  zeros, and `/proc/loadavg` was a literal string (`0.00 0.00 0.00 1/<processes>`) under a
+  `docs/uapi/` row saying the file was served, so a caller reading "the machine is idle" was told a
+  legal number that was never computed. A load average is a decayed integral in fixed point
+  (`FSHIFT 11`, `EXP_1/5/15`, `calc_load`) resampled on a five-second boundary, and it is **one**
+  array: Linux's `/proc/loadavg` text is it rounded to hundredths and `sysinfo.loads` is the same
+  array shifted by five bits. Measured: only the 5 s boundary moves the three averages (40 samples at
+  100 ms), and `loads[0] = 127456` is `1.9449 << 16` of the `1.94` the file prints. `src/sched/
+  loadavg.rs` now carries the arithmetic; `charge_cpu` - the tick hook, already under the scheduler's
+  lock - samples it and feeds `ready + uninterruptible + running` (uninterruptible sleepers now say
+  so), and both readers read that array; the fourth field's denominator became threads, as Linux
+  counts. `t-loadavg` pins it, three claims red without the fix (`§6.98`, item 211)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

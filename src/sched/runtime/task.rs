@@ -3257,7 +3257,10 @@ pub fn block_until_uninterruptible_until(site: u8, cond: impl Fn() -> bool, dead
                 let now = hal::since_boot_nanos();
                 t.sched.advance(now);
                 let remaining = deadline.saturating_sub(now).max(1);
-                t.sched.sleep(id, priority, remaining);
+                // Uninterruptible, and the load average asks the queue which
+                // sleepers are: Linux counts a task in `D` as load
+                // (`docs/notes/` §6.98).
+                t.sched.sleep_uninterruptible(id, priority, remaining);
             }
         });
     }
@@ -3298,7 +3301,7 @@ pub fn block_until_uninterruptible_armed(site: u8, cond: impl Fn() -> bool, arm:
             } else {
                 let id = t.current;
                 let priority = t.task(id).priority;
-                t.sched.sleep(id, priority, u64::MAX);
+                t.sched.sleep_uninterruptible(id, priority, u64::MAX);
             }
         });
     }

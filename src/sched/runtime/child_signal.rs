@@ -1248,7 +1248,8 @@ pub fn charge_cpu(in_user: bool) {
     // land while `current` names a slot that is momentarily empty. Nobody to
     // charge means the tick is simply not attributed; the machine is whole.
     with_table(|t| {
-        if let Some(task) = t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+        let current = t.tasks.get(t.current.0).and_then(|slot| slot.as_ref());
+        if let Some(task) = current {
             // Two charges, one tick: the group's (what `RUSAGE_SELF` and
             // `times()` report) and the thread's (`RUSAGE_THREAD`). Linux keeps
             // both and they differ the moment a process has two threads, so the
@@ -1261,7 +1262,39 @@ pub fn charge_cpu(in_user: bool) {
             };
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        // The load average's sample, on Linux's own schedule: one tick in every
+        // five seconds, not every tick. `active` is Linux's `nr_running +
+        // nr_uninterruptible`: the ready queues, the one task that is running
+        // (a picked task is in neither queue), and the sleepers whose wait
+        // ignores signals - `t-blk-sleep`'s transfers park there, and Linux
+        // counts a task in `D` as load. Measured on the host
+        // (`build/scratch/loadavg/p.c`): the three figures move only at
+        // 5-second boundaries, and four spinners lift the one-minute average
+        // from 1.94 to 2.27 at the next one.
+        if crate::sched::loadavg::sample_tick(crate::hal::TICK_HZ) {
+            let running = usize::from(current.is_some());
+            let active = t.sched.ready_count() + t.sched.uninterruptible_count() + running;
+            crate::sched::loadavg::AVENRUN.update(active as u64);
+        }
     });
+}
+
+/// How many tasks could run right now: the ready queues plus the one task
+/// holding the CPU.
+///
+/// This is `/proc/loadavg`'s fourth field's numerator - Linux's `nr_running`,
+/// which a shell reads as "how many jobs are waiting" - and deliberately not
+/// the number the load average itself samples, which also counts the sleepers
+/// in an uninterruptible wait (`charge_cpu` adds them). The two numbers differ
+/// exactly while a transfer is in flight, and measured on the host
+/// (`build/scratch/loadavg/p.c`) the field changes between every pair of reads
+/// while the averages change once per five seconds.
+#[cfg(target_os = "none")]
+pub fn runnable_count() -> usize {
+    with_table(|t| {
+        let running = usize::from(t.tasks.get(t.current.0).and_then(|s| s.as_ref()).is_some());
+        t.sched.ready_count() + running
+    })
 }
 
 /// The running **thread**'s CPU time in internal clock ticks, `(user,

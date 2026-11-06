@@ -9511,3 +9511,36 @@ tick). Red on the unfixed kernel - six failures, including `CLOCK_MONOTONIC reso
 step count and a clock skew by host-shaped numbers and the aarch64 arm answered them as statements about
 its own speed; both are now anchored to the interval each measurement spans, and the amended coarse claim
 is still red unfixed (`1938 steps over 1 ticks`). Mechanism and the full reading: `docs/notes/` §6.97.
+
+### Item 211 - `/proc/loadavg` and `sysinfo.loads` report the load average Linux computes (2026-11-07, landed)
+
+`/proc/loadavg` was a literal `0.00 0.00 0.00 1/<processes>` and `sysinfo.loads[0..3]` stayed zero, while
+`docs/uapi/03-flag-vocabularies.md` listed the file as served. A load average is a decayed integral
+resampled every five seconds, not the runnable count; both doors read Linux's one `avenrun`.
+
+| | Linux (host, 7.2.14, 16 CPUs) | this kernel, before |
+|---|---|---|
+| `/proc/loadavg`, idle | `1.85 2.04 2.21 3/1312 500203` | `0.00 0.00 0.00 1/<processes>` (literal) |
+| when the three averages change | only on a 5 s boundary (40 samples at 100 ms) | never |
+| `sysinfo.loads[0]` vs the file | `127456` = `1.9449 << 16` | `0` |
+| fourth field numerator / denominator | `nr_running` / `nr_threads` | `1` / process count |
+| `+4 spinners, 6 s` | `2.27` and `loads[0] = 148768` on the same sample | `0.00`, `0` |
+
+**Landed.** `src/sched/loadavg.rs` (host-compiled) carries `FSHIFT`/`FIXED_1`/`EXP_1`/`EXP_5`/`EXP_15`,
+`calc_load`, and `Averages` behind one `AVENRUN`. `charge_cpu` - the tick hook, under the scheduler's
+lock - counts ticks modulo `5 * TICK_HZ` and on the boundary feeds `ready_count() +
+uninterruptible_count() + running` through the three decays. (Uninterruptible sleepers now say so:
+`policy::Sleeper` carries the flag and the blocked-transfer parks use `sleep_uninterruptible`.) Both
+readers read the same array: `/proc/loadavg` formats it with Linux's `FIXED_1/200` rounding and now
+counts threads for the fourth field, and `handle_sysinfo` writes `avenrun << (16 - 11)` into `loads`.
+Owner: `src/sched/loadavg.rs`, `src/sched/policy.rs`, `src/sched/runtime/child_signal.rs`,
+`src/vfs/procfs.rs`, `src/syscall/linux/proc.rs`.
+
+Pin: `user/tests/src/bin/t-loadavg.rs`, 5 claims (the two doors agree; the fourth field counts three
+spinners as ready; a sample lifts both doors off zero; the averages hold steady between samples). Red on
+the unfixed kernel - `FAIL: one sample lifts the one-minute average off zero (0 hundredths)`,
+`FAIL: and sysinfo carries the same lift (loads[0] = 0, which is 0 hundredths)` and the fourth field
+`1/2` (`build/boot-loadavg-cf1.log`, `=== t-loadavg exit=1`), green with it
+(`build/boot-loadavg3.log`: `(6/10)`, `(32 hundredths)`, `loads[0] = 20992`, `exit=0`); the same program
+is `PASS` on the host. Host unit tests pin the arithmetic without a machine
+(`sched::loadavg::tests`, five cases). Mechanism and the full reading: `docs/notes/` §6.98.

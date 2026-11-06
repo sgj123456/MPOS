@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, the clock family §6.97):** stage 1 `1225 tests, 0 failed`
+**Latest measured gate (2026-11-07, the load average §6.98):** stage 1 `1231 tests, 0 failed`
+(98.88 s); x86_64 `pass=265 fail=0 (265 built)`, `mpos-kunit 35 passed, 0 failed`, `total 99.22 s
+(previous green run 110.48 s, -10.2%)`; aarch64 `pass=264 fail=0 (264 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 187.39 s (previous green run 294.53 s, -36.4%)` (`build/gate-loadavg2.log`), both
+arms in one command with the lane count forced to two. `GATE EXIT=0`, and the new pin is `=== PASS` on
+both arms - x86_64 `the runnable field counts the threads that are ready (5/14)`, `one sample lifts the
+one-minute average off zero (32 hundredths)`, `sysinfo … loads[0] = 20992, which is 32 hundredths`;
+aarch64 `(5/13)`, `(85 hundredths)`, `loads[0] = 55520, which is 84 hundredths` and both doors agreeing
+within one hundredth (`66 against 65 and 65`).
+
+**Measured gate before it (2026-11-07, the clock family §6.97):** stage 1 `1225 tests, 0 failed`
 (50.62 s); x86_64 `pass=264 fail=0 (264 built)`, `mpos-kunit 35 passed, 0 failed`, `total 50.93 s
 (previous green run 86.81 s, -41.3%)`; aarch64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 139.54 s (previous green run 141.24 s, -1.2%)` (`build/gate-clkres2.log`), both arms

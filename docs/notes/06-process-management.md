@@ -7370,3 +7370,84 @@ source: if `clock_gettime` divides a counter, `clock_getres` cannot answer the t
 named `_COARSE` its reading has to *be* the coarse one. And when two doors take the same argument,
 they take the same set of values - the door that refuses a value its sibling serves is the defect,
 whichever of the two is "right" about the number.
+
+## §6.98 `/proc/loadavg` printed zeros, and `sysinfo.loads` printed zeros beside it (LANDED 2026-11-07)
+
+**What Linux answers.** A load average is not the runnable count; it is a decayed integral of it, in
+fixed point, resampled once every five seconds. `build/scratch/loadavg/p.c` (musl static, 16 CPUs,
+Linux 7.2.14) read both doors on an idle host, then with four spinner threads:
+
+```
+idle          /proc/loadavg  1.85 2.04 2.21 3/1312 500203
+              sysinfo loads  127456 134624 145376      (127456 / 65536 = 1.9449)
++4 spinners   /proc/loadavg  2.27 2.12 2.24 7/1316 ...
+              sysinfo loads  148768 135168 145728
+```
+
+Forty samples at 100 ms intervals showed the three averages **changing only on a 5 s boundary** while
+the fourth field (`runnable/total`) changed on every read:
+
+```
+1.85 2.04 2.21   -> 1.94 2.05 2.22   (0.7 s in)
+1.94 2.05 2.22   -> 2.27 2.12 2.24   (5.0 s in, after the spinners started)
+```
+
+So: `/proc/loadavg`'s text is `avenrun` rounded to hundredths; `sysinfo.loads` is the *same*
+`avenrun` shifted into its own fixed point (`<< (16 - 11)`); the fourth field's numerator is
+`nr_running`, its denominator `nr_threads`; and both doors move together, once per five seconds.
+The arithmetic is `kernel/sched/loadavg.c`: `FSHIFT 11`, `FIXED_1 2048`, `EXP_1 1884`,
+`EXP_5 2014`, `EXP_15 2037`, and
+
+```
+calc_load(load, exp, active) = (load * exp + active * (FIXED_1 - exp) + (active >= load ? FIXED_1-1 : 0)) / FIXED_1
+```
+
+with `active = (nr_running + nr_uninterruptible) * FIXED_1` - the activity term is a fixed-point
+number too, and the rounding addend is what keeps a steady load at its own fixed point.
+
+**What this kernel answered.** `/proc/loadavg` was a literal: `format!("0.00 0.00 0.00 1/{} {}\n",
+process_count(), newest)` - the string is the shape of a load average and none of its content - and
+`handle_sysinfo` zeroed its 112-byte buffer and filled `uptime`, `totalram`, `freeram`, `procs` and
+`mem_unit`, leaving `loads[0..3]` at zero. `docs/uapi/03-flag-vocabularies.md:50` already listed
+`loadavg` as served "as the neutral renderings", so this was not a named gap but a shape that looks
+finished while doing less (AGENTS.md §3 rule 5) - and unlike most divergences here, a caller cannot
+tell, because zero is a legal load.
+
+**The fix.** A new host-compiled `src/sched/loadavg.rs` carries Linux's constants, `calc_load`, and
+`Averages { one, five, fifteen: AtomicU64 }` behind the kernel's one `AVENRUN`. The clock is taken
+where this kernel already charges CPU (`charge_cpu`, the tick hook): `sample_tick(TICK_HZ)` counts
+ticks modulo `5 * TICK_HZ` and, on the boundary, `active` is read from the scheduler under the table
+lock that the hook already holds - `ready_count()` (the ready bands), `uninterruptible_count()` (the
+sleepers this kernel parks as blocked-transfers, now carrying a flag) and the running task. Three
+loads are updated in place; nothing allocates, and nothing walks a structure an interrupt can have
+left half-changed. `/proc/loadavg` and `handle_sysinfo` read the same array and apply the same two
+formats Linux does (`hundredths` adds `FIXED_1/200` before splitting; `sysinfo_load` shifts).
+
+The *fourth* field also had its denominator wrong: it counted processes (`process_count()`), and
+Linux's is threads. It is `task_count()` now.
+
+**Pin.** `user/tests/src/bin/t-loadavg.rs`, 5 claims: the two doors agree; the fourth field counts
+the ready threads while three spinners run; one sample lifts the one-minute average off zero; and
+`sysinfo.loads[0]` carries the same lift; and the averages hold steady between samples (1 s of 50 ms
+reads sees at most two distinct triples). On the fixed kernel
+(`build/boot-loadavg3.log`): `ok: the runnable field counts the threads that are ready (6/10)`,
+`ok: one sample lifts the one-minute average off zero (32 hundredths)`,
+`ok: and sysinfo carries the same lift (loads[0] = 20992, which is 32 hundredths)`,
+`ok: the averages hold steady between samples (1 distinct triples in 20 reads)`, `PASS`.
+
+Counterfactually (`build/boot-loadavg-cf1.log`, kernel with `src/sched/` and both readers reverted):
+`FAIL: the runnable field counts the threads that are ready (1/2)`,
+`FAIL: one sample lifts the one-minute average off zero (0 hundredths)`,
+`FAIL: and sysinfo carries the same lift (loads[0] = 0, which is 0 hundredths)`,
+`=== t-loadavg exit=1` - while the "holds steady" claim stayed green, which is exactly what a
+constant zero is. Host tests pin the arithmetic without a machine:
+`the_first_sample_of_one_runnable_task_is_one_tasks_worth` (`calc_load(0, EXP_1, FIXED_1) == 164`,
+which the file prints as `0.08`), `a_steady_load_is_its_own_fixed_point`,
+`an_idle_machine_decays_by_the_one_minute_constant`, `the_two_doors_report_the_same_fixed_point_value`
+(`3983 -> "1.94"` and `127456`), and `a_sample_lands_once_every_five_seconds_of_ticks`.
+
+**The rule.** A counter that a reader parses is served only if the number answers the question the
+reader is asking: "the machine is idle" and "the machine has this much load" are different answers,
+and a zero that never moves is not the second one. And when one Linux array feeds two doors, both
+doors read the array - a `sysinfo` that fills its own copy of a number the file prints from is the
+divergence waiting to happen.

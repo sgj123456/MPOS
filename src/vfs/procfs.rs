@@ -4132,7 +4132,25 @@ impl ProcFs {
                 // to pick a number for a job. Ours comes from the same place
                 // a pid comes from, so it agrees with what `ps` lists.
                 let newest = process_ids().into_iter().max().unwrap_or(1);
-                alloc::format!("0.00 0.00 0.00 1/{} {}\n", process_count(), newest)
+                // The three averages and the runnable count are the kernel's
+                // own now, not the `0.00 0.00 0.00 1/n` this file printed while
+                // `docs/uapi/03-flag-vocabularies.md` called it served. One
+                // `avenrun` feeds both this file and `sysinfo.loads`, the way
+                // Linux's `loadavg_proc_show` and `do_sysinfo` share
+                // `get_avenrun` - measured on the host
+                // (`build/scratch/loadavg/p.c`) as `1.94` beside
+                // `loads[0] = 127456`, one fixed-point value printed two ways
+                // (`docs/notes/` §6.98).
+                let [one, five, fifteen] = crate::sched::loadavg::AVENRUN.get();
+                let (one_int, one_frac) = crate::sched::loadavg::hundredths(one);
+                let (five_int, five_frac) = crate::sched::loadavg::hundredths(five);
+                let (fifteen_int, fifteen_frac) = crate::sched::loadavg::hundredths(fifteen);
+                alloc::format!(
+                    "{one_int}.{one_frac:02} {five_int}.{five_frac:02} {fifteen_int}.{fifteen_frac:02} {}/{} {}\n",
+                    runnable_count(),
+                    thread_count(),
+                    newest
+                )
             }),
         );
         self.root
@@ -4533,14 +4551,36 @@ fn max_pids() -> usize {
     64
 }
 
-/// How many processes are running, for `/proc/loadavg`'s "1/n" field.
+/// How many threads there are, for `/proc/loadavg`'s "R/n" field.
+///
+/// Linux's denominator is `nr_threads`, not the process count: the numerator
+/// beside it is `nr_running`, which counts threads too, so a process with three
+/// busy threads shows `3/n` where `n` is the machine's threads and not its
+/// processes. This kernel used to print `1/{processes}` while calling the file
+/// served (`docs/notes/` §6.98).
 #[cfg(target_os = "none")]
-fn process_count() -> usize {
-    process_ids().len()
+fn thread_count() -> usize {
+    crate::sched::task_count()
 }
 
 #[cfg(not(target_os = "none"))]
-fn process_count() -> usize {
+fn thread_count() -> usize {
+    1
+}
+
+/// How many tasks could run right now, for `/proc/loadavg`'s fourth field.
+///
+/// Linux's `nr_running`; the denominator beside it is `nr_threads`, which this
+/// kernel spells [`process_count`]. The host build has one caller and nothing
+/// else, so one is its answer - the same number a machine prints when it has
+/// nothing else to run.
+#[cfg(target_os = "none")]
+fn runnable_count() -> usize {
+    crate::sched::runnable_count()
+}
+
+#[cfg(not(target_os = "none"))]
+fn runnable_count() -> usize {
     1
 }
 
