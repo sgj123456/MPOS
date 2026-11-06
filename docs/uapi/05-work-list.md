@@ -9702,3 +9702,28 @@ they are two reads of a moving address space), plus the host unit test
 unfixed kernel (`build/boot-statm-cf1.log`: `mapping 4 MiB ... (121 -> 123 pages)` and `and leaves
 the address space where it was (1147 against 123 pages)`, `exit=1`), green with it
 (`build/boot-statm2.log`, `exit=0`). Mechanism and the Linux reading: `docs/notes/` §6.103.
+
+### Item 217 - `starttime` is when the task came into being, not the boot (2026-11-07, landed)
+
+`/proc/<pid>/stat`'s field 22. Linux counts it in `USER_HZ` ticks (100) since boot, and a reader
+turns it into an age by subtracting it from `btime`.
+
+| field 22 | Linux 7.2.14 | this kernel, before | this kernel, now |
+|---|---|---|---|
+| a process 0.09 s into a boot (`uptime=63431.94 s`) | `6343185` | `0` | `start_nanos / 10_000_000` |
+| two children forked 1 s apart | counts 100 ticks apart | both `0` | counts 100 ticks apart (`Some(150)` over a `1500 ms` wait) |
+| `/proc/self/stat` against `/proc/<pid>/stat` | one record | `0` against `0` | one record |
+| the field across 300 ms of the task running | unchanged | unchanged | unchanged |
+| age a `ps` computes | `now - btime - starttime/HZ` | the machine's age | this process's age |
+
+**Landed.** `Task::start_nanos` is written at the six places a task is constructed - the only moment
+the fact exists - and `TaskSnapshot`/`Process` mirror it. Owner: `src/sched/runtime/task.rs`,
+`src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`. The rendering truncates to centiseconds, which is
+Linux's `nsec_to_clock_t`.
+
+Pin: `user/tests/src/bin/t-starttime.rs` (six claims: nonzero, the two paths agree, no movement,
+a later child a later count, the difference equal to the wait, and an age younger than the machine),
+plus the host unit test `vfs::procfs::tests::starttime_is_the_creation_instant_in_user_hz_ticks`.
+Red on the unfixed kernel (`build/boot-starttime-cf1.log`: `Some(0)`, `Some(0) ticks`, and an age of
+`Some(2120) ms of Some(2120) ms`, `exit=1`), green with it (`build/boot-starttime2.log`, `exit=0`).
+Mechanism and the Linux reading: `docs/notes/` §6.104.

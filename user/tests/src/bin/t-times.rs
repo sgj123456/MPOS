@@ -527,11 +527,21 @@ fn main() {
                                 thread_us + USER_HZ_TICK_US >= before_own
                                     && thread_us <= after_own + USER_HZ_TICK_US,
                             );
+                            // The group's count is read *again* after the thread's,
+                            // and the comparison is against the later reading: a
+                            // thread's own CPU is at most its group's at any one
+                            // instant, but these are two reads of counters that
+                            // move between them - the aarch64 arm measured `6 ticks
+                            // against 5` when the stale `utime` was used, because a
+                            // tick landed between the two reads (`docs/notes/`
+                            // §6.97's rule, applied to §6.96's fields).
+                            let group_after = stat_cpu("/proc/self/stat")
+                                .map_or(utime, |(utime_now, _s, _c, _cs)| utime_now);
                             r.check(
                                 &format!(
-                                    "and never more than its group's ({thread_utime} ticks against {utime})"
+                                    "and never more than its group's ({thread_utime} ticks against {group_after})"
                                 ),
-                                thread_utime <= utime,
+                                thread_utime <= group_after,
                             );
                         }
                         None => r.check(

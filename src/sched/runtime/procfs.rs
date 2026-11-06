@@ -306,6 +306,16 @@ pub struct TaskSnapshot {
     /// CPU this **task** has burned, `(utime, stime)`, in the kernel's ticks.
     /// The `task/<tid>/stat` spelling's numbers; the group's are [`Self::cpu`].
     pub cpu_own: (u64, u64),
+    /// When this task came into being, in `since_boot_nanos` - the number
+    /// `/proc/<pid>/stat`'s field 22 (`starttime`) renders as `USER_HZ` ticks
+    /// since boot.
+    ///
+    /// Measured on a current host (`build/scratch/starttime/p.c`, Linux 7.2.14):
+    /// two children created a second apart read `6343185` and `6343194`, so the
+    /// field is the creation instant in centiseconds, and `ps` turns it into an
+    /// age by subtracting it from the boot time it read separately (`docs/notes/`
+    /// §6.104).
+    pub start_nanos: u64,
     /// Signals pending on **this task**, in the [`signal::Pending`] layout -
     /// `/proc/<pid>/stat`'s field 31.
     ///
@@ -422,6 +432,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             task.cpu_user.load(core::sync::atomic::Ordering::Relaxed),
             task.cpu_system.load(core::sync::atomic::Ordering::Relaxed),
         ),
+        start_nanos: task.start_nanos,
         pending: task.signals,
         blocked: task.blocked,
         ignored,

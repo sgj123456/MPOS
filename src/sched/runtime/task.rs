@@ -983,6 +983,20 @@ pub(crate) struct Task {
     /// in the timer interrupt, which may not allocate.
     pub(crate) cpu_user: core::sync::atomic::AtomicU64,
     pub(crate) cpu_system: core::sync::atomic::AtomicU64,
+    /// The moment this task came into being, in `since_boot_nanos` - what
+    /// `/proc/<pid>/stat`'s field 22 (`starttime`) reports, in the `USER_HZ`
+    /// ticks Linux counts it in.
+    ///
+    /// Recorded at creation rather than derived from anything else, because
+    /// nothing else knows it: a child forked late in a boot starts late, and
+    /// `ps` computes a process's age as `now - btime - starttime/USER_HZ`, so a
+    /// kernel that prints `0` there tells every reader its processes are as old
+    /// as the machine. Measured on a current host (`build/scratch/starttime/p.c`,
+    /// Linux 7.2.14): two children created a second apart read field 22 `6343185`
+    /// and `6343194`, i.e. one `USER_HZ` tick per centisecond of difference, and
+    /// the unit is `sysconf(_SC_CLK_TCK)` = 100 - not this kernel's `TICK_HZ`
+    /// (`docs/notes/` §6.104).
+    pub(crate) start_nanos: u64,
     pub(crate) priority: Priority,
     /// `None` only for the boot task, whose stack belongs to the bootloader.
     pub(crate) stack: Option<Stack>,
@@ -1544,6 +1558,7 @@ impl Task {
             context: Context::empty(),
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            start_nanos: crate::hal::since_boot_nanos(),
             sem_undo: None,
             priority: Priority::NORMAL,
             stack: None,
@@ -2282,6 +2297,7 @@ impl Table {
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            start_nanos: crate::hal::since_boot_nanos(),
             // A kernel task has no System V adjustments to record or apply.
             sem_undo: None,
             fpu_live: false,

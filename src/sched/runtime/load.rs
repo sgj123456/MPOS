@@ -655,6 +655,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            start_nanos: crate::hal::since_boot_nanos(),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,
             // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the
@@ -860,6 +861,7 @@ pub fn try_spawn_user(
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            start_nanos: crate::hal::since_boot_nanos(),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,
             // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the

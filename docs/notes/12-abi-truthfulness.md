@@ -292,7 +292,28 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `vsize` and `statm`'s total §6.103):** stage 1 `1234 tests,
+**Latest measured gate (2026-11-07, `stat`'s `starttime` §6.104):** stage 1 `1235 tests, 0 failed`
+(56.01 s); x86_64 `pass=270 fail=0 (270 built)`, `mpos-kunit 35 passed, 0 failed`, `total 56.21 s
+(previous green run 99.50 s, -43.5%)`; aarch64 `pass=269 fail=0 (269 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 147.46 s (previous green run 103.07 s, +43.1%)` (`build/gate-starttime2.log`,
+`GATE2=0`), both arms in one command with the lane count forced to two. The new pin is `=== PASS` on
+both arms with the same movement on each: x86_64 `stat's starttime is a tick count, not a literal zero
+(Some(4452))`, `a child created later carries a later starttime (Some(150) ticks)`, `and the
+difference is the wait, a tick per centisecond (Some(150) ticks against Some(1510) ms)`; aarch64
+`(Some(8590))`, `(Some(151) ticks)`, `(Some(151) ticks against Some(1510) ms)` (`build/test-serial.log`,
+`build/aarch64-test-serial.log`). The agreements in that pin (self against the directory path, the
+field against itself) are green under the unfixed kernel too and are not what this section quotes.
+
+**The run before it was red on the second machine, and the red was one of `t-times`'s own
+comparisons.** The aarch64 arm reported `FAIL t-times` on `and never more than its group's (6 ticks
+against 5)` (`build/gate-starttime.log`): the claim compared a thread's own count, read at one
+instant, against the *group's* count read earlier - and a tick landed between the two reads. A
+thread's CPU is at most its group's at any one instant, so the fix is the one `§6.97` already states:
+read the group's count *again* after the thread's and compare against the later reading. Re-run
+alone the same arm was green (`build/gate-starttime-a.log`, `pass=269 fail=0`, `the never more than
+its group's (5 ticks against 5)`), and the combined run above is the final tree's.
+
+**Measured gate before it (2026-11-07, `vsize` and `statm`'s total §6.103):** stage 1 `1234 tests,
 0 failed` (94.57 s); x86_64 `pass=269 fail=0 (269 built)`, `mpos-kunit 35 passed, 0 failed`, `total
 94.77 s (previous green run 55.59 s, +70.5%)`; aarch64 `pass=268 fail=0 (268 built)`, `mpos-kunit 35
 passed, 0 failed`, `total 229.12 s (previous green run 94.54 s, +142.4%)` (`build/gate-statm.log`,

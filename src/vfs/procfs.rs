@@ -1543,6 +1543,9 @@ pub struct Process {
     pub cpu: (u64, u64, u64, u64),
     /// See [`crate::sched::TaskSnapshot::cpu_own`].
     pub cpu_own: (u64, u64),
+    /// See [`crate::sched::TaskSnapshot::start_nanos`] - when the task came
+    /// into being, for `stat`'s field 22.
+    pub start_nanos: u64,
     /// See [`crate::sched::TaskSnapshot::pending`] - `/proc/<pid>/stat`'s
     /// field 31.
     pub pending: u64,
@@ -1711,10 +1714,15 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         Cow::Owned(alloc::format!("{}", task.nice)),
         Cow::Owned(alloc::format!("{}", task.threads)),
         Cow::Borrowed("0"), // itrealvalue
-        // starttime: no per-task record of when a process began, so every
-        // process claims to have started at boot. A `ps` that reads it prints
-        // a start time rather than crashing on an absent one.
-        Cow::Borrowed("0"),
+        // starttime: when this task came into being, in `USER_HZ` ticks since
+        // boot - the unit `sysconf(_SC_CLK_TCK)` names (100), not this kernel's
+        // `TICK_HZ` (250). Measured on a current host
+        // (`build/scratch/starttime/p.c`, Linux 7.2.14): two children created a
+        // second apart read `6343185` and `6343194`, and `ps` makes an age of it
+        // by subtracting the field from the boot time it read elsewhere. Printing
+        // `0` claimed every process started with the machine, which is the shape
+        // `docs/notes/` §6.104 records.
+        Cow::Owned(alloc::format!("{}", starttime_ticks(&task))),
         // vsize: the pages the address space has *mapped*, in bytes. Not the
         // resident set - a mapping nobody has touched still holds addresses,
         // which is what this field is a claim about. Measured on a current
@@ -1786,6 +1794,24 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
 /// number report the same one.
 fn vsize_bytes(task: &Process) -> usize {
     task.virtual_pages * 4096
+}
+
+/// `stat`'s `starttime` (field 22): the moment the task came into being, in the
+/// `USER_HZ` ticks Linux counts it in.
+///
+/// `USER_HZ` is 100 - the number `sysconf(_SC_CLK_TCK)` reports and the one a
+/// reader divides by - so the nanosecond record is truncated to centiseconds.
+/// This is the same unit `vfs::procfs`'s `btime` and `ps`'s arithmetic meet in:
+/// measured on a current host (`build/scratch/starttime/p.c`, Linux 7.2.14), a
+/// child created one second after another read a `starttime` one hundred ticks
+/// larger, and the machine's own field put the reading process's age at
+/// `0.090 s` against a `uptime` of `63431.94 s` (`docs/notes/` §6.104).
+///
+/// The truncation is Linux's: `nsec_to_clock_t` divides and keeps the floor, so
+/// a task created `9_999_999` ns into a centisecond reads the same tick as one
+/// created at its start.
+fn starttime_ticks(task: &Process) -> u64 {
+    task.start_nanos / (1_000_000_000 / 100)
 }
 
 /// The seven fields of `statm`, from the two numbers this kernel counts.
@@ -4888,6 +4914,37 @@ mod tests {
         );
     }
 
+    /// `starttime` is the creation instant in `USER_HZ` ticks, truncated the way
+    /// `nsec_to_clock_t` truncates - not the boot, and not sub-centisecond.
+    ///
+    /// The two numbers are what separate this from a literal `0`: a process a
+    /// second and a bit into the boot reads a tick count, and two processes a
+    /// second apart read counts a hundred ticks apart (measured,
+    /// `build/scratch/starttime/p.c`; `docs/notes/` §6.104).
+    #[test]
+    fn starttime_is_the_creation_instant_in_user_hz_ticks() {
+        let mut earlier = process(7, 7, None, 0, 'R');
+        earlier.start_nanos = 1_234_000_000;
+        assert_eq!(
+            starttime_ticks(&earlier),
+            123,
+            "1.234 s is 123 centiseconds"
+        );
+        earlier.start_nanos = 12_345_000_000;
+        assert_eq!(
+            starttime_ticks(&earlier),
+            1234,
+            "the floor, not a rounded 1235"
+        );
+        let mut just_born = process(8, 8, None, 0, 'R');
+        just_born.start_nanos = 9_999_999;
+        assert_eq!(
+            starttime_ticks(&just_born),
+            0,
+            "a task created inside the first centisecond is at tick 0, as Linux floors it"
+        );
+    }
+
     /// A dead task keeps its directory only when it leads the group - Linux's
     /// `__unhash_process`, and the clause that lets a tid's directory be served
     /// at all without serving one for a thread that has left.
@@ -5896,6 +5953,7 @@ mod tests {
             exit_signal: 17,
             cpu: (0, 0, 0, 0),
             cpu_own: (0, 0),
+            start_nanos: 0,
             pending: 0,
             blocked: 0,
             ignored: 0,

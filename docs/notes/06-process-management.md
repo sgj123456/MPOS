@@ -7875,3 +7875,61 @@ space does this process hold" is a claim about mappings, "how much of it is in m
 about pages present, and one number cannot be both. When a field looks plausible because the
 common case has them equal (here, a small program whose mapped and resident counts happen to be
 close), find the case that separates them - map without touching - and make that the pin.
+
+## §6.104 `stat`'s `starttime` was the literal zero, so every process started at boot (LANDED 2026-11-07)
+
+`/proc/<pid>/stat`'s field 22 is the instant a task came into being, in `USER_HZ` ticks since boot,
+and this kernel printed `0` there under a comment that said there was no per-task record of when a
+process began. The comment was true when it was written and the field was not: `ps` reads it, and
+`btime` (now served, §6.100) beside it, and computes a process's age as `now - btime -
+starttime/USER_HZ`. A zero there tells every reader that every process on the machine started with
+it - a plausible-looking `00:00` in `ps`'s `START` column instead of an error, which is why it
+survived.
+
+**Measured on a current host** (`build/scratch/starttime/p.c`, Linux 7.2.14,
+`sysconf(_SC_CLK_TCK) = 100`):
+
+```
+hz=100 self starttime=6343185 uptime=63431.94 -> implied age 0.090 s
+/proc/<pid>/stat for this pid: starttime=6343185 (same as self: 1)
+uptime 63435.94 child(1 s in) starttime=6343194 implied age 4.000 | grandchild starttime=-1
+```
+
+Two children forked a second apart read counts a hundred ticks apart, the field is the same number
+through `/proc/self` and `/proc/<pid>`, and the unit is the ABI's `USER_HZ` (100) - not this kernel's
+`TICK_HZ` (250).
+
+**The fix, and why it is a record rather than arithmetic.** `Task` carries `start_nanos`, written at
+the six places that construct one, because nothing else knows when a task began: a child forked late
+in a boot begins late, and its creation is the only moment that fact exists. `TaskSnapshot` and the
+host `Process` mirror it, `stat`'s field 22 renders `start_nanos / 10_000_000` (Linux's
+`nsec_to_clock_t` truncation), and a task created inside the first centisecond reads `0` exactly as
+Linux floors it.
+
+**Pin** `t-starttime` (6 claims, `user/tests/src/bin/t-starttime.rs`): a nonzero count; the same
+number through `/proc/self` and `/proc/<pid>`; the field not moving while the task runs; and the two
+that carry the change - a child forked 1.5 s later reads a later count, and the difference is the
+wait itself (a centisecond per tick). Measured on the machine: `Some(30)` for a process 0.3 s into
+the boot, then `Some(150) ticks against Some(1510) ms` between the two children.
+
+```
+unfixed kernel  FAIL:  stat's starttime is a tick count, not a literal zero (Some(0))
+                ok:    the task's own file and its /proc/<pid>/stat agree (Some(0) against Some(0))
+                ok:    the field does not move while the task runs (Some(0) against Some(0))
+                FAIL:  a child created later carries a later starttime (Some(0) ticks)
+                FAIL:  and the difference is the wait, a tick per centisecond (Some(0) ticks against Some(1500) ms)
+                FAIL:  and an age computed from it is younger than the machine (Some(2120) ms of Some(2120) ms)
+                === t-starttime exit=1
+fixed kernel    all six ok, PASS, exit=0
+             (Some(30); Some(150) ticks against Some(1510) ms; Some(1830) ms of Some(2130) ms)
+```
+
+The three claims that pass in both are the *agreements* - `self` versus the directory path, and the
+field against itself - because a literal answers both consistently. The pin is the movement: a
+later child's later count, and the wait between them.
+
+**The rule.** A monitor's field is a record the kernel keeps, not a value that looks right in the
+common case: `0` is a legal `starttime` only for a task created in the machine's first centisecond,
+and for every other task it is a claim that the process is as old as the boot. When a comment says
+"there is no record of that", check whether the record is what is missing - here it was one `u64` at
+six construction sites.

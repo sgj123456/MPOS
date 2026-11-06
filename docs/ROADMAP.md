@@ -278,6 +278,12 @@ One-glance status of the whole roadmap.
       **Named gap:** `statm`'s `shared`/`text`/`library`/`data`/`dirty` print zero because this
       kernel keeps no accounting for them (a plausible number is worse than an honest zero, and
       `data` used to print the resident count) - `§6.103`, item 216, pin `t-statm`.
+- [x] `starttime` is the moment the task was made — field 22 was the literal `0`, so `ps` computed
+  every process's age as the machine's (`btime` is served now, and the subtraction is what `ps`
+  does). The field is a record: `Task::start_nanos`, written where a task is constructed, rendered
+  in Linux's `USER_HZ` ticks and truncated the way `nsec_to_clock_t` truncates. Measured on the host:
+  two children a second apart read counts a hundred ticks apart; on the machine `Some(150) ticks over
+  Some(1510) ms`. Six claims in `t-starttime`, four red without the record (`§6.104`, item 217).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
