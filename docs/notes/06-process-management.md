@@ -6744,3 +6744,117 @@ answered without changing how numbers are allocated.
 **The rule.** A fact about a death outlives the task, so it must be stored **with** the death. Reading it off
 the task table is not a stale read, it is a read of a different subject: the table is the living, and the
 record's whole reason to exist is that the living moved on.
+
+---
+
+## §6.91 A number handed to a syscall is read in the caller's namespace (LANDED 2026-11-06)
+
+Found while costing Item 202 (§6.89), and it is not that defect. §6.89 is about a number that no longer names
+*any* task - a recycled slot. This is about a number that is completely valid **in the namespace it was
+written in**, handed to a door that indexes the task table with it. On a machine that never unshares, those
+two numbers are the same integer, which is why it read as correct for the whole life of these doors.
+
+The fixture is the shape a container runtime uses:
+
+```
+unshare(CLONE_NEWUSER)  →  write uid_map/gid_map  →  unshare(CLONE_NEWPID)  →  fork
+```
+
+`unshare(CLONE_NEWPID)` renumbers the caller's **children**, so the unsharing process stays where it was and
+its next `fork` is the namespace's init. The init then forks `work`, which has number **2** in that namespace
+and gives itself a distinctive `RLIMIT_NOFILE` of `123/456` and a nice of 7. Every call below is made by the
+init with the number `2` - a number that names exactly one task, here.
+
+**Measured on Linux first** (`build/scratch/nsnum/p.c`, `q.c`, `r.c`, musl-gcc -static -O1, 7.2.11):
+
+```
+the namespace's init has pid 1
+its child has pid 2 there
+prlimit64(2) = 0 errno=0 cur=123 max=456 (want 123/456)
+sched_getparam(2) = 0 errno=0
+sched_getscheduler(2) = 0 errno=0
+getpriority(2) = 5 errno=0
+setpriority(PRIO_PROCESS, 2, 7) = 0 errno=0
+  read back via getpriority(2) = 7 errno=0
+```
+
+**Measured on this machine** (`build/boot-nsprlimit1.log`, `build/boot-nsdoors1.log`, `build/boot-nsset1.log`):
+
+```
+prlimit64(2) = 0 errno=0 cur=1024 max=1048576 (want 123/456)     ← a stranger's table, answered 0
+sched_getparam(2) = -1 errno=3
+sched_getscheduler(2) = -1 errno=3
+getpriority(2) = 5 errno=0                                        ← right: it goes through pid_task
+/proc/2/limits Max open files -> 123 456                          ← right: procfs goes through resolve_pid
+setpriority(PRIO_PROCESS, 2, 7) = 0 errno=0
+  read back via getpriority(2) = 0 errno=0                        ← wrote a stranger, reported success
+```
+
+Two of those are the worst answer this repo has a name for (`AGENTS.md` §3 rule 2): **success for a thing not
+done**. `prlimit64` returned `0` and filled the caller's struct from a task the number did not name.
+`setpriority` returned `0` and wrote its nice into that other task - so a set and a get through one number
+were about two tasks, and the caller could not tell.
+
+The pair disagreeing is the whole evidence. `getpriority` resolves the number (`super::proc::pid_task` ->
+`resolve_pid`) and was right; `setpriority` took `who` as the slot and was wrong. `/proc/<n>/limits` was right
+because procfs turns the number through `resolve_pid` before it builds a directory. Three doors into the same
+concept, two of them resolving the name and one not.
+
+**The doors that took a raw number as a slot.** `handle_prlimit64`'s cross-process half, through
+`rlimits_of_pid` -> `crate::sched::rlimits_of(pid)` (`src/sched/runtime/task.rs`), which built
+`TaskId(pid)` directly. `live_thread` (`src/syscall/linux/posix.rs`), through `crate::sched::snapshot(pid)`
+- which is every one of `sched_getparam`, `sched_setparam`, `sched_getscheduler`, `sched_setscheduler`,
+`rr_get_interval`, `sched_setattr` and `sched_getattr`. And `handle_setpriority`'s `PRIO_PROCESS` arm, which
+handed `who` to `set_nice`.
+
+**The fix.** Each resolves first, with the same function the correct siblings already used:
+`crate::sched::resolve_pid(pid as i64)` in `live_thread` and in the `prlimit64` arm, and
+`super::proc::pid_task(who as isize)` in `setpriority`. No new resolver was invented: `pid_task` and
+`resolve_pid` are the two the kernel already routes every other pid through, and `resolve_pid`'s own doc
+comment had been saying "the init namespace's map is an identity function and not a map" for as long as the
+defect had existed.
+
+**Why it looked correct on every machine that never unshares.** In the init namespace `task_of(n)` is
+`Some(n)`, so `resolve_pid(n)` returns `TaskId(n)` and the two spellings agree. Every `t-*` program that
+names another process - `t-kill-numbers`, `t-waitid`, a tracer's `PTRACE_SETREGS` on a pid - runs in the init
+namespace, so a raw number and a resolved one were the same integer. The change therefore moved **no
+existing reading**, which is also why it needs a namespace to be measured at all: the counterfactual below is
+the only thing that can tell the two spellings apart.
+
+**The pin** is `user/tests/src/bin/t-nsnumbers.rs`, a check, not a reading. It enters the namespace the way
+the fixture above does, the child sets `RLIMIT_NOFILE` 123/456 and nice 7, and the init asks about it by the
+number it has there. Two claims are made in the **parent** as well, from the init's exit status, because the
+claims themselves are made in a child: `Report::failed()` was added for that (`user/tests/src/lib.rs`) - a
+program whose claims are made below a `fork` cannot call `finish` there without taking the child out before
+the parent reports.
+
+**Counterfactual** (`build/boot-nsnumbers1.log`, the fix stashed out of `src/` and **both** the kernel and the
+loader rebuilt - `boot/src/lib.rs` embeds the kernel, so rebuilding only `-p mpos` measures the old one,
+§6.77b):
+
+```
+ok:    the namespace's init reads its own number as 1 (reads 1)
+ok:    its child answers to the number 2 there (is 2)
+FAIL:  prlimit64 names the task the number does, not another slot (1024 / 1048576)
+FAIL:  setpriority writes the task the number names (set=0, read back=0)
+ok:    the machine gives an unprivileged program a pid namespace (exit 1)
+FAIL:  every reading in the namespace named the task it was asked about (exit 1)
+FAILED
+=== t-nsnumbers exit=1
+```
+
+With the fix (`build/probe/oneshot/serial.log`, same tree and same boot recipe) all six are `ok:`, `PASS`,
+`=== t-nsnumbers exit=0`. `MPOS_ON_HOST=1` reads the same six.
+
+**Two claims deliberately not in the pin.** `sched_getparam`'s *success* cannot be claimed on the host this
+repo is developed on: the container's seccomp filter answers `ENOSYS`, which is the sandbox's answer and not
+Linux's 0, so a pin asserting success would be measuring the sandbox. And `/proc/<n>/limits` is not a claim
+either, because it is a *different* rule from the one this section is about: a procfs directory resolves its
+number in the namespace the procfs was **mounted** in, while a syscall resolves it in the **caller's**. On the
+host the mount is the host's namespace, so `/proc/2` reads `kthreadd` there - measured, and not a defect.
+Both readings are the table above instead.
+
+**The rule.** A pid number is meaningful only in a namespace, so a door may not take one and use it as a slot:
+resolve it first, and let the resolver own the question of what "names a task" means. The tell is a pair of
+siblings where one resolves and one does not - a set that reports success while its get reads the old value is
+this defect, not a lost write.

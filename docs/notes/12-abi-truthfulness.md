@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, a death belongs to its parent §6.90):** stage 1 `1224 tests, 0
+**Latest measured gate (2026-11-06, a number read in its own namespace §6.91):** stage 1 `1224 tests,
+0 failed` (42.89 s); x86_64 `pass=261 fail=0 (261 built)`, `mpos-kunit 35 passed, 0 failed`,
+`total 43.11 s (previous green run 42.35 s, +1.8%)`, and the new pin green in
+`build/test-serial.log` (`ok: prlimit64 names the task the number does … (123 / 456)`,
+`ok: setpriority writes the task the number names (set=0, read back=7)`, `=== PASS t-nsnumbers`)
+(`build/gate-nsnum2.log`); aarch64 `pass=260 fail=0 (260 built)`, `mpos-kunit 35 passed, 0 failed`,
+every lane on `=== END`, `total 85.34 s` and the same six `ok:` lines for the pin in
+`build/aarch64-test-serial.log` (`build/gate-nsnum2c.log`, run with `MPOS_TEST_LANES=2`). Three
+aarch64 attempts before it lost a lane each at the recorded EL0 boot check - lane 0, lane 3 and
+lane 5, every time before that lane's first program, the same four registers (`EXCEPTION:
+synchronous`, `ESR_EL1 0x96000047` EC 0x25, `ELR_EL1 0xffffffff80214aa4`, `FAR_EL1 0x221000`) and a
+6591-byte serial log with no `=== RUN` in it - so none of the three is a reading.
+
+**Measured gate before it (2026-11-06, a death belongs to its parent §6.90):** stage 1 `1224 tests, 0
 failed` (42.14 s); x86_64 `pass=260 fail=0`, `mpos-kunit 35 passed, 0 failed`, `total 42.35 s
 (previous green run 39.78 s, +6.4%)` (`build/gate-steal.log`); aarch64 `pass=259 fail=0 (259 built)`,
 `mpos-kunit 35 passed, 0 failed`, every lane on `=== END`, `total 34.68 s (previous green run 91.00 s,

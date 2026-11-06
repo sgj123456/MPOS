@@ -39,7 +39,13 @@ fn live_thread(pid: isize) -> Option<usize> {
     if pid == 0 {
         return Some(crate::sched::current().0);
     }
-    crate::sched::snapshot(pid as usize).map(|snap| snap.tid)
+    // The number is read in the **caller's** namespace, like every other pid
+    // this kernel is handed. `snapshot` takes a slot, and in the init namespace
+    // the two are the same number - which is exactly why this read as correct
+    // for so long: inside a namespace `sched_getparam(2)` resolved 2 to slot 2
+    // and answered `ESRCH` about a task the number did not name
+    // (`docs/notes/` §6.91, `t-nsnumbers`).
+    crate::sched::resolve_pid(pid as i64).map(|id| id.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -824,10 +830,19 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
     let prio = prio.clamp(-20, 19) as i32;
     match which {
         PRIO_PROCESS => {
+            // The number is the caller's namespace's, resolved the same way the
+            // sibling `getpriority` resolves it - so a set and a get through one
+            // number are about one task. They were not: `set_nice` was handed
+            // the raw number as a slot while `getpriority` went through
+            // `pid_task`, so inside a namespace the setter wrote a stranger and
+            // reported success (`docs/notes/` §6.91, `t-nsnumbers`).
             let pid = if who == 0 {
                 crate::sched::current().0
             } else {
-                who
+                match super::proc::pid_task(who as isize) {
+                    Some(id) => id.0,
+                    None => return err::ESRCH,
+                }
             };
             // `set_nice` answers `false` when the process is gone (or was never
             // there), which is Linux's `ESRCH` for `setpriority(PRIO_PROCESS,

@@ -9244,3 +9244,45 @@ claims, counterfactually red without the fix (two `FAIL:` lines, `exit=1`) and g
 **Not fixed by this, and still open as Item 202**: a **live** stranger taking a recycled number
 (`kill`, `/proc/<n>`). That one cannot be answered at the doors, because at the moment of the check the number
 really is the live tenant's; it wants the allocation-end change.
+
+### Item 204 - a number handed to a syscall is read in the caller's namespace (2026-11-06, landed)
+
+`§6.91` in `docs/notes/06-process-management.md`. A narrower defect than Item 202 and a different one: this is
+not about a **recycled** number, but about a number that is perfectly valid *in the namespace it was written
+in* being used as a **task-table slot**. Inside a fresh pid namespace the group is init = 1, its child = 2,
+while the slots those tasks occupy are global numbers far above both - so a door that indexes the table with
+the number it was handed answers about an unrelated task.
+
+| inside the namespace, `init` asks about `work` (number 2) | Linux 7.2.11 | this kernel, before |
+|---|---|---|
+| `prlimit64(2, RLIMIT_NOFILE, NULL, &old)` | `cur=123 max=456` | `cur=1024 max=1048576` |
+| `setpriority(PRIO_PROCESS, 2, 7)` | `0`, and `getpriority(2)` reads `7` | `0`, and `getpriority(2)` reads `0` |
+| `sched_getparam(2)` / `sched_getscheduler(2)` | `0` / `SCHED_OTHER` | `-1 errno=3 (ESRCH)` |
+
+Both columns are `build/scratch/nsnum/{p,q,r}.c` (host) and their boots as `t-nsprlimit`/`t-nsdoors`/`t-nsset`
+(machine); the mechanism is §6.91. Two of those readings are the worst shape available - **success for a thing
+not done**: `prlimit64` answered `0` with a stranger's table, and `setpriority` answered `0` after writing a
+stranger's slot, so a set-then-get round trip through one number was two different tasks. `getpriority` was
+already right because it goes through `pid_task`, and `/proc/<n>/limits` was right because procfs turns the
+number through `resolve_pid` first - the pair disagreeing is what made the door visible.
+
+The doors that took a raw number as a slot: `handle_prlimit64`'s cross-process half (`rlimits_of_pid`),
+`live_thread` (`sched_getparam`/`getparam`/`getscheduler`/`rr_get_interval`/`setattr`/`getattr` - seven
+handlers), and `handle_setpriority`'s `PRIO_PROCESS` arm. Landing: each resolves the number with
+`resolve_pid` first, exactly as `getpriority` and `pid_task` already did. The kinds of number this leaves
+alone are the two that are *already* slots and must stay slots: `current_tgid().0` written into a lock record,
+and `TaskId(child as usize)` for a task this kernel just created.
+
+Pin: `user/tests/src/bin/t-nsnumbers.rs` - a user and pid namespace entered without privilege (the layout is
+Linux's: `unshare(CLONE_NEWPID)` renumbers the caller's *children*, so the unsharing process forks the
+namespace's init), the child gives itself a distinctive `RLIMIT_NOFILE` of `123/456` and a nice of 7, and the
+init asks about it by the number it has **there**. Counterfactually red without the fix
+(`FAIL: prlimit64 … (1024 / 1048576)`, `FAIL: setpriority writes the task the number names (set=0, read back=0)`,
+`exit=1`) and green with it (six `ok:`, `PASS`) - on this machine and on `MPOS_ON_HOST=1`.
+
+**Deliberately not claimed in the pin**, because one host cannot hold both machines to them: `sched_getparam`'s
+*success* (this container's seccomp filter answers `ENOSYS`, which is the sandbox's answer rather than
+Linux's) and `/proc/<n>/limits` (a procfs directory resolves in the namespace the procfs was **mounted** in,
+while a syscall resolves in the *caller's* - the host reads `kthreadd`). Their readings are the table above.
+
+**Not fixed by this, still open as Item 202**: a number that no longer names *any* task - a recycled slot.

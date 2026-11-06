@@ -131,6 +131,16 @@ One-glance status of the whole roadmap.
   generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
   its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,
   and poll/epoll see `POLLIN` at group death and `POLLHUP` only at the reap (§6.8, item 92)
+- [x] a number handed to a syscall is read in the caller's namespace — inside a pid namespace
+  the group is `1` and its child `2`, while the slots they occupy are global numbers far above
+  both; `handle_prlimit64`'s cross-process half, `live_thread` (seven scheduling calls) and
+  `setpriority`'s `PRIO_PROCESS` arm took the number as the slot, so `prlimit64(2)` answered `0`
+  with a stranger's table (`cur=1024 max=1048576` where the task named 2 had `123/456`) and
+  `setpriority(2, 7)` answered `0` after writing a stranger - a set and a get through one number
+  were two different tasks. `getpriority` and `/proc/<n>/limits` were already right, and their
+  disagreement with the broken siblings is what made it visible. Each door now resolves with
+  `resolve_pid`/`pid_task` first, which changes no reading on a machine that never unshares
+  (`t-nsnumbers`, §6.91, item 204)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
@@ -147,9 +157,11 @@ One-glance status of the whole roadmap.
   that had already exited and not been collected had its **death** collected by whoever asked, and
   the real parent then got `ECHILD` for its own child. That is a different defect with its own fix -
   a death now carries its owner (`Retired::parent`, `t-steal`, §6.90, item 203) - and it is closed.
-  What is still open here is `kill`/`tkill`/`tgkill`, `/proc/<n>`, `/proc/<n>/limits` and the
-  descriptor's `getrlimit(pid)`, which resolve a number to a slot without asking whether the number
-  still means that task. **Not a patch**: at the moment of the check the slot genuinely holds a live tenant and
+  What is still open here is `kill`/`tkill`/`tgkill` and `/proc/<n>`, which resolve a number to a
+  slot without asking whether the number still means that task - the *other* half, where the number
+  must be read in the caller's namespace before it is resolved at all, is closed
+  (`resolve_pid`/`pid_task` at `prlimit64`, the seven scheduling calls and `setpriority`,
+  `t-nsnumbers`, §6.91, item 204). **Not a patch**: at the moment of the check the slot genuinely holds a live tenant and
   the number genuinely is theirs, so the fix is at the allocation end - the init namespace stops
   numbering by slot and gets the monotonic table every nested namespace already has
   (`crates/pidns/src/lib.rs`), which moves that crate's stated load-bearing decision, its

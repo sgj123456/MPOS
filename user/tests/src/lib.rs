@@ -41,6 +41,15 @@ impl Report {
         self.failed |= !ok;
     }
 
+    /// Whether any claim made so far failed.
+    ///
+    /// A program whose claims are made in a *child* cannot use [`finish`] there
+    /// - it would take the child out before the parent could report - so the
+    /// child reads the bit and carries it out through its exit status instead.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
     /// The verdict, and the exit status the runner turns into `=== PASS` or
     /// `=== FAIL`. Exits rather than panicking: a claim that did not hold is a
     /// result about the kernel, not a crash in the test.

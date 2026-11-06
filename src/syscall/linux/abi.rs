@@ -3092,8 +3092,15 @@ pub(crate) fn handle_prlimit64(args: [usize; crate::syscall::ARG_COUNT], from_us
     #[cfg(not(target_os = "none"))]
     let is_self = true;
     if !is_self {
-        // Reading another process: it must exist.
-        let table = rlimits_of_pid(pid as usize);
+        // Reading another process: the number is the caller's namespace's, and
+        // it must name a task there before it can name a table. Resolving it is
+        // the whole difference: `rlimits_of` takes a **slot**, and in the init
+        // namespace a number and a slot are the same integer, so passing the
+        // raw number looked right on every machine that never unshared and
+        // answered about an unrelated task inside a namespace (`docs/notes/`
+        // §6.91, `t-nsnumbers`: `prlimit64(2)` returned a stranger's
+        // `1024/1048576` while the task named 2 had `123/456`).
+        let table = crate::sched::resolve_pid(pid as i64).and_then(|id| rlimits_of_pid(id.0));
         let Some(table) = table else {
             return err::ESRCH;
         };
