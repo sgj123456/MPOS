@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-04, the seccomp stop's queued-signal pin §6.85):** x86_64
+**Latest measured gate (2026-11-06, the futex tests' module lock §6.87):** stage 1 `1224 tests,
+0 failed` (24.63 s) — the first run in several sessions where the host stage was green **and** the
+tail that reaches the gate names a number rather than only `error: test failed, to rerun pass -p
+mpos --lib`; x86_64 `pass=258 fail=0 (258 built)`, `total 24.82 s (previous green run 28.31 s,
+-12.3%)`; aarch64 `pass=256 fail=1 (257 built)`, `mpos-kunit 35 passed, 0 failed`, every lane on
+`=== END` with summaries `22/45/47/47/47(fail=1)/48` (`build/gate-futexlock.log`). The one red is the
+recorded `t-ptrace-attach` detach race (`FAIL: a detach leaves a stop the user asked for alone
+(state "", collected true)`), whose mechanism is §6.79's stop-park wake and whose fix is still owed.
+Both machines' queued-signal pin is green (`ok: and its registers can still be written (answer
+Some(Ok(0)))` in `build/test-lane-x86_64-5/serial.log` and `build/test-lane-aarch64-5/serial.log`).
+Previous: **Measured gate (2026-11-04, the seccomp stop's queued-signal pin §6.85):** x86_64
 `pass=258 fail=0 (258 built)`, `mpos-kunit 35 passed, 0 failed`, exit 33 (`build/gate-regs1.log`);
 aarch64 `pass=257 fail=0 (257 built)`, `mpos-kunit 35 passed, 0 failed`, every lane on `=== END`
 (`build/gate-regs3.log`). The first aarch64 attempt lost lane 4 at the recorded EL0 boot check
