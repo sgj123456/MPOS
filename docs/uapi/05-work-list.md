@@ -9314,11 +9314,21 @@ way round, and a non-empty mask is copied before either.
 
 - Owner: `src/syscall/linux/abi.rs` (`affinity_target`, `handle_sched_getaffinity`,
   `handle_sched_setaffinity`), with the number resolved through `crate::sched::resolve_pid` (§6.91).
-- Pin: `user/tests/src/bin/t-affinity-rules.rs`, 13 claims - nine red on the unfixed kernel, thirteen `ok:` with
-  it, and the same thirteen on `MPOS_ON_HOST=1`. Measurements and the five probe iterations:
+- Pin: `user/tests/src/bin/t-affinity-rules.rs`, 15 claims - nine red on the unfixed kernel, fifteen `ok:` with
+  it, and the same fifteen on `MPOS_ON_HOST=1`. Measurements and the five probe iterations:
   `docs/notes/` §6.92.
-- **Gap deliberately left open**: the setter's `CAP_SYS_NICE` half and the getter's ptrace-may-access half.
-  Linux answers `EPERM` for another user's task (measured `setter(pid 1) => EPERM`, `getter(pid 1) => 0`); this
-  kernel checks neither. It cannot be pinned here because the payload runs as root, so a claim about `EPERM`
-  would only be true on the host. The helpers exist (`current_credentials().capable(crate::cred::CAP_SYS_NICE)`
-  at `src/syscall/linux/proc.rs:2782`; `crate::sched::may_inspect`).
+- **Authority** (landed with the same item, second commit): the setter needs `CAP_SYS_NICE` only when the target
+  belongs to **another user** - a same-uid stranger's child is served, so blood relation is not the rule - and
+  the getter asks for nothing at all. Re-measured on the host as uid 1000 with an empty `CapEff`
+  (`build/scratch/affperm/s.c`, `t.c`, `u.c`, `v.c`):
+
+  | call | another user's task | same user, anyone's child | own task |
+  |---|---|---|---|
+  | `sched_setaffinity` | `EPERM` | `0` | `0` |
+  | `sched_getaffinity` | `0` | `0` | `0` |
+
+  The refusal order is `EFAULT` → `ESRCH` → `EPERM` → `EINVAL`, measured with `set(<pid 1>, 0, NULL) =>
+  EPERM` against `set(<no such pid>, 8, NULL) => EFAULT`: authority sits before the mask judgement, so a caller
+  without the capability cannot probe this machine's CPU count one refusal shape at a time. This entry earlier
+  claimed a getter-side `ptrace_may_access` half - that was wrong, and wrong in the direction that would have
+  refused reads Linux serves.

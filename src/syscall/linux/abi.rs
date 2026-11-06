@@ -3193,6 +3193,55 @@ fn affinity_target(pid: usize) -> Option<()> {
     crate::sched::resolve_pid(pid as i64).map(|_| ())
 }
 
+/// May the caller move the task `pid` names onto a different CPU?
+///
+/// The setter is the half of this family that carries authority; the getter
+/// carries none at all. Measured on the host as uid 1000 with an empty
+/// `CapEff` (`build/scratch/affperm/s.c`, `t.c`, `v.c`, musl static):
+///
+/// * a task with **another uid** is `EPERM` - pid 1 as uid 1000, every time,
+///   whatever the mask and the length;
+/// * a task with the **same uid** is served, blood relation or not: this
+///   file's own parent shell and a stranger's child both answered `0`;
+/// * the getter never asks: `sched_getaffinity(1, …)` answered a full mask
+///   for root's task as uid 1000.
+///
+/// The uid comparison is [`crate::cred::kill_ok`]'s - the sender's real or
+/// effective id against the target's real or saved one - because that is
+/// Linux's own "same creds" test and the one this kernel already uses for
+/// signals. Otherwise the caller needs `CAP_SYS_NICE`, the capability
+/// `process_madvise(2)` also asks for.
+///
+/// Two answers are deliberately "allowed": a number the ESRCH arm has already
+/// refused, and a task that exited between the two table reads. Neither can
+/// be observed by the caller, because the earlier refusal is the answer it
+/// gets.
+#[cfg(target_os = "none")]
+fn affinity_may_retarget(pid: usize) -> bool {
+    let Some(target) = crate::sched::resolve_pid(pid as i64) else {
+        return true;
+    };
+    if target == crate::sched::current_tgid() {
+        return true;
+    }
+    let Some(them) = crate::sched::identity_of(target) else {
+        return true;
+    };
+    let caller = crate::sched::current_identity();
+    if crate::cred::kill_ok(caller.ruid, caller.euid, them.ruid, them.suid) {
+        return true;
+    }
+    crate::sched::current_credentials().capable(crate::cred::CAP_SYS_NICE)
+}
+
+/// A host build has no task table, so every number names the one process and
+/// the question folds to the caller retargeting itself - which Linux serves.
+/// The same absence [`crate::sched::may_inspect`]'s stand-in describes.
+#[cfg(not(target_os = "none"))]
+fn affinity_may_retarget(_pid: usize) -> bool {
+    true
+}
+
 /// `sched_getaffinity(pid, len, mask)` — which CPUs the caller may run on.
 ///
 /// One CPU, so the mask is bit 0 and the answer is the byte count Linux
@@ -3238,6 +3287,12 @@ pub(crate) fn handle_sched_getaffinity(args: [usize; crate::syscall::ARG_COUNT])
 ///   `len` 0 falls through to `ESRCH` (`set(bad, 0, NULL)` is `ESRCH`).
 /// * then the number is resolved: a collected child, a stranger's number and
 ///   `-1` are all `ESRCH`.
+/// * then the authority [`affinity_may_retarget`] describes: another user's
+///   task is `EPERM` unless the caller holds `CAP_SYS_NICE`. That check sits
+///   **before** the mask is judged, which is measured, not chosen
+///   (`build/scratch/affperm/t.c`): a caller without the capability reads
+///   `EPERM` for a mask that names no CPU, so it cannot probe the machine's
+///   CPUs one refusal at a time.
 /// * then the mask has to name a CPU this machine has. Any length from one
 ///   byte up is enough to say so - this handler used to insist on a whole
 ///   word, which refused a request Linux honours.
@@ -3248,6 +3303,14 @@ pub(crate) fn handle_sched_setaffinity(args: [usize; crate::syscall::ARG_COUNT])
     }
     if affinity_target(pid).is_none() {
         return err::ESRCH;
+    }
+    // Authority comes after the copy and after the number, and before the
+    // mask is judged - measured (`build/scratch/affperm/t.c`): as uid 1000,
+    // `set(root's task, 0, mem)` and `set(root's task, 8, empty)` are both
+    // `EPERM`, so a caller cannot tell a malformed mask from a refused one
+    // until it is allowed to make the request at all.
+    if !affinity_may_retarget(pid) {
+        return err::EPERM;
     }
     // Only the first byte matters: CPU 0 is bit 0 of the lowest word, and a
     // request shorter than a word still carries it. Reading one byte keeps

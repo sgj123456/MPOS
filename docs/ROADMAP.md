@@ -150,9 +150,12 @@ One-glance status of the whole roadmap.
   accepted 12), the getter must **not** zero the caller's tail, and the refusal order is asymmetric
   — length before number on the getter, number first on the setter — both of which are what Linux's
   own ordering produces rather than what either direction derives. One `affinity_target` helper now
-  resolves through `resolve_pid` for both (`t-affinity-rules`, §6.92, item 205). Named gap: the
-  setter's `CAP_SYS_NICE` and the getter's ptrace-may-access halves are still unchecked, and cannot
-  be pinned here because the payload runs as root
+  resolves through `resolve_pid` for both, and `affinity_may_retarget` adds the authority rule —
+  measured, the setter needs `CAP_SYS_NICE` only for **another user's** task (a same-uid stranger's
+  child is served, so blood relation is not the rule) and the **getter asks for nothing at all**,
+  which corrects an earlier claim here that it needed a ptrace check; the order is `EFAULT` →
+  `ESRCH` → `EPERM` → `EINVAL`, so authority sits before the mask judgement (`t-affinity-rules`,
+  §6.92, item 205)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

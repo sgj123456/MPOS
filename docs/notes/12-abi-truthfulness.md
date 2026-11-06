@@ -292,7 +292,21 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, an affinity mask's number is resolved first §6.92):** stage 1
+**Latest measured gate (2026-11-06, an affinity setter's authority §6.92):** stage 1
+`1224 tests, 0 failed` (45.33 s and 101.18 s on the two arms); x86_64 `pass=262 fail=0 (262 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 45.66 s (previous green run 40.88 s, +11.7%)`
+(`build/gate-affperm-x.log`), with the pin's fifteen `ok:` lines and `=== PASS t-affinity-rules` in its
+lane log; aarch64 `pass=261 fail=0 (261 built)`, `mpos-kunit 35 passed, 0 failed`, `total 101.51 s
+(previous green run 40.57 s, +150.2%)` (`build/gate-affperm-a.log`), the same fifteen `ok:`. **Both arms
+were run with the lane count forced** (`MPOS_TEST_LANES=3` and `=2`): the container this ran in was pinned
+to one CPU (`Cpus_allowed_list: 0`), and the default lane count is `available_parallelism()`, which is
+then 1 - one lane running all 262 programs in one boot fills the task table with `busybox timeout`'s
+watchdog children and reddens eighteen of them for reasons that are not the kernel's (`pass=244 fail=18`,
+`build/gate-affperm.log`), and with six lanes on one core the scheduler's own timing cases go red
+(`mpos-kunit 32 passed, 3 failed`, `sched.alternating`/`sched.preempted`/`sched.sleeping`,
+`build/gate-affperm2.log`). Neither is a reading; the two runs quoted here are.
+
+**Measured gate before it (2026-11-06, an affinity mask's number is resolved first §6.92):** stage 1
 `1224 tests, 0 failed` (40.68 s); x86_64 `pass=262 fail=0 (262 built)`, `mpos-kunit 35 passed, 0 failed`,
 `total 40.88 s (previous green run 43.11 s, -5.2%)` (`build/gate-aff.log`), with the new pin's thirteen
 `ok:` lines and `=== PASS t-affinity-rules` in `build/test-serial.log`; aarch64 `pass=261 fail=0

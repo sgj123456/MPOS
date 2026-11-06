@@ -6899,9 +6899,16 @@ case; `r2.c`'s "the tail is untouched" was itself wrong because it prefilled wit
 "untouched" from "filled with ones". The lesson is the one this repo keeps re-learning: a probe that prints two
 calls in one line is measuring the interaction, not the calls.
 
-**The pin** is `user/tests/src/bin/t-affinity-rules.rs`, 13 claims. On the unfixed kernel nine are red
-(`build/boot-affrules-pin1.log`); with the fix all thirteen are `ok:` and `PASS`
-(`build/probe/oneshot/serial.log`), and `MPOS_ON_HOST=1` reads the same thirteen against real Linux.
+**The pin** is `user/tests/src/bin/t-affinity-rules.rs`, 15 claims. On the unfixed kernel nine are red
+(`build/boot-affrules-pin1.log`); with the fix all fifteen are `ok:` and `PASS`
+(`build/probe/oneshot/serial.log`), and `MPOS_ON_HOST=1` reads the same fifteen against real Linux. The two
+authority claims took a second counterfactual, because they are a separate door: with only
+`affinity_may_retarget` removed and the rest of the fix kept, `build/boot-affperm-cf.log` reads
+`FAIL:  a dropped program cannot retarget its root parent (uid 65534)` beside
+`ok:    and a getter asks for no authority at all (uid=65534 get=8 geterrno=3 set=-1 seterrno=1)`, and putting
+it back reads `PASS` (`build/boot-affperm3.log`). Note what the dropped reading says about the *getter*: it asks
+about a root task and gets `get=8 geterrno=3`, where `3` is the `errno` left over from the failed `setuid` - the
+getter itself returned the eight bytes it filled.
 
 **The fix**, `src/syscall/linux/abi.rs`: one private helper,
 ```rust
@@ -6917,12 +6924,32 @@ copies the mask and writes **only the words it fills**; the setter copies what i
 one byte), resolves the number, and reads one byte to see whether CPU 0 is named. The old tail-zeroing block
 is gone: filling bytes the caller did not ask about is a write, and Linux does not make it.
 
-**What this does not fix.** The setter's *permission* half. Linux wants `CAP_SYS_NICE` to pin another user's
-task and answers `EPERM` otherwise (measured: `setter(pid 1) => EPERM`, `getter(pid 1) => 0`). This kernel has
-neither check now. It is named as a gap rather than pinned because the payload runs as root, so a claim about
-`EPERM` could only ever be true on the host - the same rule as the two claims §6.91 leaves out. The helpers it
-would need are already there and in use elsewhere (`current_credentials().capable(crate::cred::CAP_SYS_NICE)`
-at `src/syscall/linux/proc.rs:2782`, and `crate::sched::may_inspect` for the getter's ptrace-may-access half).
+**The authority half, and a sentence above that was wrong.** The paragraph that stood here said the setter's
+`CAP_SYS_NICE` check and a getter-side `ptrace_may_access` check were both missing, and that neither could be
+pinned because the payload runs as root. Re-measured (`build/scratch/affperm/s.c`, `t.c`, `u.c`, `v.c`; uid 1000,
+empty `CapEff`, 16 CPUs), the rule is narrower and the second half does not exist:
+
+| call | another user's task | the same user's task, anyone's child | own task |
+|---|---|---|---|
+| `sched_setaffinity` | `EPERM` | `0` | `0` |
+| `sched_getaffinity` | `0` (16 CPUs) | `0` | `0` |
+
+So the **getter asks for no authority at all** - the earlier sentence about a ptrace check was wrong, and it was
+wrong in the direction that would have made this kernel refuse reads Linux serves. The setter needs
+`CAP_SYS_NICE` only when the target belongs to another user; blood relation is not part of it, because a
+same-uid stranger's child is retargetable. The refusal order is `EFAULT` (a non-empty mask is copied first) →
+`ESRCH` → `EPERM` → `EINVAL` (the mask names no CPU), measured with `set(<pid 1>, 0, NULL) => EPERM` against
+`set(<no such pid>, 8, NULL) => EFAULT`: authority sits **before** the mask judgement, so a caller without the
+capability cannot probe the machine's CPU count one refusal shape at a time.
+
+The fix is `affinity_may_retarget` in `src/syscall/linux/abi.rs`: the caller's own task is always served,
+another task is compared with `crate::cred::kill_ok` (the four-id check `kill` already uses, so "same user"
+means what it means everywhere else here), and only then is `CAP_SYS_NICE` consulted. That it can be pinned at
+all is the other correction: the sweep's payload runs as root, but a *child* can `setgid`/`setuid` to `nobody`
+first and then ask about its root parent - `t-proc-access` has done exactly that for its own access claims for
+months. The pin's `authority_probe` is that child, and it reports the uid it ended up as rather than assuming
+the drop happened, because a host run cannot drop and is then the same user as its parent (the allowed side of
+the same rule).
 
 **The rule.** A call that takes a number and acts on a *task* resolves the number first, and refuses with
 `ESRCH` when it names nothing - even when the rest of the arguments are also bad, unless Linux's own ordering
