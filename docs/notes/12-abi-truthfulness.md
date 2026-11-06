@@ -292,7 +292,15 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s CPU fields §6.96):** stage 1
+**Latest measured gate (2026-11-07, the boot's sub-tick check §13.33):** stage 1
+`1225 tests, 0 failed` (51.09 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 51.41 s (previous green run 51.07 s, +0.7%)`; aarch64 `pass=262 fail=0 (262 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 141.24 s (previous green run 85.76 s, +64.7%)`
+(`build/gate-subtick.log`), both arms in one command, lane count forced to two. `GATE EXIT=0`, and
+both aarch64 lanes' boot printed `the one-shot woke idle() off the tick path (0 arm(s) the tick
+answered first)` - the check that halted a lane here a run earlier now answers from the register.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/stat`'s CPU fields §6.96):** stage 1
 `1225 tests, 0 failed` (88.08 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 88.39 s (previous green run 88.73 s, -0.4%)`; aarch64 `pass=262 fail=0 (262 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 215.97 s (previous green run 88.08 s, +145.2%)`
@@ -321,7 +329,9 @@ outer bound. That check arms a 2 ms one-shot, parks, and then *requires the tick
 a 4 ms tick, an arm placed inside the same period lets the periodic tick arrive first, which is a confound
 and not a violation, and two TCG guests plus a host stage-1 run on one core make that window easy to hit.
 Re-run alone, the aarch64 arm came back `pass=262 fail=0` in 88.08 s. The check's own fix is a separate
-commit (it is a boot assertion, not an ABI claim).
+commit (it is a boot assertion, not an ABI claim) and it landed as *the boot's sub-tick check answers from
+the register, not from a counter two comparators move* - `docs/notes/` §13.33, and the block at the top
+of this section is the gate that followed it.
 
 **Measured gate before it (2026-11-07, the two `0/0` resource rows §6.94):** stage 1 `1224 tests, 0 failed`
 (50.48 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 50.79 s

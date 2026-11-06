@@ -1664,25 +1664,62 @@ fn check_cpu() {
     }
 
     // And the one-shot must wake between two ticks - the half of the sub-tick
-    // contract a pin cannot see from a syscall. Arm the virtual timer two
-    // milliseconds out - half a period, so a tick cannot be the thing that
-    // answered - park on it, and read the figures back: woken it must be, and
-    // with the tick count unmoved, or this machine's `SUB_TICK_WAKE` is a lie
-    // every sleep would pay for.
-    let wake_ns = timer::since_boot_nanos() + 2_000_000;
-    timer::arm_wake_ns(Some(wake_ns));
-    let before = timer::ticks();
-    vectors::idle();
-    let fired = timer::ticks() == before;
+    // contract a pin cannot see from a syscall. Arm the virtual timer half a
+    // period out, park on it, and read back *which* comparator answered.
+    //
+    // The answer is the virtual timer's own control register, not the tick
+    // count. The periodic tick and this one-shot are two comparators over one
+    // counter, so an arm that lands close to the periodic deadline lets the
+    // tick answer the park first - a confound, not a violation of the sub-tick
+    // contract, and on a host running two TCG guests on one core it is easy to
+    // hit. Measured 2026-11-07: a whole aarch64 gate lane halted here, and the
+    // dump it printed said `ctl 0x0001 = enable 1 imask 0 istatus 0` - the
+    // one-shot still armed and *not yet due* when `idle` returned, which is the
+    // tick having answered it. The handler disarms the one-shot before the EOI,
+    // so `enable` clear after the park says the one-shot fired; `enable` set
+    // says it never got the chance, and that case is retried with the arm
+    // re-aligned half a period after a tick boundary. A machine whose arm can
+    // never survive four tries still fails, with the figures.
+    let mut fired = false;
+    let mut confounds = 0u32;
+    for _ in 0..4 {
+        let wake_ns = timer::since_boot_nanos() + 2_000_000;
+        timer::arm_wake_ns(Some(wake_ns));
+        let before = timer::ticks();
+        vectors::idle();
+        if vectors::interrupts_enabled() {
+            fail!("the one-shot's idle() returned with interrupts still enabled");
+        }
+        if timer::vtimer_control() & 1 == 0 {
+            // It fired, and it fired first: `idle` returns with interrupts
+            // masked, so no tick could have been served between the wake and
+            // this read - a moved count here would mean the masking leaked.
+            if timer::ticks() != before {
+                fail!(
+                    "the virtual timer's one-shot woke idle() but the tick \
+                     count moved too ({before} -> {}); a wake with interrupts \
+                     masked cannot have served a tick",
+                    timer::ticks()
+                );
+            }
+            fired = true;
+            break;
+        }
+        confounds += 1;
+        // The periodic tick answered the park before the one-shot was due: land
+        // the next arm half a period after a tick boundary and try again.
+        timer::vtimer_disarm();
+        timer::arm_next_period();
+        vectors::idle();
+    }
     if !fired {
         let ctl = timer::vtimer_control();
         let state = gic::state();
         fail!(
-            "the virtual timer's one-shot did not wake idle() two milliseconds \
-             out (ticks moved to {}, ctl {:#06x} = enable {} imask {} istatus {}, \
-             cval {:#x}, count {:#x}, base {:#x}, gic pending {:#x} enabled {:#x} \
-             hpplr {:#x})",
-            timer::ticks(),
+            "the virtual timer's one-shot did not wake idle() half a period out \
+             in four tries ({confounds} confounded by the periodic tick; ctl \
+             {:#06x} = enable {} imask {} istatus {}, cval {:#x}, count {:#x}, \
+             base {:#x}, gic pending {:#x} enabled {:#x} hpplr {:#x})",
             ctl,
             ctl & 1,
             (ctl >> 1) & 1,
@@ -1695,15 +1732,13 @@ fn check_cpu() {
             state.highest_pending
         );
     }
-    if vectors::interrupts_enabled() {
-        fail!("the one-shot's idle() returned with interrupts still enabled");
-    }
 
     let _ = writeln!(
         out,
         "cpu: CPACR.FPEN full access after enable_user_simd; a distributor line \
          enabled then masked and read back; idle() woken by the clock (tick \
-         {before} -> {}) and returning with interrupts off",
+         {before} -> {}) and returning with interrupts off; the one-shot woke \
+         idle() off the tick path ({confounds} arm(s) the tick answered first)",
         timer::ticks()
     );
 }

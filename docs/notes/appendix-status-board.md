@@ -1321,6 +1321,46 @@ are not restated in the phase sections above.
         same observation rather than a regression; three readings at one site is where the
         discipline says a diagnosis is owed, and what is missing is a reproduction that does not
         depend on host load.
+  - [x] 13.33 the boot's sub-tick check answered from a counter two comparators move - the check
+        halted a whole gate lane, and the dump it printed was the diagnosis.
+        **What was seen.** One aarch64 lane of a both-arm gate timed out at its 900 s outer bound;
+        its serial ended at the machine's own `cpu:` check, which had printed
+        `the virtual timer's one-shot did not wake idle() two milliseconds out (ticks moved to 73,
+        ctl 0x0001 = enable 1 imask 0 istatus 0, cval …, gic pending 0x3ff …)` and then `super::halt()`
+        - so the machine stopped and the lane had nothing left to conclude with. Everything else on
+        that arm was fine on the re-run.
+        **The dump was the answer.** `ctl 0x0001` is `CNTV_CTL_EL0` with `enable` set, `imask` clear
+        and `istatus` clear: the **one-shot was still armed and had not reached its compare** when
+        `idle()` returned. So the park had been answered by something else - the periodic clock is
+        the only other wake in this window - and the check's own evidence said so while its verdict
+        called it a lie. The two comparators (`CNTP_*` periodic, `CNTV_*` one-shot) read one counter:
+        arm the one-shot half a period out from an arbitrary phase and the periodic deadline can be
+        nearer, which is a confound of the *measurement*, not a violation of `SUB_TICK_WAKE`.
+        Measured shape: two TCG guests plus a host stage-1 run on the one core this container is
+        pinned to; the failing arm's sibling lane, the x86_64 arm and every re-run were green.
+        **The fix.** The verdict now reads the hardware rather than the tick count. The `CNTV` handler
+        disarms the one-shot before the EOI, so `enable` clear after the park says the one-shot fired;
+        `enable` set says the tick answered first, which is retried after re-aligning the arm half a
+        period past a tick boundary (`arm_next_period` + `idle`), four tries before the machine
+        reports the figures. And the masking argument makes the two remaining readings exact: `idle`
+        returns with interrupts masked, so a moved tick count *and* a fired one-shot cannot both be
+        true - that combination still fails, from its own message.
+        **The pin is the boot, and the confound path was exercised on purpose.** With the retry arm
+        forced to 5 ms (past a whole 4 ms period) so the tick had to answer the first attempt, the
+        machine printed `the one-shot woke idle() off the tick path (1 arm(s) the tick answered
+        first)` and the sweep ran `pass=262 fail=0` (`build/gate-checksforce.log`) - the shape that
+        used to halt now costs one retry. The unforced path reads `(0 arm(s) the tick answered
+        first)`, and the shipped arm is green: aarch64 alone `pass=262 fail=0`, `mpos-kunit 35
+        passed, 0 failed`, `total 85.76 s` (`build/gate-oneshot-a.log`); x86_64 in the both-arm run
+        `pass=263 fail=0`, `mpos-kunit 35 passed, 0 failed`, `total 51.07 s`, stage 1 `1225 tests,
+        0 failed` (`build/gate-oneshot.log`). That same both-arm log reddens `sched.alternating` on
+        one aarch64 lane (`[1, 0, 0, 0, 1, 0, 1, 0, 1, 1]`) with both guests and stage 1 on one core
+        and is green alone - the contention shape §12.4a records, not this change.
+        **The commit's own gate** (`build/gate-subtick.log`, both arms in one command, lanes forced to
+        two) is green: stage 1 `1225 tests, 0 failed`, x86_64 `pass=263 fail=0` and aarch64
+        `pass=262 fail=0`, `mpos-kunit 35 passed, 0 failed` on both, `GATE EXIT=0` - and both aarch64
+        lanes printed `the one-shot woke idle() off the tick path (0 arm(s) the tick answered first)`,
+        so the shipped phase ships confound-free as well as confound-proof.
   - [x] 13.19 `reboot(2)` answers Linux's shape on **both** machines - two mechanisms behind one
         symptom, and the symptom was on every aarch64 boot.
         **What was seen.** `mpos: syscall 142 -> ENOSYS`, once, between the kernel's handoff and the
