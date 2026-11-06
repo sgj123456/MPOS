@@ -1528,6 +1528,10 @@ pub struct Process {
     pub session: usize,
     pub threads: usize,
     pub rss_pages: usize,
+    /// See [`crate::sched::TaskSnapshot::virtual_pages`] - the pages the
+    /// group's address space has mapped, for `stat`'s `vsize` and `statm`'s
+    /// first field. Distinct from `rss_pages`, which counts what is present.
+    pub virtual_pages: usize,
     /// See [`crate::sched::TaskSnapshot::nice`] - the mirror carries the field
     /// because the *generators* are compiled here too, which is what makes the
     /// file's shape host-testable.
@@ -1673,7 +1677,6 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
     let (utime, stime, cutime, cstime) = cpu_fields(&task, whole);
     let shown = if tid == task.pid { task.pid } else { tid };
     let shown = reader_number(shown);
-    let kb = task.rss_pages * 4096 / 1024;
     let fields: [alloc::borrow::Cow<'_, str>; 52] = [
         Cow::Owned(alloc::format!("{}", shown)),
         Cow::Owned(alloc::format!("({})", task.comm)),
@@ -1712,14 +1715,20 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         // process claims to have started at boot. A `ps` that reads it prints
         // a start time rather than crashing on an absent one.
         Cow::Borrowed("0"),
-        Cow::Owned(alloc::format!("{}", kb * 1024)), // vsize
+        // vsize: the pages the address space has *mapped*, in bytes. Not the
+        // resident set - a mapping nobody has touched still holds addresses,
+        // which is what this field is a claim about. Measured on a current
+        // host (`build/scratch/vsize/p.c`, Linux 7.2.14): mapping 4 MiB and
+        // touching none of it moved `vsize` from `258048` to `4452352` while
+        // the resident count stayed at 24 pages (`docs/notes/` §6.103).
+        Cow::Owned(alloc::format!("{}", vsize_bytes(&task))),
         Cow::Owned(alloc::format!("{}", task.rss_pages)), // rss
-        Cow::Borrowed("0"),                          // rsslim
-        Cow::Borrowed("0"),                          // startcode
-        Cow::Borrowed("0"),                          // endcode
-        Cow::Borrowed("0"),                          // startstack
-        Cow::Borrowed("0"),                          // kstkesp
-        Cow::Borrowed("0"),                          // kstkeip
+        Cow::Borrowed("0"),                               // rsslim
+        Cow::Borrowed("0"),                               // startcode
+        Cow::Borrowed("0"),                               // endcode
+        Cow::Borrowed("0"),                               // startstack
+        Cow::Borrowed("0"),                               // kstkesp
+        Cow::Borrowed("0"),                               // kstkeip
         // The four signal words: this task's pending and blocked sets, then
         // the group's two disposition sets. All four are `signal::Pending`
         // (a `u64`, signal n in bit n-1), which is the shape Linux prints -
@@ -1772,16 +1781,40 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
     Some(out)
 }
 
+/// `stat`'s field 23, `vsize`: the pages the address space has mapped, in the
+/// bytes a reader subtracts. One function so the two files that report this
+/// number report the same one.
+fn vsize_bytes(task: &Process) -> usize {
+    task.virtual_pages * 4096
+}
+
+/// The seven fields of `statm`, from the two numbers this kernel counts.
+fn statm_text(task: &Process) -> alloc::string::String {
+    alloc::format!("{} {} 0 0 0 0 0\n", task.virtual_pages, task.rss_pages)
+}
+
 /// `/proc/<pid>/statm`: the same memory numbers as `stat`, in pages, as
 /// seven fields - total, resident, shared, text, library, data, dirty.
+///
+/// Two of the seven are the kernel's to answer and are: `total` is the pages
+/// the address space has mapped (the same number `stat`'s `vsize` prints in
+/// bytes) and `resident` the pages that are present (the same number `stat`'s
+/// `rss` prints). Measured on a current host (`build/scratch/vsize/p.c`, Linux
+/// 7.2.14): mapping 4 MiB and touching none of it moved `total` from `63` to
+/// `1087` while `resident` stayed `24`, and touching it moved `resident` to
+/// `1048` with `total` unchanged - the two questions a reader of this file
+/// asks, which is why printing the resident count twice answered neither.
+///
+/// The remaining five are a **named gap** rather than a shape: `shared`,
+/// `text`, `library`, `data` and `dirty` need accounting this kernel does not
+/// keep (which frames are a file's and shared, how many belong to the image's
+/// text, dirty versus clean), and they print `0` the way a machine with none
+/// of them would honestly report. `data` used to print the resident count,
+/// which is not that question at all - a number that looked plausible is worse
+/// here than an honest zero, because `ps_mem` and `smem` fold these fields
+/// into a total (`docs/ROADMAP.md`, `docs/notes/` §6.103).
 fn statm_line(pid: usize) -> Option<String> {
-    let task = task(pid)?;
-    Some(alloc::format!(
-        "{} {} 0 0 0 {} 0\n",
-        task.rss_pages,
-        task.rss_pages,
-        task.rss_pages
-    ))
+    Some(statm_text(&task(pid)?))
 }
 
 /// The column a mapping's name starts in, on Linux.
@@ -4829,6 +4862,32 @@ mod tests {
         assert_eq!(cpu_fields(&p, true).0, 0);
     }
 
+    /// `vsize` is the address space a process has *mapped*, not the pages it
+    /// has touched, and `statm` prints the same two numbers in pages.
+    ///
+    /// Measured on a current host (`build/scratch/vsize/p.c`, Linux 7.2.14):
+    /// mapping 4 MiB with `MAP_ANONYMOUS|MAP_PRIVATE` and touching none of it
+    /// moved `/proc/self/statm`'s total from `63` to `1087` while `resident`
+    /// stayed `24`; touching it moved `resident` to `1048` with `total`
+    /// unchanged. A kernel that formatted `vsize` from the resident count
+    /// answered neither question - the number moved only when a page became
+    /// present, which is the other field's job.
+    ///
+    /// The two files are asserted together because they must not disagree:
+    /// `stat`'s field 23 is `statm`'s first field times the page size.
+    #[test]
+    fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
+        let mut p = process(7, 7, None, 0, 'R');
+        p.virtual_pages = 1087;
+        p.rss_pages = 24;
+        assert_eq!(vsize_bytes(&p), 1087 * 4096, "field 23, in bytes");
+        assert_eq!(
+            statm_text(&p),
+            "1087 24 0 0 0 0 0\n",
+            "statm: total, resident, and the five fields this kernel does not count"
+        );
+    }
+
     /// A dead task keeps its directory only when it leads the group - Linux's
     /// `__unhash_process`, and the clause that lets a tid's directory be served
     /// at all without serving one for a thread that has left.
@@ -5832,6 +5891,7 @@ mod tests {
             session: 0,
             threads: 1,
             rss_pages: 0,
+            virtual_pages: 0,
             nice: 0,
             exit_signal: 17,
             cpu: (0, 0, 0, 0),

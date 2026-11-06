@@ -9666,3 +9666,39 @@ process did to itself (the baseline word is not zero on either machine - both ig
 Red on the unfixed kernel (`build/boot-sigfield-cf1.log`, four claims `0 -> 0`, `=== t-stat-signal-
 fields exit=1`), green with it (`build/boot-sigfield2.log`, nine ok, `exit=0`). Reading and rule:
 `docs/notes/` §6.102.
+
+### Item 216 - `vsize` and `statm`'s total are the address space, not the resident set (2026-11-07, landed)
+
+`/proc/<pid>/stat`'s field 23 and `/proc/<pid>/statm`'s first field are Linux's `mm->total_vm` -
+the pages the address space has **mapped** - and this kernel formatted both from `rss_pages`, the
+pages that happen to be present. Measured on a current host (`build/scratch/vsize/p.c`, Linux
+7.2.14): mapping 4 MiB with `MAP_ANONYMOUS|MAP_PRIVATE` and touching none of it moved `statm`'s
+total `63 -> 1087` pages (`vsize` `258048 -> 4452352`) with `resident` fixed at `24`; touching it
+moved `resident` to `1048` with `total` unchanged.
+
+| | Linux 7.2.14 | this kernel, before | this kernel, now |
+|---|---|---|---|
+| baseline `vsize` / `statm total` | `258048` / `63` | `151552` / `37` | `516096` / `124` |
+| after mapping 4 MiB, untouched | `4452352` / `1087`, resident `24` | unchanged - `151552` / `37` | `4714496` / `1151`, resident `123` |
+| after touching it | `4452352` / `1087`, resident `1048` | `4345856` / `1061`, resident `1061` | resident `+1024`, total unchanged |
+| `vsize - total * 4096` | `0` | `0` (both were the resident count) | `0` |
+| `statm` shared/text/library/data/dirty | the file's real counts | `0 ... rss_pages ... 0` | `0 0 0 0 0` (**named gap**) |
+
+**Landed.** `Mm::mapped_pages` (`src/sched/runtime/child_mm.rs`) sums the VMA table and the
+eagerly-filled ranges in one critical section; `TaskSnapshot::virtual_pages` carries it beside
+`rss_pages`; `vsize_bytes` formats `stat`'s field 23 and `statm_text` the page list
+(`src/vfs/procfs.rs`). Owner: `src/sched/runtime/child_mm.rs`, `src/sched/runtime/procfs.rs`,
+`src/vfs/procfs.rs`.
+
+**Named gap.** `statm`'s five non-residency fields (`shared`, `text`, `library`, `data`, `dirty`)
+print `0` because this kernel keeps no accounting for them - which frames are a file's and shared,
+how many are the image's text, dirty versus clean. `data` used to print the resident count, which
+is a different question; an honest zero is stated here and in `docs/ROADMAP.md` rather than
+formatted from the nearest number.
+
+Pin: `user/tests/src/bin/t-statm.rs` (eleven claims; the two files are read as a bracket because
+they are two reads of a moving address space), plus the host unit test
+`vfs::procfs::tests::vsize_counts_address_space_and_rss_counts_what_is_behind_it`. Red on the
+unfixed kernel (`build/boot-statm-cf1.log`: `mapping 4 MiB ... (121 -> 123 pages)` and `and leaves
+the address space where it was (1147 against 123 pages)`, `exit=1`), green with it
+(`build/boot-statm2.log`, `exit=0`). Mechanism and the Linux reading: `docs/notes/` §6.103.

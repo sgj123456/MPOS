@@ -269,6 +269,15 @@ One-glance status of the whole roadmap.
       a `SIGTERM` handler puts `1 << 14` in field 34, a raised-and-blocked `SIGWINCH` puts `1 << 27`
       in field 31, and the two disposition words partition (measured on a current host first, because
       neither machine starts at a zero word: both ignore `SIGPIPE` - `§6.102`, item 215).
+- [x] `vsize` and `statm`'s total are the address space, not the resident set - `/proc/<pid>/stat`'s
+      field 23 and `/proc/<pid>/statm`'s first field were both formatted from `rss_pages`, so a
+      process that mapped 4 MiB and touched none of it was reported as unchanged (measured on a
+      current host: `statm` total `63 -> 1087` pages with `resident` fixed at `24`; the machine's
+      own probe moved `total` only when the pages became present). `Mm::mapped_pages` sums the VMA
+      table and the eager ranges now, and `statm`'s second field stays the resident count it was.
+      **Named gap:** `statm`'s `shared`/`text`/`library`/`data`/`dirty` print zero because this
+      kernel keeps no accounting for them (a plausible number is worse than an honest zero, and
+      `data` used to print the resident count) - `§6.103`, item 216, pin `t-statm`.
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

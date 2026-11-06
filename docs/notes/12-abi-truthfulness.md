@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s four signal words §6.102):** stage 1 `1233
+**Latest measured gate (2026-11-07, `vsize` and `statm`'s total §6.103):** stage 1 `1234 tests,
+0 failed` (94.57 s); x86_64 `pass=269 fail=0 (269 built)`, `mpos-kunit 35 passed, 0 failed`, `total
+94.77 s (previous green run 55.59 s, +70.5%)`; aarch64 `pass=268 fail=0 (268 built)`, `mpos-kunit 35
+passed, 0 failed`, `total 229.12 s (previous green run 94.54 s, +142.4%)` (`build/gate-statm.log`,
+`GATE=0`), both arms in one command with the lane count forced to two - so the two totals are the host's
+statement, not a regression. The new pin is `=== PASS` on both arms, and the claims that carry the
+change are the *movements* rather than the relation: x86_64 `stat's vsize is statm's total in bytes
+(516096 against 124 pages of 4096)`, `mapping 4 MiB nobody has touched extends the address space (124
+-> 1151 pages)`, `touching it makes it resident (1024 of the 1024 pages mapped)`; aarch64 the same three
+shaped `(495616 against 119 pages of 4096)`, `(119 -> 1146 pages)`, `(1024 of the 1024 pages mapped)`
+(`build/test-serial.log`, `build/aarch64-test-serial.log`). `vsize == statm.total * 4096` is green under
+the unfixed kernel too, which is why it is not the claim this section would quote.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/stat`'s four signal words §6.102):** stage 1 `1233
 tests, 0 failed` (55.20 s / 94.17 s); x86_64 `pass=268 fail=0 (268 built)`, `mpos-kunit 35 passed, 0
 failed`, `total 55.59 s (previous green run 55.39 s, +0.4%)` (`build/gate-sigfield-x.log`, `X=0`);
 aarch64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total 94.54 s (previous

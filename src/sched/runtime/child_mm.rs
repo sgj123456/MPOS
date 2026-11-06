@@ -2109,6 +2109,44 @@ impl Mm {
     }
 
     /// The group's CPU time in internal clock ticks, as `(user, system,
+    /// How many pages this group's address space has **mapped**, present or
+    /// not - Linux's `mm->total_vm`, which `/proc/<pid>/stat`'s field 23
+    /// (`vsize`) prints times the page size and `/proc/<pid>/statm`'s first
+    /// field prints plain.
+    ///
+    /// Two sources, because the space is described by two (see [`MapFacts`]):
+    /// the VMA table holds what `mmap`, `mprotect`, `brk` and the stack put
+    /// there, and the eagerly-filled ranges hold what the loader laid out with
+    /// no VMA behind it. A page counted by neither is a page that no fault can
+    /// reach, so the sum is the answer to "how much address space does this
+    /// process hold".
+    ///
+    /// Measured on a current host (`build/scratch/vsize/p.c`, Linux 7.2.14):
+    /// mapping 4 MiB with `MAP_ANONYMOUS|MAP_PRIVATE` and touching none of it
+    /// moved `/proc/self/statm`'s total from `63` to `1087` pages (and `vsize`
+    /// with it) while `resident` stayed `24` - mapping is the claim, presence
+    /// is the substance, and the two files report both. This kernel answered
+    /// the same probe with `total`/`vsize` equal to the *resident* count, so a
+    /// mapping nobody had touched did not exist to any reader of these files
+    /// (`docs/notes/` §6.103).
+    pub(crate) fn mapped_pages(&self) -> usize {
+        let page = pframe::PAGE_SIZE;
+        let round = |len: usize| -> usize { (len + page - 1) / page };
+        let mut pages = 0;
+        // One critical section for both tables: an interrupt between them must
+        // not be able to see half a sum, and neither table's borrow is held
+        // across the walk's arithmetic (there is none but additions).
+        critical_section::with(|cs| {
+            for vma in self.vmas.borrow(cs).borrow().iter() {
+                pages += round(vma.end.saturating_sub(vma.start));
+            }
+            for range in self.eager.borrow(cs).borrow().iter() {
+                pages += round(range.end.saturating_sub(range.start));
+            }
+        });
+        pages
+    }
+
     /// child-user, child-system)` - the four `times()` reports and the pair
     /// behind each `getrusage` direction.
     pub(crate) fn cpu_all(&self) -> (u64, u64, u64, u64) {

@@ -7786,3 +7786,92 @@ a set field has a second obligation a scalar does not: the *layout* is part of t
 is the wire `sigset_t`'s (signal *n* in bit *n-1*), which is why no conversion sits between
 `Task::blocked` and the file - and why the pin could be written as "moved by exactly this bit"
 before either machine was touched.
+
+## §6.103 `vsize` and `statm`'s total counted only the pages that were *present* (LANDED 2026-11-07)
+
+Two files answer the two memory questions a monitor asks separately, and this kernel answered
+both with the same number. `/proc/<pid>/statm`'s seven fields are total, resident, shared, text,
+library, data and dirty, in pages; `/proc/<pid>/stat`'s field 23 is `vsize`. The first field and
+`vsize` are Linux's `mm->total_vm` - the pages the address space has **mapped**, present or not -
+and this kernel formatted `vsize` as `rss_pages * 4096` and printed `rss_pages` three times in
+`statm`. So a process that mapped a gigabyte and touched one page was reported as one page: an
+address-space leak was invisible, and the file could not answer the question it exists for.
+
+**Measured on a current host first** (`build/scratch/vsize/p.c`, Linux 7.2.14, x86_64, one page
+size of 4096):
+
+```
+baseline            vsize=258048  statm total=63   resident=24  shared=18 text=13 data=37
+mapped 4 MiB rw, touched none
+                    vsize=4452352 statm total=1087 resident=24
+touched all of it   vsize=4452352 statm total=1087 resident=1048 dirty=0
+a second 8 MiB, untouched
+                    vsize=12840960 statm total=3135 resident=1048
+unmapped the first  vsize=8646656 statm total=2111
+```
+
+`vsize - total * 4096 == 0` at every step, and the mapping moved `total` by exactly `1024`/`2048`
+pages while `resident` did not move at all - so the two fields are two questions and `vsize` is
+`total` in bytes.
+
+**This kernel, same probe, before the fix** (`build/boot-vsize-cf.log`):
+
+```
+baseline            vsize=151552  statm total=37  resident=37
+mapped 4 MiB rw, touched none
+                    vsize=151552  statm total=37  resident=37      <- nothing moved
+touched all of it   vsize=4345856 statm total=1061 resident=1061
+a second 8 MiB      vsize=4345856 statm total=1061 resident=1061
+unmapped the first  vsize=151552  statm total=37  resident=37
+```
+
+The untouched mapping did not exist to either file, and touching it moved *both* numbers by
+1024 pages - the pairing that says one number is being read twice.
+
+**The fix.** The counting belongs to the address space, so it lives on `Mm`:
+`src/sched/runtime/child_mm.rs`'s `Mm::mapped_pages` sums the VMA table and the eagerly-filled
+ranges in one critical section (the two descriptions of the space `MapFacts` already names), each
+range rounded up to whole pages. `TaskSnapshot` carries it as `virtual_pages` beside `rss_pages`,
+`stat`'s field 23 prints it times the page size through `vsize_bytes`, and `statm_line` prints
+`{virtual_pages} {rss_pages} 0 0 0 0 0`.
+
+Two consequences worth stating rather than hiding:
+
+- **`statm`'s other five fields print `0` and are a named gap**, not a shape. `shared`, `text`,
+  `library`, `data` and `dirty` need accounting this kernel does not keep - which frames belong to
+  a file and are shared, how many are the image's text, dirty versus clean. `data` used to print the
+  resident count, which is not that question; a plausible number there is worse than an honest
+  zero, because `ps_mem` and `smem` fold these fields into a total. The gap is named in
+  `docs/ROADMAP.md` and item 216.
+- `stat`'s field 23 is in **bytes** and `statm`'s first field in **pages**; the two files must agree
+  through the page size, which the host unit test asserts as one relation
+  (`vfs::procfs::tests::vsize_counts_address_space_and_rss_counts_what_is_behind_it`).
+
+**Pin.** `user/tests/src/bin/t-statm.rs` (11 claims): the seven fields read; `vsize == total * 4096`; resident never exceeds the space; a 4 MiB anonymous mapping nobody touches extends `total`
+by 1016+ pages while `resident` does not move; touching it makes 1016+ pages resident and leaves
+`total` where it was; unmapping returns `total` to its baseline. The two files are read as a
+*bracket* - `statm`, `vsize`, `statm` - because they are two reads of a moving address space: the
+first version compared a `statm` taken before the read with a `vsize` taken after it and reddened
+on the host by three pages the process had mapped in between (`622592 against 610304 bytes`).
+
+**Counterfactual** (`build/boot-statm-cf1.log` against `build/boot-statm2.log`):
+
+```
+unfixed kernel  ok:    statm has seven page counts ((121, 121, 0, 0, 0, 121, 0))
+                FAIL:  mapping 4 MiB nobody has touched extends the address space (121 -> 123 pages)
+                ok:    and adds nothing to the resident set (121 -> 123 pages)
+                FAIL:  and leaves the address space where it was (1147 against 123 pages)
+                === t-statm exit=1
+fixed kernel    all eleven ok, PASS, exit=0
+             (124 -> 1151 pages; 121 -> 123 resident; touching makes 1024 resident, total 1151)
+```
+
+The three claims that pass in both are the relations (`vsize == total * page`, resident ≤ total,
+unmapping returns to baseline) - they hold for any implementation that formats both fields from
+one number, which is exactly why the claims that *move* are the pin.
+
+**The rule.** A file two tools read must answer the question each is asking: "how much address
+space does this process hold" is a claim about mappings, "how much of it is in memory" is a claim
+about pages present, and one number cannot be both. When a field looks plausible because the
+common case has them equal (here, a small program whose mapped and resident counts happen to be
+close), find the case that separates them - map without touching - and make that the pin.

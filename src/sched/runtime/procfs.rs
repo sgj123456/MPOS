@@ -264,6 +264,16 @@ pub struct TaskSnapshot {
     /// Frames behind the group's user mappings. `stat` wants resident pages,
     /// `status` wants kilobytes, and both are this number.
     pub rss_pages: usize,
+    /// Pages the group's address space has **mapped**, present or not: `stat`'s
+    /// field 23 (`vsize`, in bytes) and `/proc/<pid>/statm`'s first field (in
+    /// pages). [`crate::sched::child_mm`]'s `Mm::mapped_pages` owns the
+    /// counting and its measurement; this is the copy `/proc` formats.
+    ///
+    /// Distinct from [`Self::rss_pages`] by construction: a mapping is a claim
+    /// on the address space and residency is the substance behind it, which is
+    /// why Linux reports both and why the two files that share this number
+    /// print the same pages in two units.
+    pub virtual_pages: usize,
     /// The nice value `setpriority` stored on this task, `-20..=19` - the
     /// number `/proc/<pid>/stat`'s field 19 prints and its field 18 prints as
     /// `20 + nice`.
@@ -369,6 +379,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         'R'
     };
     let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
+    let virtual_pages = task.mm.mapped_pages();
     let (ignored, caught) = disposition_sets(task.dispositions.snapshot());
     TaskSnapshot {
         tid: id.0,
@@ -403,6 +414,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .count()
             .max(1),
         rss_pages,
+        virtual_pages,
         nice: task.nice,
         exit_signal: task.exit_signal,
         cpu: task.mm.cpu_all(),
