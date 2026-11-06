@@ -292,7 +292,25 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, `setpriority`'s authority §6.93):** stage 1 `1224 tests, 0 failed`
+**Latest measured gate (2026-11-07, the two `0/0` resource rows §6.94):** stage 1 `1224 tests, 0 failed`
+(50.48 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 50.79 s
+(previous green run 44.10 s, +15.2%)` (`build/gate-rlim-x3.log`); aarch64 `pass=262 fail=0 (262 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 131.12 s (previous green run 129.94 s, +0.9%)`
+(`build/gate-rlim-a.log`, stage 1 130.78 s). Both arms forced the lane count to two
+(`MPOS_TEST_LANES=2`) - the container is pinned to one CPU, see below. The pin's two new claims are `ok:`
+on both arms (`build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-0/serial.log`), and
+`t-prlimit64` is `=== PASS` on both.
+
+**Three reds before it, all statements about the host:** the first x86_64 attempt (three lanes,
+`build/gate-rlim-x.log`) came back `pass=262 fail=1` on `t-blk-sleep`'s `the sibling ran inside 33 of 64
+device calls (bound 40)`; the second (`build/gate-rlim-x2.log`) was green on every user program but
+`mpos-kunit 34 passed, 1 failed` on `sched.alternating` - `two tasks at the same priority did not take
+turns: [0, 1, 1, 0, 1, 1, 0, 1, 0, 0]`. Both are "how much CPU did the guest get" claims on a single
+core shared by the QEMU machines, and neither case's subject (a parked transfer yielding; priority
+bands taking turns) is touched by two entries in a table nobody schedules with. Two lanes gave
+`pass=263 fail=0` and `mpos-kunit 35 passed, 0 failed`.
+
+**Measured gate before it (2026-11-06, `setpriority`'s authority §6.93):** stage 1 `1224 tests, 0 failed`
 (43.91 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 44.10 s
 (previous green run 45.66 s, -3.4%)` (`build/gate-nice-x3.log`); aarch64 `pass=262 fail=0 (262 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 129.94 s (previous green run 101.51 s, +28.0%)`

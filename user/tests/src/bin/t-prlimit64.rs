@@ -116,6 +116,34 @@ fn main() {
         }
     }
 
+    // RLIMIT_NICE (13) and RLIMIT_RTPRIO (14) read `0/0` on Linux, and this
+    // kernel used to leave them at the table's infinity starting value - a
+    // promise it does not keep, because `0/0` is what refuses a priority raise
+    // to a caller without CAP_SYS_NICE. Measured on a host: `getrlimit` answers
+    // `0/0` for both rows (`docs/notes/` §6.94).
+    for (name, resource) in [
+        ("RLIMIT_NICE", libc::RLIMIT_NICE),
+        ("RLIMIT_RTPRIO", libc::RLIMIT_RTPRIO),
+    ] {
+        let mut row = Rlimit64 {
+            cur: u64::MAX,
+            max: u64::MAX,
+        };
+        match prlimit64(resource as libc::c_int, core::ptr::null(), &mut row) {
+            Ok(()) => {
+                r.check(&format!("querying {name} succeeds"), true);
+                r.check(
+                    &format!("{name} reads 0/0, the row Linux answers"),
+                    row.cur == 0 && row.max == 0,
+                );
+            }
+            Err(_) => {
+                r.check(&format!("querying {name} succeeds"), false);
+                r.check(&format!("{name} reads 0/0, the row Linux answers"), false);
+            }
+        }
+    }
+
     // A resource number past the table has no row to read: EINVAL. 99 is the
     // first number past `RLIM_NLIMITS` (16) that is also obviously not a typo
     // for one of them.

@@ -163,14 +163,26 @@ One-glance status of the whole roadmap.
   single-rooted kernel", which was inherited rather than measured. Linux answers **two** refusals
   to two questions: `EPERM` is ownership (a task that is not the caller's, in *either* direction —
   lowering a stranger's nice is refused just as raising is), and `EACCES` is direction (the task
-  *is* the caller's but the value raises its priority, which needs `CAP_SYS_NICE`; this kernel has
-  no `RLIMIT_NICE` entry yet, so the capability is the whole rule there). Not blood relation: a
+  *is* the caller's but the value raises its priority, which needs `CAP_SYS_NICE`; the row that
+  would let a caller without the capability raise as far as `RLIMIT_NICE` allows is carried now
+  (§6.94) but not yet read here, so on this machine the capability is still the whole rule). Not blood relation: a
   scan of 484 same-uid targets on the host answered `0` for an equal-nice call on every one of
   them, parent and stranger alike. `PRIO_USER` is stricter than `PRIO_PROCESS` upstream, so both
   collection arms test ownership per member and refuse the **whole** set — nothing half-written.
   `nice_may_retarget`/`nice_may_raise` in `src/syscall/linux/posix.rs` are the two predicates, and
   the pin drops a child to `nobody` and asks about its own root parent (`t-nice-authority`, §6.93,
   item 206)
+- [x] `RLIMIT_NICE` and `RLIMIT_RTPRIO` read `0/0`, the way Linux answers them — the two rows sat
+  past the ones `default_rlimits()` fills, so they kept the table's infinity starting value. That
+  is a promise rather than a default: `0/0` is the row `can_nice` reads to refuse a priority raise
+  to a caller without `CAP_SYS_NICE`, and a caller that reads `infinity` there is told the opposite
+  of what the kernel will do. `RLIMIT_RTPRIO`'s zero says the same about realtime priority. Both
+  now read `0/0`; `t-prlimit64` pins the two rows (`RLIMIT_NICE reads 0/0, the row Linux answers`,
+  `RLIMIT_RTPRIO reads 0/0, the row Linux answers`) and both claims are red on the kernel without
+  the two lines (§6.94, item 207). The row's **reading** half — `can_nice` inside `setpriority` —
+  is not implemented and is named as the open half: on this machine the row can only be lifted by
+  root, which holds the capability anyway, so the check would be a line no fixture could tell apart
+  from its absence until `rlimit_admit` learns `CAP_SYS_RESOURCE`
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

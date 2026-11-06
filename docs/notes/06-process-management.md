@@ -7037,3 +7037,66 @@ every value they set is a raise it is allowed to make.
 mine* (`EPERM`) and *may I move it this way* (`EACCES`). A handler that answers a lowering with success for a
 task it does not own has not checked anything - and a check written from a comment ("moot for this kernel")
 instead of a measurement will be wrong in whichever direction the comment guessed.
+
+## §6.94 `RLIMIT_NICE` and `RLIMIT_RTPRIO` are zero on Linux; infinity is a promise (LANDED 2026-11-07)
+
+The row was found by following §6.93 to the sentence it had inherited: `nice_may_raise`'s doc comment said
+"this kernel does not carry `RLIMIT_NICE`". A `getrlimit` walk over all sixteen rows shows that only half true -
+the row exists, and it reads `infinity`.
+
+```
+Linux (host, 7.2.14, uid 1000)                 this kernel (guest, payload as root, slot 5)
+  RLIMIT_NICE       cur=0        max=0           RLIMIT_NICE       cur=18446744073709551615 max=18446744073709551615
+  RLIMIT_RTPRIO     cur=0        max=0           RLIMIT_RTPRIO     cur=18446744073709551615 max=18446744073709551615
+setrlimit(NICE,{40,40})  rc=-1 errno=1 (EPERM) setrlimit(NICE,{40,40})  rc=0
+setrlimit(NICE,{0,0})    rc=0                  setrlimit(NICE,{0,0})    rc=0
+setrlimit(NICE,{20,20})  rc=-1 errno=1 (EPERM) setrlimit(NICE,{20,20})  rc=0, and the row is *written* to 20
+NICE finally             cur=0 max=0           NICE finally             cur=20 max=20
+```
+
+Both rows sit past the ones `default_rlimits()` fills, so they were left at the table's `RLIM_INFINITY`
+starting value (`crates/abi/src/lib.rs:280`). The `setrlimit` half differs for a second reason: `rlimit_admit`
+asks `is_root`, and the payload runs as root, so nothing is refused. That is Linux's answer for root too
+(`CAP_SYS_RESOURCE`), so the acceptance is not a divergence in itself - the **row's value** is.
+
+**The zero is the rule, not a leftover.** `can_nice` is the kernel's check behind a priority-raise: a caller
+with `CAP_SYS_NICE` may raise, and one without may raise only as far as `RLIMIT_NICE` allows (`rlim_cur >=
+20 - nice`). Measured on the host through the only lever an unprivileged caller has: `0/0` refuses **every**
+raise (`setpriority(self, 0)` from a stored nice of 19 is `EACCES`, and so is `setpriority(self, 10)`, because
+`10 < 19` is still a raise), while an equal value is served (`setpriority(self, 19)` = `0`; the equal case
+never asks `can_nice`, which is why it passes). A task that reads `RLIMIT_NICE = infinity` and then acts on it
+is told it may raise its priority freely, and that is a promise this kernel does not keep - §3's rule 2, the
+failure that matters most here, because the caller has no fallback to take after being trusted.
+
+`RLIMIT_RTPRIO`'s zero is the same shape: it is the row that says "no realtime priority above zero without the
+capability". This kernel grants `SCHED_FIFO` without consulting it (`sched_setscheduler` asks its own rule),
+so the row was describing a budget nobody spends - but a caller reads it, and Linux's answer is `0`.
+
+**The fix** is two lines in `default_rlimits()`, both at `0/0`, plus the doc comment that argued they were
+absent. `t-prlimit64` gained the pin, two claims for the two rows, written the same raw-`prlimit64` way as its
+neighbours so the same program reads both machines:
+
+```
+unfixed kernel                                            fixed kernel
+FAIL:  RLIMIT_NICE reads 0/0, the row Linux answers       ok:    RLIMIT_NICE reads 0/0, the row Linux answers
+FAIL:  RLIMIT_RTPRIO reads 0/0, the row Linux answers     ok:    RLIMIT_RTPRIO reads 0/0, the row Linux answers
+FAILED  (=== t-prlimit64 exit=1)                          PASS    (=== t-prlimit64 exit=0)
+```
+
+(`build/boot-rlim-cf1.log` and `build/boot-rlim-fix1.log`: the first built from a stash of the two lines with
+**both** the kernel and the loader rebuilt, since the loader carries the kernel as a deflate payload.)
+
+**What is not here, and why it is a named gap by shape.** The row's *reading* half - calling `can_nice` inside
+`setpriority`, which is what the zero is for - is not implemented. `nice_may_raise` still asks for
+`CAP_SYS_NICE` and nothing else. That is not a stub standing in for the rule: on this machine the row can only
+be lifted by root (the `is_root` clause), and root holds the capability anyway, so every pair the row would
+admit is already admitted, and a line implementing it would be one no fixture could tell apart from its
+absence - rule 4's counterfactual would fail. It becomes real work the moment `rlimit_admit` learns
+`CAP_SYS_RESOURCE` (a distinct, larger question about who may lift a *hard* limit), and it is named in
+`docs/ROADMAP.md` as such.
+
+**The rule.** A table's infinity is a default, and a default is a promise: a row Linux answers `0` for and this
+kernel answers `infinity` for tells the caller the opposite of what the kernel will do. The rows that matter are
+the ones whose zero *is* the rule (`RLIMIT_NICE`, `RLIMIT_RTPRIO`), and "we do not carry that row" is a claim
+to check with `getrlimit` before it is written into a comment - this one read `infinity` on the machine that
+was said not to carry it.

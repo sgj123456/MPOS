@@ -271,8 +271,10 @@ pub struct Rlimit {
 /// assert_eq!(t[5], Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY });
 /// ```
 ///
-/// The four rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6), `RLIMIT_NOFILE`
-/// (7) and `RLIMIT_SIGPENDING` (11) - the numbers `asm-generic/resource.h`
+/// The finite rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6), `RLIMIT_NOFILE`
+/// (7), `RLIMIT_SIGPENDING` (11), `RLIMIT_MSGQUEUE` (12) and the two `0/0`
+/// rows `RLIMIT_NICE` (13) / `RLIMIT_RTPRIO` (14) - the numbers
+/// `asm-generic/resource.h`
 /// gives, and so the ones a caller's `getrlimit`/`setrlimit`/`prlimit64`
 /// speaks. They were written at `5` and `7` (Linux's `RLIMIT_RSS` and
 /// `RLIMIT_NPROC` rows), which made a caller asking for the descriptor ceiling
@@ -315,6 +317,27 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
     // the kernel (`rlimits_report_the_startup_defaults_and_refuse_unknown_rows`)
     // pins the two together.
     t[11] = Rlimit { cur: 16, max: 16 }; // RLIMIT_SIGPENDING
+    // RLIMIT_NICE (13) and RLIMIT_RTPRIO (14): Linux answers `0/0` for both on
+    // an ordinary process, and that zero is load-bearing rather than a
+    // leftover - `can_nice` reads `RLIMIT_NICE` (`rlim_cur >= 20 - nice`) as
+    // the *only* way a caller without `CAP_SYS_NICE` may raise a priority, and
+    // `RLIMIT_RTPRIO`'s zero is what says "no realtime priority above zero
+    // without the capability".  Leaving them at the table's `INFINITY`
+    // starting value told a caller it might raise its priority freely when the
+    // kernel would refuse, which is a promise the kernel does not keep
+    // (measured: a host running unprivileged answers `0/0` here and refuses
+    // `setrlimit(RLIMIT_NICE, {40,40})` with `EPERM`, while this kernel
+    // answered `infinity` and accepted the pair - `docs/notes/` §6.94).
+    //
+    // The *reading* half of `RLIMIT_NICE` - consulting the row inside
+    // `setpriority`, which is what `can_nice` is for - is not here yet: this
+    // kernel's `nice_may_raise` asks for `CAP_SYS_NICE` and nothing else. That
+    // is a named gap rather than a stub, because every pair it would admit on
+    // this machine (the row can only be lifted by root, which holds the
+    // capability anyway) is already admitted, so adding the check would be a
+    // line no test could tell apart from its absence.
+    t[13] = Rlimit { cur: 0, max: 0 }; // RLIMIT_NICE
+    t[14] = Rlimit { cur: 0, max: 0 }; // RLIMIT_RTPRIO
     t
 }
 
@@ -859,9 +882,10 @@ mod tests {
     fn default_rlimits_budgets_stack_nofile_nproc_and_sigpending() {
         let t = default_rlimits();
         assert_eq!(t.len(), RLIM_NLIMITS);
-        // The four rows that are finite are the ones a static musl binary needs
-        // to start, plus the queued-signal bound; everything else reads
-        // infinity. Which four they are is the point:
+        // The finite rows are the ones a static musl binary needs to start,
+        // plus the queued-signal bound, the queue budget, and the two rows
+        // Linux answers `0/0` for on every ordinary process; everything else
+        // reads infinity. Which rows they are is the point:
         // `asm-generic/resource.h`'s numbers, so that a caller asking for
         // RLIMIT_NOFILE gets the descriptor ceiling.
         assert_eq!(
@@ -892,6 +916,15 @@ mod tests {
         // the number to `sched::signal::RT_QUEUE_LEN`, which this leaf cannot
         // name.
         assert_eq!(t[RLIMIT_SIGPENDING], Rlimit { cur: 16, max: 16 });
+        // `RLIMIT_NICE` (13) and `RLIMIT_RTPRIO` (14) read `0/0` on Linux, not
+        // infinity, and the zero is the rule rather than a leftover: it is the
+        // row `can_nice` reads to decide whether a caller without
+        // `CAP_SYS_NICE` may raise a priority, and the row that says "no
+        // realtime priority above zero without the capability". Measured on a
+        // current host: `getrlimit` answers `0/0` and `setrlimit` refuses to
+        // lift `RLIMIT_NICE` above it with `EPERM` (`docs/notes/` §6.94).
+        assert_eq!(t[13], Rlimit { cur: 0, max: 0 });
+        assert_eq!(t[14], Rlimit { cur: 0, max: 0 });
         // `RLIMIT_RSS` (5) is the row the descriptor ceiling used to sit on, and
         // nothing budgets it - the assertion that keeps the two from swapping
         // back.

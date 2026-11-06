@@ -9371,3 +9371,44 @@ Measured on the host (`build/scratch/niceperm/{y,g2,s2,w,x2}.c`; uid 1000, empty
   and fails on the host, where the same-uid branch reads the allowed side of the same rule.
   `t-priority`'s twenty claims stay green - as root they hold the capability, so their raises are allowed.
 - Measurements, the two errnos and the mislabelling that hid them: `docs/notes/` §6.93.
+
+### Item 207 - `RLIMIT_NICE` and `RLIMIT_RTPRIO` read `0/0`, the way Linux answers them (2026-11-07, landed)
+
+Found by following item 206's own sentence. `nice_may_raise`'s doc comment said "this kernel does not
+carry `RLIMIT_NICE`" - a `getrlimit` walk over all sixteen rows showed the row does exist and reads
+`infinity`.
+
+| | Linux (host, 7.2.14, uid 1000) | this kernel, before (guest, payload as root) |
+|---|---|---|
+| `getrlimit(RLIMIT_NICE)` | `cur=0 max=0` | `cur=infinity max=infinity` |
+| `getrlimit(RLIMIT_RTPRIO)` | `cur=0 max=0` | `cur=infinity max=infinity` |
+| `setrlimit(RLIMIT_NICE, {40,40})` | `-1 EPERM`, row unchanged | `0`, row becomes `40` |
+| `setrlimit(RLIMIT_NICE, {0,0})` | `0` | `0` |
+| `setrlimit(RLIMIT_NICE, {20,20})` | `-1 EPERM` | `0`, row becomes `20` |
+
+The zero is the rule, not a leftover: `RLIMIT_NICE` is the row `can_nice` reads to decide whether a
+caller **without** `CAP_SYS_NICE` may raise a priority (`rlim_cur >= 20 - nice`), and `RLIMIT_RTPRIO`'s
+zero is what says "no realtime priority above zero without the capability". A caller that reads
+`infinity` there is told it may raise as it pleases and has no fallback to take after being trusted -
+§3's rule 2 failure, not a cosmetic difference. Measured on the host, `0/0` refuses **every** raise
+(`setpriority(self, 0)` from a stored nice of 19 is `EACCES`, and so is `setpriority(self, 10)` - `10 <
+19` is still a raise), while an equal value is served (`setpriority(self, 19)` = `0`, because the equal
+case never asks `can_nice`).
+
+The `setrlimit` half differs for a second reason and is *not* a divergence: `rlimit_admit` refuses a
+raised hard limit when the caller is not root, and the payload is root - which is what Linux does for
+`CAP_SYS_RESOURCE` too.
+
+**Landed.** `crates/abi/src/lib.rs`'s `default_rlimits()` sets rows 13 and 14 to `Rlimit { cur: 0, max: 0 }`
+and its doc comment no longer argues they are absent; `crates/abi/src/lib.rs`'s host test pins both rows.
+Pin: `user/tests/src/bin/t-prlimit64.rs` gained two claims, `RLIMIT_NICE reads 0/0, the row Linux answers`
+and `RLIMIT_RTPRIO reads 0/0, the row Linux answers` - both red on the unfixed kernel
+(`build/boot-rlim-cf1.log`, `=== t-prlimit64 exit=1`) and green with it (`build/boot-rlim-fix1.log`,
+`exit=0`), kernel and loader both rebuilt between the two.
+
+**The reading half is a named gap, by shape.** `can_nice` inside `setpriority` is not implemented:
+`nice_may_raise` still asks for `CAP_SYS_NICE` and nothing else. On this machine the row can only be
+lifted by root (`rlimit_admit`'s `is_root` clause) and root holds the capability anyway, so every pair
+the row would admit is already admitted - a line implementing it would be one no fixture could tell
+apart from its absence, so rule 4's counterfactual would fail. It becomes real work when `rlimit_admit`
+learns `CAP_SYS_RESOURCE`, which is a separate question about who may lift a *hard* limit.
