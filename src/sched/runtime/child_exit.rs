@@ -1286,6 +1286,8 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
 
         t.tasks[slot] = Some(Task {
             context,
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             sem_undo,
             pdeathsig: 0,
             subreaper: false,
@@ -2013,6 +2015,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
 
         t.tasks[slot] = Some(Task {
             context,
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             sem_undo,
             fpu_live: false,
             priority,

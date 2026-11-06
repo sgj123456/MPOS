@@ -966,6 +966,23 @@ pub(crate) struct Task {
     /// until that machine wires its own FPU path.
     #[allow(dead_code)]
     pub(crate) fpu_live: bool,
+    /// The CPU **this thread** has used, in internal clock ticks, as
+    /// `(user, system)` - the pair behind `getrusage(RUSAGE_THREAD)`.
+    ///
+    /// A thread group's totals are `mm`'s (`Mm::cpu_all`), because `RUSAGE_SELF`
+    /// and `times()` are the process's and a group's CPU is the sum of its
+    /// threads'. Linux keeps both numbers, and they part company the moment a
+    /// process has a second thread: measured on Linux 7.2.14
+    /// (`build/scratch/batch/b.c`), a spinner thread moved `RUSAGE_SELF`'s
+    /// `ru_utime` 0.033 s -> 0.046 s while `RUSAGE_THREAD` inside the joined,
+    /// idle main thread stayed at 0.031 s.
+    ///
+    /// Charged in the same `charge_cpu` call that adds the tick to the group, so
+    /// the two doors can never disagree about how many ticks there were, and
+    /// they are atomics for the same reason the group's are: the charge happens
+    /// in the timer interrupt, which may not allocate.
+    pub(crate) cpu_user: core::sync::atomic::AtomicU64,
+    pub(crate) cpu_system: core::sync::atomic::AtomicU64,
     pub(crate) priority: Priority,
     /// `None` only for the boot task, whose stack belongs to the bootloader.
     pub(crate) stack: Option<Stack>,
@@ -1525,6 +1542,8 @@ impl Task {
     pub(crate) fn adopted() -> Task {
         Task {
             context: Context::empty(),
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             sem_undo: None,
             priority: Priority::NORMAL,
             stack: None,
@@ -2256,6 +2275,8 @@ impl Table {
 
         self.tasks[slot] = Some(Task {
             context,
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             // A kernel task has no System V adjustments to record or apply.
             sem_undo: None,
             fpu_live: false,

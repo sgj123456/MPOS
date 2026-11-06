@@ -183,6 +183,16 @@ One-glance status of the whole roadmap.
   is not implemented and is named as the open half: on this machine the row can only be lifted by
   root, which holds the capability anyway, so the check would be a line no fixture could tell apart
   from its absence until `rlimit_admit` learns `CAP_SYS_RESOURCE`
+- [x] `getrusage` serves all three `who` values, and the third is the thread's own CPU — `RUSAGE_SELF`
+  (0), `RUSAGE_THREAD` (1) and `RUSAGE_CHILDREN` (-1) are three constants Linux serves; this kernel
+  answered `EINVAL` for the middle one, which is the answer for a malformed argument given to a valid
+  constant and leaves the caller no fallback. Serving it needed a counter that did not exist: the
+  group's CPU lives on the shared `Mm` (that is `RUSAGE_SELF` and `times()`), and nothing recorded a
+  *thread*'s. The live `Task` now carries `cpu_user`/`cpu_system`, charged in the same `charge_cpu`
+  call that adds the tick to the group, so the two doors cannot disagree about how many ticks there
+  were; `t-times` pins four claims — the call succeeds, a spinner thread's CPU lands in `RUSAGE_SELF`,
+  it is *not* charged to the idle main thread's own record, and that record does grow when the main
+  thread itself burns — with the first two red on the kernel without the fix (§6.95, item 208)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

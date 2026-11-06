@@ -653,6 +653,8 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
 
         t.tasks[slot] = Some(Task {
             context,
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,
             // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the
@@ -856,6 +858,8 @@ pub fn try_spawn_user(
 
         t.tasks[slot] = Some(Task {
             context,
+            cpu_user: core::sync::atomic::AtomicU64::new(0),
+            cpu_system: core::sync::atomic::AtomicU64::new(0),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,
             // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the

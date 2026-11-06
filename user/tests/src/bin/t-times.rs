@@ -267,6 +267,93 @@ fn main() {
         other => r.check(&format!("getrusage(-2) is EINVAL (got {other:?})"), false),
     }
 
+    // --- getrusage(RUSAGE_THREAD): this thread's own CPU, not the group's ---
+    //
+    // Measured on Linux 7.2.14 (`build/scratch/batch/b.c`): a spinner thread
+    // moved `RUSAGE_SELF`'s `ru_utime` 0.033 s -> 0.046 s while `RUSAGE_THREAD`
+    // in the joined-but-idle main thread stayed at 0.031 s. So `who == 1` is a
+    // valid constant that Linux serves with the *task's* own CPU, and a kernel
+    // answering `EINVAL` refuses a shape the caller cannot recover from - while
+    // a kernel answering it with the group's totals would pass a "it succeeds"
+    // claim and still be a body with the wrong contents.
+    let mut th: Rusage = unsafe { core::mem::zeroed() };
+    seed(&mut th, 0xAA);
+    match getrusage(libc::RUSAGE_THREAD, &mut th) {
+        Ok(0) => r.check("getrusage(RUSAGE_THREAD) succeeds", true),
+        other => r.check(
+            &format!("getrusage(RUSAGE_THREAD) succeeds (got {other:?})"),
+            false,
+        ),
+    }
+    let thread_before = micros(th.ru_utime);
+
+    let mut sb: Rusage = unsafe { core::mem::zeroed() };
+    let _ = getrusage(libc::RUSAGE_SELF, &mut sb);
+    let self_before = micros(sb.ru_utime);
+
+    // The spinner is its own yardstick: it burns until the *group's* user time
+    // has grown 20 ms, so the claim does not depend on how fast this machine
+    // runs. A ceiling keeps a machine whose CPU is never charged from hanging
+    // the program; that shape reddens the growth claim instead.
+    let spinner = std::thread::spawn(move || {
+        let mut chunks = 0u32;
+        loop {
+            burn_chunk();
+            chunks += 1;
+            if chunks % 8 == 0 {
+                let mut now: Rusage = unsafe { core::mem::zeroed() };
+                if getrusage(libc::RUSAGE_SELF, &mut now).is_ok()
+                    && micros(now.ru_utime) >= self_before + 20_000
+                {
+                    break;
+                }
+            }
+            if chunks >= 4_000 {
+                break;
+            }
+        }
+    });
+    spinner.join().unwrap();
+
+    let mut sa: Rusage = unsafe { core::mem::zeroed() };
+    let _ = getrusage(libc::RUSAGE_SELF, &mut sa);
+    let self_after = micros(sa.ru_utime);
+    let mut ta: Rusage = unsafe { core::mem::zeroed() };
+    let _ = getrusage(libc::RUSAGE_THREAD, &mut ta);
+    let thread_after = micros(ta.ru_utime);
+
+    let group_grew = self_after - self_before;
+    let thread_grew = thread_after - thread_before;
+    r.check(
+        &format!("a spinner thread's CPU lands in RUSAGE_SELF (grew {group_grew} us)"),
+        group_grew >= 20_000,
+    );
+    // The group grew at least the 20 ms the spinner waited for; this thread's
+    // own record must not carry it. A kernel that answered `RUSAGE_THREAD` with
+    // the group's totals would report exactly that growth here - which is why
+    // the bound is the spinner's target and not a ratio: an idle thread can
+    // still pick up a tick or two of accounting slop, and a claim that reddened
+    // on that would be pinning the scheduler rather than the record's owner.
+    r.check(
+        &format!(
+            "and is not charged to this thread's own RUSAGE_THREAD (grew {thread_grew} us, the group {group_grew} us)"
+        ),
+        thread_grew < 20_000,
+    );
+    // The other half, so a kernel that answered zero forever cannot pass: this
+    // thread's own record moves when *this* thread burns CPU.
+    let own_before = thread_after;
+    let mut own_now: Rusage = unsafe { core::mem::zeroed() };
+    let mut read_own = || {
+        let _ = getrusage(libc::RUSAGE_THREAD, &mut own_now);
+        micros(own_now.ru_utime)
+    };
+    let own_after = burn_until_grew(own_before, &mut read_own);
+    r.check(
+        &format!("this thread's own record grows when this thread burns CPU ({own_after} us)"),
+        own_after > own_before,
+    );
+
     // --- reaped-child aggregation: a child's CPU folds into the parent ---
     //
     // A fresh process has waited no children, so its child CPU is zero. Fork a

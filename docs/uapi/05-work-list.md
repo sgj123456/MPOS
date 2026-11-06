@@ -9412,3 +9412,39 @@ lifted by root (`rlimit_admit`'s `is_root` clause) and root holds the capability
 the row would admit is already admitted - a line implementing it would be one no fixture could tell
 apart from its absence, so rule 4's counterfactual would fail. It becomes real work when `rlimit_admit`
 learns `CAP_SYS_RESOURCE`, which is a separate question about who may lift a *hard* limit.
+
+### Item 208 - `getrusage(RUSAGE_THREAD)` is served with the thread's own CPU (2026-11-07, landed)
+
+Found by walking a batch of small syscalls on both machines and diffing the whole transcript
+(`build/scratch/batch/a.c`), rather than by reading one call's handler. `who` has three values in
+Linux's uapi; this kernel served two and answered `EINVAL` for the third - the answer for a malformed
+argument, given to a valid constant.
+
+| | Linux (host, 7.2.14) | this kernel, before |
+|---|---|---|
+| `getrusage(RUSAGE_THREAD, &ru)` | `0`, `ru_utime` = this thread's own | `-1 EINVAL`, record untouched |
+| `getrusage(RUSAGE_SELF, &ru)` | `0`, the whole group's | `0`, the whole group's |
+| `getrusage(2, &ru)` | `-1 EINVAL` | `-1 EINVAL` |
+
+The two served doors differ the moment a process has a second thread: with one spinner thread,
+`RUSAGE_SELF`'s `ru_utime` went `0.033 s -> 0.046 s` while `RUSAGE_THREAD` in the idle main thread
+stayed at `0.031 s`. Answering the third value from the group's counters would have been the
+approximation shape - a claim that "it succeeds" passes and the body is another thread's CPU.
+
+**Landed.** The live `Task` carries `cpu_user`/`cpu_system` atomics, charged in `charge_cpu` beside the
+group's increment (interrupt context: allocation-free, bounded, two atomics);
+`current_thread_cpu_ticks()` reads them; `handle_getrusage` accepts `who == 1` and answers from that
+accessor. Owner: `src/sched/runtime/task.rs`, `src/sched/runtime/child_signal.rs`,
+`src/syscall/linux/proc.rs`.
+
+Pin: `user/tests/src/bin/t-times.rs`, four claims - `getrusage(RUSAGE_THREAD) succeeds`, `a spinner
+thread's CPU lands in RUSAGE_SELF`, `and is not charged to this thread's own RUSAGE_THREAD`, and
+`this thread's own record grows when this thread burns CPU` (the fourth because a kernel answering
+zero forever would satisfy the third). Both thread claims are red on the unfixed kernel
+(`build/boot-thread-cpu-cf1.log`, `=== t-times exit=1`) and green with it
+(`build/boot-thread-cpu3.log`, `exit=0`); on the host, `MPOS_ON_HOST=1` reports `grew 70 us, the group
+20867 us`.
+
+The per-thread counter's doc comment had claimed "there is no per-thread split because there are no
+threads here" - false since `clone(CLONE_THREAD)` landed. Mechanism, measurements and the third claim's
+bound: `docs/notes/` §6.95.

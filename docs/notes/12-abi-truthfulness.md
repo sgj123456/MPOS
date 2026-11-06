@@ -292,7 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, the two `0/0` resource rows §6.94):** stage 1 `1224 tests, 0 failed`
+**Latest measured gate (2026-11-07, `RUSAGE_THREAD` §6.95):** stage 1 `1224 tests, 0 failed`; x86_64
+`pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 88.73 s` (`build/gate-threadcpu.log`,
+stage 1 `88.39 s`); aarch64 `pass=262 fail=0 (262 built)`, `mpos-kunit 35 passed, 0 failed`, `total 88.08 s`
+(`build/gate-threadcpu-a.log`, stage 1 `87.76 s`). Lane count forced to two on both arms
+(`MPOS_TEST_LANES=2`). The pin's four claims are `ok:` on both arms and `t-times` is `=== PASS` on both.
+
+**One red before it, and it was the boot check racing rather than either arm:** the first run of *both*
+arms in one command (`build/gate-threadcpu.log`) was green on x86_64 and then timed out on aarch64 - lane
+0's serial ends at the machine's own `cpu:` check, `the virtual timer's one-shot did not wake idle() two
+milliseconds out (ticks moved to 73, ...)`, which halts the machine and so hangs the lane for its 900 s
+outer bound. That check arms a 2 ms one-shot, parks, and then *requires the tick count not to move* - with
+a 4 ms tick, an arm placed inside the same period lets the periodic tick arrive first, which is a confound
+and not a violation, and two TCG guests plus a host stage-1 run on one core make that window easy to hit.
+Re-run alone, the aarch64 arm came back `pass=262 fail=0` in 88.08 s. The check's own fix is a separate
+commit (it is a boot assertion, not an ABI claim).
+
+**Measured gate before it (2026-11-07, the two `0/0` resource rows §6.94):** stage 1 `1224 tests, 0 failed`
 (50.48 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 50.79 s
 (previous green run 44.10 s, +15.2%)` (`build/gate-rlim-x3.log`); aarch64 `pass=262 fail=0 (262 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 131.12 s (previous green run 129.94 s, +0.9%)`

@@ -7100,3 +7100,87 @@ kernel answers `infinity` for tells the caller the opposite of what the kernel w
 the ones whose zero *is* the rule (`RLIMIT_NICE`, `RLIMIT_RTPRIO`), and "we do not carry that row" is a claim
 to check with `getrlimit` before it is written into a comment - this one read `infinity` on the machine that
 was said not to carry it.
+
+## §6.95 `RUSAGE_THREAD` is the thread's CPU, and this kernel refused it as a bad argument (LANDED 2026-11-07)
+
+`getrusage(2)`'s `who` has three values: `RUSAGE_SELF` (0), `RUSAGE_THREAD` (1) and `RUSAGE_CHILDREN`
+(-1). This kernel served two of them and answered `EINVAL` for the third - a *valid* constant refused
+the way a bad argument is, which is the one shape `docs/ARCHITECTURE.md` §3's rule 2 cannot excuse:
+a caller that asks for its thread's CPU is told its request was malformed, and has no fallback to take.
+The refusal was not a decision recorded anywhere; it was the `if who != SELF && who != CHILDREN`
+guard, and the two-valued world behind it.
+
+**What Linux answers.** Measured on host 7.2.14 (`build/scratch/batch/b.c`, musl-gcc -static -O1
+-pthread) - a process with one spinner thread, `ru_utime` in seconds:
+
+```
+                          RUSAGE_SELF     RUSAGE_THREAD
+before any spin              0.033            0.031
+after the spinner ran        0.046            0.031     <- the spinner's CPU is the group's, not main's
+after main also spun         0.049            0.034
+who = 2                     -1 EINVAL
+```
+
+So the two doors report different numbers the moment a process has a second thread, and `who == 1`
+answers the *calling task's* own CPU, with no child term. (Linux's own `getrusage(RUSAGE_THREAD)` in
+glibc is served from `current->utime/stime`, which is why the two rows above diverge exactly by what
+the spinner burned.)
+
+**What this kernel answered.** A probe calling all three (`build/scratch/batch/a.c`, run through the
+one-test boot, `build/probe/oneshot/serial.log`):
+
+```
+getrusage(RUSAGE_SELF, &ru)      = 0
+getrusage(RUSAGE_CHILDREN, &ru)  = 0
+getrusage(RUSAGE_THREAD, &ru)    = -1 errno=22 (Invalid argument)
+getrusage(99, &ru)               = -1 errno=22
+```
+
+The last line is Linux's answer and is right; the third is the same answer for a `who` Linux serves.
+
+**Why it was not servable in one line.** The kernel had no per-thread CPU counter. `Mm`'s
+`cpu_utime`/`cpu_stime` are the *group's* - shared by every thread, because `RUSAGE_SELF` and
+`times()` are the process's - and `current_cpu_ticks`'s doc comment said so: "there is no per-thread
+split because there are no threads here". That sentence was inherited and false: this kernel has had
+threads since `clone(CLONE_THREAD)` and `t-exec-threads` runs them on both machines. Serving
+`RUSAGE_THREAD` from the group's counters would have been the *approximating* fix - it passes a
+"the call succeeds" claim and hands back a body that is the wrong process's (`docs/notes/` §3's rule 4,
+refuse rather than approximate).
+
+**The fix.** Two `AtomicU64`s on the live `Task` (`cpu_user`, `cpu_system`, `src/sched/runtime/task.rs`
+- the pair a *thread* owns), charged in the same `charge_cpu` call that adds the tick to the group, so
+the two doors cannot disagree about how many ticks there were; `current_thread_cpu_ticks()` in
+`src/sched/runtime/child_signal.rs` reads them; `handle_getrusage` accepts `who == 1` and answers from
+that accessor. The charge happens in the timer interrupt, so both additions are atomics - allocation-free
+and bounded, as rule 5 requires of interrupt context - and a task that never runs costs nothing.
+
+**The pin** is four claims in `t-times`, and its counterfactual is a real red, because the shape it
+pins is "the call is served" rather than "the call is nearly served":
+
+```
+unfixed kernel                                            fixed kernel
+FAIL:  getrusage(RUSAGE_THREAD) succeeds (got Err(...         ok:    getrusage(RUSAGE_THREAD) succeeds
+         code: 22, kind: InvalidInput ...))                   ok:    a spinner thread's CPU lands in RUSAGE_SELF (grew 24000 us)
+ok:    a spinner thread's CPU lands in RUSAGE_SELF            ok:    and is not charged to this thread's own RUSAGE_THREAD
+FAIL:  and is not charged to this thread's own RUSAGE_THREAD         (grew 4000 us, the group 24000 us)
+         (grew -6148914691235850538 us ...)                  ok:    this thread's own record grows when this thread burns CPU
+FAILED  (=== t-times exit=1)                                  PASS    (=== t-times exit=0)
+```
+
+(`build/boot-thread-cpu-cf1.log` - built from a stash of the six source files with **both** the kernel
+and the loader rebuilt, since the loader carries the kernel as a deflate payload - and
+`build/boot-thread-cpu3.log`.) The third claim is the one that could be satisfied by a kernel that
+always answers zero, so the fourth exists: the same record must move when *this* thread burns. On the
+host both machines' runs agree (`MPOS_ON_HOST=1`: `grew 70 us, the group 20867 us`).
+
+The second claim's bound is the spinner's own target (20 ms) rather than a ratio: an idle thread can
+still pick up a tick or two of accounting slop on a uniprocessor (the guest's tick is 4 ms, and one
+run showed 4000 us), and a claim that reddened on that would be pinning the scheduler's accounting
+slop rather than who owns the record. A kernel answering with the group's totals reports *at least*
+the group's growth there, so the bound still catches the approximating shape.
+
+**The rule.** A `who` that Linux serves is not "an unsupported option": `EINVAL` is a statement that
+the argument was malformed. When the honest answer needs a counter that does not exist yet, the choice
+is between adding the counter and naming the gap - refusing a valid constant is neither, and it is
+especially cheap to spot when the refusal sits beside two siblings that resolve it correctly (the
+`_ => EINVAL` arm here is the same disagreement §6.91 found in `prlimit64`'s cross-process half).

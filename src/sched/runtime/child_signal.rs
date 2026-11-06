@@ -1249,9 +1249,40 @@ pub fn charge_cpu(in_user: bool) {
     // charge means the tick is simply not attributed; the machine is whole.
     with_table(|t| {
         if let Some(task) = t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            // Two charges, one tick: the group's (what `RUSAGE_SELF` and
+            // `times()` report) and the thread's (`RUSAGE_THREAD`). Linux keeps
+            // both and they differ the moment a process has two threads, so the
+            // pair below is the whole distinction - see `Task::cpu_user`.
             task.mm.charge_tick(in_user);
+            let counter = if in_user {
+                &task.cpu_user
+            } else {
+                &task.cpu_system
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     });
+}
+
+/// The running **thread**'s CPU time in internal clock ticks, `(user,
+/// system)` - what `getrusage(RUSAGE_THREAD)` reports.
+///
+/// Distinct from [`current_cpu_ticks`], which is the group's: a process with two
+/// threads where one spins has a growing `RUSAGE_SELF` and an unchanged
+/// `RUSAGE_THREAD` in the idle thread (measured on Linux 7.2.14,
+/// `build/scratch/batch/b.c`: 0.033 s -> 0.046 s against 0.031 s -> 0.031 s).
+/// `(0, 0)` before the scheduler runs or if `current` names no live task.
+#[cfg(target_os = "none")]
+pub fn current_thread_cpu_ticks() -> (u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => (
+                task.cpu_user.load(Ordering::Relaxed),
+                task.cpu_system.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        },
+    )
 }
 
 /// The running process's CPU time in internal clock ticks, `(user, system)`.

@@ -5312,9 +5312,10 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     // so never saw it. Truncating to the `int` the ABI names accepts both, which
     // is what the migrated `t-times` pins.
     const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_THREAD: i32 = 1;
     const RUSAGE_CHILDREN: i32 = -1;
     let (who, usage) = (args[0] as u32 as i32, args[1]);
-    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
+    if who != RUSAGE_SELF && who != RUSAGE_THREAD && who != RUSAGE_CHILDREN {
         return err::EINVAL;
     }
     // A null `usage` here is not "not interested" as it is on the wait doors -
@@ -5324,12 +5325,23 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     //
     // `RUSAGE_SELF` is the process's own split CPU; `RUSAGE_CHILDREN` is the
     // CPU of children already waited for, which the reap folded into the
-    // parent's child totals.
+    // parent's child totals; `RUSAGE_THREAD` is **this thread's** own, which
+    // Linux reports from the task rather than from the group.
+    //
+    // The two differ the moment a process has a second thread, and a kernel
+    // that answered one with the other would be a shape that looks finished:
+    // measured on Linux 7.2.14 (`build/scratch/batch/b.c`), a spinner thread
+    // moved `RUSAGE_SELF`'s `ru_utime` 0.033 s -> 0.046 s while
+    // `RUSAGE_THREAD` inside the idle main thread stayed at 0.031 s. This
+    // kernel answers `EINVAL` for `who == 1` before the change - a valid
+    // constant refused as if it were a bad argument, which is the shape a
+    // caller cannot recover from (docs/notes/ §3's rule 2).
     let (utime, stime) = match who {
         RUSAGE_SELF => {
             let (u, s, _, _) = crate::sched::current_cpu_ticks();
             (u, s)
         }
+        RUSAGE_THREAD => crate::sched::current_thread_cpu_ticks(),
         _ => {
             let (_, _, cu, cs) = crate::sched::current_cpu_ticks();
             (cu, cs)
