@@ -292,7 +292,15 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, the futex tests' module lock §6.87):** stage 1 `1224 tests,
+**Latest measured gate (2026-11-06, the stop as a record §6.88):** stage 1 `1224 tests, 0 failed`
+(39.59 s); x86_64 `pass=258 fail=0 (258 built)`, `mpos-kunit 35 passed, 0 failed`, `total 39.78 s
+(previous green run 47.89 s, -16.9%)`; aarch64 `pass=257 fail=0 (257 built)`, `mpos-kunit 35
+passed, 0 failed`, `total 91.00 s (previous green run 117.04 s, -22.2%)` (`build/gate-parkfinal.log`).
+Both arms are fully green, which is the point: the detach claim that reddened once on an aarch64 lane
+in the run below is green here, because `trace::park` no longer hands a stopped task back to the
+picker (§6.88, item 201).
+
+**Measured gate before it (2026-11-06, the futex tests' module lock §6.87):** stage 1 `1224 tests,
 0 failed` (24.63 s) — the first run in several sessions where the host stage was green **and** the
 tail that reaches the gate names a number rather than only `error: test failed, to rerun pass -p
 mpos --lib`; x86_64 `pass=258 fail=0 (258 built)`, `total 24.82 s (previous green run 28.31 s,

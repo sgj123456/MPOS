@@ -469,11 +469,69 @@ pub(crate) fn park(regs: &mut AbiRegs, stop: Stop) {
             t.sched.wake(parent);
         }
         let priority = t.task(id).priority;
+        // A park blocks on a record, not a condition: whatever else was true of
+        // this task, it is not runnable while the stop stands (`leave_ready`'s
+        // doc has the measured shape).
+        t.sched.leave_ready(id);
         // `u64::MAX` is "until someone wakes me". A stop has no clock on it:
         // a tracee that gave up waiting would break the protocol, and a group
         // stop is ended by `SIGCONT` and nothing else.
         t.sched.sleep(id, priority, u64::MAX);
     });
+    // A wake is not the same thing as "the stop is over", and this loop is the
+    // difference: two things wake a stopped task without ending its stop, a
+    // timer it armed before it stopped (`nanosleep`'s own expiry, which the tick
+    // hands back as a plain wake) and any signal that is not one of the four
+    // that end a stop. Linux leaves both pending and the task stopped; treating
+    // the first wake of either kind as `SIGCONT` resumes a process the user
+    // suspended (`docs/notes/` §6.88).
+    //
+    // The check has to share the lock with the sleep: a resumer clears
+    // `trace.stop` *before* it wakes, so a check that found "still stopped" just
+    // before sleeping cannot miss a resume that landed in between - and a lost
+    // wake would be a task nothing ever resumes.
+    loop {
+        // `SIGKILL` is the one signal that ends a stop instead of waiting for
+        // it, and Linux says so plainly: measured on a host, `SIGTERM` to a
+        // stopped process leaves it `state=T` with the signal still pending
+        // (`waitpid -> 0`), while `SIGKILL` takes it at once (`waitpid` reports
+        // `signaled=1 sig=9`) - `.workbuddy/probe_stopterm.c`. Everything else
+        // a stopped task is sent stays pending until the `SIGCONT` that ends
+        // the stop; that is the rule the park loop below holds to by ignoring
+        // every other wake. A hold that ignored this one too would be a task
+        // nothing can ever end: the death would be queued, the park would put
+        // it back to sleep, and a parent's blocking `wait` would never hear of
+        // it - measured as `t-waitid` hanging after "a stopped child's si_uid
+        // is its real id too", which kills a stopped child and then waits for
+        // it to exit (`docs/notes/` §6.88).
+        if with_table(|t| t.task(id).signals & signal::bit(signal::SIGKILL) != 0) {
+            crate::sched::die_of_fatal_signal(signal::SIGKILL);
+        }
+        if with_table(|t| t.task(id).trace.stop.is_none()) {
+            break;
+        }
+        schedule(|t| {
+            if t.task(id).trace.stop.is_none() {
+                return;
+            }
+            // The same question inside the lock, so a `SIGKILL` that lands
+            // between the check above and the sleep below cannot be lost to
+            // it: the loop answers it on the next pass instead of sleeping
+            // through it.
+            if t.task(id).signals & signal::bit(signal::SIGKILL) != 0 {
+                return;
+            }
+            let priority = t.task(id).priority;
+            // Every sleep a park makes has to take the task out of the ready
+            // queue as well, or the loop spins on its own ready entry and a
+            // `SIGCONT` that clears the stop then finds no sleeper to wake -
+            // the task and its waiting parent park for ever (measured as
+            // `t-waitid` hanging at `a stopped child is reported by WSTOPPED`,
+            // 2026-11-04).
+            t.sched.leave_ready(id);
+            t.sched.sleep(id, priority, u64::MAX);
+        });
+    }
     *regs = with_table(|t| t.task(id).trace.regs).unwrap_or(snapshot);
 }
 

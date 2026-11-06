@@ -6435,3 +6435,89 @@ runs). The futex module was simply never converted.
 `0xa000`/`0xb000` races, and only when the harness happens to schedule them on two threads at once. A single-run
 green - which is what every hand check did, and what `run_captured`'s tail suggested - is not evidence that the
 suite is stable.
+
+## §6.88 A stop is a record, not a sleep: `trace::park` returned on the first wake of any kind (LANDED 2026-11-06)
+
+§6.79 named the shape - a stop published by `trace::park`, and any wake ending it - and §6.86 recorded seven
+attempts to pin it, every one of which either stayed green or hung `t-waitid`. This section is the one that
+landed, and the reason the previous seven could not: **the fixture was asking a question a stop-state copy
+cannot answer, and the pin had to be about whether the task ran.**
+
+**The defect, in the shape that made it invisible.** `trace::park` published the stop record, woke the tracer
+and the parent, and then called `t.sched.sleep(id, priority, u64::MAX)` exactly once. A parked task at that
+moment has **two** claims on it that disagree: a `trace.stop` record saying "stopped", and an entry that the
+scheduler's picker still pops from the ready queue - because `sleep` adds a heap entry but nothing removed the
+task from ready. The picker therefore handed the task back, `sleep` returned immediately, and `park` fell
+through with the stop record still installed. On the isolated fixtures this never showed: nothing else in those
+programs woke the task inside the window. Under the sweep's six concurrent machines an unrelated wake (a timer,
+a signal, any `sched.wake`) landed inside it, and the stopped task simply ran on - `t-ptrace-attach`'s detach
+claim reads the corpse: `a detach leaves a stop the user asked for alone (state "", collected true)`.
+
+**The fix, in two halves that have to move together.**
+
+1. `src/sched/policy.rs` gained
+
+   ```rust
+   pub fn leave_ready(&mut self, id: TaskId)
+   ```
+
+   which drops the task from every ready band. Its doc comment states the invariant this defect violated: a
+   parking task waits on a **record**, not on a condition, so it must not be reachable by the picker while the
+   record stands. Without this, `sleep` is a suggestion, not a park.
+2. `src/sched/runtime/trace.rs`'s `park` now calls `t.sched.leave_ready(id)` before `sleep`, and wraps the whole
+   of `sleep` in a loop that re-parks while the stop record is still there. Two wakes legitimately do not end a
+   stop and are named in the code: the tracee's own timer expiring before it stopped, and any signal that is not
+   one of the four that end a group stop. The one exception is `SIGKILL`: a stopped task that is killed must
+   die, so the loop checks the pending `SIGKILL` bit under the same table lock before deciding to re-park and
+   takes `die_of_fatal_signal(SIGKILL)` when it is set. That check is what previous attempts were missing; it is
+   why the earlier `hold`-style loops hung `t-waitid`, which kills a stopped child and then blocks in
+   `waitid(WEXITED)`.
+
+**The counterfactual, and the two pins that are not it.** Two fixtures were tried and rejected because the
+unfixed kernel passed them:
+
+- the 100-detach claim in `t-ptrace-attach` (`a detach leaves the user's stop alone, 100 times over`): green with
+  and without the fix, because nothing in that fixture produces a wake that is not a resume. This is §6.78a's
+  lesson in another costume - a poll window is not a state assertion, and a fixture that cannot aim the wake
+  cannot see the defect.
+- `PTRACE_SETREGS` on a stalled tracee (`a stop outlives a timer the tracee armed for itself (answer ...)`): also
+  green without the fix, because the *record* survives anyway - `set_trace_regs` only asks whether `trace.stop`
+  is `Some`, and the old `park` left it there even as the task ran. The register answer is not the observable.
+
+What is observed is **whether the stopped task ran past the stop**. The shipped fixture is
+`user/tests/src/bin/t-seccomp.rs`'s `claim_a_stop_outlives_the_tracees_own_timer`: the tracee arms a 50 ms
+`ITIMER_REAL` immediately before a judged call that stops it under `SECCOMP_RET_TRACE`, the tracer sleeps 200 ms
+(four times the timer), and the claim is
+
+```rust
+let mut probe = 0i32;
+let collected = unsafe { libc::waitpid(child, &mut probe, libc::WNOHANG) };
+r.check(
+    &format!("and the tracee has not run past it (waitpid {collected})"),
+    collected == 0,
+);
+```
+
+Measured, one boot each way, kernel and loader both rebuilt (`boot/src/lib.rs:176` embeds the kernel - a `-p
+mpos` rebuild alone measures the old one, §6.77b):
+
+| kernel | reading |
+|---|---|
+| without `leave_ready` + the re-park loop | `ok: a stop outlives a timer ... (answer Some(Ok(0)))` then **`FAIL: and the tracee has not run past it (waitpid 6)`**, `=== t-seccomp exit=1` |
+| with the fix | `ok: and the tracee has not run past it (waitpid 0)`, `ok: the traced timer's tracee then runs to its exit (status 0x0: exited=true)`, `PASS`, `=== t-seccomp exit=0` |
+
+Linux answers the same way (`build/scratch/stoppedsig/t.c`): a stopped task's timer expiring does not release
+the stop - six samples 100 ms apart all read state `T` and `waitpid` 0, and only `SIGCONT` ends it. The tracee's
+pending `SIGALRM` after the resume is a signal-delivery stop the tracer must answer, which is why the fixture's
+tail continues it while `WSTOPSIG(status) == SIGALRM` rather than assuming one `PTRACE_CONT` reaches the exit.
+
+**Gate.** `build/gate-parkfinal.log`, `TMPDIR=$PWD/build/tmp cargo xtask test`, both arms: stage 1 `1224 tests, 0
+failed`; x86_64 `pass=258 fail=0 (258 built)`; aarch64 `pass=257 fail=0 (257 built)`; `mpos-kunit 35 passed, 0
+failed` on both. The one red this section exists to close - `t-ptrace-attach`'s detach claim, which had appeared
+once on an aarch64 lane in `build/gate-futexlock.log` - is green on both arms in this run, and the 100-cycle
+detach claim stays in `t-ptrace-attach` as the regression guard for the detach path it does cover.
+
+**The rule.** A wait that is *decided by a record* must (a) make the task unreachable to the picker, and (b)
+re-check the record after every wake, because the wake set is not the resume set. A park that does only (b), or
+only (a), reads as correct in isolation and fails under load - which is why the fix needs the load to be
+measured, not just the fixture run once.

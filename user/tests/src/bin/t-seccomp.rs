@@ -681,6 +681,151 @@ fn claim_a_stop_survives_a_queued_signal(r: &mut Report) {
     );
 }
 
+/// Whether a stop the tracer has not answered yet outlives the tracee's own
+/// clock.
+///
+/// The tracee arms a 50 ms `ITIMER_REAL` immediately before the judged call and
+/// then stops at its seccomp event. The tracer waits 200 ms - four times the
+/// timer - and only then writes registers.
+///
+/// Linux (host, measured): `Ok(0)`. A stopped task's timer expiry does not
+/// release the stop; the signal stays pending and the task is still a task the
+/// tracer may write to (`.workbuddy/probe_stoptimer.c`). This machine answered
+/// `ESRCH` before `trace::park` stopped returning on the first wake of any kind
+/// (`docs/notes/` §6.86, §6.88).
+///
+/// This is the witness the detach claim could not be: a wake that is not a
+/// resume is the property, and a timer is the one wake this fixture can aim.
+fn claim_a_stop_outlives_the_tracees_own_timer(r: &mut Report) {
+    extern "C" fn ignore_alarm(_: libc::c_int) {}
+    const DATA: u32 = 0x2345;
+    const UID: u32 = libc::SYS_getuid as u32;
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: syscalls and one `signal(2)` between fork and `_exit`.
+        unsafe {
+            // A no-op handler: the point of the wake is that the task does not
+            // die of it, so the park is the only thing that could end the stop.
+            libc::signal(libc::SIGALRM, ignore_alarm as libc::sighandler_t);
+            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
+                libc::_exit(11);
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                libc::_exit(13);
+            }
+            libc::raise(libc::SIGSTOP);
+            if install(UID, libc::SECCOMP_RET_TRACE | DATA).map(|v| v == 0) != Ok(true) {
+                libc::_exit(12);
+            }
+            // Armed *after* the install, so the timer is running when the
+            // judged call stops the task.
+            let timer = libc::itimerval {
+                it_interval: libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                it_value: libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 50_000,
+                },
+            };
+            libc::setitimer(libc::ITIMER_REAL, &timer, core::ptr::null_mut());
+            let got = unsafe { libc::syscall(libc::SYS_getuid) } as isize;
+            libc::_exit(if got >= 0 { 0 } else { 15 });
+        }
+    }
+    let mut status = 0i32;
+    // SAFETY: `child` is this process's own child and `status` a local.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    if n != child {
+        r.check("a tracee for the timer claim was forked", false);
+        return;
+    }
+    r.check(
+        "a tracee for the timer claim was forked",
+        libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+    );
+    let _ = ptrace(
+        libc::PTRACE_SETOPTIONS as c_long,
+        child,
+        0,
+        PTRACE_O_TRACESECCOMP as usize,
+    );
+    let _ = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0);
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    let stopped = n == child && libc::WIFSTOPPED(status) && (status >> 16) == PTRACE_EVENT_SECCOMP;
+    r.check(
+        &format!(
+            "the timer's call stops the tracee (status {status:#x}: event={})",
+            status >> 16
+        ),
+        stopped,
+    );
+    if !stopped {
+        let _ = unsafe { libc::kill(child, libc::SIGKILL) };
+        let _ = unsafe { libc::waitpid(child, &mut status, 0) };
+        return;
+    }
+    // Four times the timer. On this machine before the fix the expiry woke the
+    // park and the stop was gone by here.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut regs: [u64; REG_WORDS] = [0; REG_WORDS];
+    let mut answered = None;
+    if ptrace(
+        libc::PTRACE_GETREGS as c_long,
+        child,
+        0,
+        regs.as_mut_ptr() as usize,
+    ) == Ok(0)
+    {
+        regs[NUMBER_SLOT] = UID as u64;
+        answered = Some(ptrace(
+            libc::PTRACE_SETREGS as c_long,
+            child,
+            0,
+            regs.as_ptr() as usize,
+        ));
+    }
+    r.check(
+        &format!("a stop outlives a timer the tracee armed for itself (answer {answered:?})"),
+        answered == Some(Ok(0)),
+    );
+    // The observable that matters is not the register write - the record stays
+    // there either way - but whether the task *ran*. Before the park held, the
+    // timer's wake released it, the judged call went through and the tracee
+    // reached its own `_exit`, so by now there is a death to collect and the
+    // "stopped" task is a corpse. Linux leaves it stopped until `SIGCONT`.
+    let mut probe = 0i32;
+    let collected = unsafe { libc::waitpid(child, &mut probe, libc::WNOHANG) };
+    r.check(
+        &format!("and the tracee has not run past it (waitpid {collected})"),
+        collected == 0,
+    );
+    // The tracee still has its `SIGALRM` pending, and a pending signal that
+    // reaches a traced task is a signal-delivery stop the tracer has to answer -
+    // so continue it as often as it stops for that signal before it can leave.
+    let _ = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0);
+    let mut n = 0;
+    for _ in 0..8 {
+        n = unsafe { libc::waitpid(child, &mut status, 0) };
+        if n != child || libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            break;
+        }
+        if libc::WSTOPSIG(status) != libc::SIGALRM {
+            break;
+        }
+        let _ = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0);
+    }
+    r.check(
+        &format!(
+            "the traced timer's tracee then runs to its exit (status {status:#x}: exited={})",
+            libc::WIFEXITED(status)
+        ),
+        n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
+}
+
 fn main() {
     let mut r = Report::new();
 
@@ -1014,6 +1159,7 @@ fn main() {
     );
 
     claim_a_stop_survives_a_queued_signal(&mut r);
+    claim_a_stop_outlives_the_tracees_own_timer(&mut r);
 
     r.finish()
 }

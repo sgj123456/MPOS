@@ -9155,3 +9155,28 @@ Linux's limit is memory; a machine whose limit is a table should be wider than a
 playground. The table is 256 now, at `256 × 32 KiB = 8 MiB` of stacks. Pinned by `t-fork-limit`'s *the
 machine has room for more than a hundred tasks at once* - it reads 57 at 64 slots and ~249 at 256. Both
 arms green after: `pass=258 fail=0` and `pass=257 fail=0`. `docs/notes/` §6.84.
+
+### Item 201 - a stop the tracer has not answered survives a wake that is not a resume (2026-11-06, landed)
+
+`trace::park` published a stop record, woke the tracer and then slept **once**. The task was still in the
+ready queue the picker pops from, so the picker handed it straight back, `sleep` returned, and the stop was
+over while the record stood. In the isolated fixtures no wake arrived inside that window, so everything
+looked right; under the sweep's six concurrent machines one did, and a task the user had `SIGSTOP`ed ran on
+- measured as `t-ptrace-attach`'s `a detach leaves a stop the user asked for alone (state "", collected
+true)`, once on an aarch64 lane. Linux (`build/scratch/stoppedsig/s.c`, `t.c`) keeps the stop: repeated
+`SIGSTOP` adds no second report, a `SIGTERM` stays pending at state `T`, a stopped task's own timer expiring
+does not release it, and only `SIGCONT` delivers the pending signal.
+
+Fixed in two halves that must move together: `policy::leave_ready` takes the parking task out of every ready
+band (a park waits on a record, not on a condition, so the picker must not reach it), and `park` re-checks
+the record after each wake and re-parks while it stands. `SIGKILL` is the one wake that ends it, taken
+through `die_of_fatal_signal` under the same table lock - the piece every earlier attempt missed, and the
+reason those loops hung `t-waitid`, which kills a stopped child and then blocks in `waitid(WEXITED)`.
+
+Pinned by `t-seccomp`'s *a stop outlives a timer the tracee armed for itself* plus *and the tracee has not
+run past it*: the tracee arms a 50 ms `ITIMER_REAL` before a `SECCOMP_RET_TRACE` stop, the tracer waits
+200 ms and then asks `waitpid(WNOHANG)`. Counterfactual, one boot each way with kernel **and** loader
+rebuilt: without the fix `FAIL: and the tracee has not run past it (waitpid 6)`; with it `waitpid 0` and
+`PASS`. `t-ptrace-attach` also carries *a detach leaves the user's stop alone, 100 times over* as the detach
+regression guard. Both arms green after: `pass=258 fail=0` and `pass=257 fail=0`, `mpos-kunit 35 passed, 0
+failed`. `docs/notes/` §6.88.

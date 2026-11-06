@@ -143,6 +143,124 @@ fn read_pid_file() -> isize {
         .unwrap_or(-1)
 }
 
+/// How many times the stop/detach/check cycle is repeated below.
+///
+/// One pass per gate run reddened about one run in three. The shape it needs is
+/// narrow: the `SIGSTOP` has to arrive while the target is already woken, so the
+/// stop's park finds its task back in the ready queue and returns instead of
+/// holding, and the target then runs on with its stop still recorded while
+/// `/proc` calls it `T`. That is a race, and a race cannot be a claim by itself -
+/// so this is the same coin tossed a hundred times in one program, which is both
+/// the shape that fails without the fix and the shape that passes with it
+/// (`docs/notes/` §6.84).
+const DETACH_CYCLES: usize = 100;
+
+/// The user's stop, a trace, and a detach - a hundred times over.
+///
+/// Each cycle is the three-step shape the single claim above states once, kept
+/// separate here because the *repetition* is the measurement, not any one pass.
+/// A cycle that cannot reach its own stop (the child died, the trace was
+/// refused) is skipped rather than counted, and the claim says how many cycles
+/// actually reached the question.
+fn claim_a_stop_survives_a_hundred_detaches(r: &mut Report) {
+    let mut reached = 0;
+    let mut lost: Option<String> = None;
+    let mut refused = false;
+    for cycle in 0..DETACH_CYCLES {
+        // The child parks in its own `nanosleep` for longer than the stop takes
+        // to arrive, which is the state the race needs: the kill wakes it out of
+        // that park, and only then is the stop delivered.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            continue;
+        }
+        if child == 0 {
+            sleep_ms(100);
+            // SAFETY: `_exit` never returns, and nothing here runs after it.
+            unsafe { libc::_exit(0) };
+        }
+        sleep_ms(20);
+        if unsafe { libc::kill(child, libc::SIGSTOP) } != 0 {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let mut ignored = 0;
+            unsafe { libc::waitpid(child, &mut ignored, 0) };
+            continue;
+        }
+        let mut status: libc::c_int = 0;
+        let mut stopped = false;
+        for _ in 0..40 {
+            sleep_ms(5);
+            status = 0;
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG | libc::WUNTRACED) } > 0 {
+                stopped = status & 0x7f == 0x7f;
+                break;
+            }
+        }
+        if !stopped {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let mut ignored = 0;
+            unsafe { libc::waitpid(child, &mut ignored, 0) };
+            continue;
+        }
+        let attached = ptrace(libc::PTRACE_ATTACH as libc::c_int, child, 0);
+        if refused_host(attached) {
+            refused = true;
+            unsafe { libc::kill(child, libc::SIGCONT) };
+            let mut ignored = 0;
+            unsafe { libc::waitpid(child, &mut ignored, 0) };
+            break;
+        }
+        let _ = ptrace(libc::PTRACE_DETACH as libc::c_int, child, 0);
+        // The window the single claim above uses, for the same reason: a detach
+        // that handed the target back running reaches its exit inside it.
+        let mut gone = false;
+        for _ in 0..20 {
+            sleep_ms(10);
+            status = 0;
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } > 0 {
+                gone = true;
+                break;
+            }
+        }
+        let state = stat_field(&format!("/proc/{child}/stat"), 3).unwrap_or_default();
+        reached += 1;
+        if gone || state != "T" {
+            lost = Some(format!(
+                "first loss at cycle {cycle}: state {state:?}, collected {gone}"
+            ));
+            unsafe { libc::kill(child, libc::SIGCONT) };
+            let mut ignored = 0;
+            unsafe { libc::waitpid(child, &mut ignored, 0) };
+            break;
+        }
+        unsafe { libc::kill(child, libc::SIGCONT) };
+        let mut ended = false;
+        for _ in 0..40 {
+            sleep_ms(5);
+            status = 0;
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } > 0 {
+                ended = true;
+                break;
+            }
+        }
+        if !ended {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let mut ignored = 0;
+            unsafe { libc::waitpid(child, &mut ignored, 0) };
+        }
+    }
+    let made_it = lost.is_none();
+    let detail = match (refused, lost) {
+        (true, _) => "the host refused the door".to_string(),
+        (false, Some(loss)) => loss,
+        (false, None) => format!("{reached} cycles reached the question"),
+    };
+    r.check(
+        &format!("a detach leaves the user's stop alone, {DETACH_CYCLES} times over ({detail})"),
+        made_it,
+    );
+}
+
 fn main() {
     println!("t-ptrace-attach");
     let mut r = Report::new();
@@ -414,6 +532,10 @@ fn main() {
         }
         r.check("and the user's own SIGCONT is what ends it", gone);
     }
+
+    // The same cycle, a hundred times: one pass is the coin toss the gate threw
+    // once per run, which is how this read as a flake for a week.
+    claim_a_stop_survives_a_hundred_detaches(&mut r);
 
     r.finish()
 }

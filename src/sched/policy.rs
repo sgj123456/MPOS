@@ -230,6 +230,26 @@ impl Scheduler {
         }));
     }
 
+    /// Take a task out of the ready queues without touching its sleep entry.
+    ///
+    /// A park is the one place a task blocks on a *record* rather than a
+    /// condition: it must not come back until somebody clears the record, so it
+    /// cannot be left looking runnable. The ordinary [`sleep`](Self::sleep) is
+    /// not enough on its own, because a task can be in both queues at once - a
+    /// `kill` that queues a stop signal wakes its target out of `nanosleep`
+    /// first, and the stop itself is then delivered at that task's own syscall
+    /// exit, by which time the target is in the ready queue again. Sleeping
+    /// while still runnable lets the picker take the ready entry, the park
+    /// returns immediately, and a process the user suspended runs on with its
+    /// stop still recorded. Measured on the gate's own aarch64 lane as
+    /// `a detach leaves a stop the user asked for alone (state "", collected
+    /// true)` (`docs/notes/` §6.88).
+    pub fn leave_ready(&mut self, id: TaskId) {
+        for band in self.ready.iter_mut() {
+            band.retain(|queued| *queued != id);
+        }
+    }
+
     /// The earliest deadline in the sleep queue, in the clock's own unit.
     ///
     /// The runtime asks for this after every turn to decide whether to arm the

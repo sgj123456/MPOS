@@ -35,7 +35,11 @@ One-glance status of the whole roadmap.
   `timeout(1)`'s `wait` answers (§6.37, §6.77b, §6.77c, item 123) - and a
   process-directed signal handed to a thread that may take it, so a copy that
   lands on a thread whose mask blocks it is not stuck there while the only
-  thread that could take it stays parked (§2.12, item 197); the named
+  thread that could take it stays parked (§2.12, item 197), and a stop that is a
+  **record** rather than a sleep - the parking task leaves the picker's queues
+  and re-checks the record after every wake, so a wake that is not a resume does
+  not hand a `SIGSTOP`ped task back with the stop still installed (§6.88, item
+  201); the named
   residues are the kernel-spawned program path's `SIG_DFL` start and the
   alternate-stack pin's shape, not a missing rule
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
@@ -830,34 +834,24 @@ parking its task, §10.5), the namespace ladder (all eight kinds of `namespaces(
 
 The shutdown path is its own open item (item 193, `docs/notes/` §7.4h): with the kill landing after the main loop is up, weston logs `caught signal 15` and stays alive — `/proc/<pid>/stat` reads `S threads: 2` before and `R threads: 1` after, the survivor parked at a wait, so the group is never reaped. Half of the mechanism is now named and closed: the group-death rule had **two** doors and only one of them ended the group, so a task that killed itself died alone and left its parked sibling alive (`syscall 62` at the `kill` gate, `retired=false`) — the one door is `die_of_fatal_signal`, pinned by `t-kill-ends-group`'s self-kill fixture (§6.77b, item 123). The second half is named and closed too: the copy that killed the wrong thread was **process-directed but delivered to one task**, and Linux hands such a signal to a thread that may take it - measured as a parked worker's `FUTEX_WAIT` answering `EINTR` where this kernel's left the handler unrun and both threads parked (§2.12, item 197, pinned by `t-signal-park`'s third shape). What still stands open is the composition's own ending: weston's survivor may be a thread at a futex nobody wakes for a different reason (§7.4h's fourth and fifth readings, both measured with `retired=false`), and the confirmation still owed is weston's own boot reaching a reaped group.
 
-Two more observations were named on 2026-11-04 and neither is diagnosed yet. **A detach can hand back a tracee the
-user had stopped**: `t-ptrace-attach`'s "a detach leaves a stop the user asked for alone" reddened twice on the
-second machine's six-lane sweep, once with the collected evidence `(state "", collected true)` — the detach resumed
-a child the user had `SIGSTOP`ped — and it will not reproduce alone (8/8 green in one x86_64 boot, and green on the
-same fix in a control run). The suspect is that `PTRACE_ATTACH` injects its stop as the same `SIGSTOP` bit a user's
-`kill -STOP` sets, and a task has one stop object, so `detach_traced`'s "drop the attach's stop" clears the user's
-too (§6.79). A stopped tracee's own wake is the newest reading there: `trace::park` sleeps once and returns on
-the first wake of any kind, so the park comes back with the stop still recorded (`mpos-dbg: PARKWAKE id=6
-stop_now=true`), and the re-park loop written for it was **not shipped** — the claim that would pin it passes with
-and without the loop, which pins nothing (§3 rule 4). The stop itself holds on both machines through a stopped
-process's own `nanosleep` deadline and its own interval timer, so those are not the interleaving either. **A
-one-lane sweep exhausted the 64 task slots** — both halves of that are now closed: the caller gets Linux's
-`EAGAIN` (§6.81, item 198), and the "leak" was the runner's own arithmetic, since `busybox timeout -s KILL
-<budget>` keeps a watchdog child alive for the whole budget, one slot per program for two minutes, so a lane
-of ~50 programs filled the table and `MAX_TASKS` is 256 now (§6.80/§6.84, item 200). What is still owed is the
-stop's own interleaving: the failing detach run is caught in the act (`GROUPSTOP` then a `PARKWAKE` that
-leaves `trace.stop` set, no `DETACH-CLEAR`, no `RESUME`, no `SIGCONT-CLEAR`, then the child runs to its exit),
-and the two halves of a fix were written and reverted twice because neither could be pinned — a park whose
-sleep leaves its task in the ready queue has to be taken out of it, and a wake that is not a resume has to be
-re-parked, but every bare-stop shape this file could build stayed green without either (§6.79).
-**Two reds sit beside it, both seen once and neither diagnosed** (2026-11-04, the first aarch64 arm runs
-after the task table widened): `t-seccomp`'s "the tracer can rewrite the syscall number at the seccomp stop"
-— a bare `PTRACE_SETREGS` answering something other than 0, while the same program's cancel-the-call claim,
-which makes the same call, passed — and a lane that ran past its 900 s budget with no summary. Both are
-one-offs under a host running the whole sweep's TCG machines; the first now has a mechanism — its bare
-`PTRACE_SETREGS` fell to `ESRCH` because `set_trace_regs` needs `trace.stop.is_some()`, i.e. the same park
-that returns on any wake (§6.85) — and a cheaper pin shape than the detach's, a blocked signal sent between
-the stop and the `SETREGS`. The second has no reading yet.
+Two more observations were named on 2026-11-04. **One is closed: a detach could hand back a tracee the user had
+stopped.** `t-ptrace-attach`'s "a detach leaves a stop the user asked for alone" reddened twice on the second
+machine's six-lane sweep, once with `(state "", collected true)`, and would not reproduce alone. The suspect named
+here — `PTRACE_ATTACH`'s stop and the user's `SIGSTOP` sharing one stop object — was the wrong half; the defect was
+in `trace::park`, which slept once while its task was still in the ready queue the picker pops from, so the park
+came back on the first wake of any kind and the stopped task ran on (`mpos-dbg: PARKWAKE id=6 stop_now=true`, the
+record still set, nothing clearing it). The fix is `policy::leave_ready` plus a re-park loop that also lets
+`SIGKILL` through, and the reason two earlier versions of that loop were reverted is now part of the record: the
+fixtures they were written against stayed green without the fix **because a stop-state copy cannot answer the
+question** — `set_trace_regs` only asks whether `trace.stop` is `Some`, and the old park left it set even as the
+task ran. What distinguishes the two is whether the stopped task ran, so the shipped pin arms a 50 ms timer in the
+tracee before its stop and asks `waitpid(WNOHANG)` 200 ms later: `FAIL: and the tracee has not run past it
+(waitpid 6)` without the fix, `waitpid 0` with it (§6.88, item 201), and the 100-cycle detach claim stays as the
+detach guard. §6.79's open paragraph is closed by this.
+
+**What that left, and is still open:** `t-seccomp`'s "the tracer can rewrite the syscall number at the seccomp
+stop" was the same park answered `ESRCH` (§6.85), and it is green now that the stop holds. A lane that ran past
+its 900 s budget with no summary has no reading yet.
 
 ---
 
