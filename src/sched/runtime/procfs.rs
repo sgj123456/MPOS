@@ -263,6 +263,16 @@ pub struct TaskSnapshot {
     /// Frames behind the group's user mappings. `stat` wants resident pages,
     /// `status` wants kilobytes, and both are this number.
     pub rss_pages: usize,
+    /// The nice value `setpriority` stored on this task, `-20..=19` - the
+    /// number `/proc/<pid>/stat`'s field 19 prints and its field 18 prints as
+    /// `20 + nice`.
+    ///
+    /// Measured on a current host (`build/scratch/psig/n.c`, Linux 7.2.14):
+    /// with the process at nice 19 the two fields read `39` and `19`, so the
+    /// pair is one number twice, and a kernel that printed `20`/`0` there was
+    /// reporting the defaults rather than the value `setpriority` had stored
+    /// (`docs/notes/` §6.101).
+    pub nice: i32,
     /// The signal this task's death reports - the byte its `clone` carried,
     /// held as the byte rather than as a boolean because Linux *delivers* it
     /// and prints it. `/proc/<pid>/stat`'s field 38 is the one report of it,
@@ -340,6 +350,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .count()
             .max(1),
         rss_pages,
+        nice: task.nice,
         exit_signal: task.exit_signal,
         cpu: task.mm.cpu_all(),
         cpu_own: (

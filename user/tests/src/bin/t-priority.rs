@@ -97,6 +97,24 @@ fn setpriority(which: i32, who: i32, nice: i32) -> Result<(), Errno> {
 }
 
 /// The 48-byte `struct sched_attr`'s `sched_nice`, at its own offset.
+/// `/proc/self/stat`'s fields 18 and 19 - `priority` and `nice`.
+///
+/// A second door onto the same number `getpriority` reports: Linux prints the
+/// stored nice in field 19 and its `20 + nice` encoding in field 18 (measured
+/// on a current host, `build/scratch/psig/n.c`: nice 19 reads `39`/`19`), so a
+/// `ps` and a `getpriority` that disagree about one process are two answers to
+/// one question. Read through the last `)` because field 2 is the command name
+/// and may contain spaces.
+fn stat_priority_and_nice() -> Option<(i64, i64)> {
+    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let tail = &text[text.rfind(')')? + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    // Field N is `fields[N - 3]`: field 3, the state, is the first token here.
+    let priority = fields.get(15)?.parse().ok()?;
+    let nice = fields.get(16)?.parse().ok()?;
+    Some((priority, nice))
+}
+
 fn attr_nice(attr: &[u8; 48]) -> i32 {
     i32::from_ne_bytes([attr[16], attr[17], attr[18], attr[19]])
 }
@@ -181,6 +199,25 @@ fn main() {
         "getpriority reads back 17 (= 20 - 3)",
         getpriority(PRIO_PROCESS, 0) == 17,
     );
+
+    // The same number through the other door: `/proc/self/stat` formats the
+    // stored nice, not a constant. Before this shipped both fields were
+    // literals (`20`/`0`), so a `ps` on a reniced process printed 0 whatever
+    // `setpriority` had stored - measured on a current host as the pair
+    // `39`/`19` for nice 19.
+    let (priority, nice) = stat_priority_and_nice().unwrap_or((-1, -1));
+    r.check(
+        &format!("proc stat's priority is 20 + its nice (reads {priority}/{nice})"),
+        priority == 20 + nice,
+    );
+    // The machine half: this host starts every process at nice 19 and refuses
+    // a raise, so it cannot show the set this program made - the machine can.
+    if !mpos_user_tests::host_run() {
+        r.check(
+            &format!("proc stat reports the nice setpriority stored (reads {priority}/{nice})"),
+            priority == 23 && nice == 3,
+        );
+    }
 
     // The whole process group the caller leads is the same set for a
     // single-process group: a group set round-trips through the process get.

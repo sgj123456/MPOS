@@ -292,7 +292,16 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/stat`'s counters §6.100):** stage 1 `1233 tests, 0 failed`
+**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s nice pair §6.101):** stage 1 `1233 tests,
+0 failed` (92.16 s); x86_64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total
+92.51 s (previous green run 99.46 s, -7.0%)`; aarch64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35
+passed, 0 failed`, `total 232.67 s (previous green run 236.29 s, -1.5%)` (`build/gate-nicefield.log`),
+both arms in one command with the lane count forced to two. `GATE EXIT=0`. The new pin is `=== PASS` on
+both arms, and both read the value a `setpriority` put there rather than the literal:
+`proc stat's priority is 20 + its nice (reads 23/3)` and `proc stat reports the nice setpriority stored
+(reads 23/3)` (`build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-1/serial.log`).
+
+**Measured gate before it (2026-11-07, `/proc/stat`'s counters §6.100):** stage 1 `1233 tests, 0 failed`
 (99.11 s); x86_64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total 99.46 s
 (previous green run 54.77 s, +81.6%)`; aarch64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 236.29 s (previous green run 152.83 s, +54.6%)` (`build/gate-procstat.log`), both arms

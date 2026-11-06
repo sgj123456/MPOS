@@ -1528,6 +1528,10 @@ pub struct Process {
     pub session: usize,
     pub threads: usize,
     pub rss_pages: usize,
+    /// See [`crate::sched::TaskSnapshot::nice`] - the mirror carries the field
+    /// because the *generators* are compiled here too, which is what makes the
+    /// file's shape host-testable.
+    pub nice: i32,
     pub exit_signal: u8,
     /// See [`crate::sched::TaskSnapshot::cpu`] - the mirror carries the field
     /// because the *generators* are compiled here too, which is what makes the
@@ -1688,8 +1692,11 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         Cow::Owned(alloc::format!("{stime}")),
         Cow::Owned(alloc::format!("{cutime}")),
         Cow::Owned(alloc::format!("{cstime}")),
-        Cow::Borrowed("20"), // priority
-        Cow::Borrowed("0"),  // nice
+        // priority/nice: one number twice, the way Linux reports it - the
+        // stored nice and its `20 + nice` encoding. Measured on a current host
+        // (`build/scratch/psig/n.c`): nice 19 reads `39`/`19`.
+        Cow::Owned(alloc::format!("{}", 20 + task.nice)),
+        Cow::Owned(alloc::format!("{}", task.nice)),
         Cow::Owned(alloc::format!("{}", task.threads)),
         Cow::Borrowed("0"), // itrealvalue
         // starttime: no per-task record of when a process began, so every
@@ -5812,6 +5819,7 @@ mod tests {
             session: 0,
             threads: 1,
             rss_pages: 0,
+            nice: 0,
             exit_signal: 17,
             cpu: (0, 0, 0, 0),
             cpu_own: (0, 0),

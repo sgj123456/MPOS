@@ -259,6 +259,10 @@ One-glance status of the whole roadmap.
   times handlers out of system separately, which needs per-handler timing), and the `intr` line is
   absent rather than zero because there is no per-vector count - a zero would claim the machine never
   took an interrupt. Pin `t-procstat`, seven of nine claims red without the fix (§6.100, item 213)
+- [x] `/proc/<pid>/stat`'s nice pair are the stored nice, not two literals - fields 18/19 read
+      `20 + nice` and `nice` where they used to be the constants `20`/`0`, so a `ps` on a reniced
+      process no longer prints nice 0 (measured: nice 19 reads `39`/`19` on a current host; the
+      machine's own process set to 3 reads `23`/`3`, `20`/`0` without the fix — `§6.101`, item 214).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

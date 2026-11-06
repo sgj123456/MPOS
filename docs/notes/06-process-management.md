@@ -7664,3 +7664,48 @@ the nearest number at hand (here, the uptime) is worse than leaving the line out
 subtracts two readings and reports the difference. And "idle" is a context, not the absence of a slot:
 the scheduler's own loop is a task on this machine, so every question about "is anything running" has to
 name it.
+
+## §6.101 `/proc/<pid>/stat`'s nice pair were two literals (LANDED 2026-11-07)
+
+`/proc/<pid>/stat` fields 18 and 19 — `priority` and `nice` — were the string literals `"20"` and
+`"0"`, so a process that had called `setpriority` was still described by a `ps` as nice 0 at priority
+20. It is one number reported twice, and the kernel had it stored (`Task::nice`, `src/sched/runtime/
+task.rs:1291`) the whole time: the file simply did not read it. Measured on a current host that the
+pair is one number (`build/scratch/psig/n.c`, Linux 7.2.14): with the process at nice 19 the two
+fields read
+
+```
+nice=0       priority(f18)=39 nice(f19)=19
+```
+
+so field 18 is `20 + nice` and field 19 is the stored nice. (The same probe is why the host cannot
+*counterfactual* this: every process in that container starts at nice 19 and `RLIMIT_NICE` is `0/0`,
+so `setpriority` to anything else is refused - the machine's own process starts at nice 0 and can be
+lowered, which is what the pin sets.)
+
+**The fix** is the field reading the value rather than a constant: `TaskSnapshot` carries `nice`
+(`src/sched/runtime/procfs.rs:275`, filled by `snapshot_of` from `task.nice`), the host mirror
+`Process` carries it too, and `stat_line` (`src/vfs/procfs.rs:1698`) formats `20 + nice` and `nice`.
+
+**The pin** is in `user/tests/src/bin/t-priority.rs`, which already sets and restores a nice value
+through `setpriority`: two claims beside the round-trip.
+
+- `proc stat's priority is 20 + its nice (reads 23/3)` — the relation, on both machines.
+- `proc stat reports the nice setpriority stored (reads 23/3)` — the machine claim: after
+  `setpriority(PRIO_PROCESS, 0, 3)` both doors say 3.
+
+The relation claim alone is not a counterfactual (the literals `20`/`0` satisfy it), which is why the
+second claim exists and is machine-only: this host starts every process at nice 19.
+
+```
+unfixed kernel (build/boot-nicefield-cf1.log)   ok:   priority is 20 + its nice (reads 20/0)
+                                                FAIL: reports the nice setpriority stored (reads 20/0)
+                                                === t-priority exit=1
+fixed kernel   (build/boot-nicefield2.log)      ok:   priority is 20 + its nice (reads 23/3)
+                                                ok:   reports the nice setpriority stored (reads 23/3)
+                                                === t-priority exit=0
+```
+
+**The rule.** A field a reader formats is answered from the kernel's own record of that thing, not
+from the default value of the thing: two literals look like an answer because the common case is nice
+0, and the case that is not the common case is the one a monitor exists to show.

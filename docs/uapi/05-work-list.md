@@ -9621,3 +9621,24 @@ aggregate equals `cpu0` on this one CPU). Red on the unfixed kernel - seven of n
 (`build/boot-procstat-cf1.log`, `=== t-procstat exit=1`), green with it
 (`build/boot-procstat-stat2.log`, `(12 -> 13)`, `(493 -> 539)`, `exit=0`), and `PASS` on the host.
 Mechanism and the full reading: `docs/notes/` §6.100.
+
+### Item 214 - `/proc/<pid>/stat`'s `priority` and `nice` are the stored nice (2026-11-07, landed)
+
+| | Linux | this kernel, before | this kernel, now |
+|---|---|---|---|
+| field 18 `priority` | `20 + nice` | literal `20` | `20 + nice` |
+| field 19 `nice` | the stored nice | literal `0` | the stored nice |
+| with nice 3 (measured) | `23` / `3` | `20` / `0` | `23` / `3` |
+| with nice 19 (host reading) | `39` / `19` | - | - |
+
+**Landed.** `TaskSnapshot::nice` (`src/sched/runtime/procfs.rs:275`) reads `Task::nice`
+(`src/sched/runtime/task.rs:1291`), the host mirror `Process` carries it, and `stat_line`
+(`src/vfs/procfs.rs:1698`) formats the pair. Owner: `src/sched/runtime/procfs.rs`,
+`src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-priority.rs` - `proc stat's priority is 20 + its nice (reads 23/3)` (both
+machines) and `proc stat reports the nice setpriority stored (reads 23/3)` (machine-only: this host
+starts every process at nice 19 and `RLIMIT_NICE` is `0/0`, so the host cannot move the value the
+claim is about). Red on the unfixed kernel (`build/boot-nicefield-cf1.log`, `20/0`, `=== t-priority
+exit=1`), green with it (`build/boot-nicefield2.log`, `23/3`, `exit=0`). Reading and rule:
+`docs/notes/` §6.101.
