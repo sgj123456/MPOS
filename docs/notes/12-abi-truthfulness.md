@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, the two CPU-time clocks §6.99):** stage 1 `1231 tests, 0 failed`
+**Latest measured gate (2026-11-07, `/proc/stat`'s counters §6.100):** stage 1 `1233 tests, 0 failed`
+(99.11 s); x86_64 `pass=267 fail=0 (267 built)`, `mpos-kunit 35 passed, 0 failed`, `total 99.46 s
+(previous green run 54.77 s, +81.6%)`; aarch64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 236.29 s (previous green run 152.83 s, +54.6%)` (`build/gate-procstat.log`), both arms
+in one command with the lane count forced to two. `GATE EXIT=0`, and the two totals above the previous
+run are the host's: the two arms ran concurrently on this single-core container (the same statement the
+`§6.98` block makes). The new pin is `=== PASS` on both arms - x86_64 `the cpu line carries ten columns
+([2882, 0, 252, 7667, 0, 0, 0, 0, 0, 0])`, aarch64 `user and system grow while this process burns CPU
+(3951 -> 4028)`, `the idle column grows while the machine has nothing to run (15657 -> 15732)`,
+`processes counts the task this run forked (839 -> 840)`, `ctxt counts the switches a sleep takes
+(64341 -> 64400)` - and `t-loadavg` stays green after the idle-identity change (`(6/10)`, `(32
+hundredths)`).
+
+**Measured gate before it (2026-11-07, the two CPU-time clocks §6.99):** stage 1 `1231 tests, 0 failed`
 (54.44 s); x86_64 `pass=266 fail=0 (266 built)`, `mpos-kunit 35 passed, 0 failed`, `total 54.77 s
 (previous green run 99.22 s, -44.8%)`; aarch64 `pass=265 fail=0 (265 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 152.83 s (previous green run 187.39 s, -18.4%)` (`build/gate-cpuclock2.log`), both

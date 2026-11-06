@@ -7547,3 +7547,120 @@ still what proves the namespace moved them and not the caller.
 two ids Linux derives from the CPU counters must be derived from them here - agreeing with the sibling
 call that reports the same number (`getrusage`) is the check that catches this class. And when the
 reading moves in tick steps, the advertised resolution has to be the tick.
+
+## §6.100 `/proc/stat` printed the uptime as CPU time, and three of its lines did not exist (LANDED 2026-11-07)
+
+**What Linux answers.** `/proc/stat` is the first file a monitor reads, and every field in it is a
+*counter*: two readings subtracted are a rate, one reading is "since boot". Measured on the host
+(`build/scratch/stat/s.c`, musl static pthread, Linux 7.2.14):
+
+```
+cpu  2372652 1659219 418642 84996969 90527 127699 64261 0 10254 12726   (ten columns)
+cpu0 ... (one line per CPU, same shape)
+ctxt 398176780      btime 1793942878      processes 538201
+procs_running 3     procs_blocked 0       intr 415096808 130 5605 ...
+```
+
+and the probe fixing each field's meaning:
+
+```
+processes: 538372 -> after 3 forks 538375 (+3) -> after 3 pthread_create 538378 (+3)
+ctxt:      398374095 -> 398374107 (+12)
+intr:      +6 during the run
+btime=1793942878  now=1793998793  uptime=55915.27   (now - uptime rounds to btime)
+```
+
+So `processes` counts **threads as well as processes** - Linux increments `total_forks` in
+`copy_process`, which every `clone` goes through - `ctxt` counts context switches, `btime` is
+`now - uptime` to the second, `procs_running` is `nr_running`, and `procs_blocked` is
+`nr_uninterruptible`.
+
+**What this kernel answered.** The generator was one `format!`:
+
+```
+cpu  {} 0 0 0 0 0 0 0 0 0        <- the {} is (ticks / TICK_HZ), the uptime in seconds
+intr 0
+ctxt 0
+```
+
+with no `btime`, `processes`, `procs_running` or `procs_blocked` line at all. Measured on the machine
+before the fix (`build/scratch/stat/read.c` staged as `t-statread`, log `build/boot-statread-cf.log`):
+
+```
+--- t=0
+cpu  0 0 0 0 0 0 0 0 0 0
+intr 0
+ctxt 0
+--- t=12s
+cpu  12 0 0 0 0 0 0 0 0 0
+intr 0
+ctxt 0
+```
+
+The user column **grew by one per second of wall time** - it was the uptime, and by minute ten it would
+have claimed ten thousand times the CPU time the machine had spent - while `system` and `idle` were
+hardcoded zero, `intr`/`ctxt` claimed the machine had never taken an interrupt or left a task, and the
+four lines every monitor wants were absent (a reader's parse error, not a zero).
+
+**The fix.** A new host-compiled `src/sched/cpustat.rs` carries the counters this kernel actually keeps:
+`USER_TICKS`/`SYSTEM_TICKS`/`IDLE_TICKS` charged from the tick (`charge_cpu`, the same hook the load
+average samples on), `TASKS_MADE` bumped in `Table::alloc_slot` (the one door a task enters through, so
+threads count exactly as Linux counts them), and `SWITCHES` bumped in `schedule` after `hand_over` and
+before the stacks change. `/proc/stat` prints them in Linux's order and shape: an aggregate `cpu` line
+with ten columns, a `cpu0` line (a uniprocessor's aggregate *is* its one CPU), `ctxt`, `btime`
+(`hal::boot_epoch`, which is what the wall clock anchors on), `processes`, `procs_running`
+(`sched::runnable_count`) and `procs_blocked` (a new `sched::blocked_count`, the uninterruptible
+sleepers the load average already folds into `active`).
+
+**Which context is idle.** The first boot of the pin failed on the idle column: it stayed zero while the
+process slept. The cause was the definition of "nobody was running" - every reader asked "is there a
+current task", and the answer is always yes: the scheduler's own loop *is* the current task whenever it
+has nothing to hand the CPU to (`hand_over` enters `SCHED_ID` and the picker runs there). So idle ticks
+were charged to the scheduler, and the same mistake floored the **load average** at about 0.9 on an idle
+machine (`active` always counted one) and made `procs_running` at least one. All three readers now ask
+`current != SCHED_ID`, which is what "the idle context" means here. Linux's `nr_running` excludes idle
+for the same reason, and its idle time is the idle task's own.
+
+**What is still not counted, and is named rather than faked.** The `cpu` line's other seven columns -
+nice, iowait, irq, softirq, steal, guest, guest_nice - print zero because this kernel keeps no such
+dimension: interrupt time is charged to whatever the interrupt interrupted (Linux takes `irq`/`softirq`
+*out* of system and times handlers separately, a measurement this kernel does not make), and a
+uniprocessor with no steal or guest notion has nothing to put in the last four. The `intr` line is
+**absent** rather than zero: there is no per-vector interrupt count, and a zero would claim the machine
+had never taken an interrupt - the one kind of lie `AGENTS.md` §3 forbids. Both are recorded in
+`docs/ROADMAP.md` with what each needs (per-handler time accounting, a per-vector dispatch count).
+
+**Pin.** `user/tests/src/bin/t-procstat.rs`, nine claims: the ten columns exist; user+system grow while
+this process burns CPU; idle grows while the machine sleeps; `btime` is `now - uptime` within two
+seconds; `processes` grows when the run forks; `ctxt` grows across a sleep; `procs_running` reaches two
+with a spinner beside this thread; `procs_blocked` reads zero (and exists); and the aggregate equals
+`cpu0` on this one-CPU machine (machine-only - Linux on many CPUs would disagree). Every claim holds on
+the host too (`MPOS_ON_HOST=1`: `btime 1793942878 against 1793942878, 0 s apart`, `processes 544329 ->
+544330`, `ctxt 403807382 -> 403808181`).
+
+Red on the unfixed kernel (`build/boot-procstat-cf1.log`): seven of the nine -
+
+```
+FAIL:  user and system grow while this process burns CPU (0 -> 0)
+FAIL:  and the idle column grows while the machine has nothing to run (0 -> 0)
+FAIL:  the file names the boot instant (btime is a line of its own)
+FAIL:  the file counts the tasks it made and the switches it took
+FAIL:  procs_running counts the threads that could run (0)
+FAIL:  procs_blocked names the uninterruptible waiters (absent)
+FAIL:  the file has a cpu0 line beside the aggregate
+```
+
+- and green with it (`build/boot-procstat-stat2.log`): `the cpu line carries ten columns ([46, 0, 23, 0,
+...])`, `user and system grow while this process burns CPU (70 -> 146)`, `and the idle column grows while
+the machine has nothing to run (0 -> 76)`, `btime is now minus uptime (1793999696 against 1793999695, 1 s
+apart)`, `processes counts the task this run forked (12 -> 13)`, `ctxt counts the switches a sleep takes
+(493 -> 539)`, `procs_running counts the threads that could run (4)`, `procs_blocked names the
+uninterruptible waiters (0)`, `the aggregate is cpu0, this being one CPU (323 against 323)`. The two
+claims that stay green on both are shape claims (ten columns, and the burn) - which is why a pin needs
+claims that would fail if the number were a constant.
+
+**The rule.** A field every monitor parses is a promise that the kernel *counts* that thing; printing
+the nearest number at hand (here, the uptime) is worse than leaving the line out, because the reader
+subtracts two readings and reports the difference. And "idle" is a context, not the absence of a slot:
+the scheduler's own loop is a task on this machine, so every question about "is anything running" has to
+name it.

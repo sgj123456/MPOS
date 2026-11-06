@@ -1262,6 +1262,17 @@ pub fn charge_cpu(in_user: bool) {
             };
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        // The machine's own counters: one tick in exactly one of the three CPU
+        // columns (`sched::cpustat`, `/proc/stat`'s `cpu` line).
+        //
+        // "Nobody was running" is `current == SCHED_ID`, not "no current task":
+        // the scheduler's own loop *is* the current task whenever it has nothing
+        // to hand the CPU to (`hand_over` enters `SCHED_ID` and the picker runs
+        // there), so a slot test alone would charge every idle tick to the
+        // scheduler and `/proc/stat`'s idle column would stay zero on a sleeping
+        // machine - which is the reading the pin caught on its first boot.
+        let running = t.current != super::SCHED_ID;
+        crate::sched::cpustat::charge(in_user, running);
         // The load average's sample, on Linux's own schedule: one tick in every
         // five seconds, not every tick. `active` is Linux's `nr_running +
         // nr_uninterruptible`: the ready queues, the one task that is running
@@ -1272,7 +1283,10 @@ pub fn charge_cpu(in_user: bool) {
         // 5-second boundaries, and four spinners lift the one-minute average
         // from 1.94 to 2.27 at the next one.
         if crate::sched::loadavg::sample_tick(crate::hal::TICK_HZ) {
-            let running = usize::from(current.is_some());
+            // The same identity `cpustat::charge` uses: the scheduler's loop is
+            // not a runnable task, and counting it would floor an idle machine's
+            // load at about 0.9 instead of letting it decay to zero.
+            let running = usize::from(t.current != super::SCHED_ID);
             let active = t.sched.ready_count() + t.sched.uninterruptible_count() + running;
             crate::sched::loadavg::AVENRUN.update(active as u64);
         }
@@ -1292,9 +1306,24 @@ pub fn charge_cpu(in_user: bool) {
 #[cfg(target_os = "none")]
 pub fn runnable_count() -> usize {
     with_table(|t| {
-        let running = usize::from(t.tasks.get(t.current.0).and_then(|s| s.as_ref()).is_some());
+        // Linux's `nr_running` excludes the idle context, and this kernel's idle
+        // context is the scheduler's own loop.
+        let running = usize::from(t.current != super::SCHED_ID);
         t.sched.ready_count() + running
     })
+}
+
+/// How many tasks are in an **uninterruptible** wait right now: Linux's
+/// `nr_uninterruptible`, which `procs_blocked` counts and which the load
+/// average folds into `active` alongside the runnable ones.
+///
+/// The wait that lands here is the one a signal may not interrupt - the block
+/// transfer's and the ext4 claim's (`sched::policy::Sleeper::uninterruptible`,
+/// `§6.98`) - so a task counted here is blocked on the device, not on
+/// userland's own choice.
+#[cfg(target_os = "none")]
+pub fn blocked_count() -> usize {
+    with_table(|t| t.sched.uninterruptible_count())
 }
 
 /// The running **thread**'s CPU time in internal clock ticks, `(user,

@@ -5,6 +5,9 @@
 //! runtime below it owns the task table and the stacks, and calls into
 //! `arch::context` to move between them.
 
+/// The machine's own counters - CPU time per mode, tasks made, switches - and
+/// the one door `/proc/stat` reads. Host-compiled because they are integers.
+pub mod cpustat;
 pub mod exit;
 pub mod fs;
 pub mod futex;
@@ -63,7 +66,7 @@ pub use runtime::{
     block_until_child_event, block_until_code, block_until_interruptible,
     block_until_interruptible_rolling_back, block_until_nanos, block_until_uninterruptible,
     block_until_uninterruptible_armed, block_until_uninterruptible_at,
-    block_until_uninterruptible_until, brk, charge_cpu, check_itimer, child_event,
+    block_until_uninterruptible_until, blocked_count, brk, charge_cpu, check_itimer, child_event,
     child_event_pending, child_visible_to, claim_anon_gaps, clone, continued_report_pending,
     controlling_tty_of_current, credentials_of, current, current_blocked, current_cgroup_root,
     current_child_subreaper, current_comm_bytes, current_cpu_ticks, current_credentials,
@@ -572,6 +575,13 @@ pub fn current_thread_cpu_ticks() -> (u64, u64) {
 #[cfg(not(target_os = "none"))]
 pub fn runnable_count() -> usize {
     1
+}
+
+/// Nothing blocks in the host build's one-process fiction, which is what
+/// `/proc/stat`'s `procs_blocked` reads as there.
+#[cfg(not(target_os = "none"))]
+pub fn blocked_count() -> usize {
+    0
 }
 
 /// The host build's one process, so one slot stands for "the running task's

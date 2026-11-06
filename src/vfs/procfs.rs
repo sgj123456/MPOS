@@ -4170,12 +4170,45 @@ impl ProcFs {
         // was. Nor is a file that says "cannot tell you" better: the difference
         // between "none" and "unknown" is the whole value of the file.
         self.root.add("modules", NodeKind::File, file(String::new));
+        // `/proc/stat`: the machine's counters, and not a stand-in for them.
+        //
+        // This file used to print the machine's **uptime in seconds** as the
+        // `cpu` line's user field, with `intr 0` and `ctxt 0` below it and no
+        // `btime`, `processes`, `procs_running` or `procs_blocked` line at all.
+        // Every reader of this file (`vmstat`, `top`, `sar`, every exporter)
+        // takes those fields as counters and does arithmetic on the deltas, so
+        // a minute of uptime read back as ten thousand times the CPU time the
+        // machine had spent, and the missing lines were a reader's parse error.
+        // The shape below is Linux's, measured on the host (`build/scratch/stat/
+        // s.c`, `§6.100`): ten `cpu` columns, one `cpuN` line per CPU, `ctxt`,
+        // `btime`, `processes`, `procs_running`, `procs_blocked`.
+        //
+        // Three of those ten columns are what this kernel actually counts
+        // (user, system, idle - `sched::cpustat`); the rest are printed as zero
+        // because the dimensions themselves are not accounted here, which the
+        // module header states and `docs/ROADMAP.md` names as a gap. The `intr`
+        // line is **absent** rather than zero: this kernel does not keep a
+        // per-vector interrupt count, and a zero there would claim no interrupt
+        // had ever been taken - the one kind of lie `AGENTS.md` §3 forbids.
+        // `cpuN` repeats the aggregate because this is a uniprocessor: one CPU
+        // is the whole machine, which is also why the aggregate and `cpu0` agree.
         self.root.add(
             "stat",
             NodeKind::File,
             file(|| {
-                let (secs, _) = uptime();
-                alloc::format!("cpu  {} 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\n", secs)
+                let counters = crate::sched::cpustat::counters();
+                let cpu = alloc::format!(
+                    "{} 0 {} {} 0 0 0 0 0 0",
+                    counters.user, counters.system, counters.idle
+                );
+                alloc::format!(
+                    "cpu  {cpu}\ncpu0 {cpu}\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
+                    counters.switches,
+                    boot_seconds(),
+                    counters.tasks,
+                    runnable_count(),
+                    blocked_count(),
+                )
             }),
         );
         // Every device the kernel has registered, split the way a reader of
@@ -4582,6 +4615,37 @@ fn runnable_count() -> usize {
 #[cfg(not(target_os = "none"))]
 fn runnable_count() -> usize {
     1
+}
+
+/// The boot instant in epoch seconds, for `/proc/stat`'s `btime`.
+///
+/// Linux's `btime` is "when the machine booted", and this kernel's wall clock is
+/// exactly that anchor plus the ticks since (`hal::boot_epoch` +
+/// `ticks / TICK_HZ`), so the anchor itself is the answer - measured on the host
+/// as `now - uptime` rounded to the second (`btime=1793942878`, `now=1793998793`,
+/// `uptime=55915.27`, `§6.100`). A host build has no RTC, so it says zero, the
+/// same answer it gives for uptime.
+#[cfg(target_os = "none")]
+fn boot_seconds() -> u64 {
+    crate::hal::boot_epoch()
+}
+
+#[cfg(not(target_os = "none"))]
+fn boot_seconds() -> u64 {
+    0
+}
+
+/// How many tasks are blocked in an uninterruptible wait, for `/proc/stat`'s
+/// `procs_blocked` - Linux's `nr_uninterruptible`. The host build's one-process
+/// fiction blocks nothing.
+#[cfg(target_os = "none")]
+fn blocked_count() -> usize {
+    crate::sched::blocked_count()
+}
+
+#[cfg(not(target_os = "none"))]
+fn blocked_count() -> usize {
+    0
 }
 
 /// The calling thread's id, for `/proc/thread-self`.

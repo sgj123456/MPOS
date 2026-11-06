@@ -9580,3 +9580,44 @@ fork (`build/scratch/forkcpu/f.c`: parent `242041816 ns` against child `12794 ns
 (`CLOCK_PROCESS_CPUTIME_ID still reads the child's own CPU inside the namespace (0 us against
 RUSAGE_SELF's 0 us, 0 us apart)`, `build/boot-nstime-fix1.log`). Mechanism and the full reading:
 `docs/notes/` §6.99.
+
+### Item 213 - `/proc/stat` is counters, and every line a monitor parses exists (2026-11-07, landed)
+
+The file printed the machine's **uptime in seconds** as the `cpu` line's user column, with `system` and
+`idle` hardcoded zero, `intr 0` and `ctxt 0` beneath them, and no `btime`, `processes`, `procs_running`
+or `procs_blocked` line at all. Every monitor (`vmstat`, `top`, `sar`, every exporter) subtracts two
+readings of these fields to get a rate, so the number at hand was arithmetic on the wrong quantity.
+
+| | Linux (host, 7.2.14) | this kernel, before |
+|---|---|---|
+| `cpu` columns | ten, counters since boot | ten, but `user` was the uptime in seconds |
+| a reading 12 s into the boot | `user` ~ a tick count | `cpu  12 0 0 0 0 0 0 0 0 0` |
+| `cpu0` line | one per CPU | absent |
+| `btime` | `now - uptime` to the second | absent |
+| `processes` | tasks **and threads** made since boot (`+3` per three `fork`s or threads) | absent |
+| `ctxt` | context switches (`+12` across a six-task run) | `ctxt 0` (never switched) |
+| `procs_running`, `procs_blocked` | `nr_running`, `nr_uninterruptible` | absent |
+
+**Landed.** `src/sched/cpustat.rs` (host-compiled) keeps the counters this kernel can honestly count -
+user/system/idle ticks charged from the tick, tasks made in `Table::alloc_slot`, switches in `schedule`
+- and `/proc/stat` prints them in Linux's shape. Two questions of *definition* came with it: an idle
+tick is one where `current == SCHED_ID` (the scheduler's own loop is a task here, so "is there a current
+task" is always yes - the first boot of the pin read `idle 0 -> 0`), and the same identity now fixes
+`procs_running` and the load average's `active`, which had counted that loop as a runnable task and
+floored an idle machine at about `0.9`. Owner: `src/vfs/procfs.rs`, `src/sched/cpustat.rs`,
+`src/sched/runtime/{child_signal,task}.rs`.
+
+**Named gaps, not stubs.** The `cpu` line's nice/iowait/irq/softirq/steal/guest/guest_nice columns print
+zero because this kernel keeps no such dimension (interrupt time is charged to whatever the interrupt
+interrupted; Linux times handlers separately), and the `intr` line is **absent** rather than `0` - there
+is no per-vector count, and a zero would claim the machine never took an interrupt. Both are recorded in
+`docs/ROADMAP.md` with what each would need.
+
+Pin: `user/tests/src/bin/t-procstat.rs`, nine claims (ten columns; user+system grow across a burn; idle
+grows across a sleep; `btime` against `now - uptime` within two seconds; `processes` grows on a fork;
+`ctxt` grows across a sleep; `procs_running` reaches two beside a spinner; `procs_blocked` reads zero;
+aggregate equals `cpu0` on this one CPU). Red on the unfixed kernel - seven of nine, including
+`(0 -> 0)` for both CPU claims and `(absent)` for `procs_blocked`
+(`build/boot-procstat-cf1.log`, `=== t-procstat exit=1`), green with it
+(`build/boot-procstat-stat2.log`, `(12 -> 13)`, `(493 -> 539)`, `exit=0`), and `PASS` on the host.
+Mechanism and the full reading: `docs/notes/` §6.100.

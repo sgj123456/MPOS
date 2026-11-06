@@ -2237,6 +2237,11 @@ impl Table {
         // is empty, or its number is not the one the descriptor recorded.
         self.generations[slot] = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
+        // A slot taken is a task made: `/proc/stat`'s `processes`, which Linux
+        // counts in `copy_process` and therefore counts threads in too. The
+        // scheduler's own reserved slot never comes through here (`create_at`
+        // names it), so the count is of tasks the machine spawned.
+        crate::sched::cpustat::count_task();
         Some(slot)
     }
 
@@ -3625,6 +3630,11 @@ pub(crate) fn schedule(prepare: impl FnOnce(&mut Table)) {
         // Deliberately not `with_table`: the borrow has to be dead before the
         // switch below, and a closure would hold it across.
         let (from, to) = unsafe { (*TABLE.borrow(cs).get()).hand_over(prepare) };
+        // One switch, counted after the table borrow is dead and before the
+        // stacks change: `/proc/stat`'s `ctxt` is this number, and Linux counts
+        // every switch the same way - the count is the machine's, not a task's,
+        // so there is no table state to guard it with.
+        crate::sched::cpustat::count_switch();
         unsafe { hal::switch_context(from, to) };
     });
 }

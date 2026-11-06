@@ -244,6 +244,21 @@ One-glance status of the whole roadmap.
   lock - samples it and feeds `ready + uninterruptible + running` (uninterruptible sleepers now say
   so), and both readers read that array; the fourth field's denominator became threads, as Linux
   counts. `t-loadavg` pins it, three claims red without the fix (`§6.98`, item 211)
+- [x] `/proc/stat` is counters, and the lines a monitor parses exist — the file printed the machine's
+  **uptime in seconds** as the `cpu` line's user column (`final cpu  12 0 0 0 …` twelve seconds into a
+  boot, measured), with `system`/`idle` hardcoded zero, `intr 0` and `ctxt 0`, and no `btime`,
+  `processes`, `procs_running` or `procs_blocked` line at all, while every monitor subtracts two
+  readings of exactly those fields. `src/sched/cpustat.rs` now keeps what the kernel can honestly count
+  - user/system/idle ticks from the tick, tasks made in `alloc_slot`, switches in `schedule` - and the
+  file prints them in Linux's ten-column shape with `cpu0`, `ctxt`, `btime`, `processes`,
+  `procs_running` and `procs_blocked`. The question the pin settled on its first boot was what "idle"
+  *is*: the scheduler's own loop is the current task whenever nothing runs, so every reader now asks
+  `current != SCHED_ID` - which also stopped the load average flooring an idle machine at about 0.9 and
+  `procs_running` at one. **Named gaps:** the nice/iowait/irq/softirq/steal/guest columns print zero
+  because this kernel keeps no such dimension (interrupt time is charged to what it interrupted; Linux
+  times handlers out of system separately, which needs per-handler timing), and the `intr` line is
+  absent rather than zero because there is no per-vector count - a zero would claim the machine never
+  took an interrupt. Pin `t-procstat`, seven of nine claims red without the fix (§6.100, item 213)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
