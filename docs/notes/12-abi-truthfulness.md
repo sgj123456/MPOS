@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, a number read in its own namespace §6.91):** stage 1 `1224 tests,
+**Latest measured gate (2026-11-06, an affinity mask's number is resolved first §6.92):** stage 1
+`1224 tests, 0 failed` (40.68 s); x86_64 `pass=262 fail=0 (262 built)`, `mpos-kunit 35 passed, 0 failed`,
+`total 40.88 s (previous green run 43.11 s, -5.2%)` (`build/gate-aff.log`), with the new pin's thirteen
+`ok:` lines and `=== PASS t-affinity-rules` in `build/test-serial.log`; aarch64 `pass=261 fail=0
+(261 built)`, `mpos-kunit 35 passed, 0 failed`, `total 40.57 s (previous green run 85.34 s, -52.5%)`
+(`build/gate-aff-a2.log`), the same thirteen `ok:` and `=== PASS t-affinity-rules` in
+`build/test-lane-aarch64-4/serial.log`. The first aarch64 attempt lost `t-ns-pid` to its 120 s budget
+(`=== FAIL t-ns-pid timeout=120s`, the section stopped after `the child reports eight words`) with the
+other five lanes green at 1/43/53/54/54 - the recorded §6.22 hang, and not a reading: the re-run quoted
+here is 261/0.
+
+**Measured gate before it (2026-11-06, a number read in its own namespace §6.91):** stage 1 `1224 tests,
 0 failed` (42.89 s); x86_64 `pass=261 fail=0 (261 built)`, `mpos-kunit 35 passed, 0 failed`,
 `total 43.11 s (previous green run 42.35 s, +1.8%)`, and the new pin green in
 `build/test-serial.log` (`ok: prlimit64 names the task the number does … (123 / 456)`,

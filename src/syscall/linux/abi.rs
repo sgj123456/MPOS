@@ -3173,45 +3173,87 @@ pub(crate) fn handle_setrlimit(args: [usize; crate::syscall::ARG_COUNT], from_us
 // sched_setaffinity(2) / sched_getaffinity(2)
 // ---------------------------------------------------------------------------
 
-/// `sched_getaffinity(pid, len, mask)` — which CPUs the caller may run on.
+/// Which task an affinity call names, in the caller's own namespace.
 ///
-/// One CPU, so the mask is always bit 0 and the answer is the CPU count
-/// Linux returns: the byte count a caller scans for bits. Bytes beyond the
-/// first word are zeroed, the way Linux clears what it does not fill.
-pub(crate) fn handle_sched_getaffinity(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    let (_pid, len, mask) = (args[0], args[1], args[2]);
-    if len < core::mem::size_of::<u64>() {
-        return err::EINVAL;
+/// The argument is Linux's `pid_t`, which arrives in a `usize`: `0` is the
+/// caller, a positive number is resolved through
+/// [`crate::sched::resolve_pid`] - the same door every other pid-taking call
+/// goes through, so a number that names no live task (a collected child, a
+/// stranger's, `-1`, which is *not* "the caller" here even though `wait4`
+/// gives that number a different meaning) is `None`.
+///
+/// Nothing about *which* task comes back is used: this machine schedules on
+/// one CPU, so every task's affinity is the same one bit. What the answer is
+/// needed for is the question a caller can see - whether the number named
+/// anything at all - which is the half this kernel used to skip entirely.
+fn affinity_target(pid: usize) -> Option<()> {
+    if pid == 0 {
+        return Some(());
     }
-    if !buffer_ok(mask, len, true, true) {
-        return err::EFAULT;
-    }
-    unsafe {
-        (mask as *mut u64).write_unaligned(1);
-        if len > core::mem::size_of::<u64>() {
-            core::ptr::write_bytes(
-                (mask + core::mem::size_of::<u64>()) as *mut u8,
-                0,
-                len - core::mem::size_of::<u64>(),
-            );
-        }
-    }
-    core::mem::size_of::<u64>() as isize
+    crate::sched::resolve_pid(pid as i64).map(|_| ())
 }
 
-/// `sched_setaffinity(pid, len, mask)` - pin the caller to the CPUs named in
-/// `mask`. This machine has one, so the only acceptable request is one that
-/// keeps it; anything else asks for a machine that is not here.
-pub(crate) fn handle_sched_setaffinity(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    let (_pid, len, mask) = (args[0], args[1], args[2]);
-    if len < core::mem::size_of::<u64>() {
+/// `sched_getaffinity(pid, len, mask)` — which CPUs the caller may run on.
+///
+/// One CPU, so the mask is bit 0 and the answer is the byte count Linux
+/// returns: the words a caller scans for bits. Three rules come straight from
+/// the host's own answers (`build/scratch/aff/q2.c`, `r3.c`):
+///
+/// * `len` must be a whole number of words - `12` is `EINVAL` while `8` and
+///   `16` succeed - and that judgement happens **before** the pid is looked
+///   at, so a nonsense number with a bad length answers `EINVAL`, not
+///   `ESRCH`.
+/// * a number that names no live task is `ESRCH`, a collected child included.
+/// * the caller's buffer is touched **only** for the words actually filled:
+///   Linux filled 8 bytes of a 16-byte mask and left the rest at whatever the
+///   caller had there (measured: `0xAA` bytes stayed `0xAA`). This handler
+///   used to zero the tail, which is a write the caller never asked for.
+pub(crate) fn handle_sched_getaffinity(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
+    let (pid, len, mask) = (args[0], args[1], args[2]);
+    let word = core::mem::size_of::<u64>();
+    if len < word || len % word != 0 {
         return err::EINVAL;
+    }
+    if affinity_target(pid).is_none() {
+        return err::ESRCH;
     }
     if !buffer_ok(mask, len, true, true) {
         return err::EFAULT;
     }
-    let requested = unsafe { (mask as *const u64).read_unaligned() };
-    if requested & 1 == 0 {
+    unsafe { (mask as *mut u64).write_unaligned(1) };
+    word as isize
+}
+
+/// `sched_setaffinity(pid, len, mask)` - pin a task to the CPUs named in
+/// `mask`. This machine has one, so the only acceptable request is one that
+/// keeps it; anything else asks for a machine that is not here.
+///
+/// The order of the three refusals is not symmetric with the getter's, and
+/// that is measured, not chosen (`build/scratch/aff/r4.c`):
+///
+/// * the mask is copied **first**, so a NULL with a usable length is `EFAULT`
+///   even for a number that names nothing (`set(bad, 8, NULL)` is `EFAULT`).
+///   A length of zero copies nothing - Linux's `copy_from_user` never
+///   dereferences when asked for no bytes - so the same nonsense number with
+///   `len` 0 falls through to `ESRCH` (`set(bad, 0, NULL)` is `ESRCH`).
+/// * then the number is resolved: a collected child, a stranger's number and
+///   `-1` are all `ESRCH`.
+/// * then the mask has to name a CPU this machine has. Any length from one
+///   byte up is enough to say so - this handler used to insist on a whole
+///   word, which refused a request Linux honours.
+pub(crate) fn handle_sched_setaffinity(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
+    let (pid, len, mask) = (args[0], args[1], args[2]);
+    if len > 0 && !buffer_ok(mask, len, false, true) {
+        return err::EFAULT;
+    }
+    if affinity_target(pid).is_none() {
+        return err::ESRCH;
+    }
+    // Only the first byte matters: CPU 0 is bit 0 of the lowest word, and a
+    // request shorter than a word still carries it. Reading one byte keeps
+    // this inside the buffer the caller actually gave, whatever `len` is.
+    let names_cpu0 = len > 0 && unsafe { (mask as *const u8).read() } & 1 == 1;
+    if !names_cpu0 {
         return err::EINVAL;
     }
     0
@@ -5662,23 +5704,57 @@ mod tests {
     /// `sched_setaffinity(2)`/`sched_getaffinity(2)`: one CPU, so the mask
     /// is bit 0 and the only acceptable pin keeps it; the get half answers
     /// the byte count Linux returns.
+    ///
+    /// The three length rules here were measured on the host
+    /// (`build/scratch/aff/q2.c`, `r3.c`) rather than assumed, and the two
+    /// that used to be the other way round are called out where they sit: a
+    /// **short** mask is fine for the setter (Linux reads only the bytes it
+    /// was given - `set(len 1, bit 0)` is `0`), while the **getter** needs a
+    /// whole number of words and writes only the words it fills, leaving the
+    /// rest of the caller's buffer as it was.
     #[test]
     fn affinity_masks_name_exactly_the_one_cpu() {
         let mut mask = [0u8; 8];
-        // Get: bit 0 set, byte count is the answer, the rest is cleared.
+        // Get: bit 0 set, byte count is the answer.
         assert_eq!(
             handle_sched_getaffinity([0, 8, mask.as_mut_ptr() as usize, 0, 0, 0]),
             8
         );
         assert_eq!(u64::from_le_bytes(mask), 1);
 
-        // A short mask cannot name a CPU set: EINVAL.
+        // The getter's length is whole words: 4 is short, 12 is not a whole
+        // number of them. Both are EINVAL, and both are judged before the pid.
         assert_eq!(
             handle_sched_getaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]),
             crate::syscall::err::EINVAL
         );
         assert_eq!(
-            handle_sched_setaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]),
+            handle_sched_getaffinity([0, 12, mask.as_mut_ptr() as usize, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+
+        // The setter takes any length from one byte up, because it only reads
+        // what the caller gave: this is the request Linux honours (measured
+        // `0`, not `EINVAL`) and the one this kernel used to refuse.
+        let mut short = [1u8, 0, 0, 0];
+        assert_eq!(
+            handle_sched_setaffinity([0, 4, short.as_mut_ptr() as usize, 0, 0, 0]),
+            0
+        );
+        let one = [1u8];
+        assert_eq!(
+            handle_sched_setaffinity([0, 1, one.as_ptr() as usize, 0, 0, 0]),
+            0
+        );
+
+        // A mask that names no CPU is refused whatever its length.
+        let empty = [0u8; 8];
+        assert_eq!(
+            handle_sched_setaffinity([0, 8, empty.as_ptr() as usize, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_sched_setaffinity([0, 0, empty.as_ptr() as usize, 0, 0, 0]),
             crate::syscall::err::EINVAL
         );
 
@@ -5695,14 +5771,41 @@ mod tests {
             crate::syscall::err::EINVAL
         );
 
-        // A long mask gets its tail zeroed, as Linux clears what it does not fill.
-        let mut long = [0xFFu8; 16];
+        // A long mask is filled up to the words this machine has and **left
+        // alone** after that: Linux wrote 8 bytes into a 16-byte buffer and
+        // the other 8 kept the caller's `0xAA` (measured, `r3.c`), so zeroing
+        // them here would be a write the caller never asked for.
+        let mut long = [0xAAu8; 16];
         assert_eq!(
             handle_sched_getaffinity([0, 16, long.as_mut_ptr() as usize, 0, 0, 0]),
             8
         );
         assert_eq!(u64::from_le_bytes(long[0..8].try_into().unwrap()), 1);
-        assert!(long[8..].iter().all(|&b| b == 0));
+        assert!(long[8..].iter().all(|&b| b == 0xAA));
+
+        // A number that names no live task is ESRCH in both directions, and
+        // `-1` is not "the caller" (Linux answers ESRCH for it, measured).
+        //
+        // Only the machine build can show this: the host stand-in for
+        // `resolve_pid` has no task table and answers "yes" for every
+        // positive number (it is the identity a never-unshared namespace
+        // gives), so a host run cannot tell a resolved number from an
+        // unresolved one. That is the stand-in's contract, not a gap in the
+        // claim - `t-affinity-rules` is the pin that runs it on the machine.
+        if cfg!(target_os = "none") {
+            assert_eq!(
+                handle_sched_getaffinity([0x7FFF_FFFF, 8, mask.as_mut_ptr() as usize, 0, 0, 0]),
+                crate::syscall::err::ESRCH
+            );
+            assert_eq!(
+                handle_sched_setaffinity([0x7FFF_FFFF, 8, keep.as_ptr() as usize, 0, 0, 0]),
+                crate::syscall::err::ESRCH
+            );
+            assert_eq!(
+                handle_sched_getaffinity([usize::MAX, 8, mask.as_mut_ptr() as usize, 0, 0, 0]),
+                crate::syscall::err::ESRCH
+            );
+        }
     }
 
     /// The registration calls a libc's startup makes: `set_robust_list` pins its

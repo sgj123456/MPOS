@@ -9286,3 +9286,39 @@ Linux's) and `/proc/<n>/limits` (a procfs directory resolves in the namespace th
 while a syscall resolves in the *caller's* - the host reads `kthreadd`). Their readings are the table above.
 
 **Not fixed by this, still open as Item 202**: a number that no longer names *any* task - a recycled slot.
+
+---
+
+### Item 205 - an affinity mask is a request about a number, so the number is resolved first (2026-11-06, landed)
+
+`sched_getaffinity`/`sched_setaffinity` were the last two pid-taking calls whose handler never read the pid:
+both bound `let (_pid, len, mask) = (args[0], args[1], args[2]);`. A number that named nothing answered `0`,
+and a request about a stranger was answered about the caller - success about the wrong subject, which is §3
+rule 2's worst shape.
+
+| call | Linux (measured) | before | now |
+|---|---|---|---|
+| `set(<no such pid>, 8, bit 0)` | `ESRCH` | `0` | `ESRCH` |
+| `get(<no such pid>, 8, mem)` | `ESRCH` | `8` | `ESRCH` |
+| `get(-1, 8, mem)` | `ESRCH` | `8` | `ESRCH` |
+| `set(self, 1, bit 0)` | `0` | `EINVAL` | `0` |
+| `set(self, 4, bit 0)` | `0` | `EINVAL` | `0` |
+| `get(self, 12, mem)` | `EINVAL` | `8` | `EINVAL` |
+| `get(self, 16, mem)` | `8`, bytes 8..16 untouched | `8`, tail zeroed | `8`, untouched |
+| `set(<no such pid>, 0, NULL)` | `ESRCH` | `EINVAL` | `ESRCH` |
+| `get(<no such pid>, 0, NULL)` | `EINVAL` | `EINVAL` | `EINVAL` |
+| `set(<no such pid>, 8, NULL)` | `EFAULT` | `EFAULT` | `EFAULT` |
+
+The refusal order is measured, not derived: the getter judges its length before the pid, the setter the other
+way round, and a non-empty mask is copied before either.
+
+- Owner: `src/syscall/linux/abi.rs` (`affinity_target`, `handle_sched_getaffinity`,
+  `handle_sched_setaffinity`), with the number resolved through `crate::sched::resolve_pid` (§6.91).
+- Pin: `user/tests/src/bin/t-affinity-rules.rs`, 13 claims - nine red on the unfixed kernel, thirteen `ok:` with
+  it, and the same thirteen on `MPOS_ON_HOST=1`. Measurements and the five probe iterations:
+  `docs/notes/` §6.92.
+- **Gap deliberately left open**: the setter's `CAP_SYS_NICE` half and the getter's ptrace-may-access half.
+  Linux answers `EPERM` for another user's task (measured `setter(pid 1) => EPERM`, `getter(pid 1) => 0`); this
+  kernel checks neither. It cannot be pinned here because the payload runs as root, so a claim about `EPERM`
+  would only be true on the host. The helpers exist (`current_credentials().capable(crate::cred::CAP_SYS_NICE)`
+  at `src/syscall/linux/proc.rs:2782`; `crate::sched::may_inspect`).

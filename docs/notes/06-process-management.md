@@ -6858,3 +6858,73 @@ Both readings are the table above instead.
 resolve it first, and let the resolver own the question of what "names a task" means. The tell is a pair of
 siblings where one resolves and one does not - a set that reports success while its get reads the old value is
 this defect, not a lost write.
+
+---
+
+## §6.92 An affinity mask is a request about a number, so the number comes first (LANDED 2026-11-06)
+
+`sched_getaffinity`/`sched_setaffinity` were the last two pid-taking calls whose handler never looked at the
+pid. Both bound the argument as `let (_pid, len, mask) = (args[0], args[1], args[2]);` and went straight to
+the mask, so a number that named nothing - a collected child, a stranger's, `-1` - answered `0`, and a number
+that named *somebody* was quietly answered about the caller. That is the shape §3's rule 2 forbids in its
+worst form: it is not a refusal, it is a success about a different subject.
+
+The rest of the family was wrong too, and this machine had no way to notice either: it has one CPU, so every
+task's affinity is the same bit and the only visible part of the answer was the byte count.
+
+**Linux, measured** (`build/scratch/aff/q2.c`, `r3.c`, `r4.c`; host kernel 7.2.14, 16 CPUs, `sizeof(long)` 8):
+
+| call | Linux | this kernel, before |
+|---|---|---|
+| `set(<no such pid>, 8, bit 0)` | `ESRCH` | `0` |
+| `get(<no such pid>, 8, mem)` | `ESRCH` | `8` |
+| `get(-1, 8, mem)` | `ESRCH` (`-1` is not "the caller") | `8` |
+| `set(self, 1, bit 0)` | `0` | `EINVAL` |
+| `set(self, 4, bit 0)` | `0` | `EINVAL` |
+| `get(self, 12, mem)` | `EINVAL` (whole words) | `8` |
+| `get(self, 16, mem)` | `8`, bytes 8..16 left as the caller had them | `8`, **tail zeroed** |
+| `set(<no such pid>, 0, NULL)` | `ESRCH` (length judged after the pid here) | `EINVAL` |
+| `get(<no such pid>, 0, NULL)` | `EINVAL` (length judged *before* the pid here) | `EINVAL` |
+| `set(<no such pid>, 8, NULL)` | `EFAULT` (the copy happens first) | `EFAULT` |
+
+The two asymmetric rows are the interesting ones: the getter judges its **length** before its **pid**, and the
+setter the other way round, except that a non-empty mask is copied before either. That is not a rule either
+direction derives - it is what Linux's own ordering produces, and both are in the pin.
+
+**Five probe iterations to get there.** The first readings contradicted each other because `printf` does not
+guarantee argument evaluation order and one probe put a `set()` and a `get()` in the same call's arguments, so
+the getter wrote bit 0 into the buffer the setter then read - which is also how "an empty mask is accepted"
+appeared and disappeared across runs. `q2.c` measures one call per statement with a freshly `memset` buffer per
+case; `r2.c`'s "the tail is untouched" was itself wrong because it prefilled with `0xff` and could not tell
+"untouched" from "filled with ones". The lesson is the one this repo keeps re-learning: a probe that prints two
+calls in one line is measuring the interaction, not the calls.
+
+**The pin** is `user/tests/src/bin/t-affinity-rules.rs`, 13 claims. On the unfixed kernel nine are red
+(`build/boot-affrules-pin1.log`); with the fix all thirteen are `ok:` and `PASS`
+(`build/probe/oneshot/serial.log`), and `MPOS_ON_HOST=1` reads the same thirteen against real Linux.
+
+**The fix**, `src/syscall/linux/abi.rs`: one private helper,
+```rust
+fn affinity_target(pid: usize) -> Option<()> {
+    if pid == 0 { return Some(()); }
+    crate::sched::resolve_pid(pid as i64).map(|_| ())
+}
+```
+because `0` is the caller while every other number goes through the door that already knows what a number
+means (§6.91), and `-1` is a number like any other here - Linux measured `ESRCH`, not "the caller" as `wait4`
+would read it. The getter then judges `len` (a whole number of words, at least one), resolves the number,
+copies the mask and writes **only the words it fills**; the setter copies what it was given (any length from
+one byte), resolves the number, and reads one byte to see whether CPU 0 is named. The old tail-zeroing block
+is gone: filling bytes the caller did not ask about is a write, and Linux does not make it.
+
+**What this does not fix.** The setter's *permission* half. Linux wants `CAP_SYS_NICE` to pin another user's
+task and answers `EPERM` otherwise (measured: `setter(pid 1) => EPERM`, `getter(pid 1) => 0`). This kernel has
+neither check now. It is named as a gap rather than pinned because the payload runs as root, so a claim about
+`EPERM` could only ever be true on the host - the same rule as the two claims §6.91 leaves out. The helpers it
+would need are already there and in use elsewhere (`current_credentials().capable(crate::cred::CAP_SYS_NICE)`
+at `src/syscall/linux/proc.rs:2782`, and `crate::sched::may_inspect` for the getter's ptrace-may-access half).
+
+**The rule.** A call that takes a number and acts on a *task* resolves the number first, and refuses with
+`ESRCH` when it names nothing - even when the rest of the arguments are also bad, unless Linux's own ordering
+says the other refusal comes first. A handler that binds `let (_pid, ...)` has already answered about the
+caller, which is right only for the one caller that passed 0.

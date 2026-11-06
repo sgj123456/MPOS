@@ -141,6 +141,18 @@ One-glance status of the whole roadmap.
   disagreement with the broken siblings is what made it visible. Each door now resolves with
   `resolve_pid`/`pid_task` first, which changes no reading on a machine that never unshares
   (`t-nsnumbers`, §6.91, item 204)
+- [x] an affinity mask is a request about a number, so the number is resolved first —
+  `sched_getaffinity`/`sched_setaffinity` were the last two pid-taking calls whose handler bound
+  `let (_pid, len, mask) = …` and never read the number, so a collected child, a stranger's number
+  and `-1` all answered `0` (`ESRCH` on Linux) and a request about somebody was answered about the
+  caller. The rest of the family was measured too: the setter takes **any** length from one byte
+  (this kernel demanded a whole word), the getter's length must be a whole number of words (it
+  accepted 12), the getter must **not** zero the caller's tail, and the refusal order is asymmetric
+  — length before number on the getter, number first on the setter — both of which are what Linux's
+  own ordering produces rather than what either direction derives. One `affinity_target` helper now
+  resolves through `resolve_pid` for both (`t-affinity-rules`, §6.92, item 205). Named gap: the
+  setter's `CAP_SYS_NICE` and the getter's ptrace-may-access halves are still unchecked, and cannot
+  be pinned here because the payload runs as root
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
