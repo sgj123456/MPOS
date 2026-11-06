@@ -292,7 +292,16 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, the stop as a record §6.88):** stage 1 `1224 tests, 0 failed`
+**Latest measured gate (2026-11-06, a death belongs to its parent §6.90):** stage 1 `1224 tests, 0
+failed` (42.14 s); x86_64 `pass=260 fail=0`, `mpos-kunit 35 passed, 0 failed`, `total 42.35 s
+(previous green run 39.78 s, +6.4%)` (`build/gate-steal.log`); aarch64 `pass=259 fail=0 (259 built)`,
+`mpos-kunit 35 passed, 0 failed`, every lane on `=== END`, `total 34.68 s (previous green run 91.00 s,
+-61.9%)` (`build/gate-steal-a2.log`). The first aarch64 attempt lost lane 2 at the recorded EL0 boot
+check (`EXCEPTION: synchronous`, `ESR_EL1 0x96000047` EC 0x25, `FAR_EL1 0x221000`) and is not a
+reading of the sweep; the re-run is the one quoted. `t-steal` is green on both arms
+(`ok: a wait for somebody else's uncollected child is ECHILD (waitpid -1, errno 10)`).
+
+**Measured gate before it (2026-11-06, the stop as a record §6.88):** stage 1 `1224 tests, 0 failed`
 (39.59 s); x86_64 `pass=258 fail=0 (258 built)`, `mpos-kunit 35 passed, 0 failed`, `total 39.78 s
 (previous green run 47.89 s, -16.9%)`; aarch64 `pass=257 fail=0 (257 built)`, `mpos-kunit 35
 passed, 0 failed`, `total 91.00 s (previous green run 117.04 s, -22.2%)` (`build/gate-parkfinal.log`).

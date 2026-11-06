@@ -12,7 +12,7 @@ use super::TABLE;
 use super::USER_STACK_TOP;
 use super::child_exit::{drop_retired, exit_code_pending, task_entry};
 
-use super::child_exit::{die_of_fatal_signal, exit, exit_code};
+use super::child_exit::{die_of_fatal_signal, exit_code};
 use super::child_mm::{Mm, populate_in, split_cow};
 use super::child_signal::{queue_signal, table_has_deliverable, take_fatal_signal};
 
@@ -722,6 +722,27 @@ pub(crate) struct Retired {
     /// fish` run reports the fish exit to `timeout` while strace still owns
     /// the body, and the two wait loops race for one record.
     pub(crate) tracer: Option<TaskId>,
+    /// Whose death this was, as a **group** - the parent the dying task had at
+    /// the moment it died, or `None` for a task that never had one (init, and
+    /// the boot task).
+    ///
+    /// Carried for `uid`'s reason, and it is the one field a reader cannot
+    /// reconstruct: the slot may already belong to somebody else when a `wait`
+    /// reads the record, so "is this mine" asked of the *table* answers about a
+    /// different task. The fault that made this field exist is a stranger's
+    /// `waitpid(stale_number, WNOHANG)` collecting a death it had nothing to do
+    /// with - and the real parent then answering `ECHILD` for its own child
+    /// (`docs/notes/` §6.90). Linux's record lives on the task, which keeps its
+    /// `parent`, so the ownership is a fact about the death rather than about
+    /// the slot's current tenant.
+    ///
+    /// Stored as the **group** because that is the answer a wait asks: a child
+    /// forked on a worker thread is the leader's to collect (`waitable`), and
+    /// `parent` on a `CLONE_THREAD` task is already the group's parent
+    /// (`CLONE_THREAD` implies `CLONE_PARENT`). The reparenting walk in
+    /// `child_exit::exit` rewrites every live child's `parent`, so this is read
+    /// after adoption and names the adopter - which is who may collect.
+    pub(crate) parent: Option<TaskId>,
 }
 
 /// Exit codes, kept after the task is gone. The slot a task occupied is free

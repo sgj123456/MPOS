@@ -9180,3 +9180,67 @@ rebuilt: without the fix `FAIL: and the tracee has not run past it (waitpid 6)`;
 `PASS`. `t-ptrace-attach` also carries *a detach leaves the user's stop alone, 100 times over* as the detach
 regression guard. Both arms green after: `pass=258 fail=0` and `pass=257 fail=0`, `mpos-kunit 35 passed, 0
 failed`. `docs/notes/` §6.88.
+
+### Item 202 - a pid number is a promise on Linux; here it is the task slot (2026-11-06, open)
+
+`§6.89` in `docs/notes/06-process-management.md`. I collect a child of mine, then some other process's
+`fork` takes the freed slot. Linux answers `ESRCH`/`ENOENT` for the number I still hold, forever, because a
+pid is a refcounted `struct pid` whose lifetime is its own. This machine answers for the *stranger*:
+
+```text
+build/scratch/reapwait/kslot.c on 7.2.11      the same probe booted as t-kslot
+kill(72463, 0)      = -1 errno=3 (ESRCH)      kill(7, 0)      = 0 errno=0 (NOT ESRCH)
+/proc/72463              -> ENOENT            /proc/7              state=S
+kill(72463, SIGTERM)= -1 errno=3 (ESRCH)      kill(7, SIGTERM)= 0 errno=0 (NOT ESRCH)
+/proc/72463 (after)      -> ENOENT            /proc/7 (after)      state=Z
+```
+
+The stale number did not merely resolve - `kill` **ended an unrelated process**.
+
+The `wait` path is already Linux's and is pinned: `handle_wait` asks `is_child` before it touches the slot,
+so `waitpid(<stale>, WNOHANG)` and the blocking form both answer `ECHILD` (`t-stranger`, `t-slotowner`,
+`t-reapwait`; `t-waitid`'s *a second wait for a collected child answers ECHILD, not a park* and `t-wait4`'s
+*and a second wait for it is ECHILD*). That is also what refuted §6.86's "last door" reading, which this
+item's measurement corrects.
+
+Open are the doors that resolve a number to a slot without asking whether the number still means that task:
+`named_process`/`named_thread` (the `kill` family, `src/sched/runtime/child_signal.rs`), `resolve_pid`
+(`/proc/<n>`, `src/sched/runtime/pid.rs`), `rlimits_of` (`/proc/<n>/limits` and `getrlimit(pid)`, which
+builds `TaskId(pid)` directly) and `snapshot`. **No check at those doors can close it**: at the moment of the
+check the slot really does hold a live tenant and the number really is theirs. The fix is at the allocation
+end - the init namespace stops numbering by slot and gets the monotonic `Numbers` table every nested
+namespace already has, so a released number is *spent*. Cost, stated so this is not mistaken for a patch:
+`crates/pidns/src/lib.rs`'s header calls the identity map the load-bearing decision in the file, its
+`the_init_namespace_numbers_by_slot()` host pin asserts the identity, and every reported pid value changes
+once (`getpid`, `wait`, `/proc/<n>`, `%P`, a VT's promised pid, a render task's recorded waiter). Cheaper
+first step: one resolver behind all four doors, whose contract states what it can and cannot promise.
+
+### Item 203 - a death belongs to the parent that had it, and the record now says so (2026-11-06, landed)
+
+Found while booting Item 202's instrument for its machine reading, and a different defect from that one: a
+process waited on a number that was never its child and **collected that child's death**.
+
+| | Linux 7.2.11 | this kernel, before |
+|---|---|---|
+| unrelated `waitpid(<not mine>, WNOHANG)` | `-1 errno=10 (ECHILD)` | `7 errno=0 status=0x700` |
+| the real parent's collect, afterwards | `78455 errno=0 status=0x700` | `-1 errno=10` |
+
+Both readings are `build/scratch/reapwait/steal.c` (host) and `t-steal` (machine); the mechanism is
+`docs/notes/` §6.90. It needed **no slot reuse**: the slot still held the zombie, so Item 202's
+number-equals-slot problem is not the cause.
+
+The cause is that a pending death carried no owner. `Retired` had the code, the numbers, the pgid, the ids,
+the times and the tracer - everything but *whose* it was - so the four readers answered "is this mine?" by
+looking at the **slot**, reading an empty slot as "the pending record must be mine". That is inverted: a slot
+is empty precisely *because* the record outlived its task.
+
+Landing: `Retired` gained `parent: Option<TaskId>` - the owning **group**, written when the death is recorded,
+retargeted to the adopter's group when the reparenting walk moves the corpse. `take_retired_for`,
+`any_child_code`, `scan_child_event` and `has_matching_children` all compare it instead of the table, and
+`handle_wait` no longer takes the record before it asks `is_child`. Pin: `user/tests/src/bin/t-steal.rs`, six
+claims, counterfactually red without the fix (two `FAIL:` lines, `exit=1`) and green with it (six `ok:`,
+`PASS`) - on this machine and on `MPOS_ON_HOST=1`.
+
+**Not fixed by this, and still open as Item 202**: a **live** stranger taking a recycled number
+(`kill`, `/proc/<n>`). That one cannot be answered at the doors, because at the moment of the check the number
+really is the live tenant's; it wants the allocation-end change.

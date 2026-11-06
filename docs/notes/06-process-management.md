@@ -6394,6 +6394,13 @@ ok:    and leaves the caller's rusage record untouched
   event that `take_retired_current` has already handed over once. Linux's answer for "the child is gone and
   collected" is `ECHILD`, and the shape that would give it here is: a blocking wait must re-check
   `take_retired_current`/`has_matching_children` inside its own park predicate, not only before it parks.
+  **Measured false (2026-11-06).** The blocking second wait does answer `ECHILD` here
+  (`build/scratch/reapwait/p.c` on a current host and the same probe on the machine): `second (WNOHANG)
+  waitpid=-1 errno=10`, `second (blocking) waitpid=-1 errno=10`, and `wait4`/`waitid` the same - the
+  `is_child` check already refuses the collected number before any park. The parked reading above was a
+  *different* defect wearing the same clothes: the wait was on the collected child 7 at a moment when slot 7
+  had been handed to another task, and what the blocking path then waited for was that **stranger's** exit.
+  That is §6.89's defect, and its fix is not in the wait path at all.
 - The adopt-and-hold patch itself is validated by this run: with it in, the stop/resume section passes and
   only this wait is left (`=== FAIL t-waitid timeout=120s`, one lane, `pass=256 fail=1`); `t-rename`'s
   earlier red did not recur without the debug prints.
@@ -6521,3 +6528,219 @@ detach claim stays in `t-ptrace-attach` as the regression guard for the detach p
 re-check the record after every wake, because the wake set is not the resume set. A park that does only (b), or
 only (a), reads as correct in isolation and fails under load - which is why the fix needs the load to be
 measured, not just the fixture run once.
+
+## §6.89 A pid number is a promise on Linux; here it is the task slot (2026-11-06)
+
+Found while re-measuring §6.86's "last door". That suspicion turned out to be false (see the correction in
+§6.86), and chasing the same probe one step further produced a **real, reproducible divergence** that the
+roadmap had only ever mentioned in passing.
+
+**The shape.** I hold a number for a child I have already collected. Somebody else's process takes that slot.
+What do `kill` and `/proc/<n>` answer?
+
+Linux, `build/scratch/reapwait/kslot.c` on a current host (7.2.11), `musl-gcc -static`:
+
+```text
+my child 72463 collected
+stranger (helper's child) 72464
+kill(72463, 0) = -1 errno=3 (ESRCH)
+the stale number: /proc/72463 -> ENOENT
+kill(72463, SIGTERM) = -1 errno=3 (ESRCH)
+after SIGTERM: /proc/72463 -> ENOENT
+```
+
+This machine, the same probe booted as `t-kslot` (`build/boot-kslot1.log`, `BOOT EXIT=0`):
+
+```text
+=== RUN t-kslot
+my child 7 collected
+stranger (helper's child) 7
+kill(7, 0) = 0 errno=0 (NOT ESRCH)
+the stale number: /proc/7 state=S
+kill(7, SIGTERM) = 0 errno=0 (NOT ESRCH)
+after SIGTERM: /proc/7 state=Z
+NOTE: the stranger reused my number
+=== t-kslot exit=0
+```
+
+The stale number did not merely resolve - `kill(<it>, SIGTERM)` **ended an unrelated process**, and
+`/proc/<it>` read that process's state. Everything a caller does with a pid it remembered is wrong.
+
+**Why the number came back.** A pid here *is* the task slot: `pidns::PidNs::number_of`/`task_of` are the
+identity function at the root level (`crates/pidns/src/lib.rs:215-227`), `insert`/`forget` return immediately
+there, and the slot allocator hands out the lowest free index (`src/sched/runtime/task.rs:2193`). Release a
+child and the very next `fork` takes its number. Linux's answer to the same question is a refcounted
+`struct pid` whose lifetime is its own, which is exactly what makes a number a promise; this crate's own
+header says so and names this consequence instead of hiding it ("the *init* namespace still numbers by slot,
+so slot reuse there is exactly what `docs/notes/` §7.1 records as an open problem, unmoved by this crate").
+
+**Part of it is already safe, measured - and the measurement found a worse hole beside it.** `build/scratch/
+reapwait/{stranger,slotowner,p}.c` booted as `t-stranger`, `t-slotowner` and `t-reapwait` all read
+`waitpid(<stale>, WNOHANG) = -1 errno=10 (ECHILD)` on the machine, the same as Linux, because the number
+named a **live** stranger and `handle_wait` asks `crate::sched::is_child(id, me, kind)` (around
+`src/syscall/linux/proc.rs:568`) before it does anything with the slot. `t-waitid`'s *a second wait for a
+collected child answers ECHILD, not a park* (`user/tests/src/bin/t-waitid.rs:435`) and `t-wait4`'s *and a
+second wait for it is ECHILD* (`user/tests/src/bin/t-wait4.rs:403`) pin the collected-child half. The
+blocking second wait is `ECHILD` too, which is what refutes §6.86's last-door reading: there was never a
+park on a collected child, there was a *stranger's* exit being waited for.
+
+**Correction (2026-11-06): that "safe" was measured on the live stranger only, and it was false one step
+further on.** A death's **record** outlives its slot, and the old ownership test asked the *slot* - "is it
+empty? then the pending record must be mine" - which is backwards, because a slot is empty precisely
+*because* the record outlived its task. So a wait for a number whose stranger had **already exited and not
+been collected** collected that death, and the real parent was left with `ECHILD` for its own child. Not a
+pid-reuse problem at all, and it needed no slot reuse: the slot still held the zombie. The fix and its
+measurement are §6.90 - the record now carries its owner, and every reader asks the record instead of the
+table. This section's four doors are about a *live* tenant taking a number; they stay open.
+
+**The doors that are open** are the three that resolve a number to a slot without asking whether the number
+still means the task it meant:
+
+| door | code | answer for a stale number |
+|---|---|---|
+| `kill`/`tkill`/`tgkill` | `named_process` / `named_thread`, `src/sched/runtime/child_signal.rs:1705`/`:1741` | the stranger's process |
+| `/proc/<n>` | `resolve_pid`, `src/sched/runtime/pid.rs:178`, used by `src/vfs/procfs.rs:1276` | the stranger's directory |
+| `/proc/<n>/limits`, `getrlimit(pid)` | `rlimits_of`, `src/sched/runtime/task.rs:588` (`TaskId(pid)` directly) | the stranger's table |
+| `/proc/<n>` snapshots | `snapshot`, `src/sched/runtime/procfs.rs:466` (`t.tasks.get(pid)`) | the stranger's |
+
+**Why this is not a patch, and what closing it costs.** The number has to *become spent* at release, and in
+this kernel the number and the slot are the same object, so no amount of checking at the doors can help: at
+the moment of the check the slot genuinely holds a live tenant and the number genuinely is that tenant's.
+The fix is therefore at the allocation end - the init namespace stops numbering by slot and gets the
+monotonic table every nested namespace already has (`Numbers { next, by_number, by_slot }` in
+`crates/pidns/src/lib.rs`, which never reuses a number). That is a design change with a stated cost, not a
+bug fix, and it is why this section names the gap instead of stubbing it (AGENTS.md §3 rule 5):
+
+- `crates/pidns/src/lib.rs`'s header calls the identity map at the root **the load-bearing decision** in the
+  file, and the host pin `the_init_namespace_numbers_by_slot()` asserts `root.number_of(7) == Some(7)`,
+  `root.task_of(7) == Some(7)` and `root.task_of(63) == Some(63)`. Both move, with the measurement.
+- every pid the machine reports changes value once (`getpid`, `wait`, `/proc/<n>`, `%P` in
+  `/proc/self/mounts`, a VT's promised pid, a render task's recorded waiter) - the divergence has to be
+  argued for rather than slipped in under a "no behaviour change" commit.
+- the reason the identity map exists at all is byte-for-byte invariance for a machine that never unshares;
+  that sentence stops being true and the header must say what replaces it.
+
+The cheap half that is worth doing first, and is **not** done here either: the four doors in the table above
+should share one resolver whose contract states what it can and cannot promise, so the next reader does not
+have to rediscover that two of them bypass the namespace map entirely.
+
+**Pinned as a measurement, not as a check.** The probe is `build/scratch/reapwait/kslot.c` and its two
+siblings; they are booted by hand, because a check that asserts Linux's answer would be red on this machine
+every run and the sweep must stay a statement about the kernel (AGENTS.md §5's group rule - a known
+divergence measured is a `diagnostic`, not a check). The claim that *is* pinned is the safe half, already in
+`t-waitid` and `t-wait4`.
+
+## §6.90 A death belongs to the parent that had it — `Retired::parent` (LANDED 2026-11-06)
+
+Found while booting §6.89's instrument for its machine reading. The instrument asked the natural follow-up
+question of a stale number - what does `waitpid` answer - and got the stranger's exit status back.
+
+**Measured, this machine** (`t-kslot`, `build/probe/oneshot/serial.log`, boot `BOOT EXIT=0`):
+
+```
+=== RUN t-kslot
+my child 7 collected
+stranger (helper's child) 7
+kill(7, 0) = 0 errno=2 (NOT ESRCH)
+the stale number: /proc/7 -> S
+kill(7, SIGTERM) = 0 errno=2 (NOT ESRCH)
+after SIGTERM: /proc/7 -> Z
+NOTE: the stranger reused my number
+waitpid(7, WNOHANG) = 7 errno=2 (NOT Linux's answer)
+DONE
+```
+
+The `waitpid` line is the new fact. §6.89 had recorded the `wait` path as the safe half, and it was - for the
+numbers it was measured with. Every one of those probes asked about a **live** stranger, and `is_child` is
+enough to refuse a live task that is somebody else's child. The moment the stranger's own victim was a
+**zombie**, a different door answered, and it did so before `is_child` was ever consulted.
+
+**Measured, Linux** (`build/scratch/reapwait/steal.c`, musl-gcc -static -O1, this host's 7.2.11): a helper
+forks a child that `_exit`s at once, leaves the record uncollected, and sleeps on a pipe; an unrelated
+process waits for it:
+
+```
+the helper's child is 78455 (its record is pending, uncollected)
+MY waitpid(78455, WNOHANG) = -1 errno=10 (ECHILD, Linux's answer)
+parent of it: waitpid(78455) = 78455 errno=0 status=0x700
+```
+
+and the orphan case (`orphan.c`) - the helper exits without collecting, so the zombie belongs to init:
+
+```
+helper 78951 collected; its child 78952 is an orphan
+grandparent waitpid(78952, WNOHANG) = -1 errno=10 status=0x0 (ECHILD)
+```
+
+Linux answers `ECHILD` to any process that is not the owner, and the owner still gets its status. Measured
+here (same shape, `t-steal`): **`MY waitpid(7, WNOHANG) = 7 errno=0 (I TOOK SOMEONE ELSE'S DEATH)
+status=0x700`**, and the helper's own collect then failed.
+
+**Why the check could not be made where the number is.** The number was fine. The slot was fine - it still
+held the zombie. What was wrong is that nothing in the system knew **whose** the pending death was. The
+record (`src/sched/runtime/task.rs`'s `Retired`) carried the code, the numbers, the pgid, the ids, the times
+and the tracer - everything except an owner. Asked "is this record mine", three readers answered it by
+looking at the **slot**:
+
+```rust
+let free = t.tasks[id.0].is_none();
+let ours = free || t.tasks[id.0].as_ref().is_some_and(|_| waitable(t, id, parent, kind));
+```
+
+in `any_child_code`, `scan_child_event` and `has_matching_children`, while `take_retired_for` used
+`t.tasks[id.0].as_ref().is_none_or(|task| task.parent == Some(me))`. Every one of those reads `free` as
+"mine" - and `free` is exactly the state a record creates by outliving its task. The inference is not merely
+incomplete, it is inverted.
+
+The fourth door was worse: `src/syscall/linux/proc.rs:498`'s `handle_wait` took the record
+(`take_retired_current`, `:579`) **before** it asked `is_child` (`:588`). So even a correct ownership test
+inside the record's own accessor would have been reached late, with the code already handed out.
+
+**The fix: the record carries its owner.** `Retired` gained
+
+```rust
+/// Whose death this was, as a **group** - the parent the dying task had at
+/// the moment it died, or `None` for a task that never had one (init, and
+/// the boot task).
+pub(crate) parent: Option<TaskId>,
+```
+
+- **Written** at `src/sched/runtime/child_exit.rs`'s `exit`, in the same `group_dead` arm that builds the
+  record, from the dying task's own `parent` - resolved to a **group**, because ownership is a group fact
+  (a child forked on a worker thread is the leader's to collect, `waitable`'s rule). A task with no parent
+  records `None`, and `None` matches no caller's group.
+- **Read** by all four doors, in place of the table: `take_retired_for` compares `retired.parent` with the
+  caller's group and falls back to the tracer rule (a tracer still gets the code, but as a **release**: the
+  record stays on file for the real parent). `any_child_code`, `scan_child_event` and `has_matching_children`
+  replace their `free ||` clause with `retired.parent == my_group`.
+- **Moved** when the reparenting walk moves the corpse. A child that died *before* its parent did has its
+  record on file already, naming a group that is now gone; Linux's `forget_original_parent` reparents
+  zombies with the children and the new parent collects them. The same walk in `exit` now retargets every
+  record whose owner was the dying group to the adopter's group, so an orphan's death is collectable by
+  exactly the process that adopted the corpse - and by nobody else, which is `orphan.c`'s reading.
+
+**Counterfactual** (`build/boot-steal-cf.log`, kernel and loader both rebuilt with the fix stashed):
+
+```
+ok:    the helper's child 7 exists and is not ours
+FAIL:  a wait for somebody else's uncollected child is ECHILD (waitpid 7, errno 2)
+FAIL:  and its own parent still collects it (helper exit 1)
+ok:    a number this program never forked answers ESRCH
+ok:    this program's own child is still collectable (waitpid 6, exit 3)
+ok:    and this program still reads its own /proc entry (state R)
+FAILED
+=== t-steal exit=1
+```
+
+With the fix (`build/boot-steal2.log`, same tree, same boot recipe) all six are `ok:` and the program ends
+`PASS`, `=== t-steal exit=0`. The pin is `user/tests/src/bin/t-steal.rs` and it is a **check**, not a
+reading: Linux's answer is the answer, and the host route (`MPOS_ON_HOST=1`) reads the same six `ok:` lines.
+
+**What it does not fix.** §6.89's four doors stay open: they are about a **live** tenant taking a number, and
+the record's ownership cannot help there - at the moment of the check the number really is the live
+stranger's. This section closes the door that was about a **dead** tenant, which is the one that could be
+answered without changing how numbers are allocated.
+
+**The rule.** A fact about a death outlives the task, so it must be stored **with** the death. Reading it off
+the task table is not a stale read, it is a read of a different subject: the table is the living, and the
+record's whole reason to exist is that the living moved on.

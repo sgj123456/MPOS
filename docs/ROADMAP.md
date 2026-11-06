@@ -131,6 +131,30 @@ One-glance status of the whole roadmap.
   generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
   its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,
   and poll/epoll see `POLLIN` at group death and `POLLHUP` only at the reap (§6.8, item 92)
+- [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
+  now carries the owning **group** (`Retired::parent`), written when the death is recorded and
+  retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
+  readers asked the *slot*, and a slot is empty precisely *because* the record outlived its task, so
+  a stranger's `waitpid` collected a death it had nothing to do with and the real parent was left
+  with `ECHILD` for its own child (`MY waitpid(7, WNOHANG) = 7 errno=0` where Linux answers
+  `ECHILD`; `t-steal`, §6.90, item 203)
+- [ ] **a pid number is a promise, and here it is the task slot** — a number I held for a child I
+  already collected is handed straight to the next `fork`, so `kill(<it>, SIGTERM)` ended an
+  unrelated process and `/proc/<it>` read that process (`kill(7, SIGTERM) = 0 errno=0 (NOT ESRCH)` /
+  `/proc/7 state=Z`, where Linux answers `ESRCH`/`ENOENT` - `build/scratch/reapwait/kslot.c`, §6.89).
+  A **live** stranger taking the number is refused on the `wait` path and pinned (`is_child` answers
+  `ECHILD` - `t-stranger`, `t-slotowner`, `t-reapwait`), but that was only half of it: a stranger
+  that had already exited and not been collected had its **death** collected by whoever asked, and
+  the real parent then got `ECHILD` for its own child. That is a different defect with its own fix -
+  a death now carries its owner (`Retired::parent`, `t-steal`, §6.90, item 203) - and it is closed.
+  What is still open here is `kill`/`tkill`/`tgkill`, `/proc/<n>`, `/proc/<n>/limits` and the
+  descriptor's `getrlimit(pid)`, which resolve a number to a slot without asking whether the number
+  still means that task. **Not a patch**: at the moment of the check the slot genuinely holds a live tenant and
+  the number genuinely is theirs, so the fix is at the allocation end - the init namespace stops
+  numbering by slot and gets the monotonic table every nested namespace already has
+  (`crates/pidns/src/lib.rs`), which moves that crate's stated load-bearing decision, its
+  `the_init_namespace_numbers_by_slot()` pin, and every reported pid value once (§6.89 has the cost
+  and the doors)
 - [x] a pidfd can fetch a descriptor — `pidfd_getfd` duplicates the target's **open file
   description** into the caller's table, with Linux's refusal order (flags, pidfd, task,
   authority, target fd), `FD_CLOEXEC` unconditionally and `ESRCH` for a zombie or a leader

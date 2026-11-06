@@ -285,6 +285,22 @@ pub fn exit(code: isize) -> ! {
             // the number **its** namespace gives, and by the time it reads the
             // record the registration is gone (`Retired::numbers`).
             let numbers = crate::sched::pid_chain_of(tgid);
+            // Whose death this is, resolved **now** while the answer is still
+            // in the table - a wait that reads the record later cannot ask the
+            // slot, because it may name somebody else by then (`Retired::parent`).
+            //
+            // The **group** is what a wait asks about (`waitable` walks the
+            // caller's group), and a `CLONE_THREAD` task's `parent` is already
+            // the group's parent, so a leader's record and its worker's agree.
+            // A parent that has itself exited cannot be named here - its own
+            // exit reparented this task first, which is why the lookup finds a
+            // live adopter or nothing.
+            let parent = t.task(id).parent.and_then(|parent| {
+                t.tasks
+                    .get(parent.0)
+                    .and_then(Option::as_ref)
+                    .map(|task| task.tgid)
+            });
             record_retired(Retired {
                 id: tgid,
                 code,
@@ -302,6 +318,7 @@ pub fn exit(code: isize) -> ! {
                 utime,
                 stime,
                 tracer: leader.trace.tracer,
+                parent,
             });
         }
 
@@ -521,6 +538,31 @@ pub fn exit(code: isize) -> ! {
             if adopted {
                 t.sched.wake(reaper);
             }
+            // A child that died **before** this task did has its record on file
+            // already, and that record names this (now dead) group as its owner
+            // - so the walk above, which only moves live children, would leave
+            // it collectable by nobody: a zombie under a parent that no longer
+            // exists. Linux reparents the corpse with the children
+            // (`forget_original_parent` walks the `children` list, zombies
+            // included), and the new parent collects it. Same move here: the
+            // record's owner follows the child's new one.
+            //
+            // Retargeting to the **adopter's group** rather than to `reaper`
+            // itself, for `Retired::parent`'s reason: ownership is a group fact.
+            let adopter = t
+                .tasks
+                .get(reaper.0)
+                .and_then(Option::as_ref)
+                .map(|task| task.tgid);
+            if let Some(adopter) = adopter {
+                critical_section::with(|cs| {
+                    for retired in RETIRED.borrow(cs).borrow_mut().iter_mut() {
+                        if retired.parent == Some(tgid) {
+                            retired.parent = Some(adopter);
+                        }
+                    }
+                });
+            }
         }
 
         // Anything this task was tracing is let go. A tracee whose tracer has
@@ -648,22 +690,33 @@ pub fn exit_code(id: TaskId) -> Option<isize> {
 /// death a second time to the same waiter, whose tcb is already gone. It comes
 /// out instead.
 pub(crate) fn take_retired_for(t: &Table, id: TaskId, me: TaskId) -> Option<Retired> {
+    let my_group = t
+        .tasks
+        .get(me.0)
+        .and_then(Option::as_ref)
+        .map(|task| task.tgid);
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         let at = retired.iter().rposition(|retired| retired.id == id)?;
         if retired[at].tracer.is_some_and(|tracer| tracer != me) {
             return None;
         }
-        let also_parent = retired[at].tracer == Some(me)
-            && t.tasks[id.0]
-                .as_ref()
-                .is_none_or(|task| task.parent == Some(me));
-        if also_parent {
-            return Some(retired.remove(at));
-        }
-        if retired[at].tracer == Some(me) {
-            retired[at].tracer = None;
-            return Some(retired[at].clone());
+        // Whose death this is, asked of the **record** and not of the table: the
+        // slot may belong to somebody else by now, and the whole point of
+        // `Retired::parent` is that the answer travels with the death. A caller
+        // that is neither the parent nor the tracer used to be handed the
+        // record here - a stranger's `waitpid(<stale number>, WNOHANG)`
+        // collected a death it had nothing to do with, and the real parent then
+        // answered `ECHILD` for its own child (`docs/notes/` §6.90).
+        if retired[at].parent != my_group {
+            // Not this caller's child. A tracer still gets the code, but only
+            // as a release: the record stays on file for the real parent, which
+            // is the tracer-first order the record exists to keep.
+            if retired[at].tracer == Some(me) {
+                retired[at].tracer = None;
+                return Some(retired[at].clone());
+            }
+            return None;
         }
         Some(retired.remove(at))
     })
@@ -692,6 +745,14 @@ pub(crate) fn any_child_code(
     parent: TaskId,
     kind: ChildKind,
 ) -> Option<(TaskId, isize)> {
+    // The caller's **group**, because that is who a death belongs to: a child
+    // forked on a worker thread is the leader's to collect, and `Retired::parent`
+    // records the group the dying task had.
+    let my_group = t
+        .tasks
+        .get(parent.0)
+        .and_then(Option::as_ref)
+        .map(|task| task.tgid);
     critical_section::with(|cs| {
         RETIRED
             .borrow(cs)
@@ -699,15 +760,16 @@ pub(crate) fn any_child_code(
             .iter()
             .rev()
             .find(|retired| {
-                // The slot is spoken for by a live task: the record describes
-                // an older tenant of the same number, so it is not this
-                // parent's business.
+                // Whose death this is comes from the **record**, not from the
+                // slot. The old test read `t.tasks[id.0].is_none()` as "free,
+                // so the record must be mine", and that is exactly backwards:
+                // a slot is free *because* the record outlived its task, so the
+                // answer says nothing about who may collect. A stranger's wait
+                // collected a death it had nothing to do with that way, and the
+                // real parent was left with `ECHILD` for its own child
+                // (`docs/notes/` §6.90).
                 let id = retired.id;
-                let free = t.tasks[id.0].is_none();
-                let ours = free
-                    || t.tasks[id.0]
-                        .as_ref()
-                        .is_some_and(|_| waitable(t, id, parent, kind));
+                let ours = retired.parent == my_group;
                 ours && id != parent
                     && kind.sees(retired.exit_signal)
                     && retired.tracer.is_none_or(|tracer| tracer == parent)
@@ -2369,6 +2431,14 @@ fn scan_child_event(
     continues: bool,
     exited: bool,
 ) -> Option<WaitEvent> {
+    // The caller's group, which is who a death belongs to: a child forked on a
+    // worker thread is the leader's to collect (`waitable`), and
+    // `Retired::parent` holds the group the dying task had.
+    let my_group = t
+        .tasks
+        .get(parent.0)
+        .and_then(Option::as_ref)
+        .map(|task| task.tgid);
     let children = || {
         t.tasks.iter().enumerate().filter_map(|(slot, task)| {
             let task = task.as_ref()?;
@@ -2410,12 +2480,11 @@ fn scan_child_event(
             .iter()
             .rev()
             .find(|retired| {
+                // The record says whose death it was; the slot cannot, because
+                // it may already belong to somebody else (`Retired::parent`,
+                // `docs/notes/` §6.90).
                 let id = retired.id;
-                let free = t.tasks[id.0].is_none();
-                let ours = free
-                    || t.tasks[id.0]
-                        .as_ref()
-                        .is_some_and(|_| waitable(t, id, parent, kind));
+                let ours = retired.parent == my_group;
                 ours && id != parent
                     && sel.names_retired(retired, kind)
                     && retired.tracer.is_none_or(|tracer| tracer == parent)
@@ -2601,16 +2670,21 @@ pub fn poll_any_child_event(
 /// measurement (`ECHILD`) rather than a design choice.
 pub fn has_matching_children(parent: TaskId, sel: WaitFor, kind: ChildKind, exited: bool) -> bool {
     with_table(|t| {
+        // A record belongs to the group that owned the dying task, which is
+        // what `Retired::parent` carries. Asking the *slot* instead read "no
+        // current tenant" as "mine", so a stranger's death kept a wait parked
+        // (`docs/notes/` §6.90).
+        let my_group = t
+            .tasks
+            .get(parent.0)
+            .and_then(Option::as_ref)
+            .map(|task| task.tgid);
         child_alive_for(t, parent, sel, kind)
             || (exited
                 && critical_section::with(|cs| {
                     RETIRED.borrow(cs).borrow().iter().any(|retired| {
                         let id = retired.id;
-                        let free = t.tasks[id.0].is_none();
-                        let ours = free
-                            || t.tasks[id.0]
-                                .as_ref()
-                                .is_some_and(|_| waitable(t, id, parent, kind));
+                        let ours = retired.parent == my_group;
                         ours && id != parent
                             && sel.names_retired(retired, kind)
                             && retired.tracer.is_none_or(|tracer| tracer == parent)
