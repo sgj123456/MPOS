@@ -204,6 +204,20 @@ One-glance status of the whole roadmap.
   scaled to `USER_HZ` the way `times()`/`getrusage` already answer; `t-times` pins field 14 against
   `RUSAGE_SELF`, field 16 against a reaped child's folded CPU, and the `task/<tid>` spelling against the
   group's — the first two red on the kernel without the fix (§6.96, item 209)
+- [x] the clock family says what it delivers, and the coarse clocks are coarse — `clock_getres`
+  answered **one tick (4 ms) for every clock** under a comment saying the tick counter was the only
+  time source there was, a sentence the neighbouring `clock_gettime` had already overtaken: it
+  interpolates the free-running counter, and the measured `CLOCK_MONOTONIC` step was 616 ns while
+  `CLOCK_MONOTONIC_COARSE` stepped 352 ns - so the resolution was four million times coarser than the
+  readings and the coarse clock was not coarse at all. Measured on the host: the counter clocks resolve
+  to `1 ns`, the two coarse ones to the tick, and 5000 back-to-back coarse reads move **0** times. The
+  id set was also three shorter than `clock_gettime`'s, so `clock_getres(CLOCK_TAI, …)` answered
+  `EINVAL` for a clock this kernel serves, and `CLOCK_BOOTTIME_ALARM` read as wall time. `Clock::
+  resolution_nanos` (the counter's quantum: `1 ns` on x86_64's TSC arithmetic, `ceil(10^9/CNTFRQ)` on
+  aarch64) now answers for the fine clocks and the tick for the coarse pair, and the coarse pair reads
+  whole ticks; `t-clock-getres` pins all of it, six claims red without the fix, and its two
+  timing-shaped claims were then re-anchored to the run they measure - an emulated aarch64 read them as
+  the host's speed rather than as the clock's face (`§6.97`, item 210)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

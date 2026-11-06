@@ -263,6 +263,11 @@ impl crate::hal::Clock for crate::hal::Current {
         timer::busy_wait_ms(ms)
     }
 
+    #[inline]
+    fn resolution_nanos() -> u64 {
+        timer::resolution_nanos()
+    }
+
     /// The LAPIC's own count-down timer can raise a vector between two PIT
     /// ticks, so a wait shorter than 4 ms ends when it is due (`lapic`).
     const SUB_TICK_WAKE: bool = true;

@@ -7249,3 +7249,124 @@ zero" but "does the kernel still not count it". And the fields a reader cross-ch
 `getrusage` are the cheap place to notice: `ps` and `top` show `0:00` for a process that has been
 busy, which is the silent-success shape §3 rule 2 forbids in a syscall and forbids just as much in a
 file.
+
+## §6.97 `clock_getres` told every caller the tick, while the clock stepped in nanoseconds (LANDED 2026-11-07)
+
+A clock's advertised resolution is not decoration: `epoll` loops, `timerfd` arming, a compositor's
+frame pacing and a program's own back-off all read it to decide how coarse their arithmetic has to
+be. Two things were wrong with this kernel's answer, and they were two halves of one subject - what
+the clock family says about itself versus what it delivers.
+
+**What the host answers.** `build/scratch/batch/g.c` (musl static, Linux 7.2.14) walks all the ids a
+real kernel keeps:
+
+```
+REALTIME          rc=0 res=0.000000001     REALTIME_COARSE   rc=0 res=0.001000000
+MONOTONIC         rc=0 res=0.000000001     MONOTONIC_COARSE  rc=0 res=0.001000000
+PROCESS_CPUTIME   rc=0 res=0.000000001     BOOTTIME          rc=0 res=0.000000001
+THREAD_CPUTIME    rc=0 res=0.000000001     TAI               rc=0 res=0.000000001
+MONOTONIC_RAW     rc=0 res=0.000000001     BOOTTIME_ALARM    rc=0 res=0.000000001
+bad id 12345      rc=-1 errno=22 (EINVAL)
+```
+
+and the readings match those claims (`build/scratch/batch/k.c`): in 5000 back-to-back reads
+`CLOCK_MONOTONIC` moved 5000 times with a smallest step of **20 ns**, `CLOCK_MONOTONIC_COARSE` moved
+**0** times, and `CLOCK_REALTIME_COARSE` once, by a millisecond. The coarse clocks are the tick's own
+reading, and the fine ones are the counter's.
+
+**What this kernel answered.** One tick - 4 ms - for *every* id, under a comment saying "the tick
+counter is the only source of time there is, so the honest resolution is one tick". That sentence was
+true when it was written and had been overtaken by the very function it documents: `clock_gettime`
+interpolates the free-running counter inside the tick (`since_boot_nanos`), and the measured steps are
+sub-microsecond - `MONOTONIC` **616 ns**, and, in the same run, `MONOTONIC_COARSE` **352 ns**. So the
+resolution was four million times coarser than the readings, and the coarse clock was not coarse at
+all: a caller that picked `_COARSE` for its cheapness paid the full read and was handed a fine value
+under a coarse label.
+
+Two more facts came out of the same walk:
+
+- The id set was **three shorter than `clock_gettime`'s**: `{0..=9, 11}` at one door, eight ids at the
+  other. So `clock_getres(CLOCK_TAI, …)` - a clock this kernel serves - came back `EINVAL`, the answer
+  for a malformed argument. One argument, two doors, two verdicts: the same shape §6.95 recorded for
+  `RUSAGE_THREAD`.
+- `CLOCK_BOOTTIME_ALARM` (9) was answered as **wall** time while `CLOCK_BOOTTIME` (7) is boot-relative.
+  Measured on the host (`build/scratch/batch/m.c`): `BOOTTIME_ALARM` is `752 ns` from `BOOTTIME`, and
+  `REALTIME_ALARM` `1313 ns` from `REALTIME` - each alarm clock reads like the clock it alarms from,
+  and the two bases are ~1.8e18 ns apart, so this was not a rounding difference.
+
+**The fix.** `Clock::resolution_nanos` (default: the tick, so a machine whose only source is the tick
+says so) is overridden by both machines:
+
+- x86_64 `timer::resolution_nanos`: the reading is `ticks * tick_ns + frac * tick_ns / cpt`, so one
+  step is `tick_ns / cpt` - sub-nanosecond with a gigahertz TSC and a 4 ms tick - and the ABI's unit
+  rounds it up to `1 ns`, which is what Linux answers for its fine clocks. Before the second tick has
+  calibrated `cpt` there is no fraction, and it answers the tick.
+- aarch64 `timer::resolution_nanos`: the reading is `elapsed * 10^9 / freq`, so one step is
+  `ceil(10^9 / CNTFRQ)` - the machine's own quantum (16 ns at QEMU's 62.5 MHz), answered from the
+  register the machine states rather than a constant.
+
+`clock_getres` then answers `hal::clock_resolution_nanos()` for the fine clocks and `hal::ns_per_tick()`
+for the two coarse ones, over the *same* id set `clock_gettime` accepts; and `clock_gettime` makes the
+coarse pair genuinely coarse - `ticks() * ns_per_tick()`, not the interpolated counter - so the value
+and the resolution now agree. `CLOCK_BOOTTIME_ALARM` joined the boot-relative family (value and its
+time-namespace offset, the latter by the family rule rather than a separate measurement: this host
+cannot create a time namespace unprivileged, so the offset half is source-derived and the value half is
+measured).
+
+**Pin.** `user/tests/src/bin/t-clock-getres.rs` (31 claims). Every id gets a resolution inside one
+second; `CLOCK_MONOTONIC` resolves *finer than a tick*; both coarse clocks resolve at exactly the
+4 ms tick and every coarse reading across 2000 reads is a whole multiple of it (and the coarse clock
+moves no more often than the ticks the loop itself crossed); each alarm clock reads within a millisecond
+of its base; `CLOCK_TAI` is served and
+reads as the wall clock (no leap table on this machine, and the host had none either - 1162 ns apart);
+plus the vocabulary refusals (`10` and `999` are `EINVAL`, a null `res` is allowed). The three
+coarse-resolution claims and the whole-tick claim are guarded with `host_run()`: they are statements
+about *this* kernel's tick, and a host answers its own (1 ms, and a sub-tick offset in the value).
+
+**Counterfactual** (`build/boot-clkres-cf1.log` against `build/boot-clkres-fix2.log`):
+
+```
+unfixed kernel                                    fixed kernel
+FAIL: clock_getres(CLOCK_REALTIME_ALARM) answers  ok:   (1 ns)
+FAIL: clock_getres(CLOCK_BOOTTIME_ALARM) answers  ok:   (1 ns)
+FAIL: CLOCK_MONOTONIC resolves finer than a tick  ok:   (1 ns)
+      (4000000 ns)
+FAIL: a coarse reading is a whole number of its   ok:   (0 fractions in 2000)
+      ticks (2000 fractions in 2000)
+FAIL: and the coarse clock barely moves across    ok:   (0 steps)
+      2000 reads (1999 steps)
+FAIL: CLOCK_BOOTTIME_ALARM reads with             ok:   (14900 ns apart)
+      CLOCK_BOOTTIME (1793993879000015781 ns apart)
+```
+
+**Two of those claims were written as numbers only a fast host reaches, and the second machine said so.**
+The first gate that ran the pin asked both arms for it and the aarch64 arm - an emulated machine, on the
+one core this container is pinned to - came back `=== FAIL t-clock-getres exit=1` with two reds that were
+statements about its speed:
+
+```
+FAIL: and the coarse clock barely moves across 2000 reads (5 steps)
+FAIL: and reads as the wall clock, this machine having no leap table (1603792 ns apart)
+```
+
+The first bound `moved <= 2` was a step *count*, chosen from a host where 2000 coarse reads finish inside
+one tick; on aarch64 2000 syscalls span several ticks, so the coarse clock legitimately moved five times.
+The second bound was a fixed 1 ms on the skew between a `CLOCK_TAI` read and a `CLOCK_REALTIME` read taken
+one after the other - and three syscalls on an emulated aarch64 are themselves milliseconds of wall time,
+so the skew measured the gap between the reads, not anything about the clocks. Both are the same mistake
+as a test that reads a clock it invented: a claim about the clock wearing a claim about the host's speed.
+Each is now anchored to the interval the claim's own measurement spans - the coarse bound is the
+**number of tick boundaries the loop crossed** (`(last - first) / quantum`, plus one), and the wall-clock
+skew is bracketed by reading `CLOCK_REALTIME` again afterwards and allowing the bracket
+(`skew <= spanned + 1 ms`). Fixed-kernel readings: x86_64 `1 steps over 1 ticks`,
+aarch64 `3 steps over 3 ticks` and `15968 ns apart over a 24368 ns read`. Counterfactually the same:
+the amended coarse claim on the unfixed kernel reads
+`FAIL: and the coarse clock moves only as often as its ticks do (1938 steps over 1 ticks)`
+(`build/boot-clkres-cf2.log`), because a fine-grained reading under a coarse label moves once per read
+while the loop crossed one tick.
+
+**The rule.** A resolution is a promise about the readings, so the two must be computed from the same
+source: if `clock_gettime` divides a counter, `clock_getres` cannot answer the tick, and if a clock is
+named `_COARSE` its reading has to *be* the coarse one. And when two doors take the same argument,
+they take the same set of values - the door that refuses a value its sibling serves is the defect,
+whichever of the two is "right" about the number.

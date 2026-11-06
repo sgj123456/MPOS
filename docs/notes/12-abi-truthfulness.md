@@ -292,7 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, the boot's sub-tick check §13.33):** stage 1
+**Latest measured gate (2026-11-07, the clock family §6.97):** stage 1 `1225 tests, 0 failed`
+(50.62 s); x86_64 `pass=264 fail=0 (264 built)`, `mpos-kunit 35 passed, 0 failed`, `total 50.93 s
+(previous green run 86.81 s, -41.3%)`; aarch64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 139.54 s (previous green run 141.24 s, -1.2%)` (`build/gate-clkres2.log`), both arms
+in one command with the lane count forced to two. `GATE EXIT=0`, and the new pin is `=== PASS` on both
+arms - x86_64 `1 steps over 1 ticks`, aarch64 `3 steps over 3 ticks` and `15968 ns apart over a 24368 ns
+read`.
+
+**The run before it was green on x86_64 and red on aarch64, and the red was the pin's own numbers.**
+`build/gate-clkres.log` read x86_64 `pass=264 fail=0` and aarch64 `pass=262 fail=1`, with
+`FAIL t-clock-getres`: two claims bounded a step count (`moved <= 2`) and a clock skew (`< 1 ms`) by
+numbers only a fast host reaches, so an emulated machine that spends milliseconds in three syscalls
+answered `5 steps` and `1603792 ns apart`. Both are now anchored to the interval their own measurement
+spans (`§6.97`), and the amended coarse claim is still red on the unfixed kernel
+(`build/boot-clkres-cf2.log`, `1938 steps over 1 ticks`).
+
+**Measured gate before it (2026-11-07, the boot's sub-tick check §13.33):** stage 1
 `1225 tests, 0 failed` (51.09 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 51.41 s (previous green run 51.07 s, +0.7%)`; aarch64 `pass=262 fail=0 (262 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 141.24 s (previous green run 85.76 s, +64.7%)`

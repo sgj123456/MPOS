@@ -101,6 +101,24 @@ pub trait Clock {
     /// exists for the milestone checks, which must wait without a scheduler.
     fn busy_wait_ms(ms: u64);
 
+    /// Nanoseconds in one step of the clock's finest source - the resolution
+    /// `clock_getres(2)` reports.
+    ///
+    /// Distinct from [`TICK_HZ`](Clock::TICK_HZ) because the clock a caller
+    /// reads does not step at the tick: both machines interpolate (or divide) a
+    /// free-running counter, so the smallest distinguishable step is the
+    /// counter's own. Measured on the host, `clock_getres(CLOCK_MONOTONIC)`
+    /// answers `1 ns` while the coarse clocks answer their tick; this kernel
+    /// answered a tick for *every* clock while `clock_gettime` delivered
+    /// sub-microsecond steps, which is a resolution claim the clock itself
+    /// contradicted (`docs/notes/` §6.97).
+    ///
+    /// The default is the tick: a machine whose only time source is the tick
+    /// says so, and a machine with a counter overrides it.
+    fn resolution_nanos() -> u64 {
+        1_000_000_000 / Self::TICK_HZ as u64
+    }
+
     /// Whether this machine can interrupt *between* two clock ticks, so a wait
     /// shorter than one ends when it is due rather than at the next tick.
     ///
@@ -1212,6 +1230,13 @@ pub const SUB_TICK_WAKE: bool = <Current as Clock>::SUB_TICK_WAKE;
 #[inline]
 pub fn arm_wake_ns(deadline_ns: Option<u64>) {
     <Current as Clock>::arm_wake_ns(deadline_ns)
+}
+
+/// Nanoseconds in one step of the clock's finest source; see
+/// [`Clock::resolution_nanos`].
+#[inline]
+pub fn clock_resolution_nanos() -> u64 {
+    <Current as Clock>::resolution_nanos()
 }
 
 /// Nanoseconds in one clock tick - the unit conversion between a wait named in

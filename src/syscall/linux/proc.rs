@@ -4577,12 +4577,14 @@ pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
 /// REALTIME and must see the calendar, while monotonic callers must never see
 /// that anchor jump under them.
 pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
+    const CLOCK_REALTIME_COARSE: usize = 5;
     const CLOCK_MONOTONIC: usize = 1;
     const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
     const CLOCK_THREAD_CPUTIME_ID: usize = 3;
     const CLOCK_MONOTONIC_RAW: usize = 4;
     const CLOCK_MONOTONIC_COARSE: usize = 6;
     const CLOCK_BOOTTIME: usize = 7;
+    const CLOCK_BOOTTIME_ALARM: usize = 9;
     let (clk_id, tp) = (args[0], args[1]);
     // The clock id is checked before the destination, the way Linux is: a clock
     // the kernel does not keep is `EINVAL` whatever the `tp` is. Measured on the
@@ -4610,8 +4612,25 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     // Return the elapsed time, anchored to the RTC's wall time for the
     // REALTIME clocks. `since_boot_nanos` interpolates within the current tick
     // via the TSC, so a fast syscall reports a true sub-millisecond delta
-    // instead of snapping to the 10 ms grid the tick counter alone gives.
-    let elapsed = crate::hal::since_boot_nanos();
+    // instead of snapping to the 4 ms grid the tick counter alone gives.
+    //
+    // The two *coarse* clocks are the exception, and they are the reason their
+    // `clock_getres` answer is the tick: Linux's coarse clocks are the tick's
+    // own reading, not an interpolated one - measured on the host
+    // (`build/scratch/batch/k.c`, 5000 back-to-back reads) `MONOTONIC_COARSE`
+    // moved **0** times and `REALTIME_COARSE` once by a millisecond, while
+    // `MONOTONIC` moved 5000 times in 20 ns steps. On this kernel they used to
+    // be as fine as the fine clocks (4827 distinct steps in 5000 reads), which
+    // is not coarse at all: a caller that picks `_COARSE` for its cheapness was
+    // paying the full read and being handed a value that claimed otherwise.
+    // Whole ticks is also what makes the value and its advertised resolution
+    // agree - `§6.97`.
+    let coarse = matches!(clk_id, CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE);
+    let elapsed = if coarse {
+        crate::hal::ticks().saturating_mul(crate::hal::ns_per_tick())
+    } else {
+        crate::hal::since_boot_nanos()
+    };
     let monotonic = matches!(
         clk_id,
         CLOCK_MONOTONIC
@@ -4620,6 +4639,7 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
             | CLOCK_MONOTONIC_RAW
             | CLOCK_MONOTONIC_COARSE
             | CLOCK_BOOTTIME
+            | CLOCK_BOOTTIME_ALARM
     );
     let wall = if monotonic {
         0
@@ -4643,7 +4663,7 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     let (monotonic_offset, boottime_offset) = crate::sched::time_offsets();
     let offset = match clk_id {
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => monotonic_offset,
-        CLOCK_BOOTTIME => boottime_offset,
+        CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => boottime_offset,
         _ => 0,
     };
     let total = (wall as i64) * 1_000_000_000 + elapsed as i64 + offset;
@@ -4673,7 +4693,7 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     }
     // gettimeofday has no monotonic variant - every caller wants the wall
     // clock, so the RTC anchor rides along here unconditionally. The TSC-
-    // interpolated elapsed time gives a microsecond the 10 ms tick never could.
+    // interpolated elapsed time gives a microsecond the 4 ms tick never could.
     let elapsed = crate::hal::since_boot_nanos();
     let secs = crate::hal::boot_epoch() + elapsed / 1_000_000_000;
     let usecs = (elapsed % 1_000_000_000) / 1000;
@@ -5352,41 +5372,52 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
 
 /// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
 ///
-/// `struct timespec { tv_sec, tv_nsec }`. The tick counter is the only
-/// source of time there is, so the honest resolution is one tick - a
-/// caller that asks is told what it will actually get, rather than the
-/// nanosecond a modern Linux advertises. An unknown clock id is `EINVAL`.
+/// `struct timespec { tv_sec, tv_nsec }`. Two answers, and the pair is what
+/// Linux's own table says: the clocks that read the free-running counter step
+/// at the counter's quantum (1 ns on this machine's arithmetic, the machine's own
+/// `ceil(10^9/CNTFRQ)` on the other - `hal::clock_resolution_nanos`), and the two
+/// *coarse* clocks step at the tick, because that is what a coarse clock is.
+///
+/// The earlier version answered one tick for every clock, under a comment saying
+/// the tick counter was the only source of time there was. That sentence had
+/// been overtaken: `clock_gettime` had long interpolated the counter inside the
+/// tick, and measured on the machine (`build/scratch/batch/k.c`) its
+/// `CLOCK_MONOTONIC` step 616 ns while `CLOCK_MONOTONIC_COARSE` stepped 352 ns -
+/// so the resolution was four million times coarser than the readings and the
+/// coarse clock was not coarse at all. Measured on the host for the answer:
+/// `MONOTONIC`/`BOOTTIME`/`TAI` resolve to `1 ns`, the two coarse clocks to
+/// their tick (`1 ms` there, because their internal tick is 1 ms).
+///
+/// The id set is the *same* set `clock_gettime` accepts (`{0..=9, 11}`). It used
+/// to be three ids shorter, so `clock_getres(CLOCK_TAI, ...)` - a clock this
+/// kernel serves - came back `EINVAL` as if the number were malformed; that
+/// disagreement between two doors over one argument is the defect
+/// `docs/notes/` §6.97 records. Both alarm clocks are accepted too, and they
+/// read like the clock they alarm from: `CLOCK_REALTIME_ALARM` is wall time,
+/// `CLOCK_BOOTTIME_ALARM` is boot-relative, measured on the host as equal to
+/// their bases to within the read (`build/scratch/batch/m.c`).
 pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
-    const CLOCK_REALTIME: usize = 0;
-    const CLOCK_MONOTONIC: usize = 1;
-    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
-    const CLOCK_THREAD_CPUTIME_ID: usize = 3;
-    const CLOCK_MONOTONIC_RAW: usize = 4;
     const CLOCK_REALTIME_COARSE: usize = 5;
     const CLOCK_MONOTONIC_COARSE: usize = 6;
-    const CLOCK_BOOTTIME: usize = 7;
     let (clk_id, res) = (args[0], args[1]);
-    if !matches!(
-        clk_id,
-        CLOCK_REALTIME
-            | CLOCK_MONOTONIC
-            | CLOCK_PROCESS_CPUTIME_ID
-            | CLOCK_THREAD_CPUTIME_ID
-            | CLOCK_MONOTONIC_RAW
-            | CLOCK_REALTIME_COARSE
-            | CLOCK_MONOTONIC_COARSE
-            | CLOCK_BOOTTIME
-    ) {
+    // The clock id is checked before the destination, the way Linux is and the
+    // way `clock_gettime` in this file already is: a clock the kernel does not
+    // keep is `EINVAL` whatever the `res` is, and the `10` gap plus every id
+    // from `12` up are refused.
+    if !matches!(clk_id, 0..=9 | 11) {
         return err::EINVAL;
     }
     if res != 0 {
         if !buffer_ok(res, 16, true, true) {
             return err::EFAULT;
         }
-        let hz = crate::hal::TICK_HZ as u64;
+        let nanos = match clk_id {
+            CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => crate::hal::ns_per_tick(),
+            _ => crate::hal::clock_resolution_nanos(),
+        };
         unsafe {
             (res as *mut i64).write_unaligned(0);
-            ((res + 8) as *mut i64).write_unaligned((1_000_000_000 / hz) as i64);
+            ((res + 8) as *mut i64).write_unaligned(nanos as i64);
         }
     }
     0

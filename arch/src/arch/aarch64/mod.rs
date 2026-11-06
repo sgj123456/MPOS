@@ -540,6 +540,11 @@ impl crate::hal::Clock for crate::hal::Current {
         timer::busy_wait_ms(ms)
     }
 
+    #[inline]
+    fn resolution_nanos() -> u64 {
+        timer::resolution_nanos()
+    }
+
     /// The architecture gives the machine a second comparator - the EL1
     /// *virtual* timer, independent of the physical one the tick runs on - so
     /// a wait shorter than 4 ms ends when it is due (`timer::arm_wake_ns`,

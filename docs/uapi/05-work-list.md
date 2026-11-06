@@ -9478,3 +9478,36 @@ this host's procfs hides thread directories). Red on the unfixed kernel
 (`build/boot-procstat2.log`, `exit=0`). Host unit test:
 `vfs::procfs::tests::the_cpu_fields_report_the_group_or_the_thread_as_whole_says`. Mechanism and the
 full reading: `docs/notes/` §6.96.
+
+### Item 210 - `clock_getres` says what the clock delivers, and the coarse clocks are coarse (2026-11-07, landed)
+
+`clock_getres` answered **one tick (4 ms) for every id**, under a comment saying the tick counter was
+the only time source there was - while `clock_gettime` interpolates the free-running counter inside the
+tick. It also kept an id set three shorter than `clock_gettime`'s, and answered `CLOCK_BOOTTIME_ALARM`
+as wall time.
+
+| | Linux (host, 7.2.14) | this kernel, before |
+|---|---|---|
+| `clock_getres(CLOCK_MONOTONIC)` | `1 ns` | `4 ms` |
+| smallest step of 5000 back-to-back `CLOCK_MONOTONIC` reads | `20 ns` | `616 ns` |
+| `clock_getres(CLOCK_MONOTONIC_COARSE)` | `1 ms` (its tick) | `4 ms` (claimed) |
+| steps in 5000 back-to-back `CLOCK_MONOTONIC_COARSE` reads | **0** | `4985` (as fine as the fine clock) |
+| `clock_getres(CLOCK_TAI)` / `(CLOCK_REALTIME_ALARM)` / `(CLOCK_BOOTTIME_ALARM)` | `0`, `1 ns` | `EINVAL` |
+| `CLOCK_BOOTTIME_ALARM` reading | equals `CLOCK_BOOTTIME` (`752 ns` apart) | wall time (`1.8e18 ns` from it) |
+
+**Landed.** `Clock::resolution_nanos` (default: the tick) overridden per machine - x86_64
+`tick_ns / cycles_per_tick` rounded up to the ABI's `1 ns` (the tick before calibration), aarch64
+`ceil(10^9 / CNTFRQ)`; forwarded as `hal::clock_resolution_nanos()`. `handle_clock_getres` accepts the
+same `{0..=9, 11}` `clock_gettime` does and answers the counter's quantum for the fine clocks and
+`ns_per_tick()` for the two coarse ones; `handle_clock_gettime` makes the coarse pair read whole ticks
+(`ticks() * ns_per_tick()`) and puts `CLOCK_BOOTTIME_ALARM` in the boot-relative family. Owner:
+`src/syscall/linux/proc.rs`, `arch/src/hal/mod.rs`, both `arch/src/arch/*/timer.rs` and `mod.rs`.
+
+Pin: `user/tests/src/bin/t-clock-getres.rs`, 31 claims (machine-only where the number is this kernel's
+tick). Red on the unfixed kernel - six failures, including `CLOCK_MONOTONIC resolves finer than a tick
+(4000000 ns)` and `a coarse reading is a whole number of its ticks (2000 fractions in 2000)`
+(`build/boot-clkres-cf1.log`, `=== t-clock-getres exit=1`), green with it (`build/boot-clkres-fix2.log`,
+31 `ok:`, `exit=0`); the same program is `PASS` on the host (`MPOS_ON_HOST=1`). Two of its claims bound a
+step count and a clock skew by host-shaped numbers and the aarch64 arm answered them as statements about
+its own speed; both are now anchored to the interval each measurement spans, and the amended coarse claim
+is still red unfixed (`1938 steps over 1 ticks`). Mechanism and the full reading: `docs/notes/` §6.97.

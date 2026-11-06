@@ -121,6 +121,24 @@ pub fn since_boot_nanos() -> u64 {
     ticks * tick_ns + frac * tick_ns / cpt
 }
 
+/// Nanoseconds in one step of [`since_boot_nanos`] - the resolution a caller is
+/// told.
+///
+/// The reading is `ticks * tick_ns + frac * tick_ns / cpt`, so one unit of
+/// `frac` is `tick_ns / cpt` nanoseconds: with a TSC in the gigahertz range and
+/// a 4 ms tick that quotient is below one, and the ABI's own unit rounds it up
+/// to `1 ns` - the number Linux answers for its fine clocks. Before the second
+/// tick has calibrated `cpt` there is no fraction to add and the reading steps
+/// at the tick, so that is what it answers then.
+pub fn resolution_nanos() -> u64 {
+    let tick_ns = 1_000_000_000 / TICK_HZ as u64;
+    let cpt = CYCLES_PER_TICK.load(Ordering::Relaxed);
+    if cpt == 0 {
+        return tick_ns;
+    }
+    (tick_ns / cpt).max(1)
+}
+
 /// Busy-wait for roughly `ms` milliseconds. Only for boot-time tests and
 /// driver bring-up; the real sleep path arrives with the scheduler in M4.
 pub fn busy_wait_ms(ms: u64) {

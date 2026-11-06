@@ -310,6 +310,22 @@ pub fn since_boot_nanos() -> u64 {
     (u128::from(elapsed) * 1_000_000_000 / u128::from(freq)) as u64
 }
 
+/// Nanoseconds in one step of [`since_boot_nanos`] - the resolution a caller is
+/// told.
+///
+/// The reading is `elapsed * 10^9 / freq`, so one count of `CNTPCT_EL0` is
+/// `ceil(10^9 / freq)` nanoseconds - the machine's own quantum, not the tick's.
+/// Answered from [`FREQ`] rather than as a constant because `CNTFRQ_EL0` is the
+/// machine's statement of its rate. Before [`init`] there is no rate and the
+/// counter is not the clock yet, so the tick is what the reading steps at.
+pub fn resolution_nanos() -> u64 {
+    let freq = FREQ.load(Ordering::Relaxed);
+    if freq == 0 {
+        return 1_000_000_000 / TICK_HZ as u64;
+    }
+    (1_000_000_000 + freq - 1) / freq
+}
+
 /// Spin for approximately `ms` with interrupts as they are.
 ///
 /// Derived from the counter rather than from ticks, so it is usable before the
