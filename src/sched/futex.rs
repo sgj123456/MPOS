@@ -438,6 +438,14 @@ pub fn wake_all(address: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    //! The waiters' map is one module global (`WAITERS` above), and the
+    //! addresses below repeat on purpose - two of these claims are about the
+    //! *same* two words - so every test here takes the module's test lock.
+    //! Without it two claims about `0xa000`/`0xb000` see each other's waiters and
+    //! the suite reddens about one run in three (`docs/notes/` §6.87). The rule
+    //! is this repo's own: *a test that touches a module global takes that
+    //! module's test lock* (`AGENTS.md` §3, concurrency).
+
     use super::*;
 
     /// A task id the tests can use without a scheduler.
@@ -447,6 +455,7 @@ mod tests {
 
     #[test]
     fn a_wake_reaches_only_the_address_it_names_and_only_as_many_as_asked() {
+        let _lock = crate::sched::test_lock::take();
         let (a, b) = (0x1000usize, 0x2000usize);
         register(a, task(1), BITSET_ANY);
         register(a, task(2), BITSET_ANY);
@@ -467,6 +476,7 @@ mod tests {
 
     #[test]
     fn a_bitset_wake_reaches_only_intersecting_sleepers() {
+        let _lock = crate::sched::test_lock::take();
         let a = 0x5000usize;
         register(a, task(1), 0b0001);
         register(a, task(2), 0b0010);
@@ -496,6 +506,7 @@ mod tests {
 
     #[test]
     fn a_wake_that_arrives_before_the_sleep_is_not_lost() {
+        let _lock = crate::sched::test_lock::take();
         // The ordering the whole primitive rests on: the waiter is in the
         // queue before the value is re-checked, so a wake landing in between
         // marks a waiter that has not slept yet - and the sleep that follows
@@ -511,6 +522,7 @@ mod tests {
 
     #[test]
     fn a_task_that_never_waited_is_never_woken() {
+        let _lock = crate::sched::test_lock::take();
         let address = 0x4000usize;
         assert_eq!(mark_woken(address, 1), 0);
         assert!(!is_woken(address, task(9)));
@@ -518,6 +530,7 @@ mod tests {
 
     #[test]
     fn a_multi_wait_holds_a_place_on_every_word_and_names_the_one_that_fired() {
+        let _lock = crate::sched::test_lock::take();
         let (a, b) = (0x8000usize, 0x9000usize);
         let waits = [
             Wait {
@@ -549,6 +562,7 @@ mod tests {
 
     #[test]
     fn a_multi_wait_names_the_earliest_word_when_several_fire() {
+        let _lock = crate::sched::test_lock::take();
         let (a, b) = (0xa000usize, 0xb000usize);
         let waits = [
             Wait {
@@ -572,6 +586,7 @@ mod tests {
 
     #[test]
     fn a_requeue_wakes_the_first_places_and_moves_the_rest_to_its_other_word() {
+        let _lock = crate::sched::test_lock::take();
         let (a, b) = (0x7000usize, 0x8000usize);
         register(a, task(1), BITSET_ANY);
         register(a, task(2), BITSET_ANY);
@@ -597,6 +612,7 @@ mod tests {
 
     #[test]
     fn a_requeue_with_no_count_on_one_side_leaves_that_half_alone() {
+        let _lock = crate::sched::test_lock::take();
         let (a, b) = (0xa000usize, 0xb000usize);
         register(a, task(1), BITSET_ANY);
         register(a, task(2), BITSET_ANY);

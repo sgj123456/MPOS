@@ -6397,3 +6397,41 @@ ok:    and leaves the caller's rusage record untouched
 - The adopt-and-hold patch itself is validated by this run: with it in, the stop/resume section passes and
   only this wait is left (`=== FAIL t-waitid timeout=120s`, one lane, `pass=256 fail=1`); `t-rename`'s
   earlier red did not recur without the debug prints.
+
+### 6.87 The futex tests shared one map and raced each other — LANDED (2026-11-06)
+
+`cargo xtask test` has spent several sessions reporting **"the kernel's host unit tests failed"** with no
+failing test name in the captured tail: stage 1 runs in a thread beside the first arm's sweep, and
+`run_captured` keeps only the last 40 lines of a combined stdout+stderr, so the tail that reached the gate
+was compiler warnings plus `error: test failed, to rerun pass -p mpos --lib`. Running the gate's exact stage-1
+command by hand was green every time (726 + 9 + 15 + … , 0 failed), which is how it stayed "unexplained".
+
+It is `src/sched/futex.rs`'s own tests. `static WAITERS: Mutex<RefCell<Vec<Waiter>>>` (`src/sched/futex.rs:46`)
+is one module global, and the addresses the tests use are **deliberately repeated**: `a_multi_wait_names_the_earliest_word_when_several_fire`
+and `a_requeue_with_no_count_on_one_side_leaves_that_half_alone` are both about `0xa000`/`0xb000`. Two of them
+running on different test threads therefore see each other's waiters:
+
+```
+thread 'sched::futex::tests::a_requeue_with_no_count_on_one_side_leaves_that_half_alone' panicked at
+src/sched/futex.rs:608:9:
+assertion `left == right` failed
+  left: 1
+right: 0
+```
+
+(line 608 is `assert_eq!(waiting_on(b), 0);`, the "the destination never hears of them" claim, in a test whose
+own words are "the destination never hears of them").
+
+**The counterfactual, 20 runs each way of `cargo test --lib --target x86_64-unknown-linux-gnu -p mpos futex::tests`:**
+without the lock **13/20 green**; with it **20/20**. Nine parallel `cargo test … -p mpos -p mpos-err` runs also
+failed twice (`par-3-2.log`, `par-2-3.log`) while the same command alone never did.
+
+**Fix.** Every test in the module takes `crate::sched::test_lock::take()` as its first statement, and the module
+carries a header saying why. This is not new policy: `AGENTS.md` §3 already says *a test that touches a module
+global takes that module's test lock*, and it names this exact failure shape (the devpts option tests, 5 of 40
+runs). The futex module was simply never converted.
+
+**Why it hid for so long.** The module's tests are fast and mostly independent; only the pair that shares
+`0xa000`/`0xb000` races, and only when the harness happens to schedule them on two threads at once. A single-run
+green - which is what every hand check did, and what `run_captured`'s tail suggested - is not evidence that the
+suite is stable.
