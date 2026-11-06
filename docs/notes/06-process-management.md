@@ -6955,3 +6955,85 @@ the same rule).
 `ESRCH` when it names nothing - even when the rest of the arguments are also bad, unless Linux's own ordering
 says the other refusal comes first. A handler that binds `let (_pid, ...)` has already answered about the
 caller, which is right only for the one caller that passed 0.
+
+## §6.93 `setpriority` asks whose task, and says so with two different errnos (LANDED 2026-11-06)
+
+`handle_setpriority` had no authority check in any of its three arms. A program running as one user could
+lower the nice of *another* user's task and the call answered `0` - and wrote it, so a later `getpriority` on
+that task read the intruder's value. The doc comment said why it was "not needed": *"the unprivileged-lowering
+rule is moot for this single-rooted kernel, which accepts the whole range."* That sentence was inherited, never
+measured, and wrong in three separate ways.
+
+**Linux, measured** (`build/scratch/niceperm/{y,g2,s2,z,ns,w,x2,y2}.c`; musl static, host kernel 7.2.14,
+uid 1000, empty `CapEff`, `RLIMIT_NICE` 0/0, every process at nice 19):
+
+| call | Linux | this kernel, before |
+|---|---|---|
+| `set(PROCESS, <another user's task>, 19)` (a *lowering*) | `EPERM` | `0` |
+| `set(PROCESS, <another user's task>, -5)` | `EPERM` | `0` |
+| `set(PROCESS, 0, 0)` (raising itself) | `EACCES` | `0` |
+| `set(PROCESS, 0, <its current nice>)` | `0` | `0` |
+| `set(PROCESS, <same-uid stranger>, <its own nice>)` | `0` | `0` |
+| `set(USER, <own uid>, 19)` | `EPERM` | `0` |
+| `set(PGRP, <a group with any foreign member>, …)` | `EPERM` | `0` |
+| `set(USER/PGRP/PROCESS, 424242, …)` | `ESRCH` | `ESRCH` |
+| `get(anything)` | no authority check at all | no authority check |
+
+**Two refusals, not one.** The measurement that took three iterations to get right is that `EPERM` and
+`EACCES` are *different answers to different questions*:
+
+- **`EPERM` is ownership.** The target is not the caller's, in either direction - and a lowering of a
+  stranger's nice is refused just as a raising is. The first readings here mislabelled this: `EACCES` is `13`
+  and `EPERM` is `1`, and an early probe printed `-1` with `errno 13` and called it "EPERM", which made the
+  table look like a direction rule and nothing else.
+- **`EACCES` is direction.** The target *is* the caller's, but the request raises its priority: Linux reaches
+  this through `capable(CAP_SYS_NICE)` or the caller's `RLIMIT_NICE`. This kernel has no `RLIMIT_NICE` entry
+  (`default_rlimits()` fills five of `RLIM_NLIMITS`' sixteen), so the capability is the whole of the rule
+  here - and a caller without it may still lower any task it owns, which Linux never refuses. That is why the
+  predicate is `prio < current` and not `prio != current`: an equal value is not a raise, and Linux answers `0`
+  for it on a task the caller owns.
+
+**Blood relation is not the rule**, which the name "may retarget" invites. A scan over every process this host
+would show (`w.c`, `x2.c`, `y2.c`: 484 targets with an empty `CapPrm`) answered `0` for
+`setpriority(PRIO_PROCESS, <pid>, <that process's own nice>)` on **every one of them** - parent, sibling,
+stranger, child. The only refusals were the targets holding a capability (`pid 1330`, `CapPrm` = a wake-alarm
+bit) or a different uid, which is the two branches of `set_one_prio`, not a family tree.
+
+**`PRIO_USER` is stricter than `PRIO_PROCESS`, and that is upstream's own asymmetry**: the same uid and the
+same equal value answer `0` through `PRIO_PROCESS` and `EPERM` through `PRIO_USER` (`g2.c`). So the two
+collection arms get the ownership question per member, and any member the caller may not touch refuses the
+**whole set** - nothing is written. Linux walks the group and stops at the first task `set_one_prio` refuses,
+leaving the earlier members changed; that partial write's extent is the task list's iteration order, which is
+not a promise to a caller, so refusing the set whole is the same answer with nothing half-done.
+
+**Ordering.** Empty first (`ESRCH` beats `EPERM`: `set(USER, 1, 10)` = `ESRCH` on this host, not `EPERM`),
+then ownership (`EPERM`), then direction (`EACCES`), then the write. The number has to resolve before any of it
+- an unknown pid is `ESRCH` in every arm, never `EPERM`.
+
+The fix is two predicates in `src/syscall/linux/posix.rs`: `nice_may_retarget` (the caller's own task, else
+`crate::cred::kill_ok` on the four ids, else `CAP_SYS_NICE` - the same shape `affinity_may_retarget` uses, so
+"same user" means the same thing across the syscall surface) and `nice_may_raise` (the capability, then
+`prio >= current`). A task that has already exited passes both and `set_nice` answers `ESRCH`, which is the
+answer the caller can act on.
+
+**The pin, and how it can exist.** `user/tests/src/bin/t-nice-authority.rs` drops a child to `nobody` and has
+it lower and raise its own nice and then lower its root parent's - the fixture `t-affinity-rules` established
+(`setgroups(0, null)`, `setgid`, `setuid(NOBODY)`; the payload runs as root so the drop succeeds in a guest and
+fails on the host, where the same-uid branch is then the allowed side of the same rule). Four claims, on the
+unfixed kernel **two red**:
+
+```
+ok:    lowering a task's own nice is served (uid 65534)
+FAIL:  and raising it again is refused (uid 65534, errno Some(2))
+FAIL:  a program of another user cannot lower its root parent's nice (uid 65534)
+ok:    and a getter asks for no authority at all (uid 65534, read … raise=0 raiseerrno=2 parent=0 parenterrno=2 …)
+```
+
+and with the fix all four `ok:`, `parent=-1 parenterrno=1` (the `EPERM`) and `raise=-1 raiseerrno=13` (the
+`EACCES`). `t-priority`'s twenty existing claims stay green: they run as root, which holds the capability, so
+every value they set is a raise it is allowed to make.
+
+**The rule.** A call that changes another task asks two questions and they have **two errnos**: *is this task
+mine* (`EPERM`) and *may I move it this way* (`EACCES`). A handler that answers a lowering with success for a
+task it does not own has not checked anything - and a check written from a comment ("moot for this kernel")
+instead of a measurement will be wrong in whichever direction the comment guessed.

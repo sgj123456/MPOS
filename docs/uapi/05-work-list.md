@@ -9332,3 +9332,42 @@ way round, and a non-empty mask is copied before either.
   without the capability cannot probe this machine's CPU count one refusal shape at a time. This entry earlier
   claimed a getter-side `ptrace_may_access` half - that was wrong, and wrong in the direction that would have
   refused reads Linux serves.
+
+### Item 206 - `setpriority` asks whose task, and answers two different errnos (2026-11-06, landed)
+
+`handle_setpriority` had no authority check in any arm. A program running as one user could lower another
+user's task's nice, the call answered `0`, and the value was written - so a later `getpriority` on that task
+read the intruder's number. The doc comment claimed the opposite reason: *"the unprivileged-lowering rule is
+moot for this single-rooted kernel, which accepts the whole range"*.
+
+Measured on the host (`build/scratch/niceperm/{y,g2,s2,w,x2}.c`; uid 1000, empty `CapEff`, `RLIMIT_NICE` 0/0):
+
+| call | Linux | this kernel, before |
+|---|---|---|
+| `set(PROCESS, <another user's task>, 19)` (a lowering) | `EPERM` | `0`, and written |
+| `set(PROCESS, 0, 0)` (raising itself) | `EACCES` | `0` |
+| `set(PROCESS, <same-uid stranger>, <its own nice>)` | `0` | `0` |
+| `set(USER, <own uid>, 19)` | `EPERM` | `0` |
+| `set(PGRP, <any foreign member>, …)` | `EPERM` | `0` |
+| `set(USER/PGRP/PROCESS, <no members>, …)` | `ESRCH` | `ESRCH` |
+| `get(anything)` | no authority check | no authority check |
+
+- **Two refusals, two questions.** `EPERM` is ownership (the task is not the caller's, in either direction);
+  `EACCES` is direction (the task is the caller's but the request raises its priority, which needs
+  `CAP_SYS_NICE` or `RLIMIT_NICE` here; this kernel has no `RLIMIT_NICE`, so the capability is the rule).
+  Ownership is judged first, and an empty set is `ESRCH` before either. An early reading in this repo
+  mislabelled `EACCES` (13) as `EPERM` (1), which is what made the rule look like direction alone.
+- **Not blood relation.** A scan of every same-uid target this host would show (484 of them) answered `0` for
+  an equal-nice call on each - parent, sibling, stranger alike. Only capability-holding or different-uid
+  targets were refused.
+- **`PRIO_USER` is stricter than `PRIO_PROCESS`** (same uid, same equal value: `0` versus `EPERM`), so both
+  collection arms test ownership per member and refuse the **whole set** on any foreign one. Linux stops at the
+  first refused member and leaves the earlier ones changed; that extent is the task list's iteration order,
+  not a promise, so this refuses without writing.
+- Owner: `src/syscall/linux/posix.rs` (`nice_may_retarget`, `nice_may_raise`, `handle_setpriority`).
+- Pin: `user/tests/src/bin/t-nice-authority.rs`, 4 claims - two red on the unfixed kernel (`raise` and the roof
+  parent's `EPERM`), four `ok:` with it, and four `ok:` on `MPOS_ON_HOST=1`. The fixture drops a child to
+  `nobody`, the shape `t-affinity-rules` established; the payload runs as root, so the drop lands in a guest
+  and fails on the host, where the same-uid branch reads the allowed side of the same rule.
+  `t-priority`'s twenty claims stay green - as root they hold the capability, so their raises are allowed.
+- Measurements, the two errnos and the mislabelling that hid them: `docs/notes/` §6.93.

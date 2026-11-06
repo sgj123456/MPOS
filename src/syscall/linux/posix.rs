@@ -799,16 +799,100 @@ pub fn handle_getpriority(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
+/// May the running task give `target` a **new** nice value at all — the
+/// ownership half of `setpriority`'s authority?
+///
+/// Linux asks this per task, from `set_one_prio` (`kernel/sys.c`):
+/// `if (!uid_eq(current_euid(), task_uid(p)) && !in_egroup_p(...) &&
+/// !ns_capable(CAP_SYS_NICE)) return -EPERM`. It is the same four-value
+/// question `crate::cred::kill_ok` answers for signals and
+/// `affinity_may_retarget` (`src/syscall/linux/abi.rs`) answers for affinity
+/// masks, and it is **not** blood relation: measured on this host as uid 1000
+/// with an empty `CapEff`, `setpriority(PRIO_PROCESS, <another uid-1000
+/// process's pid>, 19)` answered `0` for a stranger and for this program's own
+/// parent, while the same call on pid 1 answered `EPERM` — and a scan of every
+/// same-uid process it could reach answered `0` for 484 of them and refused
+/// only the ones holding `CAP_WAKE_ALARM`, which is the capability branch and
+/// not the user one.
+///
+/// A task that has already exited answers `true` here rather than `EPERM`:
+/// `set_nice` then refuses with `ESRCH`, which is the answer Linux gives and the
+/// one the caller can act on.
+fn nice_may_retarget(target: crate::sched::TaskId) -> bool {
+    #[cfg(target_os = "none")]
+    {
+        if target == crate::sched::current_tgid() {
+            return true;
+        }
+        let Some(them) = crate::sched::identity_of(target) else {
+            return true;
+        };
+        let caller = crate::sched::current_identity();
+        crate::cred::kill_ok(caller.ruid, caller.euid, them.ruid, them.suid)
+            || crate::sched::current_credentials().capable(crate::cred::CAP_SYS_NICE)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = target;
+        true
+    }
+}
+
+/// May the running task move `target` to `prio` — the *direction* half of
+/// `setpriority`'s authority, and a different errno from the ownership one.
+///
+/// Measured, and the reason this is a second question: the two refusals are
+/// **`EPERM` and `EACCES`**, not one code. A target the caller does not own is
+/// `EPERM` whatever the value (`setpriority(PRIO_PROCESS, 1, 19)` = `EPERM`);
+/// a target the caller *does* own but may not promote is `EACCES`, and Linux
+/// reaches it through `capable(CAP_SYS_NICE)` or the caller's `RLIMIT_NICE`, not
+/// through ownership (`setpriority(PRIO_PROCESS, 0, 0)` as uid 1000 with
+/// `RLIMIT_NICE` 0/0 answers `EACCES`, and so does `-21`). This kernel does not
+/// carry `RLIMIT_NICE` yet — `default_rlimits()` fills five of the sixteen
+/// entries and that is not one of them — so the capability is the whole of the
+/// rule here, and a caller without it may still **lower** a task's priority
+/// (a larger nice), which Linux never refuses.
+///
+/// That is why the test is `prio < current` rather than `prio != current`: an
+/// equal value is not a raise, and Linux answers `0` for it on a task the
+/// caller owns.
+fn nice_may_raise(target: crate::sched::TaskId, prio: i32) -> bool {
+    #[cfg(target_os = "none")]
+    {
+        if crate::sched::current_credentials().capable(crate::cred::CAP_SYS_NICE) {
+            return true;
+        }
+        let Some(current) = crate::sched::nice_of(target.0) else {
+            return true;
+        };
+        prio >= current
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (target, prio);
+        true
+    }
+}
+
 /// `setpriority(which, who, prio)` — set the nice value.
 ///
-/// The nice is now stored on the task (the scheduler's priority *bands* remain
-/// its policy and a caller cannot move a task between them, so the value has no
-/// weight effect here - a named sub-gap), but the call is no longer a
-/// accept-and-drop: over `PRIO_PROCESS` it targets the caller (or the named
-/// process, `ESRCH` if it is gone), and over `PRIO_PGRP`/`PRIO_USER` it applies
-/// to every member, `ESRCH` when the set is empty. The `which` validation is
-/// Linux's; the unprivileged-lowering rule is moot for this single-rooted
-/// kernel, which accepts the whole range.
+/// The nice is stored on the task (the scheduler's priority *bands* remain its
+/// policy and a caller cannot move a task between them, so the value has no
+/// weight effect here - a named sub-gap), over `PRIO_PROCESS` it targets the
+/// caller (or the named process, `ESRCH` if it is gone), and over
+/// `PRIO_PGRP`/`PRIO_USER` it applies to every member, `ESRCH` when the set is
+/// empty.
+///
+/// **Authority is two separate questions with two separate errnos**, and this
+/// handler used to ask neither — it answered `0` while writing a stranger's nice
+/// (`docs/notes/` §6.93). [`nice_may_retarget`] is ownership and refuses
+/// `EPERM`; [`nice_may_raise`] is direction and refuses `EACCES`. They are
+/// ordered the way Linux orders them: an empty set is `ESRCH` before anything,
+/// ownership is judged before the value, and a set is refused **whole** - one
+/// member the caller may not touch makes `PRIO_PGRP`/`PRIO_USER` answer
+/// `EPERM` for every member, and nothing is written. That last part is what
+/// makes the check useless if it is done per member while writing: a partial
+/// application is a failure shape Linux never produces.
 ///
 /// The nice is **clamped** to `-20..=19`, not refused: Linux's `setpriority`
 /// clamps (`if (niceval < MIN_NICE) niceval = MIN_NICE;`, `kernel/sys.c`), and
@@ -847,6 +931,16 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
             // `set_nice` answers `false` when the process is gone (or was never
             // there), which is Linux's `ESRCH` for `setpriority(PRIO_PROCESS,
             // pid, ..)` on a pid that does not name a task.
+            //
+            // Authority is asked *after* the number resolves (an unknown number
+            // is `ESRCH`, not `EPERM`) and *before* anything is written.
+            let target = crate::sched::TaskId(pid);
+            if !nice_may_retarget(target) {
+                return err::EPERM;
+            }
+            if !nice_may_raise(target, prio) {
+                return err::EACCES;
+            }
             if crate::sched::set_nice(pid, prio) {
                 0
             } else {
@@ -867,6 +961,21 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
             if members.is_empty() {
                 return err::ESRCH;
             }
+            // A set is judged as a whole before a member is touched, and the
+            // two questions keep their own errnos in the same order as the
+            // single-process branch: membership first (`EPERM`), then the
+            // direction (`EACCES`). Linux reaches this by walking the group and
+            // stopping at the first task `set_one_prio` refuses, so it leaves
+            // the earlier members already changed - a partial write whose extent
+            // is the task list's iteration order, which is not a promise to a
+            // caller. Refusing the whole set is the same answer with nothing
+            // half-done (`docs/notes/` §6.93).
+            if !members.iter().all(|id| nice_may_retarget(*id)) {
+                return err::EPERM;
+            }
+            if !members.iter().all(|id| nice_may_raise(*id, prio)) {
+                return err::EACCES;
+            }
             for id in members {
                 crate::sched::set_nice(id.0, prio);
             }
@@ -882,6 +991,14 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
             let members = crate::sched::uid_members(ruid);
             if members.is_empty() {
                 return err::ESRCH;
+            }
+            // Same two questions, same order, same whole-set rule as
+            // `PRIO_PGRP` above.
+            if !members.iter().all(|id| nice_may_retarget(*id)) {
+                return err::EPERM;
+            }
+            if !members.iter().all(|id| nice_may_raise(*id, prio)) {
+                return err::EACCES;
             }
             for id in members {
                 crate::sched::set_nice(id.0, prio);

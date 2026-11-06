@@ -292,7 +292,24 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-06, an affinity setter's authority §6.92):** stage 1
+**Latest measured gate (2026-11-06, `setpriority`'s authority §6.93):** stage 1 `1224 tests, 0 failed`
+(43.91 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 44.10 s
+(previous green run 45.66 s, -3.4%)` (`build/gate-nice-x3.log`); aarch64 `pass=262 fail=0 (262 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 129.94 s (previous green run 101.51 s, +28.0%)`
+(`build/gate-nice-a.log`). Both arms ran with the lane count forced (`MPOS_TEST_LANES=3` and `=2`) - see
+below. The new pin `t-nice-authority` is `=== PASS` on both, in
+`build/test-lane-x86_64-1/serial.log` and `build/aarch64-test-serial.log`.
+
+**One red before it, and what it was:** the first x86_64 attempt (`build/gate-nice-x2.log`) came back
+`pass=262 fail=1` with two timing-shaped failures - `mpos-kunit sched.alternating FAILED: two tasks at
+the same priority did not take turns: [0, 1, 0, 1, 0, 1, 1, 1, 0, 0]` and `t-blk-sleep`'s `the sibling
+ran inside 38 of 64 device calls (bound 40)`. Both are statements about how much CPU a guest got, and that
+run had the *other* arm's QEMU machines on the same pinned core - the same cause as the six-lane reading
+under the §6.92 entry. Re-run alone, the same tree gave `pass=263 fail=0`. Neither name appears in any
+later run, and neither case's subject (priority bands taking turns; a parked transfer yielding) was touched
+by this change.
+
+**Measured gate before it (2026-11-06, an affinity setter's authority §6.92):** stage 1
 `1224 tests, 0 failed` (45.33 s and 101.18 s on the two arms); x86_64 `pass=262 fail=0 (262 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 45.66 s (previous green run 40.88 s, +11.7%)`
 (`build/gate-affperm-x.log`), with the pin's fifteen `ok:` lines and `=== PASS t-affinity-rules` in its
@@ -364,7 +381,7 @@ aarch64 `pass=257 fail=0 (257 built)`, `mpos-kunit 35 passed, 0 failed`, every l
 (`ESR_EL1 0x96000047`, EC 0x25, `FAR_EL1 0x221000`, the lane's serial log only 6591 bytes) and is not a
 reading of the sweep; the re-run is the one quoted.
 
-**Latest measured gate (2026-11-04, one both-arm run with all three stages green —
+**Measured gate before those (2026-11-04, one both-arm run with all three stages green —
 `build/gate-sigfutex3.log`, a process-directed signal's thread (§2.12) and `t-ns-cgroup`'s own groups
 (§3.28)):** stage 1 `1224 tests, 0 failed` (30.60 s); x86_64 `pass=256 fail=0 (256 built)`,
 `mpos-kunit 35 passed, 0 failed`, exit 33, `all 256 user tests passed … (15 not run)`, `total 30.80 s`;

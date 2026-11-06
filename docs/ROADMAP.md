@@ -156,6 +156,21 @@ One-glance status of the whole roadmap.
   which corrects an earlier claim here that it needed a ptrace check; the order is `EFAULT` →
   `ESRCH` → `EPERM` → `EINVAL`, so authority sits before the mask judgement (`t-affinity-rules`,
   §6.92, item 205)
+- [x] `setpriority` asks whose task, and says so with two different errnos — no arm of
+  `handle_setpriority` had an authority check, so a program running as one user could lower
+  **another** user's task's nice, get `0`, and have it written (a later `getpriority` on that task
+  then read the intruder's value). The doc comment said the lowering rule was "moot for this
+  single-rooted kernel", which was inherited rather than measured. Linux answers **two** refusals
+  to two questions: `EPERM` is ownership (a task that is not the caller's, in *either* direction —
+  lowering a stranger's nice is refused just as raising is), and `EACCES` is direction (the task
+  *is* the caller's but the value raises its priority, which needs `CAP_SYS_NICE`; this kernel has
+  no `RLIMIT_NICE` entry yet, so the capability is the whole rule there). Not blood relation: a
+  scan of 484 same-uid targets on the host answered `0` for an equal-nice call on every one of
+  them, parent and stranger alike. `PRIO_USER` is stricter than `PRIO_PROCESS` upstream, so both
+  collection arms test ownership per member and refuse the **whole** set — nothing half-written.
+  `nice_may_retarget`/`nice_may_raise` in `src/syscall/linux/posix.rs` are the two predicates, and
+  the pin drops a child to `nobody` and asks about its own root parent (`t-nice-authority`, §6.93,
+  item 206)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four
