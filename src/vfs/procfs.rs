@@ -1529,6 +1529,12 @@ pub struct Process {
     pub threads: usize,
     pub rss_pages: usize,
     pub exit_signal: u8,
+    /// See [`crate::sched::TaskSnapshot::cpu`] - the mirror carries the field
+    /// because the *generators* are compiled here too, which is what makes the
+    /// file's shape host-testable.
+    pub cpu: (u64, u64, u64, u64),
+    /// See [`crate::sched::TaskSnapshot::cpu_own`].
+    pub cpu_own: (u64, u64),
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1599,10 +1605,59 @@ fn exit_signal_field(exit_signal: u8, is_thread: bool) -> i32 {
 /// Fifty-two fields, because that is what the file is: a `ps` reads field 4
 /// for the parent and field 3 for the state, and a tool that stops reading
 /// after the ones it wants still lands on the right ones. Fields this kernel
-/// does not account - page faults, CPU time, wchan - are zero, which is what
-/// a machine that never counted them would honestly report.
-fn stat_line(pid: usize, tid: usize) -> Option<String> {
+/// does not account - page faults - are zero, which is what a machine that
+/// never counted them would honestly report. CPU is *not* one of them: the
+/// timer interrupt charges every task, and fields 14-17 carry those numbers
+/// scaled to the `USER_HZ` ticks a reader expects (see `user_hz_ticks`).
+///
+/// `whole` is Linux's own flag, and it picks **whose** CPU fields 14 and 15
+/// report: set for `/proc/<pid>/stat` and for a thread's `/proc/<tid>/stat`
+/// (the *group's* total), clear only for `/proc/<pid>/task/<tid>/stat` (that
+/// thread's own). The two spellings reach this function with the same two
+/// numbers, so the difference cannot be read off the arguments - it is the
+/// caller that knows which file it is building. Measured on a current host
+/// (`build/scratch/batch/s8.c`, Linux 7.2.14): `/proc/<pid>/stat`'s field 14
+/// answered `66` while the reading thread's own CPU was `0.030 s` of `0.667 s`.
+/// A kernel tick count as `USER_HZ` ticks, the unit `/proc/<pid>/stat`'s CPU
+/// fields are in on Linux.
+///
+/// `USER_HZ` is 100 on every Linux that exists (it is ABI, not a setting),
+/// while this kernel's timer runs at [`crate::hal::TICK_HZ`] - so the scaling
+/// is a multiply and a divide, the same shape `handle_times` and `write_rusage`
+/// use to answer microseconds. Truncating rather than rounding is Linux's own
+/// choice: the fields count completed ticks.
+/// Fields 14-17 of `/proc/<pid>/stat`, in `USER_HZ` ticks: which pair fields
+/// 14 and 15 carry is Linux's `whole` flag ([`stat_line`] explains it), while
+/// 16 and 17 are the group's children either way - the child totals sit in the
+/// group's `signal_struct` on Linux, not on the task.
+fn cpu_fields(task: &Process, whole: bool) -> (u64, u64, u64, u64) {
+    let own = if whole {
+        (task.cpu.0, task.cpu.1)
+    } else {
+        task.cpu_own
+    };
+    (
+        user_hz_ticks(own.0),
+        user_hz_ticks(own.1),
+        user_hz_ticks(task.cpu.2),
+        user_hz_ticks(task.cpu.3),
+    )
+}
+
+fn user_hz_ticks(ticks: u64) -> u64 {
+    #[cfg(target_os = "none")]
+    let hz = crate::hal::TICK_HZ as u64;
+    // The host build has no timer at all: nothing it generates counts ticks,
+    // so the divisor only has to be the machine's for the *shape* the host
+    // tests assert (`0` stays `0`, and a tick cannot round to zero by accident).
+    #[cfg(not(target_os = "none"))]
+    let hz = 250u64;
+    ticks * 100 / hz
+}
+
+fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
     let task = task(tid)?;
+    let (utime, stime, cutime, cstime) = cpu_fields(&task, whole);
     let shown = if tid == task.pid { task.pid } else { tid };
     let shown = reader_number(shown);
     let kb = task.rss_pages * 4096 / 1024;
@@ -1626,10 +1681,13 @@ fn stat_line(pid: usize, tid: usize) -> Option<String> {
         Cow::Borrowed("0"),  // cminflt
         Cow::Borrowed("0"),  // majflt
         Cow::Borrowed("0"),  // cmajflt
-        Cow::Borrowed("0"),  // utime
-        Cow::Borrowed("0"),  // stime
-        Cow::Borrowed("0"),  // cutime
-        Cow::Borrowed("0"),  // cstime
+        // utime/stime: the group's CPU for `/proc/<pid>/stat`, this thread's
+        // for the `task/<tid>/` spelling - and always the group's children in
+        // cutime/cstime, because the child totals live in the group.
+        Cow::Owned(alloc::format!("{utime}")),
+        Cow::Owned(alloc::format!("{stime}")),
+        Cow::Owned(alloc::format!("{cutime}")),
+        Cow::Owned(alloc::format!("{cstime}")),
         Cow::Borrowed("20"), // priority
         Cow::Borrowed("0"),  // nice
         Cow::Owned(alloc::format!("{}", task.threads)),
@@ -2742,7 +2800,7 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     node.add(
         "stat",
         NodeKind::File,
-        maybe_file(move || stat_line(pid, tid)),
+        maybe_file(move || stat_line(pid, tid, false)),
     );
     node.add(
         "comm",
@@ -3107,7 +3165,7 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     node.add(
         "stat",
         NodeKind::File,
-        maybe_file(move || stat_line(leader, slot)),
+        maybe_file(move || stat_line(leader, slot, true)),
     );
     node.add(
         "statm",
@@ -4617,6 +4675,36 @@ mod tests {
         assert_eq!(exit_signal_field(0, true), -1);
     }
 
+    /// `/proc/<pid>/stat`'s CPU fields carry the numbers the timer interrupt
+    /// charged, and *which* numbers fields 14 and 15 carry is Linux's `whole`
+    /// flag: the group's for `/proc/<pid>/stat` and a thread's `/proc/<tid>/stat`,
+    /// this thread's own only for `/proc/<pid>/task/<tid>/stat`. Measured on a
+    /// current host (`build/scratch/batch/s8.c`, Linux 7.2.14): field 14
+    /// answered `66` USER_HZ ticks (`0.667 s`, the whole group) while the
+    /// reading thread's own `RUSAGE_THREAD` was `0.030 s`.
+    ///
+    /// The kernel's clock is `TICK_HZ` and the field's unit is the ABI's
+    /// `USER_HZ` (100), so the scaling is part of the rule and is asserted
+    /// here: a raw tick count in field 14 would be a number no `ps` can read.
+    #[test]
+    fn the_cpu_fields_report_the_group_or_the_thread_as_whole_says() {
+        let mut p = process(7, 7, None, 0, 'R');
+        // 250 ticks of group user time, 100 of group system, 50/25 of children,
+        // and the thread's own pair is different from every one of them.
+        p.cpu = (250, 100, 50, 25);
+        p.cpu_own = (25, 0);
+        assert_eq!(cpu_fields(&p, true), (100, 40, 20, 10));
+        assert_eq!(
+            cpu_fields(&p, false),
+            (10, 0, 20, 10),
+            "a thread's own pair, with the group's children beside it"
+        );
+        // A count below one USER_HZ tick is zero, not rounded up into one -
+        // Linux counts completed ticks.
+        p.cpu = (2, 0, 0, 0);
+        assert_eq!(cpu_fields(&p, true).0, 0);
+    }
+
     /// A dead task keeps its directory only when it leads the group - Linux's
     /// `__unhash_process`, and the clause that lets a tid's directory be served
     /// at all without serving one for a thread that has left.
@@ -5621,6 +5709,8 @@ mod tests {
             threads: 1,
             rss_pages: 0,
             exit_signal: 17,
+            cpu: (0, 0, 0, 0),
+            cpu_own: (0, 0),
         }
     }
 

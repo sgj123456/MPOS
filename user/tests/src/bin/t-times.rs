@@ -60,7 +60,7 @@
 //! what it pins is the kernel's write. Measured on a host Linux
 //! (`.workbuddy/probe_times.c`): the whole 144 bytes come back zero.
 
-use mpos_user_tests::{Report, Rusage, Timeval};
+use mpos_user_tests::{Report, Rusage, Timeval, host_run};
 use rustix::io::Errno;
 use rustix::thread::NanosleepRelativeResult;
 use rustix::time::Timespec;
@@ -148,6 +148,29 @@ fn check_with<T: std::fmt::Debug>(r: &mut Report, label: &str, ok: bool, detail:
 fn micros(tv: Timeval) -> i64 {
     tv.tv_sec * 1_000_000 + tv.tv_usec
 }
+
+/// Fields 14-17 of a `/proc/.../stat` line, in the `USER_HZ` ticks Linux prints
+/// them in: `(utime, stime, cutime, cstime)`.
+///
+/// The split starts at the **last** `)` because field 2 is `(comm)` and a name
+/// may hold spaces and parentheses of its own - the same reason Linux's own
+/// reader scans for the closing one rather than splitting on whitespace.
+fn stat_cpu(path: &str) -> Option<(u64, u64, u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let rest = &text[text.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_ascii_whitespace().collect();
+    // `f[0]` is field 3 (state), so field 14 is `f[11]`.
+    Some((
+        f[11].parse().ok()?,
+        f[12].parse().ok()?,
+        f[13].parse().ok()?,
+        f[14].parse().ok()?,
+    ))
+}
+
+/// One `USER_HZ` tick in microseconds. 100 is ABI on every Linux, and the
+/// fields are counts of those ticks, not of this machine's timer ticks.
+const USER_HZ_TICK_US: i64 = 10_000;
 
 fn main() {
     let mut r = Report::new();
@@ -418,6 +441,59 @@ fn main() {
         let mut tb: libc::tms = unsafe { core::mem::zeroed() };
         times(Some(&mut tb));
         r.check("and into times() tms_cutime", tb.tms_cutime > 0);
+
+        // --- /proc/<pid>/stat carries the same numbers through procfs ---
+        //
+        // Measured on Linux 7.2.14 (`build/scratch/batch/s8.c`): field 14
+        // tracked `RUSAGE_SELF` while a second thread spun (`66` USER_HZ ticks =
+        // 0.667 s) and not the reading thread's own `RUSAGE_THREAD`
+        // (0.030 s) - the process file carries the *group's* CPU. A kernel that
+        // never counted, or that printed the raw timer ticks, is the shape
+        // `ps`/`top` shows as `0:00` for a process that has been busy.
+        match stat_cpu("/proc/self/stat") {
+            Some((utime, _stime, cutime, _cstime)) => {
+                let shown_us = utime as i64 * USER_HZ_TICK_US;
+                // One tick of slack in each direction: the record was read
+                // before this line and the field truncates toward zero, so the
+                // two cannot agree to the microsecond by construction.
+                r.check(
+                    &format!(
+                        "/proc/self/stat's utime is the group CPU getrusage reports ({shown_us} us against {self_after} us)"
+                    ),
+                    (shown_us - self_after).abs() <= 2 * USER_HZ_TICK_US,
+                );
+                let child_us = cutime as i64 * USER_HZ_TICK_US;
+                r.check(
+                    &format!(
+                        "and its cutime is the waited child's CPU ({child_us} us against {cutime1} us)"
+                    ),
+                    child_us > 0 && (child_us - cutime1).abs() <= 2 * USER_HZ_TICK_US,
+                );
+                // The thread spelling is the other half of Linux's `whole`
+                // flag: `/proc/<pid>/task/<tid>/stat` carries *this thread's*
+                // own CPU, so it must be the smaller of the two here (the
+                // spinner did the burning). The host this suite also runs on
+                // (`MPOS_ON_HOST=1`) hides thread directories, so the claim is
+                // the machine's alone and skipping it there is stated rather
+                // than silent.
+                if !host_run() {
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                    match stat_cpu(&format!("/proc/self/task/{tid}/stat")) {
+                        Some((thread_utime, _ts, _tc, _tcs)) => r.check(
+                            &format!(
+                                "and the thread spelling carries this thread's own ({thread_utime} ticks against the group's {utime})"
+                            ),
+                            thread_utime < utime,
+                        ),
+                        None => r.check(
+                            "and the thread spelling carries this thread's own (its stat file did not open)",
+                            false,
+                        ),
+                    }
+                }
+            }
+            None => r.check("/proc/self/stat has a stat line", false),
+        }
     }
 
     r.finish()

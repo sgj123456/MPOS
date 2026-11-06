@@ -9448,3 +9448,33 @@ zero forever would satisfy the third). Both thread claims are red on the unfixed
 The per-thread counter's doc comment had claimed "there is no per-thread split because there are no
 threads here" - false since `clone(CLONE_THREAD)` landed. Mechanism, measurements and the third claim's
 bound: `docs/notes/` §6.95.
+
+### Item 209 - `/proc/<pid>/stat`'s CPU fields carry the CPU the kernel charges (2026-11-07, landed)
+
+Fields 14-17 of `stat` (`utime`, `stime`, `cutime`, `cstime`) were a hardcoded `0` in
+`src/vfs/procfs.rs`'s `stat_line`, with a comment saying the kernel did not account CPU - a sentence
+that had been overtaken twice (wchan stopped being zero, and the timer interrupt has charged CPU since
+`times()` landed). A busy process therefore read `0:00` in `ps` and `top`.
+
+| | Linux (host, 7.2.14) | this kernel, before |
+|---|---|---|
+| `/proc/<pid>/stat` field 14, busy process | the **group's** user CPU in `USER_HZ` ticks (`66` = 0.667 s) | `0` |
+| `/proc/<pid>/stat` field 16 after a reap | the waited children's CPU | `0` |
+| `/proc/<pid>/task/<tid>/stat` field 14 | **that thread's** own CPU | `0` (group's, had the file been fed) |
+
+The process file carries the *group's* numbers (Linux's `whole` flag), while the `task/<tid>` spelling
+carries the thread's own - measured with a spinner thread: field 14 tracked `RUSAGE_SELF` (`0.667 s`)
+and not the reading thread's `RUSAGE_THREAD` (`0.030 s`).
+
+**Landed.** `TaskSnapshot`/the host `Process` carry `cpu: (u64,u64,u64,u64)` (group) and
+`cpu_own: (u64,u64)` (thread); `stat_line(pid, tid, whole)` takes Linux's flag from its caller;
+`cpu_fields` picks the pair and `user_hz_ticks` scales `ticks * 100 / TICK_HZ` (100 is the ABI's
+`USER_HZ`, `TICK_HZ` is 250). Owner: `src/vfs/procfs.rs`, `src/sched/runtime/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-times.rs` - `/proc/self/stat`'s utime against `RUSAGE_SELF`, its cutime
+against the reaped child's folded CPU, and the `task/<tid>` spelling against the group's (machine-only:
+this host's procfs hides thread directories). Red on the unfixed kernel
+(`build/boot-procstat-cf.log`, `0 us against 40000 us`, `=== t-times exit=1`), green with it
+(`build/boot-procstat2.log`, `exit=0`). Host unit test:
+`vfs::procfs::tests::the_cpu_fields_report_the_group_or_the_thread_as_whole_says`. Mechanism and the
+full reading: `docs/notes/` §6.96.

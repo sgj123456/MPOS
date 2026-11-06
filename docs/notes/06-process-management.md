@@ -7184,3 +7184,68 @@ the argument was malformed. When the honest answer needs a counter that does not
 is between adding the counter and naming the gap - refusing a valid constant is neither, and it is
 especially cheap to spot when the refusal sits beside two siblings that resolve it correctly (the
 `_ => EINVAL` arm here is the same disagreement §6.91 found in `prlimit64`'s cross-process half).
+
+## §6.96 `/proc/<pid>/stat`'s CPU fields were zero while the kernel counted them (LANDED 2026-11-07)
+
+The `stat` file's fields 14-17 are `utime`, `stime`, `cutime`, `cstime`, and this kernel printed `0`
+in all four. The comment beside them said so on purpose - "fields this kernel does not account - page
+faults, CPU time, wchan - are zero, which is what a machine that never counted them would honestly
+report" - but by the time this was measured, `wchan` had already stopped being zero (field 36 reads
+`park_site`) and CPU had been accounted since `times()` landed. So the sentence was true when it was
+written and had been overtaken twice; the zero was the one part of it that nothing revisited.
+
+**The Linux reading** (`build/scratch/batch/s8.c`, musl static, a spinner thread plus the main
+thread, Linux 7.2.14, `sysconf(_SC_CLK_TCK) = 100`):
+
+```
+t=0  /proc/self/stat utime=  3 | RUSAGE_SELF 0.032 | RUSAGE_THREAD 0.030
+t=1  /proc/self/stat utime= 66 | RUSAGE_SELF 0.667 | RUSAGE_THREAD 0.030
+```
+
+Field 14 followed `RUSAGE_SELF` (the whole group, `66` ticks = 0.667 s) and **not** the reading
+thread's own CPU (0.030 s). That is Linux's `whole` flag: set for `/proc/<pid>/stat` and for a
+thread's own `/proc/<tid>/stat`, clear only for `/proc/<pid>/task/<tid>/stat`, which carries *that
+thread's* numbers. The unit is `USER_HZ` ticks (100 is ABI), not the kernel's timer ticks, and the
+fields count completed ticks, so the scaling truncates.
+
+The host this measurement ran on hides thread directories (`/proc/<pid>/task` lists only the leader
+and `/proc/<pid>/task/<tid>/stat` does not open), so the per-thread half of the rule could not be
+measured here - it is Linux's source semantics, and the claim that pins it runs on the machine only.
+
+**The fix.** `TaskSnapshot` (and its host mirror) carries `cpu: (utime, stime, cutime, cstime)` from
+`task.mm.cpu_all()` - the group's four numbers, the same ones `getrusage(RUSAGE_SELF)` and `times()`
+answer - and `cpu_own: (utime, stime)` from the per-thread atomics §6.95 added. `stat_line` takes
+Linux's `whole` flag from its caller (`process_dir` builds `/proc/<pid>` and `/proc/<tid>`, both
+`whole`; `thread_dir` builds `/proc/<pid>/task/<tid>`, not), `cpu_fields` picks the pair, and
+`user_hz_ticks` scales `ticks * 100 / TICK_HZ` the way `handle_times` and `write_rusage` already do.
+`cutime`/`cstime` are the group's either way: Linux keeps the child totals in the group's
+`signal_struct`, not on the task.
+
+**The pin** is three claims in `t-times`, inside the section that already measures CPU: field 14
+against `RUSAGE_SELF`, field 16 against the reaped child's folded CPU, and (on the machine only) the
+`task/<tid>` spelling against the group's. Its counterfactual is a real red - the stash removed
+`src/vfs/procfs.rs` and `src/sched/runtime/procfs.rs` while keeping the test, and both the kernel and
+the loader were rebuilt:
+
+```
+unfixed kernel (`build/boot-procstat-cf.log`)             fixed kernel (`build/boot-procstat2.log`)
+FAIL:  /proc/self/stat's utime is the group CPU            ok:    /proc/self/stat's utime is the group
+         getrusage reports (0 us against 40000 us)                 CPU getrusage reports (50000 us against 40000 us)
+FAIL:  and its cutime is the waited child's CPU            ok:    and the thread spelling carries this
+         (0 us against 12000 us)                                   thread's own (3 ticks against the group's 5)
+FAIL:  and the thread spelling carries this thread's
+         own (0 ticks against the group's 0)
+FAILED  (=== t-times exit=1)                               PASS    (=== t-times exit=0)
+```
+
+The tolerance is two `USER_HZ` ticks in each direction: the record is read before the comparison and
+the field truncates, so the two cannot agree to the microsecond by construction, while a kernel
+printing raw timer ticks would be off by a factor of 2.5 (`TICK_HZ` is 250).
+
+**The rule.** A field a reader parses is a promise like any other, and "we do not count it" is only
+honest while it is true. The tell here was a comment that named three fields as unaccounted and had
+been overtaken twice without anyone re-reading it - so the check is not "does the comment explain the
+zero" but "does the kernel still not count it". And the fields a reader cross-checks against
+`getrusage` are the cheap place to notice: `ps` and `top` show `0:00` for a process that has been
+busy, which is the silent-success shape §3 rule 2 forbids in a syscall and forbids just as much in a
+file.

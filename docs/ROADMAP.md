@@ -193,6 +193,17 @@ One-glance status of the whole roadmap.
   were; `t-times` pins four claims — the call succeeds, a spinner thread's CPU lands in `RUSAGE_SELF`,
   it is *not* charged to the idle main thread's own record, and that record does grow when the main
   thread itself burns — with the first two red on the kernel without the fix (§6.95, item 208)
+- [x] `/proc/<pid>/stat`'s CPU fields carry the CPU the kernel charges — fields 14-17 (`utime`,
+  `stime`, `cutime`, `cstime`) were a hardcoded `0` under a comment saying this kernel did not account
+  CPU, a sentence overtaken twice: `wchan` had already stopped being zero and the timer interrupt has
+  charged CPU since `times()` landed. Measured on a current host with a spinner thread, `/proc/<pid>/stat`
+  field 14 tracks the **group's** user time (`66` USER_HZ ticks = 0.667 s) and not the reading thread's
+  own (0.030 s) — Linux's `whole` flag, set for the process file and for a thread's own `/proc/<tid>/stat`,
+  clear only for `/proc/<pid>/task/<tid>/stat`. The snapshot now carries the group's four numbers and
+  the per-thread pair (§6.95's counters), `stat_line` takes the flag from its caller, and the fields are
+  scaled to `USER_HZ` the way `times()`/`getrusage` already answer; `t-times` pins field 14 against
+  `RUSAGE_SELF`, field 16 against a reaped child's folded CPU, and the `task/<tid>` spelling against the
+  group's — the first two red on the kernel without the fix (§6.96, item 209)
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

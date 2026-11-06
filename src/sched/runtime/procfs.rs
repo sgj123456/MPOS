@@ -271,6 +271,20 @@ pub struct TaskSnapshot {
     /// `vfs::procfs::exit_signal_field`, which owns the rendering rule and its
     /// measurement.
     pub exit_signal: u8,
+    /// CPU the **thread group** has burned, in this kernel's own ticks:
+    /// `(utime, stime, cutime, cstime)` - the same four numbers
+    /// `getrusage(RUSAGE_SELF)` and `times()` report.
+    ///
+    /// Measured on a current host (`build/scratch/batch/s8.c`, Linux 7.2.14):
+    /// `/proc/<pid>/stat`'s field 14 tracked `RUSAGE_SELF`'s user time while a
+    /// second thread spun (`66` USER_HZ ticks = `0.667 s`), and not the
+    /// reading thread's own (`0.030 s`) - which is Linux's `whole` flag, set
+    /// for `/proc/<pid>/stat` and `/proc/<tid>/stat` and clear only for
+    /// `/proc/<pid>/task/<tid>/stat`.
+    pub cpu: (u64, u64, u64, u64),
+    /// CPU this **task** has burned, `(utime, stime)`, in the kernel's ticks.
+    /// The `task/<tid>/stat` spelling's numbers; the group's are [`Self::cpu`].
+    pub cpu_own: (u64, u64),
 }
 
 /// The facts about `task`, in the shape `/proc` reports them.
@@ -327,6 +341,11 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .max(1),
         rss_pages,
         exit_signal: task.exit_signal,
+        cpu: task.mm.cpu_all(),
+        cpu_own: (
+            task.cpu_user.load(core::sync::atomic::Ordering::Relaxed),
+            task.cpu_system.load(core::sync::atomic::Ordering::Relaxed),
+        ),
     }
 }
 

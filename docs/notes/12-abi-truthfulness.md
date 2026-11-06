@@ -292,7 +292,22 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `RUSAGE_THREAD` §6.95):** stage 1 `1224 tests, 0 failed`; x86_64
+**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s CPU fields §6.96):** stage 1
+`1225 tests, 0 failed` (88.08 s); x86_64 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed,
+0 failed`, `total 88.39 s (previous green run 88.73 s, -0.4%)`; aarch64 `pass=262 fail=0 (262 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 215.97 s (previous green run 88.08 s, +145.2%)`
+(`build/gate-procstat.log`). Lane count forced to two on both arms (`MPOS_TEST_LANES=2`), and
+`GATE EXIT=0`. The pin's three new claims read `ok:` on both arms - x86_64 `(60000 us against
+48000 us)`, `(10000 us against 12000 us)`, `(4 ticks against the group's 6)`; aarch64 `(80000 us
+against 80000 us)`, `(10000 us against 16000 us)`, `(5 ticks against the group's 8)` - and `t-times`
+is `=== PASS` on both (`build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-1/serial.log`).
+
+**The aarch64 total is this run's own statement about the host, not a regression.** Both arms were
+asked for in one command, so a TCG guest and then a second TCG guest shared the one core this container
+is pinned to while stage 1 ran beside them; the arm still ended on `=== END` with `all 262 user tests
+passed`. Compare totals only between runs of the same shape.
+
+**Measured gate before it (2026-11-07, `RUSAGE_THREAD` §6.95):** stage 1 `1224 tests, 0 failed`; x86_64
 `pass=263 fail=0 (263 built)`, `mpos-kunit 35 passed, 0 failed`, `total 88.73 s` (`build/gate-threadcpu.log`,
 stage 1 `88.39 s`); aarch64 `pass=262 fail=0 (262 built)`, `mpos-kunit 35 passed, 0 failed`, `total 88.08 s`
 (`build/gate-threadcpu-a.log`, stage 1 `87.76 s`). Lane count forced to two on both arms
