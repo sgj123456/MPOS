@@ -1347,6 +1347,55 @@ pub fn current_thread_cpu_ticks() -> (u64, u64) {
     )
 }
 
+/// The running process's context switches, `(voluntary, involuntary, child
+/// voluntary, child involuntary)` - what `getrusage(RUSAGE_SELF)` and
+/// `RUSAGE_CHILDREN` report as `ru_nvcsw`/`ru_nivcsw`.
+///
+/// The group's, not the thread's, for the same reason the CPU pair is: a
+/// worker that sleeps moves the process's count (measured on Linux 7.2.14,
+/// `build/scratch/rusage/threadsw.c`: a hundred sleeps in a joined thread moved
+/// `RUSAGE_SELF` 0/0 -> 101/1 while that thread's own `RUSAGE_THREAD` read
+/// 100/0). `(0, 0, 0, 0)` before the scheduler runs.
+#[cfg(target_os = "none")]
+pub fn current_switches() -> (u64, u64, u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => task.mm.switches_all(),
+            None => (0, 0, 0, 0),
+        },
+    )
+}
+
+/// A task's group switches by id, own-plus-children - the live-task shape of
+/// [`current_switches`], for the two `wait` event classes reported while the
+/// child is still in the table (a stop and a resume). `None` when the slot is
+/// gone, which a caller reads as the zero a cleared record carries.
+#[cfg(target_os = "none")]
+pub fn switches_of(id: TaskId) -> Option<(u64, u64)> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| task.mm.switches_both())
+    })
+}
+
+/// The running **thread**'s own context switches, `(voluntary, involuntary)` -
+/// what `getrusage(RUSAGE_THREAD)` reports. Distinct from
+/// [`current_switches`], which is the group's.
+#[cfg(target_os = "none")]
+pub fn current_thread_switches() -> (u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => (
+                task.nvcsw.load(Ordering::Relaxed),
+                task.nivcsw.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        },
+    )
+}
+
 /// The running process's CPU time in internal clock ticks, `(user, system)`.
 /// `times()` and `getrusage(RUSAGE_SELF)` read it and convert to their own
 /// units; there is no per-thread split because there are no threads here, and a

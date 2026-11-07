@@ -284,6 +284,18 @@ One-glance status of the whole roadmap.
   in Linux's `USER_HZ` ticks and truncated the way `nsec_to_clock_t` truncates. Measured on the host:
   two children a second apart read counts a hundred ticks apart; on the machine `Some(150) ticks over
   Some(1510) ms`. Six claims in `t-starttime`, four red without the record (`§6.104`, item 217).
+- [x] `getrusage`'s switch counters are the switches the scheduler took — `ru_nvcsw`/`ru_nivcsw`
+  were zeros in every `struct rusage` this kernel wrote (both `wait` doors and all three `getrusage`
+  `who` values), beside a CPU pair it has counted for years, so a program asking "did I block or was
+  I preempted" was told "neither, ever". The scheduler has both facts because every switch goes
+  through one function: `Task` keeps the thread's pair, `Mm` the group's own and children's columns,
+  and `Table::hand_over` decides the column once, after the caller has said where the task is going —
+  left the ready queue without exiting → voluntary, still runnable → involuntary, exiting → neither.
+  Measured on Linux 7.2.14: 200 sleeps are `+200/+0`, 200 yields `+0/+1`, a worker's 100 sleeps move
+  the process's pair and not the main thread's, and `RUSAGE_CHILDREN` folds a waited child's beside
+  `cutime`. Pin `t-rusage-switch` (seven movement claims; five red without the fix), and the twelve
+  page-fault/block-I/O counters before them stay zero as a **named gap** — the minor/major split
+  needs an I/O signal the mapped-object seam does not report (`§6.105`, item 218).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

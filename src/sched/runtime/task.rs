@@ -715,6 +715,16 @@ pub(crate) struct Retired {
     /// with it.
     pub(crate) utime: u64,
     pub(crate) stime: u64,
+    /// The context switches the dying group had taken, `(voluntary,
+    /// involuntary)` - its own **plus its reaped children's**.
+    ///
+    /// The same sum and the same reason as `utime`/`stime`: a `wait4`/`waitid`
+    /// caller's `struct rusage` carries the child's `ru_nvcsw`/`ru_nivcsw`, and
+    /// the counters live on the group's `mm`, which the slot takes with it when
+    /// the corpse is reaped. Read at the death beside the CPU pair, off the
+    /// record when the wait answers.
+    pub(crate) nvcsw: u64,
+    pub(crate) nivcsw: u64,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -983,6 +993,36 @@ pub(crate) struct Task {
     /// in the timer interrupt, which may not allocate.
     pub(crate) cpu_user: core::sync::atomic::AtomicU64,
     pub(crate) cpu_system: core::sync::atomic::AtomicU64,
+    /// The context switches **this thread** has taken, split the way
+    /// `getrusage` splits them: `(voluntary, involuntary)`.
+    ///
+    /// A switch is voluntary when this task gave the CPU up because it could
+    /// not use it - it went to sleep, parked on a deadline, waited for a
+    /// device or a lock - and involuntary when the CPU was taken from it while
+    /// it was still runnable: the tick preempted it, or it called
+    /// `sched_yield`. Linux's rule is that one, spelled in `__schedule`'s
+    /// `prev->state` test, and it is what the two names mean to every reader:
+    /// `nvcsw` counts the times a program said "not now", `nivcsw` the times
+    /// the machine said "not you". Measured on Linux 7.2.14
+    /// (`build/scratch/rusage/switch.c`, musl static): 200 `nanosleep(1ms)`
+    /// moved `ru_nvcsw` by exactly +200 and `ru_nivcsw` by +0, while 200
+    /// `sched_yield` moved them +0/+1 - the yield returns to the same task, so
+    /// it is one switch, and it is the *involuntary* column because the task
+    /// was runnable when it gave up the CPU.
+    ///
+    /// A group's totals are `mm`'s (`Mm::switches_all`), for the same reason
+    /// its CPU is: `RUSAGE_SELF` is the process's and a group's switches are
+    /// its threads'. Measured (`build/scratch/rusage/threadsw.c`): a worker
+    /// that slept a hundred times moved the main thread's `RUSAGE_SELF` pair
+    /// 0/0 -> 101/1 while its own `RUSAGE_THREAD` read 100/0.
+    ///
+    /// Atomics because the charge happens in the switch path with the clock
+    /// interrupt masked, which may not allocate. See
+    /// [`Table::hand_over`] for where the classification is made - one place,
+    /// after the caller has said where the task is going, so no reader can
+    /// find a switch counted in neither column or both.
+    pub(crate) nvcsw: core::sync::atomic::AtomicU64,
+    pub(crate) nivcsw: core::sync::atomic::AtomicU64,
     /// The moment this task came into being, in `since_boot_nanos` - what
     /// `/proc/<pid>/stat`'s field 22 (`starttime`) reports, in the `USER_HZ`
     /// ticks Linux counts it in.
@@ -1558,6 +1598,8 @@ impl Task {
             context: Context::empty(),
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo: None,
             priority: Priority::NORMAL,
@@ -1944,7 +1986,39 @@ impl Table {
             self.current, SCHED_ID,
             "the scheduler runs its own loop and never yields"
         );
+        self.charge_switch();
         self.enter(SCHED_ID)
+    }
+
+    /// Count the switch this task is about to take, in the column Linux's
+    /// `__schedule` would put it in: **voluntary** when the task has just
+    /// taken itself off the ready queue (it went to sleep, parked on a
+    /// deadline, or waits for something), **involuntary** when it is still
+    /// runnable (the tick preempted it, or it yielded) and it did not die.
+    ///
+    /// The classification is read from the queue, not from a flag a caller
+    /// sets, because the caller's `prepare` closure is the only thing that
+    /// knows where the task went and every one of them ends here: `sleep`,
+    /// `block_until*`, `exit` and `requeue_current` all reach this one place,
+    /// so a switch cannot be counted in neither column or in both. An exiting
+    /// task is counted in neither - it never runs again, and a zombie's
+    /// `RUSAGE_SELF` is read by its parent through the child's own record,
+    /// where the last switch it took was the one into the body it already
+    /// charged. Measured rule (`build/scratch/rusage/switch.c`, Linux 7.2.14):
+    /// a sleep is voluntary, a yield is involuntary - the task was runnable
+    /// when it gave the CPU up - and 200 of the former gave `+200/+0`.
+    fn charge_switch(&mut self) {
+        let id = self.current;
+        let Some(task) = self.tasks.get(id.0).and_then(|slot| slot.as_ref()) else {
+            return;
+        };
+        if task.exited {
+            return;
+        }
+        let voluntary = self.sched.is_sleeping(id);
+        let counter = if voluntary { &task.nvcsw } else { &task.nivcsw };
+        counter.fetch_add(1, Ordering::Relaxed);
+        task.mm.charge_switch(voluntary);
     }
 
     /// Fire every interval timer whose deadline has passed.
@@ -2297,6 +2371,8 @@ impl Table {
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             // A kernel task has no System V adjustments to record or apply.
             sem_undo: None,
@@ -2592,7 +2668,8 @@ impl Table {
                 named[task.tgid.0] += 1;
             }
         }
-        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64))> = alloc::vec::Vec::new();
+        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64), (u64, u64, u64, u64))> =
+            alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
             if !task.exited {
@@ -2623,10 +2700,16 @@ impl Table {
             // group's (`cpu_all`), so folding one would charge the whole
             // group's work to the parent once per thread that happened to be
             // collected. Only the leader's slot is a process to hand up.
+            //
+            // Its context switches fold the same way, for the same reason:
+            // Linux accumulates `cnvcsw`/`cnivcsw` on `wait` beside `cutime`/
+            // `cstime`, and `RUSAGE_CHILDREN` reports both. Read out here, while
+            // the child's `mm` is still reachable, and applied below under the
+            // parent's.
             if task.tgid.0 == slot
                 && let Some(parent) = task.parent
             {
-                folds.push((parent, task.mm.cpu_all()));
+                folds.push((parent, task.mm.cpu_all(), task.mm.switches_all()));
             }
 
             let stack = task
@@ -2651,9 +2734,10 @@ impl Table {
         // Saturating, so a child cannot wrap the parent's counter; a parent whose
         // slot is already gone has nobody left to report the child to (the
         // reparent-to-init edge, beyond what the waited case needs).
-        for (parent, child) in folds {
+        for (parent, child, switches) in folds {
             if let Some(parent_task) = self.tasks.get(parent.0).and_then(|slot| slot.as_ref()) {
                 parent_task.mm.absorb_child(child);
+                parent_task.mm.absorb_child_switches(switches);
             }
         }
     }
@@ -2867,6 +2951,12 @@ pub enum WaitEvent {
         /// The death's CPU, off the record - see the enum's own note.
         utime: u64,
         stime: u64,
+        /// The death's context switches, own-plus-children, off the record for
+        /// the CPU pair's reason: `ru_nvcsw`/`ru_nivcsw` are written on the
+        /// same door that writes `ru_utime`/`ru_stime`, and the group's
+        /// counters go with the slot.
+        nvcsw: u64,
+        nivcsw: u64,
     },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.

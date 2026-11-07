@@ -292,7 +292,27 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `stat`'s `starttime` §6.104):** stage 1 `1235 tests, 0 failed`
+**Latest measured gate (2026-11-07, `getrusage`'s switch counters §6.105):** stage 1 `1235 tests, 0
+failed` (56.20 s); x86_64 `pass=271 fail=0 (271 built)`, `mpos-kunit 35 passed, 0 failed`, `total
+56.58 s (previous green run 56.21 s, +0.7%)`; aarch64 `pass=270 fail=0 (270 built)`, `mpos-kunit 35
+passed, 0 failed`, `total 97.04 s (previous green run 155.25 s, -37.5%)` (`build/gate-switch-x.log`,
+`build/gate-switch-a.log`). The new pin reads `fifty sleeps land fifty voluntary switches (0 -> 50)`
+and `a yield is an involuntary switch (202)` on x86_64, `(0 -> 50)` and `(202)` on aarch64.
+
+**The combined run before those was green on one arm and red on the other, and the red was one of
+`t-blk-sleep`'s own bounds.** `build/gate-switch2.log`: aarch64 `pass=270 fail=0`, x86_64
+`pass=270 fail=1`, the red `FAIL:  the sibling ran inside 39 of 64 device calls (bound 40) - the
+transfer parks its task` — a threshold of 40 on a measurement that reads in the high thirties when
+two emulated machines and the host suite share one core. The arm alone answered `pass=271 fail=0`
+(`build/gate-switch-x.log`), and the same claim read 39 in the run before it
+(`build/gate-switch.log`), which is why the number is quoted off the uncontended runs and the bound
+itself is left alone here rather than moved to fit a busy host.
+
+**The first run of all was red on both arms on a claim this change dated**, which is recorded in
+§6.105 rather than here: `t-wait4` asserted that all fourteen `rusage` counters were zero, and the
+last two are now the child's switches.
+
+**Measured gate before it (2026-11-07, `stat`'s `starttime` §6.104):** stage 1 `1235 tests, 0 failed`
 (56.01 s); x86_64 `pass=270 fail=0 (270 built)`, `mpos-kunit 35 passed, 0 failed`, `total 56.21 s
 (previous green run 99.50 s, -43.5%)`; aarch64 `pass=269 fail=0 (269 built)`, `mpos-kunit 35 passed,
 0 failed`, `total 147.46 s (previous green run 103.07 s, +43.1%)` (`build/gate-starttime2.log`,

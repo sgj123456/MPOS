@@ -1656,6 +1656,29 @@ pub struct Mm {
     /// report.
     pub(crate) cpu_cutime: core::sync::atomic::AtomicU64,
     pub(crate) cpu_cstime: core::sync::atomic::AtomicU64,
+    /// Context switches this group's tasks have made, `(voluntary,
+    /// involuntary)` - what `getrusage`'s `ru_nvcsw`/`ru_nivcsw` report.
+    ///
+    /// Linux counts a switch as **voluntary** when the task left the CPU
+    /// because it had nothing to run (a sleep, a wait, a blocking read) and
+    /// **involuntary** when the CPU was taken from it (a preemption by the
+    /// clock, or a `sched_yield` that found somebody else). Measured on a
+    /// current host (`build/scratch/rusage/switch.c`, Linux 7.2.14): 200
+    /// `nanosleep(1 ms)` calls moved `ru_nvcsw` by exactly 200 and `ru_nivcsw`
+    /// by 0; 200 `sched_yield` calls moved `ru_nvcsw` by 0 and `ru_nivcsw` by 1.
+    ///
+    /// On the group rather than the task for the reason the CPU counters are:
+    /// `RUSAGE_SELF` is the process's, and a thread's switches are the
+    /// process's - measured in the same run (`build/scratch/rusage/threadsw.c`),
+    /// a worker that slept 100 times moved the leader's `RUSAGE_SELF` by 101
+    /// while the worker's own `RUSAGE_THREAD` read 100.
+    pub(crate) nvcsw: core::sync::atomic::AtomicU64,
+    pub(crate) nivcsw: core::sync::atomic::AtomicU64,
+    /// These fields for this process's *reaped* children, accumulated by
+    /// [`Mm::absorb_child_switches`] at the reap - Linux's `cnvcsw`/`cnivcsw`,
+    /// which is what `getrusage(RUSAGE_CHILDREN)` reports.
+    pub(crate) cnvcsw: core::sync::atomic::AtomicU64,
+    pub(crate) cnivcsw: core::sync::atomic::AtomicU64,
 }
 
 /// A thread group's memory: the frames behind its mappings, how many threads
@@ -1703,6 +1726,10 @@ impl Mm {
             cpu_stime: core::sync::atomic::AtomicU64::new(0),
             cpu_cutime: core::sync::atomic::AtomicU64::new(0),
             cpu_cstime: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
+            cnvcsw: core::sync::atomic::AtomicU64::new(0),
+            cnivcsw: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2180,6 +2207,63 @@ impl Mm {
     /// accounting on `wait`: the parent's `cutime` grows by the child's own
     /// `utime` plus the child's own `cutime` (its children, already folded in),
     /// the same for system. Saturating, so no exit can wrap the counter.
+    /// Charge one context switch this group's task made - see
+    /// [`Self::nvcsw`] for what makes one voluntary.
+    ///
+    /// Called from the scheduler's one switch point, in interrupt-free context,
+    /// so the two `fetch_add`s are the whole of it: no allocation and no lock.
+    pub(crate) fn charge_switch(&self, voluntary: bool) {
+        let counter = if voluntary { &self.nvcsw } else { &self.nivcsw };
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The group's switches, `(voluntary, involuntary, children's voluntary,
+    /// children's involuntary)` - `getrusage`'s four numbers.
+    pub(crate) fn switches_all(&self) -> (u64, u64, u64, u64) {
+        (
+            self.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
+            self.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
+            self.cnvcsw.load(core::sync::atomic::Ordering::Relaxed),
+            self.cnivcsw.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The group's own switches *plus its reaped children's*, which is what a
+    /// `wait`'s `struct rusage` reports for the child it just collected - the
+    /// same shape [`Self::cpu_both`] has for CPU, and for the same reason: a
+    /// grandchild's switches reach the parent through the child that reaped it.
+    pub(crate) fn switches_both(&self) -> (u64, u64) {
+        let (voluntary, involuntary, children_v, children_iv) = self.switches_all();
+        (
+            voluntary.saturating_add(children_v),
+            involuntary.saturating_add(children_iv),
+        )
+    }
+
+    /// Fold a reaped child's switches into this process's child totals, the way
+    /// [`Self::absorb_child`] folds its CPU: the parent's `cnvcsw` grows by the
+    /// child's own count plus the child's own child count, so a grandchild
+    /// reaches the grandparent through the child that collected it.
+    pub(crate) fn absorb_child_switches(&self, child: (u64, u64, u64, u64)) {
+        let (voluntary, involuntary, children_v, children_iv) = child;
+        self.cnvcsw.fetch_add(
+            voluntary.saturating_add(children_v),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        self.cnivcsw.fetch_add(
+            involuntary.saturating_add(children_iv),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether this address space's group has a reaped child's switches to fold
+    /// into - the guard the reap path asks before taking the group's books: a
+    /// group that never lost a child never pays for the four loads.
+    pub(crate) fn has_child_switches(&self) -> bool {
+        let (_, _, children_v, children_iv) = self.switches_all();
+        children_v != 0 || children_iv != 0
+    }
+
     pub(crate) fn absorb_child(&self, child: (u64, u64, u64, u64)) {
         let (cu, su, ccu, csu) = child;
         self.cpu_cutime.fetch_add(

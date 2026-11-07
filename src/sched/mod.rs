@@ -75,24 +75,24 @@ pub use runtime::{
     current_is_root, current_is_seccomp_strict, current_is_session_leader, current_map_user,
     current_net_ns, current_no_new_privs, current_owner, current_pdeathsig, current_pending,
     current_pgid, current_pid_ns_id, current_pid_number, current_real_owner, current_rlimit,
-    current_root, current_stack_range, current_tgid, current_thread_cpu_ticks, current_tid_address,
-    current_tls, current_umask, current_user_ns, current_uts, deliver_pending_signal,
-    descriptor_access, descriptor_inode_of, descriptor_numbers, descriptors_of,
-    destructive_advice_refused, detach_traced, die_of_fatal_signal, discard_exit_code,
-    exec_replace, exit, exit_code, exit_group, fill_owner, fork, frames_range_free,
-    get_mmap_cursor, group_members, has_children, has_deliverable_signal, has_live_child,
-    has_matching_children, has_seccomp_filter, has_tracer, identity_of, init, insert_vma, is_child,
-    is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible,
-    last_syscall, madvise_dontneed, map_anon, map_facts, map_frames, mapping_name_at,
-    mapping_span_at, may_inspect, may_mint_pid_ns, may_signal, membarrier_registrations,
-    move_eager_ranges, move_user_page, munmap_user, name_user_range, named_process, named_thread,
-    nice_of, note_blk_counts, note_blk_mailbox, note_blk_wait, note_claim_registration,
-    note_claim_wake, note_claim_wake_result, note_ext4_scratch, note_fill_begin, note_fill_end,
-    note_fill_owner, note_run_begin, note_run_end, note_run_owner, note_syscall, ns_of,
-    oom_score_adj_of, out_of_memory, own_pid_number, page_present_in, parent_group_of, parent_of,
-    park_site, parks_of, pause, pgid_of, pid_chain_of, pid_number_of, pid_numbers_of,
-    pidfd_fd_table, pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member,
-    pidfd_still_names, pidfd_task_alive, poll_any_child_event, poll_child_event,
+    current_root, current_stack_range, current_switches, current_tgid, current_thread_cpu_ticks,
+    current_thread_switches, current_tid_address, current_tls, current_umask, current_user_ns,
+    current_uts, deliver_pending_signal, descriptor_access, descriptor_inode_of,
+    descriptor_numbers, descriptors_of, destructive_advice_refused, detach_traced,
+    die_of_fatal_signal, discard_exit_code, exec_replace, exit, exit_code, exit_group, fill_owner,
+    fork, frames_range_free, get_mmap_cursor, group_members, has_children, has_deliverable_signal,
+    has_live_child, has_matching_children, has_seccomp_filter, has_tracer, identity_of, init,
+    insert_vma, is_child, is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, last_syscall, madvise_dontneed, map_anon, map_facts, map_frames,
+    mapping_name_at, mapping_span_at, may_inspect, may_mint_pid_ns, may_signal,
+    membarrier_registrations, move_eager_ranges, move_user_page, munmap_user, name_user_range,
+    named_process, named_thread, nice_of, note_blk_counts, note_blk_mailbox, note_blk_wait,
+    note_claim_registration, note_claim_wake, note_claim_wake_result, note_ext4_scratch,
+    note_fill_begin, note_fill_end, note_fill_owner, note_run_begin, note_run_end, note_run_owner,
+    note_syscall, ns_of, oom_score_adj_of, out_of_memory, own_pid_number, page_present_in,
+    parent_group_of, parent_of, park_site, parks_of, pause, pgid_of, pid_chain_of, pid_number_of,
+    pid_numbers_of, pidfd_fd_table, pidfd_generation, pidfd_group_alive, pidfd_identity,
+    pidfd_live_member, pidfd_still_names, pidfd_task_alive, poll_any_child_event, poll_child_event,
     populate_user_page_at, preempt, preempt_at, prev_syscall, process_members, protect_user,
     protect_user_range, raise_sigpipe, range_is_mapped, read_user, read_user_of,
     record_eager_range, register_membarrier, release_controlling_tty, release_pid,
@@ -109,16 +109,17 @@ pub use runtime::{
     set_signal_alt_stack, set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time,
     setns_user, setns_uts, shm_attachment_at, shm_attachment_count, signal_action,
     signal_alt_stack, sleep_ns, sleep_ticks, snapshot, snapshots, space_root_of, spawn,
-    spawn_permanent, spawn_user, started, stop_of, take_child_event, take_continued_report,
-    take_deliverable_siginfo, take_deliverable_signal, take_exit_code, take_fatal_signal,
-    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_alive, task_count,
-    thread_group_has_siblings, thread_group_of, thread_snapshots, time_offsets, timer_alloc,
-    timer_arm, timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall,
-    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_cgroup, unshare_files, unshare_fs,
-    unshare_ipc, unshare_mnt, unshare_pid, unshare_time, unshare_user, unshare_uts, user_frame_at,
-    user_mapped, user_range_sealed, vfork, vma_count_reached, vma_gaps, vma_kind_at, vma_prot_at,
-    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
-    with_current_credentials, write_user, write_user_of, yield_now,
+    spawn_permanent, spawn_user, started, stop_of, switches_of, take_child_event,
+    take_continued_report, take_deliverable_siginfo, take_deliverable_signal, take_exit_code,
+    take_fatal_signal, take_pending_event, take_signal_in_set, take_stop_report, take_vmas,
+    task_alive, task_count, thread_group_has_siblings, thread_group_of, thread_snapshots,
+    time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove, timer_state, tls_of,
+    trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members, unmap_user,
+    unshare_cgroup, unshare_files, unshare_fs, unshare_ipc, unshare_mnt, unshare_pid, unshare_time,
+    unshare_user, unshare_uts, user_frame_at, user_mapped, user_range_sealed, vfork,
+    vma_count_reached, vma_gaps, vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event,
+    wait_child_event, wait_for_interrupt, wake, with_current_credentials, write_user,
+    write_user_of, yield_now,
 };
 
 /// The permissions the VMA covering a page grants - `UFFDIO_COPY` installs the
@@ -565,6 +566,16 @@ pub fn current_cpu_ticks() -> (u64, u64, u64, u64) {
 
 #[cfg(not(target_os = "none"))]
 pub fn current_thread_cpu_ticks() -> (u64, u64) {
+    (0, 0)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn current_switches() -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn current_thread_switches() -> (u64, u64) {
     (0, 0)
 }
 

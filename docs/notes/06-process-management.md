@@ -7933,3 +7933,126 @@ common case: `0` is a legal `starttime` only for a task created in the machine's
 and for every other task it is a claim that the process is as old as the boot. When a comment says
 "there is no record of that", check whether the record is what is missing - here it was one `u64` at
 six construction sites.
+
+## §6.105 `getrusage`'s two switch counters were zeros, beside a CPU pair it counted
+
+**LANDED 2026-11-07.** `struct rusage` has been 144 bytes since the beginning: two `timeval`s of
+CPU, twelve counters of page faults, block I/O, IPC and signals, and then the pair only a scheduler
+can answer — `ru_nvcsw` (the times the task gave the CPU up because it could not use it) and
+`ru_nivcsw` (the times the CPU was taken while it was still runnable). `/proc/<pid>/stat`'s CPU
+fields were fixed in §6.96, `RUSAGE_THREAD` in §6.95 and the CPU-time clocks in §6.99, and through
+all of it `write_rusage` wrote the two opening `timeval`s and left the last two counters zero — an
+honest "nothing measured" that had stopped being true the moment the scheduler had both facts.
+
+### What Linux does (measured)
+
+`build/scratch/rusage/switch.c` (musl static, `-pthread`, Linux 7.2.14, one CPU):
+
+```
+200x nanosleep(1ms): nvcsw +200 nivcsw +0
+200x sched_yield:    nvcsw +0 nivcsw +1
+spinning beside a thread: nvcsw +80 nivcsw +82
+join: nvcsw +120 nivcsw +2
+```
+
+The sleep is the clean one: one switch per sleep, in the **voluntary** column. The yield is the
+other column — the task was runnable when it gave the CPU up, so it is involuntary, and on a
+single-CPU machine 200 back-to-back yields cost exactly one switch (the yield returns to the same
+task). The spinning row is noise (the libc's own futex waits land in `nvcsw`), which is why no claim
+in the pin is built from it.
+
+`build/scratch/rusage/threadsw.c` answers the second question — whose switches are these:
+
+```
+RUSAGE_SELF before 0/0 after 101/1 (nvcsw +101 nivcsw +1)
+worker's own RUSAGE_THREAD: nvcsw 100 nivcsw 0
+```
+
+A hundred sleeps in a joined worker move the **process's** pair and not the main thread's: the group
+has the totals, exactly as its CPU pair does (§6.95), and `RUSAGE_CHILDREN` is the third set — the
+children's, folded in at the reap beside `cutime`/`cstime`.
+
+### What this kernel answered
+
+`write_rusage` (`src/syscall/linux/proc.rs`) built the wire record with the two `timeval`s and
+nothing else, so bytes 128..144 stayed zero on **every** door: `getrusage`'s three `who` values,
+`wait4`'s and `waitid`'s `rusage`. A program asking "did I block or was I preempted" was told
+"neither, ever" — and the kernel had both facts, because every switch in this kernel goes through
+one function.
+
+### The fix
+
+* `Task` gained `nvcsw`/`nivcsw` atomics (the **thread**'s pair) beside `cpu_user`/`cpu_system`;
+  `Mm` gained `nvcsw`/`nivcsw`/`cnvcsw`/`cnivcsw` (the **group**'s own and children's columns).
+* The classification is made in `Table::hand_over`, once, **after `prepare` has run**: a task that
+  has just left the ready queue without exiting (it went to sleep, parked on a deadline, or waits
+  for something) is **voluntary**; a task still runnable (the tick preempted it, or it yielded) is
+  **involuntary**; an exiting task is counted in neither. The rule is read off the queue rather than
+  set by a flag, because `sleep`, `block_until*`, `exit` and `requeue_current` all reach the same
+  place — a flag would have to be set at every one of them and forgotten at one.
+* The switch charges the task's column **and** the group's in the same call, so the two doors can
+  never disagree about how many switches there were (§6.95's reason for the CPU pair).
+* The reap folds the child's `Mm::switches_all()` into the parent's child columns beside
+  `absorb_child`'s CPU, and `Retired` carries the pair so `wait4`/`waitid` can write the child's
+  numbers after the slot is gone — the same carry `utime`/`stime` already needed.
+* `write_rusage` writes `ru_nvcsw` at 128 and `ru_nivcsw` at 136 of the 144-byte record; the twelve
+  counters before them stay zero (page faults would need an I/O signal this kernel's mapped objects
+  do not report — a **named gap**, see below).
+
+### The pin
+
+`user/tests/src/bin/t-rusage-switch.rs`, seven claims, all movements:
+
+```
+ok:    getrusage fills the two switch counters (Some(Switches { voluntary: 0, involuntary: 1 }))
+ok:    fifty sleeps land fifty voluntary switches (0 -> 50)
+ok:    and none of them is a switch the machine took (1)
+ok:    a yield is an involuntary switch (202)
+ok:    a sibling's sleeps are the process's (Some(50) in that thread)
+ok:    and are not this thread's (50 -> 101)
+ok:    a waited child's switches fold into the child totals (0 -> 50)
+PASS
+```
+
+Unfixed kernel (`build/boot-switch-cf1.log`) — the same program, five reds:
+
+```
+ok:    getrusage fills the two switch counters (Some(Switches { voluntary: 0, involuntary: 0 }))
+FAIL:  fifty sleeps land fifty voluntary switches (0 -> 0)
+ok:    and none of them is a switch the machine took (0)
+FAIL:  a yield is an involuntary switch (0)
+FAIL:  a sibling's sleeps are the process's (Some(0) in that thread)
+FAIL:  and are not this thread's (0 -> 0)
+FAIL:  a waited child's switches fold into the child totals (0 -> 0)
+FAILED
+```
+
+The two that pass on both are shape claims (the counters read as numbers; a zero involuntary column
+is within the sleep row's bound), which is why they are not the pin: the movements are.
+
+### One old claim had to move with it
+
+`t-wait4` asserted that **all fourteen** counters were zero after a `wait4` - an honest statement
+while `write_rusage` filled two `timeval`s and nothing else, and a false one the moment the last two
+became real. The gate answered it on both arms (`FAIL:  the unmeasured counters are zero, not the
+caller's own seed`, `build/gate-switch.log`). The claim is now two: the twelve fault/block-I/O/IPC
+counters are still zero, and the switch pair is the child's - written rather than the `-1` seed
+(`build/boot-wait4-switch.log`: `(0 / 58)`, and on this one-CPU machine the tick took the CPU from
+the burning child 58 times). That is the contract changing because the kernel now serves the field,
+not the test being bent to fit: the twelve that stayed zero are still asserted to be zero.
+
+### Named gap
+
+The twelve counters between the `timeval`s and the switch pair — `ru_maxrss`, `ru_minflt`,
+`ru_majflt`, `ru_nswap`, `ru_inblock`, `ru_oublock`, `ru_msgsnd`, `ru_msgrcv`, `ru_nsignals` — stay
+zero. The CPU pair and the switches are things this kernel counts; the page-fault pair needs the
+minor/major split, and the split needs the mapped-object seam to say whether a fault was answered
+from a frame the object already held or by a device read (`MappedObject::frame_at` answers only
+"here is the frame"), and `ru_maxrss` is a high-water mark nothing tracks. An honest zero is
+recorded in `docs/ROADMAP.md` as this item's gap rather than a plausible number.
+
+**The rule.** A record's field is either counted or named as not counted — "we only write the first
+two" ages into a wrong answer as soon as the kernel starts counting the rest, which is exactly what
+happened here: the CPU pair beside the zeros was right, so nothing looked broken. And a counter with
+two columns has one place that decides which column a switch lands in; that place is after the
+caller has said where the task is going, because before it, the question has no answer.

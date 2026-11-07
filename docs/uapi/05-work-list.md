@@ -9727,3 +9727,30 @@ plus the host unit test `vfs::procfs::tests::starttime_is_the_creation_instant_i
 Red on the unfixed kernel (`build/boot-starttime-cf1.log`: `Some(0)`, `Some(0) ticks`, and an age of
 `Some(2120) ms of Some(2120) ms`, `exit=1`), green with it (`build/boot-starttime2.log`, `exit=0`).
 Mechanism and the Linux reading: `docs/notes/` §6.104.
+
+### Item 218 - `getrusage`'s `ru_nvcsw`/`ru_nivcsw` are the switches the scheduler took (2026-11-07, landed)
+
+`getrusage`'s record carries two counters of context switches at the end of the 144 bytes Linux laid
+out, and the two `wait` doors fill the same record for a child. The kernel counted neither fact when
+this item was opened; the scheduler has both, because every switch goes through `Table::hand_over`
+in `src/sched/runtime/task.rs`.
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| 200 × `nanosleep(1ms)` | `ru_nvcsw +200`, `ru_nivcsw +0` | `+0` / `+0` | `+50` for fifty sleeps, `+0` involuntary |
+| 200 × `sched_yield` | `ru_nvcsw +0`, `ru_nivcsw +1` | `+0` | `+202` (one hand-over each) |
+| a worker's 50 sleeps | `RUSAGE_SELF +101`, `RUSAGE_THREAD 100/0` | all zero | `RUSAGE_THREAD +50`, group `+51` |
+| a waited child's 50 sleeps | `RUSAGE_CHILDREN` grows beside `cutime` | zero | `+50` |
+| `ru_maxrss`/`ru_minflt`/`ru_majflt`/`ru_nswap`/`ru_inblock`/`ru_oublock`/`ru_msgsnd`/`ru_msgrcv`/`ru_nsignals` | counted | zero | zero — **named gap** |
+
+**Landed.** `Task::nvcsw`/`nivcsw` (the thread's pair) and `Mm`'s four columns (the group's own and
+children's); `Table::hand_over` classifies each switch after `prepare` has run — left the ready queue
+without exiting → voluntary, still runnable → involuntary, exiting → neither; `Retired` carries the
+pair so a `wait` can report the child's numbers after its slot is gone; `write_rusage` writes them at
+offsets 128 and 136. Owners: `src/sched/runtime/task.rs`, `src/sched/runtime/child_mm.rs`,
+`src/sched/runtime/child_signal.rs`, `src/syscall/linux/proc.rs`.
+
+Pin: `user/tests/src/bin/t-rusage-switch.rs` — seven claims, all movements (a host's own switch count
+at start is not the test's number). Red on the unfixed kernel (`build/boot-switch-cf1.log`: `0 -> 0`
+on four movements), green with it (`build/boot-switch1.log`, `=== t-rusage-switch exit=0`). Mechanism
+and the full reading: `docs/notes/` §6.105.

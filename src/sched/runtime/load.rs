@@ -655,6 +655,8 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,
@@ -861,6 +863,8 @@ pub fn try_spawn_user(
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             // A fresh process starts with no semaphore adjustments: the list is
             // per-process and is *not* inherited by a plain `fork` (measured,

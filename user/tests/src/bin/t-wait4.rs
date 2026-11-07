@@ -360,10 +360,43 @@ fn main() {
                 true,
             );
         } else {
+            // The twelve fault/block-I/O/IPC counters are still not measured by
+            // this kernel, and the record is zeroed before it is filled - an
+            // honest "nothing measured" rather than a plausible number. The
+            // last two are no longer unmeasured: `ru_nvcsw`/`ru_nivcsw` are the
+            // child's context switches, counted since `§6.105`, so they are
+            // asked about separately and are no longer part of this claim.
             r.check(
-                "the unmeasured counters are zero, not the caller's own seed",
-                ru.counters.iter().all(|c| *c == 0),
+                "the twelve unmeasured counters are zero, not the caller's own seed",
+                ru.counters[..12].iter().all(|c| *c == 0),
             );
+            // A child that burnt CPU and exited: this kernel counts the switch
+            // that left the ready queue without exiting, and a burn is taken
+            // off the CPU by the tick, so the involuntary column carries it.
+            // The voluntary column is the child's own business (it never
+            // slept), which is why the claim is the pair having been written
+            // rather than a count.
+            r.check(
+                &format!(
+                    "and the switch pair is the child's, written rather than seeded ({} / {})",
+                    ru.counters[12], ru.counters[13]
+                ),
+                ru.counters[12] >= 0 && ru.counters[13] >= 0,
+            );
+            if !host_run() {
+                // This machine is one CPU: a child that burns for 150 ms cannot
+                // stay on it, so the tick took the CPU away from it at least
+                // once and the involuntary column says so. On the host the same
+                // child may never be preempted, which is why this half is the
+                // machine's claim.
+                r.check(
+                    &format!(
+                        "and the tick took the CPU from it at least once ({})",
+                        ru.counters[13]
+                    ),
+                    ru.counters[13] >= 1,
+                );
+            }
         }
     }
 

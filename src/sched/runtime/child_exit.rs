@@ -266,6 +266,11 @@ pub fn exit(code: isize) -> ! {
         // record: the slot - and with it the counters - is free by the time a
         // `wait` collects the death.
         let (utime, stime) = t.task(id).mm.cpu_both();
+        // Its switches fold the same way and for the same reason: Linux's
+        // `wait4`/`waitid` `struct rusage` carries the child's `ru_nvcsw` and
+        // `ru_nivcsw` beside `ru_utime`, and the group's counters live on the
+        // `mm` that the slot takes with it.
+        let (nvcsw, nivcsw) = t.task(id).mm.switches_both();
 
         // The process's death is recorded once, when its last thread leaves,
         // and it is **the leader's** record: the pid a parent can name is the
@@ -317,6 +322,8 @@ pub fn exit(code: isize) -> ! {
                 dumped,
                 utime,
                 stime,
+                nvcsw,
+                nivcsw,
                 tracer: leader.trace.tracer,
                 parent,
             });
@@ -1288,6 +1295,8 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo,
             pdeathsig: 0,
@@ -2018,6 +2027,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            nvcsw: core::sync::atomic::AtomicU64::new(0),
+            nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo,
             fpu_live: false,
@@ -2503,6 +2514,8 @@ fn scan_child_event(
                 dumped: retired.dumped,
                 utime: retired.utime,
                 stime: retired.stime,
+                nvcsw: retired.nvcsw,
+                nivcsw: retired.nivcsw,
             })
     })
 }
@@ -2534,6 +2547,8 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 dumped: retired.dumped,
                 utime: retired.utime,
                 stime: retired.stime,
+                nvcsw: retired.nvcsw,
+                nivcsw: retired.nivcsw,
             })
         }
         WaitEvent::Stopped {
@@ -2827,6 +2842,8 @@ pub fn block_until_child_event(
             dumped: retired.dumped,
             utime: retired.utime,
             stime: retired.stime,
+            nvcsw: retired.nvcsw,
+            nivcsw: retired.nivcsw,
         }),
         None => WaitPark::NoChild,
     }
