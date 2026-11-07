@@ -292,7 +292,21 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s masks and switches §6.106):** stage 1
+**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s identity lines §6.107):** stage 1
+`1236 tests, 0 failed` (98.59 s); x86_64 `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0
+failed`, `total 98.79 s (previous green run 100.27 s, -1.5%)` (`build/gate-identity.log`). The
+aarch64 arm of that same run timed out on a lane, and the lane was the boot's own `cpu:` check
+halting - not this change: `build/test-lane-aarch64-0/serial.log` ended at
+`the virtual timer's one-shot woke idle() but the tick count moved too (66 -> 67)`, a condition the
+check now records as data (`c579349`, `docs/notes/` 13.33's second correction). The arm re-run alone
+after that fix is green: stage 1 `1236 tests, 0 failed` (103.48 s), `verdict pass=272 fail=0`,
+`mpos-kunit 35 passed, 0 failed`, `total 103.89 s (previous green run 241.17 s, -56.9%)`
+(`build/gate-identity-a2.log`). The new pin reads `umask(077) shows as the four octal digits 0077`,
+`a dropped identity empties the two capability words (0000000000000000/0000000000000000)` and
+`a tracee's status names its tracer (Some(6) against this pid 6)` on x86_64, and the same ten claims
+pass on aarch64.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/status`'s masks and switches §6.106):** stage 1
 `1236 tests, 0 failed` (100.08 s); x86_64 `pass=272 fail=0 (272 built)`, `mpos-kunit 35 passed, 0
 failed`, `total 100.27 s (previous green run 56.58 s, +77.2%)`; aarch64 `pass=271 fail=0 (271 built)`,
 `mpos-kunit 35 passed, 0 failed`, `total 241.17 s (previous green run 97.04 s, +148.5%)`

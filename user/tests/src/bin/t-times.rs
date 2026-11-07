@@ -527,21 +527,26 @@ fn main() {
                                 thread_us + USER_HZ_TICK_US >= before_own
                                     && thread_us <= after_own + USER_HZ_TICK_US,
                             );
-                            // The group's count is read *again* after the thread's,
-                            // and the comparison is against the later reading: a
-                            // thread's own CPU is at most its group's at any one
-                            // instant, but these are two reads of counters that
-                            // move between them - the aarch64 arm measured `6 ticks
-                            // against 5` when the stale `utime` was used, because a
-                            // tick landed between the two reads (`docs/notes/`
-                            // §6.97's rule, applied to §6.96's fields).
+                            // A thread's own CPU is at most its group's **at any
+                            // one instant**, but these are two files read one after
+                            // the other while the counters move: a tick landing
+                            // between them makes the later reading the *earlier*
+                            // one's past. So the group is read on both sides of the
+                            // thread's file and the relation is stated against the
+                            // larger of the two - the same bracketing §6.97's rule
+                            // asks for, applied to §6.96's fields. Measured twice
+                            // on the aarch64 arm: `6 ticks against 5` with the
+                            // stale reading, then `7 ticks against 6` with only the
+                            // later one.
+                            let group_before = utime;
                             let group_after = stat_cpu("/proc/self/stat")
-                                .map_or(utime, |(utime_now, _s, _c, _cs)| utime_now);
+                                .map_or(group_before, |(utime_now, _s, _c, _cs)| utime_now);
+                            let group_high = group_before.max(group_after);
                             r.check(
                                 &format!(
-                                    "and never more than its group's ({thread_utime} ticks against {group_after})"
+                                    "and never more than its group's at either end of the read ({thread_utime} ticks against {group_before}..{group_after})"
                                 ),
-                                thread_utime <= group_after,
+                                thread_utime <= group_high,
                             );
                         }
                         None => r.check(

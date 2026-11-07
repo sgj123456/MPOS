@@ -316,6 +316,28 @@ pub struct TaskSnapshot {
     /// `16` - and `getrusage(RUSAGE_SELF)` answered `106` for the same process,
     /// which is the *group's* number and a different door (§6.105).
     pub switches: (u64, u64),
+    /// The process's file-creation mask - `umask(2)`'s value, which
+    /// `/proc/<pid>/status` prints as four octal digits and which every create
+    /// masks its mode with. Per process, because [`crate::sched::FsStruct`] is
+    /// shared between a group's threads.
+    pub umask: u32,
+    /// `PR_SET_NO_NEW_PRIVS`: whether this task's exec keeps privileges from
+    /// being gained. `/proc/<pid>/status` prints it as `NoNewPrivs:`.
+    pub no_new_privs: bool,
+    /// The seccomp mode `/proc/<pid>/status`'s `Seccomp:` line names: `0` none,
+    /// `1` strict, `2` filter.
+    pub seccomp_mode: u8,
+    /// How many filters are stacked - `Seccomp_filters:`.
+    pub seccomp_filters: usize,
+    /// The four capability sets `/proc/<pid>/status` prints as `CapInh`,
+    /// `CapPrm`, `CapEff` and `CapBnd`, straight off the group's
+    /// [`crate::cred::Credentials`]: the same words the credential model asks
+    /// its own questions with, so a dropped identity prints the sets it really
+    /// holds rather than a constant.
+    pub cap_inheritable: u64,
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_bounding: u64,
     /// When this task came into being, in `since_boot_nanos` - the number
     /// `/proc/<pid>/stat`'s field 22 (`starttime`) renders as `USER_HZ` ticks
     /// since boot.
@@ -401,6 +423,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
     let virtual_pages = task.mm.mapped_pages();
     let (ignored, caught) = disposition_sets(task.dispositions.snapshot());
+    let credentials = task.mm.credentials();
     TaskSnapshot {
         tid: id.0,
         pid: task.tgid.0,
@@ -446,6 +469,20 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
             task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
         ),
+        umask: task.fs.umask(),
+        no_new_privs: task.no_new_privs,
+        seccomp_mode: if task.seccomp_strict {
+            1
+        } else if task.seccomp_filters.is_empty() {
+            0
+        } else {
+            2
+        },
+        seccomp_filters: task.seccomp_filters.len(),
+        cap_inheritable: credentials.inheritable,
+        cap_permitted: credentials.permitted,
+        cap_effective: credentials.effective,
+        cap_bounding: credentials.bounding,
         start_nanos: task.start_nanos,
         pending: task.signals,
         blocked: task.blocked,

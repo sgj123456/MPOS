@@ -306,6 +306,15 @@ One-glance status of the whole roadmap.
   sleeps read `50` in its own `task/<tid>/status` while the main thread read `16` and
   `RUSAGE_SELF` said `106`. Pin `t-status-masks` (eleven claims, seven red without the fix), plus a
   host test for the notation (`§6.106`, item 219).
+- [x] `/proc/<pid>/status`'s identity lines are the kernel's — `Umask`, `TracerPid`, `NoNewPrivs`,
+  `Seccomp`, `Seccomp_filters` and the five `Cap*` words were literals while the kernel held every
+  fact behind them. The capability words were right for a root payload and wrong for everything
+  else: a dropped program read the full set it no longer held. Measured on Linux: `Umask:` is four
+  octal digits, `TracerPid:` is the tracer's number in the reader's namespace (`0` when unattached),
+  `Seccomp:` is a mode with `Seccomp_filters:` its depth, and the `Cap*` words are sixteen lowercase
+  hex digits off the credential masks. Pin `t-status-identity` (ten claims, a dropped-identity child
+  so a constant cannot pass, `capget`/`PR_CAPBSET_READ` as the second and third doors; five red
+  without the fix), plus host tests for the two notations (`§6.107`, item 220).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

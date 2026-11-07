@@ -8157,3 +8157,84 @@ file kept printing zeros for weeks of commits — the tell was that the numbers 
 zero, all the time) while a sibling file carried the same facts. When a field lands on one door,
 grep for the other doors that print it: `status`, `stat`, `statm`, `getrusage` and `wait4` are five
 renderings of one task, and they must be made of the same numbers in the same units.
+
+## §6.107 `/proc/<pid>/status`'s identity lines were constants
+
+**LANDED 2026-11-07.** §6.106 made the masks and the switch lines real; ten lines below them were
+still literals, and every one of the facts behind them was held by the kernel: the process's umask,
+the task's tracer, `no_new_privs`, the seccomp mode and filter count, and the five capability words.
+The capability words were the worst of the five kinds of wrong: they were **right for a root payload
+and wrong for everything else**, so a `t-status`-style reading of a dropped program reported the full
+set it no longer held.
+
+### What Linux prints (measured, `build/scratch/status2/p.c`)
+
+```
+baseline                             Umask: 0022  TracerPid: 0  NoNewPrivs: 0  Seccomp: 0  Seccomp_filters: 0
+after umask(077) + PR_SET_NO_NEW_PRIVS    Umask: 0077   NoNewPrivs: 1
+after seccomp(SET_MODE_FILTER, one filter)   Seccomp: 2   Seccomp_filters: 1
+tracee's status (PTRACE_TRACEME child)      TracerPid: 684234    (its tracer's pid)
+tracer's own status                         TracerPid: 0
+```
+
+`Umask:` is four **octal** digits; `Seccomp:` is a mode (`0` none, `1` strict, `2` filter) and
+`Seccomp_filters:` how many filters are stacked; `TracerPid:` is the tracer's number **in the
+reader's namespace** (the same door `Pid:` goes through) and `0` when nobody is attached. The five
+`Cap*` words are sixteen lowercase hex digits and come from the credential model's own masks —
+`build/scratch/status2/p.c` read `CapInh 0000000800000000`, `CapPrm`/`CapEff` `0000000000000000`
+(a container drops them), `CapBnd 000001ffffffffff`.
+
+### The fix
+
+`TaskSnapshot` gained `umask`, `no_new_privs`, `seccomp_mode`, `seccomp_filters` and the four
+credential masks; `status_of` renders them through two helpers:
+
+```rust
+fn mask_word(mask: u64) -> alloc::string::String { alloc::format!("{mask:016x}") }
+fn umask_word(umask: u32) -> alloc::string::String { alloc::format!("{:04o}", umask & 0o777) }
+```
+
+and `TracerPid` comes from a new `tracer_number(slot)` (`crate::sched::tracer_of` → `reader_number`,
+so the file's `Pid:` and `TracerPid:` are the same numbering). `CapAmb` stays `0` and is honest
+rather than claimed: `PR_CAP_AMBIENT`'s raises are refused here, so no task can hold an ambient cap.
+
+### The pin
+
+`user/tests/src/bin/t-status-identity.rs`, ten claims — movements, a two-door agreement against
+`capget(2)`/`PR_CAPBSET_READ`, and a **dropped-identity** child so a constant cannot pass:
+
+```
+ok:    status prints the identity lines (true)
+ok:    umask(077) shows as the four octal digits 0077 (0077)
+ok:    PR_SET_NO_NEW_PRIVS shows as NoNewPrivs (0 -> 1)
+ok:    a filter shows as Seccomp 2 and one filter (0 -> 2, 0 -> 1)
+ok:    status's CapInh/Prm/Eff are capget's words (0/000001ffffffffff/000001ffffffffff against the same)
+ok:    and its CapBnd is the set PR_CAPBSET_READ answers (000001ffffffffff against 000001ffffffffff)
+ok:    a dropped identity empties the two capability words (0000000000000000/0000000000000000)
+ok:    and status says the same (0/0 against 0/0)
+ok:    a tracee's status names its tracer (Some(5) against this pid 5)
+ok:    and the tracer's own status names none (Some(0))
+PASS
+```
+
+Unfixed kernel (`build/boot-identity-cf2.log`) — five red:
+
+```
+FAIL:  umask(077) shows as the four octal digits 0077 (0022)
+FAIL:  PR_SET_NO_NEW_PRIVS shows as NoNewPrivs (0 -> 0)
+FAIL:  a filter shows as Seccomp 2 and one filter (0 -> 0, 0 -> 0)
+FAIL:  and status says the same (000001ffffffffff/000001ffffffffff against 0/0)
+FAIL:  a tracee's status names its tracer (Some(0) against this pid 5)
+FAILED
+```
+
+The five that pass on both are the root payload's own agreement claims (`CapInh/Prm/Eff` against
+`capget`, `CapBnd` against `PR_CAPBSET_READ`, and the empty-set claim read from `capget`), which is
+exactly why the dropped child is in the test: a constant is indistinguishable from a fact while the
+only reader holds the constant's value.
+
+**The rule.** A capability word is a *set a task holds*, and a constant is a claim that every task
+holds the same set. §6.93 and §6.106 each set a precedent: measure the thing the field reports, and
+put the reader in a state that can distinguish it from its most plausible constant. For the
+capability words that state is a dropped identity — and `capget(2)`/`PR_CAPBSET_READ` are the second
+and third doors onto the same words, so the pin compares doors rather than trusting one.

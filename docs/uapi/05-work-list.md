@@ -9781,3 +9781,27 @@ green with it (`build/boot-status2.log`, `=== PASS`). Host unit test
 per-thread-ness of the switch lines is measured rather than assumed
 (`build/scratch/status/u.c`: worker `50`, main `16`, `RUSAGE_SELF` `106`). Mechanism and the full
 reading: `docs/notes/` §6.106.
+
+### Item 220 - `/proc/<pid>/status`'s identity lines are the kernel's (2026-11-07, landed)
+
+| line | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| `Umask:` | four octal digits: `0022`, `0077` | literal `0022` | `umask_word(fs.umask)`, four octal digits |
+| `TracerPid:` | the tracer's number in the reader's namespace, `0` if none | literal `0` | `tracer_of` through `reader_number` |
+| `NoNewPrivs:` | `0`/`1`, `PR_SET_NO_NEW_PRIVS` sets it | literal `0` | `task.no_new_privs` |
+| `Seccomp:` | `0` none, `1` strict, `2` filter | literal `0` | `seccomp_strict`/`seccomp_filters` |
+| `Seccomp_filters:` | how many are stacked | literal `0` | `seccomp_filters.len()` |
+| `CapInh/Prm/Eff/Bnd` | sixteen lowercase hex digits of the credential masks | four **constants** (`0`, `000001ffffffffff`) - right for root, wrong for a dropped identity | the `Credentials` masks |
+| `CapAmb` | `0` unless `PR_CAP_AMBIENT` raised one | literal `0` | still `0`, and honestly so: ambient raises are refused here |
+
+**Landed.** `TaskSnapshot::{umask, no_new_privs, seccomp_mode, seccomp_filters, cap_inheritable,
+cap_permitted, cap_effective, cap_bounding}`, `mask_word`, `umask_word`, `tracer_number`. Owner:
+`src/vfs/procfs.rs`, `src/sched/runtime/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-status-identity.rs` - ten claims, including a **dropped-identity child**
+whose `CapEff`/`CapPrm` must be empty in both `status` and `capget(2)` (a root payload cannot tell a
+constant from a fact). Red on the unfixed kernel (`build/boot-identity-cf2.log`: five reds), green
+with it (`build/boot-identity3.log`, `=== PASS`). Host unit tests
+`vfs::procfs::tests::a_umask_is_four_octal_digits` and
+`vfs::procfs::tests::a_signal_mask_is_sixteen_lowercase_hex_digits` pin the notations. Mechanism and
+the full reading: `docs/notes/` §6.107.

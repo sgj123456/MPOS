@@ -1549,6 +1549,19 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::start_nanos`] - when the task came
     /// into being, for `stat`'s field 22.
     pub start_nanos: u64,
+    /// See [`crate::sched::TaskSnapshot::umask`] - `status`'s `Umask:` line.
+    pub umask: u32,
+    /// See [`crate::sched::TaskSnapshot::no_new_privs`].
+    pub no_new_privs: bool,
+    /// See [`crate::sched::TaskSnapshot::seccomp_mode`] and
+    /// [`crate::sched::TaskSnapshot::seccomp_filters`].
+    pub seccomp_mode: u8,
+    pub seccomp_filters: usize,
+    /// See [`crate::sched::TaskSnapshot::cap_inheritable`] and its siblings.
+    pub cap_inheritable: u64,
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_bounding: u64,
     /// See [`crate::sched::TaskSnapshot::pending`] - `/proc/<pid>/stat`'s
     /// field 31.
     pub pending: u64,
@@ -2689,6 +2702,33 @@ fn mask_word(mask: u64) -> alloc::string::String {
     alloc::format!("{mask:016x}")
 }
 
+/// The `Umask:` word: four **octal** digits with a leading zero, which is what
+/// Linux prints (`0022` for a shell's default, `0077` after `umask(077)` -
+/// `build/scratch/status2/p.c`). Hex here would read as a plausible mask and be
+/// the wrong number; decimal would be ambiguously short.
+fn umask_word(umask: u32) -> alloc::string::String {
+    alloc::format!("{:04o}", umask & 0o777)
+}
+
+/// The pid `/proc/<pid>/status`'s `TracerPid:` line names: the task that has
+/// `slot` attached, in the *reader's* numbers (`reader_number`, the same door
+/// `Pid:` goes through, so the two lines of one file cannot disagree), or `0`
+/// when nobody is tracing it - which is Linux's answer too, and the answer a
+/// file must give rather than being absent.
+#[cfg(target_os = "none")]
+fn tracer_number(slot: usize) -> usize {
+    match crate::sched::tracer_of(crate::sched::TaskId(slot)) {
+        Some(tracer) => reader_number(tracer.0),
+        None => 0,
+    }
+}
+
+/// The host's stand-in: there is no task table to ask, so nobody is traced.
+#[cfg(not(target_os = "none"))]
+fn tracer_number(_slot: usize) -> usize {
+    0
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
@@ -2720,13 +2760,13 @@ fn status_of(slot: usize) -> Option<String> {
     let leader_pending = task.pending;
     Some(alloc::format!(
         "Name:\t{name}\n\
-         Umask:\t0022\n\
+         Umask:\t{umask}\n\
          State:\t{state} ({state_name})\n\
          Tgid:\t{tgid}\n\
          Ngid:\t0\n\
          Pid:\t{pid}\n\
          PPid:\t{ppid}\n\
-         TracerPid:\t0\n\
+         TracerPid:\t{tracer_pid}\n\
          Uid:\t{uid_line}\n\
          Gid:\t{gid_line}\n\
          FDSize:\t64\n\
@@ -2759,14 +2799,14 @@ fn status_of(slot: usize) -> Option<String> {
          SigBlk:\t{sig_blk}\n\
          SigIgn:\t{sig_ign}\n\
          SigCgt:\t{sig_cgt}\n\
-         CapInh:\t0000000000000000\n\
-         CapPrm:\t000001ffffffffff\n\
-         CapEff:\t000001ffffffffff\n\
-         CapBnd:\t000001ffffffffff\n\
-         CapAmb:\t0000000000000000\n\
-         NoNewPrivs:\t0\n\
-         Seccomp:\t0\n\
-         Seccomp_filters:\t0\n\
+         CapInh:\t{cap_inh}\n\
+         CapPrm:\t{cap_prm}\n\
+         CapEff:\t{cap_eff}\n\
+         CapBnd:\t{cap_bnd}\n\
+         CapAmb:\t{cap_amb}\n\
+         NoNewPrivs:\t{no_new_privs}\n\
+         Seccomp:\t{seccomp_mode}\n\
+         Seccomp_filters:\t{seccomp_filters}\n\
          Cpus_allowed:\t1\n\
          Cpus_allowed_list:\t0\n\
          Mems_allowed:\t1\n\
@@ -2807,6 +2847,27 @@ fn status_of(slot: usize) -> Option<String> {
         sig_cgt = mask_word(task.caught),
         voluntary = task.switches.0,
         nonvoluntary = task.switches.1,
+        // `Umask:` is four **octal** digits, not hex and not decimal: Linux
+        // prints `0022` for the shell's default and `0077` after `umask(077)`
+        // (`build/scratch/status2/p.c`).
+        umask = umask_word(task.umask),
+        tracer_pid = tracer_number(slot),
+        // The five capability words are sixteen lowercase hex digits, off the
+        // credential model's own masks - the same words its `capable`/
+        // `has_effective` questions read, so a task that dropped its identity
+        // prints the sets it holds rather than a constant.
+        //
+        // `CapAmb` is the ambient set, which this kernel does not implement
+        // (`PR_CAP_AMBIENT`'s raises are refused), so zero is the honest word
+        // rather than a claimed one.
+        cap_inh = mask_word(task.cap_inheritable),
+        cap_prm = mask_word(task.cap_permitted),
+        cap_eff = mask_word(task.cap_effective),
+        cap_bnd = mask_word(task.cap_bounding),
+        cap_amb = mask_word(0),
+        no_new_privs = u8::from(task.no_new_privs),
+        seccomp_mode = task.seccomp_mode,
+        seccomp_filters = task.seccomp_filters,
     ))
 }
 
@@ -4937,6 +4998,17 @@ mod tests {
     /// The two files are asserted together because they must not disagree:
     /// `stat`'s field 23 is `statm`'s first field times the page size.
     #[test]
+    fn a_umask_is_four_octal_digits() {
+        // Measured on a host (`build/scratch/status2/p.c`): `0022` at the
+        // default, `0077` after `umask(077)`. Octal, zero padded to four - the
+        // kind of notation a field's contract includes and a plausible-looking
+        // alternative (hex `0x22` -> `0022`, dec `34`) gets wrong.
+        assert_eq!(umask_word(0o022), "0022");
+        assert_eq!(umask_word(0o077), "0077");
+        assert_eq!(umask_word(0o777), "0777");
+        assert_eq!(umask_word(0), "0000");
+    }
+
     fn a_signal_mask_is_sixteen_lowercase_hex_digits() {
         // Measured on a host: `SIGUSR1 | SIGINT | SIGILL` blocked is
         // `000000000000020a` in `/proc/self/status` (`build/scratch/status/t.c`).
@@ -6006,6 +6078,14 @@ mod tests {
             cpu_own: (0, 0),
             switches: (0, 0),
             start_nanos: 0,
+            umask: 0o022,
+            no_new_privs: false,
+            seccomp_mode: 0,
+            seccomp_filters: 0,
+            cap_inheritable: 0,
+            cap_permitted: 0,
+            cap_effective: 0,
+            cap_bounding: 0,
             pending: 0,
             blocked: 0,
             ignored: 0,
