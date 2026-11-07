@@ -422,7 +422,7 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
 /// filling one number to the limit refuses a `sigqueue` of a different number,
 /// and a sibling process of the same uid is refused while the filler holds the
 /// quota (`.workbuddy/probe_sigpending.c`).
-fn queued_for_user(t: &Table, ruid: u32) -> u64 {
+pub(crate) fn queued_for_user(t: &Table, ruid: u32) -> u64 {
     t.tasks
         .iter()
         .flatten()

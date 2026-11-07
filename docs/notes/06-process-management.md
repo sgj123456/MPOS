@@ -8420,3 +8420,107 @@ recomputes it from what is present now will answer every question about the pres
 every question about the past wrongly. And before pinning a field, measure whether Linux's own
 value is strictly monotonic — `VmHWM` is not, and a stronger claim would have been a test that is
 red on Linux.
+
+### §6.110 `/proc/<pid>/status` printed constants for `FDSize` and `SigQ` (LANDED 2026-11-07)
+
+Two more lines of `status_of` were literals: `FDSize:\t64` and `SigQ:\t0/64`. Neither number was
+the kernel's. Linux 7.2.14, measured with probes that hold their own `/proc/self/status` stream
+open (a probe that reopens the file allocates an fd and perturbs the very table it is reading):
+
+`build/scratch/fdq/formula.c` (fd 3 held, `rewind` on each read):
+
+```
+start FDSize=64
+high fd=63 (slots=64) FDSize=128
+high fd=127 (slots=128) FDSize=256
+high fd=255 (slots=256) FDSize=512
+high fd=511 (slots=512) FDSize=1024
+high fd=1000 (slots=1001) FDSize=1024
+```
+
+`boundary2.c` (one `dup(2)` at a time): `fd=64 (65 slots) 64 -> 128`, `fd=128 (129) -> 256`,
+`fd=256 (257) -> 512`, `fd=512 (513) -> 1024`. `boundary.c`: closing all 70 descriptors leaves
+`FDSize=128` — the value never shrinks. `hole.c`: `dup2` to 200 gives 256, to 1000 gives 1024,
+so the number is the *capacity the table has grown to*, not the highest descriptor in use.
+
+That is exactly `slot_count().next_power_of_two().max(64)` — the same rule `FdTable::select_clamp`
+already implements. `close()` only `take()`s a slot, it never truncates the `Vec`, and `take_all()`
+(`drain(..)`) runs only at exit: so `slot_count()` *is* the high-water slot count. No new fd-table
+field is needed; the earlier `both.c` reading that "the select clamp stays 64 while FDSize grows"
+was a probe that read its own status file through a fresh `fopen` each time. `TaskSnapshot` now
+carries `fd_slots`, and the pure `fd_size(slots)` in `src/vfs/procfs.rs` derives the 64-slot step.
+
+`SigQ` is two books, not one number. `build/scratch/fdq/sigq.c`:
+
+```
+baseline SigQ=1/125239
+5 RT signals queued SigQ=6/125239
+setrlimit(RLIMIT_SIGPENDING,{3,3}) rc=0
+after lowering the limit SigQ=6/3
+```
+
+The denominator is the **task's own** `RLIMIT_SIGPENDING.cur` (it moves with `setrlimit`, and the
+numerator may be larger than it). `sigq3.c` shows the numerator is the **per-user** shared count:
+a parent with 5 queued, a live child that queues 2 more, reads `8/125239` for itself and `8/9`
+for the child — the child's two records raise the parent's numerator too, while each denominator
+stays the rlimit of whichever task was read. `sigq0.c` shows Linux's numerator has a baseline of 1
+(the kernel counts a record of its own); this kernel's `queued_for_user` honestly starts at 0, so
+the pin asserts *movement*, not that baseline.
+
+Both facts already lived in the kernel. `queued_for_user(t, ruid)` sums `rtq.queued()` across every
+task of that uid — it is the same function `send_signal_info` charges against
+`task.rlimits[RLIMIT_SIGPENDING].cur` — and is now `pub(crate)` so `snapshot_of` reuses it instead
+of writing a second sum that could disagree. `snapshot_of` adds three fields (`fd_slots`,
+`sig_queued`, `sig_pending_limit`) all inside the same `with_table` look, and `status_of` renders
+them through two pure functions (`fd_size`, `sigq_line`) because a host build has no `TaskSnapshot`
+to read (`task()` returns `None`). The remaining `FDSize`/`SigQ` constants (`Ngid`, `CoreDumping`,
+`Cpus_allowed*`, `Mems_allowed*`, the other `Vm*` lines) stay a named gap — item 222 covers the
+`Vm*` ones.
+
+Pin `user/tests/src/bin/t-status-counts.rs` — nine claims, all movement or separation, so the
+literal kernel cannot pass:
+
+```
+status prints FDSize and SigQ as two counts
+growing the descriptor table past 64 slots moves FDSize (64 -> Some(128))
+and the next 64-slot step moves it again (Some(256))
+and one more step is the same rule (Some(512))
+closing them all never shrinks FDSize (Some(512))
+SigQ's denominator is this task's RLIMIT_SIGPENDING soft limit (Some(16) against Some(16))
+five queued real-time copies move SigQ's numerator by five (Some(0) -> Some(5))
+lowering the soft limit moves the denominator with it (Some(16) -> Some(3))
+and the numerator may be larger than that limit (Some((5, 3)))
+```
+
+Host (`MPOS_ON_HOST=1`) 9/9 `PASS`; fixed kernel (`build/boot-counts1.log`, kernel + loader both
+rebuilt) 9/9 `PASS`, `exit=0`. Counterfactual (`git stash push -q -m cf-counts --` the three
+source files, kernel **and** loader rebuilt, `build/boot-counts-cf1.log`) — eight reds, only the
+shape claim green:
+
+```
+FAIL:  growing the descriptor table past 64 slots moves FDSize (64 -> Some(64))
+FAIL:  and the next 64-slot step moves it again (Some(64))
+FAIL:  and one more step is the same rule (Some(64))
+FAIL:  closing them all never shrinks FDSize (Some(64))
+FAIL:  SigQ's denominator is this task's RLIMIT_SIGPENDING soft limit (Some(64) against Some(16))
+FAIL:  five queued real-time copies move SigQ's numerator by five (Some(0) -> Some(0))
+FAIL:  lowering the soft limit moves the denominator with it (Some(64) -> Some(64))
+FAIL:  and the numerator may be larger than that limit (Some((0, 64)))
+FAILED
+```
+
+`git stash pop` + rebuild + re-boot (`build/boot-counts2.log`) returns to 9 `ok:`/`PASS`.
+
+The host test `vfs::procfs::tests::fd_size_grows_by_the_slot_high_water_and_sigq_keeps_two_books`
+feeds `fd_size` the boundaries `0→64, 3→64, 64→64, 65→128, 129→256, 257→512, 513→1024,
+1001→1024` and asserts `sigq_line(3,16) != sigq_line(16,3)` — a constant implementation fails
+both. The same commit fixes two test-registration mistakes in that module: a duplicate `#[test]`
+above the `Vm` test and a missing `#[test]` on `a_group_list_is_gids_separated_by_one_space_each`
+(the host count had stayed at 741 instead of 742 — the same tell as §6.108).
+
+**The rule.** A counter is a promise about what is being counted, and Linux counts `SigQ` across a
+*user* against *one task's* limit: two different owners, so one `0/64` string cannot be right.
+Reuse the kernel's own charge function for the file rather than writing a second sum — the two
+readers of one quantity agreeing is part of the contract, not an implementation detail. And measure
+a table's boundary with a probe that does not itself grow the table: the first `FDSize` reading was
+wrong because `fopen` opened an fd.

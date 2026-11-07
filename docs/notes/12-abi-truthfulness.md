@@ -292,7 +292,35 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s four `Vm` lines §6.109):**
+**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s `FDSize` and `SigQ` §6.110):**
+`build/gate-counts.log` — stage 1 `1240 tests, 0 failed` (98.66 s); x86_64
+`pass=275 fail=0 (275 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `total 99.06 s`
+(`=== PASS t-mremap` too), with the pin reading
+`growing the descriptor table past 64 slots moves FDSize (64 -> Some(128))`,
+`five queued real-time copies move SigQ's numerator by five (Some(0) -> Some(5))`,
+`lowering the soft limit moves the denominator with it (Some(16) -> Some(3))` and
+`and the numerator may be larger than that limit (Some((5, 3)))` (`build/test-serial.log`).
+aarch64 `pass=273 fail=1 (274 built)`, `mpos-kunit 35 passed, 0 failed`: the one red was
+`FAIL t-mremap timeout=120s`, which hung at `=== RUN t-mremap` before printing its own name —
+the known aarch64-under-load stall, not a claim this change wrote (`t-mremap` maps a
+2 MiB PROT_NONE arena and never opens `/proc/<pid>/status`). `t-status-counts` was
+`=== PASS` on that arm (`build/aarch64-test-serial.log`), and the pin's eight discriminating
+claims were red on the unfixed kernel (`build/boot-counts-cf1.log`) and green with it
+(`build/boot-counts1.log`). The citable aarch64 green is the same tree's last arm of
+`build/gate-counts-final.log`: `pass=274 fail=0 (274 built)`, `mpos-kunit 35 passed, 0 failed`,
+`verdict pass=274 fail=0`, with the pin's nine claims green. Every intermediate aarch64
+re-run of that same binary reddened on a *different* old moving-record claim
+(`build/gate-counts-a.log`: the §13.33 boot-check halt at 900 s; `gate-counts-a1.log`:
+`t-starttime` plus three 120 s timeouts; `gate-counts-a2.log`: `t-times`' `6 ticks against
+4..5`; `gate-counts-a3.log`: `t-times` and `t-starttime`) while `t-status-counts` stayed
+green in all five runs — the shape of host load on one core, not of a regression in a
+read-only snapshot. `gate-counts-final.log`'s x86_64 arm was `pass=274 fail=1` on
+`t-blk-sleep`'s `35 of 64 device calls (bound 40)` (§12.4a's contention reading). The
+clean single-arm re-run `build/gate-counts-x.log` is the citable x86_64 green: stage 1
+`1240 tests, 0 failed` (59.16 s), `verdict pass=275 fail=0`, `total 59.55 s (-39.9%)`,
+with `=== PASS t-status-counts` on both arms of every run.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/status`'s four `Vm` lines §6.109):**
 `build/gate-vmstatus.log` — stage 1 `1239 tests, 0 failed` (101.61 s); x86_64
 `pass=274 fail=0 (274 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `total 102.00 s`;
 aarch64 `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0 failed`, `total 277.81 s` (the

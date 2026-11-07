@@ -9849,3 +9849,28 @@ named gap: Linux's `VmData` counts private *writable* mappings, and this kernel'
 tell private from shared but not yet writable data from the stack, so returning a guess would be a
 shape that looks finished while doing less. Mechanism, the four Linux readings and the
 `VmHWM`-is-not-monotonic measurement: `docs/notes/` §6.109.
+
+### Item 223 - `/proc/<pid>/status`'s `FDSize` and `SigQ` are counters, not literals (2026-11-07, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| `FDSize` after growing the fd table past 64/128/256 slots | 64 → 128 → 256 → 512 (64-slot steps) | literal `64` forever | `slot_count().next_power_of_two().max(64)` |
+| `FDSize` after closing every descriptor | never shrinks (128 stays 128) | literal `64` | the high-water slot count, unchanged |
+| `FDSize` after `dup2` to 1000 | 1024 (capacity, not highest fd) | literal `64` | 1024 |
+| `SigQ` after 5 queued RT signals | `6/125239` (numerator +5) | `0/64` | `5/16` (numerator +5) |
+| `SigQ` after `setrlimit(RLIMIT_SIGPENDING,{3,max})` | `6/3` (denominator follows the task's rlimit; numerator may exceed it) | `0/64` | `5/3` |
+| `SigQ` read for a live child of the same user | child's numerator is the per-user total, denominator is the child's own limit (`8/9`) | `0/64` | both books come from the task's own `with_table` look |
+
+**Landed.** `queued_for_user` is `pub(crate)` and reused by `snapshot_of`; `TaskSnapshot` carries
+`fd_slots`/`sig_queued`/`sig_pending_limit`; `src/vfs/procfs.rs` derives the two lines through the
+host-testable `fd_size(slots)` and `sigq_line(queued, limit)` (the host build's `task()` returns
+`None`, so `status_of` itself cannot be unit-tested). Owner: `src/sched/runtime/child_signal.rs`,
+`src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-status-counts.rs` (9 claims; eight red on the unfixed kernel —
+`build/boot-counts-cf1.log` — green with it, `build/boot-counts1.log`/`build/boot-counts2.log`), and
+host test `vfs::procfs::tests::fd_size_grows_by_the_slot_high_water_and_sigq_keeps_two_books`.
+Linux's `SigQ` numerator has a baseline of 1 that this kernel does not have, so the pin asserts
+movement, not that baseline. `Ngid`, `CoreDumping`, `Cpus_allowed*`, `Mems_allowed*` and the
+remaining `Vm*` lines stay a named gap (item 222). Mechanism and all six Linux readings:
+`docs/notes/` §6.110.

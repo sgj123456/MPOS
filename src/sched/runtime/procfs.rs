@@ -1,5 +1,5 @@
 use super::child_mm::current_mm;
-use super::child_signal::process_members;
+use super::child_signal::{process_members, queued_for_user};
 use super::task::with_table;
 use super::task::{Table, Task, current};
 use crate::hal;
@@ -387,6 +387,27 @@ pub struct TaskSnapshot {
     /// `sigaction(SIGTERM, handler)` read `16384` = `1 << 14`, and replacing it
     /// with `SIG_IGN` moved the same bit into field 33.
     pub caught: signal::Pending,
+    /// Slots this task's descriptor table has ever grown to. `status`'s
+    /// `FDSize:` is this rounded up to a power of two and floored at 64
+    /// (§6.110). It never shrinks: `close` frees a slot without truncating the
+    /// vector, so a table that once named fd 200 still reports a 256-slot
+    /// capacity after every descriptor is gone. Measured on Linux 7.2.14
+    /// (`build/scratch/fdq/formula.c`, `boundary2.c`): 64 slots -> 64, 65 ->
+    /// 128, 129 -> 256, 257 -> 512, 513 -> 1024, and a `dup2` to 1000 -> 1024.
+    pub fd_slots: usize,
+    /// Real-time records queued for this task's **user**, across every one of
+    /// that user's tasks and all signal numbers. `status`'s `SigQ:` numerator;
+    /// the same count `RLIMIT_SIGPENDING` bounds in `send_signal_info`
+    /// (`child_signal::queued_for_user`). Measured on Linux 7.2.14
+    /// (`build/scratch/fdq/sigq3.c`): a child's two extra records raised the
+    /// parent's numerator too, so the count is the user's and not the task's.
+    pub sig_queued: u64,
+    /// This task's `RLIMIT_SIGPENDING` soft limit - `SigQ:`'s denominator, which
+    /// belongs to the task being read even though the numerator is shared.
+    /// Measured (`build/scratch/fdq/sigq.c`): `setrlimit(3, 3)` moved
+    /// `SigQ` from `6/125239` to `6/3`, and the numerator is allowed to exceed
+    /// the limit when the limit is lowered underneath already-queued signals.
+    pub sig_pending_limit: u64,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -508,6 +529,14 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         blocked: task.blocked,
         ignored,
         caught,
+        // Three counters off the same look that already took `rss_pages` and
+        // `credentials`: the fd table's high water, and the user's queued total
+        // paired with *this* task's own ceiling. `status` is the only reader of
+        // all three; keeping them on the snapshot is what lets a file be built
+        // outside the table's critical section (§6.110).
+        fd_slots: task.fds.slot_count(),
+        sig_queued: queued_for_user(t, task.identity.ruid),
+        sig_pending_limit: task.rlimits[crate::abi::RLIMIT_SIGPENDING].cur,
     }
 }
 

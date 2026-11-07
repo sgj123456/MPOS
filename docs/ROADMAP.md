@@ -333,6 +333,17 @@ One-glance status of the whole roadmap.
   Linux does not have. Pin `t-vmstatus` (14 claims, five red without the fix) plus a host test on
   the four-input derivation. `VmData`/`RssAnon` and the other `Vm*` lines stay a **named gap** —
   the VMA table cannot yet tell writable data from the stack (`§6.109`, item 222).
+- [x] `/proc/<pid>/status` counts `FDSize` and `SigQ` instead of printing `64` and `0/64` —
+  `FDSize` is the fd table's 64-slot capacity step (`64 → 128 → 256 → 512` as `dup` grows it,
+  never shrinking on `close`, `1024` after `dup2` to 1000), which is the `slot_count()` high water
+  this kernel already kept; `SigQ` is two different books (the per-user queued RT total over the
+  *read task's* `RLIMIT_SIGPENDING.cur`), so five queued copies move the numerator and lowering
+  the soft limit moves the denominator while the numerator may stay larger. Both come from the
+  kernel's own `queued_for_user`/rlimit charge, not a second sum. Linux's `SigQ` numerator has a
+  baseline of 1 this kernel honestly lacks, so the pin asserts movement. Pin `t-status-counts`
+  (9 claims, eight red without the fix) plus a host test on the two pure derivations; `Ngid`,
+  `CoreDumping`, `Cpus_*`/`Mems_*` and the other `Vm*` lines stay a **named gap** (`§6.110`,
+  item 223).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

@@ -1577,6 +1577,13 @@ pub struct Process {
     pub ignored: u64,
     /// See [`crate::sched::TaskSnapshot::caught`] - field 34.
     pub caught: u64,
+    /// See [`crate::sched::TaskSnapshot::fd_slots`] - `status`'s `FDSize:`.
+    pub fd_slots: usize,
+    /// See [`crate::sched::TaskSnapshot::sig_queued`] - `SigQ:`'s numerator.
+    pub sig_queued: u64,
+    /// See [`crate::sched::TaskSnapshot::sig_pending_limit`] - `SigQ:`'s
+    /// denominator.
+    pub sig_pending_limit: u64,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -2781,6 +2788,38 @@ fn vm_lines(facts: VmFacts) -> (usize, usize, usize, usize) {
     (peak_kb, size_kb, hwm_kb, rss_kb)
 }
 
+/// `FDSize:` is the descriptor table's high-water slot count rounded up to a
+/// power of two, floored at one machine word's worth of bits (64).
+///
+/// Measured on Linux 7.2.14 (`build/scratch/fdq/formula.c`, `boundary2.c`) by
+/// holding `/proc/self/status` open on fd 3 and `dup`ing to each boundary: 64
+/// slots still report 64, the 65th slot reports 128, the 129th 256, the 257th
+/// 512 and the 513th 1024; a `dup2` to 1000 reports 1024. It is the same rule
+/// `FdTable::select_clamp` already answers for `select`, and it never shrinks,
+/// because `close` frees a slot without truncating the vector.
+///
+/// A constant `FDSize:\t64` is indistinguishable from the truth only while the
+/// reader has opened fewer than 65 descriptors - the first `dup` past that is
+/// the fact this line owes a caller.
+fn fd_size(slots: usize) -> usize {
+    slots.next_power_of_two().max(64)
+}
+
+/// `SigQ:`'s two numbers: the user's queued real-time records over the task's
+/// own `RLIMIT_SIGPENDING` soft limit.
+///
+/// The numerator is **not** this task's queue: Linux's count is the user's,
+/// shared across that user's tasks and signal numbers (`user_struct::sigpending`,
+/// `build/scratch/fdq/sigq3.c` - a child's two new records raised the parent's
+/// `SigQ` too). The denominator is the task being read: lowering its own limit
+/// moved `6/125239` to `6/3` while the six records stayed queued, so a numerator
+/// above the denominator is a real answer, not an error to clamp
+/// (`build/scratch/fdq/sigq.c`). `status_of` used to print `0/64` - a numerator
+/// that never moved and a denominator that was never this task's limit.
+fn sigq_line(queued: u64, limit: u64) -> alloc::string::String {
+    alloc::format!("{queued}/{limit}")
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
@@ -2797,6 +2836,8 @@ fn status_of(slot: usize) -> Option<String> {
         peak_pages: task.peak_pages,
         hwm_frames: task.hwm_frames,
     });
+    let fd_size_value = fd_size(task.fd_slots);
+    let sig_q = sigq_line(task.sig_queued, task.sig_pending_limit);
     // `VmData` is still the resident set's kilobytes: Linux counts private
     // writable mappings here (16 kB at rest, 4112 kB after a 4 MiB anonymous
     // `MAP_PRIVATE`), and this kernel's VMA table can tell private from shared
@@ -2839,7 +2880,7 @@ fn status_of(slot: usize) -> Option<String> {
          TracerPid:\t{tracer_pid}\n\
          Uid:\t{uid_line}\n\
          Gid:\t{gid_line}\n\
-         FDSize:\t64\n\
+         FDSize:\t{fd_size_value}\n\
          Groups:\t{groups}\n\
          NStgid:\t{nstgid}\n\
          NSpid:\t{nspid}\n\
@@ -2863,7 +2904,7 @@ fn status_of(slot: usize) -> Option<String> {
          HugetlbPages:\t       0 kB\n\
          CoreDumping:\t0\n\
          Threads:\t{threads}\n\
-         SigQ:\t0/64\n\
+         SigQ:\t{sig_q}\n\
          SigPnd:\t{sig_pnd}\n\
          ShdPnd:\t{sig_shd_pnd}\n\
          SigBlk:\t{sig_blk}\n\
@@ -5069,7 +5110,6 @@ mod tests {
     /// The two files are asserted together because they must not disagree:
     /// `stat`'s field 23 is `statm`'s first field times the page size.
     #[test]
-    #[test]
     fn the_four_vm_lines_are_four_different_books() {
         // §6.109: `status_of` used to print one number (`rss_pages`, in kB) as
         // all four lines. Four deliberately distinct inputs here - a process
@@ -5095,6 +5135,7 @@ mod tests {
         assert_eq!(vm_lines(after), (8192, 512, 1024, 128));
     }
 
+    #[test]
     fn a_group_list_is_gids_separated_by_one_space_each() {
         // Measured on a host (`build/scratch/status2/g.c`): `Groups:\t953 966
         // 992 998 1000 ` - a space after every number, the last included.
@@ -5129,6 +5170,29 @@ mod tests {
         // silently disagree.
         assert!(mask_word(0xabc).chars().all(|c| !c.is_ascii_uppercase()));
         assert_eq!(mask_word(0xabc).len(), 16);
+    }
+
+    #[test]
+    fn fd_size_grows_by_the_slot_high_water_and_sigq_keeps_two_books() {
+        // §6.110: `FDSize:\t64` and `SigQ:\t0/64` were constants. These two
+        // pure functions are the whole rendering rule `status_of` uses, and the
+        // inputs are deliberately distinct: a constant in either position
+        // answers every one of these the same and fails the assertion.
+        assert_eq!(fd_size(0), 64, "a fresh table is floored at 64");
+        assert_eq!(fd_size(3), 64, "the standard three descriptors");
+        assert_eq!(fd_size(64), 64, "a full first word is still 64");
+        assert_eq!(fd_size(65), 128, "the 65th slot doubles it");
+        assert_eq!(fd_size(129), 256);
+        assert_eq!(fd_size(257), 512);
+        assert_eq!(fd_size(513), 1024);
+        assert_eq!(fd_size(1001), 1024, "a dup2 to 1000 is still 1024");
+        // The two numbers are separate books: swapping them changes the line,
+        // and a numerator above the denominator is a real answer after a limit
+        // is lowered underneath already-queued signals.
+        assert_eq!(sigq_line(0, 16), "0/16");
+        assert_eq!(sigq_line(6, 16), "6/16");
+        assert_eq!(sigq_line(6, 3), "6/3");
+        assert_ne!(sigq_line(3, 16), sigq_line(16, 3));
     }
 
     #[test]
@@ -6200,6 +6264,9 @@ mod tests {
             blocked: 0,
             ignored: 0,
             caught: 0,
+            fd_slots: 0,
+            sig_queued: 0,
+            sig_pending_limit: 0,
         }
     }
 
