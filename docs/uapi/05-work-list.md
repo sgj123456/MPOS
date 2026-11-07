@@ -9754,3 +9754,30 @@ Pin: `user/tests/src/bin/t-rusage-switch.rs` — seven claims, all movements (a 
 at start is not the test's number). Red on the unfixed kernel (`build/boot-switch-cf1.log`: `0 -> 0`
 on four movements), green with it (`build/boot-switch1.log`, `=== t-rusage-switch exit=0`). Mechanism
 and the full reading: `docs/notes/` §6.105.
+
+### Item 219 - `/proc/<pid>/status`'s masks and switch lines are the kernel's (2026-11-07, landed)
+
+The long form of the process table carries the same facts as `stat`, in the notation a reader
+decodes: four signal masks as sixteen lowercase hex digits, and the context-switch pair as decimal.
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| `SigBlk` after blocking `SIGUSR1` | `0000000000000200` | `0000000000000000` | `0000000000000200` (and `stat`'s word 32 agrees) |
+| `SigIgn` after `SIG_IGN` on `SIGUSR2` | bit `0x800` set | zero | set; `SigCgt` is the partition's other half |
+| `SigCgt` after a `SIGTERM` handler | `0000000000004000` | zero | set |
+| `SigPnd` after raising a blocked signal | `0000000000000200` | zero | set |
+| `ShdPnd` | the group's pending set | zero | the leader's pending set (where a process-directed signal lands) |
+| `voluntary_ctxt_switches` after 50 sleeps | `+50` (the **thread's**) | `0` | `+50`; a worker's own line says `50` while the main thread's stays put |
+
+**Landed.** `status_of` renders all six lines from the same `TaskSnapshot` `stat` reads (§6.102's four
+words, §6.105's thread pair) through `mask_word`, which is `{mask:016x}` because Linux prints
+sixteen lowercase hex digits. Owner: `src/vfs/procfs.rs`, with the pair's source in
+`src/sched/runtime/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-status-masks.rs` — eleven claims (movements, plus `status`'s blocked word
+against `stat`'s field 32). Red on the unfixed kernel (`build/boot-status-cf1.log`: seven reds),
+green with it (`build/boot-status2.log`, `=== PASS`). Host unit test
+`vfs::procfs::tests::a_signal_mask_is_sixteen_lowercase_hex_digits` pins the notation, and the
+per-thread-ness of the switch lines is measured rather than assumed
+(`build/scratch/status/u.c`: worker `50`, main `16`, `RUSAGE_SELF` `106`). Mechanism and the full
+reading: `docs/notes/` §6.106.

@@ -1543,6 +1543,9 @@ pub struct Process {
     pub cpu: (u64, u64, u64, u64),
     /// See [`crate::sched::TaskSnapshot::cpu_own`].
     pub cpu_own: (u64, u64),
+    /// See [`crate::sched::TaskSnapshot::switches`] - this thread's context
+    /// switches, the two `/proc/<pid>/status` lines.
+    pub switches: (u64, u64),
     /// See [`crate::sched::TaskSnapshot::start_nanos`] - when the task came
     /// into being, for `stat`'s field 22.
     pub start_nanos: u64,
@@ -2674,6 +2677,18 @@ fn environ_of(pid: usize) -> Option<String> {
 /// says `wdthread` where its leader says `probe_tid_dir`), and `Threads` is the
 /// group's either way. A leader is the case where the two ids coincide, which
 /// is why this was invisible through `/proc/<pid>` alone.
+/// Render a signal mask the way `/proc/<pid>/status` prints it: sixteen
+/// lowercase hex digits, zero padded, the bit for signal `n` at `n - 1`.
+///
+/// Measured on a current host (`build/scratch/status/t.c`, Linux 7.2.14): with
+/// `SIGUSR1` (10), `SIGINT` (2) and `SIGILL` (4) blocked the line read
+/// `SigBlk:\t000000000000020a` - lowercase, padded, and `2`, `4` and `10`
+/// where the bits of `1`, `3` and `9` sit. A host can test this without a
+/// machine because it is text, not state.
+fn mask_word(mask: u64) -> alloc::string::String {
+    alloc::format!("{mask:016x}")
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
@@ -2696,6 +2711,13 @@ fn status_of(slot: usize) -> Option<String> {
     };
     #[cfg(not(target_os = "none"))]
     let (uid_line, gid_line) = (alloc::string::String::new(), alloc::string::String::new());
+    // `ShdPnd` is the group's pending set; this kernel keeps one per task and a
+    // process-directed signal lands on the leader (§6.78b), so the leader's set
+    // is what the shared word reports for every member.
+    #[cfg(target_os = "none")]
+    let leader_pending = crate::sched::snapshot(leader).map_or(task.pending, |s| s.pending);
+    #[cfg(not(target_os = "none"))]
+    let leader_pending = task.pending;
     Some(alloc::format!(
         "Name:\t{name}\n\
          Umask:\t0022\n\
@@ -2732,11 +2754,11 @@ fn status_of(slot: usize) -> Option<String> {
          CoreDumping:\t0\n\
          Threads:\t{threads}\n\
          SigQ:\t0/64\n\
-         SigPnd:\t0000000000000000\n\
-         ShdPnd:\t0000000000000000\n\
-         SigBlk:\t0000000000000000\n\
-         SigIgn:\t0000000000000000\n\
-         SigCgt:\t0000000000000000\n\
+         SigPnd:\t{sig_pnd}\n\
+         ShdPnd:\t{sig_shd_pnd}\n\
+         SigBlk:\t{sig_blk}\n\
+         SigIgn:\t{sig_ign}\n\
+         SigCgt:\t{sig_cgt}\n\
          CapInh:\t0000000000000000\n\
          CapPrm:\t000001ffffffffff\n\
          CapEff:\t000001ffffffffff\n\
@@ -2749,8 +2771,8 @@ fn status_of(slot: usize) -> Option<String> {
          Cpus_allowed_list:\t0\n\
          Mems_allowed:\t1\n\
          Mems_allowed_list:\t0\n\
-         voluntary_ctxt_switches:\t0\n\
-         nonvoluntary_ctxt_switches:\t0\n",
+         voluntary_ctxt_switches:\t{voluntary}\n\
+         nonvoluntary_ctxt_switches:\t{nonvoluntary}\n",
         name = task.comm,
         uid_line = uid_line,
         gid_line = gid_line,
@@ -2772,6 +2794,19 @@ fn status_of(slot: usize) -> Option<String> {
         // whose chain is the one zero this prints.
         nssid = number_chain(task.session),
         threads = task.threads,
+        // The four mask words and the two switch lines, off the same snapshot
+        // `stat` renders its field 31-34 words from (§6.102) and off this
+        // thread's own switch pair (§6.105, §6.106). Linux prints the masks as
+        // sixteen lowercase hex digits, and splits the dispositions into two
+        // words that never share a bit: `SigIgn` is what a task ignores and
+        // `SigCgt` what it has a handler for.
+        sig_pnd = mask_word(task.pending),
+        sig_shd_pnd = mask_word(leader_pending),
+        sig_blk = mask_word(task.blocked),
+        sig_ign = mask_word(task.ignored),
+        sig_cgt = mask_word(task.caught),
+        voluntary = task.switches.0,
+        nonvoluntary = task.switches.1,
     ))
 }
 
@@ -4902,6 +4937,22 @@ mod tests {
     /// The two files are asserted together because they must not disagree:
     /// `stat`'s field 23 is `statm`'s first field times the page size.
     #[test]
+    fn a_signal_mask_is_sixteen_lowercase_hex_digits() {
+        // Measured on a host: `SIGUSR1 | SIGINT | SIGILL` blocked is
+        // `000000000000020a` in `/proc/self/status` (`build/scratch/status/t.c`).
+        assert_eq!(mask_word(0), "0000000000000000");
+        assert_eq!(mask_word(0x20a), "000000000000020a");
+        // `SIGTERM` is 15, so its bit is `1 << 14` - the pad and the position
+        // are what a reader decodes.
+        assert_eq!(mask_word(1 << 14), mask_word(0x4000));
+        // Uppercase would be a different file: Linux prints lowercase, and a
+        // reader that compares the line to its own `%016lx` formatting would
+        // silently disagree.
+        assert!(mask_word(0xabc).chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(mask_word(0xabc).len(), 16);
+    }
+
+    #[test]
     fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
         let mut p = process(7, 7, None, 0, 'R');
         p.virtual_pages = 1087;
@@ -5953,6 +6004,7 @@ mod tests {
             exit_signal: 17,
             cpu: (0, 0, 0, 0),
             cpu_own: (0, 0),
+            switches: (0, 0),
             start_nanos: 0,
             pending: 0,
             blocked: 0,

@@ -296,6 +296,16 @@ One-glance status of the whole roadmap.
   `cutime`. Pin `t-rusage-switch` (seven movement claims; five red without the fix), and the twelve
   page-fault/block-I/O counters before them stay zero as a **named gap** — the minor/major split
   needs an I/O signal the mapped-object seam does not report (`§6.105`, item 218).
+- [x] `/proc/<pid>/status`'s mask and switch lines are the kernel's — six lines were literals
+  (`SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn`, `SigCgt`, and the two `*_ctxt_switches`) while `stat`'s
+  fields 31–34 and `getrusage`'s pair (§6.102, §6.105) carried the same facts at another door, so
+  `top` and `ps` read zeros for a task whose masks and switches were known. Measured on Linux: masks
+  are sixteen lowercase hex digits with signal `n` at bit `n - 1`; the disposition words are a
+  partition; `ShdPnd` is the group's set, which this kernel answers from the leader where a
+  process-directed signal lands; and the switch lines are the **thread's** pairs — a worker's fifty
+  sleeps read `50` in its own `task/<tid>/status` while the main thread read `16` and
+  `RUSAGE_SELF` said `106`. Pin `t-status-masks` (eleven claims, seven red without the fix), plus a
+  host test for the notation (`§6.106`, item 219).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

@@ -292,7 +292,16 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `getrusage`'s switch counters §6.105):** stage 1 `1235 tests, 0
+**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s masks and switches §6.106):** stage 1
+`1236 tests, 0 failed` (100.08 s); x86_64 `pass=272 fail=0 (272 built)`, `mpos-kunit 35 passed, 0
+failed`, `total 100.27 s (previous green run 56.58 s, +77.2%)`; aarch64 `pass=271 fail=0 (271 built)`,
+`mpos-kunit 35 passed, 0 failed`, `total 241.17 s (previous green run 97.04 s, +148.5%)`
+(`build/gate-status.log` - one run of both arms, which is why the totals are the host's figure for
+two emulated machines and one host suite on one core, not a regression). The new pin reads
+`fifty sleeps move voluntary_ctxt_switches by fifty (1 -> 51)` on x86_64 and `(112 -> 162)` on
+aarch64, where the baseline is larger because more of the sweep has run before it.
+
+**Measured gate before it (2026-11-07, `getrusage`'s switch counters §6.105):** stage 1 `1235 tests, 0
 failed` (56.20 s); x86_64 `pass=271 fail=0 (271 built)`, `mpos-kunit 35 passed, 0 failed`, `total
 56.58 s (previous green run 56.21 s, +0.7%)`; aarch64 `pass=270 fail=0 (270 built)`, `mpos-kunit 35
 passed, 0 failed`, `total 97.04 s (previous green run 155.25 s, -37.5%)` (`build/gate-switch-x.log`,

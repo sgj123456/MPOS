@@ -8056,3 +8056,104 @@ two" ages into a wrong answer as soon as the kernel starts counting the rest, wh
 happened here: the CPU pair beside the zeros was right, so nothing looked broken. And a counter with
 two columns has one place that decides which column a switch lands in; that place is after the
 caller has said where the task is going, because before it, the question has no answer.
+
+## §6.106 `/proc/<pid>/status` printed zeros for the masks and the switches
+
+**LANDED 2026-11-07.** `/proc/<pid>/status` is the long form of the process table — what `top`,
+`ps`, a shell's job control and a debugger read. Six of its lines were literals in the kernel while
+the facts behind them were already in the task table: `SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn`,
+`SigCgt`, and the two `*_ctxt_switches` lines. §6.102 had just put the same four masks into
+`/proc/<pid>/stat`'s fields 31–34 and §6.105 had just started counting switches, so the zeroes were
+not a missing feature but a second door that had not been told.
+
+### What Linux prints (measured)
+
+`build/scratch/status/t.c` (musl static, Linux 7.2.14):
+
+```
+blocked USR1+INT+ILL:             SigBlk:	000000000000020a
+ign+handler:                      SigIgn:	0000000001001800
+                                  SigCgt:	0000000000004000
+raised USR1 (blocked):            SigPnd:	0000000000000200
+```
+
+Sixteen lowercase hex digits, zero padded, signal `n` at bit `n - 1` — the same layout `stat`'s
+words use, in the other notation. `build/scratch/status/s.c` additionally showed the disposition
+words partition: setting `SIGUSR2` to `SIG_IGN` moves its bit from `SigCgt` to `SigIgn`, never both.
+
+The switch lines are the **thread's** own, which is the fact that decides where they come from.
+`build/scratch/status/u.c`:
+
+```
+main before voluntary=15
+worker own status voluntary=50
+main after voluntary=16
+```
+
+Fifty sleeps in the worker read `50` in the worker's own `/proc/<pid>/task/<tid>/status`, while the
+main thread moved by one — and `getrusage(RUSAGE_SELF)` for the same process answered `106`, the
+group's number. So the status lines are the thread's pair (§6.105's `Task::nvcsw`/`nivcsw`), not the
+group's columns, and a program that opens one file and reads the other gets two numbers that
+disagree **because they are two different questions**.
+
+### The fix
+
+`status_of` renders all six lines from the same `TaskSnapshot` that `stat`'s fields read (§6.102,
+§6.105), through one helper:
+
+```rust
+fn mask_word(mask: u64) -> alloc::string::String { alloc::format!("{mask:016x}") }
+```
+
+* `SigPnd`/`SigBlk` — this thread's pending and blocked sets.
+* `SigIgn`/`SigCgt` — the group's dispositions, split into what it ignores and what it has a handler
+  for. The two words never share a bit, which is the property that makes the split a partition
+  rather than two entries in a table.
+* `ShdPnd` — the group's pending set. This kernel keeps one pending set **per task**, and the one
+  fact that makes the group word answerable is §6.78b's delivery rule: a process-directed signal
+  lands on the leader, so the leader's pending set is the shared one every member would report.
+* `voluntary_ctxt_switches`/`nonvoluntary_ctxt_switches` — the thread's pair, off `Task` and not off
+  the group's `Mm`, because the measurement above says Linux answers from the thread.
+
+### The pin
+
+`user/tests/src/bin/t-status-masks.rs`, eleven claims, movements and two-door agreements:
+
+```
+ok:    status prints the mask and switch lines (true)
+ok:    blocking SIGUSR1 puts its bit in SigBlk (0000000000000000 -> 0000000000000200)
+ok:    and stat's blocked word says the same (Some(512))
+ok:    ignoring SIGUSR2 puts its bit in SigIgn (0000000000001000 -> 0000000000001800)
+ok:    a handled SIGTERM puts its bit in SigCgt (0000000000000440 -> 0000000000004440)
+ok:    and the two words never share a bit (0000000000001800 & 0000000000004440)
+ok:    a raised blocked signal shows in SigPnd (0000000000000200)
+ok:    fifty sleeps move voluntary_ctxt_switches by fifty (0 -> 50)
+ok:    and none of them is an involuntary one (7 -> 9)
+ok:    a sibling's sleeps are that sibling's lines (Some(50))
+ok:    and not this thread's (50 -> 51)
+PASS
+```
+
+Unfixed kernel (`build/boot-status-cf1.log`) — seven red:
+
+```
+FAIL:  blocking SIGUSR1 puts its bit in SigBlk (0000000000000000 -> 0000000000000000)
+FAIL:  and stat's blocked word says the same (Some(512))
+FAIL:  ignoring SIGUSR2 puts its bit in SigIgn (0000000000000000 -> 0000000000000000)
+FAIL:  a handled SIGTERM puts its bit in SigCgt (0000000000000000 -> 0000000000000000)
+FAIL:  a raised blocked signal shows in SigPnd (0000000000000000)
+FAIL:  fifty sleeps move voluntary_ctxt_switches by fifty (0 -> 0)
+FAIL:  a sibling's sleeps are that sibling's lines (Some(0))
+FAILED
+```
+
+The four that pass on both are shape claims (a zero mask parses, two zero words do not share a bit,
+a thread that moved by zero did not move by fifty) — the mask format itself is pinned on the host
+instead, by `vfs::procfs::tests::a_signal_mask_is_sixteen_lowercase_hex_digits`, because a
+sixteen-digit lowercase word is text and not state.
+
+**The rule.** A second door onto the same fact is not free: §6.102 made `stat`'s words real and this
+file kept printing zeros for weeks of commits — the tell was that the numbers were *round* (all
+zero, all the time) while a sibling file carried the same facts. When a field lands on one door,
+grep for the other doors that print it: `status`, `stat`, `statm`, `getrusage` and `wait4` are five
+renderings of one task, and they must be made of the same numbers in the same units.

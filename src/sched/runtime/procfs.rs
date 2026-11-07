@@ -306,6 +306,16 @@ pub struct TaskSnapshot {
     /// CPU this **task** has burned, `(utime, stime)`, in the kernel's ticks.
     /// The `task/<tid>/stat` spelling's numbers; the group's are [`Self::cpu`].
     pub cpu_own: (u64, u64),
+    /// The context switches this **thread** has taken, `(voluntary,
+    /// involuntary)` - the two `/proc/<pid>/status` lines, which Linux answers
+    /// from the thread and not from the group.
+    ///
+    /// Measured on a current host (`build/scratch/status/u.c`, Linux 7.2.14): a
+    /// worker that slept fifty times read `voluntary_ctxt_switches: 50` in the
+    /// worker's own `/proc/<pid>/task/<tid>/status` while the main thread read
+    /// `16` - and `getrusage(RUSAGE_SELF)` answered `106` for the same process,
+    /// which is the *group's* number and a different door (§6.105).
+    pub switches: (u64, u64),
     /// When this task came into being, in `since_boot_nanos` - the number
     /// `/proc/<pid>/stat`'s field 22 (`starttime`) renders as `USER_HZ` ticks
     /// since boot.
@@ -431,6 +441,10 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         cpu_own: (
             task.cpu_user.load(core::sync::atomic::Ordering::Relaxed),
             task.cpu_system.load(core::sync::atomic::Ordering::Relaxed),
+        ),
+        switches: (
+            task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
+            task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
         ),
         start_nanos: task.start_nanos,
         pending: task.signals,
