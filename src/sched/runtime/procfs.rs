@@ -269,6 +269,14 @@ pub struct TaskSnapshot {
     /// pages). [`crate::sched::child_mm`]'s `Mm::mapped_pages` owns the
     /// counting and its measurement; this is the copy `/proc` formats.
     ///
+    /// The high-water marks: Linux's `VmPeak` (largest address space ever) and
+    /// `VmHWM` (largest resident set ever), in pages. Measured on Linux 7.2.14
+    /// (`build/scratch/vmfields/p.c`): mapping 4 MiB and unmapping it again
+    /// leaves `VmPeak: 4324 kB` and `VmRSS: 72 kB` - the peak is a fact about
+    /// the past that no current count can answer, so it is recorded where the
+    /// tables grow ([`crate::sched::Mm`]'s `record_peak`/`own`), not derived.
+    pub peak_pages: usize,
+    pub hwm_frames: usize,
     /// Distinct from [`Self::rss_pages`] by construction: a mapping is a claim
     /// on the address space and residency is the substance behind it, which is
     /// why Linux reports both and why the two files that share this number
@@ -428,6 +436,8 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         'R'
     };
     let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
+    let peak_pages = task.mm.peak_pages();
+    let hwm_frames = task.mm.hwm_frames();
     let virtual_pages = task.mm.mapped_pages();
     let (ignored, caught) = disposition_sets(task.dispositions.snapshot());
     let credentials = task.mm.credentials();
@@ -464,6 +474,8 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .count()
             .max(1),
         rss_pages,
+        peak_pages,
+        hwm_frames,
         virtual_pages,
         nice: task.nice,
         exit_signal: task.exit_signal,

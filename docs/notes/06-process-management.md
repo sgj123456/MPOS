@@ -8316,3 +8316,107 @@ whose moment lies inside an interval cannot be compared as two numbers.**
 **The rule.** A list field is a promise about *order and separators* as much as about membership:
 `Groups:` is gids in `setgroups` order with a space each, not a set, and a reader that rebuilds the
 line from a set will pass every membership test and still print a different file.
+
+## §6.109 `status`'s four `Vm` lines were one number, and a high water is a memory (LANDED 2026-11-07)
+
+**LANDED 2026-11-07.** §6.103 gave `/proc/<pid>/stat`'s `vsize` and `statm`'s total the address
+space rather than the resident set, and §6.108 finished the `Groups:` line. The four `Vm` lines
+below them in `/proc/<pid>/status` still came from one `let kb = task.rss_pages * 4096 / 1024;`:
+`VmPeak`, `VmSize`, `VmHWM` and `VmRSS` all printed the same kilobytes, and `VmData`/`RssAnon` used
+it as well. A program reading `top` or a monitoring agent asking "how big did this process get"
+was told its current resident set, and a 4 MiB mapping nobody had touched moved **none** of the
+four lines.
+
+### What Linux answers (7.2.14, measured)
+
+`build/scratch/vmfields/u.c` maps 4 MiB `MAP_PRIVATE|MAP_ANONYMOUS`, touches all of it, then
+unmaps it, reading the four lines at each step with `sscanf(strchr(buf, ':') + 1, "%ld", …)` (the
+tab after the colon is why a fixed `buf + 6` reads -1):
+
+```
+baseline                  VmPeak=248   VmSize=248   VmHWM=88   VmRSS=88   kB
+mapped 4 MiB, untouched   VmPeak=4344  VmSize=4344  VmHWM=88   VmRSS=88   kB
+touched all 4 MiB         VmPeak=4344  VmSize=4344  VmHWM=4184 VmRSS=4184 kB
+unmapped it again         VmPeak=4344  VmSize=248   VmHWM=4112 VmRSS=88   kB
+```
+
+So the file is four books, not one number with four names: `VmSize` is the address space now,
+`VmPeak` is the largest address space ever, `VmRSS` is what is present now, `VmHWM` is a record of
+the largest resident set. The unmap row is the whole distinction — the two current counts fall back
+and the two high waters do not unhappen.
+
+`build/scratch/vmfields/w.c` also measured a subtlety worth writing down before it becomes a false
+claim: `VmHWM` is **not** `max(VmRSS)` sampled at every instant. It is the synced `mm->hiwater_rss`,
+and on this host it dipped `4188 -> 4112 kB` across a `munmap` while `ru_maxrss` stayed at
+`4112 kB`. A pin asserting `VmHWM >= the largest transient VmRSS reading this program took` would be
+red on Linux itself. The honest claim is that it still records a set much larger than the current
+one after the pages are gone.
+
+### The fix
+
+- `src/sched/runtime/child_mm.rs`: `Mm` gains `hwm_frames: AtomicUsize` and
+  `peak_pages: AtomicUsize`. `own()` does `self.hwm_frames.fetch_max(frames.len(), Relaxed)` inside
+  its `critical_section::with`, and a private `record_peak()` does
+  `self.peak_pages.fetch_max(self.mapped_pages(), Relaxed)`. It hangs off every place the VMA table
+  grows — `record_range`, `vma_insert`, `vma_insert_present` — and off `set_vmas` (a `fork` copies
+  the VMA table, and Linux's `copy_mm` carries the peak with it). `with_eager` seeds both from the
+  eager ranges and frames so a task born with a loaded image starts at its own size, not zero.
+- `src/sched/runtime/procfs.rs`: `TaskSnapshot` carries `peak_pages`/`hwm_frames` off `task.mm`.
+- `src/vfs/procfs.rs`: `struct VmFacts { virtual_pages, rss_pages, peak_pages, hwm_frames }` and
+  `fn vm_lines(facts) -> (peak_kb, size_kb, hwm_kb, rss_kb)`, each high water `max(recorded,
+  current)` because a read can land between a mapping being made and the record being taken.
+  `vm_kilobytes(pages) = pages * 4096 / 1024`. Extracting the four books into a pure function is
+  what makes them host-testable: `fn task(_pid) -> Option<Process> { None }` on the host, so
+  `status_of` itself is not.
+
+`VmData` and `RssAnon` still print the resident set's kilobytes. Linux counts private *writable*
+mappings in `VmData` (16 kB at rest, 4112 kB after a 4 MiB anonymous `MAP_PRIVATE`), and this
+kernel's VMA table can tell private from shared but not yet "writable data" from "the stack".
+Guessing would be a shape that looks finished while doing less, so that stays a **named gap**
+(`docs/uapi/05-work-list.md`, item 222), as do the other `Vm*` lines that still print `0 kB`.
+
+### The pin
+
+`user/tests/src/bin/t-vmstatus.rs` (14 claims) walks the same four steps as the Linux probe and
+asserts the separations: mapping moves `VmSize`/`VmPeak` and leaves `VmRSS`/`VmHWM` alone; touching
+moves `VmRSS`/`VmHWM` and leaves `VmSize`; unmapping gives the two current counts back while
+`VmPeak` keeps the largest address space and `VmHWM` still records the large resident set. Two
+claims ask that the peaks stay separated from the current counts after the unmap.
+
+Fixed kernel (`build/boot-vmstatus3.log`, 14 `ok:`, `PASS`):
+
+```
+ok:    mapping 4 MiB nobody has touched extends VmSize (492 -> 4600 kB)
+ok:    and takes VmPeak with it (492 -> 4600 kB)
+ok:    and leaves VmRSS alone (480 -> 488 kB)
+ok:    touching it raises VmRSS (488 -> 4584 kB)
+ok:    unmapping gives VmSize back (504 against 492 kB)
+ok:    but VmPeak keeps the largest address space (4604 against 504 kB)
+ok:    and VmHWM still records the large resident set (4588 against a baseline of 480 kB)
+ok:    so the two peaks are separated from the two current counts (4604 > 504 and 4588 > 488 kB)
+```
+
+Unfixed kernel (`build/boot-vmstatus-cf1.log`, `git stash push` of the three source files, kernel
+and loader both rebuilt) — five reds:
+
+```
+FAIL:  mapping 4 MiB nobody has touched extends VmSize (480 -> 488 kB)
+FAIL:  and leaves VmSize where it was (4584 against 488 kB)
+FAIL:  but VmPeak keeps the largest address space (488 against 488 kB)
+FAIL:  and VmHWM still records the large resident set (488 against a baseline of 480 kB)
+FAIL:  so the two peaks are separated from the two current counts (488 > 488 and 488 > 488 kB)
+FAILED
+```
+
+The host unit test `vfs::procfs::tests::the_four_vm_lines_are_four_different_books` feeds
+`VmFacts { 1024, 128, 2048, 256 }` and `{ 128, 32, 2048, 256 }` and expects four different
+answers each time; a one-number implementation cannot produce them. A first attempt at that test
+asserted `core::cmp::max(4096, 0) == 4096`, which is true with or without the fix and so pinned
+nothing — the repo's counterfactual rule caught it before it landed.
+
+**The rule.** A high-water mark is a *record of the past*, not a function of the current count: it
+must be written where the table grows, and it survives the table shrinking. Any implementation that
+recomputes it from what is present now will answer every question about the present correctly and
+every question about the past wrongly. And before pinning a field, measure whether Linux's own
+value is strictly monotonic — `VmHWM` is not, and a stronger claim would have been a test that is
+red on Linux.

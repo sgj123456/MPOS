@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s `Groups:` line §6.108):**
+**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s four `Vm` lines §6.109):**
+`build/gate-vmstatus.log` — stage 1 `1239 tests, 0 failed` (101.61 s); x86_64
+`pass=274 fail=0 (274 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `total 102.00 s`;
+aarch64 `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0 failed`, `total 277.81 s` (the
+second arm pays for the two emulated machines sharing the container's one CPU). Both arms carry
+`=== PASS t-vmstatus`: x86_64
+`so the two peaks are separated from the two current counts (4604 > 504 and 4588 > 488 kB)`
+(`build/test-serial.log`), aarch64 `(4584 > 484 and 4564 > 464 kB)`
+(`build/aarch64-test-serial.log`). The pin's five discriminating claims were red on the unfixed
+kernel (`build/boot-vmstatus-cf1.log`) and green with it (`build/boot-vmstatus3.log`).
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/status`'s `Groups:` line §6.108):**
 
 - stage 1 - `1236 tests, 0 failed`.
 - x86_64 - `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `stdout is

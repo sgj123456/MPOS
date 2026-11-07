@@ -322,6 +322,17 @@ One-glance status of the whole roadmap.
   `t-status-identity` (clear, list in order, `getgroups` agreeing; one red without the fix). The same
   commit registers two notation tests `5b28889` left without their `#[test]` attribute — the host
   count not moving was the tell (`§6.108`, item 221).
+- [x] `/proc/<pid>/status`'s four `Vm` lines are four different books — they were one `rss_pages`
+  number printed four times, so a 4 MiB mapping nobody had touched moved none of them and unmapping
+  a touched one made the peaks "unhappen". Measured on Linux 7.2.14: map → `VmSize`/`VmPeak` 4344
+  kB with `VmRSS` still 88 kB, touch → `VmRSS`/`VmHWM` 4184 kB with `VmSize` unchanged, unmap →
+  `VmSize`/`VmRSS` fall back while `VmPeak`/`VmHWM` keep their records. `Mm` now records both high
+  waters where its tables grow (`own()`, `vma_insert`, `record_range`, `set_vmas`), and `vm_lines`
+  derives the four kilobyte values. Linux's `VmHWM` is a synced record that was measured *dipping*
+  4188 → 4112 kB across a `munmap`, so the pin asserts the separation, not a strict monotonicity
+  Linux does not have. Pin `t-vmstatus` (14 claims, five red without the fix) plus a host test on
+  the four-input derivation. `VmData`/`RssAnon` and the other `Vm*` lines stay a **named gap** —
+  the VMA table cannot yet tell writable data from the stack (`§6.109`, item 222).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

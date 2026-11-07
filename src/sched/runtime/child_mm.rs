@@ -1587,6 +1587,17 @@ pub struct Mm {
     /// stack and heap. Dropping the address space frees its tables but never
     /// these, so the reaper returns them by hand.
     pub(crate) frames: Mutex<RefCell<Vec<usize>>>,
+    /// The largest number of frames this group has ever held at once - Linux's
+    /// `VmHWM`, the high-water resident set. It is recorded where the frames
+    /// table grows ([`Self::own`]) and nowhere derived: a process that mapped 4
+    /// MiB, touched it and freed it reads `VmHWM: 4096 kB` and `VmRSS: 0 kB` on
+    /// Linux (`build/scratch/vmfields/p.c`), which is a fact about the past that
+    /// no current count can answer.
+    pub(crate) hwm_frames: core::sync::atomic::AtomicUsize,
+    /// The largest number of pages this address space has ever claimed -
+    /// Linux's `VmPeak`, the high-water virtual size. Recorded where a mapping
+    /// is added ([`Self::record_peak`]); `unmap` must not lower it.
+    pub(crate) peak_pages: core::sync::atomic::AtomicUsize,
     /// The group's virtual memory areas: which ranges exist, with what
     /// permissions, and what backs each one.
     ///
@@ -1710,10 +1721,21 @@ impl Mm {
         frames: Vec<usize>,
         eager: Vec<MappedRange>,
     ) -> Arc<Mm> {
+        // The high-water marks start at what the loader already placed: the
+        // eager ranges it recorded and the frames it filled are this address
+        // space's first peak, not something to discover on the first read.
+        let page = crate::mm::pframe::PAGE_SIZE;
+        let eager_pages: usize = eager
+            .iter()
+            .map(|range| (range.end.saturating_sub(range.start) + page - 1) / page)
+            .sum();
+        let held_frames = frames.len();
         Arc::new(Mm {
             live: core::sync::atomic::AtomicUsize::new(1),
             root_value: root,
             frames: Mutex::new(RefCell::new(frames)),
+            hwm_frames: core::sync::atomic::AtomicUsize::new(held_frames),
+            peak_pages: core::sync::atomic::AtomicUsize::new(eager_pages),
             vmas: Mutex::new(RefCell::new(VmaTable::new())),
             eager: Mutex::new(RefCell::new(eager)),
             leader,
@@ -1737,6 +1759,10 @@ impl Mm {
     /// memory is its parent's - address space included.
     pub(crate) fn set_vmas(&self, vmas: VmaTable) {
         critical_section::with(|cs| *self.vmas.borrow(cs).borrow_mut() = vmas);
+        // A child inherits the parent's address space, so its `VmPeak` starts at
+        // what the parent has mapped now - not at the loader's eager ranges the
+        // constructor saw. Linux's `copy_mm` takes the peak with the table.
+        self.record_peak();
     }
 
     /// A copy of the table, for a child about to be given its own.
@@ -1759,6 +1785,7 @@ impl Mm {
     /// neither put a VMA in the table instead.
     pub(crate) fn record_range(&self, range: MappedRange) {
         critical_section::with(|cs| self.eager.borrow(cs).borrow_mut().push(range));
+        self.record_peak();
     }
 
     /// Drop the parts of eagerly-mapped ranges inside `start..end`, clipped.
@@ -1969,6 +1996,7 @@ impl Mm {
 
     pub(crate) fn vma_insert(&self, vma: Vma) {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().insert(vma));
+        self.record_peak();
     }
 
     /// Claim a run whose pages the caller has just placed, beside descriptions
@@ -1977,6 +2005,7 @@ impl Mm {
         critical_section::with(|cs| {
             self.vmas.borrow(cs).borrow_mut().insert_present(vma);
         });
+        self.record_peak();
     }
 
     pub(crate) fn vma_remove_range(&self, start: usize, end: usize) {
@@ -2174,6 +2203,30 @@ impl Mm {
         pages
     }
 
+    /// The high-water marks `/proc/<pid>/status` prints as `VmPeak` and
+    /// `VmHWM`: pages, like [`Self::mapped_pages`] and the frames table.
+    ///
+    /// Both only rise. A read is not a place they can be caught up from either:
+    /// a process that maps 4 MiB and unmaps it again between two reads has a
+    /// peak the second read still has to report, which is why they are recorded
+    /// on the mutation and not computed here.
+    pub(crate) fn peak_pages(&self) -> usize {
+        self.peak_pages.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn hwm_frames(&self) -> usize {
+        self.hwm_frames.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Note the address space's size after a mapping was added, for `VmPeak`.
+    /// Called from the three insertion points rather than from the reader: the
+    /// value has to survive whatever happens between two reads.
+    fn record_peak(&self) {
+        let pages = self.mapped_pages();
+        self.peak_pages
+            .fetch_max(pages, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// child-user, child-system)` - the four `times()` reports and the pair
     /// behind each `getrusage` direction.
     pub(crate) fn cpu_all(&self) -> (u64, u64, u64, u64) {
@@ -2293,7 +2346,12 @@ impl Mm {
 
     /// A frame this group now owns.
     pub(crate) fn own(&self, frame: usize) {
-        critical_section::with(|cs| self.frames.borrow(cs).borrow_mut().push(frame));
+        critical_section::with(|cs| {
+            let mut frames = self.frames.borrow(cs).borrow_mut();
+            frames.push(frame);
+            self.hwm_frames
+                .fetch_max(frames.len(), core::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     /// Forget a frame without giving it back: whoever took it owns it now.

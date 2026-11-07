@@ -1559,6 +1559,10 @@ pub struct Process {
     pub seccomp_filters: usize,
     /// See [`crate::sched::TaskSnapshot::groups`] - `status`'s `Groups:` line.
     pub groups: alloc::vec::Vec<u32>,
+    /// See [`crate::sched::TaskSnapshot::peak_pages`] and `hwm_frames` - the two
+    /// high-water marks `status` prints as `VmPeak` and `VmHWM`.
+    pub peak_pages: usize,
+    pub hwm_frames: usize,
     /// See [`crate::sched::TaskSnapshot::cap_inheritable`] and its siblings.
     pub cap_inheritable: u64,
     pub cap_permitted: u64,
@@ -2744,10 +2748,61 @@ fn groups_line(groups: &[u32]) -> alloc::string::String {
     line
 }
 
+/// One page count as the kilobytes every `Vm*` line of `status` prints.
+fn vm_kilobytes(pages: usize) -> usize {
+    pages * 4096 / 1024
+}
+
+/// The four page counts `status`'s `Vm` lines are made from.
+struct VmFacts {
+    /// Right now: the address space (`VmSize`) and what is resident (`VmRSS`).
+    virtual_pages: usize,
+    rss_pages: usize,
+    /// Ever: the largest address space (`VmPeak`) and the largest resident set
+    /// (`VmHWM`). Both are recorded where their tables grow, so neither can be
+    /// recomputed from the two current numbers.
+    peak_pages: usize,
+    hwm_frames: usize,
+}
+
+/// The four lines, in Linux's order and kilobytes. Each high-water mark is the
+/// greater of its recorded peak and the current count: the record lives on the
+/// mutation, while the current count can be momentarily ahead of it if a read
+/// lands between a mapping being made and the record being taken.
+///
+/// This is the whole distinction §6.109 is about. `status_of` used to compute
+/// all four from `rss_pages` alone, so a 4 MiB mapping nobody had touched moved
+/// none of them and unmapping a touched one made the peaks "unhappen".
+fn vm_lines(facts: VmFacts) -> (usize, usize, usize, usize) {
+    let size_kb = vm_kilobytes(facts.virtual_pages);
+    let peak_kb = vm_kilobytes(facts.peak_pages.max(facts.virtual_pages));
+    let rss_kb = vm_kilobytes(facts.rss_pages);
+    let hwm_kb = vm_kilobytes(facts.hwm_frames.max(facts.rss_pages));
+    (peak_kb, size_kb, hwm_kb, rss_kb)
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
-    let kb = task.rss_pages * 4096 / 1024;
+    // Four different facts, which one number used to pretend to be: the address
+    // space (`VmSize`), its high water (`VmPeak`), what is present (`VmRSS`) and
+    // the high water of that (`VmHWM`). Measured on Linux 7.2.14
+    // (`build/scratch/vmfields/u.c`): a 4 MiB private anonymous mapping raises
+    // `VmSize` and `VmPeak` to 4344 kB while `VmRSS` stays 88 kB; touching it
+    // raises `VmRSS`/`VmHWM` to 4184 kB and leaves the sizes alone; unmapping it
+    // drops `VmSize` back to 248 kB while `VmPeak` keeps 4344 kB.
+    let (peak_kb, size_kb, hwm_kb, rss_kb) = vm_lines(VmFacts {
+        virtual_pages: task.virtual_pages,
+        rss_pages: task.rss_pages,
+        peak_pages: task.peak_pages,
+        hwm_frames: task.hwm_frames,
+    });
+    // `VmData` is still the resident set's kilobytes: Linux counts private
+    // writable mappings here (16 kB at rest, 4112 kB after a 4 MiB anonymous
+    // `MAP_PRIVATE`), and this kernel's VMA table can tell private from shared
+    // but not yet "writable data" from "the stack" - a named gap rather than a
+    // second guess (`docs/uapi/05-work-list.md`, item 222).
+    let kb = rss_kb;
     let state_name = match task.state {
         'R' => "running",
         'S' => "sleeping",
@@ -2790,12 +2845,12 @@ fn status_of(slot: usize) -> Option<String> {
          NSpid:\t{nspid}\n\
          NSpgid:\t{nspgid}\n\
          NSsid:\t{nssid}\n\
-         VmPeak:\t   {kb} kB\n\
-         VmSize:\t   {kb} kB\n\
+         VmPeak:\t   {peak_kb} kB\n\
+         VmSize:\t   {size_kb} kB\n\
          VmLck:\t       0 kB\n\
          VmPin:\t       0 kB\n\
-         VmHWM:\t   {kb} kB\n\
-         VmRSS:\t   {kb} kB\n\
+         VmHWM:\t   {hwm_kb} kB\n\
+         VmRSS:\t   {rss_kb} kB\n\
          RssAnon:\t   {kb} kB\n\
          RssFile:\t       0 kB\n\
          RssShmem:\t       0 kB\n\
@@ -5014,6 +5069,32 @@ mod tests {
     /// The two files are asserted together because they must not disagree:
     /// `stat`'s field 23 is `statm`'s first field times the page size.
     #[test]
+    #[test]
+    fn the_four_vm_lines_are_four_different_books() {
+        // §6.109: `status_of` used to print one number (`rss_pages`, in kB) as
+        // all four lines. Four deliberately distinct inputs here - a process
+        // that mapped 1024 pages, once held 2048, now has 128 resident and once
+        // held 256 - must give four different answers, in Linux's order.
+        let facts = VmFacts {
+            virtual_pages: 1024,
+            rss_pages: 128,
+            peak_pages: 2048,
+            hwm_frames: 256,
+        };
+        assert_eq!(vm_lines(facts), (8192, 4096, 1024, 512));
+
+        // After an unmap the two current counts fall back while the two peaks
+        // stay: that separation is the fact a single current count cannot
+        // answer, and it is what the machine pin asserts on real mappings.
+        let after = VmFacts {
+            virtual_pages: 128,
+            rss_pages: 32,
+            peak_pages: 2048,
+            hwm_frames: 256,
+        };
+        assert_eq!(vm_lines(after), (8192, 512, 1024, 128));
+    }
+
     fn a_group_list_is_gids_separated_by_one_space_each() {
         // Measured on a host (`build/scratch/status2/g.c`): `Groups:\t953 966
         // 992 998 1000 ` - a space after every number, the last included.
@@ -6113,6 +6194,8 @@ mod tests {
             cap_effective: 0,
             cap_bounding: 0,
             groups: alloc::vec::Vec::new(),
+            peak_pages: 0,
+            hwm_frames: 0,
             pending: 0,
             blocked: 0,
             ignored: 0,

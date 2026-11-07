@@ -9826,3 +9826,26 @@ green with it (`build/boot-groups2.log`, thirteen `ok:` lines). Host test
 The same commit registers two notation tests that `5b28889` had left without their `#[test]`
 attribute - the host count stayed at 738 through that commit, which was the tell. Mechanism and the
 full reading: `docs/notes/` §6.108.
+
+### Item 222 - `/proc/<pid>/status`'s four `Vm` lines are four different books (2026-11-07, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| map 4 MiB, untouched | `VmSize`/`VmPeak` 4344 kB, `VmRSS`/`VmHWM` 88 kB | all four stay at the resident set | sizes move, resident set does not |
+| touch all 4 MiB | `VmRSS`/`VmHWM` 4184 kB, `VmSize` unchanged | all four become the resident set | resident set moves, size does not |
+| unmap it again | `VmSize` 248 kB, `VmPeak` 4344 kB, `VmRSS` 88 kB, `VmHWM` 4112 kB | all four fall back together | peaks stay, current counts fall |
+| `VmHWM` across a `munmap` | a synced record; measured dipping 4188 → 4112 kB while `ru_maxrss` stayed 4112 kB | one number | `max(recorded, current)`, same shape |
+| `VmData`, `RssAnon`, the other `Vm*` lines | private writable / anonymous / shared / library / stack / swap / locked / pin / pte / exe / lib / swap / pinned, each its own sum | the resident set, or a literal `0 kB` | **named gap** — unchanged |
+
+**Landed.** `Mm::peak_pages`/`hwm_frames` (recorded at `own()`, `record_range`, `vma_insert`,
+`vma_insert_present`, `set_vmas`, seeded by `with_eager`), `TaskSnapshot`'s two fields,
+`VmFacts`/`vm_lines`/`vm_kilobytes` in `src/vfs/procfs.rs`. Owner: `src/sched/runtime/child_mm.rs`,
+`src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-vmstatus.rs` (14 claims; five red on the unfixed kernel —
+`build/boot-vmstatus-cf1.log` — green with it, `build/boot-vmstatus3.log`), and host test
+`vfs::procfs::tests::the_four_vm_lines_are_four_different_books`. The other `Vm*` lines stay a
+named gap: Linux's `VmData` counts private *writable* mappings, and this kernel's VMA table can
+tell private from shared but not yet writable data from the stack, so returning a guess would be a
+shape that looks finished while doing less. Mechanism, the four Linux readings and the
+`VmHWM`-is-not-monotonic measurement: `docs/notes/` §6.109.
