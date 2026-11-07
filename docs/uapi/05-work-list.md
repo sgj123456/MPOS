@@ -9805,3 +9805,24 @@ with it (`build/boot-identity3.log`, `=== PASS`). Host unit tests
 `vfs::procfs::tests::a_umask_is_four_octal_digits` and
 `vfs::procfs::tests::a_signal_mask_is_sixteen_lowercase_hex_digits` pin the notations. Mechanism and
 the full reading: `docs/notes/` §6.107.
+
+### Item 221 - `/proc/<pid>/status`'s `Groups:` line lists the supplementary groups (2026-11-07, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| `Groups:` with none set | empty after the tab | empty (by accident) | empty |
+| `Groups:` after `setgroups(10, 20, 30)` | `10 20 30 ` - a space after every gid, the last included | still empty | `10 20 30 `, in the order given |
+| the other door | `getgroups(2)` reports the same list | `getgroups` was right; the file was not | both agree |
+
+**Landed.** `TaskSnapshot::groups` (a clone of `Identity::groups`), `groups_line`. Owner:
+`src/vfs/procfs.rs`, `src/sched/runtime/procfs.rs`.
+
+Pin: three claims in `user/tests/src/bin/t-status-identity.rs` (machine-only: `setgroups` needs
+privilege): clear, list in order, and `getgroups` agreeing. Red on the unfixed kernel
+(`build/boot-groups-cf1.log`: `FAIL: setgroups(10, 20, 30) lists them in that order (Some([]))`),
+green with it (`build/boot-groups2.log`, thirteen `ok:` lines). Host test
+`vfs::procfs::tests::a_group_list_is_gids_separated_by_one_space_each` pins the separators.
+
+The same commit registers two notation tests that `5b28889` had left without their `#[test]`
+attribute - the host count stayed at 738 through that commit, which was the tell. Mechanism and the
+full reading: `docs/notes/` §6.108.

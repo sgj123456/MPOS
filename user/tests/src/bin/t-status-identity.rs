@@ -23,7 +23,7 @@
 //! another door, and the umask is read back after `umask(077)` rather than
 //! assumed.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, host_run};
 
 const NOBODY: u32 = 65_534;
 
@@ -70,6 +70,16 @@ fn read_identity(path: &str) -> Option<Identity> {
         cap_prm: hex_word(&text, "CapPrm:")?,
         cap_eff: hex_word(&text, "CapEff:")?,
         cap_bnd: hex_word(&text, "CapBnd:")?,
+    })
+}
+
+/// The `Groups:` line as the gids it lists.
+fn groups_of(path: &str) -> Option<Vec<u32>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    line(&text, "Groups:").map(|rest| {
+        rest.split_whitespace()
+            .filter_map(|gid| gid.parse().ok())
+            .collect()
     })
 }
 
@@ -327,6 +337,47 @@ fn main() {
     unsafe {
         libc::kill(child, libc::SIGKILL);
         libc::waitpid(child, &mut status, 0);
+    }
+
+    // The `Groups:` line is the supplementary group list, and `getgroups(2)` is
+    // the other door onto it. Measured on Linux 7.2.14
+    // (`build/scratch/status2/g.c`): `Groups:\t953 966 992 998 1000 ` - one
+    // space after every gid, the last included. A payload that starts with no
+    // supplementary groups is the clean case: the line is empty, then it lists
+    // exactly what `setgroups(2)` was given.
+    let groups_before = groups_of("/proc/self/status");
+    if !host_run() {
+        let mut none: libc::gid_t = 0;
+        let cleared = unsafe { libc::setgroups(0, &mut none) };
+        let empty = groups_of("/proc/self/status");
+        r.check(
+            &format!("setgroups(0) empties the Groups line ({empty:?})"),
+            cleared == 0 && empty == Some(Vec::new()),
+        );
+
+        let chosen: [libc::gid_t; 3] = [10, 20, 30];
+        let set = unsafe { libc::setgroups(chosen.len(), chosen.as_ptr()) };
+        let listed = groups_of("/proc/self/status");
+        r.check(
+            &format!("setgroups(10, 20, 30) lists them in that order ({listed:?})"),
+            set == 0 && listed == Some(vec![10, 20, 30]),
+        );
+        let mut read = [0 as libc::gid_t; 8];
+        let count = unsafe { libc::getgroups(read.len() as libc::c_int, read.as_mut_ptr()) };
+        let through_getgroups = if count > 0 {
+            Some(read[..count as usize].to_vec())
+        } else {
+            None
+        };
+        r.check(
+            &format!("and getgroups reports the same list ({through_getgroups:?})"),
+            through_getgroups == Some(vec![10, 20, 30]),
+        );
+    } else {
+        r.check(
+            &format!("the Groups line reads as a list ({groups_before:?})"),
+            groups_before.is_some(),
+        );
     }
 
     let _ = quiet_handler as usize;

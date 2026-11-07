@@ -116,10 +116,12 @@ fn main() {
 
     // Two children, one wait apart. The difference is the pin: a literal zero
     // makes it zero, whatever the machine's age is.
+    let before_first = uptime_ms();
     let soon = spawn_sleeper();
     let born_at = uptime_ms();
     let soon_time = soon.and_then(|pid| starttime_of(&format!("/proc/{pid}/stat")));
     std::thread::sleep(std::time::Duration::from_millis(1_500));
+    let before_second = uptime_ms();
     let late = spawn_sleeper();
     let late_time = late.and_then(|pid| starttime_of(&format!("/proc/{pid}/stat")));
     let late_at = uptime_ms();
@@ -133,17 +135,35 @@ fn main() {
         delta.is_some_and(|ticks| ticks > 0),
     );
 
-    // ... and the difference is the wait itself, in centiseconds. 1.5 s of
-    // `nanosleep` plus the fork of the second child, so 100 ticks and a little;
-    // the window is the measurement's own error, not a value to hold.
+    // ... and the difference is the wait itself, in centiseconds. Both stamps
+    // are taken *inside* their task's creation (`Task::start_nanos`), and the
+    // parent's clock stops outside `fork` - so the separation the two stamps
+    // report lies somewhere inside a bracket, not at one number: the earliest
+    // it can be is the gap between the two `fork`s finishing, the latest is the
+    // gap between them starting. Both ends are measured and the window is that
+    // bracket plus the parent's own 60 ms of slop.
+    //
+    // Measured 2026-11-07 (`build/gate-groups.log`, aarch64): `150 ticks against
+    // 1320 ms` - the fork of the first child took 180 ms on a loaded TCG lane,
+    // so the child was born before the parent's `born_at` and the one-number
+    // comparison called a true difference a wrong one.
+    let bracket = match (before_first, born_at, before_second, late_at) {
+        (Some(open), Some(born), Some(before_late), Some(close)) => {
+            Some((before_late.saturating_sub(born), close.saturating_sub(open)))
+        }
+        _ => None,
+    };
     let elapsed = match (born_at, late_at) {
         (Some(before), Some(after)) => Some(after - before),
         _ => None,
     };
-    let agrees = matches!((delta, elapsed), (Some(ticks), Some(ms))
-        if (ticks * (1000 / USER_HZ) - ms).abs() <= 60);
+    let agrees = matches!((delta, bracket), (Some(ticks), Some((low, high)))
+    if {
+        let us = ticks * (1000 / USER_HZ);
+        us + 60 >= low && us <= high + 60
+    });
     r.check(
-        &format!("and the difference is the wait, a tick per centisecond ({delta:?} ticks against {elapsed:?} ms)"),
+        &format!("and the difference is the wait, a tick per centisecond ({delta:?} ticks inside {bracket:?} ms, {elapsed:?} ms apart)"),
         agrees,
     );
 

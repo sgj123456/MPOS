@@ -315,6 +315,13 @@ One-glance status of the whole roadmap.
   hex digits off the credential masks. Pin `t-status-identity` (ten claims, a dropped-identity child
   so a constant cannot pass, `capget`/`PR_CAPBSET_READ` as the second and third doors; five red
   without the fix), plus host tests for the two notations (`§6.107`, item 220).
+- [x] `/proc/<pid>/status`'s `Groups:` line lists the supplementary groups — it was a bare tab for
+  every task while the identity record has carried `setgroups(2)`'s list. Linux's rendering is a
+  promise about separators as much as membership (`10 20 30 `, a space after every gid including the
+  last), so `groups_line` writes the trailing space and the host test pins it. Pin: three claims in
+  `t-status-identity` (clear, list in order, `getgroups` agreeing; one red without the fix). The same
+  commit registers two notation tests `5b28889` left without their `#[test]` attribute — the host
+  count not moving was the tell (`§6.108`, item 221).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

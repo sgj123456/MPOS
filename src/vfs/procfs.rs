@@ -1557,6 +1557,8 @@ pub struct Process {
     /// [`crate::sched::TaskSnapshot::seccomp_filters`].
     pub seccomp_mode: u8,
     pub seccomp_filters: usize,
+    /// See [`crate::sched::TaskSnapshot::groups`] - `status`'s `Groups:` line.
+    pub groups: alloc::vec::Vec<u32>,
     /// See [`crate::sched::TaskSnapshot::cap_inheritable`] and its siblings.
     pub cap_inheritable: u64,
     pub cap_permitted: u64,
@@ -2729,6 +2731,19 @@ fn tracer_number(_slot: usize) -> usize {
     0
 }
 
+/// The `Groups:` word: every gid followed by one space, which is Linux's own
+/// rendering (`build/scratch/status2/g.c`: `953 966 992 998 1000 ` - note the
+/// space after the last one) and empty for an identity with no supplementary
+/// groups, which is the state a fresh root process is in.
+fn groups_line(groups: &[u32]) -> alloc::string::String {
+    let mut line = alloc::string::String::new();
+    for gid in groups {
+        use alloc::fmt::Write as _;
+        let _ = write!(line, "{gid} ");
+    }
+    line
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
@@ -2770,7 +2785,7 @@ fn status_of(slot: usize) -> Option<String> {
          Uid:\t{uid_line}\n\
          Gid:\t{gid_line}\n\
          FDSize:\t64\n\
-         Groups:\t\n\
+         Groups:\t{groups}\n\
          NStgid:\t{nstgid}\n\
          NSpid:\t{nspid}\n\
          NSpgid:\t{nspgid}\n\
@@ -2860,6 +2875,7 @@ fn status_of(slot: usize) -> Option<String> {
         // `CapAmb` is the ambient set, which this kernel does not implement
         // (`PR_CAP_AMBIENT`'s raises are refused), so zero is the honest word
         // rather than a claimed one.
+        groups = groups_line(&task.groups),
         cap_inh = mask_word(task.cap_inheritable),
         cap_prm = mask_word(task.cap_permitted),
         cap_eff = mask_word(task.cap_effective),
@@ -4998,6 +5014,15 @@ mod tests {
     /// The two files are asserted together because they must not disagree:
     /// `stat`'s field 23 is `statm`'s first field times the page size.
     #[test]
+    fn a_group_list_is_gids_separated_by_one_space_each() {
+        // Measured on a host (`build/scratch/status2/g.c`): `Groups:\t953 966
+        // 992 998 1000 ` - a space after every number, the last included.
+        assert_eq!(groups_line(&[]), "");
+        assert_eq!(groups_line(&[10]), "10 ");
+        assert_eq!(groups_line(&[10, 20, 30]), "10 20 30 ");
+    }
+
+    #[test]
     fn a_umask_is_four_octal_digits() {
         // Measured on a host (`build/scratch/status2/p.c`): `0022` at the
         // default, `0077` after `umask(077)`. Octal, zero padded to four - the
@@ -5009,6 +5034,7 @@ mod tests {
         assert_eq!(umask_word(0), "0000");
     }
 
+    #[test]
     fn a_signal_mask_is_sixteen_lowercase_hex_digits() {
         // Measured on a host: `SIGUSR1 | SIGINT | SIGILL` blocked is
         // `000000000000020a` in `/proc/self/status` (`build/scratch/status/t.c`).
@@ -6086,6 +6112,7 @@ mod tests {
             cap_permitted: 0,
             cap_effective: 0,
             cap_bounding: 0,
+            groups: alloc::vec::Vec::new(),
             pending: 0,
             blocked: 0,
             ignored: 0,

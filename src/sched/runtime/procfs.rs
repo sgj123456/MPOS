@@ -329,6 +329,13 @@ pub struct TaskSnapshot {
     pub seccomp_mode: u8,
     /// How many filters are stacked - `Seccomp_filters:`.
     pub seccomp_filters: usize,
+    /// The supplementary groups, in the order `setgroups(2)` gave them -
+    /// `/proc/<pid>/status`'s `Groups:` line, which is also what
+    /// `getgroups(2)` reports. Measured on Linux 7.2.14
+    /// (`build/scratch/status2/g.c`): `Groups:\t953 966 992 998 1000 ` - one
+    /// space after every number, the last one included, and an empty line part
+    /// after the tab when the list is empty.
+    pub groups: alloc::vec::Vec<u32>,
     /// The four capability sets `/proc/<pid>/status` prints as `CapInh`,
     /// `CapPrm`, `CapEff` and `CapBnd`, straight off the group's
     /// [`crate::cred::Credentials`]: the same words the credential model asks
@@ -479,6 +486,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             2
         },
         seccomp_filters: task.seccomp_filters.len(),
+        groups: task.identity.groups.clone(),
         cap_inheritable: credentials.inheritable,
         cap_permitted: credentials.permitted,
         cap_effective: credentials.effective,

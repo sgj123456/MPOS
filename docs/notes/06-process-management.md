@@ -8238,3 +8238,81 @@ holds the same set. §6.93 and §6.106 each set a precedent: measure the thing t
 put the reader in a state that can distinguish it from its most plausible constant. For the
 capability words that state is a dropped identity — and `capget(2)`/`PR_CAPBSET_READ` are the second
 and third doors onto the same words, so the pin compares doors rather than trusting one.
+
+## §6.108 `/proc/<pid>/status`'s `Groups:` line was empty, and two of the notation tests were never run
+
+**LANDED 2026-11-07.** §6.107 made the identity lines real. The `Groups:` line under them was a
+literal part after the tab - empty for every task - while the identity record has carried the
+supplementary group list since `setgroups(2)` was served (`Identity::groups`, in the order the call
+gave them).
+
+### What Linux prints (measured, `build/scratch/status2/g.c`)
+
+```
+Groups:	953 966 992 998 1000 
+```
+
+One space after **every** gid, the last one included, and nothing after the tab when the list is
+empty. The `cat -A` shape is `Groups:^I953 966 992 998 1000 $`, which is why `groups_line` writes a
+trailing space rather than joining: a reader that splits on whitespace cannot tell, but a reader that
+compares the line to its own `%u ` formatting can.
+
+### The fix
+
+`TaskSnapshot` gained `groups: Vec<u32>` (a clone of the identity record's list, which is small and
+per process); `status_of` renders it through
+
+```rust
+fn groups_line(groups: &[u32]) -> alloc::string::String // "10 20 30 " and "" for none
+```
+
+and the host test `vfs::procfs::tests::a_group_list_is_gids_separated_by_one_space_each` pins the
+spacing on the host, where the line is text and not state.
+
+### The pin
+
+Three new claims in `t-status-identity` (thirteen total), machine-only because `setgroups(2)` needs
+privilege the host test lacks:
+
+```
+ok:    setgroups(0) empties the Groups line (Some([]))
+ok:    setgroups(10, 20, 30) lists them in that order (Some([10, 20, 30]))
+ok:    and getgroups reports the same list (Some([10, 20, 30]))
+```
+
+Unfixed kernel (`build/boot-groups-cf1.log`):
+
+```
+FAIL:  setgroups(10, 20, 30) lists them in that order (Some([]))
+FAILED
+```
+
+The clear-to-empty claim passes on both, which is the shape a zero field always has - the listing is
+the claim that discriminates, and it is the one that names the order.
+
+### A test-integrity correction, in the same file
+
+`5b28889` reported that host tests pin both notations, and at that commit only one of them ran: the
+`#[test]` attribute belonged to `a_signal_mask_is_sixteen_lowercase_hex_digits`, and inserting
+`a_umask_is_four_octal_digits` *above* it left the new function holding the attribute and the old one
+without. The host suite stayed at 738 either way, which is exactly the tell - a count that does not
+move when a test is added. Both are registered now (740 host tests), and the lesson is §12.4a's
+neighbour: **a test that does not move the count did not run**, and "it passed" from a suite whose
+count is unchanged is a statement about nothing.
+
+### A claim this gate had to reshape, in the same commit
+
+`t-starttime`'s "the difference is the wait, a tick per centisecond" compared one number (`delta*10`)
+to one number (`late_at - born_at`) with 60 ms of slop. On the loaded aarch64 arm it read
+`150 ticks against 1320 ms` (`build/gate-groups.log`) - the first child's stamp is taken **inside**
+`create`, before `fork` returns to the parent, so on a contended TCG lane the child is born up to
+180 ms before `born_at` and the one-number comparison calls a true difference a wrong one. The claim
+now measures a bracket - `before_first`, `born_at`, `before_second`, `late_at` - and asks whether
+`delta*10` lies inside `[before_second - born_at, late_at - before_first]` widened by the same 60 ms.
+Green arm reads `151 ticks inside Some((1500, 1500)) ms, Some(1500) ms apart`
+(`build/gate-groups-a.log`). This is §6.97's rule again, in a place that predates it: **two stamps
+whose moment lies inside an interval cannot be compared as two numbers.**
+
+**The rule.** A list field is a promise about *order and separators* as much as about membership:
+`Groups:` is gids in `setgroups` order with a space each, not a set, and a reader that rebuilds the
+line from a set will pass every membership test and still print a different file.

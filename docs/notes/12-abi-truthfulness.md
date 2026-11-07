@@ -292,7 +292,26 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s identity lines §6.107):** stage 1
+**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s `Groups:` line §6.108):**
+
+- stage 1 - `1236 tests, 0 failed`.
+- x86_64 - `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `stdout is
+  the sweep's own` (`build/gate-groups.log`); the three new claims are machine-only, so this arm only
+  carries the program passing.
+- aarch64 - `pass=272 fail=0 (272 built)`, `mpos-kunit 35 passed, 0 failed`, `total 102.41 s`
+  (`build/gate-groups-a.log`), with the pin reading
+  `setgroups(10, 20, 30) lists them in that order (Some([10, 20, 30]))` and `and getgroups reports the
+  same list (Some([10, 20, 30]))` (`build/aarch64-test-serial.log`).
+
+**The combined run before it was green on one arm and red on the other, and the red was a claim this
+change did not write:** `t-starttime`'s "the difference is the wait" read `150 ticks against 1320 ms`
+on a loaded aarch64 lane, because its two stamps lie *inside* their forks rather than at one instant.
+It is bracketed now, and the arm re-runs green (§6.108). The `x86_64` number above is from the run
+that carried the red arm; the aarch64 number is from the run after the fix, which is why the two are
+quoted from two logs.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/status`'s identity lines §6.107):**
+ (2026-11-07, `/proc/<pid>/status`'s identity lines §6.107):** stage 1
 `1236 tests, 0 failed` (98.59 s); x86_64 `pass=273 fail=0 (273 built)`, `mpos-kunit 35 passed, 0
 failed`, `total 98.79 s (previous green run 100.27 s, -1.5%)` (`build/gate-identity.log`). The
 aarch64 arm of that same run timed out on a lane, and the lane was the boot's own `cpu:` check
