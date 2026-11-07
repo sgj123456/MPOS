@@ -238,6 +238,16 @@ pub const RLIM_NLIMITS: usize = 16;
 /// at it and `kill`/`tgkill` drop the copy and answer 0, which is Linux's
 /// measured split (`docs/notes/` §2.3).
 pub const RLIMIT_SIGPENDING: usize = 11;
+/// `RLIMIT_RSS` (5 in `asm-generic/resource.h`): the process's resident-set
+/// ceiling. Linux prints this row's `rlim_cur` as `/proc/<pid>/stat`'s field 25
+/// (`rsslim`) as a bare `u64` — infinity is the decimal `18446744073709551615`,
+/// not `-1` — and the field moves with `setrlimit` (`build/scratch/rsslim/q.c`,
+/// Linux 7.2.14: baseline `18446744073709551615`, a 4 MiB soft limit reads
+/// `4194304`, restoring it reads the infinity word again). It is a named row
+/// because `stat`'s 25th field is a promise about which of the sixteen limits
+/// is being read, and a reader that reaches for the wrong index answers with
+/// another resource's ceiling (`docs/notes/` §6.111).
+pub const RLIMIT_RSS: usize = 5;
 /// `RLIM_INFINITY`: what an unlimited limit reads as.
 pub const RLIM_INFINITY: u64 = u64::MAX;
 

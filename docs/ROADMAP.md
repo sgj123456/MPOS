@@ -344,6 +344,15 @@ One-glance status of the whole roadmap.
   (9 claims, eight red without the fix) plus a host test on the two pure derivations; `Ngid`,
   `CoreDumping`, `Cpus_*`/`Mems_*` and the other `Vm*` lines stay a **named gap** (`§6.110`,
   item 223).
+- [x] `/proc/<pid>/stat`'s field 25 (`rsslim`) is the task's `RLIMIT_RSS` soft row, not a literal
+  `0` — Linux prints it as the bare `u64` word (`18446744073709551615` for infinity, `4194304`
+  after `setrlimit(RSS,{4 MiB,max})`, back to the infinity word on restore), and a child that
+  lowers *its own* ceiling to 2 MiB reads `2097152` in its own file while its parent's still reads
+  `4194304`. The row is named `RLIMIT_RSS = 5` in `crates/abi` and read from `task.rlimits` in the
+  same `snapshot_of` look that serves `SigQ`; the rendering is a host-testable pure function
+  because `stat_line` itself is machine-only. Pin `t-stat-rsslim` (6 claims, five red without the
+  fix) plus a host test; an `i64` field parser cannot hold the infinity word, which is how the
+  first Linux probe's `-1` appeared (`§6.111`, item 224).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

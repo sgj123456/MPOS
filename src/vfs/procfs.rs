@@ -1584,6 +1584,8 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::sig_pending_limit`] - `SigQ:`'s
     /// denominator.
     pub sig_pending_limit: u64,
+    /// See [`crate::sched::TaskSnapshot::rsslim`] - `stat`'s field 25.
+    pub rsslim: u64,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1760,12 +1762,18 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         // the resident count stayed at 24 pages (`docs/notes/` §6.103).
         Cow::Owned(alloc::format!("{}", vsize_bytes(&task))),
         Cow::Owned(alloc::format!("{}", task.rss_pages)), // rss
-        Cow::Borrowed("0"),                               // rsslim
-        Cow::Borrowed("0"),                               // startcode
-        Cow::Borrowed("0"),                               // endcode
-        Cow::Borrowed("0"),                               // startstack
-        Cow::Borrowed("0"),                               // kstkesp
-        Cow::Borrowed("0"),                               // kstkeip
+        // rsslim (field 25): the task's `RLIMIT_RSS` soft limit as Linux's bare
+        // `u64` word. Measured (`build/scratch/rsslim/q.c`, Linux 7.2.14):
+        // infinity reads `18446744073709551615`, a 4 MiB soft limit reads
+        // `4194304`. The literal `0` this replaces claimed no process had ever
+        // been given a resident-set ceiling, and a reader comparing field 25
+        // to `getrlimit(RLIMIT_RSS)` saw a disagreement (`docs/notes/` §6.111).
+        Cow::Owned(rsslim_word(task.rsslim)),
+        Cow::Borrowed("0"), // startcode
+        Cow::Borrowed("0"), // endcode
+        Cow::Borrowed("0"), // startstack
+        Cow::Borrowed("0"), // kstkesp
+        Cow::Borrowed("0"), // kstkeip
         // The four signal words: this task's pending and blocked sets, then
         // the group's two disposition sets. All four are `signal::Pending`
         // (a `u64`, signal n in bit n-1), which is the shape Linux prints -
@@ -1846,6 +1854,18 @@ fn starttime_ticks(task: &Process) -> u64 {
 /// The seven fields of `statm`, from the two numbers this kernel counts.
 fn statm_text(task: &Process) -> alloc::string::String {
     alloc::format!("{} {} 0 0 0 0 0\n", task.virtual_pages, task.rss_pages)
+}
+
+/// `stat`'s field 25, `rsslim`: the task's `RLIMIT_RSS` soft limit, as the bare
+/// `u64` word Linux prints. A literal `0` claimed no process had ever been
+/// given a resident-set ceiling; the honest answer starts at the full twenty
+/// digits of `u64::MAX` and moves with `setrlimit` (`build/scratch/rsslim/q.c`,
+/// Linux 7.2.14: `18446744073709551615` -> `4194304` -> back). Kept as a pure
+/// function of the row because `stat_line` reads `Process` through a machine
+/// snapshot (`task()` is `None` on the host), so the rendering itself is the
+/// part a host test can hold to a counterfactual.
+fn rsslim_word(limit: u64) -> alloc::string::String {
+    alloc::format!("{limit}")
 }
 
 /// `/proc/<pid>/statm`: the same memory numbers as `stat`, in pages, as
@@ -5196,6 +5216,24 @@ mod tests {
     }
 
     #[test]
+    fn rsslim_is_the_u64_row_not_a_literal_zero() {
+        // §6.111: `stat`'s field 25 was the borrowed `"0"`. These are the three
+        // readings `build/scratch/rsslim/q.c` took on Linux 7.2.14, and a
+        // constant answers all three the same - so this fails without the fix.
+        let infinity = crate::abi::RLIM_INFINITY;
+        assert_eq!(rsslim_word(infinity), "18446744073709551615");
+        assert_eq!(rsslim_word(4 * 1024 * 1024), "4194304");
+        assert_eq!(rsslim_word(8 * 1024 * 1024), "8388608");
+        assert_ne!(rsslim_word(0), rsslim_word(infinity));
+        // A fixture's default is the infinity word, not zero: the host mirror
+        // must not invent a ceiling the real row does not have.
+        assert_eq!(
+            rsslim_word(process(7, 7, None, 0, 'R').rsslim),
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
     fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
         let mut p = process(7, 7, None, 0, 'R');
         p.virtual_pages = 1087;
@@ -6267,6 +6305,9 @@ mod tests {
             fd_slots: 0,
             sig_queued: 0,
             sig_pending_limit: 0,
+            // An ordinary process's field 25 is the infinity word; a test that
+            // wants a finite one sets `rsslim` itself (§6.111's host test does).
+            rsslim: crate::abi::RLIM_INFINITY,
         }
     }
 

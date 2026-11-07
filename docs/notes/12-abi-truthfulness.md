@@ -292,7 +292,35 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/status`'s `FDSize` and `SigQ` §6.110):**
+**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s `rsslim` §6.111):**
+`build/gate-rsslim.log` — stage 1 `1241 tests, 0 failed` (102.40 s); x86_64
+`pass=276 fail=0 (276 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
+`total 102.79 s (+72.6%)`, with `=== PASS t-stat-rsslim` and the pin reading
+`field 25 is this task's RLIMIT_RSS soft limit (Some(18446744073709551615) against Some(18446744073709551615))`,
+`a child's own ceiling is the field in its file (Some(2097152), child Some(7))` and
+`restoring the ceiling moves field 25 back to the infinity word (Some(18446744073709551615))`
+(`build/test-serial.log`). aarch64 of that run was `pass=274 fail=1 (275 built)`,
+`mpos-kunit 34 passed, 1 failed`: the two reds were the known one-core TCG contention
+shape, neither a claim this change wrote — `sched.alternating FAILED: two tasks at the same
+priority did not take turns` (`build/test-lane-aarch64-1/serial.log:118`) and
+`=== FAIL t-fadvise timeout=120s` (`build/test-lane-aarch64-0/serial.log:3962`), while
+`=== PASS t-stat-rsslim` sits in the aggregate and in lane 1
+(`build/aarch64-test-serial.log:10168-10176`, `build/test-lane-aarch64-1/serial.log:5315-5323`).
+The pin's five discriminating claims were red on the unfixed kernel
+(`build/boot-rsslim-cf1.log`) and green with it (`build/boot-rsslim1.log`, and after the
+`stash pop` restore `build/boot-rsslim2.log`). Host 6/6 `PASS`.
+
+The citable aarch64 green is the clean single-arm re-run `build/gate-rsslim-a2.log`:
+stage 1 `1241 tests, 0 failed` (136.36 s), `verdict pass=275 fail=0`,
+`mpos-kunit 35 passed, 0 failed`, `all 275 user tests passed`, `total 136.75 s (-27.8%)`,
+`=== PASS t-stat-rsslim` with its six claims green
+(`build/aarch64-test-serial.log:9385-9393`). Two intermediate aarch64 re-runs reddened on
+*different* old moving-record / contention claims while the pin stayed green in all three:
+`build/gate-rsslim-a.log` `pass=274 fail=1` on `t-times`' `6 ticks against 5..5` (kunit 35/0),
+and the combined run's `sched.alternating` + `t-fadvise timeout=120s` above. That is the
+one-core host-load shape of §12.4a, not a regression in a read-only snapshot field.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/status`'s `FDSize` and `SigQ` §6.110):**
 `build/gate-counts.log` — stage 1 `1240 tests, 0 failed` (98.66 s); x86_64
 `pass=275 fail=0 (275 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`, `total 99.06 s`
 (`=== PASS t-mremap` too), with the pin reading

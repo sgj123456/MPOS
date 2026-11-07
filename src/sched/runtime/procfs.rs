@@ -408,6 +408,14 @@ pub struct TaskSnapshot {
     /// `SigQ` from `6/125239` to `6/3`, and the numerator is allowed to exceed
     /// the limit when the limit is lowered underneath already-queued signals.
     pub sig_pending_limit: u64,
+    /// This task's `RLIMIT_RSS` soft limit - `/proc/<pid>/stat`'s field 25,
+    /// `rsslim`, printed as the bare `u64` row. The row starts at
+    /// `RLIM_INFINITY`, so an ordinary process's field reads the full twenty
+    /// digits of `u64::MAX`; lowering the soft limit to 4 MiB moves it to
+    /// `4194304`, and restoring it moves it back (`build/scratch/rsslim/q.c`,
+    /// Linux 7.2.14). A literal `0` claimed no process had ever been given a
+    /// ceiling, which is the shape §6.111 records.
+    pub rsslim: u64,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -537,6 +545,10 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         fd_slots: task.fds.slot_count(),
         sig_queued: queued_for_user(t, task.identity.ruid),
         sig_pending_limit: task.rlimits[crate::abi::RLIMIT_SIGPENDING].cur,
+        // Field 25 belongs to the task being read, like `rss_pages` beside it:
+        // the row is the task's own table, not a global default, so a child
+        // that lowers its own ceiling shows a different word from its parent.
+        rsslim: task.rlimits[crate::abi::RLIMIT_RSS].cur,
     }
 }
 

@@ -8524,3 +8524,84 @@ Reuse the kernel's own charge function for the file rather than writing a second
 readers of one quantity agreeing is part of the contract, not an implementation detail. And measure
 a table's boundary with a probe that does not itself grow the table: the first `FDSize` reading was
 wrong because `fopen` opened an fd.
+
+### 6.111 `stat`'s `rsslim` was a literal zero, so no process had ever been given a ceiling (LANDED 2026-11-07)
+
+`/proc/<pid>/stat`'s field 25 is `rsslim`. Linux prints the *task's* `RLIMIT_RSS.rlim_cur` as a
+bare `u64` word: infinity is the twenty digits of `u64::MAX`, not `-1` and not `0`. Measured on
+the host, Linux 7.2.14 (`build/scratch/rsslim/q.c`, the token read raw rather than through
+`atol`, which overflowed the first probe into `-1`):
+
+```
+baseline  field25 rsslim=[18446744073709551615]
+set(4MiB) rc=0
+lowered   field25 rsslim=[4194304]
+restored  field25 rsslim=[18446744073709551615]
+```
+
+`/usr/include/asm-generic/resource.h` names the row `RLIMIT_RSS = 5`. This kernel's
+`stat_line` printed `Cow::Borrowed("0")` for the field, and `crates/abi` had no named constant
+for row 5 — the table's `t[5]` simply stayed at the all-`RLIM_INFINITY` default, so the honest
+answer was there but unreachable from the file. A reader comparing field 25 to
+`getrlimit(RLIMIT_RSS)` saw `0` against `18446744073709551615`; after the reader lowered its own
+soft limit the field still said `0`. The wrong shape is not merely a wrong number: a `0` ceiling
+claims the process may hold no resident pages at all, which is a promise about resource
+accounting this kernel does not even implement.
+
+The fix is four small edges, all pointing at the one row:
+
+- `crates/abi/src/lib.rs` gains `pub const RLIMIT_RSS: usize = 5;` beside
+  `RLIMIT_SIGPENDING`, with the `q.c` reading and the header's index in its doc.
+- `TaskSnapshot` gains `pub rsslim: u64`, and `snapshot_of` fills it from
+  `task.rlimits[crate::abi::RLIMIT_RSS].cur` in the same `with_table` look that already reads
+  `sig_pending_limit`. The row is the *task's*, not a global default and not the reader's.
+- the host mirror `Process` gains the same field (its `process(...)` fixture defaults it to
+  `RLIM_INFINITY`, because an ordinary process's field is the infinity word, not zero).
+- `stat_line` renders field 25 through `rsslim_word(limit) -> String { format!("{limit}") }`.
+  It is a pure function of the row because a host build's `task()` returns `None` and
+  `stat_line` itself cannot be unit-tested (the same shape as §6.109's `vm_lines` and §6.110's
+  `fd_size`/`sigq_line`).
+
+Host test `vfs::procfs::tests::rsslim_is_the_u64_row_not_a_literal_zero` holds the three readings
+above against three different limits (`u64::MAX`, 4 MiB, 8 MiB) and asserts the fixture's default
+is the infinity word — a constant answer fails every line.
+
+Pin `user/tests/src/bin/t-stat-rsslim.rs` — six claims, parsed with a `u64` field reader (the
+`i64` helper in `t-starttime.rs` cannot hold the infinity word):
+
+```
+stat prints field 25 as a u64 word
+field 25 is this task's RLIMIT_RSS soft limit (Some(18446744073709551615) against Some(18446744073709551615))
+lowering the soft limit to 4 MiB moves field 25 with it (Some(4194304) against Some(4194304))
+a child's own ceiling is the field in its file (Some(2097152), child Some(6))
+and the parent's file keeps the parent's ceiling (Some(4194304) against Some(2097152))
+restoring the ceiling moves field 25 back to the infinity word (Some(18446744073709551615))
+```
+
+The child claim is the one `/proc/self/stat` cannot make: a forked child lowers *its own* soft
+limit to 2 MiB and its `/proc/<child>/stat` must read `2097152` while the parent's still reads
+`4194304`. A fix that read the startup default instead of the task's stored table would pass the
+first two claims and fail the third; a fix that read the reading task's row would fail the child
+claim. Host (`MPOS_ON_HOST=1`) 6/6 `PASS`; fixed kernel (`build/boot-rsslim1.log`, kernel **and**
+loader rebuilt) 6/6 `PASS`, `exit=0`.
+
+Counterfactual (`git stash push -q -m cf-rsslim --` the three source files, kernel **and** loader
+rebuilt, `build/boot-rsslim-cf1.log`) — five reds, only the shape claim green:
+
+```
+FAIL:  field 25 is this task's RLIMIT_RSS soft limit (Some(0) against Some(18446744073709551615))
+FAIL:  lowering the soft limit to 4 MiB moves field 25 with it (Some(0) against Some(4194304))
+FAIL:  a child's own ceiling is the field in its file (Some(0), child Some(6))
+FAIL:  and the parent's file keeps the parent's ceiling (Some(0) against Some(0))
+FAIL:  restoring the ceiling moves field 25 back to the infinity word (Some(0))
+FAILED
+```
+
+`git stash pop` + rebuild + re-boot (`build/boot-rsslim2.log`) returns to 6 `ok:`/`PASS`.
+
+**The rule.** A field that names a resource limit is a promise about *which* row and *whose*
+row it reads, not merely a plausible-looking number. Two probes paid for the same lesson: the
+first `p.c` let `atol` turn `u64::MAX` into `-1` and momentarily looked like Linux's answer, and
+a pin that only read `/proc/self/stat` cannot distinguish "the task's row" from "a default",
+because there the task and the reader are one. Render the row through a leaf the kernel already
+charges against, and give the claim a second task with a different row.

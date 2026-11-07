@@ -9874,3 +9874,28 @@ Linux's `SigQ` numerator has a baseline of 1 that this kernel does not have, so 
 movement, not that baseline. `Ngid`, `CoreDumping`, `Cpus_allowed*`, `Mems_allowed*` and the
 remaining `Vm*` lines stay a named gap (item 222). Mechanism and all six Linux readings:
 `docs/notes/` §6.110.
+
+### Item 224 - `/proc/<pid>/stat`'s `rsslim` is `RLIMIT_RSS`'s soft row (2026-11-07, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| field 25 for an ordinary process | `18446744073709551615` (bare `u64::MAX`) | literal `0` | `RLIM_INFINITY`'s word |
+| after `setrlimit(RLIMIT_RSS,{4 MiB,max})` | `4194304`, and `getrlimit` agrees | `0` | `4194304`, same row as the charge |
+| after restoring the soft limit | `18446744073709551615` again | `0` | the infinity word again |
+| a child that lowers its *own* ceiling to 2 MiB | child's file `2097152`, parent's file `4194304` | `0`/`0` (one literal) | two rows, two words |
+| `RLIMIT_RSS`'s index in the rlimit table | `5` (`asm-generic/resource.h`) | unnamed; `t[5]` left at the default | `pub const RLIMIT_RSS: usize = 5` |
+
+**Landed.** `crates/abi/src/lib.rs` names the row; `TaskSnapshot`/host `Process` carry
+`rsslim: u64` filled by `snapshot_of` from `task.rlimits[RLIMIT_RSS].cur`; `src/vfs/procfs.rs`
+renders it through the host-testable `rsslim_word(limit) -> String`. Owner:
+`crates/abi/src/lib.rs`, `src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-stat-rsslim.rs` (6 claims; five red on the unfixed kernel —
+`build/boot-rsslim-cf1.log` — green with it, `build/boot-rsslim1.log`/`build/boot-rsslim2.log`),
+and host test `vfs::procfs::tests::rsslim_is_the_u64_row_not_a_literal_zero`. The field is parsed
+as `u64` — an `i64` reader cannot hold the infinity word, which is how the first probe's `-1`
+appeared. The other stat literals (`tty_nr`, `tpgid`, `flags`, the four fault counters,
+`startcode`/`endcode`/`startstack`/`kstkesp`/`kstkeip`, `nswap`/`cnswap`, `processor`,
+`rt_priority`/`policy`, `delayacct_blkio_ticks`, `guest_time`/`cguest_time`, fields 45-52) stay
+honest zeros or the named gaps of §6.103/§6.105. Mechanism and the four Linux readings:
+`docs/notes/` §6.111.
