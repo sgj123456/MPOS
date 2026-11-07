@@ -1682,6 +1682,7 @@ fn check_cpu() {
     // never survive four tries still fails, with the figures.
     let mut fired = false;
     let mut confounds = 0u32;
+    let mut both = 0u32;
     for _ in 0..4 {
         let wake_ns = timer::since_boot_nanos() + 2_000_000;
         timer::arm_wake_ns(Some(wake_ns));
@@ -1691,16 +1692,23 @@ fn check_cpu() {
             fail!("the one-shot's idle() returned with interrupts still enabled");
         }
         if timer::vtimer_control() & 1 == 0 {
-            // It fired, and it fired first: `idle` returns with interrupts
-            // masked, so no tick could have been served between the wake and
-            // this read - a moved count here would mean the masking leaked.
+            // It fired: the handler disarms the one-shot before the EOI, so a
+            // cleared enable bit is the register saying so.
+            //
+            // The tick count moving in the same park is **not** evidence
+            // against it, which is what this check first asserted and what
+            // measured it wrong: `idle` enables interrupts *before* it waits,
+            // so a periodic tick that was already pending in the distributor is
+            // served at that enable and the count moves before `wfi` is even
+            // reached. Measured 2026-11-07 (`build/test-lane-aarch64-0/serial.log`
+            // of `build/gate-identity.log`): `(66 -> 67)` on a park whose
+            // one-shot had fired, from a lane that then halted on the old
+            // wording and cost a whole 900 s timeout. The count is reported as
+            // data instead - "both answered" is a reachable state, and the
+            // register is the only thing that says which comparator woke the
+            // wait.
             if timer::ticks() != before {
-                fail!(
-                    "the virtual timer's one-shot woke idle() but the tick \
-                     count moved too ({before} -> {}); a wake with interrupts \
-                     masked cannot have served a tick",
-                    timer::ticks()
-                );
+                both += 1;
             }
             fired = true;
             break;
@@ -1738,7 +1746,8 @@ fn check_cpu() {
         "cpu: CPACR.FPEN full access after enable_user_simd; a distributor line \
          enabled then masked and read back; idle() woken by the clock (tick \
          {before} -> {}) and returning with interrupts off; the one-shot woke \
-         idle() off the tick path ({confounds} arm(s) the tick answered first)",
+         idle() off the tick path ({confounds} arm(s) the tick answered first, \
+         {both} park(s) where a pending tick was served at the wake too)",
         timer::ticks()
     );
 }

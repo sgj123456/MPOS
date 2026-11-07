@@ -1342,9 +1342,19 @@ are not restated in the phase sections above.
         disarms the one-shot before the EOI, so `enable` clear after the park says the one-shot fired;
         `enable` set says the tick answered first, which is retried after re-aligning the arm half a
         period past a tick boundary (`arm_next_period` + `idle`), four tries before the machine
-        reports the figures. And the masking argument makes the two remaining readings exact: `idle`
-        returns with interrupts masked, so a moved tick count *and* a fired one-shot cannot both be
-        true - that combination still fails, from its own message.
+        **That masking argument was wrong, and the same check then cost a second lane.** The first
+        version also failed the park when the one-shot had fired *and* the tick count had moved, on
+        the reasoning that a wake with interrupts masked cannot have served a tick. It can: `idle`
+        enables interrupts **before** it waits, so a periodic tick already pending in the distributor
+        is served at that enable - the count moves before `wfi` is reached, and the one-shot then
+        wakes the wait as intended. Measured 2026-11-07: `build/test-lane-aarch64-0/serial.log` of
+        `build/gate-identity.log` ended at `cpu: the virtual timer's one-shot woke idle() but the tick
+        count moved too (66 -> 67); a wake with interrupts masked cannot have served a tick`, and the
+        lane hung there for its 900 s bound. The verdict is the register alone now (`enable` clear =
+        fired; `enable` set = the tick answered first, and the arm is retried), and a park where both
+        answered is counted and reported as data - `1 park(s) where a pending tick was served at the
+        wake too` - rather than called a lie. The condition is not an error: it is the two comparators
+        over one counter, this row's whole subject, showing up on the other side of the park.
         **The pin is the boot, and the confound path was exercised on purpose.** With the retry arm
         forced to 5 ms (past a whole 4 ms period) so the tick had to answer the first attempt, the
         machine printed `the one-shot woke idle() off the tick path (1 arm(s) the tick answered
