@@ -1027,37 +1027,13 @@ pub(crate) fn mknod_needs_capability(mode: usize, dev: usize) -> bool {
 // wait(2): the status word
 // ---------------------------------------------------------------------------
 
-/// Encode an exit the way `WIFEXITED` and friends decode it.
-///
-/// mpos records a death by signal as the negated signal number, because that is
-/// the shape the rest of the kernel wants; the word Linux reports is different,
-/// so the sign is what carries the distinction here.
-pub(crate) fn wait_status(code: isize, dumped: bool) -> i32 {
-    if code < 0 {
-        // Killed by a signal: its number fills the low byte, and the core-dump
-        // bit (0x80) is set when `dumped` says the death was one the kernel's
-        // coredump path classified.
-        //
-        // That bit is **not** about whether a core file was written, which is
-        // what this comment used to say: measured on a current host
-        // (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9), a child killed by
-        // `SIGSEGV` reports `WCOREDUMP` **with `RLIMIT_CORE` set to zero and
-        // read back as zero** - so the bit follows the *signal*, and the same
-        // death is `CLD_DUMPED` rather than `CLD_KILLED` in the record beside
-        // it. It follows the signal **and** the child's `dumpable` flag
-        // (`.workbuddy/probe_wcore_dumpable.c`): the death path computes the
-        // pair once and hands it here as `dumped`, and `crate::abi::exit_chld`
-        // reads the same value for `waitid`'s record, so a `wait` reader and a
-        // `waitid` reader cannot classify one death two ways. The strip is
-        // `& 0x7f` because the signal's number fits under the bit.
-        let sig = -code as i32;
-        let core = if dumped { 0x80 } else { 0 };
-        ((sig & 0x7f) | core) as i32
-    } else {
-        // A normal exit: the low byte of the code, in bits 15:8.
-        ((code & 0xff) << 8) as i32
-    }
-}
+// The wait-status word is one definition in the `abi` leaf, because
+// `/proc/<pid>/stat`'s field 52 (`src/sched/runtime/child_exit.rs`) reads the
+// same word `wait4` writes here. Its doc comment - the Linux measurements, the
+// `dumped`/`WCOREDUMP` rule and why the signal is negated inside the kernel -
+// lives beside that definition; the test below still reaches it through
+// `use super::*` and is the encoding's pin.
+pub(crate) use mpos_abi::wait_status;
 
 // ---------------------------------------------------------------------------
 // ptrace(2): the request numbers, the options, and the shapes it reports

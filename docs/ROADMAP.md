@@ -353,6 +353,16 @@ One-glance status of the whole roadmap.
   because `stat_line` itself is machine-only. Pin `t-stat-rsslim` (6 claims, five red without the
   fix) plus a host test; an `i64` field parser cannot hold the infinity word, which is how the
   first Linux probe's `-1` appeared (`§6.111`, item 224).
+- [x] `/proc/<pid>/stat`'s field 52 (`exit_code`) is the encoded `wait4` status of the zombie, not
+  a literal `0` — Linux prints `10752` (`42 << 8`) for a child that called `exit(42)`, `15` for
+  `SIGTERM`, `9` for `SIGKILL` and `139` (`WTERMSIG 11 | WCOREDUMP 128`) for `SIGSEGV`, each
+  identical to the word `waitpid` reports afterwards; a live task and a group whose leader died
+  while a sibling still ran both read `0`. The encoding is now one definition in the `crates/abi`
+  leaf (`wait_status`), shared by `wait4` and by `sched`'s `retired_status` (which reads the whole
+  `Retired` record, including the `dumped` bit that a raw `code` does not carry); `stat_line` only
+  prints that field, so no new `vfs → syscall` edge appears. Pin `t-stat-exitcode` (11 claims,
+  eight red without the fix — every death claim) plus host tests on the leaf and the pure
+  rendering (`§6.112`, item 225).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

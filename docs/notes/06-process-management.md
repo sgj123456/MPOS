@@ -8605,3 +8605,110 @@ first `p.c` let `atol` turn `u64::MAX` into `-1` and momentarily looked like Lin
 a pin that only read `/proc/self/stat` cannot distinguish "the task's row" from "a default",
 because there the task and the reader are one. Render the row through a leaf the kernel already
 charges against, and give the claim a second task with a different row.
+
+### 6.112 `stat`'s `exit_code` was a literal zero, so a zombie looked like a live task (LANDED 2026-11-07)
+
+`/proc/<pid>/stat`'s field 52 is `exit_code`, but it is **not** a raw exit code: it is the encoded
+`wait4` status word of the zombie, and `0` while the task (or its group) is still alive. Measured
+on the host, Linux 7.2.14 (`build/scratch/statmore/q.c`, `ulimit -c 0`, field 52 read next to the
+`waitpid` status of the same child):
+
+```
+exit(42)          field52=10752  wait_status=10752  SAME=yes
+SIGTERM           field52=15     wait_status=15     SAME=yes
+SIGKILL           field52=9      wait_status=9      SAME=yes
+SIGSEGV (core)    field52=139    wait_status=139    WTERMSIG=11 WCOREDUMP=128
+SIGABRT (core)    field52=134    wait_status=134    WTERMSIG=6  WCOREDUMP=128
+```
+
+The `0x80` core bit follows the signal and the process's dumpability, not whether a core file was
+actually written (`src/syscall/linux/abi.rs`'s old `wait_status` doc recorded the same measurement
+against `.workbuddy/probe_wcore_dumpable.c`). Two more readings bound the "alive" half
+(`build/scratch/statmore/r.c`, `s.c`): a live task reads `0`; a group whose leader has exited
+while a sibling still runs still reads `0` (`waitpid` eventually answers `0`); and only after the
+whole group dies of `SIGTERM` does the zombie's field read `15`. A first probe
+(`build/scratch/rsslim/p.c`) parsed the `u64` token with `atol` and turned `u64::MAX` into `-1` —
+that overflow was the probe's, not Linux's, which is why the new pin parses field 52 as `u64`.
+
+This kernel printed `Cow::Borrowed("0")` for the field on every task. The "before" reading
+(`build/boot-statmore-before.log`) makes the wrongness concrete:
+
+```
+self (live):              state=[R] field52=[0
+child exit 42 (zombie):   state=[Z] field52=[0
+waitpid: pid=6 status=10752
+```
+
+The two tasks are indistinguishable in the file even though `waitpid` already had the word. The
+word existed only inside `wait4`'s encoder, `src/syscall/linux/abi.rs::wait_status`, reachable
+from `vfs::procfs` only by adding a `vfs → syscall` edge — an edge the architecture record
+(`docs/ARCHITECTURE.md` §2/§3, the `vfs ↔ sched ↔ syscall ↔ net` cluster) already lists as a
+violation, not a licence for another one. The fix therefore moves the encoding *down*:
+
+- `crates/abi/src/lib.rs` gains `pub fn wait_status(code: isize, dumped: bool) -> i32` — the one
+  definition of the word, in the leaf any layer may call downward; a host test
+  (`wait_status_is_the_word_stat_and_waitpid_agree_on`) pins `10752/15/9/139/134`, `-11 false →
+  11`, `3 true → 768`, and the low-byte truncation (`256 → 0`, `257 → 256`).
+- `src/syscall/linux/abi.rs` replaces its own `wait_status` body with `pub use
+  mpos_abi::wait_status;`. `wait4` and `/proc/<pid>/stat` now read the same definition, so the
+  two doors cannot drift; the existing host test in that file still reaches it through
+  `use super::*`.
+- `src/sched/runtime/child_exit.rs` gains `pub fn retired_status(id: TaskId) -> Option<i32>`.
+  It reads the whole `Retired` record — `code` **and** `dumped` — without consuming it (reaping
+  still owns the record), and returns `crate::abi::wait_status(code, dumped)`. The old
+  `exit_code(id) -> Option<isize>` accessor was not enough: it yields the raw `code` (`42`, or
+  `-11`) and drops the core bit, which is the difference between `139` and `11`.
+- `TaskSnapshot.exit_code: i32` is filled by `snapshot_of` from
+  `retired_status(task.tgid).unwrap_or(0)`: a zombie leader's slot survives until reap, so
+  `snapshot(pid)` still finds it; a live task has no `Retired` record and answers `0`. The
+  nested `critical_section::with` is the shape `snapshot_of` already uses to read `mm.frames`.
+- `src/vfs/procfs.rs` renders field 52 through the host-testable pure function
+  `fn exit_code_word(status: i32) -> String` (0 → "0", 42 → "10752", `-15` → "15", `-9` → "9",
+  `-11 true` → "139", `-11 false` → "11"), with a host test asserting those are six *different*
+  words. `stat_line` itself is machine-only (the host `task()` returns `None`), so this is the
+  same extraction §6.109-§6.111 used.
+
+Pin `user/tests/src/bin/t-stat-exitcode.rs` (11 claims). Each death forks a child that resets
+dispositions, unblocks the signal, announces readiness on a pipe, dies, and is read *before*
+reaping; the pin asserts the absolute Linux word **and** its equality with the `waitpid` status
+that finally collects it, and that the living parent's own field stays `0`:
+
+```
+ok:    a live task's field 52 is zero (Some(0))
+ok:    exit(42) leaves 10752 in the zombie's field 52 (Some(10752))
+ok:    and that is the word waitpid reports (Some(10752) against 10752)
+ok:    while the living parent's own field 52 stays zero (Some(0))
+ok:    SIGTERM leaves 15 in the zombie's field 52 (Some(15))
+ok:    and that is the word waitpid reports (Some(15) against 15)
+ok:    SIGKILL leaves 9 in the zombie's field 52 (Some(9))
+ok:    and that is the word waitpid reports (Some(9) against 9)
+ok:    SIGSEGV leaves a signal-death word in field 52 (Some(139))
+ok:    and that is exactly the word waitpid reports (Some(139) against 139)
+```
+
+Host `MPOS_ON_HOST=1` and the rebuilt machine (`build/boot-exitcode1.log`) both answer 11/11
+`PASS`. Counterfactual: stashing the seven source files and rebuilding kernel **and** loader
+(`build/boot-exitcode-cf1.log`) gives eight red — every death claim reads `Some(0)` against the
+`waitpid` word, while the two "live"/shape claims stay green:
+
+```
+FAIL:  exit(42) leaves 10752 in the zombie's field 52 (Some(0))
+FAIL:  and that is the word waitpid reports (Some(0) against 10752)
+FAIL:  SIGTERM leaves 15 in the zombie's field 52 (Some(0))
+FAIL:  and that is the word waitpid reports (Some(0) against 15)
+FAIL:  SIGKILL leaves 9 in the zombie's field 52 (Some(0))
+FAIL:  and that is the word waitpid reports (Some(0) against 9)
+FAIL:  SIGSEGV leaves a signal-death word in field 52 (Some(0))
+FAIL:  and that is exactly the word waitpid reports (Some(0) against 139)
+FAILED
+```
+
+`git stash pop` + rebuild + re-boot (`build/boot-exitcode2.log`) returns to 11 `ok:`/`PASS`.
+
+**The rule.** A field that names a status word is a promise about the *encoding*, not about a
+number that happens to fit the column. Three easy implementations all fail some claim above: a
+literal `0` (the old kernel), the raw `exit()` code (`42` instead of `10752`), or the signal
+number with the core bit dropped (`11` instead of `139`). The encoding already existed in the
+kernel, but on the far side of a layer boundary; copying it would have made two doors that can
+disagree, and calling across the boundary would have added a forbidden edge. Move the one
+definition down to the leaf, and let both doors read it.

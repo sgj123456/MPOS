@@ -1,3 +1,4 @@
+use super::child_exit::retired_status;
 use super::child_mm::current_mm;
 use super::child_signal::{process_members, queued_for_user};
 use super::task::with_table;
@@ -416,6 +417,16 @@ pub struct TaskSnapshot {
     /// Linux 7.2.14). A literal `0` claimed no process had ever been given a
     /// ceiling, which is the shape §6.111 records.
     pub rsslim: u64,
+    /// `/proc/<pid>/stat`'s field 52, `exit_code`: the encoded `wait(2)` status
+    /// of this task's death, or `0` while no death has been recorded. Measured
+    /// on a current host (`build/scratch/statmore/q.c`, Linux 7.2.14): a zombie
+    /// whose child called `exit(42)` reads `10752`, `SIGTERM` reads `15`,
+    /// `SIGKILL` `9` and a core-dumping `SIGSEGV` `139`, each the same word
+    /// `waitpid` answers; a live task and a leader whose group has not died yet
+    /// both read `0` (`r.c`). The word is computed once by `retired_status`
+    /// from the `Retired` record's raw code and core-dump classification, so
+    /// `/proc` and `wait` cannot disagree about one death (§6.112).
+    pub exit_code: i32,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -549,6 +560,11 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         // the row is the task's own table, not a global default, so a child
         // that lowers its own ceiling shows a different word from its parent.
         rsslim: task.rlimits[crate::abi::RLIMIT_RSS].cur,
+        // Field 52 is the death of the group this slot belongs to, looked up
+        // by the group id: a zombie leader's own slot is still here, and the
+        // record is what names its encoded status. A live task has no record,
+        // so it answers `None` and the field reads `0` (§6.112).
+        exit_code: retired_status(task.tgid).unwrap_or(0),
     }
 }
 

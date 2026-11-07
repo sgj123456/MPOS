@@ -9899,3 +9899,34 @@ appeared. The other stat literals (`tty_nr`, `tpgid`, `flags`, the four fault co
 `rt_priority`/`policy`, `delayacct_blkio_ticks`, `guest_time`/`cguest_time`, fields 45-52) stay
 honest zeros or the named gaps of §6.103/§6.105. Mechanism and the four Linux readings:
 `docs/notes/` §6.111.
+
+### Item 225 - `/proc/<pid>/stat`'s `exit_code` is the zombie's wait status (2026-11-07, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| a live task's field 52 | `0` | literal `0` (right by accident) | `0`, no `Retired` record |
+| child `exit(42)`, not yet reaped | `10752` (`42 << 8`), `waitpid` agrees | `0` | `10752`, same word as `waitpid` |
+| child killed by `SIGTERM`/`SIGKILL` | `15` / `9` | `0` | `15` / `9` |
+| child killed by `SIGSEGV` (dumpable) | `139` (`WTERMSIG 11 \| WCOREDUMP 128`) | `0` | `139`, including the core bit |
+| a group whose leader died but a sibling runs | `0` | `0` | `0` (the group's death has not happened) |
+| the encoding itself | one `wait4` status word | none (the word lives only in `wait4`) | `crates/abi::wait_status`, shared by both doors |
+
+**Landed.** The encoding moved to the `crates/abi` leaf as
+`pub fn wait_status(code: isize, dumped: bool) -> i32`; `src/syscall/linux/abi.rs` re-exports it
+instead of owning a second copy, so `wait4` and `/proc/<pid>/stat` cannot drift apart.
+`src/sched/runtime/child_exit.rs` adds `retired_status(id) -> Option<i32>`, which reads the whole
+`Retired` record (`code` **and** `dumped`) without consuming it — reaping still owns the record.
+`TaskSnapshot.exit_code: i32` is filled by `snapshot_of` from that accessor for the task's group,
+and `src/vfs/procfs.rs` renders it through the host-testable `exit_code_word(status) -> String`.
+The dependency graph gains no edge: `vfs → sched` already exists, `sched` calls the `crates/abi`
+leaf downward, and `vfs → syscall` is *not* introduced (that would have been the easy but wrong
+place to call `wait_status`). Owner: `crates/abi/src/lib.rs`, `src/syscall/linux/abi.rs`,
+`src/sched/runtime/child_exit.rs`, `src/sched/runtime/procfs.rs`, `src/vfs/procfs.rs`.
+
+Pin: `user/tests/src/bin/t-stat-exitcode.rs` (11 claims; eight red on the unfixed kernel —
+`build/boot-exitcode-cf1.log` — green with it, `build/boot-exitcode1.log`/`build/boot-exitcode2.log`),
+plus `mpos_abi::tests::wait_status_is_the_word_stat_and_waitpid_agree_on` and
+`vfs::procfs::tests::exit_code_is_the_encoded_status_not_a_literal_zero`. Each death asserts the
+field's absolute Linux word *and* its agreement with `waitpid`, so neither a literal `0`, a raw
+`code` (`42` instead of `10752`) nor a missing core bit can pass. Mechanism and the four Linux
+readings: `docs/notes/` §6.112.

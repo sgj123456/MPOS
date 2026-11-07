@@ -635,6 +635,45 @@ pub fn exit_chld(code: isize, dumped: bool) -> (i32, i32) {
     }
 }
 
+/// Encode a death the way `wait(2)`'s `WIFEXITED`/`WTERMSIG` macros decode it.
+///
+/// This is `/proc/<pid>/stat`'s field 52 (`exit_code`) as well as the word
+/// `wait4`/`waitid` write into `*status`: measured on a current host
+/// (`build/scratch/statmore/q.c`, Linux 7.2.14), a zombie whose child called
+/// `exit(42)` reads `10752` in the file and `waitpid` answers the same `10752`;
+/// `SIGTERM` reads `15` in both, `SIGKILL` `9`, and a core-dumping `SIGSEGV`
+/// `139` (the `0x80` bit set), again the same word in both places. A live task
+/// reads `0`, and so does a leader whose group has not died yet
+/// (`build/scratch/statmore/r.c`), so "no death recorded" and "exited 0" are
+/// deliberately the same answer.
+///
+/// The kernel records a death by signal as the **negated** signal number,
+/// because that is the shape the rest of the scheduler wants; the word Linux
+/// reports is different, so the sign is what carries the distinction here.
+/// `dumped` is the death path's classification, not a statement that a core
+/// file was written: measured with `RLIMIT_CORE` set to zero
+/// (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9), a child killed by
+/// `SIGSEGV` still reports `WCOREDUMP`, and the bit follows the signal *and*
+/// the child's `dumpable` flag (`.workbuddy/probe_wcore_dumpable.c`).
+/// [`exit_chld`] reads the same `dumped` value for `waitid`'s record, so a
+/// `wait` reader and a `waitid` reader cannot classify one death two ways.
+/// The strip is `& 0x7f` because the signal's number fits under the bit.
+///
+/// The spelling lives here, in the leaf, because both the `wait` handlers
+/// (`src/syscall/linux/abi.rs` re-exports it) and `/proc/<pid>/stat`'s snapshot
+/// (`src/sched/runtime/child_exit.rs`) need the same word; a second copy in
+/// `vfs` would have been an upward edge into `syscall`, and two copies is how
+/// one door starts disagreeing with the other.
+pub fn wait_status(code: isize, dumped: bool) -> i32 {
+    if code < 0 {
+        let sig = -code as i32;
+        let core = if dumped { 0x80 } else { 0 };
+        (sig & 0x7f) | core
+    } else {
+        ((code & 0xff) << 8) as i32
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CPU time, in the unit a caller reads it in
 // ---------------------------------------------------------------------------
@@ -1007,6 +1046,26 @@ mod tests {
         assert_eq!(exit_chld(3, true), (CLD_EXITED, 3));
         assert_ne!(exit_chld(3, false).0, CLD_DUMPED);
         assert_eq!(CLD_DUMPED, 3);
+    }
+
+    #[test]
+    fn wait_status_is_the_word_stat_and_waitpid_agree_on() {
+        // §6.112: field 52 and `waitpid`'s status are one word. Every pair
+        // below is a Linux 7.2.14 reading from `build/scratch/statmore/q.c`.
+        assert_eq!(wait_status(42, false), 10752); // exit(42): WEXITSTATUS 42
+        assert_eq!(wait_status(-15, false), 15); // SIGTERM: WTERMSIG 15
+        assert_eq!(wait_status(-9, false), 9); // SIGKILL
+        assert_eq!(wait_status(-11, true), 139); // SIGSEGV + WCOREDUMP (0x80)
+        assert_eq!(wait_status(-6, true), 134); // SIGABRT + WCOREDUMP
+        // The core bit follows `dumped`, and a normal exit ignores it.
+        assert_eq!(wait_status(-11, false), 11);
+        assert_eq!(wait_status(3, true), 3 << 8);
+        // A live task / a leader whose group still lives has no record and is
+        // encoded as an exited-0 status, which is the `0` in the file.
+        assert_eq!(wait_status(0, false), 0);
+        // `WEXITSTATUS` keeps only the low byte, as Linux does.
+        assert_eq!(wait_status(256, false), 0);
+        assert_eq!(wait_status(257, false), 1 << 8);
     }
 
     #[test]

@@ -292,7 +292,28 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s `rsslim` §6.111):**
+**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s `exit_code` §6.112):**
+`build/gate-exitcode.log` (combined run) — stage 1 `1243 tests, 0 failed` (96.85 s);
+x86_64 `pass=277 fail=0 (277 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
+`total 97.05 s (-5.6%)`; aarch64 of that run was `pass=274 fail=2 (276 built)`,
+`mpos-kunit 35 passed, 0 failed`, with two one-core TCG timeouts — `=== FAIL t-uname
+timeout=120s` (`build/test-lane-aarch64-0/serial.log:4829`) and `=== FAIL
+t-status-counts timeout=120s` (`build/test-lane-aarch64-1/serial.log:4842`); both were
+`Killed` immediately after `=== RUN` with no program output of their own, the §12.4a shape
+under two emulated guests on one host CPU. `=== PASS t-stat-exitcode` sits in the x86_64
+aggregate (`build/test-serial.log:4533`) and aarch64 aggregate
+(`build/aarch64-test-serial.log:10146`) with all eleven claims green, including
+`exit(42) leaves 10752 in the zombie's field 52 (Some(10752))`, `SIGSEGV leaves a
+signal-death word in field 52 (Some(139))` and each `waitpid` agreement. The eight
+discriminating claims were red on the unfixed kernel (`build/boot-exitcode-cf1.log`:
+`Some(0)` against `10752`/`15`/`9`/`139`) and green with it
+(`build/boot-exitcode1.log`, and after the stash pop `build/boot-exitcode2.log`).
+The citable aarch64 green is the single-arm rerun `build/gate-exitcode-a.log` —
+`stage 1 1243 tests, 0 failed` (136.36 s), `verdict pass=276 fail=0`,
+`mpos-kunit 35 passed, 0 failed`, `total 136.75 s`, `=== PASS t-stat-exitcode`
+(`build/aarch64-test-serial.log:2654`).
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/stat`'s `rsslim` §6.111):**
 `build/gate-rsslim.log` — stage 1 `1241 tests, 0 failed` (102.40 s); x86_64
 `pass=276 fail=0 (276 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
 `total 102.79 s (+72.6%)`, with `=== PASS t-stat-rsslim` and the pin reading

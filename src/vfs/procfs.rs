@@ -1586,6 +1586,8 @@ pub struct Process {
     pub sig_pending_limit: u64,
     /// See [`crate::sched::TaskSnapshot::rsslim`] - `stat`'s field 25.
     pub rsslim: u64,
+    /// See [`crate::sched::TaskSnapshot::exit_code`] - `stat`'s field 52.
+    pub exit_code: i32,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1809,7 +1811,12 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         Cow::Borrowed("0"), // arg_end
         Cow::Borrowed("0"), // env_start
         Cow::Borrowed("0"), // env_end
-        Cow::Borrowed("0"), // exit_code
+        // exit_code (field 52): the encoded wait status of this task's death,
+        // computed once by `retired_status` from the `Retired` record. A live
+        // task has no record and reads `0`, which is also what Linux reads for
+        // a leader whose group has not died yet. The `Cow::Owned` is the whole
+        // fix: a borrowed `"0"` reported every zombie as exited cleanly (§6.112).
+        Cow::Owned(exit_code_word(task.exit_code)),
     ];
     let mut out = String::new();
     for (index, field) in fields.iter().enumerate() {
@@ -1866,6 +1873,18 @@ fn statm_text(task: &Process) -> alloc::string::String {
 /// part a host test can hold to a counterfactual.
 fn rsslim_word(limit: u64) -> alloc::string::String {
     alloc::format!("{limit}")
+}
+
+/// `stat`'s field 52, `exit_code`: the encoded `wait(2)` status of the task's
+/// death, or `0` while it is live. The word itself comes from the leaf's
+/// `crate::abi::wait_status` through the sched snapshot; this function only
+/// renders it, so the host can hold the rendering to a counterfactual (the
+/// same reason `rsslim_word` is a pure function). Measured on Linux 7.2.14
+/// (`build/scratch/statmore/q.c`): `exit(42)` reads `10752`, `SIGTERM` `15`,
+/// `SIGKILL` `9`, a core-dumping `SIGSEGV` `139` - every one the same word
+/// `waitpid` answers. A borrowed `"0"` failed all four (§6.112).
+fn exit_code_word(status: i32) -> alloc::string::String {
+    alloc::format!("{status}")
 }
 
 /// `/proc/<pid>/statm`: the same memory numbers as `stat`, in pages, as
@@ -5234,6 +5253,27 @@ mod tests {
     }
 
     #[test]
+    fn exit_code_is_the_encoded_status_not_a_literal_zero() {
+        // §6.112: `stat`'s field 52 was the borrowed `"0"`. These are the four
+        // readings `build/scratch/statmore/q.c` took on Linux 7.2.14, and a
+        // constant answers all four the same - so this fails without the fix.
+        assert_eq!(exit_code_word(0), "0");
+        assert_eq!(exit_code_word(crate::abi::wait_status(42, false)), "10752");
+        assert_eq!(exit_code_word(crate::abi::wait_status(-15, false)), "15");
+        assert_eq!(exit_code_word(crate::abi::wait_status(-9, false)), "9");
+        assert_eq!(exit_code_word(crate::abi::wait_status(-11, true)), "139");
+        // The core-dump bit is part of the word, not a separate column: the
+        // same `SIGSEGV` without `dumped` is a plain kill.
+        assert_eq!(exit_code_word(crate::abi::wait_status(-11, false)), "11");
+        assert_ne!(
+            exit_code_word(crate::abi::wait_status(-11, true)),
+            exit_code_word(crate::abi::wait_status(-11, false))
+        );
+        // A live fixture has no death and reads `0`, like every live process.
+        assert_eq!(exit_code_word(process(7, 7, None, 0, 'R').exit_code), "0");
+    }
+
+    #[test]
     fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
         let mut p = process(7, 7, None, 0, 'R');
         p.virtual_pages = 1087;
@@ -6308,6 +6348,9 @@ mod tests {
             // An ordinary process's field 25 is the infinity word; a test that
             // wants a finite one sets `rsslim` itself (§6.111's host test does).
             rsslim: crate::abi::RLIM_INFINITY,
+            // No death has been recorded for a freshly made task: field 52 is
+            // the zero Linux reads for every live process (§6.112).
+            exit_code: 0,
         }
     }
 

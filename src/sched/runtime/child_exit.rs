@@ -684,6 +684,29 @@ pub fn exit_code(id: TaskId) -> Option<isize> {
     })
 }
 
+/// The death word a `/proc/<pid>/stat` reader sees in field 52: the same
+/// `wait(2)` status `wait4` would write for this death, encoded from the raw
+/// `code`/`dumped` pair the death path recorded (`crate::abi::wait_status`).
+/// `None` means no death has been recorded for this id since its slot was last
+/// reused, which is a live task and a leader whose group has not died yet -
+/// both read `0` in the file, as Linux does (`build/scratch/statmore/r.c`).
+///
+/// This is deliberately a read, not a consume: a zombie's status must stay
+/// available while a parent has not collected it, and `wait` is what removes
+/// the record. `exit_code` above answers only the raw code; the core-dump bit
+/// is the other half of the word, so this accessor reads both.
+pub fn retired_status(id: TaskId) -> Option<i32> {
+    critical_section::with(|cs| {
+        RETIRED
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .rev()
+            .find(|retired| retired.id == id)
+            .map(|retired| crate::abi::wait_status(retired.code, retired.dumped))
+    })
+}
+
 /// Collect `id`'s exit code for caller `me`, consuming the record. `None` when
 /// no death has been recorded for that pid since its slot was last reused, or
 /// when the record is still owned by a tracer other than `me`.
