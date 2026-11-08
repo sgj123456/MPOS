@@ -8898,3 +8898,84 @@ uses only well-formed buffers. `sched_rr_get_interval`'s slice value itself is
 also still host-configuration-dependent (§6.114's own measurement: 2 ms on
 SCHED_OTHER, 100 ms on SCHED_RR, 0 on SCHED_FIFO) and remains a named gap —
 refuse-not-approximate, not a value to guess.
+
+### 6.115 the five buffered `sched_*` doors check the buffer before the pid (LANDED 2026-11-08)
+
+§6.114 closed the negative-pid half of the `sched_*` family and deliberately
+left its counterpart named: the *order* in which the doors refuse. Measured on
+Linux 7.2.14 (`build/scratch/schedorder/matrix.c`, `edges.c`, `ambig.c`,
+`sizes.c`, musl static, raw `syscall()` so no userspace wrapper pre-validates
+the buffer). Five doors take a userspace struct — `sched_getparam`,
+`sched_setparam`, `sched_setscheduler`, `sched_getattr`, `sched_setattr` —
+and share one **first** guard, literally `if (!uattr || pid < 0) return
+-EINVAL;`, before the pid is ever looked up:
+
+```
+                    NULL buffer      valid buffer     bad (0x1) ptr
+self   (pid 0)       EINVAL (22)     success (0)      EFAULT (14)
+nobody (999999)      EINVAL (22)     ESRCH (3)        (door-specific)
+negative (pid -1)    EINVAL (22)     EINVAL (22)      EINVAL (22)
+```
+
+The **NULL + nobody → EINVAL** row is the ordering claim: the failed pid
+lookup's `ESRCH` must not win over the NULL buffer's `EINVAL`. `edges.c`
+adds that the guard runs before the policy is examined —
+`sched_setscheduler(0, SCHED_FIFO, NULL)` is `EINVAL`, not `EOPNOTSUPP` — and
+that a bad *non-NULL* pointer is still `EFAULT`, not the NULL guard's
+`EINVAL`. `sched_rr_get_interval` is the deliberate **exception**: it has no
+such guard, so its pid lookup comes first (`rr_get_interval(0, NULL)` is
+`EFAULT`, `rr_get_interval(999999, NULL)` is `ESRCH`). §6.114 had already
+kept that pid-first order for the exception door, so this fix must not be
+"apply the guard to all seven" — only the five buffered ones.
+
+**The defect.** After §6.114 every handler called `sched_target(word)` first
+and its `buffer_ok` check second. On the five buffered doors that order made
+a NULL buffer fall through to `buffer_ok`, which answers `EFAULT` on self and
+never gets a chance on a nonexistent pid (the `sched_target` before it had
+already answered `ESRCH`). MPOS before: `NULL + self` → `[14 × 5]`,
+`NULL + nobody` → `[3 × 5]`, `setscheduler(0, FIFO, NULL)` → `EOPNOTSUPP`
+(95), while Linux answers `EINVAL` for all three. The boot of the new pin on
+the unfixed tree (`build/boot-schedorder-before.log`, and again
+`build/boot-schedorder-cf1.log` after the stash) recorded exactly those
+reds: three claims `FAILED`, `exit=1`.
+
+**The fix is one shared verdict reused by five doors, not five patches.**
+`src/syscall/linux/abi.rs` (host-compiled) gains
+`pub(crate) fn sched_buffered_pid_verdict(word: usize, buffer: usize) ->
+Result<i32, isize>`: it asks §6.114's `sched_pid_verdict` (truncation +
+negative→EINVAL), then adds `buffer == 0 → EINVAL` **before** returning the
+pid. `posix.rs` gains `sched_buffered_target(word, buffer)`, which resolves
+the returned pid exactly as `sched_target` does, and the five handlers now
+open with `if let Err(e) = sched_buffered_target(word, param) { return e; }`
+(the two `sched_*attr` doors bind `target`). `sched_getscheduler` (no buffer)
+and `sched_rr_get_interval` (the exception) keep `sched_target` unchanged.
+The host unit test
+`a_sched_null_buffer_is_einval_before_the_pid_is_looked_up` pins the verdict
+against an implementation that only runs `sched_pid_verdict` — the two
+`Err(EINVAL)` NULL-buffer rows fail without the buffer check.
+
+Pin `user/tests/src/bin/t-sched-order.rs` (8 claims): the five buffered
+doors on NULL + self / NULL + nobody / NULL + negative, valid-buffer
+controls, a bad non-NULL pointer (EFAULT), the NULL-param guard across four
+`setscheduler` policies, and the `rr_get_interval` exception's pid-first
+control. It calls the raw syscalls with the full 64-bit word. Host 8/8
+`PASS`; machine `build/boot-schedorder1.log` 8/8 `PASS`. Counterfactual:
+`git stash` of `abi.rs` + `posix.rs` + rebuild kernel *and* loader
+(`build/boot-schedorder-cf1.log`) → three red rows (`[14 × 5]`,
+`[3 × 5]`, `[14, 95, 95, 22]`), `FAILED`, `exit=1`; `git stash pop` +
+rebuild + `build/boot-schedorder2.log` returns to 8/8 `PASS`.
+
+**The rule.** A refusal's *order* is part of its shape, not just its errno.
+Two calls can name the same bad buffer and the same bad pid and still owe the
+caller different errnos depending on which check the kernel makes first — a
+caller branches on EINVAL (fix your argument) differently from ESRCH (the
+task is gone). §6.114 fixed the width of the word; this fixed the precedence
+of the checks, on the same seven doors, through the same host-side verdict
+style. What is *still* a named gap, measured but deliberately out of this
+intent: the two `sched_*attr` doors' `size`/`flags` guards have their own
+different order (`getattr(size=0, nobody)` → EINVAL, `getattr(flags=1,
+nobody)` → ESRCH, `setattr(flags=1, nobody)` → EINVAL), a bad non-NULL
+pointer's door-specific EFAULT/ESRCH precedence on a nonexistent pid, the
+`usize > PAGE_SIZE` ceiling, and `sched_rr_get_interval`'s host-configured
+slice value. One intent per commit: this one is the buffer-before-pid
+precedence all five buffered doors share.

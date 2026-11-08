@@ -389,6 +389,19 @@ One-glance status of the whole roadmap.
   `rr_get_interval` checks the pid first) and `rr_get_interval`'s
   configuration-dependent slice value stay named, unmeasured gaps
   (`§6.114`, item 227).
+- [x] the five buffered `sched_*` doors check their buffer **before** the pid
+  — Linux's shared `if (!uattr || pid < 0) return -EINVAL` runs before the
+  task lookup, so a NULL buffer is `EINVAL` even for a nonexistent pid (the
+  failed lookup's `ESRCH` must not win), and `setscheduler(0, FIFO, NULL)` is
+  `EINVAL` rather than `EOPNOTSUPP`. §6.114 fixed the pid word but left each
+  handler resolving the pid first, so MPOS answered `EFAULT`/`ESRCH` for
+  those rows. `sched_buffered_pid_verdict` (host-tested in `abi.rs`) now adds
+  the NULL-buffer EINVAL before the pid is returned; `sched_rr_get_interval`
+  keeps §6.114's pid-first order as the deliberate exception. Pin
+  `t-sched-order` (8 claims; three red without the fix — `[14 × 5]`,
+  `[3 × 5]`, `[14, 95, 95, 22]`). The `sched_*attr` `size`/`flags` guard
+  order, bad-pointer precedence, and `rr_get_interval`'s configured slice
+  value stay named, measured gaps (`§6.115`, item 228).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

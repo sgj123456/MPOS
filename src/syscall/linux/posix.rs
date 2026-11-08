@@ -58,6 +58,28 @@ fn sched_target(word: usize) -> Result<usize, isize> {
         .ok_or(err::ESRCH)
 }
 
+/// The five `sched_*` doors that take a userspace struct — `sched_getparam`,
+/// `sched_setparam`, `sched_setscheduler`, `sched_getattr` and
+/// `sched_setattr` — run Linux's shared **first** guard,
+/// [`super::abi::sched_buffered_pid_verdict`], before the pid is looked up:
+/// a NULL buffer is `EINVAL` even when the pid names nobody, because the
+/// guard wins over the `ESRCH` a failed `resolve_pid` would give. With a
+/// non-NULL buffer the pid resolution below is the same as [`sched_target`]'s.
+///
+/// `sched_rr_get_interval` is the deliberate exception — no buffer guard, so
+/// its pid lookup stays first — and `sched_getscheduler` has no buffer at all;
+/// both keep [`sched_target`] (§6.114). Measured on 7.2.14 in
+/// `build/scratch/schedorder/{matrix,edges,ambig}.c`.
+fn sched_buffered_target(word: usize, buffer: usize) -> Result<usize, isize> {
+    let pid = super::abi::sched_buffered_pid_verdict(word, buffer)?;
+    if pid == 0 {
+        return Ok(crate::sched::current().0);
+    }
+    crate::sched::resolve_pid(pid as i64)
+        .map(|id| id.0)
+        .ok_or(err::ESRCH)
+}
+
 // ---------------------------------------------------------------------------
 // Identity: one user, whose changes are true or refused
 // ---------------------------------------------------------------------------
@@ -531,10 +553,12 @@ pub fn handle_capset(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// for a priority outside the policy's range.
 pub fn handle_sched_setparam(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (word, param) = (args[0], args[1]);
-    if let Err(e) = sched_target(word) {
+    // The NULL-buffer guard runs before the pid lookup (§6.115). A NULL
+    // param is EINVAL whether or not the pid names a task.
+    if let Err(e) = sched_buffered_target(word, param) {
         return e;
     }
-    if param == 0 || !buffer_ok(param, 4, false, from_user) {
+    if !buffer_ok(param, 4, false, from_user) {
         return err::EFAULT;
     }
     let priority = unsafe { (param as *const i32).read_unaligned() };
@@ -548,10 +572,12 @@ pub fn handle_sched_setparam(args: [usize; ARG_COUNT], from_user: bool) -> isize
 /// the policy's zero.
 pub fn handle_sched_getparam(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (word, param) = (args[0], args[1]);
-    if let Err(e) = sched_target(word) {
+    // The NULL-buffer guard runs before the pid lookup (§6.115). A NULL
+    // param is EINVAL whether or not the pid names a task.
+    if let Err(e) = sched_buffered_target(word, param) {
         return e;
     }
-    if param == 0 || !buffer_ok(param, 4, true, from_user) {
+    if !buffer_ok(param, 4, true, from_user) {
         return err::EFAULT;
     }
     unsafe { (param as *mut i32).write_unaligned(0) };
@@ -569,7 +595,10 @@ pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> i
     const SCHED_FIFO: usize = 1;
     const SCHED_RR: usize = 2;
     let (word, policy, param) = (args[0], args[1], args[2]);
-    if let Err(e) = sched_target(word) {
+    // The NULL-buffer guard runs before the pid lookup and before the policy
+    // is examined (§6.115): a NULL param is EINVAL on every policy, not
+    // EFAULT for SCHED_OTHER or EOPNOTSUPP for the real-time ones.
+    if let Err(e) = sched_buffered_target(word, param) {
         return e;
     }
     match policy {
@@ -668,14 +697,16 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
 pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
     let (word, attr, flags) = (args[0], args[1], args[2]);
-    let target = match sched_target(word) {
+    // The NULL-buffer guard runs before the pid lookup (§6.115): a NULL attr
+    // is EINVAL whether or not the pid names a task.
+    let target = match sched_buffered_target(word, attr) {
         Ok(target) => target,
         Err(e) => return e,
     };
     if flags != 0 {
         return err::EINVAL;
     }
-    if attr == 0 || !buffer_ok(attr, SCHED_ATTR_SIZE, false, from_user) {
+    if !buffer_ok(attr, SCHED_ATTR_SIZE, false, from_user) {
         return err::EFAULT;
     }
     let (size, policy, nice) = unsafe {
@@ -716,7 +747,10 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
     let (word, attr, size, flags) = (args[0], args[1], args[2], args[3]);
-    let target = match sched_target(word) {
+    // The NULL-buffer guard runs before the pid lookup (§6.115): a NULL attr
+    // is EINVAL whether or not the pid names a task. The `size`/`flags`
+    // guards keep their own, different order — a separate named gap.
+    let target = match sched_buffered_target(word, attr) {
         Ok(target) => target,
         Err(e) => return e,
     };
@@ -726,7 +760,7 @@ pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     if size < SCHED_ATTR_SIZE {
         return err::EINVAL;
     }
-    if attr == 0 || !buffer_ok(attr, SCHED_ATTR_SIZE, true, from_user) {
+    if !buffer_ok(attr, SCHED_ATTR_SIZE, true, from_user) {
         return err::EFAULT;
     }
     // Read the task's real nice from the same per-task slot `setpriority` and

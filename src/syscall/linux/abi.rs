@@ -3905,6 +3905,39 @@ pub(crate) fn sched_pid_verdict(word: usize) -> Result<i32, isize> {
     Ok(pid)
 }
 
+/// The shared **first** guard of the five `sched_*` doors that take a
+/// userspace struct — `sched_getparam`, `sched_setparam`,
+/// `sched_setscheduler`, `sched_getattr` and `sched_setattr`. Linux checks
+/// the buffer and the 32-bit pid together, before it ever looks the pid up:
+/// `if (!uattr || pid < 0) return -EINVAL;`. A NULL buffer is therefore
+/// `EINVAL` even when the pid names nobody — the guard wins over the
+/// `ESRCH` a failed `find_process_by_pid` would give.
+///
+/// `build/scratch/schedorder/matrix.c` measured all five doors on 7.2.14:
+/// `NULL + self` and `NULL + pid 999999` are `EINVAL`(22) on every door,
+/// while a well-formed buffer gives success on self and `ESRCH`(3) for
+/// 999999. `edges.c` adds that a bad *non-NULL* pointer is still `EFAULT`
+/// and that the guard runs before the policy is examined
+/// (`sched_setscheduler(0, SCHED_FIFO, NULL)` is `EINVAL`, not `EOPNOTSUPP`).
+/// `sched_rr_get_interval` is the deliberate exception: it has no such
+/// guard, so its pid lookup comes first (`rr_get_interval(0, NULL)` is
+/// `EFAULT`, `rr_get_interval(999999, NULL)` is `ESRCH`) — §6.114 kept that
+/// order and uses [`sched_pid_verdict`] directly.
+///
+/// This is the contract only: it does not consult the task table. The
+/// handler resolves `Ok(0)` to the caller and a positive pid through
+/// `resolve_pid`, answering `ESRCH` when that fails. The `size`/`flags`
+/// guards of the two `sched_*attr` doors have their own, different order
+/// (`build/scratch/schedorder/{ambig,sizes}.c`) and remain a named gap —
+/// this one intent is the buffer-before-pid precedence all five share.
+pub(crate) fn sched_buffered_pid_verdict(word: usize, buffer: usize) -> Result<i32, isize> {
+    let pid = sched_pid_verdict(word)?;
+    if buffer == 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6884,5 +6917,42 @@ mod diskstat_tests {
         assert_eq!(sched_pid_verdict(0x1_0000_0000), Ok(0));
         assert_eq!(sched_pid_verdict(0x1_0000_0001), Ok(1));
         assert_eq!(sched_pid_verdict(0xffff_ffff), Err(err::EINVAL));
+    }
+
+    /// The five buffered `sched_*` doors check a NULL buffer together with
+    /// the pid, *before* the pid is looked up. `build/scratch/schedorder/
+    /// matrix.c` measured `NULL + self` and `NULL + pid 999999` as EINVAL(22)
+    /// on all five doors on 7.2.14; a well-formed buffer leaves self as
+    /// success and 999999 as the resolver's ESRCH.
+    ///
+    /// This is a real counterfactual: an implementation that only runs
+    /// `sched_pid_verdict` and skips the buffer check returns `Ok(0)` /
+    /// `Ok(999999)` for the NULL-buffer rows, so the two `Err(EINVAL)`
+    /// assertions below fail. The `NULL + nobody` row is the ordering claim
+    /// — EINVAL must win over the ESRCH a failed pid lookup would give.
+    #[test]
+    fn a_sched_null_buffer_is_einval_before_the_pid_is_looked_up() {
+        let buf = 0x1000usize; // any non-NULL, well-formed user pointer
+        // NULL buffer: EINVAL regardless of what the pid would resolve to.
+        assert_eq!(sched_buffered_pid_verdict(0, 0), Err(err::EINVAL));
+        assert_eq!(sched_buffered_pid_verdict(999_999, 0), Err(err::EINVAL));
+        assert_eq!(
+            sched_buffered_pid_verdict((-1i32) as u32 as usize, 0),
+            Err(err::EINVAL)
+        );
+        // The 32-bit truncation still applies: 2^32 + NULL is EINVAL too.
+        assert_eq!(
+            sched_buffered_pid_verdict(0x1_0000_0000, 0),
+            Err(err::EINVAL)
+        );
+
+        // A valid buffer hands the pid to the resolver unchanged.
+        assert_eq!(sched_buffered_pid_verdict(0, buf), Ok(0));
+        assert_eq!(sched_buffered_pid_verdict(999_999, buf), Ok(999_999));
+        // A negative (truncated) pid is still EINVAL with a valid buffer.
+        assert_eq!(
+            sched_buffered_pid_verdict(0xffff_ffff, buf),
+            Err(err::EINVAL)
+        );
     }
 }

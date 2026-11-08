@@ -292,7 +292,26 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-08, the seven `sched_*` doors' `pid_t` §6.114):**
+**Latest measured gate (2026-11-08, the five buffered `sched_*` doors' refusal order §6.115):**
+`build/gate-schedorder.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
+green on both arms (no contention reds): stage 1 `1246 tests, 0 failed`
+(60.89 s); x86_64 `pass=280 fail=0 (280 built)`, `mpos-kunit 35 passed, 0 failed`,
+`exit 33`, `total 61.09 s (previous green run 61.44 s, -0.6%)`; aarch64
+`pass=279 fail=0 (279 built)`, `mpos-kunit 35 passed, 0 failed`, reached `=== END`,
+`total 185.47 s (previous green run 194.46 s, -4.6%)`. `=== PASS t-sched-order`
+sits in both aggregates (`build/test-serial.log:4180`,
+`build/aarch64-test-serial.log:5374`): `a NULL buffer is EINVAL on self
+([22, 22, 22, 22, 22])`, `... even for a nonexistent pid ([22 × 5])`, and
+`a NULL param is EINVAL on every setscheduler policy ([22, 22, 22, 22])`,
+with `rr_get_interval keeps pid-first (NULL+self 14, NULL+nobody 3)` green on
+both. The three discriminating rows were red on the unfixed kernel
+(`build/boot-schedorder-before.log`, and after the stash
+`build/boot-schedorder-cf1.log`: `[14 × 5]`, `[3 × 5]`, `[14, 95, 95, 22]`,
+`FAILED`, `exit=1`) and green with it (`build/boot-schedorder1.log`, and
+after the stash pop `build/boot-schedorder2.log`). Host 8/8 `PASS`, 746 host
+unit tests.
+
+**Measured gate before it (2026-11-08, the seven `sched_*` doors' `pid_t` §6.114):**
 `build/gate-schedpid.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
 green on both arms (no contention reds): stage 1 `1245 tests, 0 failed`
 (61.24 s); x86_64 `pass=279 fail=0 (279 built)`, `mpos-kunit 35 passed, 0 failed`,

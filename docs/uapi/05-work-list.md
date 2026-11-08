@@ -10015,3 +10015,47 @@ checks the pid first — `build/scratch/schedattr/shapes.c`), and
 `sched_rr_get_interval`'s slice *value*, which is host-configuration-dependent
 (2 ms / 100 ms / 0 measured on SCHED_OTHER / RR / FIFO) and must be refused
 rather than approximated. Mechanism and the Linux matrix: `docs/notes/` §6.114.
+
+### Item 228 - the five buffered `sched_*` doors check the buffer before the pid (2026-11-08, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| five buffered doors, NULL buffer + self | `EINVAL` (-22) | `EFAULT` (-14) | `EINVAL` |
+| five buffered doors, NULL buffer + pid 999999 | `EINVAL` (-22) | `ESRCH` (-3) | `EINVAL` |
+| `sched_setscheduler(0, SCHED_FIFO, NULL)` | `EINVAL` (-22) | `EOPNOTSUPP` (-95) | `EINVAL` |
+| bad *non-NULL* pointer + self | `EFAULT` (-14) | `EFAULT` | `EFAULT` |
+| `sched_rr_get_interval(0, NULL)` / `(999999, NULL)` | `EFAULT` / `ESRCH` | `EFAULT` / `ESRCH` | unchanged (the exception) |
+
+The five buffered doors are `sched_getparam`, `sched_setparam`,
+`sched_setscheduler`, `sched_getattr`, `sched_setattr`. Linux runs one shared
+first guard — `if (!uattr || pid < 0) return -EINVAL` — **before** the pid is
+looked up, so a NULL buffer is `EINVAL` even when the pid names nobody; the
+failed lookup's `ESRCH` must not win. `sched_rr_get_interval` is the
+deliberate exception (no guard, pid-first) and `sched_getscheduler` has no
+buffer; both keep §6.114's `sched_target`. Full 7×6 matrix and the edge cases:
+`build/scratch/schedorder/{matrix,edges,ambig,sizes}.c`.
+
+**Landed.** §6.114 fixed the negative-pid word but left each handler calling
+`sched_target` first and `buffer_ok` second, so a NULL buffer fell through to
+`EFAULT` on self and never reached the buffer check on a nonexistent pid.
+`src/syscall/linux/abi.rs` (host-compiled) gains
+`pub(crate) fn sched_buffered_pid_verdict(word: usize, buffer: usize) ->
+Result<i32, isize>`: §6.114's `sched_pid_verdict` plus `buffer == 0 → EINVAL`
+before the pid is returned. `posix.rs` gains `sched_buffered_target` and the
+five handlers open with it; their existing `buffer_ok`/`size`/`flags` checks
+stay in their old order. Owner: `src/syscall/linux/abi.rs`,
+`src/syscall/linux/posix.rs`.
+
+Pin: `user/tests/src/bin/t-sched-order.rs` (8 claims) — host 8/8 `PASS`,
+machine `build/boot-schedorder1.log` 8/8 `PASS`, counterfactual
+`build/boot-schedorder-cf1.log` three red (`[14 × 5]`, `[3 × 5]`,
+`[14, 95, 95, 22]`) / `FAILED` / `exit=1`, restored
+`build/boot-schedorder2.log` 8/8 `PASS`. Host unit test
+`syscall::linux::abi::diskstat_tests::a_sched_null_buffer_is_einval_before_the_pid_is_looked_up`
+pins the verdict against a pid-only implementation. Named gaps still open,
+measured but out of this intent: the two `sched_*attr` doors' `size`/`flags`
+guard order (`getattr(size=0, nobody)` → EINVAL, `getattr(flags=1, nobody)` →
+ESRCH, `setattr(flags=1, nobody)` → EINVAL), a bad non-NULL pointer's
+door-specific EFAULT/ESRCH precedence on a nonexistent pid, the
+`usize > PAGE_SIZE` ceiling, and `sched_rr_get_interval`'s host-configured
+slice value. Mechanism and the Linux matrix: `docs/notes/` §6.115.
