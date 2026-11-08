@@ -8979,3 +8979,106 @@ pointer's door-specific EFAULT/ESRCH precedence on a nonexistent pid, the
 `usize > PAGE_SIZE` ceiling, and `sched_rr_get_interval`'s host-configured
 slice value. One intent per commit: this one is the buffer-before-pid
 precedence all five buffered doors share.
+
+### 6.116 the two `sched_*attr` doors' `size`/`flags` words and their guard order (LANDED 2026-11-09)
+
+§6.115 named this as a gap: the five buffered `sched_*` doors share one
+NULL-buffer-before-pid guard, but the two `sched_*attr` doors have their own
+`size` and `flags` guards with a *different* order. Every measurement here is
+Linux 7.2.14 via raw `syscall()` (no wrapper truncates a word or validates a
+buffer first), probes in `build/scratch/schedattrorder/` (`q.c`, `r.c` with
+`strerror`, `s.c` for the 32-bit truncation, `order.c` for a bad pointer),
+`build/scratch/schedorder/edges.c` re-measured to kill a stale reading.
+`PAGE_SIZE` is 4096 on both the measuring host and this kernel
+(`crates/vm/src/lib.rs:33`). The errno words: EINVAL 22, ESRCH 3, EFAULT 14,
+**E2BIG 7** (`Argument list too long`, `r.c`), EOPNOTSUPP 95.
+
+```text
+sched_getattr(pid, attr, usize, flags)   [usize is the ARG, NOT attr.size]
+  usize 0/1/4/47/4097   -> EINVAL(22) on self, nobody(999999) and pid -1
+                            ALIKE: the size guard beats the pid lookup.
+  usize 48/56/4096      -> self 0, nobody ESRCH(3)
+  flags=1 usize=48      -> self EINVAL(22), nobody ESRCH(3), pid -1 EINVAL
+                            => the LOOKUP comes first, flags AFTER it.
+  usize=0 flags=1        -> EINVAL on everyone: size beats flags.
+  flags=1 pointer=0x1    -> EINVAL (flags before the copy); flags=0 -> EFAULT.
+  2^32+48 / flags=2^32   -> served; 2^32+0 / 2^32+1 -> EINVAL
+                            => both words are read as 32-bit unsigned.
+
+sched_setattr(pid, attr, flags)          [size is attr.size IN the struct]
+  flags=1                -> EINVAL(22) on self, nobody AND pid -1
+                            => here flags is checked BEFORE the lookup.
+  attr.size 4/47/4097    -> E2BIG(7) on self AND nobody (NOT EINVAL, and
+                            it beats ESRCH); attr.size 4096 -> served.
+  attr.size 0            -> self 0 (0 means "use the kernel's version"),
+                            nobody ESRCH(3); it is NOT refused as too small.
+  attr.size 48/56/4096   -> self 0, nobody ESRCH(3)
+  flags=2^32             -> served (truncates to zero); 2^32+1 -> EINVAL.
+```
+
+An `edges.c` contradiction ("in-struct size 4 still served") was a probe
+artifact: an earlier `getattr` call wrote `size = 48` back into the same
+buffer, so `setattr` then read 48, not 4. §13.15's rule applied: re-measure
+with a freshly `arm(size)`-ed 64 KiB buffer, one syscall per statement, errno
+stored before printing. The `q/r/s/order.c` readings above are the authority.
+
+**MPOS before.** Both handlers called `sched_buffered_target` (pid lookup)
+first, then compared the *full 64-bit* `size` with `< 48` (EINVAL), had no
+`> PAGE_SIZE` ceiling, checked `flags != 0` before the lookup in *both* doors,
+and treated `attr.size = 0` as too small. Linux: `size` is 32-bit-bounded by
+PAGE_SIZE with E2BIG for short/over-page, `getattr`'s size guard is before the
+lookup but its flags guard is after, `setattr`'s flags guard is before the
+lookup and its size guard is before the lookup too, and `size = 0` means
+"default". A counterfactual boot (`build/boot-schedattr-cf1.log`) of the new
+pin against the old handlers gives **8 red** of 12 claims — the size words,
+the E2BIG errno, `size = 0`, the flags precedence, and both truncations all
+answer the wrong errno.
+
+**The fix** keeps the pure contract in host-compiled `src/syscall/linux/abi.rs`
+(the verdict style §6.114/§6.115 established) and leaves `posix.rs` two doors
+with only the ordering each door owes:
+
+- `pub(crate) const SCHED_ATTR_SIZE_V1: usize = 48;`
+- `pub(crate) fn sched_getattr_usize_verdict(word: usize) -> Result<u32, isize>`
+  — `word as u32`; `< 48` or `> crate::mm::pframe::PAGE_SIZE` → `EINVAL`,
+  else `Ok(size)`.
+- `pub(crate) fn sched_attr_flags_verdict(word: usize) -> Result<(), isize>`
+  — `word as u32 != 0` → `EINVAL`.
+- `pub(crate) fn sched_setattr_size_verdict(size: u32) -> Result<(), isize>`
+  — `0` → `Ok` (default), `0 < size < 48` or `size > PAGE_SIZE` → **`E2BIG`**,
+  else `Ok`.
+- `fn sched_resolve(vetted: i32) -> Result<usize, isize>` in `posix.rs` is the
+  single lookup both `sched_target`/`sched_buffered_target` and the attr doors
+  now share (`0` → current, positive → `resolve_pid`, else `ESRCH`), so the
+  guard order can be spelled once per door without duplicating the lookup.
+- `sched_getattr`: NULL/pid verdict → `sched_getattr_usize_verdict` → lookup →
+  `sched_attr_flags_verdict` → `buffer_ok` → write. `sched_setattr`: NULL/pid
+  verdict → `sched_attr_flags_verdict` (before lookup) → `buffer_ok` → read the
+  in-struct size → `sched_setattr_size_verdict` (E2BIG, before lookup) →
+  `sched_resolve` → policy. The size's E2BIG had to be moved *before* the
+  lookup because `q.c` measured pid 999999 + `size = 4` → E2BIG, not ESRCH.
+
+Three host unit tests in `abi.rs`'s `mod diskstat_tests` pin the three verdicts
+against 32-bit, PAGE_SIZE and E2BIG shapes; a pid-only or 64-bit implementation
+fails them. Host unit tests `749 passed; 0 failed` (three new).
+
+Pin `user/tests/src/bin/t-sched-attr.rs` (12 claims): all the rows above,
+called through raw syscalls with the full 64-bit word, a 64 KiB buffer so a
+large `usize` cannot overflow the stack, and `MPOS_ON_HOST=1` measuring the
+same claims on Linux. Host 12/12 `PASS`; machine
+`build/boot-schedattr1.log` 12/12 `PASS`. Counterfactual: `git stash` of
+`abi.rs` + `posix.rs` + rebuild kernel *and* loader
+(`build/boot-schedattr-cf1.log`) → 8 red rows, `FAILED`, `exit=1`;
+`git stash pop` + rebuild + `build/boot-schedattr2.log` returns to 12/12
+`PASS`.
+
+**The rule.** A `size` or `flags` word is a *32-bit* word, and which guard runs
+first is a promise a caller branches on — EINVAL (fix the argument), E2BIG
+(the negotiated struct is the wrong length), ESRCH (the task is gone) and
+EFAULT (the pointer) are four different recoveries. Two doors of the same
+family put their `flags` guard on *opposite* sides of the pid lookup; only a
+measurement on the real kernel says which. Named gaps still open, deliberately
+out of this intent: a bad non-NULL pointer's door-specific EFAULT/ESRCH
+precedence on a nonexistent pid combined with a short size,
+`sched_getparam`'s priority range, `size > PAGE_SIZE` on the *host* when
+PAGE_SIZE differs, and `sched_rr_get_interval`'s host-configured slice.

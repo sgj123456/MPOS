@@ -292,7 +292,28 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-08, the five buffered `sched_*` doors' refusal order §6.115):**
+**Latest measured gate (2026-11-09, the two `sched_*attr` doors' `size`/`flags` order §6.116):**
+`build/gate-schedattr.log` was red on the disk arm, and not on this change —
+x86_64 `pass=281 fail=0 (281 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
+stage 1 `1249 tests, 0 failed` (61.11 s); aarch64 lane 0 never ran a program and
+stopped in the *boot's own* EL0 check with `EXCEPTION: synchronous` /
+`ESR_EL1 0x96000047 (EC 0x25)` / `FAR_EL1 0x221000` — the page past `kernel_end`,
+§13.32's recorded shape, which halts the machine rather than failing a lane. Two
+reruns lodged it in a different lane (lane 1, then lane 0 again, always at the
+same EL0 check and always before `=== RUN`), so the red moves with the machine and
+not with the test. The citable green is `build/gate-schedattr-a3.log`, an aarch64
+arm run alone on a quiet host: stage 1 `1249 tests, 0 failed` (105.41 s), aarch64
+`pass=280 fail=0`, `mpos-kunit 35 passed, 0 failed`, both lanes `ok`, `=== END`,
+`total 105.60 s (previous green run 185.47 s, -43.1%)`, and the new pin green in a
+lane (`=== PASS t-sched-attr`, `build/test-lane-aarch64-0/serial.log:3687`).
+Two intermediate aarch64 reruns are worth naming because they were *not* this
+change either: `build/gate-schedattr-a.log` timed out in the same EL0 check, and
+`build/gate-schedattr-a1.log` (single lane, this container has one core) reported
+`pass=278 fail=2` on `t-io-uring` and `t-ahci`, both `timeout=120s` with no output
+of their own — §12.4a's contention shape, and both pass on the x86_64 arm of the
+same tree (`build/test-serial.log:487`, `:2831`).
+
+**Measured gate before it (2026-11-08, the five buffered `sched_*` doors' refusal order §6.115):**
 `build/gate-schedorder.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
 green on both arms (no contention reds): stage 1 `1246 tests, 0 failed`
 (60.89 s); x86_64 `pass=280 fail=0 (280 built)`, `mpos-kunit 35 passed, 0 failed`,

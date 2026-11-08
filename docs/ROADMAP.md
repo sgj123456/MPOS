@@ -402,6 +402,15 @@ One-glance status of the whole roadmap.
   `[3 × 5]`, `[14, 95, 95, 22]`). The `sched_*attr` `size`/`flags` guard
   order, bad-pointer precedence, and `rr_get_interval`'s configured slice
   value stay named, measured gaps (`§6.115`, item 228).
+- [x] the two `sched_*attr` doors negotiate a 32-bit `size`/`flags` word — Linux 7.2.14 reads
+  both as `unsigned int`, bounds `usize` by 48..`PAGE_SIZE` (short/over-page `EINVAL` on
+  `getattr`, **`E2BIG`** on `setattr`'s in-struct size, both *before* the pid lookup), and puts
+  `flags` on opposite sides of the lookup (`getattr`: after it, so `flags=1` on a nonexistent pid
+  is `ESRCH`; `setattr`: before it, so the same pair is `EINVAL`). MPOS resolved the pid first,
+  compared the full 64-bit words, refused short sizes with `EINVAL`, accepted sizes past a page,
+  and treated `attr.size=0` as too small instead of Linux's "use the kernel's version". The three
+  verdicts live host-side in `abi.rs`; `posix.rs` shares one `sched_resolve` and gives each door
+  its measured order. Pin `t-sched-attr` (12 claims; 8 red without the fix), `§6.116`, item 229.
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

@@ -3927,15 +3927,82 @@ pub(crate) fn sched_pid_verdict(word: usize) -> Result<i32, isize> {
 /// This is the contract only: it does not consult the task table. The
 /// handler resolves `Ok(0)` to the caller and a positive pid through
 /// `resolve_pid`, answering `ESRCH` when that fails. The `size`/`flags`
-/// guards of the two `sched_*attr` doors have their own, different order
-/// (`build/scratch/schedorder/{ambig,sizes}.c`) and remain a named gap —
-/// this one intent is the buffer-before-pid precedence all five share.
+/// guards of the two `sched_*attr` doors have their own, different order:
+/// they landed as the [`sched_getattr_usize_verdict`],
+/// [`sched_attr_flags_verdict`] and [`sched_setattr_size_verdict`] verdicts in
+/// §6.116. This one intent is the buffer-before-pid precedence all five share.
 pub(crate) fn sched_buffered_pid_verdict(word: usize, buffer: usize) -> Result<i32, isize> {
     let pid = sched_pid_verdict(word)?;
     if buffer == 0 {
         return Err(err::EINVAL);
     }
     Ok(pid)
+}
+
+/// The first `sched_attr` version's size in bytes. Both `sched_getattr`'s
+/// `usize` argument and `sched_setattr`'s in-struct `size` are measured
+/// against it; a caller that offers less cannot be served the fields this
+/// kernel writes, and Linux refuses it rather than writing a short struct.
+pub(crate) const SCHED_ATTR_SIZE_V1: usize = 48;
+
+/// `sched_getattr`'s `usize` word, read as Linux's 32-bit `unsigned int`.
+///
+/// `build/scratch/schedattrorder/{q,r,s}.c` measured on 7.2.14 that this
+/// guard runs **before** the pid is looked up: `usize = 0, 1, 4, 47` and
+/// `4097` answer `EINVAL`(22) for self, for pid 999999 (which would otherwise
+/// be `ESRCH`) and for a negative pid alike, while `48, 56, 4096` let the
+/// lookup happen (self succeeds, 999999 answers `ESRCH`). The upper bound is
+/// `PAGE_SIZE`, not an invented ceiling: `4096` is served, `4097` refused.
+/// `2^32 + 48` is served and `2^32 + 0` refused, so the word is truncated to
+/// 32 bits first — the same `unsigned int` rule `s.c` measured for `flags`.
+///
+/// Before this, `handle_sched_getattr` compared the full 64-bit `usize` with
+/// `< 48` **after** it had already resolved the pid: pid 999999 with
+/// `usize = 0` answered `ESRCH`, and `usize = 4097` was served as if it were
+/// a legal size. Both are wrong shapes, and the first is the one a caller
+/// branches on. `EINVAL` here is the whole distinction from `ESRCH`.
+pub(crate) fn sched_getattr_usize_verdict(word: usize) -> Result<u32, isize> {
+    let size = word as u32;
+    if size < SCHED_ATTR_SIZE_V1 as u32 || size > crate::mm::pframe::PAGE_SIZE as u32 {
+        return Err(err::EINVAL);
+    }
+    Ok(size)
+}
+
+/// A `sched_*attr` door's `flags` word, read as Linux's 32-bit `unsigned int`.
+///
+/// Any non-zero word is `EINVAL`. `build/scratch/schedattrorder/s.c` measured
+/// `flags = 2^32` served (it truncates to zero) and `2^32 + 1` refused, so the
+/// truncation is part of the promise. Where this verdict sits in the handler
+/// is *not* part of it: `sched_getattr` checks it after the pid lookup
+/// (`flags = 1` on pid 999999 answers `ESRCH`, `r.c`), while `sched_setattr`
+/// checks it before (`flags = 1` on 999999 answers `EINVAL`, `q.c`). The two
+/// doors share the verdict and differ only in where they call it.
+pub(crate) fn sched_attr_flags_verdict(word: usize) -> Result<(), isize> {
+    if word as u32 != 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
+/// `sched_setattr`'s in-struct `size` field, once the 48-byte struct is
+/// readable. Zero means "use the kernel's own version" and is served; a
+/// positive size below the first version's 48 bytes, or above `PAGE_SIZE`, is
+/// `E2BIG` — not `EINVAL`, and not the `ESRCH` a failed pid lookup would
+/// give. `build/scratch/schedattrorder/q.c` measured `size = 4, 47, 4097`
+/// as errno 7 (`Argument list too long`, `r.c`) on *both* self and pid
+/// 999999, so this guard too runs before the lookup; `0, 48, 56, 4096` let
+/// it happen. Before this, `handle_sched_setattr` answered `EINVAL` for every
+/// `size < 48` and accepted `size > 4096` — two wrong refusals where Linux
+/// gives one success and one different errno.
+pub(crate) fn sched_setattr_size_verdict(size: u32) -> Result<(), isize> {
+    if size == 0 {
+        return Ok(());
+    }
+    if size < SCHED_ATTR_SIZE_V1 as u32 || size > crate::mm::pframe::PAGE_SIZE as u32 {
+        return Err(err::E2BIG);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6954,5 +7021,67 @@ mod diskstat_tests {
             sched_buffered_pid_verdict(0xffff_ffff, buf),
             Err(err::EINVAL)
         );
+    }
+
+    /// `sched_getattr`'s `usize` is a 32-bit word, refused with `EINVAL` both
+    /// below the 48-byte first version and above `PAGE_SIZE`, and the guard
+    /// wins over a failed pid lookup. `build/scratch/schedattrorder/{q,r,s}.c`
+    /// measured `0/1/4/47/4097 → EINVAL` and `48/56/4096 → served` on 7.2.14,
+    /// with `2^32+48` served and `2^32+0` refused. A `< 48` check on the full
+    /// 64-bit word would serve `4097` and `2^32+48`; an `ESRCH`-first handler
+    /// would give pid 999999 the wrong errno for the small sizes.
+    #[test]
+    fn a_sched_getattr_usize_is_a_32_bit_word_bounded_by_page_size() {
+        for word in [0usize, 1, 4, 47, 4097] {
+            assert_eq!(
+                sched_getattr_usize_verdict(word),
+                Err(err::EINVAL),
+                "usize {word}"
+            );
+        }
+        for word in [48usize, 56, 4096] {
+            assert_eq!(
+                sched_getattr_usize_verdict(word),
+                Ok(word as u32),
+                "usize {word}"
+            );
+        }
+        // The high bits are dropped before either bound is applied.
+        assert_eq!(sched_getattr_usize_verdict(0x1_0000_0000 + 48), Ok(48));
+        assert_eq!(sched_getattr_usize_verdict(0x1_0000_0000), Err(err::EINVAL));
+    }
+
+    /// A `sched_*attr` door's `flags` is a 32-bit word: only zero is served.
+    /// `build/scratch/schedattrorder/s.c` measured `2^32` served (it truncates
+    /// to zero) and `2^32+1`/`2` refused. An untruncated `word != 0` check
+    /// would refuse `2^32`.
+    #[test]
+    fn a_sched_attr_flags_word_is_a_32_bit_zero() {
+        assert_eq!(sched_attr_flags_verdict(0), Ok(()));
+        assert_eq!(sched_attr_flags_verdict(0x1_0000_0000), Ok(()));
+        assert_eq!(sched_attr_flags_verdict(1), Err(err::EINVAL));
+        assert_eq!(sched_attr_flags_verdict(0x1_0000_0001), Err(err::EINVAL));
+        assert_eq!(sched_attr_flags_verdict(usize::MAX), Err(err::EINVAL));
+    }
+
+    /// `sched_setattr`'s in-struct `size`: zero is the kernel default and is
+    /// served, a positive size below 48 or above `PAGE_SIZE` is `E2BIG` (not
+    /// `EINVAL`), and 48/56/4096 are served. `build/scratch/schedattrorder/
+    /// q.c` measured errno 7 (`Argument list too long`, `r.c`) for 4/47/4097
+    /// on self and pid 999999 alike — the guard beats the lookup. The old
+    /// handler's `size < 48 → EINVAL` fails every row here but 48/56.
+    #[test]
+    fn a_sched_setattr_size_zero_is_default_and_short_or_over_page_is_e2big() {
+        assert_eq!(sched_setattr_size_verdict(0), Ok(()));
+        assert_eq!(sched_setattr_size_verdict(48), Ok(()));
+        assert_eq!(sched_setattr_size_verdict(56), Ok(()));
+        assert_eq!(sched_setattr_size_verdict(4096), Ok(()));
+        for size in [1u32, 4, 47, 4097, u32::MAX] {
+            assert_eq!(
+                sched_setattr_size_verdict(size),
+                Err(err::E2BIG),
+                "size {size}"
+            );
+        }
     }
 }

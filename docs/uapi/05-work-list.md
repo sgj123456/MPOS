@@ -10059,3 +10059,42 @@ ESRCH, `setattr(flags=1, nobody)` → EINVAL), a bad non-NULL pointer's
 door-specific EFAULT/ESRCH precedence on a nonexistent pid, the
 `usize > PAGE_SIZE` ceiling, and `sched_rr_get_interval`'s host-configured
 slice value. Mechanism and the Linux matrix: `docs/notes/` §6.115.
+
+### Item 229 — the two `sched_*attr` doors' `size`/`flags` guard order
+
+The `sched_getattr(2)`/`sched_setattr(2)` `size`/`flags` words are 32-bit and
+their guards run in a specific order. Measured on Linux 7.2.14
+(`build/scratch/schedattrorder/{q,r,s,order}.c`), `PAGE_SIZE = 4096`:
+
+| call | Linux | MPOS before §6.116 | now |
+|---|---|---|---|
+| `getattr(pid, a, usize<48 or >4096, 0)` | `EINVAL` on self/nobody/-1 alike | nobody → `ESRCH`, `4097` served | `EINVAL` on all |
+| `getattr(nobody, a, 48, flags=1)` | `ESRCH` (lookup before flags) | `EINVAL` | `ESRCH` |
+| `getattr(self, a, usize=2^32+48, 0)` | `0` (32-bit truncation) | `0` | `0` |
+| `getattr(self, BAD, 48, flags=1)` | `EINVAL` (flags before copy) | `EINVAL` | `EINVAL` |
+| `setattr(pid, a, flags=1)` | `EINVAL` on self/nobody/-1 | nobody → `ESRCH` | `EINVAL` on all |
+| `setattr(nobody, a{size=4}, 0)` | `E2BIG` (7), beats `ESRCH` | `EINVAL`/`ESRCH` | `E2BIG` |
+| `setattr(self, a{size=0}, 0)` | `0` (size 0 = kernel default) | `EINVAL` | `0` |
+| `setattr(self, a, flags=2^32)` | `0` (truncates to zero) | `EINVAL` | `0` |
+
+**Landed.** The pure contracts live in host-compiled
+`src/syscall/linux/abi.rs`: `SCHED_ATTR_SIZE_V1 = 48`,
+`sched_getattr_usize_verdict(word)` (`word as u32`, `<48` or `>PAGE_SIZE` →
+`EINVAL`), `sched_attr_flags_verdict(word)` (`u32 != 0` → `EINVAL`),
+`sched_setattr_size_verdict(size)` (`0` → default, short/over-page →
+**`E2BIG`**). `src/syscall/linux/posix.rs` shares one `sched_resolve` and gives
+each door its own measured order: `getattr` = NULL/pid → usize → lookup →
+flags → buffer; `setattr` = NULL/pid → flags → buffer → in-struct size →
+lookup → policy. Owner: `src/syscall/linux/abi.rs`,
+`src/syscall/linux/posix.rs`.
+
+Pin: `user/tests/src/bin/t-sched-attr.rs` (12 claims) — host 12/12 `PASS`,
+machine `build/boot-schedattr1.log` 12/12 `PASS`, counterfactual
+`build/boot-schedattr-cf1.log` 8 red / `FAILED` / `exit=1`, restored
+`build/boot-schedattr2.log` 12/12 `PASS`. Host unit tests: three new in
+`syscall::linux::abi::diskstat_tests` (32-bit size, 32-bit flags, E2BIG vs
+default) — `749 passed` total. Named gaps still open, measured but out of
+this intent: a bad non-NULL pointer's door-specific EFAULT/ESRCH precedence on
+a nonexistent pid combined with a short size, `sched_getparam`'s priority
+range, and `sched_rr_get_interval`'s host-configured slice value. Mechanism
+and the Linux matrix: `docs/notes/` §6.116.

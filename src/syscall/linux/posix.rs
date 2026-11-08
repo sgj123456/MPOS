@@ -48,36 +48,27 @@ const PAGE_SIZE: usize = 4096;
 /// `pid < 0` check in the old `live_thread` was dead code, so every negative
 /// pid fell through to `ESRCH`. Linux answers `EINVAL` for all seven
 /// (`build/scratch/rrinterval/neg.c`, `shapes.c`, `schedattr/p.c` on 7.2.14).
-fn sched_target(word: usize) -> Result<usize, isize> {
-    let pid = super::abi::sched_pid_verdict(word)?;
-    if pid == 0 {
+/// Resolve a pid that one of the `*_pid_verdict` functions has already
+/// vetted: `0` is the caller, a positive number is looked up in the caller's
+/// own pid namespace and a miss is `ESRCH`. The split exists because the two
+/// `sched_*attr` doors have guards that must run *between* the verdict and
+/// this lookup (§6.116); the simpler five doors call [`sched_target`] or
+/// [`sched_buffered_target`] and never need the intermediate step.
+fn sched_resolve(vetted: i32) -> Result<usize, isize> {
+    if vetted == 0 {
         return Ok(crate::sched::current().0);
     }
-    crate::sched::resolve_pid(pid as i64)
+    crate::sched::resolve_pid(vetted as i64)
         .map(|id| id.0)
         .ok_or(err::ESRCH)
 }
 
-/// The five `sched_*` doors that take a userspace struct — `sched_getparam`,
-/// `sched_setparam`, `sched_setscheduler`, `sched_getattr` and
-/// `sched_setattr` — run Linux's shared **first** guard,
-/// [`super::abi::sched_buffered_pid_verdict`], before the pid is looked up:
-/// a NULL buffer is `EINVAL` even when the pid names nobody, because the
-/// guard wins over the `ESRCH` a failed `resolve_pid` would give. With a
-/// non-NULL buffer the pid resolution below is the same as [`sched_target`]'s.
-///
-/// `sched_rr_get_interval` is the deliberate exception — no buffer guard, so
-/// its pid lookup stays first — and `sched_getscheduler` has no buffer at all;
-/// both keep [`sched_target`] (§6.114). Measured on 7.2.14 in
-/// `build/scratch/schedorder/{matrix,edges,ambig}.c`.
+fn sched_target(word: usize) -> Result<usize, isize> {
+    sched_resolve(super::abi::sched_pid_verdict(word)?)
+}
+
 fn sched_buffered_target(word: usize, buffer: usize) -> Result<usize, isize> {
-    let pid = super::abi::sched_buffered_pid_verdict(word, buffer)?;
-    if pid == 0 {
-        return Ok(crate::sched::current().0);
-    }
-    crate::sched::resolve_pid(pid as i64)
-        .map(|id| id.0)
-        .ok_or(err::ESRCH)
+    sched_resolve(super::abi::sched_buffered_pid_verdict(word, buffer)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,25 +679,37 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
 }
 
 /// `sched_setattr(pid, attr, flags)` — the extensible scheduling
-/// attributes. The struct is negotiated by size, the way `openat2`'s is:
-/// smaller than the first version is EINVAL, and the version this kernel
-/// knows is the 48-byte one. `SCHED_OTHER` with the zero priority and a
-/// nice value inside the range is the accepted shape; the deadline
-/// policy is known but unservable, and the answer is the same
-/// EOPNOTSUPP the plain family gives.
+/// attributes. The struct is negotiated by its own `size` field the way
+/// `openat2`'s is, but the guards are Linux's and their *order* is part of
+/// the answer (`build/scratch/schedattrorder/{q,r,s}.c`, 7.2.14, §6.116):
+///
+/// 1. the shared NULL-buffer/pid guard, before any lookup (§6.115);
+/// 2. `flags` as a 32-bit word — non-zero is `EINVAL`, and this guard wins
+///    over `ESRCH` (`flags = 1` on pid 999999 answers `EINVAL`, not `ESRCH`);
+/// 3. a readable 48-byte struct, then its in-struct `size`: `0` means "use
+///    the kernel's version", `0 < size < 48` and `size > PAGE_SIZE` are
+///    `E2BIG`. This guard also beats the lookup (`size = 4` on pid 999999
+///    answers `E2BIG`, not `ESRCH`), so it runs before step 4. The old
+///    handler answered `EINVAL` for every short size and accepted sizes
+///    above a page;
+/// 4. the pid lookup (`ESRCH` when it names nobody);
+/// 5. `SCHED_OTHER` with the zero priority and an in-range nice is the
+///    accepted shape; the deadline policies are known but unservable, and
+///    the answer is the same `EOPNOTSUPP` the plain family gives.
 pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const SCHED_ATTR_SIZE: usize = 48;
     let (word, attr, flags) = (args[0], args[1], args[2]);
     // The NULL-buffer guard runs before the pid lookup (§6.115): a NULL attr
     // is EINVAL whether or not the pid names a task.
-    let target = match sched_buffered_target(word, attr) {
-        Ok(target) => target,
+    let pid = match super::abi::sched_buffered_pid_verdict(word, attr) {
+        Ok(pid) => pid,
         Err(e) => return e,
     };
-    if flags != 0 {
-        return err::EINVAL;
+    // Then flags — Linux reads the word as a 32-bit unsigned int and refuses
+    // it *before* looking the pid up, so it wins over ESRCH for pid 999999.
+    if let Err(e) = super::abi::sched_attr_flags_verdict(flags) {
+        return e;
     }
-    if !buffer_ok(attr, SCHED_ATTR_SIZE, false, from_user) {
+    if !buffer_ok(attr, super::abi::SCHED_ATTR_SIZE_V1, false, from_user) {
         return err::EFAULT;
     }
     let (size, policy, nice) = unsafe {
@@ -716,9 +719,16 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             ((attr + 16) as *const i32).read_unaligned(),
         )
     };
-    if size < SCHED_ATTR_SIZE as u32 {
-        return err::EINVAL;
+    // The in-struct size guard also beats the lookup: `q.c` measured E2BIG
+    // for size 4/47/4097 on pid 999999, where an ESRCH-first handler would
+    // answer ESRCH. Only after it passes do we ask who the pid names.
+    if let Err(e) = super::abi::sched_setattr_size_verdict(size) {
+        return e;
     }
+    let target = match sched_resolve(pid) {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
     match policy {
         // SCHED_OTHER: apply the nice to the same per-task slot `setpriority`
         // writes and `sched_getattr` reads, so the value is real and round-trips
@@ -744,23 +754,49 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// written into the caller's struct up to the smaller of the two sizes.
 /// The answer is the 48-byte first version: SCHED_OTHER, the task's real
 /// nice, priority zero, no flags.
+///
+/// The guards are Linux's and their order is part of the answer
+/// (`build/scratch/schedattrorder/{q,r,s,order}.c`, 7.2.14, §6.116):
+///
+/// 1. the shared NULL-buffer/pid guard, before any lookup (§6.115);
+/// 2. `size` as a 32-bit word — below 48 bytes or above `PAGE_SIZE` is
+///    `EINVAL`, and this guard wins over `ESRCH` (pid 999999 with `size = 0`
+///    answers `EINVAL`, `r.c`). The size comes from the *argument*, not the
+///    struct: `order.c` measured a struct whose `size = 4` still served when
+///    the argument was 48;
+/// 3. the pid lookup (`ESRCH` when it names nobody) — it beats the `flags`
+///    guard (`r.c`: pid 999999 with `flags = 1` answers `ESRCH`), the
+///    opposite of `sched_setattr`'s order;
+/// 4. `flags` as a 32-bit word — non-zero is `EINVAL`, but it beats the
+///    `EFAULT` a bad pointer would give (`order.c`: `flags = 1`, pointer `0x1`
+///    answers `EINVAL`);
+/// 5. a writable 48-byte struct (`EFAULT`), then the write.
+///
+/// Before this the handler resolved the pid first, compared the full 64-bit
+/// `size` with `< 48`, and checked `flags` before the lookup too — three
+/// shapes the measurements above contradict.
 pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const SCHED_ATTR_SIZE: usize = 48;
-    let (word, attr, size, flags) = (args[0], args[1], args[2], args[3]);
+    let (word, attr, usize_word, flags) = (args[0], args[1], args[2], args[3]);
     // The NULL-buffer guard runs before the pid lookup (§6.115): a NULL attr
-    // is EINVAL whether or not the pid names a task. The `size`/`flags`
-    // guards keep their own, different order — a separate named gap.
-    let target = match sched_buffered_target(word, attr) {
+    // is EINVAL whether or not the pid names a task.
+    let pid = match super::abi::sched_buffered_pid_verdict(word, attr) {
+        Ok(pid) => pid,
+        Err(e) => return e,
+    };
+    // The 32-bit size guard beats the lookup, so it is asked before it.
+    if let Err(e) = super::abi::sched_getattr_usize_verdict(usize_word) {
+        return e;
+    }
+    let target = match sched_resolve(pid) {
         Ok(target) => target,
         Err(e) => return e,
     };
-    if flags != 0 {
-        return err::EINVAL;
+    // flags is after the lookup but before the copy: a nonexistent pid wins
+    // ESRCH, while a bad pointer with a nonzero flags word still wins EINVAL.
+    if let Err(e) = super::abi::sched_attr_flags_verdict(flags) {
+        return e;
     }
-    if size < SCHED_ATTR_SIZE {
-        return err::EINVAL;
-    }
-    if !buffer_ok(attr, SCHED_ATTR_SIZE, true, from_user) {
+    if !buffer_ok(attr, super::abi::SCHED_ATTR_SIZE_V1, true, from_user) {
         return err::EFAULT;
     }
     // Read the task's real nice from the same per-task slot `setpriority` and
@@ -770,8 +806,8 @@ pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     // what had been set.
     let nice = crate::sched::nice_of(target).unwrap_or(0);
     unsafe {
-        core::ptr::write_bytes(attr as *mut u8, 0, SCHED_ATTR_SIZE);
-        (attr as *mut u32).write_unaligned(SCHED_ATTR_SIZE as u32);
+        core::ptr::write_bytes(attr as *mut u8, 0, super::abi::SCHED_ATTR_SIZE_V1);
+        (attr as *mut u32).write_unaligned(super::abi::SCHED_ATTR_SIZE_V1 as u32);
         ((attr + 4) as *mut u32).write_unaligned(0); // policy: SCHED_OTHER
         ((attr + 16) as *mut i32).write_unaligned(nice);
     }
