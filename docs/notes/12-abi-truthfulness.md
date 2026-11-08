@@ -292,7 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-08, `getrusage`'s `ru_maxrss` §6.113):**
+**Latest measured gate (2026-11-08, the seven `sched_*` doors' `pid_t` §6.114):**
+`build/gate-schedpid.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
+green on both arms (no contention reds): stage 1 `1245 tests, 0 failed`
+(61.24 s); x86_64 `pass=279 fail=0 (279 built)`, `mpos-kunit 35 passed, 0 failed`,
+`exit 33`, `total 61.44 s (previous green run 64.92 s, -5.4%)`; aarch64
+`pass=278 fail=0 (278 built)`, `mpos-kunit 35 passed, 0 failed`, reached `=== END`,
+`total 194.46 s (previous green run 183.98 s, +5.7%)`. `=== PASS t-sched-pid`
+sits in both aggregates (`build/test-serial.log:4061`,
+`build/aarch64-test-serial.log:10119`): all six rows are `[22 × 7]` for `-1`, `-2`
+and `2^32-1`, `[3 × 7]` for `999999`, and all-success for `0` and `2^32` — i.e.
+seven doors each, on each machine. The three discriminating rows were red on the
+unfixed kernel (`build/boot-schedpid-cf1.log`: `FAIL: all seven sched doors answer
+22 for pid -1 ([3, 3, 3, 3, 3, 3, 3])` and the same for `-2` and `2^32-1`,
+`FAILED`, `exit=1`) and green with it (`build/boot-schedpid1.log`, and after the
+stash pop `build/boot-schedpid2.log`). Host 6/6 `PASS`, 745 host unit tests.
+
+**Measured gate before it (2026-11-08, `getrusage`'s `ru_maxrss` §6.113):**
 `build/gate-maxrss.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
 green on both arms (no contention reds this time): stage 1 `1244 tests, 0 failed`
 (64.72 s); x86_64 `pass=278 fail=0 (278 built)`, `mpos-kunit 35 passed, 0 failed`,

@@ -9971,3 +9971,47 @@ The ten remaining counters stay an honest, named zero: the minor/major fault
 split needs `MappedObject::frame_at` to say whether a fault went to a device.
 Mechanism and the five Linux readings (`build/scratch/maxrss/{q,r,s,t,u}.c`):
 `docs/notes/` §6.113.
+
+### Item 227 - the seven `sched_*` doors read `pid` as a 32-bit `pid_t` (2026-11-08, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| pid `-1` / `-2` (all seven doors) | `EINVAL` (-22) | `ESRCH` (-3) | `EINVAL` |
+| pid `0` (self) | success | success | success |
+| pid `999999` (nobody) | `ESRCH` (-3) | `ESRCH` | `ESRCH` |
+| the full word `2^32` | truncates to `0` → self, success | `ESRCH` | success |
+| the full word `2^32-1` | truncates to `-1` → `EINVAL` | `ESRCH` | `EINVAL` |
+
+The seven doors are `sched_setparam`, `sched_getparam`, `sched_setscheduler`,
+`sched_getscheduler`, `sched_rr_get_interval`, `sched_setattr` and
+`sched_getattr` (`nr.rs:470-478` / `nr_aarch64.rs:259-267`, all wired in
+`src/syscall/linux/mod.rs:650-658`). `build/scratch/schedpid/vector.c` measured
+the whole 7×6 errno matrix with raw `syscall()` so the full 64-bit word reaches
+the kernel; `w.c` pinned the `pid_t` truncation one value at a time.
+
+**Landed.** `src/syscall/linux/posix.rs`'s `live_thread(pid: isize)` had a
+`pid < 0` guard that was dead code: all seven handlers passed
+`args[0] as isize`, a 64-bit register, so userspace `-1`
+(`0xffff_ffff_ffff_ffff`) became a huge positive number and `resolve_pid`
+answered "nobody" → `ESRCH`. The shared verdict now lives host-side in
+`src/syscall/linux/abi.rs`: `pub(crate) fn sched_pid_verdict(word: usize) ->
+Result<i32, isize>` truncates to `i32`, answers `EINVAL` for a negative result,
+and `fn sched_target(word: usize) -> Result<usize, isize>` maps `0` to
+`current()` and a positive number through `resolve_pid` (ESRCH when nobody
+answers). All seven handlers call it with the raw word; their existing
+buffer/policy check order is unchanged. Owner: `src/syscall/linux/abi.rs`,
+`src/syscall/linux/posix.rs`.
+
+Pin: `user/tests/src/bin/t-sched-pid.rs` (6 claims, one per pid word, all seven
+doors each) — host 6/6 `PASS`, machine `build/boot-schedpid1.log` 6/6 `PASS`,
+counterfactual `build/boot-schedpid-cf1.log` three red rows (`[3 * 7]` for the
+negative words) / `FAILED` / `exit=1`, restored `build/boot-schedpid2.log`
+6/6 `PASS`. Host unit test
+`syscall::linux::abi::diskstat_tests::a_sched_pid_is_a_signed_32_bit_word_and_negative_is_einval`
+pins the verdict against a literal-ESRCH implementation. Named gaps left by
+this item (not in its intent): the doors' refusal *ordering*
+(`sched_getparam` checks its buffer before the pid, `sched_rr_get_interval`
+checks the pid first — `build/scratch/schedattr/shapes.c`), and
+`sched_rr_get_interval`'s slice *value*, which is host-configuration-dependent
+(2 ms / 100 ms / 0 measured on SCHED_OTHER / RR / FIFO) and must be refused
+rather than approximated. Mechanism and the Linux matrix: `docs/notes/` §6.114.

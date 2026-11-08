@@ -28,24 +28,34 @@ use crate::syscall::{ARG_COUNT, buffer_ok, err};
 /// The x86_64 page size, as the memory calls here round with it.
 const PAGE_SIZE: usize = 4096;
 
-/// Whether `pid` names a live task, and which thread group it belongs to.
-/// `0` is the caller. The answer is the man page's pair of questions at
-/// once: a caller wants to know "does it exist" (ESRCH when not) and,
-/// for the tgkill family, "is the group the one I named".
-fn live_thread(pid: isize) -> Option<usize> {
-    if pid < 0 {
-        return None;
-    }
+/// Resolve the `sched_*` family's `pid` word to the task it names, or the
+/// errno that refuses the word. `0` is the caller.
+///
+/// The word is a 64-bit register but Linux reads it as a signed 32-bit
+/// `pid_t`: [`super::abi::sched_pid_verdict`] does that truncation and refuses
+/// a negative result with `EINVAL` before this function ever looks at the
+/// task table. A positive number is then resolved in the **caller's** pid
+/// namespace, like every other pid this kernel is handed — `snapshot` takes a
+/// slot, and in the init namespace the two are the same number, which is why
+/// the namespace half read as correct for so long (`docs/notes/` §6.91,
+/// `t-nsnumbers`). A number naming no task is `ESRCH`; those are two
+/// different refusals and a caller branches on which one it got.
+///
+/// Seven doors share this reading — `sched_setparam`, `sched_getparam`,
+/// `sched_setscheduler`, `sched_getscheduler`, `sched_rr_get_interval`,
+/// `sched_setattr` and `sched_getattr`. Before the verdict lived here, a
+/// userspace `-1` arrived as `0xffff_ffff` or `0xffff_ffff_ffff_ffff` and the
+/// `pid < 0` check in the old `live_thread` was dead code, so every negative
+/// pid fell through to `ESRCH`. Linux answers `EINVAL` for all seven
+/// (`build/scratch/rrinterval/neg.c`, `shapes.c`, `schedattr/p.c` on 7.2.14).
+fn sched_target(word: usize) -> Result<usize, isize> {
+    let pid = super::abi::sched_pid_verdict(word)?;
     if pid == 0 {
-        return Some(crate::sched::current().0);
+        return Ok(crate::sched::current().0);
     }
-    // The number is read in the **caller's** namespace, like every other pid
-    // this kernel is handed. `snapshot` takes a slot, and in the init namespace
-    // the two are the same number - which is exactly why this read as correct
-    // for so long: inside a namespace `sched_getparam(2)` resolved 2 to slot 2
-    // and answered `ESRCH` about a task the number did not name
-    // (`docs/notes/` §6.91, `t-nsnumbers`).
-    crate::sched::resolve_pid(pid as i64).map(|id| id.0)
+    crate::sched::resolve_pid(pid as i64)
+        .map(|id| id.0)
+        .ok_or(err::ESRCH)
 }
 
 // ---------------------------------------------------------------------------
@@ -520,9 +530,9 @@ pub fn handle_capset(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// other than SCHED_OTHER's zero is EINVAL - the man page's own answer
 /// for a priority outside the policy's range.
 pub fn handle_sched_setparam(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (pid, param) = (args[0] as isize, args[1]);
-    if live_thread(pid).is_none() {
-        return err::ESRCH;
+    let (word, param) = (args[0], args[1]);
+    if let Err(e) = sched_target(word) {
+        return e;
     }
     if param == 0 || !buffer_ok(param, 4, false, from_user) {
         return err::EFAULT;
@@ -537,9 +547,9 @@ pub fn handle_sched_setparam(args: [usize; ARG_COUNT], from_user: bool) -> isize
 /// `sched_getparam(pid, param)` — the priority the task runs at, which is
 /// the policy's zero.
 pub fn handle_sched_getparam(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (pid, param) = (args[0] as isize, args[1]);
-    if live_thread(pid).is_none() {
-        return err::ESRCH;
+    let (word, param) = (args[0], args[1]);
+    if let Err(e) = sched_target(word) {
+        return e;
     }
     if param == 0 || !buffer_ok(param, 4, true, from_user) {
         return err::EFAULT;
@@ -558,9 +568,9 @@ pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> i
     const SCHED_OTHER: usize = 0;
     const SCHED_FIFO: usize = 1;
     const SCHED_RR: usize = 2;
-    let (pid, policy, param) = (args[0] as isize, args[1], args[2]);
-    if live_thread(pid).is_none() {
-        return err::ESRCH;
+    let (word, policy, param) = (args[0], args[1], args[2]);
+    if let Err(e) = sched_target(word) {
+        return e;
     }
     match policy {
         // SCHED_OTHER is this scheduler, so switching to it is the success it
@@ -596,8 +606,8 @@ pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> i
 /// `sched_getscheduler(pid)` — the policy in force, which is SCHED_OTHER:
 /// the round-robin-with-bands this kernel runs is what that name means.
 pub fn handle_sched_getscheduler(args: [usize; ARG_COUNT]) -> isize {
-    if live_thread(args[0] as isize).is_none() {
-        return err::ESRCH;
+    if let Err(e) = sched_target(args[0]) {
+        return e;
     }
     0
 }
@@ -633,9 +643,9 @@ fn priority_bound(policy: usize, max: bool) -> isize {
 /// timespec the caller filled. The scheduler's slice is one tick, the
 /// 10ms the timer runs at.
 pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (pid, tp) = (args[0] as isize, args[1]);
-    if live_thread(pid).is_none() {
-        return err::ESRCH;
+    let (word, tp) = (args[0], args[1]);
+    if let Err(e) = sched_target(word) {
+        return e;
     }
     if tp == 0 || !buffer_ok(tp, 16, true, from_user) {
         return err::EFAULT;
@@ -657,9 +667,10 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
 /// EOPNOTSUPP the plain family gives.
 pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
-    let (pid, attr, flags) = (args[0] as isize, args[1], args[2]);
-    let Some(target) = live_thread(pid) else {
-        return err::ESRCH;
+    let (word, attr, flags) = (args[0], args[1], args[2]);
+    let target = match sched_target(word) {
+        Ok(target) => target,
+        Err(e) => return e,
     };
     if flags != 0 {
         return err::EINVAL;
@@ -704,9 +715,10 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// nice, priority zero, no flags.
 pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
-    let (pid, attr, size, flags) = (args[0] as isize, args[1], args[2], args[3]);
-    let Some(target) = live_thread(pid) else {
-        return err::ESRCH;
+    let (word, attr, size, flags) = (args[0], args[1], args[2], args[3]);
+    let target = match sched_target(word) {
+        Ok(target) => target,
+        Err(e) => return e,
     };
     if flags != 0 {
         return err::EINVAL;

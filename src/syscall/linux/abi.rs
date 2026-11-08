@@ -3867,6 +3867,44 @@ pub(super) fn position_offset(args: [usize; 6]) -> i64 {
     args[3] as i64
 }
 
+// ---------------------------------------------------------------------------
+// sched_*(2): the pid word the seven doors share
+// ---------------------------------------------------------------------------
+
+/// The `pid` argument of the whole `sched_*` family, read the way Linux reads
+/// it: a signed 32-bit `pid_t`, not the 64-bit register word the handler is
+/// handed.
+///
+/// Seven doors share the reading — `sched_setparam`, `sched_getparam`,
+/// `sched_setscheduler`, `sched_getscheduler`, `sched_rr_get_interval`,
+/// `sched_setattr` and `sched_getattr`. Linux reads the first argument into a
+/// `pid_t` before it decides anything, so a word that is negative *after the
+/// 32-bit truncation* is refused `EINVAL`, while the same low bits in a wider
+/// word are not: `build/scratch/schedattr/w.c` measured on 7.2.14 that
+/// `sched_getparam(-1)` is `-22`, `sched_getparam(0xffff_ffff)` is `-22`,
+/// `sched_getparam(0x1_0000_0000)` is `0` (the high bits are dropped, so it is
+/// self), and `sched_getparam(0x1_0000_0001)` is `1`. A number that names no
+/// task is `ESRCH` instead, and `0` names the caller.
+///
+/// Before this the handlers read `args[0] as isize` on the full 64-bit word:
+/// a userspace `-1` became `0xffff_ffff` or `0xffff_ffff_ffff_ffff`, i.e. a
+/// large *positive* number, so `pid < 0` was dead code and every negative pid
+/// fell through to `resolve_pid`'s `ESRCH`. That is the wrong errno, and the
+/// shape a caller branches on (`kill(-1, …)` means "every process I may
+/// signal", but a negative pid in `sched_*` is simply an invalid argument).
+/// `[`err::EINVAL`]` rather than `[`err::ESRCH`]` is the whole distinction.
+///
+/// This is the contract only: it does not consult the task table. The handler
+/// turns `Ok(0)` into the current task and resolves a positive number in the
+/// caller's own pid namespace, answering `ESRCH` when that resolution fails.
+pub(crate) fn sched_pid_verdict(word: usize) -> Result<i32, isize> {
+    let pid = word as i32;
+    if pid < 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6815,5 +6853,36 @@ mod diskstat_tests {
         assert_eq!(futex2_bitset(0), Err(-22));
         assert_eq!(futex2_bitset(u32::MAX as usize + 1), Err(-22));
         assert_eq!(futex2_bitset(usize::MAX), Err(-22));
+    }
+
+    /// `sched_*`'s `pid` is a 32-bit `pid_t`, and a negative one is `EINVAL`
+    /// rather than the `ESRCH` a failed number lookup would give. The words
+    /// below are the ones `build/scratch/schedattr/w.c` measured on 7.2.14:
+    /// the low 32 bits decide, so `2^32` is self and `2^32-1` is `-1`.
+    ///
+    /// This is a real counterfactual: the pre-fix reading (`word as isize`)
+    /// turns `-1` into a large positive number and answers `ESRCH` for every
+    /// one of the negative words, so those three assertions fail without the
+    /// truncation-and-refusal rule.
+    #[test]
+    fn a_sched_pid_is_a_signed_32_bit_word_and_negative_is_einval() {
+        // Words that are negative after the truncation: refused EINVAL.
+        assert_eq!(sched_pid_verdict((-1i32) as u32 as usize), Err(err::EINVAL));
+        assert_eq!(sched_pid_verdict((-2i32) as u32 as usize), Err(err::EINVAL));
+        assert_eq!(
+            sched_pid_verdict(i32::MIN as u32 as usize),
+            Err(err::EINVAL)
+        );
+        assert_eq!(sched_pid_verdict(0xffff_ffff_ffff_ffff), Err(err::EINVAL));
+
+        // Zero is the caller, a positive number is handed to the resolver.
+        assert_eq!(sched_pid_verdict(0), Ok(0));
+        assert_eq!(sched_pid_verdict(1), Ok(1));
+        assert_eq!(sched_pid_verdict(999_999), Ok(999_999));
+
+        // The high bits are dropped: 2^32 is self, 2^32-1 is -1, 2^32+1 is 1.
+        assert_eq!(sched_pid_verdict(0x1_0000_0000), Ok(0));
+        assert_eq!(sched_pid_verdict(0x1_0000_0001), Ok(1));
+        assert_eq!(sched_pid_verdict(0xffff_ffff), Err(err::EINVAL));
     }
 }

@@ -376,6 +376,19 @@ One-glance status of the whole roadmap.
   baseline is ~1.09 GB); `t-wait4`'s "twelve unmeasured counters" claim moved to eleven with a new
   positive-peak claim. The remaining ten counters stay an honest, named zero — the minor/major
   fault split needs `MappedObject::frame_at` to report device I/O (`§6.113`, item 226).
+- [x] the seven `sched_*` doors read `pid` as Linux's signed 32-bit `pid_t` —
+  a negative word is `EINVAL`, a positive number naming nobody is `ESRCH`, and
+  the full words `2^32`/`2^32-1` truncate to self/`-1`. Before it,
+  `live_thread`'s `pid < 0` guard was dead code: every handler passed
+  `args[0] as isize` (a 64-bit register), so userspace `-1` became a huge
+  positive number and all seven doors answered `ESRCH`. `sched_pid_verdict`
+  now truncates and refuses in host-compiled `abi.rs`; `sched_target` resolves
+  the rest. Pin `t-sched-pid` (6 claims, all seven doors each; three red
+  without the fix — `[3 × 7]` for the negative words). The doors' refusal
+  *ordering* (`sched_getparam` checks its buffer before the pid,
+  `rr_get_interval` checks the pid first) and `rr_get_interval`'s
+  configuration-dependent slice value stay named, unmeasured gaps
+  (`§6.114`, item 227).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

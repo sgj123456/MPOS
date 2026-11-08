@@ -8822,3 +8822,79 @@ The remaining ten counters (`ru_minflt`/`ru_majflt`, block I/O, IPC,
 `ru_nsignals`) stay an honest, named zero: the fault split needs
 `MappedObject::frame_at` to say whether a fault went to a device, which it does
 not (§6.105).
+
+### 6.114 the seven `sched_*` doors read a 64-bit register where Linux reads a `pid_t` (LANDED 2026-11-08)
+
+Measured on Linux 7.2.14 (`build/scratch/schedpid/vector.c`, musl static, raw
+`syscall()` so the *full 64-bit word* reaches the kernel and the truncation is
+the kernel's, not a userspace wrapper's). Each row is the errno of all seven
+doors — `sched_setparam`, `sched_getparam`, `sched_setscheduler`,
+`sched_getscheduler`, `sched_rr_get_interval`, `sched_setattr`,
+`sched_getattr` — for one pid word; `0` means success:
+
+```
+-1       setparam=22 getparam=22 setsched=22 getsched=22 rr_int=22 setattr=22 getattr=22
+-2       setparam=22 getparam=22 setsched=22 getsched=22 rr_int=22 setattr=22 getattr=22
+0        setparam=0  getparam=0  setsched=0  getsched=0  rr_int=0  setattr=0  getattr=0
+999999   setparam=3  getparam=3  setsched=3  getsched=3  rr_int=3  setattr=3  getattr=3
+2^32     setparam=0  getparam=0  setsched=0  getsched=0  rr_int=0  setattr=0  getattr=0
+2^32-1   setparam=22 getparam=22 setsched=22 getsched=22 rr_int=22 setattr=22 getattr=22
+```
+
+`build/scratch/schedpid/w.c` pinned the truncation one value at a time
+(`4294967296 -> self`, `4294967295 -> EINVAL`, `4294967297 -> pid 1`): the kernel
+reads the pid as a **signed 32-bit `pid_t`**. `2^32` truncates to `0` (self) and
+`2^32-1` truncates to `-1`, so those two rows exactly repeat `0` and `-1`. A
+negative pid is `EINVAL`(-22), a positive number naming nobody is `ESRCH`(-3)
+— two different refusals, not one "not found".
+
+**The defect.** `src/syscall/linux/posix.rs`'s `fn live_thread(pid: isize)`
+opened with `if pid < 0 { return None; }`, but every one of the seven handlers
+called it with `args[0] as isize` — a 64-bit register value. A userspace `-1`
+arrives as `0xffff_ffff_ffff_ffff`, which is a huge *positive* `isize`, so the
+`pid < 0` guard was dead code and `resolve_pid` was handed a number that named
+nobody. All seven doors answered `ESRCH`(-3) for `-1`, `-2` and `2^32-1`, and
+`2^32` (which Linux reads as self) also went to `resolve_pid` as "nobody" and
+answered `ESRCH` instead of success. §6.91 had already fixed these doors to
+resolve a number *in the caller's namespace*; that fix kept the 64-bit read,
+which is why the negative-pid shape stayed wrong.
+
+**The fix is one shared verdict, not seven patches.**
+`src/syscall/linux/abi.rs` (host-compiled, so it can be unit-tested) gains
+`pub(crate) fn sched_pid_verdict(word: usize) -> Result<i32, isize>`: truncate
+to `i32` first, `Err(err::EINVAL)` for a negative result, else `Ok(pid)`.
+`posix.rs`'s `live_thread` becomes `fn sched_target(word: usize) -> Result<usize,
+isize>`: it asks that verdict, maps `0` to `current()` and a positive number
+through `resolve_pid` (ESRCH when nobody answers), and the seven handlers now
+start with `if let Err(e) = sched_target(word) { return e; }` (or bind `target`
+for the two `sched_*attr` doors that need it). Every handler's existing
+buffer/policy check order is left exactly as it was. The host unit test
+`a_sched_pid_is_a_signed_32_bit_word_and_negative_is_einval` pins the verdict
+against `-1/-2/i32::MIN/0xffff_ffff -> EINVAL`, `0/1/999999 -> Ok`, and the two
+truncations `2^32 -> 0`, `2^32-1 -> EINVAL`; a literal-ESRCH implementation
+would be red.
+
+Pin `user/tests/src/bin/t-sched-pid.rs` (6 claims, one per pid word): it calls
+the **raw** syscalls with the full 64-bit word — a libc wrapper such as
+`sched_getparam(pid as i32, ..)` would truncate in userspace and hide the bug —
+and asserts all seven doors answer the same errno. Host 6/6 `PASS`; machine
+`build/boot-schedpid1.log` 6/6 `PASS` (`-1/-2/2^32-1` all `[22 * 7]`,
+`999999` all `[3 * 7]`, `0/2^32` all success). Counterfactual: `git stash` of
+`abi.rs` + `posix.rs` + rebuild kernel *and* loader
+(`build/boot-schedpid-cf1.log`) → three red rows reading `[3 * 7]` where Linux
+answers `22`, `FAILED`, `exit=1`; `git stash pop` + rebuild +
+`build/boot-schedpid2.log` returns to 6/6 `PASS`.
+
+**The rule.** A syscall argument is the width its ABI says it is. Reading a
+64-bit register where Linux reads a `pid_t` did not just mis-answer `-1`: it
+made a whole guard unreachable and made `2^32` name a different task than Linux
+names. When the same wrong shape appears in seven handlers, the fix belongs in
+the one function they all share, and that function belongs host-side where its
+truncation can be pinned. The refusal-*ordering* differences between the doors
+(`sched_getparam` checks its buffer before the pid, `sched_rr_get_interval`
+checks the pid first — `build/scratch/schedattr/shapes.c`) are a separate named
+gap; this change deliberately keeps every handler's existing order and the pin
+uses only well-formed buffers. `sched_rr_get_interval`'s slice value itself is
+also still host-configuration-dependent (§6.114's own measurement: 2 ms on
+SCHED_OTHER, 100 ms on SCHED_RR, 0 on SCHED_FIFO) and remains a named gap —
+refuse-not-approximate, not a value to guess.
