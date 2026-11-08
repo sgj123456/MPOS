@@ -292,7 +292,27 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-07, `/proc/<pid>/stat`'s `exit_code` §6.112):**
+**Latest measured gate (2026-11-08, `getrusage`'s `ru_maxrss` §6.113):**
+`build/gate-maxrss.log` — a single combined run with `MPOS_TEST_LANES=2`, fully
+green on both arms (no contention reds this time): stage 1 `1244 tests, 0 failed`
+(64.72 s); x86_64 `pass=278 fail=0 (278 built)`, `mpos-kunit 35 passed, 0 failed`,
+`exit 33`, `total 64.92 s (previous green run 97.05 s, -33.1%)`; aarch64
+`pass=277 fail=0 (277 built)`, `mpos-kunit 35 passed, 0 failed`, reached `=== END`,
+`total 183.98 s (previous green run 136.75 s, +34.5%)`. `=== PASS
+t-rusage-maxrss` sits in both aggregates (`build/test-serial.log:8980`,
+`build/aarch64-test-serial.log:9989`): x86_64 `touching 32 MiB moves the peak by
+at least half of it (476 -> 33244 kB)` and `the big child's peak folds into
+RUSAGE_CHILDREN (0 -> 33252, wait4 33252 kB)`; aarch64 `(452 -> 33220 kB)` and
+`(0 -> 33228, wait4 33228 kB)`. `=== PASS t-wait4` in both aggregates too
+(`build/test-serial.log:546`, `build/aarch64-test-serial.log:913`) — its moved
+claim is green on the machine. The four discriminating claims were red on the
+unfixed kernel (`build/boot-maxrss-cf1.log`: `touching 32 MiB ... (0 -> 0 kB)`,
+`wait4 reports the child's peak (0 against 0 kB)`, and two CHILDREN claims; the
+strengthened `c1 > 0` in `build/boot-maxrss-cf2.log` made it four) and green with
+it (`build/boot-maxrss1.log`, and after the stash pop
+`build/boot-maxrss2.log`). Host 10/10 `PASS`, `mpos_abi` 11 host tests.
+
+**Measured gate before it (2026-11-07, `/proc/<pid>/stat`'s `exit_code` §6.112):**
 `build/gate-exitcode.log` (combined run) — stage 1 `1243 tests, 0 failed` (96.85 s);
 x86_64 `pass=277 fail=0 (277 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
 `total 97.05 s (-5.6%)`; aarch64 of that run was `pass=274 fail=2 (276 built)`,

@@ -356,19 +356,32 @@ fn main() {
         if host_run() {
             r.check(
                 "note: the host fills ru_maxrss/fault/switch counters from the child; this \
-                 kernel measures the CPU and leaves them zero",
+                 kernel measures the CPU, the peak and the switches and leaves the fault \
+                 counters zero",
                 true,
             );
         } else {
-            // The twelve fault/block-I/O/IPC counters are still not measured by
+            // The eleven fault/block-I/O/IPC counters are still not measured by
             // this kernel, and the record is zeroed before it is filled - an
-            // honest "nothing measured" rather than a plausible number. The
-            // last two are no longer unmeasured: `ru_nvcsw`/`ru_nivcsw` are the
-            // child's context switches, counted since `§6.105`, so they are
-            // asked about separately and are no longer part of this claim.
+            // honest "nothing measured" rather than a plausible number. Two
+            // ranges have moved out of this claim as their fields were served:
+            // `ru_nvcsw`/`ru_nivcsw` since `§6.105` (the last two), and
+            // `ru_maxrss` since `§6.113` (the first). Each is asked about
+            // separately below, so "unmeasured" stays a shrinking, named set.
             r.check(
-                "the twelve unmeasured counters are zero, not the caller's own seed",
-                ru.counters[..12].iter().all(|c| *c == 0),
+                "the eleven unmeasured counters are zero, not the caller's own seed",
+                ru.counters[1..12].iter().all(|c| *c == 0),
+            );
+            // `ru_maxrss` is the child's resident-set high water in KB. The
+            // burner inherited the loaded image's frames through fork, so its
+            // peak is strictly positive; a zero here would be the old literal
+            // (or the caller's `-1` seed leaking through), not an answer.
+            r.check(
+                &format!(
+                    "and the child's resident-set peak is written, not a zero or a seed ({})",
+                    ru.counters[0]
+                ),
+                ru.counters[0] > 0,
             );
             // A child that burnt CPU and exited: this kernel counts the switch
             // that left the ready queue without exiting, and a burn is taken

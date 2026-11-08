@@ -583,6 +583,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             retired.code,
             retired.dumped,
             (retired.utime, retired.stime),
+            retired.maxrss,
             (retired.nvcsw, retired.nivcsw),
             status,
             rusage,
@@ -624,6 +625,7 @@ fn finish_wait_event(
             stime,
             nvcsw,
             nivcsw,
+            maxrss,
             ..
         } => finish_wait(
             id,
@@ -631,6 +633,7 @@ fn finish_wait_event(
             code,
             dumped,
             (utime, stime),
+            maxrss,
             (nvcsw, nivcsw),
             status,
             rusage,
@@ -651,6 +654,7 @@ fn finish_wait_event(
             &[],
             abi::stop_status(signal, event),
             (utime, stime),
+            crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
             status,
             rusage,
@@ -661,6 +665,7 @@ fn finish_wait_event(
             &[],
             abi::CONTINUED_STATUS,
             (utime, stime),
+            crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
             status,
             rusage,
@@ -676,6 +681,7 @@ fn write_wait_status(
     numbers: &[(u64, u32)],
     word: i32,
     cpu: (u64, u64),
+    maxrss_kb: u64,
     switches: (u64, u64),
     status: usize,
     rusage: usize,
@@ -687,7 +693,7 @@ fn write_wait_status(
         }
         unsafe { (status as *mut i32).write_unaligned(word) };
     }
-    match write_wait_rusage(rusage, cpu, switches, from_user) {
+    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, from_user) {
         Some(e) => e,
         None => pid_answer(id, numbers),
     }
@@ -739,6 +745,7 @@ fn finish_wait(
     code: isize,
     dumped: bool,
     cpu: (u64, u64),
+    maxrss_kb: u64,
     switches: (u64, u64),
     status: usize,
     rusage: usize,
@@ -752,7 +759,7 @@ fn finish_wait(
         // it is spelled in `abi`, tested on the host.
         unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code, dumped)) };
     }
-    match write_wait_rusage(rusage, cpu, switches, from_user) {
+    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, from_user) {
         Some(e) => e,
         None => pid_answer(id, numbers),
     }
@@ -769,17 +776,20 @@ fn finish_wait(
 /// returned a pid and `waitid` when it reported an event, so the `WNOHANG`
 /// "nothing yet" zero and `ECHILD` leave the caller's bytes alone (measured,
 /// `.workbuddy/probe_wait4_rusage.c` scenarios J, K, L and M, Linux 7.2.9: all
-/// four leave a 0xAA-filled struct untouched).
+/// four leave a 0xAA-filled struct untouched). A death's peak comes off the
+/// record (`RUSAGE_BOTH`, own MAX reaped children); a stop or resume asks the
+/// still-live task through `maxrss_of`.
 fn write_wait_rusage(
     ptr: usize,
     cpu: (u64, u64),
+    maxrss_kb: u64,
     switches: (u64, u64),
     from_user: bool,
 ) -> Option<isize> {
     if ptr == 0 {
         return None;
     }
-    write_rusage(ptr, cpu.0, cpu.1, switches, from_user)
+    write_rusage(ptr, cpu.0, cpu.1, maxrss_kb, switches, from_user)
 }
 
 /// Write `struct rusage` from a pair of internal clock ticks: the two opening
@@ -788,12 +798,15 @@ fn write_wait_rusage(
 ///
 /// Both wait doors and `getrusage` call this, because seconds-and-microseconds
 /// off a tick count is one derivation and not three. The two opening
-/// `timeval`s carry the CPU; `ru_nvcsw`/`ru_nivcsw` carry the context switches
-/// at their Linux offsets (128 and 136 of the 144-byte record), because those
-/// the kernel does count - a task that blocks and a task that is preempted are
-/// two different facts a program asks about by name. The twelve byte/page
-/// counters between them stay zero: this kernel measures CPU and switches and
-/// nothing else, so an honest zero rather than a plausible number.
+/// `timeval`s carry the CPU; `ru_maxrss` (offset 32) carries the resident-set
+/// high water in KB; `ru_nvcsw`/`ru_nivcsw` carry the context switches at
+/// their Linux offsets (128 and 136 of the 144-byte record). Those three the
+/// kernel does count - a task that blocks and a task that is preempted are two
+/// different facts a program asks about by name, and a peak is a fact about
+/// the past that no current count can answer (§6.113). The remaining
+/// byte/page counters stay zero: this kernel measures CPU, switches and the
+/// resident peak and nothing else, so an honest zero rather than a plausible
+/// number.
 ///
 /// `None` when the struct was written, or the errno to answer with when the
 /// pointer is not writeable. A failed check leaves the caller's bytes alone; the
@@ -802,6 +815,7 @@ fn write_rusage(
     usage: usize,
     utime: u64,
     stime: u64,
+    maxrss_kb: u64,
     switches: (u64, u64),
     from_user: bool,
 ) -> Option<isize> {
@@ -822,9 +836,15 @@ fn write_rusage(
     let usecs = ((stime % hz) * 1_000_000 / hz) as i64;
     wire[16..24].copy_from_slice(&secs.to_le_bytes()); // ru_stime.tv_sec
     wire[24..32].copy_from_slice(&usecs.to_le_bytes()); // ru_stime.tv_usec
+    // `ru_maxrss` is the long at 32, in KB. Linux's high water does not fall
+    // on `munmap` even where `/proc`'s `VmHWM` dips (`build/scratch/maxrss/
+    // t.c`), and a `wait` reports the child's own peak MAX its reaped
+    // children's (`build/scratch/maxrss/r.c`, `u.c`) - both of which the
+    // snapshot/record hands us already folded.
+    wire[32..40].copy_from_slice(&maxrss_kb.to_le_bytes()); // ru_maxrss
     // Linux's `struct rusage` puts the two switch counters last:
-    // `ru_nvcsw` at 128 and `ru_nivcsw` at 136, after twelve counters this
-    // kernel does not measure (maxrss, the page-fault pair, block I/O, IPC).
+    // `ru_nvcsw` at 128 and `ru_nivcsw` at 136, after ten counters this
+    // kernel does not measure (the page-fault pair, block I/O, IPC).
     // They are written rather than skipped so the record's layout is the ABI's
     // and not this kernel's convenience: a caller reading `ru_nvcsw` asks a
     // question the kernel can answer, and zero would be the wrong one in a
@@ -5455,7 +5475,14 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
             (cv, civ)
         }
     };
-    write_rusage(usage, utime, stime, switches, true).unwrap_or_default()
+    // The resident peak's three-way split is simpler than the CPU's: Linux
+    // keeps the high water on the process's shared signal struct, so SELF and
+    // THREAD read the same own peak (`build/scratch/maxrss/q.c` reads them
+    // equal), while CHILDREN reads the MAX of the children this process has
+    // waited for (`build/scratch/maxrss/u.c`).
+    let (own, children) = crate::sched::current_maxrss();
+    let maxrss_kb = abi::rusage_maxrss(own, children, who == RUSAGE_CHILDREN);
+    write_rusage(usage, utime, stime, maxrss_kb, switches, true).unwrap_or_default()
 }
 
 /// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
@@ -5598,7 +5625,13 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     // leaves the record exactly as the caller wrote it when the rusage pointer
     // is the one that cannot be written (P).
     if let Some(reported) = &answer.reported {
-        if let Some(e) = write_wait_rusage(rusage, reported.cpu, reported.switches, from_user) {
+        if let Some(e) = write_wait_rusage(
+            rusage,
+            reported.cpu,
+            reported.maxrss,
+            reported.switches,
+            from_user,
+        ) {
             return e;
         }
     }
@@ -5664,6 +5697,7 @@ struct Reported {
     status: i32,
     uid: u32,
     cpu: (u64, u64),
+    maxrss: u64,
     switches: (u64, u64),
 }
 
@@ -5836,7 +5870,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
     // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRAPPED` and `CLD_CONTINUED`
     // all report the child's real uid) and reports `cred->uid` - the real id,
     // not the effective one.
-    let (child, si_code, status, uid, cpu, switches) = match event {
+    let (child, si_code, status, uid, cpu, maxrss, switches) = match event {
         crate::sched::WaitEvent::Exited {
             id,
             code,
@@ -5847,6 +5881,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             stime,
             nvcsw,
             nivcsw,
+            maxrss,
             ..
         } => {
             let (si_code, status) = abi::exit_chld(code, dumped);
@@ -5856,6 +5891,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
                 status,
                 uid,
                 (utime, stime),
+                maxrss,
                 (nvcsw, nivcsw),
             )
         }
@@ -5876,6 +5912,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             signal as i32,
             live_uid(id),
             (utime, stime),
+            crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
         ),
         crate::sched::WaitEvent::Continued { id, utime, stime } => (
@@ -5884,6 +5921,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             signal::SIGCONT as i32,
             live_uid(id),
             (utime, stime),
+            crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
         ),
     };
@@ -5896,6 +5934,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             status,
             uid,
             cpu,
+            maxrss,
             switches,
         }),
     }

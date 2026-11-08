@@ -2971,7 +2971,9 @@ pub(crate) fn handle_getrandom(args: [usize; crate::syscall::ARG_COUNT], from_us
 // can budget a task's rlimits without an edge up into this layer. Re-exported
 // here because the `getrlimit`/`setrlimit` handlers and `rlimit_pair` below speak
 // the same `Rlimit`/`RLIM_*` vocabulary, and one table beats two.
-pub use mpos_abi::{RLIM_INFINITY, RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
+pub use mpos_abi::{
+    RLIM_INFINITY, RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit, rusage_maxrss,
+};
 
 /// The `(rlim_cur, rlim_max)` pair a resource reports. The numbers are the
 /// defaults a static musl binary needs to start: an 8 MiB stack, a generous

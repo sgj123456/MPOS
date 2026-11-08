@@ -725,6 +725,14 @@ pub(crate) struct Retired {
     /// record when the wait answers.
     pub(crate) nvcsw: u64,
     pub(crate) nivcsw: u64,
+    /// The dying group's `ru_maxrss` in KB, its own peak **plus** its reaped
+    /// children's - Linux's `RUSAGE_BOTH`, what a `wait4`/`waitid` caller's
+    /// `struct rusage` carries. Read off the `mm` at the death for `utime`'s
+    /// reason: the slot is free by the time a `wait` reads the record, and the
+    /// high-water book lives on the group's `Mm` which goes with the slot.
+    /// Measured on Linux 7.2.14 (`build/scratch/maxrss/r.c`): a child with a
+    /// ~2060 KB own peak that reaped an 8 MiB grandchild is reported `8204`.
+    pub(crate) maxrss: u64,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -2668,7 +2676,7 @@ impl Table {
                 named[task.tgid.0] += 1;
             }
         }
-        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64), (u64, u64, u64, u64))> =
+        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64), (u64, u64, u64, u64), u64)> =
             alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
@@ -2709,7 +2717,16 @@ impl Table {
             if task.tgid.0 == slot
                 && let Some(parent) = task.parent
             {
-                folds.push((parent, task.mm.cpu_all(), task.mm.switches_all()));
+                // Its `ru_maxrss` folds as a MAX, beside the CPU and switch
+                // pairs' sums: Linux's `RUSAGE_CHILDREN` reports the largest
+                // reaped child's peak, not their total (`build/scratch/maxrss/
+                // u.c`). Read while the child's `mm` is still reachable.
+                folds.push((
+                    parent,
+                    task.mm.cpu_all(),
+                    task.mm.switches_all(),
+                    task.mm.maxrss_both(),
+                ));
             }
 
             let stack = task
@@ -2734,10 +2751,11 @@ impl Table {
         // Saturating, so a child cannot wrap the parent's counter; a parent whose
         // slot is already gone has nobody left to report the child to (the
         // reparent-to-init edge, beyond what the waited case needs).
-        for (parent, child, switches) in folds {
+        for (parent, child, switches, maxrss) in folds {
             if let Some(parent_task) = self.tasks.get(parent.0).and_then(|slot| slot.as_ref()) {
                 parent_task.mm.absorb_child(child);
                 parent_task.mm.absorb_child_switches(switches);
+                parent_task.mm.absorb_child_maxrss(maxrss);
             }
         }
     }
@@ -2957,6 +2975,10 @@ pub enum WaitEvent {
         /// counters go with the slot.
         nvcsw: u64,
         nivcsw: u64,
+        /// The death's `ru_maxrss` in KB, own-plus-children, off the record -
+        /// see the enum's own note and [`Retired::maxrss`]. A stop or a resume
+        /// names a live task and asks it through `maxrss_of`.
+        maxrss: u64,
     },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.

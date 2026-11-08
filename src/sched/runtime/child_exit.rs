@@ -271,6 +271,12 @@ pub fn exit(code: isize) -> ! {
         // `ru_nivcsw` beside `ru_utime`, and the group's counters live on the
         // `mm` that the slot takes with it.
         let (nvcsw, nivcsw) = t.task(id).mm.switches_both();
+        // Its `ru_maxrss` folds the same way and for the same reason: a
+        // `wait4`/`waitid` `struct rusage` carries the child's peak, which is
+        // the group's own high water MAX the peaks of the children it reaped
+        // (Linux's `RUSAGE_BOTH`, `build/scratch/maxrss/r.c`/`u.c`). The `mm`
+        // is still the live group's here; read once and carry it.
+        let maxrss = t.task(id).mm.maxrss_both();
 
         // The process's death is recorded once, when its last thread leaves,
         // and it is **the leader's** record: the pid a parent can name is the
@@ -324,6 +330,7 @@ pub fn exit(code: isize) -> ! {
                 stime,
                 nvcsw,
                 nivcsw,
+                maxrss,
                 tracer: leader.trace.tracer,
                 parent,
             });
@@ -2539,6 +2546,7 @@ fn scan_child_event(
                 stime: retired.stime,
                 nvcsw: retired.nvcsw,
                 nivcsw: retired.nivcsw,
+                maxrss: retired.maxrss,
             })
     })
 }
@@ -2572,6 +2580,7 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 stime: retired.stime,
                 nvcsw: retired.nvcsw,
                 nivcsw: retired.nivcsw,
+                maxrss: retired.maxrss,
             })
         }
         WaitEvent::Stopped {
@@ -2867,6 +2876,7 @@ pub fn block_until_child_event(
             stime: retired.stime,
             nvcsw: retired.nvcsw,
             nivcsw: retired.nivcsw,
+            maxrss: retired.maxrss,
         }),
         None => WaitPark::NoChild,
     }

@@ -674,6 +674,44 @@ pub fn wait_status(code: isize, dumped: bool) -> i32 {
     }
 }
 
+/// Which `ru_maxrss` a `struct rusage` reports for a process, in KB.
+///
+/// There are two books and three readers, measured on Linux 7.2.14
+/// (`build/scratch/maxrss/`): `RUSAGE_SELF` and `RUSAGE_THREAD` read the
+/// process's own resident-set peak (`q.c`: they are equal, because the peak
+/// lives on the shared signal struct and a thread has no separate one), while
+/// `RUSAGE_CHILDREN` reads the **largest** peak among the children this
+/// process has waited for - a MAX, so a later smaller child does not lower it
+/// (`u.c`: `8204` stays `8204` after a `0`-peak child). A `wait4`/`waitid`
+/// caller's struct is `RUSAGE_BOTH`: the child's own peak **MAX** the peaks of
+/// the children it reaped (`r.c`: a child with a ~2060 KB own peak that reaped
+/// an 8 MiB grandchild is reported `8204`). `rusage_maxrss(who, own, children)`
+/// is the reader's half - `SELF`/`THREAD` take `own`, `CHILDREN` takes
+/// `children`; `rusage_both(own, children)` is the wait door's.
+pub const fn rusage_maxrss(own: u64, reaped_children: u64, children: bool) -> u64 {
+    if children { reaped_children } else { own }
+}
+
+/// The `RUSAGE_BOTH` peak a `wait` reports: the greater of a group's own
+/// resident high water and the MAX of the children it reaped. A peak is a
+/// record of the past, so this is `max`, never a sum and never the current
+/// resident set (`build/scratch/maxrss/t.c`: `ru_maxrss` stays 7900 after a
+/// `munmap` while `/proc`'s `VmHWM` dips).
+pub const fn rusage_both(own: u64, reaped_children: u64) -> u64 {
+    if own > reaped_children {
+        own
+    } else {
+        reaped_children
+    }
+}
+
+/// Fold one reaped child's `RUSAGE_BOTH` peak into `RUSAGE_CHILDREN`. It is a
+/// MAX: reporting the largest child is Linux's answer, and a later smaller one
+/// must not lower it (`build/scratch/maxrss/u.c`).
+pub const fn fold_child_maxrss(current: u64, child: u64) -> u64 {
+    if child > current { child } else { current }
+}
+
 // ---------------------------------------------------------------------------
 // CPU time, in the unit a caller reads it in
 // ---------------------------------------------------------------------------
@@ -1066,6 +1104,32 @@ mod tests {
         // `WEXITSTATUS` keeps only the low byte, as Linux does.
         assert_eq!(wait_status(256, false), 0);
         assert_eq!(wait_status(257, false), 1 << 8);
+    }
+
+    #[test]
+    fn rusage_maxrss_keeps_three_readers_and_two_books_apart() {
+        // The Linux readings this encodes (`build/scratch/maxrss/q.c`, `u.c`):
+        // a fresh 8 MiB child's own peak is 8204 KB; a later 0-peak child does
+        // not lower `RUSAGE_CHILDREN`; a reaper with a 1 MiB own peak and an
+        // 8 MiB grandchild is reported 8204 by its parent's `wait4`.
+        const OWN: u64 = 8204;
+        const SMALL: u64 = 0;
+        const GRANDCHILD: u64 = 8204;
+        // SELF and THREAD read the group's own peak, never the children's.
+        assert_eq!(rusage_maxrss(OWN, SMALL, false), OWN);
+        // CHILDREN reads the children's book, even when it is smaller.
+        assert_eq!(rusage_maxrss(OWN, SMALL, true), SMALL);
+        // A constant zero (what this field was until §6.113) fails both.
+        assert_ne!(rusage_maxrss(OWN, SMALL, false), 0);
+        // The wait door is the two books' MAX, not their sum and not `own`.
+        assert_eq!(rusage_both(2060, GRANDCHILD), GRANDCHILD);
+        assert_eq!(rusage_both(OWN, SMALL), OWN);
+        assert_ne!(rusage_both(2060, GRANDCHILD), 2060 + GRANDCHILD);
+        // Folding is a MAX: a big child raises it, a later small one does not
+        // lower it, so the order of reaps cannot change the answer.
+        assert_eq!(fold_child_maxrss(0, OWN), OWN);
+        assert_eq!(fold_child_maxrss(OWN, SMALL), OWN);
+        assert_eq!(fold_child_maxrss(SMALL, OWN), OWN);
     }
 
     #[test]

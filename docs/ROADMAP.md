@@ -363,6 +363,19 @@ One-glance status of the whole roadmap.
   prints that field, so no new `vfs → syscall` edge appears. Pin `t-stat-exitcode` (11 claims,
   eight red without the fix — every death claim) plus host tests on the leaf and the pure
   rendering (`§6.112`, item 225).
+- [x] `getrusage`'s `ru_maxrss` is the resident-set high-water mark, not a literal `0` — Linux
+  reports it at byte 32 in KB (`8204` after touching 8 MiB, unchanged by an untouched mmap and by
+  `munmap`), `RUSAGE_THREAD` equals `SELF` in a single-threaded process, `wait4`'s rusage reports
+  the child's own peak OR the largest peak among the children *it* reaped (`2060` own → `8204`
+  reported), and `RUSAGE_CHILDREN` is the **MAX** of reaped children's peaks (a smaller new child
+  never lowers it). §6.105 named it a gap for want of a high-water record; §6.109's `Mm::hwm_frames`
+  made it closable, so `Mm` now keeps `cmaxrss` beside it, `Retired`/`WaitEvent::Exited` carry the
+  peak through reap, and the three pure derivations live in the `crates/abi` leaf (the wait/rusage
+  doors are machine-only). Pin `t-rusage-maxrss` (10 claims, four red without the fix — all in
+  freshly forked processes, because a fresh child inherits its parent's peak and a container's own
+  baseline is ~1.09 GB); `t-wait4`'s "twelve unmeasured counters" claim moved to eleven with a new
+  positive-peak claim. The remaining ten counters stay an honest, named zero — the minor/major
+  fault split needs `MappedObject::frame_at` to report device I/O (`§6.113`, item 226).
 - [x] a death belongs to the parent that had it — the record of an exit outlives the task, so it
   now carries the owning **group** (`Retired::parent`), written when the death is recorded and
   retargeted to the adopter's group when the reparenting walk moves the corpse. Before it, the four

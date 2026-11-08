@@ -8712,3 +8712,113 @@ number with the core bit dropped (`11` instead of `139`). The encoding already e
 kernel, but on the far side of a layer boundary; copying it would have made two doors that can
 disagree, and calling across the boundary would have added a forbidden edge. Move the one
 definition down to the leaf, and let both doors read it.
+
+### 6.113 `getrusage`'s `ru_maxrss` was a literal zero, beside a CPU pair it counted (LANDED 2026-11-08)
+
+`struct rusage` is 144 bytes: two `timeval`s of CPU (offsets 0-31), then fourteen
+`long` counters. The third `long`, at **offset 32**, is `ru_maxrss` — the
+process's resident-set high-water mark in **KB**. §6.105 landed the last two
+counters of that tail (`ru_nvcsw`/`ru_nivcsw`, offsets 128/136) and named the
+rest a gap: `ru_maxrss` had "no high-water record". §6.109 then built exactly
+that record for `/proc/<pid>/status`'s `VmHWM` (`Mm::hwm_frames`), so the gap
+became closable. What was missing was not the measurement but the *wiring* from
+that one record to the three `getrusage` readers and the two `wait` doors.
+
+Measured on Linux 7.2.14, musl static, in `build/scratch/maxrss/`. The first
+probe (`p.c`) ran in an already-existing process and was useless: this
+container's own `ru_maxrss` baseline is ~1.09 GB, so an 8 MiB mapping never
+moved it and `RUSAGE_CHILDREN` was pinned by an older, larger child. Every
+decisive probe forks a **fresh** process (its counters start at zero) and uses
+one call per statement with `setvbuf(stdout,0,_IONBF,0)` (§6.92's printf
+argument-evaluation trap paid for again):
+
+```
+q.c (fresh child)   baseline SELF=0 THREAD=0
+                    mapped 8 MiB (untouched)  SELF=0        <- mapping is not residency
+                    touched 8 MiB             SELF=8204 THREAD=8204   (KB, ~8*1024+4)
+                    after munmap              SELF=8204     <- a true peak, never lowers
+                    wait4(child) ru_maxrss=8204
+r.c (grandchild)    C1 own SELF=2060, reaped a grandchild of peak 8204
+                    wait4(C1) ru_maxrss=8204   <- RUSAGE_BOTH: own OR children, the MAX
+u.c (fresh worker)  CHILDREN=0 -> BIG(8MiB) wait4=8204 CHILDREN=8204
+                    -> SMALL(0) wait4=0 CHILDREN=8204   <- never lowers
+                    -> REAPER(own 1MiB, grand 8MiB) wait4=8204 CHILDREN=8204
+s.c (fork)          a child inherits the parent's *current* peak: parent touched
+                    32 MiB (VmHWM 32868) -> child fresh ru_maxrss=32776 VmHWM=32864
+t.c (munmap dip)    fresh child ru_maxrss=7900 stays 7900 across map/touch/unmap,
+                    while VmHWM goes 88 -> 4184 -> 4112: the two fields are NOT
+                    the same number, and ru_maxrss does not dip.
+```
+
+So there are **two books**, not one. A process has its own peak (what `RUSAGE_SELF`
+and `RUSAGE_THREAD` read in a single-threaded process). `RUSAGE_CHILDREN` is the
+**MAX** of the peaks of every child it reaped — not their sum, not the last one,
+and a smaller new child never lowers it (`u.c`). `wait4`'s rusage is
+`RUSAGE_BOTH` for that child: its own peak OR the largest peak among the children
+*it* reaped, whichever is greater (`r.c`: 2060 own, 8204 reported). A fork
+inherits the parent's current high-water mark (`s.c`), which is why a fresh
+child of a big process is not zero — and why the pin must use size relations
+and a 32 MiB touch with a half-of-it margin instead of absolute numbers.
+
+The fix, in five moves:
+
+- `src/sched/runtime/child_mm.rs`: `Mm` gains `cmaxrss: AtomicU64` (the MAX of
+  reaped children's peaks) beside the `hwm_frames` §6.109 already kept.
+  `maxrss_kb()` converts that frame count to KB; `maxrss_all()` returns
+  `(own, reaped_children)`; `maxrss_both()` is `RUSAGE_BOTH` (their max);
+  `absorb_child_maxrss()` is a `fetch_max`, not an add. The three **pure**
+  derivations live in the `crates/abi` leaf as `rusage_maxrss`,
+  `rusage_both`, `fold_child_maxrss` — `proc.rs` is machine-only, so a host
+  test could not otherwise reach them.
+- `src/sched/runtime/task.rs` / `child_exit.rs`: `Retired` and
+  `WaitEvent::Exited` carry `maxrss` (read once at death, while the `mm` is
+  still reachable — the same reason §6.105 carried `nvcsw`/`nivcsw`). The
+  reap fold in `Table::release_exited` pushes that `maxrss_both()` into the
+  parent's `cmaxrss` **as a MAX**, beside the CPU/switch pairs' sums.
+- `src/sched/runtime/child_signal.rs` / `mod.rs`: `current_maxrss()` returns
+  the two books; `maxrss_of(id)` reads a live task's `maxrss_both()` for the
+  stop/continue wait doors (the `switches_of` shape). A host stub returns
+  `(0, 0)` — the host has no resident record, and zero is the honest answer.
+- `src/syscall/linux/proc.rs`: `write_rusage` takes `maxrss_kb` and writes
+  `wire[32..40]` (leaving the other ten counters an honest zero). All four
+  wait doors — `finish_wait_event`'s death arm, its two live arms,
+  `take_retired_current`'s direct `finish_wait`, and `waitid`'s `Reported` —
+  carry the field; `handle_getrusage` splits it three ways (SELF/THREAD → own,
+  CHILDREN → reaped) through the leaf's `rusage_maxrss`.
+- The first bare-metal build failed with
+  `error[E0425]: cannot find function rusage_maxrss in module abi` because
+  `proc.rs`'s `abi::` is `super::abi` (`src/syscall/linux/abi.rs`), not the
+  `crate::abi` leaf; the re-export list gained `rusage_maxrss`.
+
+Pin `user/tests/src/bin/t-rusage-maxrss.rs` (10 claims, all movements or size
+relations, all in freshly forked processes): untouched mmap does not move the
+peak, a 32 MiB touch moves it by at least half, `RUSAGE_THREAD` equals `SELF`,
+`munmap` never lowers it, `wait4` reports the child's peak, a big child's peak
+exceeds a small one's, the big one folds into `RUSAGE_CHILDREN`, and a smaller
+child never lowers `CHILDREN`. Host 10/10 `PASS`; machine
+`build/boot-maxrss1.log` 10/10 `PASS` (`476 -> 33244 kB`, `CHILDREN 0 -> 33252`).
+
+Counterfactual: `git stash` of all nine source files + rebuild kernel *and*
+loader (`build/boot-maxrss-cf1.log`, `build/boot-maxrss-cf2.log`) → four red
+(the touch, `wait4`, the big-vs-small comparison, and the CHILDREN fold all read
+`0`), `FAILED`, `exit=1`; only the shape and zero-tolerant relation claims stay
+green, which is exactly why the strengthened `c1 > 0` was added. `git stash
+pop` + rebuild + `build/boot-maxrss2.log` returns to 10/10 `PASS`.
+`mpos_abi::tests::rusage_maxrss_keeps_three_readers_and_two_books_apart` pins
+the leaf's three functions against a literal-zero implementation. One old
+claim had to move with it (§6.105's rule again): `t-wait4`'s "the twelve
+unmeasured counters are zero" covered `counters[0]`, which is now served; it is
+now "the eleven unmeasured counters" over `counters[1..12]` plus a new claim
+that the child's peak is written and positive.
+
+**The rule.** A high-water mark is a record of the past, not a function of the
+current count — §6.109's rule applied to a second door. Three tempting
+implementations all fail: printing the current `rss_pages` (it drops on
+`munmap`, `t.c`), summing children's peaks instead of taking their max (`u.c`),
+or reporting a child's own peak only and ignoring the grandchildren it reaped
+(`r.c`). `VmHWM` and `ru_maxrss` are *not* the same number — one dips, one does
+not — so wiring the two doors to one record is a measurement, not a shortcut.
+The remaining ten counters (`ru_minflt`/`ru_majflt`, block I/O, IPC,
+`ru_nsignals`) stay an honest, named zero: the fault split needs
+`MappedObject::frame_at` to say whether a fault went to a device, which it does
+not (§6.105).

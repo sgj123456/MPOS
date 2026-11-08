@@ -9741,7 +9741,8 @@ in `src/sched/runtime/task.rs`.
 | 200 × `sched_yield` | `ru_nvcsw +0`, `ru_nivcsw +1` | `+0` | `+202` (one hand-over each) |
 | a worker's 50 sleeps | `RUSAGE_SELF +101`, `RUSAGE_THREAD 100/0` | all zero | `RUSAGE_THREAD +50`, group `+51` |
 | a waited child's 50 sleeps | `RUSAGE_CHILDREN` grows beside `cutime` | zero | `+50` |
-| `ru_maxrss`/`ru_minflt`/`ru_majflt`/`ru_nswap`/`ru_inblock`/`ru_oublock`/`ru_msgsnd`/`ru_msgrcv`/`ru_nsignals` | counted | zero | zero — **named gap** |
+| `ru_maxrss` | the resident-set peak in KB, and `RUSAGE_CHILDREN` is the MAX of reaped children's peaks | zero | the peak in KB (§6.113 / item 226) |
+| `ru_minflt`/`ru_majflt`/`ru_nswap`/`ru_inblock`/`ru_oublock`/`ru_msgsnd`/`ru_msgrcv`/`ru_nsignals` | counted | zero | zero — **named gap** (the fault split needs `MappedObject::frame_at` to say whether a fault went to a device) |
 
 **Landed.** `Task::nvcsw`/`nivcsw` (the thread's pair) and `Mm`'s four columns (the group's own and
 children's); `Table::hand_over` classifies each switch after `prepare` has run — left the ready queue
@@ -9930,3 +9931,43 @@ plus `mpos_abi::tests::wait_status_is_the_word_stat_and_waitpid_agree_on` and
 field's absolute Linux word *and* its agreement with `waitpid`, so neither a literal `0`, a raw
 `code` (`42` instead of `10752`) nor a missing core bit can pass. Mechanism and the four Linux
 readings: `docs/notes/` §6.112.
+
+### Item 226 - `getrusage`'s `ru_maxrss` is the resident-set high-water mark (2026-11-08, landed)
+
+| | Linux (7.2.14, measured) | this kernel before | this kernel now |
+|---|---|---|---|
+| `ru_maxrss` offset / unit | the third `long`, byte 32, in KB | literal `0` | the group's peak (`hwm_frames × PAGE_SIZE / 1024`) in KB |
+| untouched `mmap` of 8 MiB | peak unchanged (mapping is not residency) | `0` | unchanged |
+| touching 8 MiB, then `munmap` | `8204`, never lowers | `0` | grows by the touched frames, never lowers |
+| `RUSAGE_THREAD` in one thread | equals `RUSAGE_SELF` | `0` | equals `RUSAGE_SELF` |
+| `wait4`'s rusage for a child | `RUSAGE_BOTH`: own peak OR the largest peak among the children *it* reaped | `0` | that MAX, carried on `Retired`/`WaitEvent::Exited` |
+| `RUSAGE_CHILDREN` | the **MAX** of every reaped child's peak; a smaller new child never lowers it | `0` | that MAX, folded on reap (`fetch_max`, not add) |
+| a fork | inherits the parent's current peak | n/a | `Mm::with_eager` seeds `hwm_frames` from `frames.len()` |
+
+**Landed.** §6.105 named `ru_maxrss` a gap for want of a high-water record;
+§6.109 built `Mm::hwm_frames` for `/proc/<pid>/status`'s `VmHWM` and made it
+closable. `Mm` now also holds `cmaxrss` (the MAX of reaped children's peaks),
+with `maxrss_kb`/`maxrss_all`/`maxrss_both`/`absorb_child_maxrss`; the three
+pure derivations (`rusage_maxrss`, `rusage_both`, `fold_child_maxrss`) live in
+the `crates/abi` leaf because `src/syscall/linux/proc.rs` is machine-only and
+cannot be host-tested. `Retired`/`WaitEvent::Exited` carry `maxrss` so a `wait`
+reports the child's peak after its slot is gone, and `Table::release_exited`
+folds it into the parent as a MAX beside the CPU/switch pairs' sums.
+`src/sched/runtime/child_signal.rs` adds `current_maxrss()`/`maxrss_of(id)`;
+`write_rusage` writes `wire[32..40]` and all four wait doors plus
+`handle_getrusage`'s three-way split carry the field. Owner:
+`crates/abi/src/lib.rs`, `src/sched/runtime/child_mm.rs`,
+`src/sched/runtime/task.rs`, `src/sched/runtime/child_exit.rs`,
+`src/sched/runtime/child_signal.rs`, `src/sched/mod.rs`,
+`src/syscall/linux/abi.rs`, `src/syscall/linux/proc.rs`.
+
+Pin: `user/tests/src/bin/t-rusage-maxrss.rs` (10 claims; four red on the
+unfixed kernel — `build/boot-maxrss-cf1.log`/`cf2.log` — green with it,
+`build/boot-maxrss1.log`/`boot-maxrss2.log`), plus
+`mpos_abi::tests::rusage_maxrss_keeps_three_readers_and_two_books_apart`.
+`t-wait4`'s "twelve unmeasured counters are zero" claim moved to eleven with a
+new positive-peak claim, because `counters[0]` is now served (§6.105's rule).
+The ten remaining counters stay an honest, named zero: the minor/major fault
+split needs `MappedObject::frame_at` to say whether a fault went to a device.
+Mechanism and the five Linux readings (`build/scratch/maxrss/{q,r,s,t,u}.c`):
+`docs/notes/` §6.113.

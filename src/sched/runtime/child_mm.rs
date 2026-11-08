@@ -1592,8 +1592,18 @@ pub struct Mm {
     /// table grows ([`Self::own`]) and nowhere derived: a process that mapped 4
     /// MiB, touched it and freed it reads `VmHWM: 4096 kB` and `VmRSS: 0 kB` on
     /// Linux (`build/scratch/vmfields/p.c`), which is a fact about the past that
-    /// no current count can answer.
+    /// no current count can answer. `ru_maxrss` is the same number in KB, so
+    /// this is also the group's own half of that field (§6.113).
     pub(crate) hwm_frames: core::sync::atomic::AtomicUsize,
+    /// The largest `ru_maxrss` (in KB) among the children this group has
+    /// **reaped** - Linux's `RUSAGE_CHILDREN`. It is a MAX, not a sum: a fresh
+    /// worker that reaps an 8 MiB child reads `8204`, then reaps a 0-byte child
+    /// and still reads `8204`, then reaps a 1 MiB child with an 8 MiB
+    /// grandchild and still reads `8204` (`build/scratch/maxrss/u.c`, Linux
+    /// 7.2.14). Recorded on wait as `fetch_max`, off the child's record, so the
+    /// parent's own peak (`hwm_frames`) and its children's peak stay two
+    /// separate books - exactly the split §6.105 gave the CPU and switch pairs.
+    pub(crate) cmaxrss: core::sync::atomic::AtomicU64,
     /// The largest number of pages this address space has ever claimed -
     /// Linux's `VmPeak`, the high-water virtual size. Recorded where a mapping
     /// is added ([`Self::record_peak`]); `unmap` must not lower it.
@@ -1736,6 +1746,7 @@ impl Mm {
             frames: Mutex::new(RefCell::new(frames)),
             hwm_frames: core::sync::atomic::AtomicUsize::new(held_frames),
             peak_pages: core::sync::atomic::AtomicUsize::new(eager_pages),
+            cmaxrss: core::sync::atomic::AtomicU64::new(0),
             vmas: Mutex::new(RefCell::new(VmaTable::new())),
             eager: Mutex::new(RefCell::new(eager)),
             leader,
@@ -2216,6 +2227,51 @@ impl Mm {
 
     pub(crate) fn hwm_frames(&self) -> usize {
         self.hwm_frames.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// This group's own resident-set high water in KB - `ru_maxrss`'s own
+    /// half. A frame is `PAGE_SIZE` bytes and Linux's field is KB, so the
+    /// conversion is a single multiply off the recorded peak, not a second
+    /// counter: a process that touched 8 MiB and unmapped it still reads
+    /// `8204` (`build/scratch/maxrss/q.c`, Linux 7.2.14), while `/proc`'s
+    /// `VmHWM` may dip on the same `munmap` (`build/scratch/maxrss/t.c`).
+    pub(crate) fn maxrss_kb(&self) -> u64 {
+        let page = crate::mm::pframe::PAGE_SIZE as u64;
+        self.hwm_frames.load(core::sync::atomic::Ordering::Relaxed) as u64 * page / 1024
+    }
+
+    /// The two books `getrusage` asks about, `(own, reaped-children)`. Linux's
+    /// `RUSAGE_SELF`/`RUSAGE_THREAD` read the first (the peak lives on the
+    /// process's shared signal struct, so a thread has no separate one -
+    /// `build/scratch/maxrss/q.c` reads them equal); `RUSAGE_CHILDREN` reads
+    /// the second, the MAX of every child's peak this process has waited for.
+    pub(crate) fn maxrss_all(&self) -> (u64, u64) {
+        (
+            self.maxrss_kb(),
+            self.cmaxrss.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// What a `wait4`/`waitid` `struct rusage` reports for this group: the
+    /// greater of its own peak and the peaks of the children it reaped -
+    /// Linux's `RUSAGE_BOTH`. Measured (`build/scratch/maxrss/r.c`): a child
+    /// whose own peak was ~2060 KB but which reaped an 8 MiB grandchild is
+    /// reported by its parent's `wait4` as `8204`, and `u.c`'s reaper with a
+    /// 1 MiB own peak and an 8 MiB grandchild is reported `8204` too.
+    pub(crate) fn maxrss_both(&self) -> u64 {
+        let (own, children) = self.maxrss_all();
+        crate::abi::rusage_both(own, children)
+    }
+
+    /// Fold one reaped child's `RUSAGE_BOTH` peak into this process's
+    /// `RUSAGE_CHILDREN`. It is a MAX, not the CPU/switch pairs' sum: Linux
+    /// reports the largest child, and a later smaller child does not lower it
+    /// (`build/scratch/maxrss/u.c`: `8204` stays `8204` after a `0` child).
+    pub(crate) fn absorb_child_maxrss(&self, child_kb: u64) {
+        // `fetch_max` is the atomic form of the leaf's `fold_child_maxrss`:
+        // MAX, not a sum, and a later smaller child cannot lower it.
+        self.cmaxrss
+            .fetch_max(child_kb, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Note the address space's size after a mapping was added, for `VmPeak`.

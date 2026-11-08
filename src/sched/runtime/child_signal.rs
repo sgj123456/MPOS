@@ -1396,6 +1396,39 @@ pub fn current_thread_switches() -> (u64, u64) {
     )
 }
 
+/// The running process's resident-set peak in KB, `(own, reaped-children)`.
+/// `getrusage(RUSAGE_SELF)` and `RUSAGE_THREAD` both read the first: Linux
+/// keeps the peak on the process's shared signal struct, so a thread has no
+/// separate high water (`build/scratch/maxrss/q.c` reads SELF == THREAD);
+/// `RUSAGE_CHILDREN` reads the second, the MAX of the children this process
+/// has waited for (`build/scratch/maxrss/u.c`). `(0, 0)` before the scheduler
+/// runs. This is `ru_maxrss` - the field `write_rusage` left as one of its
+/// twelve unmeasured longs until §6.113 gave the kernel a high-water record.
+#[cfg(target_os = "none")]
+pub fn current_maxrss() -> (u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => task.mm.maxrss_all(),
+            None => (0, 0),
+        },
+    )
+}
+
+/// A live task's `RUSAGE_BOTH` peak by id - the [`switches_of`] shape for the
+/// two `wait` event classes reported while the child is still in the table (a
+/// stop and a resume). `None` when the slot is gone; a caller reads that as the
+/// zero a cleared record carries. A death carries its own peak on the record,
+/// because the slot may be gone by the time `wait` reads it.
+#[cfg(target_os = "none")]
+pub fn maxrss_of(id: TaskId) -> Option<u64> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| task.mm.maxrss_both())
+    })
+}
+
 /// The running process's CPU time in internal clock ticks, `(user, system)`.
 /// `times()` and `getrusage(RUSAGE_SELF)` read it and convert to their own
 /// units; there is no per-thread split because there are no threads here, and a
