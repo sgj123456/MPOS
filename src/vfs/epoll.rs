@@ -834,7 +834,7 @@ mod tests {
         let (table, ep, epfd) = epoll_fd();
         let (read_end, _write_end) = pipe::pair();
         let pfd = watch(&table, read_end);
-        let (a, _b) = pipe::DuplexEnd::pair((0, 0, 0));
+        let (a, _b) = pipe::DuplexEnd::pair(mpos_cred::UCred::default());
         let sfd = watch(&table, a);
 
         assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, pfd, EPOLLIN, 0), Ok(()));
@@ -1155,7 +1155,7 @@ mod tests {
     #[test]
     fn a_socketpair_reports_readable_and_hung_up() {
         let (table, ep, epfd) = epoll_fd();
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(mpos_cred::UCred::default());
         let afd = watch(&table, a.clone());
         assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, afd, EPOLLIN, 0), Ok(()));
 

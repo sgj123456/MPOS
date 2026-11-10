@@ -22,35 +22,59 @@
 //! # The chain, and why the init namespace is the identity map
 //!
 //! A task is a member of every namespace from the root down to its own: creating
-//! it registers it at each level, with a number of that level's choosing. The
-//! root level is special and it is the load-bearing decision in this file - **it
-//! has no table at all**, because its numbers *are* the slot numbers. That is not
-//! an optimisation, it is what keeps a machine that never unshares byte-for-byte
-//! what it was before this crate existed: every existing pid, every `/proc/<n>`
-//! look-up and every `/proc/<n>/ns/pid` answer is unchanged, and the whole
-//! mechanism is only reachable through a `unshare`/`setns`/`clone(CLONE_NEWPID)`
-//! that asks for it. It also happens to be Linux's own shape: the init
-//! namespace's numbers are the global ones.
+//! it registers it at each level, with a number of that level's choosing.
+//!
+//! # The root's table, and why it is not the identity map
+//!
+//! The root level used to have **no table at all**: its numbers *were* the task
+//! slots. The argument for that was that a machine which never unshares then
+//! stayed byte-for-byte what it was before this crate existed - and the cost of
+//! it is the reason this file changed. A slot is **reused**; a pid must not be.
+//!
+//! Measured on Linux 7.2.14 (`build/scratch/pidreuse/reuse.c`): ten children born
+//! and collected one at a time come back `129232`..`129241`, fifty children born
+//! after them reuse none of those numbers, and once a child is collected
+//! `kill(<its number>, 0)` answers `ESRCH`, `/proc/<its number>` answers
+//! `ENOENT`, `waitpid` answers `ECHILD` and `pidfd_open` answers `ESRCH`. A pid
+//! is a *promise* there because it is a refcounted object with a lifetime of its
+//! own.
+//!
+//! Here the number was freed with the slot, and the slot allocator hands out the
+//! lowest free index - so the very next `fork` after a `waitpid` took the number
+//! the caller had just collected, and `kill(<collected>, SIGTERM)` ended a
+//! process it had never had anything to do with
+//! (`build/scratch/reapwait/`'s `kslot.c`; `docs/notes/` §6.89, §6.121; the pin
+//! is `user/tests/src/bin/t-stale-pid.rs`).
+//!
+//! That could not be fixed in the readers. `kill`, `tgkill` and `/proc/<n>` each
+//! resolve a number to a slot and then ask whether the number means that task -
+//! and at the moment of the check the slot *does* hold a live tenant whose
+//! number *does* resolve to it, because the slot and the number were the same
+//! thing. The defect is the allocation, so the fix is there: the root gets the
+//! monotonic table every nested namespace already had, and a released number is
+//! **spent** at every level.
+//!
+//! A slot that was never registered - the kernel's own tasks, which live in the
+//! table but are not processes (`sched::snapshots` leaves them out of `/proc`
+//! for the same reason) - has *no* number at the root, and `number_of` answers
+//! `None` for it. The readers that need a number anyway keep their slot
+//! fallback, and a caller that resolves one gets `ESRCH`, which is what Linux
+//! answers for a pid that names no process rather than one that names a slot.
 //!
 //! # Numbers are never reused, and that is deliberate
 //!
 //! Linux's answer to "who is this number" is a refcounted `struct pid` whose
-//! lifetime is its own, which is what makes a pid a promise: a number that
-//! named a process cannot later name an unrelated one. This crate does not
-//! build that object. What it does instead is the conservative half - a
-//! namespace's allocator only ever moves forward, so a number that has been
-//! released is **spent**, and a caller that forgets to release one leaks a
-//! number rather than handing a stale promise to a stranger. Two consequences
-//! are named rather than hidden:
+//! lifetime is its own. This crate does not build that object. What it does
+//! instead is the conservative half - a namespace's allocator only ever moves
+//! forward, so a number that has been released is **spent**, and a caller that
+//! forgets to release one leaks a number rather than handing a stale promise to
+//! a stranger.
 //!
-//! * the *init* namespace still numbers by slot, so slot reuse there is exactly
-//!   what `docs/notes/` §7.1 records as an open problem, unmoved by this crate;
-//! * `next` is a `u32` and does not wrap - a namespace that forks four billion
-//!   times is not a case this kernel models, and saying so is cheaper than
-//!   pretending the counter is exhaustive.
-//!
-//! Linux's allocator is cyclic and skips live numbers (`idr_alloc_cyclic`), so
-//! the forward-only rule matches it for every namespace that does not wrap.
+//! `next` is a `u32` and does not wrap - a namespace that forks four billion
+//! times is not a case this kernel models, and saying so is cheaper than
+//! pretending the counter is exhaustive. Linux's allocator is cyclic and skips
+//! live numbers (`idr_alloc_cyclic`, up to `/proc/sys/kernel/pid_max`), so the
+//! forward-only rule matches it for every namespace that does not wrap.
 
 extern crate alloc;
 
@@ -213,17 +237,11 @@ impl PidNs {
     /// `getppid(2)` a 0 for a task whose parent stayed outside, and that stops
     /// `kill` from acting on a number it does not have.
     pub fn number_of(&self, slot: usize) -> Option<u32> {
-        if self.is_root() {
-            return Some(slot as u32);
-        }
         critical_section::with(|cs| self.numbers.borrow(cs).borrow().by_slot.get(&slot).copied())
     }
 
     /// The task this namespace knows `number` as, if it has one.
     pub fn task_of(&self, number: u32) -> Option<usize> {
-        if self.is_root() {
-            return Some(number as usize);
-        }
         critical_section::with(|cs| {
             self.numbers
                 .borrow(cs)
@@ -330,12 +348,9 @@ impl PidNs {
         out
     }
 
-    /// One level's half of [`PidNs::allocate`]: identity at the root, a fresh
-    /// number anywhere else.
+    /// One level's half of [`PidNs::allocate`]: a number this level has not
+    /// spent, at every level including the root.
     fn insert(&self, slot: usize) -> u32 {
-        if self.is_root() {
-            return slot as u32;
-        }
         critical_section::with(|cs| {
             let mut numbers = self.numbers.borrow(cs).borrow_mut();
             if let Some(&already) = numbers.by_slot.get(&slot) {
@@ -349,11 +364,10 @@ impl PidNs {
         })
     }
 
-    /// One level's half of [`PidNs::release`].
+    /// One level's half of [`PidNs::release`]: the number is spent, not handed
+    /// back. The counter is never rewound, which is the whole property - a
+    /// caller holding an old number must not see it resolve to somebody else.
     fn forget(&self, slot: usize) {
-        if self.is_root() {
-            return;
-        }
         critical_section::with(|cs| {
             let mut numbers = self.numbers.borrow(cs).borrow_mut();
             if let Some(number) = numbers.by_slot.remove(&slot) {
@@ -367,19 +381,59 @@ impl PidNs {
 mod tests {
     use super::*;
 
-    /// The property the whole design rests on: a machine that never unshares
-    /// numbers its tasks by slot, so nothing observable changes for it - and
-    /// the identity is a property of the object rather than a special case in
-    /// every caller.
+    /// The property the whole fix rests on: **the root numbers its tasks like
+    /// every other level does**, so a number that has been released is spent
+    /// rather than handed to the next task through the freed slot.
+    ///
+    /// Before this, the root had no table and answered `number_of(slot)` by
+    /// identity, so a caller that collected pid 7 and then watched a *stranger*
+    /// fork found the stranger holding 7 - and `kill(7, SIGTERM)` ended it
+    /// (Linux answers `ESRCH`; §6.121, `t-stale-pid`).
     #[test]
-    fn the_init_namespace_numbers_by_slot() {
+    fn the_root_numbers_monotonically_and_never_reuses_a_number() {
         let root = PidNs::root(1);
         assert!(root.is_root());
-        assert_eq!(root.number_of(7), Some(7));
-        assert_eq!(root.task_of(7), Some(7));
-        // Even a task nobody registered, because the root has nothing to
-        // register: whether the slot is *live* is the task table's question.
-        assert_eq!(root.task_of(63), Some(63));
+        assert_eq!(root.allocate(7), 1, "the machine's init is pid 1");
+        assert_eq!(root.number_of(7), Some(1));
+        assert_eq!(root.task_of(1), Some(7));
+        assert_eq!(root.allocate(8), 2);
+        assert_eq!(root.number_of(8), Some(2));
+
+        // The one thing this is all for: 7 goes away, and the *next* task to
+        // sit in that slot is somebody else with a number of its own.
+        root.release(7);
+        assert_eq!(root.number_of(7), None, "a spent number names nobody");
+        assert_eq!(
+            root.task_of(1),
+            None,
+            "and the number it was is free to fail"
+        );
+        assert_eq!(root.allocate(7), 3, "the reused slot gets a fresh number");
+        assert_eq!(root.number_of(7), Some(3));
+        assert_eq!(root.task_of(1), None, "number 1 still names nobody");
+
+        // A slot that was never registered has no number at the root, which is
+        // what makes `kill` on a kernel task's slot answer `ESRCH` rather than
+        // reaching it: whether a task is a *process* is asked of the table.
+        assert_eq!(root.number_of(63), None);
+        assert_eq!(root.task_of(63), None);
+    }
+
+    /// A number is a promise, so the counter is not rewound even when the
+    /// namespace empties out completely - the rule the nested levels already
+    /// followed.
+    #[test]
+    fn the_roots_counter_only_moves_forward() {
+        let root = PidNs::root(1);
+        for slot in 1..=4 {
+            root.allocate(slot);
+        }
+        for slot in 1..=4 {
+            root.release(slot);
+        }
+        assert_eq!(root.number_of(1), None);
+        assert_eq!(root.allocate(1), 5, "the freed slots did not free a number");
+        assert_eq!(root.number_of(1), Some(5));
     }
 
     /// `unshare(CLONE_NEWPID)`'s promise, in one assertion: the first task in a
@@ -408,6 +462,10 @@ mod tests {
         let outer = PidNs::child(&root, 2);
         let inner = PidNs::child(&outer, 3);
 
+        // A task of the machine's own, first, so the root's number for the one
+        // below is not accidentally the same as the inner levels'.
+        assert_eq!(root.allocate(9), 1);
+
         // Created *in* `inner` (its creator had unshared twice), numbered by
         // each level on the way up.
         let number = inner.allocate(12);
@@ -418,9 +476,13 @@ mod tests {
             Some(1),
             "the outer level numbers it too"
         );
-        assert_eq!(root.number_of(12), Some(12), "and the root keeps its slot");
+        assert_eq!(
+            root.number_of(12),
+            Some(2),
+            "and the root gives it the next number it has, not the slot"
+        );
         // From each level the *same* task is named, which is the whole point.
-        for (ns, n) in [(&inner, 1u32), (&outer, 1), (&root, 12)] {
+        for (ns, n) in [(&inner, 1u32), (&outer, 1), (&root, 2)] {
             assert_eq!(ns.task_of(n), Some(12));
         }
     }
@@ -438,15 +500,15 @@ mod tests {
         inner.allocate(20);
         assert_eq!(
             inner.numbered_chain(20),
-            alloc::vec![(11, 20), (12, 1), (13, 1)],
+            alloc::vec![(11, 1), (12, 1), (13, 1)],
             "outermost first, each number beside its namespace's identity"
         );
-        // A slot the nested levels never registered still has the *root's*
-        // number, because the init namespace numbers by slot and stores
-        // nothing: its level is always there, and it is the only level that is.
-        assert_eq!(inner.numbered_chain(21), alloc::vec![(11, 21)]);
+        // A slot nobody registered has no number at *any* level now - not even
+        // the root's, which used to answer the slot itself. That is what makes
+        // a collected number stop naming anybody (`t-stale-pid`).
+        assert_eq!(inner.numbered_chain(21), alloc::vec![]);
         // The numbers alone are the same walk, in the same order.
-        assert_eq!(inner.numbers(20), alloc::vec![20, 1, 1]);
+        assert_eq!(inner.numbers(20), alloc::vec![1, 1, 1]);
     }
 
     /// Two tasks in one namespace, and two namespaces over one task set: the
@@ -504,10 +566,15 @@ mod tests {
         let inner = PidNs::child(&outer, 3);
         let number = inner.allocate(8);
         assert_eq!((number, outer.number_of(8)), (1, Some(1)));
+        assert_eq!(root.number_of(8), Some(1), "the root names it too");
         inner.release(8);
         assert_eq!(inner.number_of(8), None);
-        assert_eq!(outer.number_of(8), None, "the outer level still names it");
-        assert_eq!(root.number_of(8), Some(8), "the root's identity map");
+        assert_eq!(outer.number_of(8), None, "the outer level stops naming it");
+        assert_eq!(
+            root.number_of(8),
+            None,
+            "and so does the machine's own namespace - which is the fix"
+        );
     }
 
     /// The init is the task this namespace knows as 1 - not the first slot
@@ -518,16 +585,24 @@ mod tests {
     #[test]
     fn the_init_is_the_task_numbered_one() {
         let root = PidNs::root(1);
+        // The root first, while its counter is untouched: its first allocation
+        // is the machine's init, and the number that says so is one it handed
+        // out rather than the slot it was given.
+        assert_eq!(root.allocate(4), 1);
+        assert!(root.is_init(4));
+        assert_eq!(root.allocate(7), 2);
+        assert!(!root.is_init(7), "number 2 is a member like any other");
+        assert!(
+            !root.is_init(1),
+            "slot 1 is a slot now, not a promise of the number 1"
+        );
+
         let inner = PidNs::child(&root, 2);
         assert_eq!(inner.allocate(12), 1);
         assert!(inner.is_init(12));
         assert!(!inner.is_init(13));
         assert_eq!(inner.allocate(13), 2);
         assert!(!inner.is_init(13), "number 2 is a member like any other");
-        // The root: slot 1 is the machine's init, and the identity map is what
-        // says so.
-        assert!(root.is_init(1));
-        assert!(!root.is_init(2));
     }
 
     /// A sealed namespace is one whose init has exited, and the state is
@@ -561,17 +636,19 @@ mod tests {
         let root = PidNs::root(1);
         let outer = PidNs::child(&root, 2);
         let inner = PidNs::child(&outer, 3);
+        // One task of the machine's own, so the root's number for the nested
+        // one is visibly its *second*.
+        assert_eq!(root.allocate(7), 1);
         // Registered at every level on the way in, as `allocate` does.
         assert_eq!(inner.allocate(12), 1);
-        assert_eq!(inner.numbers(12), alloc::vec![12, 1, 1]);
-        assert_eq!(outer.numbers(12), alloc::vec![12, 1]);
-        // A task in the init namespace alone has one number there, which is what
-        // Linux prints for a machine that never unshared.
-        assert_eq!(root.numbers(7), alloc::vec![7]);
-        // A slot the inner levels never registered is still a member of the
-        // root - every task is - so its chain is the one number the outermost
-        // level gives it, and nothing is invented for the levels in between.
-        assert_eq!(inner.numbers(11), alloc::vec![11]);
+        assert_eq!(inner.numbers(12), alloc::vec![2, 1, 1]);
+        assert_eq!(outer.numbers(12), alloc::vec![2, 1]);
+        // A task in the init namespace alone has exactly one number there, which
+        // is what Linux prints for a machine that never unshared.
+        assert_eq!(root.numbers(7), alloc::vec![1]);
+        // A slot nobody registered has no number anywhere, so there is nothing
+        // for the chain to carry - the root used to answer the slot itself.
+        assert_eq!(inner.numbers(11), alloc::vec![]);
     }
 
     /// A namespace is an ancestor of exactly the namespaces nested under it -

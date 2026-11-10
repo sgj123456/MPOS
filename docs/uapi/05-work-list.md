@@ -10335,3 +10335,72 @@ place of three atomics), `src/vfs/procfs.rs` (fields 45-51 render from it).
 **Pin:** `user/tests/src/bin/t-stat-image.rs`, 11 claims, counterfactually
 **6 red** (`build/boot-statimage-cf1.log`), green on host and machine.
 Measurement and reasoning: `docs/notes/` §6.120.
+
+## Item 232 — a pid number is a promise: the init namespace allocates its own
+
+Rows: every door that turns a number into a task or a task into a number, because
+the whole question is which of the two each one carries. The allocator half is
+`crates/pidns`'s root level; the door half is six places that had been right only
+while the root numbered by slot, plus the credential payload three families share.
+
+| row | Linux | this kernel before | now |
+|---|---|---|---|
+| a collected pid number, re-asked | `kill` → `ESRCH`, `/proc/<n>` → `ENOENT` (numbers are never reused) | `kill(7, 0) = 0`, `/proc/7` → the next tenant (`S`) | `ESRCH` / `ENOENT`; the number is spent |
+| the root pid namespace | a monotonic allocator, `1` for init | **no table**: `number_of`/`task_of` were the identity, `insert`/`forget` no-ops | the same `Numbers { next, by_number, by_slot }` every nested namespace has, cursor from 1 |
+| the machine's init | registered like any task, hence pid 1 | never registered (under the identity map that was a no-op) | registered before anything else can allocate |
+| `siginfo.si_pid` of a process-directed signal | the sender's **number** | the sender's **slot** (`t-signal-frame`: `got 0x6, want 0xb`) | the number, resolved under the table lock already held |
+| `fork`/`vfork`/`clone`'s answer | the child's **number** | the child's **slot** (internal callers depend on it) | converted once at the door (`number_answer`), the spawn layer keeps the slot |
+| `set_tid_address`'s answer | the calling **thread's number** | its slot | the number |
+| netlink's autobind `nl_pid` | the sender's **number** (readers compare it to their `getpid()`) | the slot | the number |
+| `IFLA_NET_NS_PID` | a **number**, resolved in the caller's namespace | looked up as a slot | `resolve_pid` first, then the namespace by slot |
+| `cgroup.procs` / `cgroup.threads` read | **numbers** | slots | numbers, and a task with none is not listed |
+| `cgroup.procs` / `cgroup.threads` write | a **number** | compared against slots, so it never matched | resolved to a slot first |
+| `struct ucred.pid` (`SCM_CREDENTIALS`, `SO_PEERCRED`, a socketpair's peer) | `pid_vnr` of a refcounted `struct pid`: a number that outlives the sender | a **slot**, resolved at the read — `0` once the sender was reaped, a stranger's number once the slot was reused | the number captured when the peer was met, plus the namespace it was minted in; the read answers `pid_vnr` |
+
+**Why the allocator, not the resolution.** At the moment of the check the slot
+genuinely held a live tenant and the number genuinely was theirs, so every
+resolver was answering truthfully. The defect was that a number *was* a slot:
+release a child and the next `fork` inherits its promise. That is a load-bearing
+decision of `crates/pidns` - its header said the root has no table on purpose -
+so the fix deletes the four short-circuits and pays the stated cost (every
+reported pid value moves once, in creation order rather than slot order; the
+crate's `the_init_namespace_numbers_by_slot` test is replaced by two that pin
+the monotonic rule). The first boot without also registering init died at
+`INIT_EXITED: the system has no init left` - the init's first child was handed
+number 1 - which is why `try_spawn_init` now calls `adopt_pid`.
+
+**The doors, and the one that taught the most.** Changing what a number is
+turned the gate into a probe for every door that conflated the two: `18` user
+programs red, then `9`, then `1`, then `0`. Five were mechanical (sender pid,
+fork's answer, `set_tid_address`, netlink's port id, `IFLA_NET_NS_PID`,
+cgroupfs's read and write halves). The sixth needed the opposite direction:
+`UCred`'s store-and-render split is deliberate - it stores what the machine
+holds and maps through the reader's namespaces at the read - so "fixing" the
+store alone mapped a number twice and reddened three pins. The real defect was
+one level down: the render resolved a **slot**, and a slot cannot outlive its
+tenant, so a reader that collected the sender first was answered `0` (and would
+have been answered a stranger's number had the slot been reused). The payload
+now carries the captured number and `pid_ns`, and answers the number for a
+reader in that namespace and `0` outside it - which is `pid_vnr`. It lives in
+the `cred` leaf because `net::unix` and `vfs::pipe` both carry it and both
+already depend on that leaf.
+
+**Landed.** `crates/pidns/src/lib.rs` (the root's table, four short-circuit
+deletions, two replacement tests), `src/sched/runtime/load.rs`
+(`try_spawn_init`'s `adopt_pid`), `src/sched/runtime/child_signal.rs` (the
+sender's number), `src/sched/runtime/child_exit.rs` (`number_answer` at the four
+task-creation doors), `src/syscall/linux/proc.rs` (`set_tid_address`),
+`src/net/rtnl.rs` (autobind, `IFLA_NET_NS_PID`), `src/vfs/cgroupfs.rs` (both
+halves), `crates/cred/src/lib.rs` (`UCred` with `pid_ns`), `src/net/unix.rs`
+(`self_cred` captures the number), `src/net/socket.rs` (`observed_cred` answers
+`pid_vnr`), `src/vfs/pipe.rs` (a pair's peer is a `UCred`).
+
+**Pins.** `user/tests/src/bin/t-stale-pid.rs` (new, 8 claims - the old
+`t-kslot.rs` diagnostic, now a real check), 6 of 8 red counterfactually
+(`build/boot-stalepid-cf1.log`) with the allocator half reverted. The door half
+is witnessed by the existing pins it broke and then fixed: `t-signal-frame`
+(3 red `build/cf-serial-t-signal-frame.log`), `t-udev-worker` (1 red,
+`build/cf-serial-t-udev-worker.log`), `t-cgroupfs` (10 red,
+`build/cf-serial-t-cgroupfs.log`) - and `t-ns-net`, `t-ns-pid`, `t-rseq`,
+`t-keyctl`, `t-unix-scm`, `t-scm` and `t-nsnumbers` all green again on the final
+kernel. Measurement and reasoning: `docs/notes/` §6.121.

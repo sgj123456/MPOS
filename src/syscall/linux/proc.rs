@@ -435,7 +435,10 @@ pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
     if args[0] != 0 {
         crate::sched::set_clear_tid(args[0]);
     }
-    crate::sched::current().0 as isize
+    // The thread's **number**, which is what `gettid` answers and what
+    // `set_tid_address` is documented to return - a slot here would name a
+    // scheduler table row (`docs/notes/` §6.121).
+    crate::sched::current_pid_number() as isize
 }
 
 /// Which kind of child a `wait4`/`waitid` option word lets the caller be

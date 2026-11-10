@@ -748,6 +748,14 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             "init's slot {slot} is already taken"
         );
         drop_retired(INIT_PID);
+        // The machine's init is a member of the machine's own pid namespace
+        // like every process after it, and it is the **first** registration
+        // there - which is what makes it pid 1. It used to need no registration
+        // at all, because that namespace numbered by slot; now that the numbers
+        // are its own (see `crates/pidns`, §6.121), a task that is not
+        // registered has no number, and an init without one would leave number
+        // 1 to be handed to its first child.
+        super::adopt_pid(INIT_PID, &super::root_ns());
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let mut loaded = load_user(
@@ -827,10 +835,8 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // price of a leaf that cannot mint its own.
             uts: crate::uts::init(crate::vfs::ns::mint()),
             // The machine's own PID namespace: the one a boot begins in, whose
-            // numbers are the task slots themselves. A task created here is
-            // registered nowhere - the init namespace's `task_of` is the
-            // identity - so this is the field pair every task starts with and
-            // nothing observable changes until something unshares.
+            // numbers are the ones it allocates above (the slot is not the
+            // number). This is the field pair every task starts with.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
             // The machine's own time namespace, in both slots, the same way:

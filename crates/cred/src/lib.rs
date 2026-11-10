@@ -165,6 +165,38 @@ pub const SUID_DUMP_USER: u8 = 1;
 /// uses it, so `PR_GET_DUMPABLE` can report it.
 pub const SUID_DUMP_ROOT: u8 = 2;
 
+/// `struct ucred`, the credential payload `SO_PEERCRED`, `SCM_CREDENTIALS` and
+/// a pipe's peer answer carry. Linux fills `pid` with the peer's thread-group
+/// id, and `uid`/`gid` with its *real* ids.
+///
+/// Why there is a fourth word. The `pid` is a **number captured when the peer
+/// was met**, not a task-table slot looked up later. A slot names its tenant
+/// only while that tenant lives, so a reader that resolved one at the read
+/// answered `0` for a sender that had since died - and worse than `0` when the
+/// slot had been handed to somebody else. Linux holds a refcounted `struct pid`
+/// instead, so the number outlives the task, and this struct has to as well:
+/// the captured number is the promise (`docs/notes/` §6.121; measured as
+/// `t-udev-worker`'s forked worker, reaped before its manager reads the
+/// message).
+///
+/// `pid_ns` says which pid namespace the number was minted in, so a reader can
+/// answer the way `pid_vnr` does: the number itself when it is in that
+/// namespace, `0` when it is not (a peer in an ancestor namespace is not a
+/// member of the reader's: `.workbuddy/probe-ucredpid.c`, `docs/notes/` §6.3).
+/// The ids are kernel ids, mapped through the reader's **user** namespace at
+/// the same render.
+///
+/// `0` is the kernel's own "no pid" - a pair made with no process behind it,
+/// and the host build, where there is no task table.
+#[derive(Clone, Copy, Default)]
+pub struct UCred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// The pid namespace `pid` was numbered in. `0` is the host.
+    pub pid_ns: u64,
+}
+
 /// The user and group ids six `identity` words, as `ptrace_may_access` and
 /// the uid-change rule see them. Split out from `sched::Identity` so this
 /// module is pure and host-testable.

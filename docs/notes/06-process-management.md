@@ -9731,3 +9731,198 @@ the stack, and fails in the sense that a Linux program scanning
 `arg_start..arg_end` would read its environment instead of its arguments. The
 layout had to move to Linux's before the numbers could be Linux's; the fields
 were the instrument that showed it.
+
+## §6.121 A pid number is a promise: the init namespace allocates its own, it does not number by slot
+
+**The reading, before and after.** `t-stale-pid` is what §6.89's hand-booted probe became
+(`build/scratch/reapwait/kslot.c` → `user/tests/src/bin/t-kslot.rs` → this): it collects a child,
+lets an unrelated helper's child take the pool slot that number just left, and then asks the
+collected number the three things a caller does with one. On `c683813`'s kernel
+(`build/boot-kslot0.log`):
+
+```
+my child 7 collected
+stranger (helper's child) 7
+kill(7, 0) = 0 errno=2 (NOT ESRCH)
+the stale number: /proc/7 -> S
+kill(7, SIGTERM) = 0 errno=2 (NOT ESRCH)
+after SIGTERM: /proc/7 -> Z
+NOTE: the stranger reused my number
+```
+
+On this kernel, the same program's eight claims (`build/boot-stalepid2.log`):
+
+```
+ok:    the freed slot's next tenant is somebody else (13 is not 12)
+ok:    a collected number is ESRCH to kill (-1 errno=3, want -1/3)
+ok:    and /proc does not name it any more (ENOENT)
+ok:    and it cannot end the process that took its slot (-1 errno=3)
+ok:    so the stranger is still running after that (sits at S)
+ok:    numbers only move forward across reuse (up to 17)
+ok:    an unreaped zombie's number still names it (state Z, kill 0)
+ok:    and reaping it spends the number too (18 -> ENOENT)
+```
+
+**Linux's answer, measured.** `build/scratch/pidreuse/reuse.c` (host 7.2.14): ten children born and
+collected one at a time are `129232`..`129241`; fifty children born *after* them reuse none of those
+numbers; and the collected number answers `kill(<n>, 0) = -1 errno=3 (ESRCH)`, `/proc/<n>` =
+`ENOENT`, `waitpid` = `-1/errno 10 (ECHILD)`, `pidfd_open` = `-1/errno 3 (ESRCH)`. A pid is a
+refcounted `struct pid` whose lifetime is its own, which is exactly what makes the number a promise.
+
+**Why the number came back.** It was never a resolution bug. `resolve_pid` and `named_process` were
+asked about a slot that genuinely held a live tenant, whose number genuinely was that number - the
+answer was true. The defect was at the allocation end: `PidNs`'s root level **had no table**, and
+`number_of`/`task_of`/`insert`/`forget` each opened with `if self.is_root() { return identity }`
+(`crates/pidns/src/lib.rs`), so the number *was* the slot, and the slot allocator hands out the
+lowest free index. Release a child and the very next `fork` inherits its promise. The crate's own
+header said so, and pointed at `docs/notes/` §7.1 as the open question (§7.1 did not carry it - a
+dangling citation, §6.89's second reading).
+
+**The fix.** Delete the four short-circuits. The root now has `Numbers { next, by_number, by_slot }`
+like every nested namespace, starts its cursor at 1, and never reuses a number. Three consequences,
+each argued in this commit rather than slipped in:
+
+1. **The machine's init must be registered, or nothing boots.** The first boot after deleting the
+   short-circuits died before `/init` printed a line - `mpos: /init is up` then `INIT_EXITED: the
+   system has no init left`. The cause is the shape of the promise: `try_spawn_init` never called
+   `adopt_pid`, because under an identity map the slot *was* the number and registration was a
+   no-op. With a table, an unregistered init has no number - so its number falls back to its slot
+   (`1`), the cursor is still `1`, and **the init's first child is handed number 1**. The shell's
+   first `fork` was numbered 1, `is_init` and the `init_discards` rules called it the init, and the
+   session collapsed. `try_spawn_init` now calls `adopt_pid(INIT_PID, &root_ns())` before anything
+   else can allocate, which is also the honest statement of what pid 1 is: the namespace's first
+   registration.
+2. **A pid value changes once.** Every number the machine reports comes from `next`, so a boot's
+   numbers are `1` (init), then `2`, `3`, … in creation order across tasks instead of following the
+   slot allocator's holes. That is a visible divergence from every earlier boot and it is the point:
+   Linux's numbers are its namespace's, not a bookkeeping index. Nothing else in the ABI depends on
+   the old values - every door resolves a number through the namespace and reports one through it.
+3. **`next` does not wrap.** Inherited from the nested namespaces, now the machine's rule too; a
+   boot would have to create 2^32 processes to see it, and the header says so instead of pretending
+   the counter is `pid_max`-like.
+
+**The pin, and what it must discriminate.** The ordering in `t-stale-pid` is what makes the reuse
+deterministic rather than a coincidence: a helper occupies its own slot first, then this program
+collects its child (freeing the slot above the helper's), then the helper forks - so the allocator
+has exactly one lowest-free slot and it is the one under test. Without the fix that grandchild took
+the collected number; with it, it takes one of its own. The last two claims are the boundary that
+stops the fix from overshooting: a **zombie**'s number still names it (`kill` = `0`, `/proc` = `Z`)
+and reaping spends it - a fix that dropped the registration at exit instead of at reap would take
+the first of those away.
+
+Green on host (`MPOS_ON_HOST=1`, 8/8) and on the machine (`build/boot-stalepid1.log`,
+`build/boot-stalepid2.log`).
+
+**Counterfactual:** `crates/pidns/src/lib.rs` and `src/sched/runtime/load.rs` stashed, kernel and
+loader rebuilt (`4341 KiB -> 1157 KiB` against `4337 KiB -> 1154 KiB`), booted - **6 of 8 red**
+(`build/boot-stalepid-cf1.log`):
+
+```
+FAIL:  the freed slot's next tenant is somebody else (7 is not 7)
+FAIL:  a collected number is ESRCH to kill (0 errno=2, want -1/3)
+FAIL:  and /proc does not name it any more (S)
+FAIL:  and it cannot end the process that took its slot (0 errno=2)
+FAIL:  so the stranger is still running after that (sits at Z)
+FAIL:  numbers only move forward across reuse (up to 8)
+ok:    an unreaped zombie's number still names it (state Z, kill 0)
+ok:    and reaping it spends the number too (8 -> ENOENT)
+FAILED
+```
+
+The two that stay green are the honest limit: a zombie's number names it whether numbers are
+promises or slots, so those claims pin the *boundary* of the fix rather than the fix.
+
+**A claim that passed on the broken kernel, and had to be fixed before it could witness.** The
+"stranger is still running" claim was first written as a read straight after the `kill`. On the
+counterfactual it went `ok: ... (R sits at 7)` - the read won the race against the signal the
+broken kernel really did deliver, and on a later run the same binary read `Z`. A claim whose answer
+depends on how fast the reader runs pins nothing. It now sleeps 100 ms between the `kill` and the
+read, and the counterfactual is `FAIL: ... (sits at Z)` every time.
+
+**The rule.** A number a caller can hold must outlive the task it names, or it is not a number - it
+is a slot with a nicer name. The identity map at the root was defensible only while nothing
+promised otherwise, and the promise was already written down: `wait` refuses a stranger's number
+(`t-stranger`, `t-slotowner`, §6.89), a death carries its owner (`Retired::parent`, §6.90), and a
+number is read in the caller's namespace (§6.91). Four doors agreeing on a promise the allocator
+did not keep is the shape of every gap this campaign has closed.
+
+**The half the allocator fix uncovered.** Changing what a number *is* is a probe for every place
+that assumed the old answer, and this one turned up six doors that had been right by coincidence:
+each compared a caller's **number** against a task-table **slot**, or reported a slot where the ABI
+wants a number. They were invisible while the identity map held, because the two spellings were the
+same integer. `/proc/<pid>/stat`'s `exit_code` fix (§6.112) and `Retired::parent` (§6.90) had
+already made the same point from the other end - a record that has to be read after the task is
+gone cannot be keyed by a slot - but these six were read at the moment of the call, so nothing but
+a boot could see them.
+
+Measured, one gate at a time (`MPOS_TEST_LANES=2`, both arms): the first run after the allocator
+change was `18 of 285` user programs red on x86_64 (aarch64 the same family); after the sender's
+pid, the fork answer and `set_tid_address` were fixed, `9`; after netlink's port id, `IFLA_NET_NS_PID`
+and the cgroupfs's two halves, `1`; the last one was `t-udev-worker` alone, whose own fix
+(`mpos_cred::UCred`, below) made the run `pass=285 fail=0`, `mpos-kunit 35 passed, 0 failed` on both
+arms. The witnesses are all old pins - `t-signal-frame` said
+`FAIL: and si_pid naming the sibling (got 0x6, want 0xb)`, where `0xb` is the sibling's number and
+`0x6` its slot; `t-cgroupfs` said `FAIL: the root's cgroup.procs lists this program`; `t-ns-net`
+said `FAIL: moving it into the child's namespace succeeds (got -3)`. Six doors, in order:
+
+1. **The sender's own pid in a signal's `siginfo`.** `send_signal` and `send_signal_process`
+   (`src/sched/runtime/child_signal.rs`) each built `(cur.tgid.0 as i32, cur.identity.ruid as i32)`
+   as the sender, under the table lock they already held. Now they resolve the **number** in the
+   same critical section (`cur.pid_ns.number_of(cur.tgid.0)`, falling back to the slot only for the
+   tasks that have no number - the kernel's own).
+2. **What `fork`, `vfork` and `clone` answer.** The spawn layer's `child_id.0 as isize` is an
+   *internal* slot: `hand_down_keyrings` and `hand_down_rseq` take it and build `TaskId(child)` from
+   it. Changing the spawn layer to answer a number broke `t-rseq` and `t-keyctl` - the right lesson,
+   learned the wrong way round. The conversion is at the door instead: a `fn number_answer(child)`
+   in `src/sched/runtime/child_exit.rs` converts once, on the way out to userspace.
+3. **`set_tid_address`'s answer** (`src/syscall/linux/proc.rs`): `current().0` → `current_pid_number()`.
+4. **Netlink's autobind port id** (`src/net/rtnl.rs`, two sites): the sender's pid is the number,
+   because a reader matches `nlmsg_pid` against its own `getpid()` - a slot there makes every
+   message from a process read as foreign mail.
+5. **`IFLA_NET_NS_PID`** (`src/net/rtnl.rs`): the attribute carries a *number*, and the code looked
+   it up as a slot; it resolves through `resolve_pid` now, then asks the namespace by slot.
+6. **`cgroup.procs` / `cgroup.threads`** (`src/vfs/cgroupfs.rs`): the read side printed slots, and
+   the write side compared the number it parsed against `(tid, pid)` slots.
+
+**`UCred`: a field can be stored as a slot and rendered as a number, and the audit has to ask who
+reads it.** The first attempt at the credential fix changed `self_cred`'s store to a number and left
+`observed_cred`'s render alone - so the number was mapped through the table a second time, and
+`t-unix-scm` (`SCM_CREDENTIALS carries the peer pid (got 0, want 414)`), `t-ns-pid` and
+`t-nsnumbers` went red. The store-and-render split is deliberate and documented: `UCred` holds what
+the machine stores, and the reader's namespaces decide what it sees. But the render cannot survive
+the sender's death: it resolved a **slot**, and `t-udev-worker` reads the credentials of a forked
+worker that the manager has already `waitpid`ed - `release_pid` has spent the number, so the render
+answered `0` (and, when the slot had a new tenant, would have named the wrong process). Linux holds
+a refcounted `struct pid` for exactly this reason.
+
+The shape that is both: store the **number**, captured when the peer is met, plus the pid namespace
+it was minted in - `mpos_cred::UCred { pid, uid, gid, pid_ns }`. The render then answers `pid_vnr`
+faithfully: the number for a reader in that namespace (which is how it outlives the sender), `0` for
+one outside it (§6.3's measurement - a peer in an ancestor namespace is not a member of the
+reader's). The type moved to the `cred` leaf because both carriers need it - `net::unix` and
+`vfs::pipe`'s socketpair, which stores the pair's creator the same way - and both already depend on
+that leaf, so no edge was added for it.
+
+**Counterfactual, the door half.** The allocator half was already witnessed (§6.89's reading above,
+6 of 8 red). For these six, the changed files (`child_signal.rs`, `child_exit.rs`, `proc.rs`,
+`rtnl.rs`, `cgroupfs.rs`, `unix.rs`, `socket.rs`, `pipe.rs`, `cred/lib.rs`, `epoll.rs`) were stashed
+with the allocator fix kept, and the kernel and loader rebuilt:
+
+```
+t-signal-frame   3 red   FAIL: and si_pid naming the sibling (got 0x6, want 0xb)
+                         FAIL: a child that dies of SIGABRT ... (status 0x0)
+                         FAIL: a child that dies of SIGSEGV ... (status 0x0)
+t-udev-worker    1 red   FAIL: a forked worker's reply carries its own pid, not the manager's
+t-cgroupfs      10 red   FAIL: the root's cgroup.procs lists this program
+                         FAIL: writing this pid moves this process into the group
+                         ...
+```
+
+Restored, rebuilt, all three green (`build/boot-fix-t-signal-frame.log`, `-t-udev-worker.log`,
+`-t-cgroupfs.log`: 0 `FAIL:` lines each).
+
+**The rule, second half.** The first half said a number must outlive the task it names. This one is
+its corollary: **a slot is not a name, and every door that hands one to userspace - or takes a name
+from userspace - is a door where the two can be confused.** The audit cannot be done by grepping
+`as i32`; it has to ask, per field, which of the two the *reader* needs, because a value can be
+stored as one and rendered as the other.

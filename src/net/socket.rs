@@ -646,15 +646,20 @@ unsafe fn collect_scm_rights(
 fn observed_cred(c: crate::net::unix::UCred) -> crate::net::unix::UCred {
     let ns = crate::sched::current_user_ns();
     crate::net::unix::UCred {
-        // `0` stays `0`: it is the kernel's own "no pid" (a message with no
-        // sender), and `pid_number_of` would otherwise resolve slot `0`.
-        pid: if c.pid == 0 {
+        // The number belongs to the namespace it was minted in: a reader
+        // sharing that namespace reads it back - which is how it survives the
+        // sender's death, the promise `mpos_cred::UCred` records - and one
+        // outside reads `0`, which is `pid_vnr`'s answer for a task it cannot
+        // see (`docs/notes/` §6.121, §6.3). `0` stays `0`: the kernel's own
+        // "no pid".
+        pid: if c.pid == 0 || c.pid_ns != crate::sched::current_pid_ns_id() {
             0
         } else {
-            crate::sched::pid_number_of(crate::sched::TaskId(c.pid as usize)).unwrap_or(0)
+            c.pid
         },
         uid: ns.uid_to_inner(c.uid),
         gid: ns.gid_to_inner(c.gid),
+        pid_ns: c.pid_ns,
     }
 }
 
@@ -5288,7 +5293,7 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
         let (a, b) = crate::net::unix::pair(type_bits as u16);
         (a as Arc<dyn Inode>, b as Arc<dyn Inode>)
     } else {
-        let (a, b) = crate::vfs::pipe::DuplexEnd::pair((creator.pid, creator.uid, creator.gid));
+        let (a, b) = crate::vfs::pipe::DuplexEnd::pair(creator);
         (a as Arc<dyn Inode>, b as Arc<dyn Inode>)
     };
     let fd0 = match crate::vfs::file::open_inode(first) {
@@ -6198,15 +6203,9 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
                     )
                 })
                 .or_else(|| {
-                    inode.as_duplex().map(|d| {
-                        let (pid, uid, gid) = d.peer_cred();
-                        (
-                            crate::net::unix::UCred { pid, uid, gid },
-                            d.passcred(),
-                            d.rcvtimeo(),
-                            d.sndtimeo(),
-                        )
-                    })
+                    inode
+                        .as_duplex()
+                        .map(|d| (d.peer_cred(), d.passcred(), d.rcvtimeo(), d.sndtimeo()))
                 })
         });
     if let Some((c, passcred, rcvtimeo, sndtimeo)) = channel {

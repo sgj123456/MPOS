@@ -263,7 +263,17 @@ pub enum Sent {
 pub fn send_signal(id: TaskId, sig: u8) -> bool {
     let (pid, uid) = with_table(|t| {
         let cur = t.task(t.current);
-        (cur.tgid.0 as i32, cur.identity.ruid as i32)
+        // The sender's **number**, not its slot: `si_pid` is read by a handler
+        // and compared against the `getpid()` that sent the signal, so a slot
+        // here was right only while the two were the same integer. The number is
+        // asked of the sender's own namespace - the one whose numbers the
+        // receiver, being in the same chain, spells the sender with
+        // (`docs/notes/` §6.121).
+        let number = cur.pid_ns.number_of(cur.tgid.0);
+        (
+            number.map_or(cur.tgid.0 as i32, |n| n as i32),
+            cur.identity.ruid as i32,
+        )
     });
     send_signal_info(id, sig, crate::sched::signal::SigInfo::user(sig, pid, uid)) != Sent::NoTask
 }
@@ -2081,7 +2091,17 @@ pub fn pidfd_live_member(id: TaskId, generation: u64) -> Option<TaskId> {
 pub fn send_signal_process(tgid: TaskId, sig: u8) -> bool {
     let (pid, uid) = with_table(|t| {
         let cur = t.task(t.current);
-        (cur.tgid.0 as i32, cur.identity.ruid as i32)
+        // The sender's **number**, not its slot: `si_pid` is read by a handler
+        // and compared against the `getpid()` that sent the signal, so a slot
+        // here was right only while the two were the same integer. The number is
+        // asked of the sender's own namespace - the one whose numbers the
+        // receiver, being in the same chain, spells the sender with
+        // (`docs/notes/` §6.121).
+        let number = cur.pid_ns.number_of(cur.tgid.0);
+        (
+            number.map_or(cur.tgid.0 as i32, |n| n as i32),
+            cur.identity.ruid as i32,
+        )
     });
     send_signal_process_info(
         tgid,

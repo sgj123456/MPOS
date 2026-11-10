@@ -155,7 +155,9 @@ pub fn bind(handle: usize, requested: u32) -> isize {
     // Read the caller's process id before the critical section: autobinding a
     // nameless socket to it is what makes a reply match the requester's own
     // `getpid()` check.
-    let tgid = crate::sched::current_tgid().0 as u32;
+    // The sender's **number**: this id is stamped into every answer's
+    // `nlmsg_pid`, and a reader matches that against its own `getpid()`.
+    let tgid = crate::sched::current_pid_number();
     critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         if requested != 0
@@ -281,7 +283,9 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
     // stamped with it: a reader that matches `nlmsg_pid` against its own
     // `getpid()` (fastfetch's local-IP probe) otherwise reads every message as
     // foreign mail, never sees the end marker, and waits forever for more.
-    let tgid = crate::sched::current_tgid().0 as u32;
+    // The sender's **number**: this id is stamped into every answer's
+    // `nlmsg_pid`, and a reader matches that against its own `getpid()`.
+    let tgid = crate::sched::current_pid_number();
     let portid = critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         let unbound = table
@@ -732,7 +736,11 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                             kind: crate::vfs::ns::Kind::Net,
                             slot: crate::vfs::ns::Slot::Own,
                         };
-                        match crate::sched::ns_of(pid as usize, net) {
+                        // The attribute carries a **number** read in the
+                        // caller's namespace; `ns_of` is indexed by slot
+                        // (`docs/notes/` §6.121).
+                        let at = crate::sched::resolve_pid(pid as i64).map(|id| id.0);
+                        match at.and_then(|slot| crate::sched::ns_of(slot, net)) {
                             Some(crate::vfs::ns::Namespace::Net(id)) => Some(id),
                             // A pid that names no task: `ESRCH`, which is what
                             // Linux's `get_net_ns_by_pid` answers (measured:

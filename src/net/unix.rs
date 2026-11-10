@@ -94,23 +94,11 @@ pub const SOMAXCONN: usize = 4096;
 /// The size of `struct sockaddr_un`'s `sun_path`, `linux/un.h`.
 pub const SUN_PATH_MAX: usize = 108;
 
-/// `struct ucred`, the credential payload `SO_PEERCRED` and the
-/// `SCM_CREDENTIALS` control message carry. Linux fills `pid` with the peer's
-/// thread-group id, and `uid`/`gid` with its *real* ids.
-///
-/// These are the numbers the machine **stores** - the parent namespace's
-/// numbering, where a task's `pid` is its own slot. What a reader sees is this
-/// mapped through the reader's own namespaces at the render, which is
-/// `socket.rs`'s `observed_cred`: the ids through the reader's **user**
-/// namespace and the `pid` through its **pid** namespace (0 when the peer is
-/// not a member of it). A task that never unshares is in the identity map of
-/// both and reads exactly these back.
-#[derive(Clone, Copy, Default)]
-pub struct UCred {
-    pub pid: u32,
-    pub uid: u32,
-    pub gid: u32,
-}
+/// `struct ucred` lives in the `cred` leaf, because the two families that
+/// carry a peer's credentials - this one and `vfs::pipe`'s socketpair - both
+/// depend on that leaf and on nothing of each other's
+/// (`docs/notes/` §6.121).
+pub use mpos_cred::UCred;
 
 /// The running task's credentials, in the shape `ucred` wants. Read outside any
 /// socket lock - the scheduler table wants the same critical section, so
@@ -122,9 +110,13 @@ pub(crate) fn self_cred() -> UCred {
     {
         let (uid, gid) = crate::sched::current_real_owner();
         UCred {
-            pid: crate::sched::current_tgid().0 as u32,
+            // The **number**, resolved now, in the namespace this task is
+            // numbered in - `pid_vnr`'s shape, and a promise the caller may
+            // hold after the task itself is gone (`docs/notes/` §6.121).
+            pid: crate::sched::current_pid_number(),
             uid,
             gid,
+            pid_ns: crate::sched::current_pid_ns_id(),
         }
     }
     #[cfg(not(target_os = "none"))]
@@ -1510,7 +1502,7 @@ fn connect_to(
                 // never the inode a descriptor names - the `UnixSock` halves
                 // wrap it, and they are who `SO_PEERCRED` answers from, with
                 // the `peer` recorded just below.
-                let (client, server) = DuplexEnd::pair((0, 0, 0));
+                let (client, server) = DuplexEnd::pair(UCred::default());
                 let listener_cred = stl.owner;
                 let waiters = stl.accept_waiters.clone();
                 // The connector owns its half immediately: connect is not

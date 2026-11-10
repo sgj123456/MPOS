@@ -874,7 +874,7 @@ pub fn fork(state: &UserFrame) -> isize {
     );
     hand_down_keyrings(parent_tgid, child, false);
     hand_down_rseq(parent_tgid, child, false);
-    child
+    number_answer(child)
 }
 
 /// `vfork(2)`: the same copy of the calling process, labelled for the tracer.
@@ -899,7 +899,22 @@ pub fn vfork(state: &UserFrame) -> isize {
     );
     hand_down_keyrings(parent_tgid, child, false);
     hand_down_rseq(parent_tgid, child, false);
-    child
+    number_answer(child)
+}
+
+/// The answer `fork`/`vfork`/`clone` give: the child's **number** in the caller's
+/// namespace, which is the value a `wait` reports and a `kill` accepts.
+///
+/// The spawns themselves answer a slot - that is what the table is indexed by,
+/// and what every inherit step between the two (`keyrings`, `rseq`, cgroup
+/// membership) is keyed by. Turning it into a number here, once, at the door the
+/// program reads, is what keeps the two spellings from being confused in the
+/// middle (`docs/notes/` §6.121).
+fn number_answer(child: isize) -> isize {
+    if child <= 0 {
+        return child;
+    }
+    crate::sched::pid_number_of(TaskId(child as usize)).map_or(child, |n| n as isize)
 }
 
 /// Hand a new task the keyrings it inherits: the session keyring and nothing
@@ -1909,12 +1924,12 @@ pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
         let child = spawn_thread(state, request);
         hand_down_keyrings(parent_tgid, child, true);
         hand_down_rseq(parent_tgid, child, true);
-        return child;
+        return number_answer(child);
     }
     let child = spawn_copy(state, request);
     hand_down_keyrings(parent_tgid, child, false);
     hand_down_rseq(parent_tgid, child, false);
-    child
+    number_answer(child)
 }
 
 /// Create a thread: a task that runs on the calling task's memory, with the

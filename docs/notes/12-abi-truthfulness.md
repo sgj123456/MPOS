@@ -292,7 +292,21 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, `stat`'s data, break and string addresses §6.120):** stage 1
+**Latest measured gate (2026-11-10, a pid number is a promise §6.121):** stage 1 `1256 tests,
+0 failed` (63.50 s); x86_64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed, 0 failed`
+(47.42 s, previous green 47.61 s); aarch64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35 passed,
+0 failed` — `GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-pidpromise4.log`). The point is a different one from the last few: no new program was
+needed, because this change *uncovered* the pins. Changing what a pid number is turned the gate
+into a probe for every door that had conflated a number with a task slot — `18 of 285` user
+programs red on the first run after the allocator change, `9` after the sender-pid/fork-answer/
+`set_tid_address` fixes, `1` after netlink's autobind id, `IFLA_NET_NS_PID` and the cgroupfs's two
+halves, and `0` after the credential payload stopped storing a slot. `t-signal-frame`
+(`si_pid naming the sibling (got 0x6, want 0xb)`), `t-udev-worker`, `t-cgroupfs`, `t-ns-net`,
+`t-ns-pid`, `t-rseq` and `t-keyctl` are the witnesses, and the new `t-stale-pid` (8 claims,
+counterfactually 6 red) is the one written for it.
+
+**Measured gate before it (2026-11-10, `stat`'s data, break and string addresses §6.120):** stage 1
 `1255 tests, 0 failed` (61.72 s); x86_64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed,
 0 failed` (61.92 s, previous green 65.11 s); aarch64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35
 passed, 0 failed` (181.79 s, previous green 192.03 s) — `GATE EXIT=0`, both arms in one command

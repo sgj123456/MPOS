@@ -418,25 +418,27 @@ One-glance status of the whole roadmap.
   a stranger's `waitpid` collected a death it had nothing to do with and the real parent was left
   with `ECHILD` for its own child (`MY waitpid(7, WNOHANG) = 7 errno=0` where Linux answers
   `ECHILD`; `t-steal`, §6.90, item 203)
-- [ ] **a pid number is a promise, and here it is the task slot** — a number I held for a child I
-  already collected is handed straight to the next `fork`, so `kill(<it>, SIGTERM)` ended an
+- [x] **a pid number is a promise, and here it is the task slot** — a number I held for a child I
+  already collected was handed straight to the next `fork`, so `kill(<it>, SIGTERM)` ended an
   unrelated process and `/proc/<it>` read that process (`kill(7, SIGTERM) = 0 errno=0 (NOT ESRCH)` /
   `/proc/7 state=Z`, where Linux answers `ESRCH`/`ENOENT` - `build/scratch/reapwait/kslot.c`, §6.89).
-  A **live** stranger taking the number is refused on the `wait` path and pinned (`is_child` answers
-  `ECHILD` - `t-stranger`, `t-slotowner`, `t-reapwait`), but that was only half of it: a stranger
-  that had already exited and not been collected had its **death** collected by whoever asked, and
-  the real parent then got `ECHILD` for its own child. That is a different defect with its own fix -
-  a death now carries its owner (`Retired::parent`, `t-steal`, §6.90, item 203) - and it is closed.
-  What is still open here is `kill`/`tkill`/`tgkill` and `/proc/<n>`, which resolve a number to a
-  slot without asking whether the number still means that task - the *other* half, where the number
-  must be read in the caller's namespace before it is resolved at all, is closed
-  (`resolve_pid`/`pid_task` at `prlimit64`, the seven scheduling calls and `setpriority`,
-  `t-nsnumbers`, §6.91, item 204). **Not a patch**: at the moment of the check the slot genuinely holds a live tenant and
-  the number genuinely is theirs, so the fix is at the allocation end - the init namespace stops
-  numbering by slot and gets the monotonic table every nested namespace already has
-  (`crates/pidns/src/lib.rs`), which moves that crate's stated load-bearing decision, its
-  `the_init_namespace_numbers_by_slot()` pin, and every reported pid value once (§6.89 has the cost
-  and the doors)
+  **Landed:** the init namespace now allocates numbers from a monotonic table instead of numbering by
+  slot — the four `is_root()` short-circuits in `crates/pidns/src/lib.rs` are gone, and the crate's
+  `the_init_namespace_numbers_by_slot` pin is replaced by two that pin the rule (numbers ascend, a
+  spent number is spent, an unregistered slot has none). The machine's init is registered as the
+  namespace's first number, which is what pid 1 is; the first boot without that died
+  `INIT_EXITED: the system has no init left`, because its first child was handed number 1. Changing
+  what a number *is* then turned the gate into a probe: `18` user programs red, then `9`, then `1`,
+  then `0` as six doors that had conflated a **number** with a **slot** were fixed — a signal's
+  `si_pid`, `fork`'s answer, `set_tid_address`, netlink's autobind id, `IFLA_NET_NS_PID`, and
+  `cgroup.procs`/`cgroup.threads` on both the read and the write side. The seventh was the
+  credential payload: `UCred` stored a slot and resolved it at the read, which answers `0` for a
+  sender that has been reaped (and a stranger's number once the slot is reused — `t-udev-worker`'s
+  forked worker is the measurement), so it now carries the **number captured when the peer was met**
+  plus the pid namespace it was minted in and answers `pid_vnr` — the number inside that namespace,
+  `0` outside it. `t-stale-pid` (8 claims, **6 red** counterfactually, `build/boot-stalepid-cf1.log`)
+  pins the allocator; the existing `t-signal-frame`, `t-udev-worker` and `t-cgroupfs` pins are the
+  witnesses for the doors (§6.121, item 232)
 - [x] a pidfd can fetch a descriptor — `pidfd_getfd` duplicates the target's **open file
   description** into the caller's table, with Linux's refusal order (flags, pidfd, task,
   authority, target fd), `FD_CLOEXEC` unconditionally and `ESRCH` for a zombie or a leader

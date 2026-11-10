@@ -22,6 +22,7 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use critical_section::Mutex;
+use mpos_cred::UCred;
 
 use super::{Ino, Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
@@ -1060,7 +1061,7 @@ pub struct DuplexEnd {
     /// is `getsockopt(SO_PEERCRED)`'s answer, and the reason a pair carries
     /// credentials at all: a compositor hands one half to a child it launched
     /// and asks the other half who its client is.
-    peer: (u32, u32, u32),
+    peer: UCred,
     /// `SO_PASSCRED`: whether a read should attach the peer's credentials.
     passcred: AtomicBool,
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO` as `struct timeval`'s two fields - the
@@ -1077,9 +1078,12 @@ pub struct DuplexEnd {
 
 impl DuplexEnd {
     /// The two ends of one connected pair, made by a process whose
-    /// credentials are `creator` - `(pid, uid, gid)`, or all zero when the
-    /// caller has no process behind the pair.
-    pub fn pair(creator: (u32, u32, u32)) -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
+    /// credentials are `creator` - the words `SO_PEERCRED` answers with, or
+    /// all zero when the caller has no process behind the pair. The pid in it
+    /// is the **number** its maker was given, captured here rather than looked
+    /// up at a later read, so it still names that process after it has exited
+    /// (`mpos_cred::UCred`, `docs/notes/` §6.121).
+    pub fn pair(creator: UCred) -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
         // Two one-way links. `a_write` feeds `b_read`, and `b_write` feeds
         // `a_read`, so each end's read half is the other's write half. The
         // halves are stream ends, not pipes: a partial write they cut short
@@ -1104,7 +1108,7 @@ impl DuplexEnd {
 
     /// `SO_PEERCRED`: the pid, uid and gid of the process that created the
     /// pair, which Linux reports as the peer's credentials on both ends.
-    pub fn peer_cred(&self) -> (u32, u32, u32) {
+    pub fn peer_cred(&self) -> UCred {
         self.peer
     }
 
@@ -1275,11 +1279,13 @@ mod tests {
     use alloc::vec;
 
     use super::{CAPACITY, Channel, DuplexEnd, PIPE_BUF, Role, pair};
+    use mpos_cred::UCred;
+
     use crate::vfs::{File, Inode, NodeKind, VfsError};
 
     #[test]
     fn a_socketpair_carries_bytes_both_ways() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         let mut buf = [0u8; 8];
 
         assert_eq!(a.write_at(0, b"ping").unwrap(), 4);
@@ -1295,10 +1301,10 @@ mod tests {
 
     #[test]
     fn an_scm_handover_rides_only_the_direction_it_was_sent_on() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         // Two distinct open files, handed over in order on a's write side.
-        let f1 = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
-        let f2 = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
+        let f1 = Arc::new(File::new(DuplexEnd::pair(UCred::default()).0));
+        let f2 = Arc::new(File::new(DuplexEnd::pair(UCred::default()).0));
         let p1 = Arc::as_ptr(&f1);
         let p2 = Arc::as_ptr(&f2);
 
@@ -1319,7 +1325,7 @@ mod tests {
 
     #[test]
     fn a_peek_shows_the_front_without_taking_it() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         let mut buf = [0u8; 8];
 
         assert_eq!(a.write_at(0, b"abcdefghij").unwrap(), 10);
@@ -1348,8 +1354,8 @@ mod tests {
 
     #[test]
     fn a_peeked_handover_is_delivered_again_to_the_read() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
-        let f = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
+        let f = Arc::new(File::new(DuplexEnd::pair(UCred::default()).0));
         let want = Arc::as_ptr(&f);
         a.write_at(0, b"x").unwrap();
         a.send_scm(vec![f]);
@@ -1378,7 +1384,7 @@ mod tests {
 
     #[test]
     fn half_closing_a_socketpair_leaves_the_other_direction_running() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         a.write_at(0, b"last").unwrap();
         a.shut_write();
 
@@ -1396,7 +1402,7 @@ mod tests {
 
     #[test]
     fn shutting_down_twice_is_harmless() {
-        let (a, _b) = DuplexEnd::pair((0, 0, 0));
+        let (a, _b) = DuplexEnd::pair(UCred::default());
         a.shut_write();
         // The second call must not take the end out of the writer count again,
         // and the drop that follows must not take it out a third time: an
@@ -1407,14 +1413,14 @@ mod tests {
 
     #[test]
     fn a_shut_down_reader_makes_the_peer_write_fail() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         a.shut_read();
         assert_eq!(b.write_at(0, b"nobody").err(), Some(VfsError::BrokenPipe));
     }
 
     #[test]
     fn dropping_one_end_ends_the_stream_the_way_a_pipe_does() {
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         drop(b);
         let mut buf = [0u8; 4];
         assert_eq!(a.read_at(0, &mut buf).unwrap(), 0, "the far end is gone");
@@ -1702,7 +1708,7 @@ mod tests {
             "a write answers EPIPE, not a wait"
         );
 
-        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let (a, b) = DuplexEnd::pair(UCred::default());
         drop(b);
         assert!(a.poll_hup(), "the peer closed, both directions with it");
         assert!(

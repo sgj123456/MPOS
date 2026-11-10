@@ -620,8 +620,14 @@ impl FileKind {
             FileKind::Procs => {
                 let mut out = String::new();
                 for (tid, pid) in members_of(node) {
+                    // The **number**, not the slot: a membership file is a list
+                    // of pids a program compares against `getpid()` and feeds
+                    // back into `cgroup.procs` (`docs/notes/` §6.121).
                     if pid == tid {
-                        out.push_str(&format!("{pid}\n"));
+                        if let Some(number) = crate::sched::pid_number_of(crate::sched::TaskId(pid))
+                        {
+                            out.push_str(&format!("{number}\n"));
+                        }
                     }
                 }
                 out
@@ -629,7 +635,9 @@ impl FileKind {
             FileKind::Threads => {
                 let mut out = String::new();
                 for (tid, _) in members_of(node) {
-                    out.push_str(&format!("{tid}\n"));
+                    if let Some(number) = crate::sched::pid_number_of(crate::sched::TaskId(tid)) {
+                        out.push_str(&format!("{number}\n"));
+                    }
                 }
                 out
             }
@@ -658,11 +666,17 @@ impl FileKind {
             // `cgroup.threads` moves the one thread it names.
             FileKind::Procs | FileKind::Threads => {
                 let number: usize = text.trim().parse().map_err(|_| VfsError::Invalid)?;
+                // The text names a **number**, and the table is indexed by slot:
+                // the two are different integers and only the namespace knows
+                // which slot a number means (`docs/notes/` §6.121).
+                let target = crate::sched::resolve_pid(number as i64)
+                    .ok_or(VfsError::NoProcess)?
+                    .0;
                 let (found_pid, found_tid) = tasks::all()
                     .into_iter()
                     .find(|(tid, pid)| match self {
-                        FileKind::Procs => *pid == number || *tid == number,
-                        _ => *tid == number,
+                        FileKind::Procs => *pid == target || *tid == target,
+                        _ => *tid == target,
                     })
                     .ok_or(VfsError::NoProcess)?;
                 if *self == FileKind::Procs {
