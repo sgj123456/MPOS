@@ -26,7 +26,7 @@ pub mod kunit;
 
 pub use pframe::{Buddy, MAX_ORDER, PAGE_SHIFT, PAGE_SIZE, Pmm};
 pub use vm::{KernelSections, MapFlags, Mapping};
-pub use vma::{Vma, VmaKind, VmaTable};
+pub use vma::{ImageBounds, VmBook, Vma, VmaKind, VmaTable, vm_book};
 
 #[cfg(target_os = "none")]
 use crate::boot::BootInfo;

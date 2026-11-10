@@ -427,6 +427,21 @@ pub struct TaskSnapshot {
     /// from the `Retired` record's raw code and core-dump classification, so
     /// `/proc` and `wait` cannot disagree about one death (§6.112).
     pub exit_code: i32,
+    /// The program image's three addresses - `stat`'s fields 26, 27 and 28.
+    ///
+    /// A zombie has no address space at all and reads zeros for all three:
+    /// Linux answers `startcode`/`endcode`/`startstack` as `0` for an
+    /// uncollected zombie (`build/scratch/zombiev/z.c`).
+    pub image: crate::mm::ImageBounds,
+    /// The three page books `status` splits `VmExe`/`VmLib`/`VmData`/`VmStk`
+    /// from, `(exec, stack, data)` - Linux's `exec_vm`, `stack_vm` and
+    /// `data_vm`.
+    ///
+    /// Gathered here with [`Self::image`] because `VmExe` and `VmLib` are a
+    /// *split* of the exec book by where the image's own text lies, so the
+    /// addresses and the count have to be one instant's. A zombie reads zeros,
+    /// which is also why its `status` prints no `Vm*` line at all.
+    pub books: (usize, usize, usize),
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -479,6 +494,17 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     let peak_pages = task.mm.peak_pages();
     let hwm_frames = task.mm.hwm_frames();
     let virtual_pages = task.mm.mapped_pages();
+    let books = task.mm.vm_books();
+    // A zombie has no address space: `release_exited` drops the space, and the
+    // `mm` left behind is the table's record of a group whose threads have all
+    // ended. Linux reports no `Vm*` line and three zero addresses for one
+    // (`build/scratch/zombiev/z.c`), so the image's bounds are only read off a
+    // task that still has an address space.
+    let image = if task.exited {
+        crate::mm::ImageBounds::default()
+    } else {
+        task.mm.image_bounds()
+    };
     let (ignored, caught) = disposition_sets(task.dispositions.snapshot());
     let credentials = task.mm.credentials();
     TaskSnapshot {
@@ -517,6 +543,8 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         peak_pages,
         hwm_frames,
         virtual_pages,
+        image,
+        books,
         nice: task.nice,
         exit_signal: task.exit_signal,
         cpu: task.mm.cpu_all(),

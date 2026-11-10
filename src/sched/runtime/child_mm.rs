@@ -5,7 +5,7 @@ use super::PERMANENT_TASKS;
 use super::load::spawn;
 use super::task::with_table;
 use super::{USER_STACK_MAX, USER_STACK_PAGES};
-use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
+use crate::mm::vma::{ImageBounds, MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use core::cell::RefCell;
 use critical_section::Mutex;
 
@@ -1700,6 +1700,29 @@ pub struct Mm {
     /// which is what `getrusage(RUSAGE_CHILDREN)` reports.
     pub(crate) cnvcsw: core::sync::atomic::AtomicU64,
     pub(crate) cnivcsw: core::sync::atomic::AtomicU64,
+    /// Where the program image sits in this address space, and where its stack
+    /// pointer started: the three absolute addresses `/proc/<pid>/stat` fields
+    /// 26-28 report as `startcode`, `endcode` and `startstack`.
+    ///
+    /// Recorded at load rather than derived, because none of the three is
+    /// recoverable from the mapping tables. `endcode` is `p_filesz`'s end, not
+    /// the page the text *occupies* - a segment with a 1 MiB `.bss` behind it
+    /// still ends at `start_code + p_filesz` (measured:
+    /// `build/scratch/statcode/x.c`, a single `RWE` load with `FileSiz 0x640`
+    /// and `MemSiz 0x100648` reads `endcode - startcode = 0x640`). And
+    /// `startstack` is the `rsp` the process was *entered* with, which no
+    /// current register and no `[stack]` VMA boundary answers: measured
+    /// `build/scratch/statcode/start.S`, a program that saves `%rsp` in its
+    /// first instruction reads exactly that value back out of `/proc/self/stat`
+    /// while its own `main` is 5024 bytes deeper.
+    ///
+    /// `fork` copies all three - a child's address space is its parent's, and
+    /// Linux's `copy_mm` takes `start_code`/`end_code`/`start_stack` with it
+    /// (`build/scratch/statcode/inherit2.c`) - while `execve` replaces them
+    /// with the new image's. A task with no user address space keeps zeros.
+    pub(crate) start_code: core::sync::atomic::AtomicUsize,
+    pub(crate) end_code: core::sync::atomic::AtomicUsize,
+    pub(crate) start_stack: core::sync::atomic::AtomicUsize,
 }
 
 /// A thread group's memory: the frames behind its mappings, how many threads
@@ -1730,6 +1753,20 @@ impl Mm {
         root: usize,
         frames: Vec<usize>,
         eager: Vec<MappedRange>,
+    ) -> Arc<Mm> {
+        Mm::with_image(leader, root, frames, eager, ImageBounds::default())
+    }
+
+    /// The same, for a group that is being given a freshly loaded program
+    /// image: what `execve` and the two spawn paths make, and the only callers
+    /// that have bounds to hand over. A `fork` child inherits its parent's
+    /// through [`Mm::set_image_bounds`] instead.
+    pub(crate) fn with_image(
+        leader: TaskId,
+        root: usize,
+        frames: Vec<usize>,
+        eager: Vec<MappedRange>,
+        image: ImageBounds,
     ) -> Arc<Mm> {
         // The high-water marks start at what the loader already placed: the
         // eager ranges it recorded and the frames it filled are this address
@@ -1763,7 +1800,33 @@ impl Mm {
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             cnvcsw: core::sync::atomic::AtomicU64::new(0),
             cnivcsw: core::sync::atomic::AtomicU64::new(0),
+            start_code: core::sync::atomic::AtomicUsize::new(image.start_code),
+            end_code: core::sync::atomic::AtomicUsize::new(image.end_code),
+            start_stack: core::sync::atomic::AtomicUsize::new(image.start_stack),
         })
+    }
+
+    /// Take another address space's image bounds: what `fork` and
+    /// `clone(CLONE_VM)` do, whose child is running the same program from the
+    /// same stack. Linux's `copy_mm` copies `start_code`, `end_code` and
+    /// `start_stack` with the rest of the `mm`, so a child's report is its
+    /// parent's down to these three addresses
+    /// (`build/scratch/statcode/inherit2.c`).
+    pub(crate) fn set_image_bounds(&self, bounds: ImageBounds) {
+        let ordering = Ordering::Relaxed;
+        self.start_code.store(bounds.start_code, ordering);
+        self.end_code.store(bounds.end_code, ordering);
+        self.start_stack.store(bounds.start_stack, ordering);
+    }
+
+    /// This address space's image bounds, for a child about to inherit them.
+    pub(crate) fn image_bounds(&self) -> ImageBounds {
+        let ordering = Ordering::Relaxed;
+        ImageBounds {
+            start_code: self.start_code.load(ordering),
+            end_code: self.end_code.load(ordering),
+            start_stack: self.start_stack.load(ordering),
+        }
     }
 
     /// Put a whole VMA table in place: what `fork` hands its child, whose
@@ -2212,6 +2275,54 @@ impl Mm {
             }
         });
         pages
+    }
+
+    /// The pages in each of `status`'s three buckets - Linux's `exec_vm`,
+    /// `stack_vm` and `data_vm`, as `(exec, stack, data)`.
+    ///
+    /// Counted here rather than kept as counters because this kernel has *two*
+    /// tables describing one address space ([`Vma`] for what can fault,
+    /// [`MappedRange`] for what was filled eagerly) and a counter would need
+    /// six mutation sites kept in step with both. Linux can afford a counter
+    /// (`vm_stat_account`) because every one of its mappings is one `vm_area`;
+    /// here a recount costs what [`Self::mapped_pages`] already costs on the
+    /// same two tables, and cannot drift from them.
+    ///
+    /// The classifier is [`crate::mm::vma::vm_book`], which is where Linux's
+    /// three predicates and the measurements behind them live. What a
+    /// [`MappedRange`] cannot say is whether it is shared - the field is not on
+    /// it - so those ranges are counted as private, which is what both of their
+    /// makers produce: the loader's segments and stack, and a `MAP_PRIVATE`
+    /// file copy.
+    pub(crate) fn vm_books(&self) -> (usize, usize, usize) {
+        use crate::mm::vma::VmBook;
+        let page = pframe::PAGE_SIZE;
+        let round = |len: usize| -> usize { (len + page - 1) / page };
+        let mut books = (0, 0, 0);
+        critical_section::with(|cs| {
+            for vma in self.vmas.borrow(cs).borrow().iter() {
+                let shared = matches!(vma.kind, VmaKind::Frames { shared: true, .. });
+                let book = crate::mm::vma::vm_book(vma.prot, shared, vma.name.as_deref());
+                let pages = round(vma.end.saturating_sub(vma.start));
+                match book {
+                    VmBook::Exec => books.0 += pages,
+                    VmBook::Stack => books.1 += pages,
+                    VmBook::Data => books.2 += pages,
+                    VmBook::Other => {}
+                }
+            }
+            for range in self.eager.borrow(cs).borrow().iter() {
+                let book = crate::mm::vma::vm_book(range.prot, false, range.name.as_deref());
+                let pages = round(range.end.saturating_sub(range.start));
+                match book {
+                    VmBook::Exec => books.0 += pages,
+                    VmBook::Stack => books.1 += pages,
+                    VmBook::Data => books.2 += pages,
+                    VmBook::Other => {}
+                }
+            }
+        });
+        books
     }
 
     /// The high-water marks `/proc/<pid>/status` prints as `VmPeak` and

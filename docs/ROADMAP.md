@@ -850,6 +850,20 @@ One-glance status of the whole roadmap.
   `EC 0x25` / `FAR_EL1 0x221000`; with the fix both aarch64 lanes print both lines every boot
   (§13.32, item 230)
 
+- [x] `status`'s four mapping lines are Linux's four books, and `stat`'s three image
+  addresses are the image's — `VmData`/`VmStk`/`VmExe`/`VmLib` were a resident-set kB, a
+  literal zero, and two more literal zeros, and `startcode`/`endcode`/`startstack` were three
+  borrowed `"0"`s in the same block. All seven are one question, and its answer is in Linux's
+  source rather than in either of the shapes this kernel had: `task_mem` splits the executable
+  book into the *span* of the image's text (clamped to the book) and the rest, `vm_stat_account`
+  books each mapping into exactly one of exec/stack/data with three ordered predicates, and
+  `binfmt_elf` records the lowest executable segment's `p_vaddr` and the highest one's
+  `p_vaddr + p_filesz` — **file** bytes, which a single `RWE` load with a 1 MiB `.bss` proves
+  (`0x640`, not `0x100648`). `VmExe` being a span and not a sum is the measurement two one-page
+  segments 1 MiB apart settle (`16 kB`, where a sum would read `8`). A zombie has no address
+  space, so it reports no `Vm*` line at all and three zeros. Pinned by `t-stat-bounds` and
+  `t-status-vm` (10 + 12 claims, counterfactually 6 + 7 red) (§6.117, item 231)
+
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 
 - [x] 11.A subtract · 11.B device seam · 11.C per-open-file registry · 11.D terminal out of `vfs` · 11.F host-test criterion · 11.G depgraph ratchet (§11.2)

@@ -10145,3 +10145,50 @@ on a stack below the probe's record, and the program left with status 7`, and it
 `-d int` trace shows the IRQ landing at `mpos_probe_return`'s own `ELR` with
 `SPSR 0x5` (`build/scratch/el0/pin-window-proof.txt`). Mechanism and the full
 trace reading: `docs/notes/` §13.32.
+
+## Item 231 — `/proc/<pid>/status`'s four mapping books and `stat`'s three image addresses
+
+Rows: `VmData`, `VmStk`, `VmExe`, `VmLib` in `/proc/<pid>/status`, and fields 26, 27,
+28 (`startcode`, `endcode`, `startstack`) in `/proc/<pid>/stat`. Item 222 named
+the first four as a gap; the last three were borrowed `"0"`s in the same block of
+the file and are closed in the same intent because they are one question: which
+mapping is this page, and which mapping is the image.
+
+| row | Linux | this kernel before | now |
+|---|---|---|---|
+| `VmData` | pages writable, not shared, not the stack — mapped, not resident | the resident set's kB (same number as `RssAnon`) | the data book, counted from the VMA and eager tables |
+| `VmStk` | the `[stack]` mapping's pages | literal `0 kB` | the stack book |
+| `VmExe` | `min(PAGE_ALIGN(end_code) - (start_code & PAGE_MASK), exec_vm << PAGE_SHIFT)` | literal `0 kB` | the span of the image's text, clamped to the exec book |
+| `VmLib` | `(exec_vm << PAGE_SHIFT) - text` | literal `0 kB` | the rest of the exec book |
+| `startcode` | lowest `PF_X` segment's `p_vaddr`, unaligned | literal `0` | the loader's record |
+| `endcode` | highest `PF_X` segment's `p_vaddr + p_filesz` | literal `0` | the loader's record |
+| `startstack` | the entry `rsp` | literal `0` | the same number the argument block is written at |
+| — | a zombie has **no** `Vm*` line at all | the whole block, all zeros | no block |
+
+Where the rules come from, and what chose between the candidates:
+`fs/proc/task_mmu.c`'s `task_mem`, `mm/mmap.c`'s `vm_stat_account`,
+`mm/vma.h`'s three predicates and `fs/binfmt_elf.c`'s `PT_LOAD` walk, each
+checked against probes on Linux 7.2.14. `endcode` is **file** bytes — a single
+`RWE` load with `FileSiz 0x640` and a 1 MiB `.bss` reads `0x640`, not `0x100648`.
+`VmExe` is a **span**, not a sum — two one-page executable segments 1 MiB apart
+report `16 kB`. Details and the tables: `docs/notes/` §6.117.
+
+**The fixes.** `src/mm/vma.rs` (`vm_book`, `ImageBounds`),
+`src/sched/runtime/child_mm.rs` (`Mm::vm_books`, the three address atoms,
+`with_image`), `src/sched/runtime/load.rs` (`load_user`'s `user_rsp` and the
+`start_code`/`end_code` walk, `Loaded::bounds`),
+`src/sched/runtime/child_exit.rs` (fork copies, exec replaces),
+`src/sched/runtime/procfs.rs` (`TaskSnapshot::image`/`books`),
+`src/vfs/procfs.rs` (`text_and_lib_kb`, `address_word`, `vm_block`, and
+`stat_line` split into `stat_fields` + `stat_text` so its fields became
+host-testable at all).
+
+**The pins.** `t-stat-bounds` (10 claims) and `t-status-vm` (12 claims), both
+green on the host and on the machine; counterfactually **6** and **7** red
+respectively, with the kernel *and* loader rebuilt from the stashed files.
+`build/boot-statbounds1.log`, `build/boot-statusvm1.log` (green) against
+`build/boot-statbounds-cf1.log`, `build/boot-statusvm-cf1.log` (red).
+
+**Still off, each an honest `0`:** `VmLck`/`VmPin` (no mlock/pin accounting),
+`RssAnon`/`RssFile`/`RssShmem` (the frames table does not record what backs a
+page), `VmPTE` (no page-table byte count) and `VmSwap` (no swap).

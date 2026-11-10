@@ -9082,3 +9082,221 @@ out of this intent: a bad non-NULL pointer's door-specific EFAULT/ESRCH
 precedence on a nonexistent pid combined with a short size,
 `sched_getparam`'s priority range, `size > PAGE_SIZE` on the *host* when
 PAGE_SIZE differs, and `sched_rr_get_interval`'s host-configured slice.
+
+### 6.117 `VmData`/`VmStk`/`VmExe`/`VmLib` and `stat`'s three addresses (LANDED 2026-11-10)
+
+Item 222's named gap, plus the three `stat` fields that were borrowed zeros in
+the same block of the file. Both are the same question asked twice: *which
+mapping is this page, and which mapping is the image?* — and both were answered
+by reading Linux's own source rather than by guessing at a shape.
+
+#### What Linux answers
+
+`fs/proc/task_mmu.c`'s `task_mem`:
+
+```c
+text = PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK);
+text = min(text, mm->exec_vm << PAGE_SHIFT);
+lib = (mm->exec_vm << PAGE_SHIFT) - text;
+/* ... */
+seq_put_decimal_ull(m, "VmData:", data_vm << (PAGE_SHIFT - 10));
+seq_put_decimal_ull(m, "VmStk:", stack_vm << (PAGE_SHIFT - 10));
+seq_put_decimal_ull(m, "VmExe:", text >> 10);
+seq_put_decimal_ull(m, "VmLib:", lib >> 10);
+```
+
+`mm/mmap.c`'s `vm_stat_account` books every mapping into exactly one of
+`exec_vm`/`stack_vm`/`data_vm`, in that order of precedence, using the three
+predicates in `mm/vma.h`:
+
+```c
+is_exec_mapping : (flags & (VM_EXEC | VM_WRITE | VM_STACK)) == VM_EXEC
+is_stack_mapping: ((flags & VM_STACK) == VM_STACK) || (flags & VM_SHADOW_STACK)
+is_data_mapping : (flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE
+```
+
+and `fs/binfmt_elf.c` sets the two addresses while walking `PT_LOAD`s:
+
+```c
+k = p_vaddr;                 if ((p_flags & PF_X) && k < start_code) start_code = k;
+k = p_vaddr + p_filesz;      if ((p_flags & PF_X) && end_code < k)   end_code = k;
+/* ... */
+mm->start_code = start_code; mm->end_code = end_code; mm->start_stack = bprm->p;
+```
+
+So: `startcode` is the **lowest** executable segment's linked `p_vaddr`
+(unaligned), `endcode` is the **highest** one's `p_vaddr + p_filesz` (file
+bytes, not memory bytes), and `startstack` is the entry `rsp`.
+
+#### The measurements
+
+Fetched from `git.kernel.org/.../torvalds/linux.git/plain/<path>` into
+`build/scratch/` (`task_mmu.c`, `binfmt_elf.c`, `mmap.c`, `vma.h`, `mm.h`,
+`mm_types.h`, `internal.h`, `mm_inline.h`, `mman.h`), then checked against
+probes on Linux 7.2.14.
+
+*`VmData` counts writable private mappings, resident or not* -
+`build/scratch/vmlines/f.c`, one probe per perturbation:
+
+| change | `VmData` | `VmStk` | `VmSize` |
+|---|---|---|---|
+| at rest | 1228 kB | 132 kB | 4000 kB |
+| `mmap(1)` private rw | **1232** (+4) | 132 | 4000 |
+| `mmap(4097)` private rw | **1236** (+8) | 132 | 4000 |
+| `alloca(1 MiB)` and touch it all | 1228 (unmoved) | **1032** (+900) | **4900** |
+
+The `alloca` row is the one that separates the books: a stack that grew by 900
+kB moved `VmStk` and left `VmData` alone. Page granularity, not bytes.
+
+*`VmData` does not count shared, and `VmStk` does not follow `MAP_STACK`* -
+`build/scratch/vmlines/b.c` and `c.c`, 2 MiB each:
+
+| mapping | `VmData` | `VmLib` |
+|---|---|---|
+| anon `PRIVATE` rw | 2252 | 1704 |
+| anon `PRIVATE` r only | 204 (unmoved) | 1704 |
+| anon `PRIVATE` rw **shared** | 204 (unmoved) | 1704 |
+| anon `PRIVATE` rx | 204 | **3752** (+2048) |
+| anon `PRIVATE` rwx | **2252** | 1704 (write beats exec) |
+| memfd `PRIVATE` rx | 204 | **3752** |
+| memfd **shared** rx | 204 | **3752** |
+| `/usr/lib/libz.so.1` private rx | 204 | **3752** |
+| anon rw with `MAP_STACK` | 2252 | 1704 (`VmStk` unmoved) |
+
+*`VmExe` is a span, not a sum.* Two executable `PT_LOAD`s and a custom linker
+script (`build/scratch/vmlines/*.ld` + `PHDRS`; two `.text.*` sections get
+merged into one segment by `ld`, so the probes use two distinct section names):
+
+| probe | segments | `VmExe` | `VmLib` |
+|---|---|---|---|
+| B | one page at `0x400000` | 4 | 8 |
+| A | two adjacent pages at `0x400000` | 8 | 8 |
+| D | one page at `0x400000`, two at `0x500000` | **20** | 0 |
+| C | one page at `0x400000`, six at `0x500000` | **36** | 0 |
+| twos | one page at `0x400000`, one at `0x500000` | **16** | 0 |
+
+`twos` is the discriminator: two pages of text reporting 16 kB rules out
+"sum the segments' pages". It is the span from the page the first segment
+starts in to the page the last one ends in, clamped to `exec_vm` — which is
+also why `VmLib` is 0 there (`text` clamps to the whole book).
+
+*`endcode` is file bytes, not memory bytes* - the decisive probe is a single
+`RWE` `PT_LOAD` with a 1 MiB `.bss` inside it, `build/scratch/statcode/x.S`
+linked with `-N`:
+
+```
+LOAD 0x000158 0x400158 FileSiz 0x640 MemSiz 0x100648 RWE
+startcode = 0x400158   endcode = 0x400798   endcode - startcode = 0x640
+```
+
+`0x640` is `FileSiz`. With `MemSiz` the difference would have been
+`0x100648`.
+
+*`startstack` is the entry `rsp`, exactly* - `build/scratch/statcode/start.S`
+saves `%rsp` before anything else touches it:
+
+```
+saved_sp  = 0x00007ffe289e0f20
+startstack = 0x00007ffe289e0f20   delta 0
+```
+
+and inside `main` the live `rsp` was 5024 bytes below it, so the field is
+neither the current pointer nor the `[stack]` mapping's boundary.
+
+*fork/exec/zombie* - `build/scratch/statcode/inherit2.c`, `zombiev/z.c`:
+
+| state | `startcode` | `endcode` | `startstack` |
+|---|---|---|---|
+| parent | `0x55cdb2efc000` | `0x55cdb2efc54d` | `0x7fff5738d870` |
+| child after `fork` | same three | | |
+| child after `exec` | the new image's | | |
+| uncollected zombie | `0` | `0` | `0` |
+
+and a zombie's `/proc/<pid>/status` has **no** `Vm*`/`Rss*` line at all —
+`State:` is followed directly by `Threads:`, because Linux reaches `task_mem`
+only through an `mm` that still exists.
+
+#### The code
+
+The bookkeeping is deliberately *recounted* rather than *incremented*. This
+kernel keeps an address space in two tables — `Mm::vmas` for what can fault and
+`Mm::eager` for what was filled at load — and a counter would need six mutation
+sites kept in step with both. Linux can afford `vm_stat_account` because every
+mapping there is one `vm_area`; here a recount costs what `Mm::mapped_pages`
+already costs over the same two tables and cannot drift from them.
+
+- `src/mm/vma.rs` — `pub fn vm_book(prot, shared, name) -> VmBook` carries the
+  three predicates and their precedence; `ImageBounds { start_code, end_code,
+  start_stack }` carries the three addresses as one value, so no construction
+  site can supply two of them and forget the third.
+- `src/sched/runtime/child_mm.rs` — `Mm::vm_books() -> (exec, stack, data)`
+  walks both tables once; `Mm::start_code`/`end_code`/`start_stack` are
+  `AtomicUsize` records; `Mm::with_image` takes the bounds and `with_eager`
+  forwards a default, so every existing construction site is unchanged.
+- `src/sched/runtime/load.rs` — `load_user` grew a `user_rsp` argument (the
+  same number the argument block is written at, because `startstack` *is* that
+  number) and computes `start_code`/`end_code` with `fs/binfmt_elf.c`'s own
+  loop; `Loaded` carries the bounds.
+- `src/sched/runtime/child_exit.rs` — `fork` copies the parent's bounds
+  (`copy_mm`), `exec` replaces them.
+- `src/sched/runtime/procfs.rs` — `TaskSnapshot` grew `image` and `books`; a
+  zombie gets `ImageBounds::default()`.
+- `src/vfs/procfs.rs` — the four lines, the zombie's empty block, and the two
+  pure renderers: `text_and_lib_kb(bounds, exec_pages)` (the `task_mem` split,
+  clamp and all) and `address_word`. `stat_line` was split into `stat_fields`
+  + `stat_text` while doing this, because it read a task through the machine's
+  snapshot and so no host test could reach a single field it printed — which is
+  how three of them stayed borrowed zeros.
+
+#### The pins
+
+`user/tests/src/bin/t-stat-bounds.rs` (10 claims) and
+`user/tests/src/bin/t-status-vm.rs` (12 claims), both runnable on the host with
+`MPOS_ON_HOST=1`.
+
+`t-stat-bounds`: the three fields are addresses; the end is above the start;
+both are in the user half; `startcode` is inside the page `/proc/self/maps`
+gives the executable segment (an independent witness from a different part of
+the kernel); the entry `rsp` is at or above the live one and inside
+`[stack]`; **8 MiB more address space moves none of the three**; a forked child
+reports its parent's three; a zombie reports `(0, 0, 0)` while its parent still
+reports its own.
+
+`t-status-vm`: the four lines are counts; none exceeds `VmSize`; `VmStk` is a
+stack's size; one private writable page moves `VmData` by exactly 4 kB and
+leaves `VmStk`; a non-writable mapping moves nothing; a shared one moves
+nothing; **an executable mapping outside the image grows `VmLib` by 4 kB and
+leaves `VmExe` alone**; a zombie's status has no `Vm*` line while a live
+process does.
+
+Host: 10/10 `PASS` (`build/boot-statbounds1.log` on the machine too — 10/10,
+`exit=0`) and 12/12 `PASS` (`build/boot-statusvm1.log`, `exit=0`).
+
+Counterfactual (`git stash push` of all seven files, kernel *and* loader
+rebuilt — `build/boot-statbounds-cf1.log`, `build/boot-statusvm-cf1.log`):
+
+| pin | red without the fix | green with it |
+|---|---|---|
+| `t-stat-bounds` | 6 red (`the three fields are addresses, not zeros`, `the text's end is above its start`, `the start is in the page maps gives…`, `the entry stack pointer is at or above…`, `and it is in the stack's mapping…`), `FAILED`, `exit=1` | 10/10 `PASS`, `exit=0` |
+| `t-status-vm` | 7 red (`the four mapping lines are counts, not zeros`, `the stack book is a stack's size…`, `a private writable page is one more…`, `an executable mapping outside the image…`, `a zombie's status carries no Vm line`, …), `FAILED`, `exit=1` | 12/12 `PASS`, `exit=0` |
+
+Two claims stayed green in both — `a forked child reports its parent's three`
+and `eight more megabytes … move none of the three` — because a kernel that
+prints zeros for everything satisfies "the child matches the parent" and
+"nothing moved". That is why the pair that *does* move is in both pins, and why
+the zombie's zero row is paired with a live row in the same claim set.
+
+**Named gaps left deliberately open**, each an honest `0` rather than an
+estimate: `VmLck` and `VmPin` (no mlock/pin accounting), `RssAnon`/`RssFile`/
+`RssShmem` (the frames table does not record what backs a page — a private file
+mapping's page and a demand-faulted anonymous page are the same kind of frame
+to it), `VmPTE` (no page-table byte count) and `VmSwap` (no swap). `RssAnon`
+keeping the whole resident set is the one that most deserves a follow-up.
+
+**The rule.** Two files answered the same question with different shapes — and
+the answer was in Linux's source, not in either shape. A count of "mapped
+pages" and a count of "pages in each of three books" are different numbers, and
+a span is not a sum. Where a rule has a *clamp*, the clamp is part of the rule:
+`min(text, exec_vm)` is why a program with scattered segments reports 16 kB of
+text rather than a stretched span, and reading the formula without it produces
+a number no probe ever produced.

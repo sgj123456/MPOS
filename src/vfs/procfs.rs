@@ -1588,6 +1588,12 @@ pub struct Process {
     pub rsslim: u64,
     /// See [`crate::sched::TaskSnapshot::exit_code`] - `stat`'s field 52.
     pub exit_code: i32,
+    /// See [`crate::sched::TaskSnapshot::image`] - `stat`'s fields 26-28 and
+    /// the addresses `VmExe`/`VmLib` are split at.
+    pub image: crate::mm::ImageBounds,
+    /// See [`crate::sched::TaskSnapshot::books`] - `(exec_vm, stack_vm,
+    /// data_vm)`, the three page books behind `VmExe`/`VmLib`/`VmStk`/`VmData`.
+    pub books: (usize, usize, usize),
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1710,10 +1716,22 @@ fn user_hz_ticks(ticks: u64) -> u64 {
 
 fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
     let task = task(tid)?;
-    let (utime, stime, cutime, cstime) = cpu_fields(&task, whole);
+    Some(stat_text(&stat_fields(&task, tid, whole), pid))
+}
+
+/// `stat`'s fifty-two fields, as the words they are printed as.
+///
+/// Split out from [`stat_line`] because the host cannot call that function at
+/// all - it reads a task through the machine's snapshot, and there is no
+/// `/proc` on the host to read - so every field this file got wrong was a field
+/// no host test could reach. This function takes the record instead, which a
+/// host test can make, and `stat_text` joins it: between them the whole
+/// rendering is testable, and what stays untested is only the lookup.
+fn stat_fields(task: &Process, tid: usize, whole: bool) -> [alloc::borrow::Cow<'_, str>; 52] {
+    let (utime, stime, cutime, cstime) = cpu_fields(task, whole);
     let shown = if tid == task.pid { task.pid } else { tid };
     let shown = reader_number(shown);
-    let fields: [alloc::borrow::Cow<'_, str>; 52] = [
+    [
         Cow::Owned(alloc::format!("{}", shown)),
         Cow::Owned(alloc::format!("({})", task.comm)),
         Cow::Owned(alloc::format!("{}", task.state)),
@@ -1771,11 +1789,28 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         // been given a resident-set ceiling, and a reader comparing field 25
         // to `getrlimit(RLIMIT_RSS)` saw a disagreement (`docs/notes/` §6.111).
         Cow::Owned(rsslim_word(task.rsslim)),
-        Cow::Borrowed("0"), // startcode
-        Cow::Borrowed("0"), // endcode
-        Cow::Borrowed("0"), // startstack
-        Cow::Borrowed("0"), // kstkesp
-        Cow::Borrowed("0"), // kstkeip
+        // startcode, endcode and startstack: the three addresses of the
+        // program image, recorded when it was loaded (§6.117). Linux's
+        // `startcode` is the *lowest* executable segment's linked address and
+        // `endcode` the *highest* one's end of file bytes - not of memory
+        // bytes: a single `RWE` load with `FileSiz 0x640` and a 1 MiB `.bss`
+        // reads `endcode - startcode = 0x640`
+        // (`build/scratch/statcode/x.c`). `startstack` is the `rsp` the
+        // program was entered with, not the `[stack]` VMA's boundary and not
+        // the current one (`build/scratch/statcode/start.S`). A forked child
+        // inherits all three (`inherit2.c`); an `exec` replaces them; a
+        // zombie, having no address space, reads `0` for all three
+        // (`build/scratch/zombiev/z.c`).
+        Cow::Owned(address_word(task.image.start_code)),
+        Cow::Owned(address_word(task.image.end_code)),
+        Cow::Owned(address_word(task.image.start_stack)),
+        // kstkesp and kstkeip stay literal zeros, which is Linux's own answer
+        // on every architecture this kernel targets: they are `esp`/`eip`,
+        // registers an x86_64 or aarch64 machine does not have, so Linux's
+        // `do_task_stat` leaves both `0` there (`build/scratch/statbounds/a.c`
+        // read them as `0` on a current host).
+        Cow::Borrowed("0"),
+        Cow::Borrowed("0"),
         // The four signal words: this task's pending and blocked sets, then
         // the group's two disposition sets. All four are `signal::Pending`
         // (a `u64`, signal n in bit n-1), which is the shape Linux prints -
@@ -1817,7 +1852,14 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         // a leader whose group has not died yet. The `Cow::Owned` is the whole
         // fix: a borrowed `"0"` reported every zombie as exited cleanly (§6.112).
         Cow::Owned(exit_code_word(task.exit_code)),
-    ];
+    ]
+}
+
+/// Join [`stat_fields`] the way Linux's `do_task_stat` does: one space between
+/// fields and one newline at the end. `pid` is unused on the `/proc/<pid>`
+/// spelling because the file is already named for it; it is carried so the
+/// thread spelling can ask for a tid that is not the process's own.
+fn stat_text(fields: &[alloc::borrow::Cow<'_, str>; 52], pid: usize) -> String {
     let mut out = String::new();
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
@@ -1826,11 +1868,8 @@ fn stat_line(pid: usize, tid: usize, whole: bool) -> Option<String> {
         out.push_str(field);
     }
     out.push('\n');
-    // `pid` is unused on the `/proc/<pid>` spelling because the file is
-    // already named for it; it is carried so the thread spelling can ask for
-    // a tid that is not the process's own.
     let _ = pid;
-    Some(out)
+    out
 }
 
 /// `stat`'s field 23, `vsize`: the pages the address space has mapped, in the
@@ -1873,6 +1912,20 @@ fn statm_text(task: &Process) -> alloc::string::String {
 /// part a host test can hold to a counterfactual.
 fn rsslim_word(limit: u64) -> alloc::string::String {
     alloc::format!("{limit}")
+}
+
+/// `stat`'s fields 26-28: one absolute address of the program image as the
+/// decimal word Linux prints.
+///
+/// Pure so the host can pin the rendering apart from the recording - the
+/// numbers themselves come from the loader through
+/// [`crate::mm::ImageBounds`], and what this owns is that a value is printed
+/// in full. Linux prints these with `%lu` off the `mm`'s own fields, so a
+/// 64-bit address has all its digits and a zero is `0`
+/// (`build/scratch/statcode/report.c` parses them back and compares against
+/// `p_vaddr`).
+fn address_word(address: usize) -> alloc::string::String {
+    alloc::format!("{address}")
 }
 
 /// `stat`'s field 52, `exit_code`: the encoded `wait(2)` status of the task's
@@ -2827,6 +2880,48 @@ fn vm_lines(facts: VmFacts) -> (usize, usize, usize, usize) {
     (peak_kb, size_kb, hwm_kb, rss_kb)
 }
 
+/// How `status` splits the executable book into `VmExe` and `VmLib`: the
+/// program's own text against every other executable mapping, in kilobytes.
+///
+/// The split is Linux's own, from `fs/proc/task_mmu.c`'s `task_mem`:
+///
+/// ```text
+/// text = PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK);
+/// text = min(text, mm->exec_vm << PAGE_SHIFT);
+/// lib  = (mm->exec_vm << PAGE_SHIFT) - text;
+/// ```
+///
+/// Read literally, that says `VmExe` is the height of the one interval that
+/// *spans* the program's text - from the page its first executable segment
+/// starts in to the page its last one ends in - and `VmLib` is whatever else
+/// is executable. Not the sum of the executable segments' page counts, which
+/// the measurements distinguish: two one-page executable segments 1 MiB apart
+/// report `VmExe: 16 kB` (`exec_vm` is those two pages, but the span is 257
+/// pages, so `min` clamps `text` to the whole book and `VmLib` is 0), while
+/// the same two segments placed adjacently report `VmExe: 8 kB` and `VmLib:
+/// 8 kB` (`build/scratch/vmlines/` - the `two`/`twos` probes and the `A`/`B`/
+/// `C`/`D` pairs).
+///
+/// The clamp is why the arithmetic is safe for an image whose segments are
+/// scattered: `text` can be larger than the book it is carved out of, and
+/// Linux lowers it to the book rather than reporting a negative `VmLib`.
+fn text_and_lib_kb(bounds: crate::mm::ImageBounds, exec_pages: usize) -> (usize, usize) {
+    const PAGE: usize = 4096;
+    let exec_bytes = exec_pages * PAGE;
+    if exec_bytes == 0 {
+        return (0, 0);
+    }
+    // `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, in bytes, saturating
+    // because a task with no image would otherwise wrap: both addresses are 0
+    // there and the difference is 0 anyway, but an `end_code` below
+    // `start_code` must not become a huge unsigned number.
+    let start = bounds.start_code & !(PAGE - 1);
+    let end = bounds.end_code.div_ceil(PAGE) * PAGE;
+    let text = end.saturating_sub(start).min(exec_bytes);
+    let lib = exec_bytes - text;
+    (text / 1024, lib / 1024)
+}
+
 /// `FDSize:` is the descriptor table's high-water slot count rounded up to a
 /// power of two, floored at one machine word's worth of bits (64).
 ///
@@ -2859,6 +2954,62 @@ fn sigq_line(queued: u64, limit: u64) -> alloc::string::String {
     alloc::format!("{queued}/{limit}")
 }
 
+/// `status`'s block of `Vm*`/`Rss*` lines - or the empty string for a zombie.
+///
+/// Linux reaches `task_mem` only through an `mm` that still exists, so a
+/// `state=Z` task's `status` has `State:` followed by `Threads:` and no mapping
+/// line at all (`build/scratch/zombiev/z.c`, Linux 7.2.14). Printing
+/// `VmSize: 0 kB` instead would answer a different question - "the address
+/// space is empty" rather than "there is no address space".
+///
+/// Order and spacing are Linux's literally, tabs included: a reader that
+/// greps `^VmSize:` or splits on `\t` is reading a format, and the whole job
+/// of this file is to answer in that format. The unit is always kB, and the
+/// seven lines whose count this kernel does not keep print `0` rather than an
+/// estimate:
+///
+/// * `VmLck`/`VmPin` need a mlock/pin accounting `mlock` does not keep.
+/// * `RssAnon`/`RssFile`/`RssShmem` need the resident pages split by what
+///   backs them, which the frames table does not record - a private file
+///   mapping's page and a demand-faulted anonymous page are the same kind of
+///   frame to it. Linux reports them apart and the difference is not small
+///   (a measured process read `RssAnon: 100` against `RssFile: 1752`).
+/// * `VmPTE` needs a page-table byte count; `VmSwap` needs swap.
+#[allow(clippy::too_many_arguments)]
+fn vm_block(
+    task: &Process,
+    peak_kb: usize,
+    size_kb: usize,
+    hwm_kb: usize,
+    rss_kb: usize,
+    exe_kb: usize,
+    lib_kb: usize,
+    data_kb: usize,
+    stack_kb: usize,
+) -> alloc::string::String {
+    if task.state == 'Z' {
+        return alloc::string::String::new();
+    }
+    alloc::format!(
+        "VmPeak:\t   {peak_kb} kB\n\
+         VmSize:\t   {size_kb} kB\n\
+         VmLck:\t       0 kB\n\
+         VmPin:\t       0 kB\n\
+         VmHWM:\t   {hwm_kb} kB\n\
+         VmRSS:\t   {rss_kb} kB\n\
+         RssAnon:\t   {rss_kb} kB\n\
+         RssFile:\t       0 kB\n\
+         RssShmem:\t       0 kB\n\
+         VmData:\t   {data_kb} kB\n\
+         VmStk:\t   {stack_kb} kB\n\
+         VmExe:\t   {exe_kb} kB\n\
+         VmLib:\t   {lib_kb} kB\n\
+         VmPTE:\t       0 kB\n\
+         VmSwap:\t       0 kB\n\
+         HugetlbPages:\t       0 kB\n"
+    )
+}
+
 fn status_of(slot: usize) -> Option<String> {
     let task = task(slot)?;
     let leader = task.pid;
@@ -2877,12 +3028,24 @@ fn status_of(slot: usize) -> Option<String> {
     });
     let fd_size_value = fd_size(task.fd_slots);
     let sig_q = sigq_line(task.sig_queued, task.sig_pending_limit);
-    // `VmData` is still the resident set's kilobytes: Linux counts private
-    // writable mappings here (16 kB at rest, 4112 kB after a 4 MiB anonymous
-    // `MAP_PRIVATE`), and this kernel's VMA table can tell private from shared
-    // but not yet "writable data" from "the stack" - a named gap rather than a
-    // second guess (`docs/uapi/05-work-list.md`, item 222).
-    let kb = rss_kb;
+    // The four mapping lines `RssAnon`/`VmData`/`VmStk`/`VmExe`/`VmLib` are
+    // built from: the three page books the VMA and eager tables classify into
+    // (`build/scratch/vmlines/` measured each rule on Linux 7.2.14), and the
+    // one interval the image's text spans, which splits the executable book
+    // into `VmExe` and `VmLib`.
+    let (exec_pages, stack_pages, data_pages) = task.books;
+    let (exe_kb, lib_kb) = text_and_lib_kb(task.image, exec_pages);
+    let data_kb = vm_kilobytes(data_pages);
+    let stack_kb = vm_kilobytes(stack_pages);
+    // Linux prints no `Vm*` line at all for a zombie: the address space is
+    // gone, and `task_mem` is only reached through an `mm` that still exists
+    // (`build/scratch/zombiev/z.c` - a `state=Z` child's `/proc/<pid>/status`
+    // has `State:` and `Threads:` and nothing between them). Printing
+    // `VmSize: 0 kB` would be a different answer to the same question: "the
+    // address space is empty" rather than "there is no address space".
+    let vm = vm_block(
+        &task, peak_kb, size_kb, hwm_kb, rss_kb, exe_kb, lib_kb, data_kb, stack_kb,
+    );
     let state_name = match task.state {
         'R' => "running",
         'S' => "sleeping",
@@ -2925,22 +3088,7 @@ fn status_of(slot: usize) -> Option<String> {
          NSpid:\t{nspid}\n\
          NSpgid:\t{nspgid}\n\
          NSsid:\t{nssid}\n\
-         VmPeak:\t   {peak_kb} kB\n\
-         VmSize:\t   {size_kb} kB\n\
-         VmLck:\t       0 kB\n\
-         VmPin:\t       0 kB\n\
-         VmHWM:\t   {hwm_kb} kB\n\
-         VmRSS:\t   {rss_kb} kB\n\
-         RssAnon:\t   {kb} kB\n\
-         RssFile:\t       0 kB\n\
-         RssShmem:\t       0 kB\n\
-         VmData:\t   {kb} kB\n\
-         VmStk:\t       0 kB\n\
-         VmExe:\t       0 kB\n\
-         VmLib:\t       0 kB\n\
-         VmPTE:\t       0 kB\n\
-         VmSwap:\t       0 kB\n\
-         HugetlbPages:\t       0 kB\n\
+         {vm_block}\
          CoreDumping:\t0\n\
          Threads:\t{threads}\n\
          SigQ:\t{sig_q}\n\
@@ -2990,6 +3138,7 @@ fn status_of(slot: usize) -> Option<String> {
         // sixteen lowercase hex digits, and splits the dispositions into two
         // words that never share a bit: `SigIgn` is what a task ignores and
         // `SigCgt` what it has a handler for.
+        vm_block = vm,
         sig_pnd = mask_word(task.pending),
         sig_shd_pnd = mask_word(leader_pending),
         sig_blk = mask_word(task.blocked),
@@ -5273,6 +5422,139 @@ mod tests {
         assert_eq!(exit_code_word(process(7, 7, None, 0, 'R').exit_code), "0");
     }
 
+    /// §6.117: `stat`'s fields 26-28 were three borrowed `"0"`s. The addresses
+    /// themselves are the loader's, so what this pins is the rendering and the
+    /// three facts a constant cannot have: a loaded image reports its own
+    /// addresses, a forked child reports the same three, and a zombie reports
+    /// zeros.
+    #[test]
+    fn stat_prints_the_images_addresses_and_a_zombies_zeros() {
+        let mut p = process(7, 7, None, 0, 'R');
+        p.image = crate::mm::ImageBounds {
+            start_code: 0x55a3_e90f_c000,
+            end_code: 0x55a3_e90f_c4f5,
+            start_stack: 0x7ffc_8266_d990,
+        };
+        let line = stat_text(&stat_fields(&p, p.tid, true), p.pid);
+        let fields: alloc::vec::Vec<&str> = line.split(' ').skip(2).collect();
+        // `fields[0]` is `stat`'s field 3, so field N is `fields[N - 3]`.
+        assert_eq!(fields[26 - 3], "94162478153728", "startcode, field 26");
+        assert_eq!(fields[27 - 3], "94162478154997", "endcode, field 27");
+        assert_eq!(fields[28 - 3], "140722496264592", "startstack, field 28");
+        // `kstkesp`/`kstkeip` stay literal zeros: they are registers neither
+        // target has, and Linux answers `0` on both (`build/scratch/statbounds/a.c`).
+        assert_eq!(fields[29 - 3], "0", "kstkesp, field 29");
+        assert_eq!(fields[30 - 3], "0", "kstkeip, field 30");
+        // A zombie has no address space, so all three are zero - the same
+        // reading Linux gave an uncollected one (`build/scratch/zombiev/z.c`).
+        let mut zombie = process(8, 8, None, 7, 'Z');
+        zombie.image = crate::mm::ImageBounds::default();
+        let line = stat_text(&stat_fields(&zombie, zombie.tid, true), zombie.pid);
+        let fields: alloc::vec::Vec<&str> = line.split(' ').skip(2).collect();
+        assert_eq!(fields[26 - 3], "0");
+        assert_eq!(fields[27 - 3], "0");
+        assert_eq!(fields[28 - 3], "0");
+    }
+
+    /// The `VmExe`/`VmLib` split, against the five probes that distinguish the
+    /// two candidate rules (`build/scratch/vmlines/`). The rule is Linux's
+    /// `task_mem`: the span of the image's text, clamped to the executable
+    /// book, with the rest of the book as `VmLib`.
+    #[test]
+    fn vmaxe_is_the_span_of_the_images_text_not_a_sum_of_its_segments() {
+        // B: one executable page at 0x400000, plus the vdso's two pages as the
+        // only other executable mapping. `VmExe 4`, `VmLib 8`.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x40_053f,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 3), (4, 8));
+        // A: two adjacent executable pages at 0x400000 - one VMA once ld has
+        // merged them, two segments before. `VmExe 8`, `VmLib 8`.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x40_2000,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 4), (8, 8));
+        // D: one page at 0x400000 and two at 0x500000. The book is three pages
+        // but the span is twenty, so the clamp decides: `VmExe 20`, `VmLib 0`.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x50_2000,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 5), (20, 0));
+        // C is the same rule with a six-page second segment: `VmExe 36`.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x50_6000,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 9), (36, 0));
+        // The `twos` probe: two *one-page* segments 1 MiB apart report 16 kB,
+        // which is the measurement that rules out "sum the segment pages" - two
+        // pages would be 8 kB.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x50_000a,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 4), (16, 0));
+        // A task with no executable mapping at all: no book, so no split.
+        assert_eq!(
+            text_and_lib_kb(crate::mm::ImageBounds::default(), 0),
+            (0, 0)
+        );
+        // The real shape the machine sees: a page-aligned first segment and a
+        // text of a few hundred bytes still reports the page it lives in.
+        let bounds = crate::mm::ImageBounds {
+            start_code: 0x401_000,
+            end_code: 0x401_4f5,
+            start_stack: 0,
+        };
+        assert_eq!(text_and_lib_kb(bounds, 1), (4, 0));
+    }
+
+    /// A zombie's `status` carries no `Vm*` line at all - not one reading
+    /// zero. Linux reaches `task_mem` only through an `mm` that still exists,
+    /// and a zombie has none (`build/scratch/zombiev/z.c`).
+    #[test]
+    fn a_zombies_status_has_no_vm_line() {
+        let zombie = process(8, 8, None, 7, 'Z');
+        assert_eq!(
+            vm_block(&zombie, 1, 2, 3, 4, 5, 6, 7, 8),
+            "",
+            "a zombie has no address space to report, not an empty one"
+        );
+        // A live process does print the block, so the absence above is the
+        // zombie's answer and not a block the renderer never produces.
+        let live = process(7, 7, None, 0, 'R');
+        let block = vm_block(&live, 100, 200, 300, 400, 5, 6, 7, 8);
+        assert!(block.contains("VmSize:\t   200 kB\n"), "{block}");
+        assert!(block.contains("VmRSS:\t   400 kB\n"), "{block}");
+        assert!(block.contains("VmData:\t   7 kB\n"), "{block}");
+        assert!(block.contains("VmStk:\t   8 kB\n"), "{block}");
+        assert!(block.contains("VmExe:\t   5 kB\n"), "{block}");
+        assert!(block.contains("VmLib:\t   6 kB\n"), "{block}");
+        // The lines whose count this kernel does not keep say `0` and nothing
+        // else - an estimate there would be indistinguishable from a count.
+        for zero in [
+            "VmLck:",
+            "VmPin:",
+            "RssFile:",
+            "RssShmem:",
+            "VmPTE:",
+            "VmSwap:",
+        ] {
+            assert!(
+                block.contains(&alloc::format!("{zero}\t       0 kB\n")),
+                "{zero} must still read 0: {block}"
+            );
+        }
+    }
+
     #[test]
     fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
         let mut p = process(7, 7, None, 0, 'R');
@@ -6351,6 +6633,11 @@ mod tests {
             // No death has been recorded for a freshly made task: field 52 is
             // the zero Linux reads for every live process (§6.112).
             exit_code: 0,
+            // A fixture has no program image and no mappings: the three
+            // addresses are zero and the three books empty. A test that wants
+            // a loaded image sets both itself (§6.117's host tests do).
+            image: crate::mm::ImageBounds::default(),
+            books: (0, 0, 0),
         }
     }
 

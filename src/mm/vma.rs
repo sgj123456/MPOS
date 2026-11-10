@@ -384,6 +384,82 @@ impl Vma {
     }
 }
 
+/// The three absolute addresses of a loaded program image that
+/// `/proc/<pid>/stat` reports as `startcode`, `endcode` and `startstack`, plus
+/// the two page books those addresses split.
+///
+/// One value rather than three fields threaded separately: the loader is the
+/// only place that knows the addresses, and every construction site that takes
+/// them has to take all three or a process would report a coherent-looking mix
+/// of two programs. Host-compiled so `/proc`'s rendering can be unit-tested
+/// against values that came from a real load.
+///
+/// What each means, and the measurements behind each, is
+/// [`crate::sched::Mm`]'s `start_code`/`end_code`/`start_stack`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ImageBounds {
+    pub start_code: usize,
+    pub end_code: usize,
+    pub start_stack: usize,
+}
+
+/// Which of `/proc/<pid>/status`'s `Vm*` books one mapping is counted in.
+///
+/// Linux keeps three page counters on the `mm` - `exec_vm`, `stack_vm`,
+/// `data_vm` - and adds a mapping to exactly one of them, in that order of
+/// preference (`mm/mmap.c`'s `vm_stat_account`, which is an `if`/`else if`
+/// chain). The three predicates are `mm/vma.h`'s:
+///
+/// ```text
+/// is_exec_mapping   (flags & (VM_EXEC | VM_WRITE | VM_STACK)) == VM_EXEC
+/// is_stack_mapping  (flags & VM_STACK) == VM_STACK
+/// is_data_mapping   (flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE
+/// ```
+///
+/// Read out of the order they are tested in, those say: **exec is read-and-
+/// execute and neither writable nor a stack; stack is a stack; data is private
+/// and writable and not a stack.** Two consequences are the ones this kernel
+/// would get wrong by describing a mapping more loosely than Linux does:
+/// an `r|w|x` mapping is *data*, not exec (the write bit disqualifies it), and
+/// a writable *stack* mapping is `VmStk`, not `VmData`.
+///
+/// This kernel has no `VM_STACK`: the one stack that exists is the loader's,
+/// and it is named `[stack]` in the range table - which is what this reads.
+/// `MAP_STACK` is accepted and changes nothing here, which is Linux's answer
+/// too: a `MAP_STACK` anonymous mapping measured on Linux 7.2.14 moved
+/// `VmData` and left `VmStk` alone (`build/scratch/vmlines/c.c`).
+///
+/// `shared` is [`VmaKind::Frames`]'s bit for a VMA, and always `false` for a
+/// [`MappedRange`] - those are the loader's and a `MAP_PRIVATE` file copy's,
+/// and both are private by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmBook {
+    Exec,
+    Stack,
+    Data,
+    /// Counted in none of the three: a shared mapping (`VmData` excludes it),
+    /// a read-only private one (`VmData` wants write), a writable one that is
+    /// not executable (`VmExe`/`VmLib` want exec).
+    Other,
+}
+
+/// Which book `status` counts a mapping in, from the three facts Linux's
+/// predicates read. See [`VmBook`] for the rules and where they come from.
+pub fn vm_book(prot: MapFlags, shared: bool, name: Option<&str>) -> VmBook {
+    let stack = name == Some("[stack]");
+    let write = prot.contains(MapFlags::WRITE);
+    let exec = prot.contains(MapFlags::EXEC);
+    if exec && !write && !stack {
+        VmBook::Exec
+    } else if stack {
+        VmBook::Stack
+    } else if write && !shared && !stack {
+        VmBook::Data
+    } else {
+        VmBook::Other
+    }
+}
+
 /// Whether two mappings carry the same name. Compared by *string* rather than
 /// by pointer, because the names of two mappings of one file are built by two
 /// separate resolutions of it - and a missed merge is a maps file with two
@@ -1412,5 +1488,37 @@ mod tests {
             table.insert_present(vma);
         }
         assert!(table.gaps(MMAP_BASE, MMAP_BASE + 4 * PAGE).is_empty());
+    }
+
+    /// The three books `status` counts into, against the mapping shapes Linux
+    /// was measured on (`build/scratch/vmlines/b.c`, `c.c`, `f.c`).
+    #[test]
+    fn a_mappings_book_is_the_one_linuxs_three_predicates_pick() {
+        let rw = MapFlags::READ | MapFlags::WRITE;
+        let rx = MapFlags::READ | MapFlags::EXEC;
+        let rwx = MapFlags::READ | MapFlags::WRITE | MapFlags::EXEC;
+        let ro = MapFlags::READ;
+        // Private writable memory is data; a private read-only mapping is none
+        // of the three (it moved no `Vm*` line at all).
+        assert_eq!(vm_book(rw, false, None), VmBook::Data);
+        assert_eq!(vm_book(ro, false, None), VmBook::Other);
+        // Executable and not writable is exec, whatever backs it: Linux moved
+        // `VmLib` for an anonymous `PROT_READ|PROT_EXEC` mapping.
+        assert_eq!(vm_book(rx, false, None), VmBook::Exec);
+        // ...and writable beats executable, so `rwx` is data, not exec.
+        assert_eq!(vm_book(rwx, false, None), VmBook::Data);
+        // A shared mapping is in neither data nor exec: `VmData` wants private,
+        // and the measurements moved `RssShmem` instead. `VmExe`/`VmLib` have
+        // no shared rule at all - a shared `r-x` mapping of a memfd moved
+        // `VmLib` (`build/scratch/vmlines/b.c`), which is what the exec
+        // predicate's mask (`EXEC|WRITE|STACK`) says by omitting `SHARED`.
+        assert_eq!(vm_book(rw, true, None), VmBook::Other);
+        assert_eq!(vm_book(rx, true, None), VmBook::Exec);
+        // The stack is its own book, and it does not also count as data even
+        // though it is private and writable.
+        assert_eq!(vm_book(rw, false, Some("[stack]")), VmBook::Stack);
+        assert_eq!(vm_book(rwx, false, Some("[stack]")), VmBook::Stack);
+        // A name that is not the stack's decides nothing.
+        assert_eq!(vm_book(rw, false, Some("/lib/libc.so")), VmBook::Data);
     }
 }

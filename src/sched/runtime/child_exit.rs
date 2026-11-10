@@ -1352,6 +1352,13 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 // either says the same thing.
                 let mm = Mm::with_eager(TaskId(slot), child_root, child_frames, parent_eager);
                 mm.set_vmas(parent_vmas);
+                // The child is running the same program from the same stack, so
+                // the three addresses `stat` reports are the parent's: Linux's
+                // `copy_mm` takes `start_code`, `end_code` and `start_stack`
+                // with the rest of the `mm`, and a forked child that has not
+                // exec'd reads its parent's three values byte for byte
+                // (`build/scratch/statcode/inherit2.c`).
+                mm.set_image_bounds(t.task(parent_id).mm.image_bounds());
                 // The credentials come along, as Linux's `copy_creds` shares
                 // them: a process that had dropped a bounding capability or
                 // become non-dumpable must not hand its child the full set.
@@ -1748,6 +1755,7 @@ pub fn exec_replace(
             &layout,
             exe,
             interp_name,
+            user_rsp,
         );
 
         write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
@@ -1779,7 +1787,7 @@ pub fn exec_replace(
         // capabilities or setuid bits at exec.
         let mut carried = task.mm.credentials();
         carried.on_exec(task.identity.euid);
-        let next_mm = Mm::with_eager(id, new_root, loaded.frames, loaded.ranges);
+        let next_mm = Mm::with_image(id, new_root, loaded.frames, loaded.ranges, loaded.bounds);
         next_mm.set_credentials(carried);
         task.mm = next_mm;
         task.brk_base = loaded.brk;

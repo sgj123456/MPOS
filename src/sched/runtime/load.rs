@@ -17,7 +17,7 @@ use crate::hal;
 use crate::hal::AddressSpace;
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
-use crate::mm::vma::{MappedRange, merge_ranges};
+use crate::mm::vma::{ImageBounds, MappedRange, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{ARGS_BYTES_MAX, ARGV_MAX};
 use crate::sched::policy::{Priority, TaskId};
@@ -290,6 +290,11 @@ pub(crate) struct Loaded {
     /// Every frame that was mapped for this process, for the reaper to give
     /// back when it exits.
     pub(crate) frames: Vec<usize>,
+    /// The three addresses `/proc/<pid>/stat` fields 26-28 report, gathered
+    /// here because the loader is the only place that knows them. See
+    /// [`ImageBounds`] and [`Mm::start_code`] for what each means and how it
+    /// was measured.
+    pub(crate) bounds: ImageBounds,
 }
 
 /// Map every page of `image` into `space` at `base` - file bytes, the zero
@@ -422,6 +427,11 @@ pub(crate) fn load_user(
     layout: &Layout,
     program_name: &str,
     interp_name: Option<&str>,
+    // The `rsp` this program is about to be entered with, which becomes
+    // `/proc/<pid>/stat`'s `startstack` - Linux's `mm->start_stack`, set from
+    // the same argument block. Passed in rather than computed here because the
+    // caller is the one that filled that block, and the two must be one number.
+    user_rsp: usize,
 ) -> Loaded {
     let mut frames = Vec::new();
     let mut ranges = Vec::new();
@@ -484,6 +494,32 @@ pub(crate) fn load_user(
         .iter()
         .map(|segment| segment.vaddr + segment.memsz)
         .max();
+    // `/proc/<pid>/stat`'s `startcode` and `endcode`: the *lowest* executable
+    // segment's linked address and the *highest* one's end-of-file-bytes, both
+    // placed. This is `fs/binfmt_elf.c`'s own loop - `start_code` takes the
+    // minimum `p_vaddr` of a `PF_X` segment and `end_code` the maximum
+    // `p_vaddr + p_filesz` - and the file bytes rather than the memory bytes
+    // is not an interpretation: a single `RWE` load of `FileSiz 0x640` with a
+    // 1 MiB `.bss` behind it reads `endcode - startcode = 0x640`
+    // (`build/scratch/statcode/x.c`). A program with no executable segment (a
+    // badly linked one) leaves both zero, which is what Linux's `~0UL`/`0`
+    // pair degrades to once `end_code` is `0` - there is nothing to report.
+    let executable = image
+        .segments
+        .iter()
+        .filter(|segment| segment.flags.contains(MapFlags::EXEC));
+    let mut start_code = usize::MAX;
+    let mut end_code = 0usize;
+    for segment in executable {
+        let start = layout.bias + segment.vaddr;
+        start_code = start_code.min(start);
+        end_code = end_code.max(start + segment.data.len());
+    }
+    let bounds = ImageBounds {
+        start_code: if end_code == 0 { 0 } else { start_code },
+        end_code,
+        start_stack: user_rsp,
+    };
 
     Loaded {
         entry,
@@ -500,6 +536,7 @@ pub(crate) fn load_user(
         brk: brk_end.map_or(0, |end| pframe::align_up(layout.bias + end, PAGE_SIZE)),
         ranges: merge_ranges(ranges),
         frames,
+        bounds,
     }
 }
 
@@ -642,6 +679,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             &layout,
             "",
             interp_name,
+            user_rsp,
         );
         write_arg_block(space.root(), user_rsp, argv, env, "", &loaded);
 
@@ -670,7 +708,13 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::with_eager(TaskId(slot), root, loaded.frames, loaded.ranges),
+            mm: Mm::with_image(
+                TaskId(slot),
+                root,
+                loaded.frames,
+                loaded.ranges,
+                loaded.bounds,
+            ),
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
@@ -826,6 +870,7 @@ pub fn try_spawn_user(
             &layout,
             exe,
             interp_name,
+            user_rsp,
         );
         // Read before the space moves into the task: a thread switches to
         // this root, and the group is what remembers it.
@@ -878,7 +923,13 @@ pub fn try_spawn_user(
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::with_eager(TaskId(slot), root, loaded.frames, loaded.ranges),
+            mm: Mm::with_image(
+                TaskId(slot),
+                root,
+                loaded.frames,
+                loaded.ranges,
+                loaded.bounds,
+            ),
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
