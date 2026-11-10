@@ -1295,32 +1295,68 @@ are not restated in the phase sections above.
         Measured after: `boot-aarch64` full chain + `INIT_EXITED`; aarch64 sweep `pass=28 fail=0`;
         x86 gate `pass=159 fail=0 (159 built)` exit 33; `alpine-aarch64` exit 0 at `mpos login:`
         with no `[ !! ]` line; `depgraph` within the ratchet; fmt clean.
-  - [ ] 13.32 **observed, not diagnosed - twice now, same shape**: the boot's EL0 check dies under
-        a load it does not control. 2026-10-25, first reading: one lane of a four-lane aarch64
-        sweep arm (the three sibling lanes and two later arms - one at the same tree, one at its
-        predecessor - all green): after the check's own `EL0: root … active, program at 0x200000
-        (40 bytes)` line, a synchronous data abort, `ESR_EL1 0x96000047` (EC 0x25, from EL0),
-        `FAR_EL1 0xffffffff802cd000` - the first page past `kernel_end`, and `ELR_EL1` inside
-        `pl011`'s print loop, whose instruction at that address (`tbz`, on a register) cannot be
-        the aborting access. Second reading, same day, six-lane arm: lane 2, same check, same
-        `ESR_EL1 0x96000047`, `FAR_EL1 0xffffffff802d8000` - again the page after the image,
-        again unreproduced by the five sibling lanes. So the dump is not trustworthy at face
-        value: the fault's own report was written by a path whose state is already suspect, and
-        the reading to trust is only the *shape* - a kernel-half address just past the image,
-        reached from the probe program's exception level, both times under a host running the
-        whole sweep's TCG machines at once. Nothing in either landing of the day runs before the
-        scheduler. The discipline is §6.22's - an observation with its readings, a re-run before
-        believing it; two readings at the same site is where a diagnosis starts, and the
-        difference between the two `FAR`s (one page apart, both past the image) is the first
-        datum in it. **Third reading, same day, item 107's gate**: a six-lane arm, lane 2, the
-        same check and the same shape once more - `ESR_EL1 0x96000047` (EC 0x25), `FAR_EL1
-        0xffffffff802d9000` (a third page, again the image's tail), `ELR_EL1` again inside
-        `pl011`'s loop - while the sibling five lanes and the whole x86_64 arm were green, and the
-        re-run of the full gate was green on both machines. The change under test touches pid
-        numbering and signal fan-out and runs nowhere near the boot's EL0 check, so this is the
-        same observation rather than a regression; three readings at one site is where the
-        discipline says a diagnosis is owed, and what is missing is a reproduction that does not
-        depend on host load.
+  - [x] 13.32 the boot's EL0 check's save area sat exactly where a trap's frame lands, so one
+        interrupt on the way back from EL0 sent `br x9` to address zero - the dump reported the
+        *second* fault of a nested pair, which is why three readings looked impossible.
+        **What was seen, three times, all 2026-10-25.** One lane of a multi-lane aarch64 sweep arm,
+        never the same lane twice and never a sibling: after the check's own `EL0: root … active,
+        program at 0x200000 (40 bytes)` line, a synchronous data abort, `ESR_EL1 0x96000047`
+        (EC 0x25), `FAR_EL1` a page past the image (`0xffffffff802cd000`, then `0xffffffff802d8000`,
+        then `0xffffffff802d9000`) and `ELR_EL1` inside `pl011`'s print loop - whose instruction
+        there (`tbz`, on a register) cannot be the aborting access. Every re-run green, every
+        sibling green, both machines' full gates green. The entry stood as "observed, not
+        diagnosed" with the honest conclusion that the dump was untrustworthy because the path
+        that printed it was already broken.
+        **The reproduction, 2026-11-10.** It reappeared as a real gate failure (§6.116's aarch64
+        arm, lane 0 halting before any `=== RUN`) with a dump whose `FAR` was *not* in the kernel
+        half: `ESR_EL1 0x0000000096000047`, `ELR_EL1 0xffffffff8021fca4`, `FAR_EL1
+        0x0000000000221000` - the page after the check's own `ANSWER_VA` of `0x220000`. `ELR`
+        disassembles to `stp x8, x9, [sp, #0x40]`, the fifth pair of `__vec_sync`'s save sequence,
+        so the *fault handler's own prologue* was the faulting instruction: a nested report, exactly
+        as the old entry suspected.
+        **What the trace showed.** Instrumenting the theory was useless - the prints changed the
+        timing and 54 boots came back green. Reverting the instrumentation and looping the gate
+        with QEMU's `-d int` reproduced it on run 1, and the first fault in the 1.85 GB trace is
+        unambiguous:
+        `Exception return from AArch64 EL1 to AArch64 EL1 PC 0xffffffff8021b300` (that is
+        `mpos_probe_return`), then `Taking exception 5 [IRQ] … with SPSR 0x5 … with ELR
+        0xffffffff8021b300`, then `Taking exception 3 [Prefetch Abort] … with FAR 0x0 … with ELR
+        0x0` - the `br x9` had jumped to zero. `SPSR 0x5` is `EL1h` with `D`/`A`/`I`/`F` all clear.
+        **The mechanism.** `leave_for_kernel`'s probe branch used to set `SP_EL1` from the record's
+        second word — `area + 240`, the `sp` the drop started from — and then `eret` to
+        `mpos_probe_return` with no interrupt mask. But `[area, area + 240)` *is* the live
+        248-byte record `enter_probe` saved (`x9`/`x8`/`x30`, the callee-saved registers, `q8`-`q15`),
+        and the stub has not read it yet at that point. A trap taken in that window builds its frame
+        starting at `area + 240` and growing **down**, straight into the record: `__vec_irq`'s
+        192-byte frame, plus `bl {irq}`'s Rust frame below it. The first two words it lands on are
+        `[area]` — the stub's return address — and `[area + 8]` — the real `sp`. `br x9` then jumps
+        to whatever the frame left there (`0`), the prefetch abort at address zero runs
+        `__vec_sync` against the same corrupted `sp`, and its own frame's fifth pair crosses the
+        unmapped page after the answer page. `sync()` sees `started() == false` (the check runs
+        before `sched::init()`), skips its resolvers, and `synchronous()` prints the *second*
+        fault's registers — which is why every historical dump named an address that cannot have
+        faulted. Both old `FAR`s being "a page past the image" is the same nesting seen from the
+        other side.
+        **The fix** (`arch/src/arch/aarch64/context.rs`): set `sp` to the *base* of the record
+        (`mov sp, x8` immediately after `mov x19, x8`) instead of `area + 240`. Frames then grow
+        away from the record rather than into it, and the stub still restores the real `sp` from
+        `[area + 8]`, so nothing downstream changes. Masking `I` in the return's `PSTATE` was
+        considered and rejected: it stops IRQs but not synchronous exceptions, and moving the frame
+        off the record fixes the actual aliasing.
+        **The pin, and it is deterministic** (`arch/src/arch/aarch64/checks.rs`): the check now runs
+        its program a second time, with `vectors::disable_interrupts()`, `timer::arm_next_period()`
+        and a 10 ms wait so the tick is pending and *stays* pending, then enters EL0 with a new
+        `PSTATE_EL0T_IRQ_MASKED` so the program cannot take the line itself. The only `eret`
+        between the arming and the stub that clears `I` is the gate's own return, so the trap
+        cannot land anywhere but the window. Counterfactual: restore `ldr x8, [x8, #8]` and the
+        very next boot halts with `EXCEPTION: synchronous` / `EC 0x25` / `FAR_EL1 0x221000` (saved
+        at `build/scratch/el0/pin-counterfactual-crash.txt`); with the fix the same boot prints
+        `EL0: a tick taken on the way back from EL0 lands on a stack below the probe's record, and
+        the program left with status 7`, and its `-d int` trace shows the IRQ landing at
+        `mpos_probe_return`'s own `ELR` with `SPSR 0x5` (saved at
+        `build/scratch/el0/pin-window-proof.txt`). Eight clean boots plus the pinned check, all
+        green. No host load involved: the reproduction is now a boot that either prints the line
+        or halts.
   - [x] 13.33 the boot's sub-tick check answered from a counter two comparators move - the check
         halted a whole gate lane, and the dump it printed was the diagnosis.
         **What was seen.** One aarch64 lane of a both-arm gate timed out at its 900 s outer bound;

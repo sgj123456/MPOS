@@ -336,6 +336,18 @@ pub const ABI_REG_COUNT: usize = 34;
 /// for or leave the program running with the clock off.
 pub const PSTATE_EL0T: u64 = 0;
 
+/// `SPSR_EL1` for a return to EL0 with `I` set: `EL0t`, interrupts masked.
+///
+/// The boot's EL0 check runs its program twice, and the second run is the one
+/// that pins [`leave_for_kernel`]'s return window. Masking `I` is what keeps a
+/// pending tick from being taken *by the program*: it stays asserted on the
+/// GIC until some `eret` writes a `PSTATE` with `I` clear, and the only one in
+/// the probe's path is the gate's own return to EL1 - which is exactly the
+/// window a trap there used to corrupt the save area through. An unmasked
+/// program would simply take the tick itself, and the window would never be
+/// tested (`docs/notes/`, §13.32).
+pub const PSTATE_EL0T_IRQ_MASKED: u64 = PSTATE_EL0T | (1 << 7);
+
 /// `SPSR_EL1` for a return to EL1 on `SP_EL1`: `EL1h`.
 ///
 /// The `h` is the half that matters: `0b0100` would be `EL1t`, which returns to
@@ -427,17 +439,25 @@ pub unsafe fn leave_for_kernel(code: u64) -> ! {
              `enter_probe` did not publish a save area"
         );
         let stub: unsafe extern "C" fn() = mpos_probe_return;
-        // SAFETY: `area` is the 16-byte region `enter_probe` reserved below its
+        // SAFETY: `area` is the 240-byte region `enter_probe` reserved below its
         // own `sp`, live until the stub's `ret` gives that frame back - which is
         // what this `eret` makes happen. Writing `x19` from inside the block is
         // legal because the block never comes back: there is no frame left whose
-        // callee-saved registers the compiler could ask for. The `eret` restores
-        // `PSTATE` from `EL1h`, whose `D`/`A`/`I`/`F` bits are all clear, so the
-        // interrupt mask the drop went under is lifted by the return itself.
+        // callee-saved registers the compiler could ask for.
+        //
+        // `sp` is set to the *base* of that record, not to the `sp` the drop
+        // started from (`area + 240`), and the difference is the whole reason
+        // this branch could corrupt itself. The record is live memory the stub
+        // has not read yet; a stack pointer above it puts every frame a trap
+        // pushes *inside* those 240 bytes, and the trap that overwrites the
+        // resume pair sends `br x9` to whatever was left there - measured as
+        // `ELR 0x0` and a prefetch abort at address zero, with every later layer
+        // a nested report of the first (`docs/notes/`, §13.32). Base-of-record
+        // means frames grow *away* from it; the stub then restores the real `sp`
+        // from `[area + 8]` as it always did, so nothing else changes.
         unsafe {
             core::arch::asm!(
                 "mov x19, x8",
-                "ldr x8, [x8, #8]",
                 "mov sp, x8",
                 "msr elr_el1, x9",
                 "mov x9, {pstate}",

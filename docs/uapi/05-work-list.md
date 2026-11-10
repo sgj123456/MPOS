@@ -10098,3 +10098,50 @@ this intent: a bad non-NULL pointer's door-specific EFAULT/ESRCH precedence on
 a nonexistent pid combined with a short size, `sched_getparam`'s priority
 range, and `sched_rr_get_interval`'s host-configured slice value. Mechanism
 and the Linux matrix: `docs/notes/` §6.116.
+
+### Item 230 — the boot's EL0 check returns through a save area a trap could overwrite
+
+The aarch64 boot's EL0 self-check (`arch/src/arch/aarch64/checks.rs`) detected its
+own failure mode only by luck: one aarch64 lane in a few, never the same one twice,
+halted with a dump that named an `ELR` inside `pl011`'s print loop — an instruction
+that cannot fault. Three such readings stood as "observed, not diagnosed" from
+2026-10-25. What they were reporting was the *second* fault of a nested pair.
+
+| what | before | now |
+|---|---|---|
+| a trap between the gate's `eret` and the stub's first read | overwrote the record's return address and saved `sp` | the frame grows away from the record |
+| the fault the machine reports | the nested second abort (`ELR` in the prologue) | none: the check's line prints |
+| reproduction | one boot in ~54, host-load dependent | every boot, twice per boot |
+
+**The mechanism.** `leave_for_kernel`'s probe branch set `SP_EL1` from the record's
+second word (`area + 240`, the `sp` the drop started from) and then `eret`'d to
+`mpos_probe_return` with `PSTATE_EL1H` (`D`/`A`/`I`/`F` all clear). But
+`[area, area + 240)` *is* the live 240-byte record `enter_probe` saved, and the stub
+has not read it yet at that point. A trap in that window builds its frame at
+`area + 240`, growing **down**: `__vec_irq`'s 192 bytes, plus `bl {irq}`'s Rust
+frame below it. The first two words it lands on are `[area]` (the stub's return
+address) and `[area + 8]` (the real `sp`), so `br x9` jumps to whatever is there —
+`0` — and the prefetch abort at address zero runs `__vec_sync` against the same
+corrupted `sp`, whose prologue's fifth pair crosses into unmapped memory.
+`sync()` sees `started() == false` (the check runs before `sched::init()`), skips
+its resolvers, and `synchronous()` prints the *second* fault's registers. Every
+historical dump named an impossible address for that reason.
+
+**The fix.** Set `sp` to the record's *base* (`mov sp, x8` straight after
+`mov x19, x8`) rather than `area + 240`, so frames grow away from the record. The
+stub still restores the real `sp` from `[area + 8]`, so nothing downstream changes.
+Owner: `arch/src/arch/aarch64/context.rs`.
+
+**The pin, and it is deterministic.** The check runs its program a second time
+with `vectors::disable_interrupts()`, `timer::arm_next_period()` and a 10 ms wait,
+so the tick is pending and stays pending (a level source), then enters EL0 under a
+new `PSTATE_EL0T_IRQ_MASKED` so the program cannot take the line itself. The only
+`eret` between the arming and the stub that clears `I` is the gate's own return, so
+the trap cannot land anywhere but the window. Counterfactual: restore
+`ldr x8, [x8, #8]` and the next boot halts with `EXCEPTION: synchronous` /
+`EC 0x25` / `FAR_EL1 0x221000` (`build/scratch/el0/pin-counterfactual-crash.txt`);
+with the fix the same boot prints `EL0: a tick taken on the way back from EL0 lands
+on a stack below the probe's record, and the program left with status 7`, and its
+`-d int` trace shows the IRQ landing at `mpos_probe_return`'s own `ELR` with
+`SPSR 0x5` (`build/scratch/el0/pin-window-proof.txt`). Mechanism and the full
+trace reading: `docs/notes/` §13.32.

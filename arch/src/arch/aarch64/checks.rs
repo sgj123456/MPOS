@@ -763,6 +763,61 @@ fn check_el0() {
     // The probe's three frames stay mapped in the space `space.switch()` made
     // active until pid 1's own space replaces it; nothing at EL0 runs between
     // this return and the handoff except `/init` itself.
+
+    // ---------------------------------------------------------------------
+    // And once more, with a trap *certain* to land on the way back.
+    // ---------------------------------------------------------------------
+    //
+    // The first run proves the mechanism; this one pins the window the
+    // mechanism is reached through. `leave_for_kernel` hands control to
+    // `mpos_probe_return` with an `eret` into `EL1h`, whose `D`/`A`/`I`/`F` are
+    // all clear - so a trap taken between that `eret` and the stub's first
+    // instruction has to be answered before the stub has read the record it is
+    // about to return through. That is a real window on real hardware, and it
+    // is where this check's whole class of failure lives: measured once by
+    // luck (`docs/notes/`, §13.32 - one crash in ~54 boots) with the trap's
+    // 192-byte frame built *above* the record, over the two words the stub was
+    // about to load, which sent `br x9` to address zero.
+    //
+    // Waiting for luck again is not a pin, so the trap is made to happen. Three
+    // moves: mask interrupts, let the periodic clock's compare go by while they
+    // are masked, then run the program with `I` masked too. Nothing can take
+    // that pending line while the program runs - not the program itself, not the
+    // `svc` that ends it, because exception entry masks as well - so the *only*
+    // `eret` between the arming and the return that clears `I` is the gate's own
+    // return to the stub. The trap is therefore not merely likely to land in the
+    // window; it cannot land anywhere else.
+    //
+    // The two ways this can come out are the two answers worth having: the tick
+    // is delivered, the handler runs, the stub reads an intact record and the
+    // program's verdict below is printed as before - or the record is clobbered
+    // and the machine halts in the gate with `ELR 0x0`. There is no third.
+    vectors::disable_interrupts();
+    timer::arm_next_period();
+    // Past the compare, so the line is asserted and stays asserted: `TIMER_INTID`
+    // is a level source, and `tick` only moves it on inside the handler.
+    timer::busy_wait_ms(10);
+    let pinned = context::UserFrame {
+        x: [0; 31],
+        sp: (STACK_VA + PAGE_SIZE) as u64,
+        pc: PROGRAM_VA as u64,
+        pstate: context::PSTATE_EL0T_IRQ_MASKED,
+    };
+    // SAFETY: `pinned` is the same three pages `frame` used, still mapped in the
+    // space `space.switch()` made active, and `SPSel` is still on the kernel
+    // stack. The one difference from the call above is the `pstate` it returns
+    // to, and that is the point.
+    let status = unsafe { context::enter_probe(&pinned) };
+    if status != 7 {
+        fail!(
+            "the program exited with {status} when a tick was waiting for it, and it asked for 7"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "EL0: a tick taken on the way back from EL0 lands on a stack below the probe's \
+         record, and the program left with status {status}"
+    );
 }
 
 /// The EL0 probe's verdict: what [`check_el0`] reads back once the program has

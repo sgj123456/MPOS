@@ -835,6 +835,20 @@ One-glance status of the whole roadmap.
 - [x] the kernel travels inside the loader — the ESP carries one bootable file (§15.9)
 - [x] the self-test sweep is many machines' — the host half beside the guests, one lane per
   core, and a deal that follows what the last run measured (§15.94)
+- [x] the boot's EL0 check can be interrupted without dying — its return path used to put
+  `SP_EL1` at the *top* of the 240-byte record `enter_probe` had saved, so a trap taken between
+  the gate's `eret` and the stub's first read built its frame on top of the record's own return
+  address and saved `sp`: `br x9` jumped to `0`, and the dump the machine printed was the
+  *second* fault of the nested pair, which is why three readings from 2026-10-25 each named an
+  `ELR` inside `pl011`'s print loop that cannot fault. A clean-tree `-d int` captured the first
+  fault in one boot (`Exception return … to PC 0xffffffff8021b300` then `Taking exception 5 [IRQ]
+  … SPSR 0x5 … ELR 0xffffffff8021b300` then `Prefetch Abort … FAR 0x0`); the fix points `sp` at
+  the record's base so frames grow away from it. Eight clean boots green, and the check now pins
+  itself: it runs its program a second time with interrupts masked, the periodic compare already
+  past and the program's own `I` masked, so the only `eret` that can clear `I` is the gate's
+  return — the trap *cannot* miss the window. Counterfactually the next boot halts with
+  `EC 0x25` / `FAR_EL1 0x221000`; with the fix both aarch64 lanes print both lines every boot
+  (§13.32, item 230)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

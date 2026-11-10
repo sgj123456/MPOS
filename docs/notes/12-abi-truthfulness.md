@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-09, the two `sched_*attr` doors' `size`/`flags` order §6.116):**
+**Latest measured gate (2026-11-10, the boot's EL0 check's save area §13.32):** stage 1
+`1249 tests, 0 failed` (59.68 s); x86_64 `pass=281 fail=0 (281 built)`, `mpos-kunit 35 passed,
+0 failed`; aarch64 `pass=280 fail=0 (280 built)`, `mpos-kunit 35 passed, 0 failed` — `GATE EXIT=0`
+(`build/gate-el0fix.log`), both arms in one command with the lane count forced to two. The point of
+this run is the aarch64 arm: the boot check that used to halt a lane before its first `=== RUN`
+now runs *twice* per boot and both lanes print both lines —
+`EL0: the program wrote 0xaaaa, called a number no system call has, read
+0xffffffffffffffda back and left with status 7` and `EL0: a tick taken on the way back from EL0
+lands on a stack below the probe's record, and the program left with status 7`
+(`build/test-lane-aarch64-0/serial.log`, `build/test-lane-aarch64-1/serial.log`). No lane was
+halted, no lane timed out. The previous gate's red on this same arm was this defect; see §13.32 for
+the trace that found it and the counterfactual that pins it.
+
+**Measured gate before it (2026-11-09, the two `sched_*attr` doors' `size`/`flags` order §6.116):**
 `build/gate-schedattr.log` was red on the disk arm, and not on this change —
 x86_64 `pass=281 fail=0 (281 built)`, `mpos-kunit 35 passed, 0 failed`, `exit 33`,
 stage 1 `1249 tests, 0 failed` (61.11 s); aarch64 lane 0 never ran a program and
