@@ -1148,74 +1148,204 @@ pub fn handle_mincore(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     0
 }
 
-/// `mlock(addr, len)` — pin a range into memory. Nothing here pages out,
-/// so every page is already pinned and the call is its validations: an
-/// unaligned range is EINVAL, an unmapped page is the man page's ENOMEM,
-/// and the success is the promise the man page makes and this kernel
-/// keeps by never having broken it.
+/// `mlock(addr, len)` — pin a range into memory.
+///
+/// Measured against a current host (`build/scratch/mlk/*.c`, Linux 7.2.14)
+/// because almost none of the shape is guessable:
+///
+/// * an **unaligned** `addr` is not refused - Linux rounds the range out to
+///   whole pages (`mlock(mapped + 1, 1)` is `0` and charges 4 kB);
+/// * `RLIMIT_MEMLOCK` is enforced, and the pages already locked inside the
+///   range are subtracted first, so locking a range twice does not charge it
+///   twice;
+/// * a range with **no mapping at all** under it is `ENOMEM`, exactly like a
+///   range with a hole in the middle - the answer is about coverage, not about
+///   "the start was below something";
+/// * `RLIMIT_MEMLOCK` of 0 without `CAP_IPC_LOCK` is `EPERM`, and that check
+///   comes *first*: `mlock(unmapped, 1)` with the limit at 0 is `EPERM`.
+///
+/// `len == 0` still rounds up (`mlock(unmapped + 1, 0)` is `ENOMEM`), which is
+/// why the alignment happens before the empty check.
 pub fn handle_mlock(args: [usize; ARG_COUNT]) -> isize {
     lock_range(args[0], args[1])
 }
 
-/// `munlock(addr, len)` — the unpinning half, whose validations are the
-/// pinning half's: the range is named the same way, and the pages must be
-/// mapped for the man page's ENOMEM to be answerable.
+/// `munlock(addr, len)` — the unpinning half. Its address checks are the
+/// pinning half's, but it asks for **no** capability and consults no limit:
+/// measured, `munlock` with `RLIMIT_MEMLOCK` at 0 is `0`, and so is an
+/// `munlock` of a range that was never locked.
 pub fn handle_munlock(args: [usize; ARG_COUNT]) -> isize {
-    lock_range(args[0], args[1])
-}
-
-fn lock_range(addr: usize, len: usize) -> isize {
-    if addr % PAGE_SIZE != 0 {
-        return err::EINVAL;
-    }
-    let end = match addr.checked_add(len) {
-        Some(end) => end,
-        None => return err::EINVAL,
+    let (start, end) = match lock_bounds(args[0], args[1]) {
+        Ok(bounds) => bounds,
+        Err(e) => return e,
     };
-    if len == 0 {
+    if start >= end {
         return 0;
     }
-    let mut page = addr;
+    if let Err(e) = lock_coverage(start, end) {
+        return e;
+    }
+    crate::sched::set_locked(start, end, false);
+    0
+}
+
+/// Round `addr..addr + len` out to the pages it touches.
+///
+/// Linux does `start &= PAGE_MASK; len = PAGE_ALIGN(len + offset_in_page(start))`
+/// and then treats a zero-length result as an empty range, which is why
+/// `mlock(page_aligned, SIZE_MAX)` is `0`: the rounding wraps to nothing rather
+/// than being an overflow error.
+fn lock_bounds(addr: usize, len: usize) -> Result<(usize, usize), isize> {
+    let offset = addr % PAGE_SIZE;
+    let start = addr - offset;
+    let Some(rounded) = len.checked_add(offset) else {
+        return Err(err::ENOMEM);
+    };
+    let Some(len) = rounded.checked_add(PAGE_SIZE - 1) else {
+        return Err(err::ENOMEM);
+    };
+    let len = len & !(PAGE_SIZE - 1);
+    let Some(end) = start.checked_add(len) else {
+        return Err(err::ENOMEM);
+    };
+    if end < start {
+        return Err(err::ENOMEM);
+    }
+    Ok((start, end))
+}
+
+/// Whether every page of `start..end` has a description under it.
+///
+/// Both descriptions count, because both are what a page can be mapped by in
+/// this kernel. A hole anywhere in the range - including the entire range - is
+/// `ENOMEM`.
+fn lock_coverage(start: usize, end: usize) -> Result<(), isize> {
+    let mut page = start;
     while page < end {
-        // A page that is *claimed* counts: with demand paging the range is the
-        // process's from `mmap`, and a page nobody has touched is one this
-        // kernel has nothing to page out either.
         if !crate::sched::user_mapped(page) {
-            return err::ENOMEM;
+            return Err(err::ENOMEM);
         }
         page += PAGE_SIZE;
     }
+    Ok(())
+}
+
+/// `do_mlock`'s limit test, which is the half a reader would skip: the pages
+/// already locked **inside the range** come off the count before the limit is
+/// compared, so re-locking a range past the limit is still `0`.
+fn lock_admits(start: usize, end: usize) -> bool {
+    if crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        return true;
+    }
+    let limit = match crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK) {
+        Some(limit) if limit.cur != crate::abi::RLIM_INFINITY => limit.cur as usize,
+        _ => 8 * 1024 * 1024,
+    };
+    let lock_limit = limit / PAGE_SIZE;
+    let wanted = (end - start).div_ceil(PAGE_SIZE);
+    let mut locked = crate::sched::locked_pages() + wanted;
+    if locked > lock_limit {
+        locked -= crate::sched::locked_within(start, end);
+    }
+    locked <= lock_limit
+}
+
+fn lock_range(addr: usize, len: usize) -> isize {
+    // `can_do_mlock()` first, before a single address is looked at: measured,
+    // `mlock(unmapped, 1)` with the limit at 0 is `EPERM` and not `ENOMEM`.
+    if !crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        let limit = crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK);
+        if limit.is_some_and(|limit| limit.cur == 0) {
+            return err::EPERM;
+        }
+    }
+    let (start, end) = match lock_bounds(addr, len) {
+        Ok(bounds) => bounds,
+        Err(e) => return e,
+    };
+    if start >= end {
+        return 0;
+    }
+    if let Err(e) = lock_coverage(start, end) {
+        return e;
+    }
+    if !lock_admits(start, end) {
+        return err::ENOMEM;
+    }
+    crate::sched::set_locked(start, end, true);
     0
 }
 
-/// `mlock2(addr, len, flags)` — the flag-taking form. `MLOCK_ONFAULT`
-/// promises to pin the pages a later fault brings in, which is a promise
-/// about a page-out this kernel never performs; it is accepted, and any
-/// other bit is the man page's EINVAL.
+/// `mlock2(addr, len, flags)` — the flag-taking form. The one flag bit is
+/// `MLOCK_ONFAULT`, and Linux's value for it is **1**, not `0x10`: measured,
+/// `mlock2(addr, page, 1)` is `0` and `mlock2(addr, page, 0x10)` is `EINVAL`.
+/// `MCL_ONFAULT`'s `4` belongs to a different argument.
 pub fn handle_mlock2(args: [usize; ARG_COUNT]) -> isize {
-    const MCL_ONFAULT: usize = 0x10;
-    if args[2] & !MCL_ONFAULT != 0 {
+    const MLOCK_ONFAULT: usize = 0x1;
+    if args[2] & !MLOCK_ONFAULT != 0 {
         return err::EINVAL;
     }
     lock_range(args[0], args[1])
 }
 
-/// `mlockall(flags)` — pin the whole address space. Everything is
-/// already resident; the flags are validated because the man page's
-/// EINVAL for an unknown bit is the caller's only way to learn the
-/// kernel did not hear the rest.
+/// `mlockall(flags)` — pin the whole address space.
+///
+/// The flags word is judged with three rules measured on a current host: an
+/// **empty** word is `EINVAL` (unlike most of this ABI, "do nothing" is not a
+/// valid request), a bit outside `MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT` is
+/// `EINVAL`, and `MCL_ONFAULT` **on its own** is `EINVAL` too - it says *how*
+/// to lock and not *what*.
+///
+/// `MCL_CURRENT` then has to fit under `RLIMIT_MEMLOCK` measured against the
+/// whole address space, which is why a small limit refuses it while
+/// `MCL_FUTURE` alone still succeeds (measured: a 4 KiB limit makes
+/// `mlockall(MCL_CURRENT)` `ENOMEM` and `mlockall(MCL_FUTURE)` `0`).
+/// `MCL_FUTURE`'s promise is kept on every mapping made afterwards, and after
+/// `munlockall` it stops being made at all.
 pub fn handle_mlockall(args: [usize; ARG_COUNT]) -> isize {
     const MCL_CURRENT: usize = 1;
     const MCL_FUTURE: usize = 2;
-    if args[0] & !(MCL_CURRENT | MCL_FUTURE) != 0 {
+    const MCL_ONFAULT: usize = 4;
+    let flags = args[0];
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 || flags == MCL_ONFAULT
+    {
         return err::EINVAL;
+    }
+    if !crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        let limit = crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK);
+        if limit.is_some_and(|limit| limit.cur == 0) {
+            return err::EPERM;
+        }
+    }
+    if flags & MCL_CURRENT != 0 && !mlockall_admits() {
+        return err::ENOMEM;
+    }
+    if flags & MCL_CURRENT != 0 {
+        crate::sched::lock_current();
+    }
+    if flags & MCL_FUTURE != 0 {
+        crate::sched::set_lock_future(true);
     }
     0
 }
 
-/// `munlockall()` — nothing was pinned that was not already resident, so
-/// nothing needs the unpinning.
+/// Whether `mlockall(MCL_CURRENT)`'s whole address space fits: Linux compares
+/// `mm->total_vm` against the limit, so it is the *mapped* pages that are
+/// counted and never the resident ones.
+fn mlockall_admits() -> bool {
+    if crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        return true;
+    }
+    let limit = match crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK) {
+        Some(limit) if limit.cur != crate::abi::RLIM_INFINITY => limit.cur as usize,
+        _ => 8 * 1024 * 1024,
+    };
+    crate::sched::mapped_pages() * PAGE_SIZE <= limit
+}
+
+/// `munlockall()` — unpin everything and drop the `MCL_FUTURE` promise.
 pub fn handle_munlockall(_args: [usize; ARG_COUNT]) -> isize {
+    crate::sched::unlock_all();
     0
 }
 

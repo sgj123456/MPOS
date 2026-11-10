@@ -10235,3 +10235,64 @@ claims — counterfactually **5 red** with the file stashed and both kernel and
 loader rebuilt (`build/boot-statm-cf1.log`), green on host and machine
 (`build/boot-statm1.log`, `build/boot-statm2.log`). Measurement and reasoning:
 `docs/notes/` §6.118.
+
+### Item 233 — `mlock`/`munlock`/`mlock2`/`mlockall` pin a page or say why not
+
+The family answered `0` to every well-formed request and pinned nothing.
+`AGENTS.md` §3 rule 2 calls returning success for something not implemented
+the single worst thing this codebase can do, and this was the case with no
+possible defence: the three readers that would have shown it were all zeros
+too.
+
+| call | Linux | here before | here now |
+|---|---|---|---|
+| `RLIMIT_MEMLOCK` default | `8388608/8388608` | `RLIM_INFINITY` | `8388608/8388608` |
+| `mlock(mapped, 8 pages)` | `0`, `VmLck += 32 kB` | `0`, `VmLck` still `0` | `0`, `VmLck += 32 kB` |
+| same range again | `0`, count unchanged | `0`, count unchanged | `0`, count unchanged |
+| `mlock(unaligned, 1)` | `0` (rounded out) | `EINVAL` | `0` (rounded out) |
+| `mlock(range with a hole)` | `ENOMEM` | `ENOMEM` | `ENOMEM` |
+| `mlock(range past every mapping)` | `ENOMEM` | `ENOMEM` | `ENOMEM` |
+| `munlock(3 of 8 pages)` | `0`, `VmLck -= 12 kB` | `0`, count unchanged | `0`, `VmLck -= 12 kB` |
+| `mlock` past the limit | `ENOMEM` | `0` | `ENOMEM` |
+| `mlock` with the limit at 0 | `EPERM` (before the address) | `0` | `EPERM` |
+| `mlock2(..., MLOCK_ONFAULT)` | `0` (`MLOCK_ONFAULT` = 1) | `EINVAL` | `0` |
+| `mlock2(..., 0x10)` | `EINVAL` | `0` | `EINVAL` |
+| `mlockall(0)` | `EINVAL` | `0` | `EINVAL` |
+| `mlockall(MCL_ONFAULT)` alone | `EINVAL` | `EINVAL` (unknown bit) | `EINVAL` |
+| `mmap(MAP_LOCKED, 8 pages)` | arrives pinned | not a flag here | arrives pinned |
+| `MAP_LOCKED` past the limit | `EAGAIN` | n/a | `EAGAIN` |
+| `MADV_DONTNEED` on a pinned page | `EINVAL`, contents kept | `0`, page dropped | `EINVAL`, contents kept |
+| `fork`'s child `VmLck` | `0 kB`, can `munlock` | `0 kB` (nothing pinned) | `0 kB`, can `munlock` |
+| `/proc/self/status` `VmLck` | the count | literal `0 kB` | the count |
+| `smaps` `Locked:` | the range's size when pinned | literal `0 kB` | the range's size when pinned |
+
+**Why the count is recounted, not incremented.** Two description tables can
+hold a mapping here — a `Vma` (faultable) or an already-filled `MappedRange` —
+and a lock is a bit on whichever carries it. Six places mutate those tables
+(`insert`, `insert_present`, `remove_range`, `lift_range`, `forget_ranges`,
+`grow_stack_range`), and an incremental counter has to be right in all six;
+recounting from the bits is `mapped_pages`'s existing cost and cannot drift.
+The same recount is what makes Linux's two subtle answers fall out for free:
+locking a range twice charges it once (the bit is already set), and a
+`munlock` of a sub-range charges off exactly its own pages.
+
+**Why `fork` clears the bits rather than copying the count.** Linux's
+`dup_mmap` clears `VMA_LOCKED_MASK` on the copied VMAs and `mm_init` starts
+`locked_vm` at 0, so the child's pages are *not* pinned even though its
+address space is a copy — measured (`build/scratch/mlk/fork3.c`): the child
+reads `VmLck 0 kB` and its `munlock` of the inherited range answers `0`.
+Copying the parent's count would have left the child pinning pages it cannot
+account for.
+
+**Landed.** `crates/abi` (`RLIMIT_MEMLOCK` constant + default row),
+`src/mm/vma.rs` (`locked` on both descriptions, `set_locked`/`locked_pages`/
+`locked_pages_within`/`clear_locks`, `abuts` refuses a mismatched pair),
+`src/sched/runtime/child_mm.rs` (the `Mm` methods and the free functions),
+`src/syscall/linux/posix.rs` (`lock_bounds`/`lock_coverage`/`lock_admits`/
+`mlockall_admits` and the two rewritten shapes), `src/syscall/linux/proc.rs`
+(`MAP_LOCKED`, `MCL_FUTURE`'s auto-pin, `MADV_DONTNEED`/`MADV_FREE` on a
+pinned range), `src/sched/runtime/child_exit.rs` (fork clears the bits),
+`src/sched/runtime/procfs.rs` + `src/vfs/procfs.rs` (`VmLck`, `smaps`
+`Locked:`). **Pins:** `user/tests/src/bin/t-mlock.rs`, 25 claims, counter-
+factually **13 red** (`build/boot-mlock-cf1.log`), green on host and machine.
+Measurement and reasoning: `docs/notes/` §6.119.

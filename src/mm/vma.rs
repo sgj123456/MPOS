@@ -32,7 +32,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::mm::vm::MapFlags;
+use crate::mm::vm::{MapFlags, PAGE_SIZE};
 
 /// The object a frame-backed mapping aliases its pages from.
 ///
@@ -210,6 +210,19 @@ pub struct MappedRange {
     /// program's text is the flagship use of the call, and in this kernel that
     /// text is an eager range.
     pub sealed: bool,
+    /// Whether this range is pinned by `mlock`/`mlock2`/`mlockall` - Linux's
+    /// `VM_LOCKED`.
+    ///
+    /// On both descriptions for the reason `sealed` gives, and it has to be
+    /// stored rather than derived from "was `mlock` called": the accounting is
+    /// per *page*, so a second `mlock` of an already-locked range must add
+    /// nothing (`build/scratch/mlk/edge.c`), `munlock` of a sub-range must take
+    /// off exactly that sub-range (`munlock(base+2P, 3P)` on an 8-page lock
+    /// reads `VmLck 32 -> 20`, `build/scratch/mlk/acct2.c`), and three callers
+    /// other than the two that set it read the bit: `VmLck` counts it, `smaps`
+    /// prints it per mapping, and a destructive `madvise` on it is `EINVAL`
+    /// (`build/scratch/mlk/dont.c`).
+    pub locked: bool,
 }
 
 impl MappedRange {
@@ -219,6 +232,7 @@ impl MappedRange {
         self.end == next.start
             && self.prot == next.prot
             && self.sealed == next.sealed
+            && self.locked == next.locked
             && same_name(&self.name, &next.name)
     }
 }
@@ -235,16 +249,23 @@ impl MappedRange {
 /// let rw = MapFlags::READ | MapFlags::WRITE;
 /// // Out of order, and the second continues the first: sorted, then folded.
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false },
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: false },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
 /// ]);
 /// assert_eq!(merged.len(), 1);
 /// assert_eq!((merged[0].start, merged[0].end), (0x1000, 0x3000));
 /// // A permission change ends the run even when the addresses abut.
 /// let rx = MapFlags::READ | MapFlags::EXEC;
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false },
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None, sealed: false },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None, sealed: false, locked: false },
+/// ]);
+/// assert_eq!(merged.len(), 2);
+/// // And so does a lock bit: a pinned page is its own run, because a
+/// // `munlock` of the rest has to be able to take it back out.
+/// let merged = merge_ranges(vec![
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: true },
 /// ]);
 /// assert_eq!(merged.len(), 2);
 /// ```
@@ -293,6 +314,10 @@ pub struct Vma {
     /// over one page of a four-page mapping leaves the other three unsealed
     /// and a later split cannot lose the bit.
     pub sealed: bool,
+    /// Whether `mlock`/`mlock2`/`mlockall` pinned this range - Linux's
+    /// `VM_LOCKED`. See [`MappedRange::locked`] for why the bit is stored on
+    /// both descriptions and what its three readers are.
+    pub locked: bool,
 }
 
 impl Vma {
@@ -305,6 +330,7 @@ impl Vma {
             kind,
             name: None,
             sealed: false,
+            locked: false,
         }
     }
 
@@ -353,6 +379,7 @@ impl Vma {
             kind,
             name: self.name.clone(),
             sealed: self.sealed,
+            locked: self.locked,
         })
     }
 
@@ -367,6 +394,7 @@ impl Vma {
         if self.end != next.start
             || self.prot != next.prot
             || self.sealed != next.sealed
+            || self.locked != next.locked
             || !same_name(&self.name, &next.name)
         {
             return false;
@@ -728,6 +756,73 @@ impl VmaTable {
             vma.prot = prot;
         }
         self.retake(inside);
+    }
+
+    /// `mlock`/`munlock`: mark or unmark every description inside
+    /// `[start, end)` as pinned, splitting at the ends exactly like
+    /// `mprotect`'s so that locking one page of four leaves three unlocked.
+    ///
+    /// The bit is what `munlock` of a *sub*-range subtracts from: measured on
+    /// a current host (`build/scratch/mlk/acct2.c`), 8 pages locked read
+    /// `VmLck 32 kB` and `munlock(base + 2 pages, 3 pages)` leaves exactly
+    /// `20 kB` - so the accounting is a count of marked pages, never a running
+    /// total the caller hands in.
+    pub fn set_locked(&mut self, start: usize, end: usize, locked: bool) {
+        let mut inside = self.split_out(start, end);
+        if inside.is_empty() {
+            return;
+        }
+        for vma in &mut inside {
+            vma.locked = locked;
+        }
+        self.retake(inside);
+    }
+
+    /// How many pages this table has marked as pinned - half of
+    /// [`crate::sched::Mm`]'s `locked_pages`, the other half being the eager
+    /// ranges.
+    pub fn locked_pages(&self) -> usize {
+        self.vmas
+            .values()
+            .filter(|vma| vma.locked)
+            .map(|vma| (vma.end - vma.start).div_ceil(PAGE_SIZE))
+            .sum()
+    }
+
+    /// How many pinned pages of this table lie inside `[start, end)`.
+    ///
+    /// The subtraction `do_mlock` makes before it compares against
+    /// `RLIMIT_MEMLOCK`: a range already locked is not re-charged, which is why
+    /// locking the same 8 pages twice reads `VmLck 32 kB` both times
+    /// (`build/scratch/mlk/acct.c`).
+    pub fn locked_pages_within(&self, start: usize, end: usize) -> usize {
+        self.vmas
+            .values()
+            .filter(|vma| vma.locked)
+            .map(|vma| {
+                (vma.end
+                    .min(end)
+                    .saturating_sub(vma.start.max(start))
+                    .div_ceil(PAGE_SIZE))
+            })
+            .filter(|pages| *pages > 0)
+            .sum()
+    }
+
+    /// Mark every description as pinned - `mlockall(MCL_CURRENT)`.
+    pub fn lock_all(&mut self) {
+        for vma in self.vmas.values_mut() {
+            vma.locked = true;
+        }
+    }
+
+    /// Unpin every description without touching the geometry - what `fork`
+    /// does to a copied table (`dup_mmap`'s `vma_clear_flags_mask(tmp,
+    /// VMA_LOCKED_MASK)`) and what `munlockall` does here.
+    pub fn clear_locks(&mut self) {
+        for vma in self.vmas.values_mut() {
+            vma.locked = false;
+        }
     }
 
     /// `PR_SET_VMA_ANON_NAME`: give every anonymous mapping in `[start, end)`
@@ -1493,6 +1588,58 @@ mod tests {
     /// The three books `status` counts into, against the mapping shapes Linux
     /// was measured on (`build/scratch/vmlines/b.c`, `c.c`, `f.c`).
     #[test]
+    /// The pin is a bit on the description, and the count is recounted from
+    /// the bits - so locking a range twice charges it once, and a `munlock` of
+    /// a sub-range takes off exactly that sub-range's pages.
+    ///
+    /// The numbers are Linux's, measured on 7.2.14 with a 32-page limit
+    /// (`build/scratch/mlk/acct2.c`): 8 locked pages read `VmLck 32 kB`, a
+    /// `munlock` of pages 2..5 takes it to `20 kB`, and the same `munlock`
+    /// again leaves it at `20`.
+    #[test]
+    fn locking_a_range_charges_its_pages_once_and_unlocking_takes_them_off() {
+        let mut table = VmaTable::new();
+        let base = 0x1000_0000;
+        table.insert(Vma::new(
+            base,
+            base + 64 * 4096,
+            MapFlags::READ | MapFlags::WRITE,
+            VmaKind::Anon,
+        ));
+        assert_eq!(table.locked_pages(), 0, "nothing is pinned to begin with");
+        table.set_locked(base, base + 8 * 4096, true);
+        assert_eq!(table.locked_pages(), 8, "8 pages at 4 KiB each is 32 kB");
+        table.set_locked(base, base + 8 * 4096, true);
+        assert_eq!(
+            table.locked_pages(),
+            8,
+            "locking the same 8 pages again charges nothing"
+        );
+        table.set_locked(base + 2 * 4096, base + 5 * 4096, false);
+        assert_eq!(
+            table.locked_pages(),
+            5,
+            "a sub-range munlock takes off exactly its own 3 pages"
+        );
+        table.set_locked(base + 2 * 4096, base + 5 * 4096, false);
+        assert_eq!(
+            table.locked_pages(),
+            5,
+            "and unlocking them again is a no-op"
+        );
+        assert_eq!(
+            table.locked_pages_within(base, base + 8 * 4096),
+            5,
+            "the pages already pinned inside a range are the ones do_mlock subtracts"
+        );
+        table.clear_locks();
+        assert_eq!(
+            table.locked_pages(),
+            0,
+            "fork's copy starts with no page pinned and no accounting"
+        );
+    }
+
     fn a_mappings_book_is_the_one_linuxs_three_predicates_pick() {
         let rw = MapFlags::READ | MapFlags::WRITE;
         let rx = MapFlags::READ | MapFlags::EXEC;

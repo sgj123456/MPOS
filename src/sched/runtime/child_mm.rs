@@ -757,6 +757,36 @@ pub fn destructive_advice_refused(virt: usize, end: usize) -> bool {
     false
 }
 
+/// Whether `virt..end` holds a page `mlock` has pinned.
+///
+/// `MADV_DONTNEED` and `MADV_FREE` both refuse a locked range with `EINVAL`:
+/// Linux's `madvise_dontneed_free_valid_vma` (`mm/madvise.c:886`) puts
+/// `VM_LOCKED` in the forbidden set unless the advice is
+/// `MADV_DONTNEED_LOCKED`, and takes the same `-EINVAL` path for both
+/// behaviours. Measured on 7.2.14 (`build/scratch/mlk/dont.c`): a 32-page
+/// locked range answers `-1 EINVAL` to `MADV_DONTNEED`, keeps its contents, and
+/// answers `-1 EINVAL` to `MADV_FREE` too - while `mprotect(PROT_NONE)` over the
+/// same pages is `0` and leaves `VmLck` alone.
+pub fn locked_advice_refused(virt: usize, end: usize) -> bool {
+    let mm = current_mm();
+    let mut page = virt;
+    while page < end {
+        if let Some(vma) = mm.vma_at(page) {
+            if vma.locked {
+                return true;
+            }
+        } else if mm
+            .eager_ranges()
+            .iter()
+            .any(|range| range.locked && page >= range.start && page < range.end)
+        {
+            return true;
+        }
+        page += PAGE_SIZE;
+    }
+    false
+}
+
 /// `madvise(MADV_DONTNEED)` over `virt..virt + len`: give the range's pages
 /// back, leaving the mapping itself in place.
 ///
@@ -844,6 +874,48 @@ pub fn user_mapped(virt: usize) -> bool {
             .is_some()
             || task.mm.vma_covers(virt)
     })
+}
+
+/// `mlock`/`munlock` over the current process's address space: mark or unmark
+/// every description inside `virt..virt + len` as pinned.
+pub fn set_locked(start: usize, end: usize, locked: bool) -> usize {
+    current_mm().set_locked(start, end, locked)
+}
+
+/// How many pages the current process has pinned - `VmLck`'s numerator.
+pub fn locked_pages() -> usize {
+    current_mm().locked_pages()
+}
+
+/// How many pinned pages of the current process lie inside `start..end`.
+pub fn locked_within(start: usize, end: usize) -> usize {
+    current_mm().locked_within(start, end)
+}
+
+/// `mlockall(MCL_CURRENT)`: pin every mapping the current process has.
+pub fn lock_current() {
+    current_mm().lock_everything();
+}
+
+/// `munlockall()`: unpin everything and stop pinning what is mapped next.
+pub fn unlock_all() {
+    current_mm().unlock_everything();
+}
+
+/// Whether `mlockall(MCL_FUTURE)` is in force for the current process.
+pub fn lock_future() -> bool {
+    current_mm().lock_future()
+}
+
+/// Set or clear `mlockall`'s `MCL_FUTURE` promise for the current process.
+pub fn set_lock_future(on: bool) {
+    current_mm().set_lock_future(on)
+}
+
+/// The current process's mapped pages - `mm->total_vm`, which is what
+/// `mlockall(MCL_CURRENT)` measures against `RLIMIT_MEMLOCK`.
+pub fn mapped_pages() -> usize {
+    current_mm().mapped_pages()
 }
 
 /// The permissions the current process has on `virt`, if a VMA covers it.
@@ -1723,6 +1795,14 @@ pub struct Mm {
     pub(crate) start_code: core::sync::atomic::AtomicUsize,
     pub(crate) end_code: core::sync::atomic::AtomicUsize,
     pub(crate) start_stack: core::sync::atomic::AtomicUsize,
+    /// Whether `mlockall(MCL_FUTURE)` is in force: for this group every mapping
+    /// made from now on is locked as it is made, which is Linux's
+    /// `mm->def_vma_flags`' `VM_LOCKED` bit.
+    ///
+    /// Measured (`build/scratch/mlk/acct2.c`): `mlockall(MCL_FUTURE)` alone
+    /// leaves `VmLck` at 0, then a 4-page `mmap` takes it to `16 kB`. Cleared by
+    /// `munlockall`, after which a new `mmap` leaves `VmLck` untouched.
+    pub(crate) lock_future: core::sync::atomic::AtomicBool,
 }
 
 /// A thread group's memory: the frames behind its mappings, how many threads
@@ -1803,6 +1883,7 @@ impl Mm {
             start_code: core::sync::atomic::AtomicUsize::new(image.start_code),
             end_code: core::sync::atomic::AtomicUsize::new(image.end_code),
             start_stack: core::sync::atomic::AtomicUsize::new(image.start_stack),
+            lock_future: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1888,6 +1969,7 @@ impl Mm {
                         prot: range.prot,
                         name: range.name.clone(),
                         sealed: range.sealed,
+                        locked: range.locked,
                     });
                 }
                 if range.end > end {
@@ -1897,6 +1979,7 @@ impl Mm {
                         prot: range.prot,
                         name: range.name.clone(),
                         sealed: range.sealed,
+                        locked: range.locked,
                     });
                 }
             }
@@ -1930,6 +2013,7 @@ impl Mm {
                         prot: range.prot,
                         name: range.name.clone(),
                         sealed: range.sealed,
+                        locked: range.locked,
                     });
                 }
                 // The piece inside the seal.
@@ -1941,6 +2025,7 @@ impl Mm {
                     prot: range.prot,
                     name: range.name.clone(),
                     sealed: true,
+                    locked: range.locked,
                 });
                 // Right piece, untouched.
                 if range.end > end {
@@ -1950,6 +2035,7 @@ impl Mm {
                         prot: range.prot,
                         name: range.name.clone(),
                         sealed: range.sealed,
+                        locked: range.locked,
                     });
                 }
             }
@@ -2033,6 +2119,181 @@ impl Mm {
                 }
             }
         });
+    }
+
+    /// Pin every description inside `start..end` (or unpin it), and answer how
+    /// many *newly* pinned pages that added.
+    ///
+    /// The pages are marked on whichever description carries them - a VMA in
+    /// the table or an eager range - because those are the two things a
+    /// mapping can be here, exactly as for `mseal`. Nothing is faulted in:
+    /// this kernel never pages a resident frame out, so a "locked" page and an
+    /// ordinary one differ only in what three readers are told
+    /// (`/proc/<pid>/status`'s `VmLck`, `smaps`'s `Locked:`, and the refusal a
+    /// destructive `madvise` gets).
+    ///
+    /// The answer is the *difference* in pinned pages, not the range's own
+    /// page count: re-locking an already-locked range must report 0 so that a
+    /// caller past its `RLIMIT_MEMLOCK` can still repeat itself, which is what
+    /// a current host does (`build/scratch/mlk/acct.c`: locking 8 pages twice
+    /// reads `VmLck 32 kB` both times, and `ackt2.c`'s sub-range `munlock`
+    /// takes off exactly its own 3 pages).
+    pub(crate) fn set_locked(&self, start: usize, end: usize, locked: bool) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let before = self.locked_pages();
+        critical_section::with(|cs| {
+            self.vmas
+                .borrow(cs)
+                .borrow_mut()
+                .set_locked(start, end, locked);
+            let mut eager = self.eager.borrow(cs).borrow_mut();
+            let mut rebuilt: Vec<MappedRange> = Vec::with_capacity(eager.len() + 2);
+            for range in eager.drain(..) {
+                if range.end <= start || range.start >= end {
+                    rebuilt.push(range);
+                    continue;
+                }
+                // The pieces outside the range keep their own bit; only the
+                // overlap changes, so a lock of one page of four leaves three
+                // alone - the same split `mseal` makes.
+                if range.start < start {
+                    rebuilt.push(MappedRange {
+                        start: range.start,
+                        end: start,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                        sealed: range.sealed,
+                        locked: range.locked,
+                    });
+                }
+                rebuilt.push(MappedRange {
+                    start: range.start.max(start),
+                    end: range.end.min(end),
+                    prot: range.prot,
+                    name: range.name.clone(),
+                    sealed: range.sealed,
+                    locked,
+                });
+                if range.end > end {
+                    rebuilt.push(MappedRange {
+                        start: end,
+                        end: range.end,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                        sealed: range.sealed,
+                        locked: range.locked,
+                    });
+                }
+            }
+            *eager = rebuilt;
+        });
+        let after = self.locked_pages();
+        after.saturating_sub(before)
+    }
+
+    /// How many pinned pages lie inside `start..end` in *both* descriptions -
+    /// the `count_mm_mlocked_page_nr` half of `do_mlock`'s limit test.
+    pub(crate) fn locked_within(&self, start: usize, end: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        critical_section::with(|cs| {
+            let vma_pages = self
+                .vmas
+                .borrow(cs)
+                .borrow()
+                .locked_pages_within(start, end);
+            let eager_pages: usize = self
+                .eager
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .filter(|range| range.locked && range.end > start && range.start < end)
+                .map(|range| {
+                    range
+                        .end
+                        .min(end)
+                        .saturating_sub(range.start.max(start))
+                        .div_ceil(pframe::PAGE_SIZE)
+                })
+                .sum();
+            vma_pages + eager_pages
+        })
+    }
+
+    /// `mlockall(MCL_CURRENT)`: pin every mapping that exists now.
+    pub(crate) fn lock_everything(&self) {
+        critical_section::with(|cs| {
+            self.vmas.borrow(cs).borrow_mut().lock_all();
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                range.locked = true;
+            }
+        });
+    }
+
+    /// `fork`'s half of the pinning rule: a child inherits the *mappings* but
+    /// none of the pinning.
+    ///
+    /// Linux's `dup_mmap` clears `VMA_LOCKED_MASK` on every copied VMA
+    /// (`mm/memory.c`, and `mm_init` starts the new `mm` with `locked_vm = 0`
+    /// and a fresh `def_vma_flags`), which is why a child of a process that
+    /// `mlock`ed 4 pages reads `VmLck 0` and can `munlock` pages it never
+    /// pinned without a word - measured (`build/scratch/mlk/fork4.c`): parent
+    /// `VmLck 16 kB`, child after `fork` `0`, child's `munlock` `0`, and the
+    /// parent still `16`. The same applies to `mlockall(MCL_FUTURE)`
+    /// (`build/scratch/mlk/futfork.c`): the child's own `mmap` is not pinned.
+    pub(crate) fn clear_locks(&self) {
+        self.lock_future.store(false, Ordering::Relaxed);
+        critical_section::with(|cs| {
+            self.vmas.borrow(cs).borrow_mut().clear_locks();
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                range.locked = false;
+            }
+        });
+    }
+
+    /// `munlockall`: unpin everything, and stop locking whatever is mapped next.
+    pub(crate) fn unlock_everything(&self) {
+        self.set_lock_future(false);
+        critical_section::with(|cs| {
+            self.vmas
+                .borrow(cs)
+                .borrow_mut()
+                .set_locked(0, usize::MAX, false);
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                range.locked = false;
+            }
+        });
+    }
+
+    /// How many pages this address space has pinned - Linux's `mm->locked_vm`,
+    /// the number `RLIMIT_MEMLOCK` bounds and `VmLck` prints.
+    pub(crate) fn locked_pages(&self) -> usize {
+        critical_section::with(|cs| {
+            let vma_pages = self.vmas.borrow(cs).borrow().locked_pages();
+            let eager_pages: usize = self
+                .eager
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .filter(|range| range.locked)
+                .map(|range| (range.end - range.start).div_ceil(pframe::PAGE_SIZE))
+                .sum();
+            vma_pages + eager_pages
+        })
+    }
+
+    /// Whether `mlockall(MCL_FUTURE)` is in force for this group.
+    pub(crate) fn lock_future(&self) -> bool {
+        self.lock_future.load(Ordering::Relaxed)
+    }
+
+    /// Set or clear `mlockall`'s `MCL_FUTURE` bit - for this group every
+    /// mapping made from now on is locked as it is made.
+    pub(crate) fn set_lock_future(&self, on: bool) {
+        self.lock_future.store(on, Ordering::Relaxed);
     }
 
     /// The lowest page the stack currently covers: where growth has reached,

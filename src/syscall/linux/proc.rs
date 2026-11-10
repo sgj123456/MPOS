@@ -3552,7 +3552,14 @@ pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
     // to take the machine down: the pages beyond it do not exist, and there is
     // nothing there to drop.
     let end = addr.saturating_add(len).min(USER_LIMIT);
+    // A pinned page is not the advice's to take: `madvise_dontneed_free_valid_vma`
+    // (`mm/madvise.c:886`) refuses `VM_LOCKED` with `EINVAL` for both advices,
+    // and it is judged before the range is touched - measured, the contents
+    // survive and `VmLck` does not move.
     if advice == super::abi::MADV_DONTNEED && len != 0 && end > addr {
+        if crate::sched::locked_advice_refused(addr, end) {
+            return err::EINVAL;
+        }
         if let Err(e) = crate::sched::madvise_dontneed(addr, end - addr) {
             return e;
         }
@@ -3562,6 +3569,9 @@ pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
     // hint: it is the promise `mseal` made, so a caller that sees it knows the
     // pages it is about to let go of are the ones it sealed.
     if advice == super::abi::MADV_FREE && len != 0 && end > addr {
+        if crate::sched::locked_advice_refused(addr, end) {
+            return err::EINVAL;
+        }
         if crate::sched::destructive_advice_refused(addr, end) {
             return err::EPERM;
         }
@@ -3634,8 +3644,8 @@ use crate::mm::vm::MapFlags;
 // The `mmap`/`mprotect`/`mremap` flag bits are Linux's numbering, pinned in
 // `abi` with the rest of the flag words.
 use super::abi::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_SHARED, MREMAP_FIXED,
-    MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_LOCKED, MAP_SHARED,
+    MREMAP_FIXED, MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
 };
 // One past the highest address a process may map: the *machine's* user span, not
 // a shared figure. The two machines' values and the reason for them are written
@@ -3811,6 +3821,21 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         },
     };
 
+    // `MAP_LOCKED`, and the promise `mlockall(MCL_FUTURE)` made earlier: both
+    // ask whether this mapping fits under `RLIMIT_MEMLOCK`, and Linux asks
+    // before it installs anything (`mm/mmap.c:424-430`). The two doors differ
+    // in their refusals, measured (`build/scratch/mlk/mapl2.c`, and
+    // `build/scratch/mlk/onf.c` for the overrun): `MAP_LOCKED` with the limit
+    // at 0 is `EPERM` - `can_do_mlock` - while a range that does not fit is
+    // `EAGAIN`, the mmap-side error, not `mlock`'s own `ENOMEM`.
+    let pin = flags & MAP_LOCKED != 0 || crate::sched::lock_future();
+    if flags & MAP_LOCKED != 0 && !mmap_may_lock() {
+        return err::EPERM;
+    }
+    if pin && !mmap_lock_admits(len) {
+        return err::EAGAIN;
+    }
+
     // Readable is what a present page is; `USER` is what makes it reachable
     // from ring 3 at all, and `PROT_NONE` is exactly the absence of that bit.
     let mut mf = MapFlags::READ;
@@ -3965,7 +3990,35 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         }
     }
 
+    if pin {
+        crate::sched::set_locked(base, base + len, true);
+    }
+
     base as isize
+}
+
+/// `can_do_mlock()` for the `mmap` door: a zero `RLIMIT_MEMLOCK` without
+/// `CAP_IPC_LOCK` refuses every pin, and this one is `EPERM`.
+fn mmap_may_lock() -> bool {
+    if crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        return true;
+    }
+    !crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK).is_some_and(|limit| limit.cur == 0)
+}
+
+/// `mlock_future_ok` (`mm/mmap.c:231`): a mapping that will be pinned has to
+/// fit under `RLIMIT_MEMLOCK` on top of what the process already holds.
+fn mmap_lock_admits(len: usize) -> bool {
+    if crate::sched::current_credentials().capable(crate::cred::CAP_IPC_LOCK) {
+        return true;
+    }
+    let limit = match crate::sched::current_rlimit(crate::abi::RLIMIT_MEMLOCK) {
+        Some(limit) if limit.cur != crate::abi::RLIM_INFINITY => limit.cur as usize,
+        _ => 8 * 1024 * 1024,
+    };
+    let page = crate::mm::pframe::PAGE_SIZE;
+    let locked = (crate::sched::locked_pages() + len.div_ceil(page)) * page;
+    locked <= limit
 }
 
 /// `mremap(old, old_size, new_size, flags, new_address)` — resize or move a

@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, `statm`'s seven fields §6.118):** stage 1 `1254 tests,
+**Latest measured gate (2026-11-10, the `mlock` family §6.119):** stage 1 `1255 tests,
+0 failed` (48.02 s); x86_64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35 passed, 0 failed`;
+aarch64 `pass=283 fail=0 (283 built)`, `mpos-kunit 35 passed, 0 failed` — `GATE EXIT=0` on the
+x86_64 arm (`build/gate-mlock-x1.log`), and the aarch64 arm green inside the combined run
+(`build/gate-mlock2.log`). The combined run's x86_64 arm went red on `t-starttime`'s bracket
+claim (`a tick per centisecond (Some(150) ticks inside Some((1140, 1140)) ms, Some(1140) ms
+apart)`) with no other program failing — the two-TCG-lanes-on-one-core shape §12.4a records —
+and came back `pass=284 fail=0` alone in 47.61 s. The new program is the point: `t-mlock`
+(25 claims) runs on both machines and fails 13 of them against the previous kernel
+(`build/boot-mlock-cf1.log`).
+
+**Measured gate before it (2026-11-10, `statm`'s seven fields §6.118):** stage 1 `1254 tests,
 0 failed`; x86_64 `pass=283 fail=0 (283 built)`, `mpos-kunit 35 passed, 0 failed`;
 aarch64 `pass=282 fail=0 (282 built)`, `mpos-kunit 35 passed, 0 failed` — both arms green in
 one command with the lane count forced to two, `build/gate-statm.log` (aarch64 arm) and

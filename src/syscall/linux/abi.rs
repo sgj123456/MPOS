@@ -263,6 +263,12 @@ pub(super) const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
 /// pool, so the honest answer is the one Linux gives when the reserve is not
 /// available - `ENOMEM` - never a silent 4 KiB mapping that pretends otherwise.
 pub(super) const MAP_HUGETLB: usize = 0x4_0000;
+/// `MAP_LOCKED` (`0x2000`) - "pin what you are about to map", the `mmap(2)`
+/// spelling of `mlock`. Measured on Linux 7.2.14 (`build/scratch/mlk/mapl2.c`):
+/// the mapping succeeds and `VmLck` grows by its size, and a request that would
+/// exceed `RLIMIT_MEMLOCK` fails with `EAGAIN` - not `ENOMEM`, which is what
+/// `mlock` itself answers for the same overrun.
+pub(super) const MAP_LOCKED: usize = 0x2000;
 /// `mprotect`'s protection bits. Readable (0x1) is what a present page is,
 /// which is why only the other two are named here.
 pub(super) const PROT_WRITE: usize = 0x2;

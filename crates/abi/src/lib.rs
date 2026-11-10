@@ -248,6 +248,16 @@ pub const RLIMIT_SIGPENDING: usize = 11;
 /// is being read, and a reader that reaches for the wrong index answers with
 /// another resource's ceiling (`docs/notes/` §6.111).
 pub const RLIMIT_RSS: usize = 5;
+/// `RLIMIT_MEMLOCK` (8 in `asm-generic/resource.h`): the bytes of address space
+/// one process may pin with `mlock`/`mlock2`/`mlockall`.
+///
+/// It is a real bound here rather than a row left at infinity, because the
+/// calls that read it now take a lock: `MCL_FUTURE` and a `MAP_LOCKED` map both
+/// pin pages, so an unlimited row would let a program pin everything it can map.
+/// Linux's own default is 8 MiB (measured on a current host: `getrlimit`
+/// answers `8388608/8388608`), and the kernel prints the pinned total as
+/// `/proc/<pid>/status`'s `VmLck` (`docs/notes/` §6.119).
+pub const RLIMIT_MEMLOCK: usize = 8;
 /// `RLIM_INFINITY`: what an unlimited limit reads as.
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
@@ -317,6 +327,17 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
         cur: 819_200,
         max: 819_200,
     }; // RLIMIT_MSGQUEUE
+    // RLIMIT_MEMLOCK (8): the bytes of address space one process may pin. Left
+    // at infinity it would be a promise the kernel does not keep, because
+    // `mlock` and `mlockall(MCL_FUTURE)` now take a lock the allocator has to
+    // account for - the row is what holds that family to a bound the way
+    // RLIMIT_MSGQUEUE holds the message queues (§8.0's worst-case rule). 8 MiB
+    // is Linux's own default and the number a caller reads back from
+    // `getrlimit` on a current host (`build/scratch/mlock/m.c`, Linux 7.2.14).
+    t[8] = Rlimit {
+        cur: 8 * 1024 * 1024,
+        max: 8 * 1024 * 1024,
+    }; // RLIMIT_MEMLOCK
     // RLIMIT_SIGPENDING (11): the queued real-time records one user may hold.
     // It is *not* infinity, because the row is a real bound here: the records
     // live in a fixed per-task ring and `RT_QUEUE_LEN` is its size, so this is
@@ -1003,6 +1024,17 @@ mod tests {
         // the number to `sched::signal::RT_QUEUE_LEN`, which this leaf cannot
         // name.
         assert_eq!(t[RLIMIT_SIGPENDING], Rlimit { cur: 16, max: 16 });
+        // `RLIMIT_MEMLOCK` (8) is finite for the same reason: `mlockall`'s
+        // `MCL_FUTURE` and a `MAP_LOCKED` map both pin pages, so the row is
+        // what bounds the family. Linux's own default is 8 MiB, measured on a
+        // current host (`docs/notes/` §6.119).
+        assert_eq!(
+            t[RLIMIT_MEMLOCK],
+            Rlimit {
+                cur: 8_388_608,
+                max: 8_388_608
+            }
+        );
         // `RLIMIT_NICE` (13) and `RLIMIT_RTPRIO` (14) read `0/0` on Linux, not
         // infinity, and the zero is the rule rather than a leftover: it is the
         // row `can_nice` reads to decide whether a caller without

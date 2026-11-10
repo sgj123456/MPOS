@@ -1594,6 +1594,9 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::books`] - `(exec_vm, stack_vm,
     /// data_vm)`, the three page books behind `VmExe`/`VmLib`/`VmStk`/`VmData`.
     pub books: (usize, usize, usize),
+    /// See [`crate::sched::TaskSnapshot::locked_pages`] - the pages pinned by
+    /// `mlock`, which `VmLck` prints in kilobytes.
+    pub locked_pages: usize,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -2187,6 +2190,13 @@ pub struct SmapsLine {
     /// anonymous (their page belongs to the object), a forked private anon page
     /// is 4 kB (`probe_smaps_shapes.c`).
     pub anonymous: bool,
+    /// Whether `mlock` has pinned this range - Linux's `VM_LOCKED`, which
+    /// `Locked:` reports as the range's own size in kilobytes.
+    ///
+    /// It is a per-mapping *bit*, not a residency figure: measured
+    /// (`build/scratch/mlk/onf.c`), 8 pages locked with `mlock2(...,
+    /// MLOCK_ONFAULT)` read `Locked: 32 kB` before a single one is touched.
+    pub locked: bool,
 }
 
 /// Render `/proc/<pid>/smaps`: for each mapping, the `maps` line, then Linux's
@@ -2213,8 +2223,9 @@ pub struct SmapsLine {
 ///
 /// The remaining lines are zero because the thing behind them does not exist
 /// here: no KSM, no huge pages, no soft-dirty tracking's `THPeligible` page, no
-/// pkeys, no swap, and no locked page - `mlock` is served as the no-op it is,
-/// so `Locked` is the truth rather than a placeholder.
+/// pkeys and no swap. `Locked:` is real: it is the range's size when `mlock`
+/// has pinned it, which is a bit on the mapping rather than a residency
+/// figure (`build/scratch/mlk/onf.c`).
 ///
 /// ```
 /// use mpos::vfs::procfs::{MapLine, SmapsLine, format_smaps};
@@ -2233,6 +2244,7 @@ pub struct SmapsLine {
 ///     },
 ///     rss_pages: 1,
 ///     anonymous: true,
+///     locked: false,
 /// };
 /// let text = format_smaps(&[line]);
 /// assert!(text.starts_with("7f00000000-7f00004000 rw-p 00000000 00:00 0 \nSize:"));
@@ -2277,10 +2289,12 @@ pub fn format_smaps(lines: &[SmapsLine]) -> String {
             "Private_Hugetlb:",
             "Swap:",
             "SwapPss:",
-            "Locked:",
         ] {
             smaps_kb(&mut out, absent, 0);
         }
+        // `Locked:` is the range's size, not its resident set: `mlock` pins the
+        // whole mapping whether or not a page of it has been faulted in.
+        smaps_kb(&mut out, "Locked:", if line.locked { size_kb } else { 0 });
         // These two are numbers rather than "kB" counts - `THPeligible` a flag
         // and `ProtectionKey` a pkey - and Linux prints them without a unit.
         smaps_number(&mut out, "THPeligible:", 0);
@@ -2426,6 +2440,7 @@ fn vma_flags(line: &MapLine) -> alloc::vec::Vec<&'static str> {
 ///     },
 ///     rss_pages: 2,
 ///     anonymous: true,
+///     locked: false,
 /// };
 /// let untouched = SmapsLine {
 ///     map: MapLine {
@@ -2440,6 +2455,7 @@ fn vma_flags(line: &MapLine) -> alloc::vec::Vec<&'static str> {
 ///     },
 ///     rss_pages: 0,
 ///     anonymous: false,
+///     locked: false,
 /// };
 /// let text = format_numa_maps(&[anon, untouched]);
 /// assert_eq!(text.lines().next().unwrap(),
@@ -2533,6 +2549,7 @@ fn push_escaped_path(out: &mut String, path: &str) {
 ///     },
 ///     rss_pages: pages,
 ///     anonymous,
+///     locked: false,
 /// };
 /// let text = format_smaps_rollup(&[
 ///     line(0x1000, 0x2000, 1, true),
@@ -2690,6 +2707,7 @@ fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
             },
             rss_pages: 0,
             anonymous: matches!(&vma.kind, VmaKind::Anon),
+            locked: vma.locked,
         });
     }
     for range in &facts.eager {
@@ -2711,6 +2729,7 @@ fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
             // frames, with nothing of the file left behind: the pages are
             // nobody else's, which is the question `Anonymous` asks.
             anonymous: true,
+            locked: range.locked,
         });
     }
 
@@ -3039,6 +3058,7 @@ fn vm_block(
     lib_kb: usize,
     data_kb: usize,
     stack_kb: usize,
+    locked_kb: usize,
 ) -> alloc::string::String {
     if task.state == 'Z' {
         return alloc::string::String::new();
@@ -3046,7 +3066,7 @@ fn vm_block(
     alloc::format!(
         "VmPeak:\t   {peak_kb} kB\n\
          VmSize:\t   {size_kb} kB\n\
-         VmLck:\t       0 kB\n\
+         VmLck:\t   {locked_kb} kB\n\
          VmPin:\t       0 kB\n\
          VmHWM:\t   {hwm_kb} kB\n\
          VmRSS:\t   {rss_kb} kB\n\
@@ -3090,6 +3110,10 @@ fn status_of(slot: usize) -> Option<String> {
     let (exe_kb, lib_kb) = text_and_lib_kb(task.image, exec_pages);
     let data_kb = vm_kilobytes(data_pages);
     let stack_kb = vm_kilobytes(stack_pages);
+    // `VmLck` is the pinned-page count `RLIMIT_MEMLOCK` bounds, not a resident
+    // set: measured (`build/scratch/mlk/acct.c`), 8 locked pages of untouched
+    // anonymous memory read `VmLck 32 kB` before anything is touched.
+    let locked_kb = vm_kilobytes(task.locked_pages);
     // Linux prints no `Vm*` line at all for a zombie: the address space is
     // gone, and `task_mem` is only reached through an `mm` that still exists
     // (`build/scratch/zombiev/z.c` - a `state=Z` child's `/proc/<pid>/status`
@@ -3097,7 +3121,7 @@ fn status_of(slot: usize) -> Option<String> {
     // `VmSize: 0 kB` would be a different answer to the same question: "the
     // address space is empty" rather than "there is no address space".
     let vm = vm_block(
-        &task, peak_kb, size_kb, hwm_kb, rss_kb, exe_kb, lib_kb, data_kb, stack_kb,
+        &task, peak_kb, size_kb, hwm_kb, rss_kb, exe_kb, lib_kb, data_kb, stack_kb, locked_kb,
     );
     let state_name = match task.state {
         'R' => "running",
@@ -5617,30 +5641,27 @@ mod tests {
     fn a_zombies_status_has_no_vm_line() {
         let zombie = process(8, 8, None, 7, 'Z');
         assert_eq!(
-            vm_block(&zombie, 1, 2, 3, 4, 5, 6, 7, 8),
+            vm_block(&zombie, 1, 2, 3, 4, 5, 6, 7, 8, 9),
             "",
             "a zombie has no address space to report, not an empty one"
         );
         // A live process does print the block, so the absence above is the
         // zombie's answer and not a block the renderer never produces.
         let live = process(7, 7, None, 0, 'R');
-        let block = vm_block(&live, 100, 200, 300, 400, 5, 6, 7, 8);
+        let block = vm_block(&live, 100, 200, 300, 400, 5, 6, 7, 8, 9);
         assert!(block.contains("VmSize:\t   200 kB\n"), "{block}");
         assert!(block.contains("VmRSS:\t   400 kB\n"), "{block}");
         assert!(block.contains("VmData:\t   7 kB\n"), "{block}");
         assert!(block.contains("VmStk:\t   8 kB\n"), "{block}");
         assert!(block.contains("VmExe:\t   5 kB\n"), "{block}");
         assert!(block.contains("VmLib:\t   6 kB\n"), "{block}");
+        // `VmLck` is a real count now - it is the `locked_kb` argument, which
+        // `status_of` fills from the group's `mm->locked_vm` (item 233). This
+        // test passes 9 for it, so the line has to read 9 and not zero.
+        assert!(block.contains("VmLck:\t   9 kB\n"), "{block}");
         // The lines whose count this kernel does not keep say `0` and nothing
         // else - an estimate there would be indistinguishable from a count.
-        for zero in [
-            "VmLck:",
-            "VmPin:",
-            "RssFile:",
-            "RssShmem:",
-            "VmPTE:",
-            "VmSwap:",
-        ] {
+        for zero in ["VmPin:", "RssFile:", "RssShmem:", "VmPTE:", "VmSwap:"] {
             assert!(
                 block.contains(&alloc::format!("{zero}\t       0 kB\n")),
                 "{zero} must still read 0: {block}"
@@ -6222,6 +6243,7 @@ mod tests {
             },
             rss_pages: 1,
             anonymous: true,
+            locked: false,
         }]);
         assert_eq!(
             text,
@@ -6282,6 +6304,7 @@ mod tests {
             },
             rss_pages: 0,
             anonymous: true,
+            locked: false,
         };
         let text = format_smaps(&[line(0x55f4_db03_6000, 0x55f4_db05_8000)]);
         assert!(text.contains(one), "{text:?}");
@@ -6307,6 +6330,7 @@ mod tests {
             },
             rss_pages: 0,
             anonymous: true,
+            locked: false,
         }]);
         // Size is the mapping's own length; every accounting line is zero.
         assert!(text.contains("Size:                128 kB\n"), "{text:?}");
@@ -6533,6 +6557,7 @@ mod tests {
             },
             rss_pages: pages,
             anonymous,
+            locked: false,
         };
         let text = format_numa_maps(&[
             line(0x7f90_92bd_f000, 1, true, None),
@@ -6584,6 +6609,7 @@ mod tests {
             },
             rss_pages: 1,
             anonymous: false,
+            locked: false,
         }]);
         assert!(
             text.starts_with("00001000 default file=/tmp/a\\040b\\011c.bin"),
@@ -6611,6 +6637,7 @@ mod tests {
             },
             rss_pages: pages,
             anonymous,
+            locked: false,
         };
         let text = format_smaps_rollup(&[
             line(0x0000_1000, 0x0000_2000, 1, true),
@@ -6731,6 +6758,7 @@ mod tests {
             // a loaded image sets both itself (§6.117's host tests do).
             image: crate::mm::ImageBounds::default(),
             books: (0, 0, 0),
+            locked_pages: 0,
         }
     }
 

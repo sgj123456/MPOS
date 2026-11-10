@@ -876,6 +876,27 @@ One-glance status of the whole roadmap.
   into file-backed/shmem pages. Pinned by `t-statm` (9 claims, counterfactually 5 red)
   (§6.118, item 232)
 
+- [x] `mlock` and its family pin a page, or say why not — every well-formed request
+  answered `0` and pinned nothing, and the three readers that would have shown it
+  (`VmLck`, `smaps`'s `Locked:`, the refusal a destructive `madvise` gets) were zeros
+  too, so the no-op was invisible. `AGENTS.md` §3 rule 2 calls that the worst thing
+  this codebase can do. Six measured answers rebuilt the family: the limit is
+  `RLIMIT_MEMLOCK` (8 MiB, not `RLIM_INFINITY`), and pages already pinned **inside**
+  the range come off the count before the limit test, so re-locking is free and a
+  sub-range `munlock` charges off exactly its own pages; coverage is the question and
+  a hole anywhere — including past every mapping — is `ENOMEM`; zero length is judged
+  *after* alignment, so `mlock(unmapped + 1, 0)` is `ENOMEM` while `mlock(aligned,
+  SIZE_MAX)` rounds to nothing and answers `0`; at a limit of 0 without
+  `CAP_IPC_LOCK` the answer is `EPERM` **before** the address is looked at, and
+  `munlock` asks for nothing at all; `mlock2`'s flag word is `MLOCK_ONFAULT` = **1**
+  where this kernel had `0x10` (so Linux's accepted spelling was refused and its
+  refused one accepted), and `mlockall` refuses an empty word and `MCL_ONFAULT`
+  alone; `MAP_LOCKED` is the same pin through `mmap` (`EAGAIN` past the limit), and a
+  pin makes `MADV_DONTNEED`/`MADV_FREE` `EINVAL` with the contents intact. `fork`
+  inherits none of it — `dup_mmap` clears the bit and the child can `munlock` what it
+  never pinned. Pinned by `t-mlock` (25 claims, counterfactually 13 red) (§6.119,
+  item 233)
+
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 
 - [x] 11.A subtract · 11.B device seam · 11.C per-open-file registry · 11.D terminal out of `vfs` · 11.F host-test criterion · 11.G depgraph ratchet (§11.2)

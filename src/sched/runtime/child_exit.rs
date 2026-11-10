@@ -1359,6 +1359,14 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 // exec'd reads its parent's three values byte for byte
                 // (`build/scratch/statcode/inherit2.c`).
                 mm.set_image_bounds(t.task(parent_id).mm.image_bounds());
+                // A child inherits the mappings, not the pinning: Linux's
+                // `dup_mmap` clears `VMA_LOCKED_MASK` on every copied VMA and
+                // `mm_init` starts the new `mm` with `locked_vm = 0` and a
+                // fresh `def_vma_flags`, so a `mlock`ed parent's child reads
+                // `VmLck 0` (`build/scratch/mlk/fork4.c`) and its own `mmap`
+                // is not pinned under the parent's `MCL_FUTURE`
+                // (`build/scratch/mlk/futfork.c`).
+                mm.clear_locks();
                 // The credentials come along, as Linux's `copy_creds` shares
                 // them: a process that had dropped a bounding capability or
                 // become non-dumpable must not hand its child the full set.

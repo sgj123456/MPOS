@@ -9449,3 +9449,156 @@ decision with a probe behind it — the clamp, the stack's book, and which half
 of residency is counted. Reading "seven fields, five are zeros" as one gap hid
 that the three answerable ones were being reported *wrongly* (a resident count
 in `data`'s place) rather than not at all.
+
+## §6.119 `mlock`, `munlock`, `mlock2`, `mlockall`: a limit, a bit on the mapping, and a set of refusals
+
+`AGENTS.md` calls it the single worst thing this codebase can do: return
+success for something not implemented. The `mlock` family was that, in its
+purest form — every well-formed request answered `0`, nothing was pinned, and
+no reader could tell the difference. `VmLck` printed the literal `0 kB`,
+`smaps`'s `Locked:` was in the `absent` list beside `KSM:` and `SwapPSS:`, and
+`src/vfs/procfs.rs`'s own doc comment said so out loud: *"no locked page -
+`mlock` is served as the no-op it is, so `Locked` is the truth rather than a
+placeholder."* It was not the truth. It was a zero that agreed with a no-op.
+
+### The six answers Linux gives, measured
+
+Everything below was read off a current host (7.2.14, `euid` 1000,
+`RLIMIT_MEMLOCK` `8388608/8388608`) with the probes in
+`build/scratch/mlk/`, and cross-checked against `mm/mlock.c` fetched from
+the kernel tree (`build/scratch/mlock/mlock.c`).
+
+**1. The limit is enforced, and re-locking is free.** `do_mlock` computes
+`locked = len >> PAGE_SHIFT`, adds `mm->locked_vm`, and — *only if that
+exceeds the limit* — subtracts `count_mm_mlocked_page_nr(mm, start, len)`, the
+pages already pinned **inside the range**. So an already-pinned range passes
+even at the limit. `acct.c`, 16-page limit: lock 8 pages reads `VmLck 32 kB`;
+lock the same 8 again still reads `32 kB` (and answers `0`); lock 8 more
+reads `64 kB`; one page past that is `ENOMEM`. `acct2.c`'s `munlock` of a
+3-page sub-range takes the count from `32 kB` to `20 kB` — exactly its own
+pages, not the whole range's.
+
+**2. Coverage, not "was the start below something".** `apply_vma_lock_flags`
+walks the VMA iterator from `start` and fails if `vma->vm_start != tmp` at any
+step — a hole anywhere in the range is `ENOMEM`, the whole range being past
+every mapping included. This one cost a wrong reading first: `b386` recorded
+"start past the last mapping answers 0", and `holes.c` — which reads
+`/proc/self/maps` before it concludes anything — showed why. A library mapping
+(`/etc/ld.so.cache`, `[vvar]`) had been landing in the range the earlier probe
+called empty. With the layout verified: `40..48 starts just past everything`
+is `-1 ENOMEM`, and so is a one-byte range there.
+
+**3. Zero length is judged after alignment.** `len = PAGE_ALIGN(len +
+offset_in_page(start)); start &= PAGE_MASK;` — so `mlock(mapped, 0)` is `0`,
+but `mlock(unmapped + 1, 0)` is `ENOMEM`, because the alignment turns it into
+a one-page range that has nothing under it (`z2.c`). And the alignment is
+where the overflow lives: `mlock(aligned, SIZE_MAX)` rounds to length 0 and
+answers `0` (`ovf.c`).
+
+**4. At the limit's zero, `EPERM` — before any address is looked at.**
+`can_do_mlock()` is `rlimit != 0 || capable(CAP_IPC_LOCK)`, and it runs first,
+so with the limit at 0 an *unmapped* range answers `EPERM`, not `ENOMEM`
+(`ov.c`). `munlock` does not call it at all: unpinning asks for no capability
+and checks no limit (`q2.c`: `munlock 8 pages with limit 0` is `0`, while
+`mlock 1 page with limit 0` is `EPERM`).
+
+**5. `mlock2`'s one flag is 1, and `mlockall`'s three are 1/2/4.** This kernel
+had `MCL_ONFAULT = 0x10` as `mlock2`'s whole flag vocabulary — the number is
+`MLOCK_ONFAULT`'s *neighbour*, and it made the pairing exactly backwards:
+`mlock2(..., 1)` (Linux's accepted spelling) was `EINVAL` and `mlock2(...,
+0x10)` (Linux's refused one) was `0`. `mlockall` refused `0x40` but accepted
+`0` and `MCL_ONFAULT` alone, where Linux refuses both: `!flags || flags &
+~(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) || flags == MCL_ONFAULT` is `EINVAL`.
+
+**6. `MAP_LOCKED` is the same pin through `mmap`, and a pin is not advice's
+to take.** `mlk/onf.c`/`mapl2.c`: `mmap(MAP_LOCKED, 8 pages)` arrives with
+`VmLck 32 kB` and no separate `mlock`; over the limit it is `MAP_FAILED` with
+`EAGAIN` (not `ENOMEM`) and `VmLck` is unchanged. And `madvise`'s two
+destructive advices refuse a locked range — `MADV_DONTNEED` and `MADV_FREE` on
+a pinned page are `EINVAL`, with the contents intact (`dont.c`), because
+`madvise_dontneed_free_valid_vma` puts `VM_LOCKED` in the forbidden set.
+
+There is a seventh, and it is a *non*-answer this kernel now gives honestly:
+`fork` inherits **nothing**. `kernel/fork.c`'s `dup_mmap` clears the lock bit
+and `mm_init` starts `locked_vm` at 0, so a child reads `VmLck 0 kB` and can
+`munlock` a range it never pinned (`fork3.c`/`fork4.c`; the parent's count is
+untouched). `MCL_FUTURE` is likewise per-`mm`.
+
+### What changed here
+
+* `crates/abi`: `RLIMIT_MEMLOCK` (row 8) is a constant and `default_rlimits()`
+  fills it with Linux's 8 MiB — it had been left at `RLIM_INFINITY`, which is
+  the row every `mlock` limit test reads.
+* `mm/vma`: `Vma` and `MappedRange` carry `locked: bool` (**the mapping is
+  what remembers**, so `fork`'s copy can be cleared by clearing bits, and the
+  count is recounted from the bits exactly as `vm_books` recounts the three
+  books). `VmaTable::{set_locked, locked_pages, locked_pages_within,
+  lock_all, clear_locks}`; `abuts` refuses to merge two descriptions that
+  disagree about it, so a `munlock` of a sub-range can split the range back
+  out.
+* `sched/runtime/child_mm`: `Mm::{set_locked, locked_pages, locked_within,
+  lock_everything, unlock_everything, clear_locks, lock_future,
+  set_lock_future}` and the free functions the syscall layer calls. `Mm` also
+  gained `lock_future: AtomicBool` — `mm->def_vma_flags`'s `VM_LOCKED` bit.
+* `syscall/linux/posix`: `lock_bounds` (align, overflow → `ENOMEM`),
+  `lock_coverage` (page-by-page `user_mapped`), `lock_admits` (the limit with
+  the already-pinned pages subtracted), `mlockall_admits` (`total_vm <=
+  lock_limit`), and the real `handle_mlock2`/`handle_mlockall` shapes.
+* `syscall/linux/proc.rs`: `MAP_LOCKED` (and `MCL_FUTURE`) pin a mapping as
+  it is made, refusing with `EAGAIN` past the limit; `madvise`'s
+  `MADV_DONTNEED`/`MADV_FREE` answer `EINVAL` on a pinned range.
+* `vfs/procfs`: `VmLck` is `vm_kilobytes(task.locked_pages)` and
+  `smaps`'s `Locked:` is the range's size when it is pinned — the two readers
+  that were zeros.
+* `sched/runtime/child_exit`: the fork path clears the child's lock bits.
+* `sched/runtime/procfs`: `TaskSnapshot::locked_pages`, zero for a task with
+  no address space.
+
+### Named gaps this leaves
+
+`munlock` on a range this process never locked answers `0` here and `0` on
+Linux too, so no gap. What is *not* served: `MADV_DONTNEED_LOCKED` (a
+`madvise` flag that lets the advice through a pinned range — it has no
+constant in this kernel, so it is `EINVAL` like every unknown advice);
+`/proc/<pid>/smaps`'s `Locked:` is per-range but its `VmLck`-equivalent
+rollup line is still the zero list; and huge-page pins, which have no mapping
+kind here to pin.
+
+### The pin
+
+`user/tests/src/bin/t-mlock.rs`, **25 claims**, every one a movement or a
+refusal — never a fixed `VmLck`, which belongs to the test binary's loader
+history. Host green (`MPOS_ON_HOST=1`: `Some(0) -> Some(32)`, `Some(32) ->
+Some(20)`, `Some(604)`, `16 kB here, wait status 0`), machine green
+(`build/boot-mlock2.log`, `build/boot-mlock3.log`, 25 ok, `PASS`, exit 0).
+
+Counterfactual: all eleven files stashed, kernel and loader rebuilt
+(`4333 KiB -> 1150 KiB`), booted — **13 of 25 red**
+(`build/boot-mlock-cf1.log`):
+
+```
+FAIL:  RLIMIT_MEMLOCK is Linux's 8 MiB row (Some(18446744073709551615))
+FAIL:  and VmLck grows by those eight pages (Some(0) -> Some(0) kB)
+FAIL:  an unaligned address is rounded out, not refused (-1)
+FAIL:  and takes off those three pages (Some(0) -> Some(0) kB)
+FAIL:  mlock2 accepts MLOCK_ONFAULT, which is 1 (-1)
+FAIL:  mlock2 refuses 0x10, which is not a flag (0, errno 22)
+FAIL:  mlockall refuses an empty flags word (0)
+FAIL:  and VmLck now covers the mapping it pinned (Some(0) kB)
+FAIL:  and the mapping arrives pinned (Some(0) -> Some(0) kB)
+FAIL:  MADV_DONTNEED on a locked page is EINVAL (0, errno 22)
+FAIL:  and the page was not dropped (first byte false)
+FAIL:  and a mapping made afterwards is pinned as it is made (Some(0) -> Some(0) kB)
+FAILED
+```
+
+The twelve that stay green are the honest limit: an unlocked range still
+answers `0` to `mlock`, `munlock` still answers `0`, a hole is still
+`ENOMEM`, and a child that inherits nothing reads `0 kB` — all four are what a
+no-op says too. Only the claims that name *what a pin does* are red.
+
+**The rule.** A no-op that answers success is invisible to its own readers:
+`VmLck` printed `0` because nothing was locked, so nothing looked wrong. The
+way this family was found is the way it will be found again — by measuring
+the *limit* and the *refusals*, not the happy path, because the happy path is
+the one thing a stub and a kernel agree on.

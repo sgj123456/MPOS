@@ -442,6 +442,10 @@ pub struct TaskSnapshot {
     /// addresses and the count have to be one instant's. A zombie reads zeros,
     /// which is also why its `status` prints no `Vm*` line at all.
     pub books: (usize, usize, usize),
+    /// The pages this group has pinned - Linux's `mm->locked_vm`, the number
+    /// `RLIMIT_MEMLOCK` bounds, `VmLck` prints and `smaps`'s `Locked:` splits
+    /// per mapping. A zombie reads zero, like the books above.
+    pub locked_pages: usize,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -545,6 +549,11 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         virtual_pages,
         image,
         books,
+        locked_pages: if task.exited {
+            0
+        } else {
+            task.mm.locked_pages()
+        },
         nice: task.nice,
         exit_signal: task.exit_signal,
         cpu: task.mm.cpu_all(),
@@ -689,6 +698,7 @@ pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option
         prot,
         name,
         sealed: false,
+        locked: false,
     });
 }
 
