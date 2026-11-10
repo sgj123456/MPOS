@@ -10463,3 +10463,54 @@ refused, not remembered (there is one policy to reset). `SCHED_BATCH`,
 running them is the same named gap as running `SCHED_FIFO` - no priority bands,
 no real-time class. `sched_rr_get_interval` answers this kernel's own slice
 (4 ms) where the reference host answers its own (2 ms).
+
+### Item 237 — a POSIX timer is built on a clock, and one of those clocks is CPU time
+
+Rows: `timer_create`'s clock argument and the three doors that read a timer's
+remaining time. The timer now carries its clock; every deadline subtraction goes
+through it (`§6.123`).
+
+| row | Linux | this kernel before | now |
+|---|---|---|---|
+| `timer_create(0 CLOCK_REALTIME)` | `0` | `0` | `0` |
+| `timer_create(1 CLOCK_MONOTONIC)` | `0` | `0` | `0` |
+| `timer_create(2 CLOCK_PROCESS_CPUTIME_ID)` | `0` | `EOPNOTSUPP` - "this kernel keeps no per-task CPU accounting" (untrue since §6.95/§6.99) | `0`, and the timer counts the group's own CPU |
+| `timer_create(3 CLOCK_THREAD_CPUTIME_ID)` | `0` | `EOPNOTSUPP` | `EOPNOTSUPP` - named gap: the clock dies with its thread, the timer outlives it |
+| `timer_create(4/5/6 raw & coarse)` | `EOPNOTSUPP` | `EOPNOTSUPP` | `EOPNOTSUPP` |
+| `timer_create(7 BOOTTIME / 11 TAI)` | `0` | `0` | `0` |
+| `timer_create(8/9 alarm clocks)` | `EPERM` (needs `CAP_WAKE_ALARM`) | `EOPNOTSUPP` | `EOPNOTSUPP` (no such capability here) |
+| `timer_create(10 / 12)` | `EINVAL` | `EINVAL` | `EINVAL` |
+| a 30 ms CPU-time one-shot across a 200 ms sleep | does not fire | (could not be built) | does not fire, and the time left does not move |
+| the same timer after burning CPU | fires once, then reads 0 ms left | (could not be built) | fires once, then reads 0 ms left |
+| a 10/10 ms periodic CPU-time timer across a 100 ms sleep | reloads 0 times | (could not be built) | reloads 0 times, and reloads on CPU |
+
+**Why the clock has to live on the timer.** The old code stored one reading -
+`crate::hal::ticks()` - and subtracted it in four places: the expiry scan, the
+periodic reload, `timer_gettime`'s remaining, and `timer_settime`'s `old_value`.
+Each was correct for a wall timer and wrong for a CPU one, and none of them could
+see the other. `PosixTimer`'s new `clock: TimerClock` field, plus `timer_arm`
+taking `value_ticks` instead of a deadline, means the arm's arithmetic happens in
+the one place that holds both the timer and the reading.
+
+**Measured, not read off a man page** (`build/scratch/timerclock/{t,fire}.c`,
+7.2.14): the accepted-clock set above, and - the two lines that decide the fix -
+a 30 ms CPU-time timer that had fired 0 times after 200 ms of `usleep` and once
+after a CPU burn, with `timer_gettime` reading the same 200 ms before and after
+the sleep.
+
+**Where it landed.** `src/sched/runtime/task.rs`: `TimerClock` (`Wall`,
+`Process`) with `now(wall, group_cpu)`, `PosixTimer::clock`, `timer_alloc`'s clock
+argument, `timer_arm`'s `value_ticks`, `timer_state`'s per-clock remaining, and
+`check_posix_timers` reading the leader's `Mm::cpu_all()` once per pass.
+`src/syscall/linux/proc.rs`: clock 2 → `TimerClock::Process`, clock 3 still
+`EOPNOTSUPP` with the reason moved (not deleted), and `handle_timer_settime`
+handing the value over. Pin `user/tests/src/bin/t-timer-cpuclock.rs` (16 claims,
+host 16/16, machine 16/16, counterfactually 7 red); `t-timer-create`'s old
+divergence claim became an agreement on both arms.
+
+**Named gaps this does not close.** `CLOCK_THREAD_CPUTIME_ID` stays refused: the
+clock belongs to the creating thread and the timer to the group, and a frozen
+reading for a dead thread has nowhere to live in this table. `TIMER_ABSTIME`
+stays `EINVAL` (one clock, no absolute domain). The alarm clocks answer
+`EOPNOTSUPP` where Linux answers `EPERM`, because there is no wake-from-suspend
+and no capability to gate it.

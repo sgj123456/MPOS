@@ -10085,3 +10085,160 @@ thing, and this kernel cannot do it". A caller retries an `EOPNOTSUPP` different
 `EINVAL`: `SCHED_BATCH` at `EINVAL` reads as "no such policy in this ABI" and loses the program its
 fallback. And the order of the questions is part of the answer, because the first refusal is the one
 that gets reported - which is why the band is asked before support, and the word before them both.
+
+## §6.123 A timer on a CPU clock counts CPU, not machine uptime
+
+The POSIX timer section of the status appendix said, for two years' worth of commits, that this
+kernel "refuses the CPU-time clocks with `EOPNOTSUPP`, **because it keeps no per-task CPU
+accounting**". That sentence stopped being true at §6.95 (`RUSAGE_THREAD` gave every task its own
+pair of CPU counters) and at §6.99 (`CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID` started
+answering from them). What was left was a refusal with a reason that no longer existed - and a
+`timer_create(CLOCK_PROCESS_CPUTIME_ID)` that answered `EOPNOTSUPP` where Linux answers 0.
+
+### What Linux does, measured
+
+`timer_create` on every clock id, on the host (7.2.14, `build/scratch/timerclock/t.c`):
+
+```text
+timer_create(0  REALTIME)          -> 0
+timer_create(1  MONOTONIC)         -> 0
+timer_create(2  PROCESS_CPUTIME)   -> 0
+timer_create(3  THREAD_CPUTIME)    -> 0
+timer_create(4  MONOTONIC_RAW)     -> EOPNOTSUPP(95)
+timer_create(5  REALTIME_COARSE)   -> EOPNOTSUPP(95)
+timer_create(6  MONOTONIC_COARSE)  -> EOPNOTSUPP(95)
+timer_create(7  BOOTTIME)          -> 0
+timer_create(8  REALTIME_ALARM)    -> EPERM(1)      needs CAP_WAKE_ALARM
+timer_create(9  BOOTTIME_ALARM)    -> EPERM(1)
+timer_create(10)                   -> EINVAL(22)    no clock has that number
+timer_create(11 TAI)               -> 0
+timer_create(12)                   -> EINVAL(22)
+```
+
+So the four refusals this kernel already answered correctly are the raw/coarse three (Linux's own
+`EOPNOTSUPP`) and a number no clock has (`EINVAL`); the alarm pair differs only in errno, and for a
+reason this kernel does not model (there is no `CAP_WAKE_ALARM`). The divergence was clock 2.
+
+What the accepted timer then *does* is the whole question, because a timer that expires on the wrong
+clock is worse than a refusal (`build/scratch/timerclock/fire.c`, `SIGEV_SIGNAL` to a `SIGUSR1`
+handler, one 30 ms value and one 10/10 ms periodic):
+
+```text
+settime(30 ms) = 0
+  after 200 ms of sleeping           fired=0
+  after burning CPU (60M iters)      fired=1
+periodic settime(10/10 ms) = 0
+  periodic: after 100 ms of sleeping fired=0
+  periodic: after burning CPU        fired=65
+gettime at arming: 50 ms
+gettime after burning past it: 0 ms
+```
+
+Two facts sit in those lines: the deadline is reached by **running**, not by the wall clock, and
+`timer_gettime`'s remaining time is measured on the same clock - it did not move across the sleep at
+all and read zero once the value had been burned through.
+
+### What this kernel did
+
+`handle_timer_create` refused clock 2 in the same arm as clock 3, and `handle_timer_settime`
+computed the deadline as `crate::hal::ticks() + value_ticks` for *every* timer. Both halves were
+one assumption: that a timer's clock is the machine's tick counter. Every door that reads a timer's
+state - the expiry scan, `timer_gettime`, and the `old_value` half of `timer_settime` - subtracted
+from that same reading.
+
+### The fix
+
+A timer now carries the clock it was built on, and the deadline arithmetic goes through it.
+
+- `TimerClock { Wall, Process }` (`src/sched/runtime/task.rs`) with one method, `now(wall,
+  group_cpu)`, since both readings are in ticks. `PosixTimer` gained a `clock` field, set once at
+  `timer_create` and never changed.
+- `process`'s reading is the group's own `utime + stime` from `Mm::cpu_all()` - **the same pair
+  `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` answers from**, so a caller cannot see the timer's clock
+  disagree with the clock it named. (Children's CPU is excluded on both sides, which is what POSIX
+  and Linux both mean by "the process's own CPU time".)
+- The four doors follow: `check_posix_timers` reads the group's CPU once per leader and then
+  `timer.clock.now(wall_now, group_now)` per timer, using that value for both the expiry test and
+  the periodic reload; `timer_state` does the same for `timer_gettime`'s remaining; `timer_arm` now
+  takes `value_ticks` instead of a deadline, because the scheduler is the only place both the clock
+  and the reading are in hand - a syscall layer converting a timespec into a tick-counter value
+  would be arming a CPU-time timer against machine uptime, which is exactly the defect this
+  signature exists to make unspellable.
+- `handle_timer_create` maps clock 2 to `TimerClock::Process` and leaves 3 refused, with the reason
+  moved rather than deleted (see the named gap below), and the doc's old sentence - "this kernel
+  keeps no per-task CPU accounting" - is gone.
+
+### The pin
+
+`user/tests/src/bin/t-timer-cpuclock.rs`, 16 claims, all of them the movement the two clocks differ
+by rather than a snapshot:
+
+- a timer can be built on the process's own CPU clock; 200 ms of CPU time can be armed;
+- **sleeping 150 ms does not fire a 200 ms CPU-time timer**, and **does not eat the time left**
+  (`200 ms -> 200 ms of 200 ms` on the machine, `200 -> 199` on the host) - the second half matters
+  because the first is trivially true of a timer that does not exist;
+- burning CPU reaches the deadline (1 expiry), and a one-shot has then spent its value (0 ms left);
+- a periodic 20 ms CPU-time timer does not reload on a 120 ms sleep, and reloads three times as CPU
+  is burned;
+- a **wall** timer of the same order of value, in the same program, does fire across that sleep - 
+  which is what makes the sleeping half a measurement of the clock rather than of the test's timing;
+- the creating thread's clock is still refused here (Linux serves it: the claim accepts either
+  answer per arm), and a raw-clock timer is `EOPNOTSUPP` on both.
+
+Host run: 16/16 `PASS`. Machine run (`build/boot-cpuclock2.log`): 16/16 `PASS`, exit 0. The two
+numbers that identify the clock on the machine are `fired 1 after 61 chunk(s)` and `200 ms -> 200 ms
+of 200 ms`.
+
+Two traps were paid for here:
+
+- **A signal with a handler is handed over at a kernel entry, and a pure burn loop has none.**
+  `deliver_pending_signal`'s own doc says it: "the syscall return path is the only place that has
+  [a register file]". The first machine run of the pin burned 400 chunks (over 200 ms of CPU,
+  `timer_gettime` reading 0 left) and the handler never ran, so two claims were red for a reason
+  that had nothing to do with the clock. The loop now makes one cheap `getpid` per chunk, which is
+  what an ordinary program's loop does. Linux also hands the signal over on an interrupt return,
+  where this kernel does not - that difference is §7.4h's, and it is named there, not here.
+- **A test's contract moves when the kernel starts serving the field it measured.** `t-timer-create`
+  carried a claim written as `a clock with no accounting behind it is EOPNOTSUPP`, which was true
+  and is now false; it became `a timer can be built on the process's own CPU clock`, an agreement
+  on both arms. This is the second time in this series (§6.105's `t-wait4` narrow, §6.123's move);
+  the rule is that the pin's *claim* is part of the fix, and leaving the old wording is how a suite
+  starts asserting last month's behaviour.
+
+### The counterfactual
+
+`git stash push -q -m cf-cpuclock -- src/sched/runtime/task.rs src/syscall/linux/proc.rs
+src/sched/mod.rs`, kernel and loader rebuilt, the pin booted (`build/boot-cpuclock-cf1.log`): **7 of
+16 red** - the timer cannot be built at all (`EOPNOTSUPP`), so arming is `EINVAL`, the remaining
+time is `-1`, the burn fires nothing and the periodic half cannot run. Restored, rebuilt, 16/16
+green.
+
+The honest limit, and it is the same shape as §6.105's: the two "does not fire while sleeping"
+claims are green on **both** kernels, because the broken kernel never gets far enough to arm a CPU
+timer. They are still worth their place - they are what a *partially* wrong fix (a CPU timer armed
+against the tick counter) would go red on, and this series has now paid twice for a counterfactual
+that could not distinguish "absent" from "right".
+
+### Named gaps this does not close
+
+- **`CLOCK_THREAD_CPUTIME_ID` (3) stays `EOPNOTSUPP`.** Its clock belongs to the thread that called
+  `timer_create`, while the timer hangs off the group (`PosixTimer` lives in the leader's table) and
+  outlives that thread. Linux freezes the dead thread's clock and the timer then expires against
+  frozen time; this table cannot express a frozen reading without walking every timer at every
+  thread's exit. A CPU-time timer that quietly started counting a *sibling's* CPU after its thread
+  died would be the "nearly right" shape `AGENTS.md` §3 rules out, so the half that cannot be honest
+  stays a refusal with its reason written down.
+- **`TIMER_ABSTIME`** is still `EINVAL` (one clock, no absolute domain) - unchanged here.
+- **The alarm clocks (8, 9)** answer `EOPNOTSUPP` where Linux answers `EPERM`; there is no
+  `CAP_WAKE_ALARM` in this kernel's capability model, and no wake-from-suspend to arm.
+- An expiry of a CPU-time timer is delivered through the same per-task pending set as a wall one,
+  with the same group-directed choice of target (`§2.11`); no overrun semantics changed.
+
+### The rule
+
+**A deadline is meaningless without the clock it was measured on, and the clock is part of the
+timer, not part of the arithmetic at each door.** The old code had one reading - `hal::ticks()` -
+woven through four places that each looked right on its own; the defect was that the reading and
+the timer it was subtracted from were stored in different objects. Storing the clock *with* the
+timer, and making the arm take a value rather than a deadline, is what turned four opportunities
+for the same mistake into one place the compiler insists on.

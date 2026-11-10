@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, the `sched_*` policy word §6.122):** stage 1 `1259 tests, 0
+**Latest measured gate (2026-11-11, a timer on a CPU clock §6.123):** stage 1 `1259 tests, 0
+failed` (71.23 s); x86_64 `pass=287 fail=0 (287 built)`, `mpos-kunit 35 passed, 0 failed` (51.78 s,
+previous green 71.31 s); aarch64 `pass=286 fail=0 (286 built)`, `mpos-kunit 35 passed, 0 failed`
+(134.30 s; `16 of 302` left out by `tests.toml`) — `GATE EXIT=0`, both arms in one command with the
+lane count forced to two (`build/gate-cpuclock.log`). One new program: `t-timer-cpuclock` (16
+claims), 7 of which fail against the kernel before this change (`build/boot-cpuclock-cf1.log`) —
+and the two "does not fire while sleeping" claims are green on both kernels, because the broken one
+never gets far enough to arm a CPU timer; they are stated as such in §6.123. `t-timer-create`'s
+claim `a clock with no accounting behind it is EOPNOTSUPP` moved to an agreement on both arms,
+which is what a pin does when the kernel starts serving the thing it measured.
+
+**Measured gate before it (2026-11-10, the `sched_*` policy word §6.122):** stage 1 `1259 tests, 0
 failed` (70.65 s); x86_64 `pass=286 fail=0 (286 built)`, `mpos-kunit 35 passed, 0 failed` (52.17 s,
 previous green 63.70 s); aarch64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed, 0 failed`
 (123.95 s) — `GATE EXIT=0`, both arms in one command with the lane count forced to two

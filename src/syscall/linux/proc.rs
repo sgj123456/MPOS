@@ -4439,7 +4439,7 @@ const ITIMERSPEC_SIZE: usize = 32;
 /// aimed at another process's thread is a way to signal a process the caller
 /// may have no right to signal.
 pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    use crate::sched::{SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID, TimerNotify};
+    use crate::sched::{SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID, TimerClock, TimerNotify};
 
     const CLOCK_REALTIME: usize = 0;
     const CLOCK_MONOTONIC: usize = 1;
@@ -4455,27 +4455,40 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     // `MONOTONIC` (and `BOOTTIME`/`TAI`, which name the same tick counter with
     // a different epoch) are measured against the one clock the machine keeps.
     //
-    // The rest are refused with the errno Linux itself uses, measured on a
-    // 6.x kernel rather than read off a man page: the CPU-time clocks (2, 3)
-    // and the raw/coarse pair (4, 5, 6) answer `EOPNOTSUPP` there - "this
-    // clock exists, and this timer cannot be built on it" - and the alarm
-    // clocks (8, 9) answer `EPERM` because they need `CAP_WAKE_ALARM`, a
-    // capability this kernel does not model. A number no clock has is
-    // `EINVAL`, which is also Linux's answer. Refusing the CPU clocks is
-    // deliberate: this kernel keeps no per-task CPU accounting, and a timer
-    // that was accepted and silently never fired would be worse than one that
-    // says so.
-    match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => {}
-        CLOCK_PROCESS_CPUTIME_ID
-        | 3 /* CLOCK_THREAD_CPUTIME_ID */
+    // The rest are refused with the errno Linux itself uses, measured on the
+    // host rather than read off a man page (`build/scratch/timerclock/t.c`,
+    // 7.2.14): the raw/coarse pair (4, 5, 6) answers `EOPNOTSUPP` there - "this
+    // clock exists, and this timer cannot be built on it" - each of the two
+    // alarm clocks (8, 9) answers `EPERM` because they need `CAP_WAKE_ALARM`, a
+    // capability this kernel does not model, and a number no clock has is
+    // `EINVAL`, which is Linux's answer too.
+    //
+    // `CLOCK_PROCESS_CPUTIME_ID` is **accepted**: the clock the timer counts
+    // down is the owning thread group's own CPU time, which this kernel charges
+    // per task and per address space (`§6.95`, `§6.99`), and a timer built on a
+    // clock nobody accounts would be the one shape worse than a refusal. What a
+    // timer armed on it must not do is count machine uptime - measured on the
+    // host, a 30 ms CPU-time timer fired zero times across 200 ms of `usleep`
+    // and once after a CPU burn (`§6.123`).
+    //
+    // `CLOCK_THREAD_CPUTIME_ID` stays refused, and the reason moved rather than
+    // went away: the clock belongs to the thread that called `timer_create`,
+    // while the timer hangs off the group and outlives that thread. Linux
+    // freezes the clock when the thread dies; this table cannot express a
+    // frozen reading without walking every timer at a thread's exit, so the
+    // half it cannot do honestly stays a named gap instead of a deadline that
+    // quietly starts counting someone else's CPU (`§6.123`).
+    let clock = match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => TimerClock::Wall,
+        CLOCK_PROCESS_CPUTIME_ID => TimerClock::Process,
+        3 /* CLOCK_THREAD_CPUTIME_ID */
         | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
         | CLOCK_MONOTONIC_COARSE
         | 8 /* CLOCK_REALTIME_ALARM */
         | 9 /* CLOCK_BOOTTIME_ALARM */ => return err::EOPNOTSUPP,
         _ => return err::EINVAL,
-    }
+    };
     if out == 0 || !buffer_ok(out, 4, true, from_user) {
         return err::EFAULT;
     }
@@ -4527,7 +4540,7 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
 
     // The tid is validated against the caller's thread group inside the
     // scheduler's table, where the group is known.
-    let slot = match crate::sched::timer_alloc(signo, value, notify) {
+    let slot = match crate::sched::timer_alloc(signo, value, notify, clock) {
         Ok(slot) => slot,
         Err(e) => return e,
     };
@@ -4575,15 +4588,16 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
         Ok(t) => t,
         Err(e) => return e,
     };
-    let deadline = if value_ticks == 0 {
-        None
-    } else {
-        Some(crate::hal::ticks() + value_ticks)
-    };
+    // The value, not a deadline: the deadline is against the **timer's own
+    // clock**, which the scheduler holds and this layer does not (`§6.123`).
+    // A CPU-time timer armed against `hal::ticks()` would count machine uptime
+    // while claiming to count CPU time, and would expire during a sleep.
+    //
     // The old state is read and replaced under one table borrow, so a caller
     // that arms and reads back in one call cannot see a state that never
     // existed.
-    let Some((old_interval, old_remaining)) = crate::sched::timer_arm(id, interval_ticks, deadline)
+    let Some((old_interval, old_remaining)) =
+        crate::sched::timer_arm(id, interval_ticks, value_ticks)
     else {
         return err::EINVAL;
     };

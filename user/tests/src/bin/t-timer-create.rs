@@ -54,12 +54,20 @@
 //! two claims below that name the numbers (`SIGEV_NONE (1)` is accepted, and a
 //! `SIGEV_NONE` expiry queues nothing) are what found it.
 //!
-//! Two of the no-std claims are *divergences* rather than translations, both
-//! about clocks this kernel does not keep: `CLOCK_PROCESS_CPUTIME_ID` answers
-//! `EOPNOTSUPP` here, where Linux serves it (measured: 0), and `TIMER_ABSTIME`
-//! is refused because this kernel keeps one clock and has no absolute domain to
-//! measure a deadline against, where Linux arms the timer. Both accept the
-//! host's own answer under `MPOS_ON_HOST=1`, printing what it was.
+//! One of the no-std claims is a *divergence* rather than a translation:
+//! `TIMER_ABSTIME` is refused because this kernel keeps one clock and has no
+//! absolute domain to measure a deadline against, where Linux arms the timer.
+//! It accepts the host's own answer under `MPOS_ON_HOST=1`, printing what it
+//! was.
+//!
+//! `CLOCK_PROCESS_CPUTIME_ID` **used to be** the second divergence - the claim
+//! below read "a clock with no accounting behind it is EOPNOTSUPP" - and
+//! `§6.123` moved it: the kernel charges per-task and per-group CPU, so a timer
+//! built on that clock counts the group's own CPU instead of machine uptime.
+//! The claim now asks the same question on both arms (this one is accepted) and
+//! the behaviour that distinguishes the two clocks is pinned in
+//! `t-timer-cpuclock`. A test's contract moves when the kernel starts serving
+//! the field it measured (`§6.105`'s lesson, twice now).
 
 use mpos_user_tests::{Report, host_run};
 use rustix::io::Errno;
@@ -392,26 +400,19 @@ fn main() {
     let silent = SigEvent::none();
     let mut id: i32 = -1;
 
-    // Measured on Linux 6.x at the raw-syscall level: `timer_create` on a
-    // CPU-time clock *succeeds* there (0), so this kernel's `EOPNOTSUPP` is its
-    // own answer - it keeps no per-task CPU accounting, and a timer that was
-    // accepted and silently never fired would be worse than one that says so.
+    // `CLOCK_PROCESS_CPUTIME_ID` is served on both arms since §6.123: the clock
+    // the timer counts down is the creating thread group's own CPU time, which
+    // this kernel charges. This claim only asks that the door opens - that the
+    // timer then counts CPU and not uptime is `t-timer-cpuclock`'s question.
     let cputime = timer_create(2 /* CLOCK_PROCESS_CPUTIME_ID */, &silent, &mut id);
-    match cputime {
-        Err(e) if e == Errno::OPNOTSUPP => {
-            r.check("a clock with no accounting behind it is EOPNOTSUPP", true)
-        }
-        Ok(0) if host_run() => {
-            println!(
-                "note: this host's kernel serves CLOCK_PROCESS_CPUTIME_ID, where mpos \
-                 keeps no per-task CPU accounting and refuses it"
-            );
-            r.check("a clock with no accounting behind it is EOPNOTSUPP", true);
-        }
-        other => r.check(
-            &format!("a clock with no accounting behind it is EOPNOTSUPP (got {other:?})"),
+    if cputime == Ok(0) {
+        let _ = timer_delete(id);
+        r.check("a timer can be built on the process's own CPU clock", true);
+    } else {
+        r.check(
+            &format!("a timer can be built on the process's own CPU clock (got {cputime:?})"),
             false,
-        ),
+        );
     }
 
     // A clock id that names no clock at all is EINVAL, as on Linux.

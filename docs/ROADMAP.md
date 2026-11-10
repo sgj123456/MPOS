@@ -932,6 +932,27 @@ One-glance status of the whole roadmap.
   `/proc/<pid>/stat` rows are *agreements*, not counterfactuals: `policy` field
   agrees with `sched_getscheduler`, `rt_priority` and `processor` are honest
   zeros of a scheduler with one band, one policy and one CPU (§6.122, item 236)
+- [x] a POSIX timer is built on a clock, and one of those clocks is CPU time —
+  `timer_create`'s first argument names the clock a timer's deadline is measured
+  on, and the two CPU-time clocks are not time in the tick sense:
+  `CLOCK_PROCESS_CPUTIME_ID` counts the CPU the machine charged to the timer's
+  own thread group. Measured on the host, a 30 ms CPU-time timer fired **zero**
+  times across 200 ms of `usleep` and once after a CPU burn, and its
+  `timer_gettime` remaining did not move across the sleep at all. This kernel
+  refused the clock with a reason that had expired - "it keeps no per-task CPU
+  accounting", untrue since §6.95 and §6.99 - while keeping one reading,
+  `hal::ticks()`, subtracted in four places (the expiry scan, the periodic
+  reload, `timer_gettime`'s remaining, and `timer_settime`'s `old_value`), each
+  correct for a wall timer and wrong for a CPU one. The clock now lives on the
+  timer (`TimerClock { Wall, Process }`, a `PosixTimer::clock` field) and its
+  reading is the group's own `utime + stime` — the same pair
+  `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` answers from — and `timer_arm` takes
+  a value rather than a deadline, so the arm's arithmetic happens where both the
+  timer and the reading are in hand. `CLOCK_THREAD_CPUTIME_ID` stays
+  `EOPNOTSUPP`: its clock dies with the creating thread while the timer lives on
+  the group, and a frozen reading has nowhere to live in this table. Pinned by
+  `t-timer-cpuclock` (16 claims, counterfactually 7 red); `t-timer-create`'s old
+  divergence claim became an agreement on both arms (§6.123, item 237)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

@@ -938,6 +938,10 @@ pub struct PosixTimer {
     /// an expiry that arrives while the last one is unread has nowhere to go
     /// but this counter, which is exactly what the count means.
     overrun: u32,
+    /// The clock the deadline is measured on (`TimerClock`). A wall timer's
+    /// `deadline` is a tick-counter value; a CPU-time timer's is a group CPU
+    /// reading, and the two never mix.
+    clock: TimerClock,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -945,6 +949,42 @@ pub enum TimerNotify {
     None,
     Signal,
     Thread(TaskId),
+}
+
+/// Which clock a POSIX timer's deadline is measured on.
+///
+/// Linux builds a timer **on a clock**, and the two clocks it accepts that are
+/// not time in the tick sense are the CPU-time ones. `CLOCK_PROCESS_CPUTIME_ID`
+/// counts the CPU the machine charged to the timer's own thread group: a timer
+/// armed on it counts down while the process runs and stands still while it
+/// sleeps. Measured on the host (`build/scratch/timerclock/fire.c`, 7.2.14) - a
+/// 30 ms CPU-time timer had fired **0** times after 200 ms of `usleep` and once
+/// after a CPU burn, and its `timer_gettime` remaining did not move across the
+/// sleep at all. That is the whole distinction this enum carries: a wall timer's
+/// deadline is against the tick counter, a CPU timer's against the group's own
+/// charged ticks.
+///
+/// The reading is the one `clock_gettime` answers for the same id - the group's
+/// own `utime + stime`, children's CPU excluded - so a caller cannot see the
+/// timer's clock disagree with the clock it named (`§6.123`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TimerClock {
+    /// The machine's tick counter: what `CLOCK_REALTIME`/`MONOTONIC` read.
+    Wall,
+    /// The owning thread group's own CPU time, in ticks, for
+    /// `CLOCK_PROCESS_CPUTIME_ID`.
+    Process,
+}
+
+impl TimerClock {
+    /// The reading this clock has right now, in ticks. Both readings are in the
+    /// same unit, which is why the deadline arithmetic needs no conversion.
+    fn now(self, wall: u64, group_cpu: u64) -> u64 {
+        match self {
+            TimerClock::Wall => wall,
+            TimerClock::Process => group_cpu,
+        }
+    }
 }
 
 impl PosixTimer {
@@ -2115,7 +2155,7 @@ impl Table {
         if !POSIX_TIMERS_ARMED.load(Ordering::Relaxed) {
             return;
         }
-        let now = hal::ticks();
+        let wall_now = hal::ticks();
         // Step 1: what the scan needs about every task, without holding any
         // of them mutably. A signal queued in this pass is also tracked in
         // `fresh` below, so a second timer aiming at the same thread in the
@@ -2154,7 +2194,15 @@ impl Table {
             let group_live = targets
                 .iter()
                 .any(|(_, tgid, exited, _, _)| *tgid == owner && !*exited);
+            // What a CPU-time timer's clock reads now: the group's own charged
+            // CPU, the same pair `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`
+            // answers from (`§6.123`). Read before the timers are borrowed.
+            let group_now = {
+                let (utime, stime, _, _) = task.mm.cpu_all();
+                utime.saturating_add(stime)
+            };
             for timer in task.timers.iter_mut().flatten() {
+                let now = timer.clock.now(wall_now, group_now);
                 if !timer.expired(now) {
                     if timer.deadline.is_some() {
                         any_armed = true;
@@ -3530,7 +3578,17 @@ pub fn itimer_snapshot(which: usize) -> Option<ItimerSnapshot> {
 /// the record, and `timer_settime` is what arms it. The new timer's slot is
 /// the lowest free one - ids are the caller's to hold, not a sequence to
 /// read meaning into.
-pub fn timer_alloc(signo: u8, value: u64, notify: TimerNotify) -> Result<usize, isize> {
+///
+/// `clock` is the clock the timer is *on*, and it is part of the record rather
+/// than of the arithmetic at each door: an expiry, a `timer_gettime` and a
+/// `timer_settime`'s `old_value` all have to subtract from the same reading the
+/// deadline was built against ([`TimerClock`]).
+pub fn timer_alloc(
+    signo: u8,
+    value: u64,
+    notify: TimerNotify,
+    clock: TimerClock,
+) -> Result<usize, isize> {
     with_table(|t| {
         if let TimerNotify::Thread(target) = notify {
             let ok = task_ok_for_timer(t, target).is_some_and(|grp| grp == t.task(t.current).tgid);
@@ -3553,6 +3611,7 @@ pub fn timer_alloc(signo: u8, value: u64, notify: TimerNotify) -> Result<usize, 
             value,
             notify,
             overrun: 0,
+            clock,
         });
         Ok(slot)
     })
@@ -3572,23 +3631,34 @@ fn task_ok_for_timer(t: &Table, target: TaskId) -> Option<TaskId> {
 /// replaced as `(interval, remaining)` ticks - the pair `timer_settime`'s
 /// `old_value` wants. `None` is an id that names no timer of this task's.
 ///
-/// `deadline` is `None` for a disarm and `Some(ticks)` for an arm; the caller
-/// has already converted the timespec and refused the absolute spelling this
-/// kernel cannot honour.
-pub fn timer_arm(slot: usize, interval_ticks: u64, deadline: Option<u64>) -> Option<(u64, u64)> {
-    if deadline.is_some() {
+/// `value_ticks` is zero for a disarm and the timespec's value in ticks for an
+/// arm; the deadline itself is computed **here**, against the timer's own clock
+/// ([`TimerClock`]), because that is the only place both the clock and the
+/// reading are in hand - a caller converting a timespec into a tick-counter
+/// value would arm a CPU-time timer against machine uptime, which is the defect
+/// this signature exists to make unspellable (`§6.123`).
+pub fn timer_arm(slot: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u64, u64)> {
+    if value_ticks != 0 {
         POSIX_TIMERS_ARMED.store(true, Ordering::Relaxed);
     }
     with_table(|t| {
         let leader = t.task(t.current).tgid;
         let task = t.task_mut(leader);
+        let group_now = {
+            let (utime, stime, _, _) = task.mm.cpu_all();
+            utime.saturating_add(stime)
+        };
+        let now = {
+            let clock = task.timers.get(slot)?.as_ref()?.clock;
+            clock.now(hal::ticks(), group_now)
+        };
         let timer = task.timers.get_mut(slot)?.as_mut()?;
         let old = (
             timer.interval_ticks,
-            timer.deadline.map_or(0, |d| d.saturating_sub(hal::ticks())),
+            timer.deadline.map_or(0, |d| d.saturating_sub(now)),
         );
         timer.interval_ticks = interval_ticks;
-        timer.deadline = deadline;
+        timer.deadline = (value_ticks != 0).then(|| now + value_ticks);
         Some(old)
     })
 }
@@ -3600,9 +3670,11 @@ pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
     with_table(|t| {
         let leader = t.task(t.current).tgid;
         let timer = t.task(leader).timers.get(slot)?.as_ref()?;
+        let (utime, stime, _, _) = t.task(leader).mm.cpu_all();
+        let now = timer.clock.now(hal::ticks(), utime.saturating_add(stime));
         Some((
             timer.interval_ticks,
-            timer.deadline.map_or(0, |d| d.saturating_sub(hal::ticks())),
+            timer.deadline.map_or(0, |d| d.saturating_sub(now)),
         ))
     })
 }
