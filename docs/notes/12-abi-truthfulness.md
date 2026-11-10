@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, `status`'s four mapping books and `stat`'s three image
+**Latest measured gate (2026-11-10, `statm`'s seven fields §6.118):** stage 1 `1254 tests,
+0 failed`; x86_64 `pass=283 fail=0 (283 built)`, `mpos-kunit 35 passed, 0 failed`;
+aarch64 `pass=282 fail=0 (282 built)`, `mpos-kunit 35 passed, 0 failed` — both arms green in
+one command with the lane count forced to two, `build/gate-statm.log` (aarch64 arm) and
+`build/gate-statm-x1.log` (x86_64 arm, `GATE EXIT=0`). The x86_64 arm's first pass in the
+combined run went red on `t-starttime`'s bracket claim with no program-level failure of its
+own — the two-TCG-lanes-on-one-core shape §12.4a records — and came back `pass=283 fail=0`
+alone. The new program is the point: `t-statm` (9 claims) runs on both machines and fails 5
+of them against the previous kernel.
+
+**Measured gate before it (2026-11-10, `status`'s four mapping books and `stat`'s three image
 addresses §6.117):** stage 1 `1253 tests, 0 failed`; x86_64 `pass=283 fail=0 (283 built)`,
 `mpos-kunit 35 passed, 0 failed`; aarch64 `pass=282 fail=0 (282 built)`, `mpos-kunit 35 passed,
 0 failed` — `GATE EXIT=0` (`build/gate-vmbounds2.log`), both arms in one command with the lane

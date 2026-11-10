@@ -10192,3 +10192,46 @@ respectively, with the kernel *and* loader rebuilt from the stashed files.
 **Still off, each an honest `0`:** `VmLck`/`VmPin` (no mlock/pin accounting),
 `RssAnon`/`RssFile`/`RssShmem` (the frames table does not record what backs a
 page), `VmPTE` (no page-table byte count) and `VmSwap` (no swap).
+
+### Item 232 — `statm`'s seven fields: four books, two of Linux's zeros, one gap
+
+`/proc/<pid>/statm` printed `"<virtual_pages> <rss_pages> 0 0 0 0 0"`. Two of
+the five zeros were answerable the moment §6.117 gave the kernel an image's
+bounds and three mapping books, and the second field was a resident count in
+the place Linux puts `data_vm + stack_vm`.
+
+| field | Linux | before | now |
+|---|---|---|---|
+| 1 `size` | `mm->total_vm` | `virtual_pages` ✓ | `virtual_pages` |
+| 2 `resident` | shared + anon pages | `rss_pages` ✓ | `rss_pages` |
+| 3 `shared` | `MM_FILEPAGES + MM_SHMEMPAGES` | `0` | `0` — **named gap** (no file/shmem residency counter) |
+| 4 `text` | `(PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)) >> PAGE_SHIFT`, **unclamped** | `0` | `text_span_pages(task.image)` |
+| 5 `lib` | literal `0` in the printer | `0` ✓ | `0` |
+| 6 `data` | `data_vm + stack_vm` | `0` | `task.books.2 + task.books.1` |
+| 7 `dt` | literal `0` in the printer | `0` ✓ | `0` |
+| zombie | seven zeros (no `mm`) | `"0 0 0 0 0 0 0"` by accident | seven zeros by `state == 'Z'` |
+
+**Why field 4 is not `VmExe / 4`.** `task_mem` clamps the same expression to
+the executable book and `task_statm` does not. One `mm`, read through both
+doors at one instant (`build/scratch/vmlines/far.c`, two one-page `PT_LOAD`s at
+`0x400000` and `0x900000`, Linux 7.2.14):
+
+```
+statm:  43 4 2 1281 0 33 0
+status: VmExe:  16 kB
+```
+
+Sharing one clamped number between the two files would answer 4 for a text that
+spans 1281 pages.
+
+**Why field 6 is not `VmData`.** It is `data_vm + stack_vm`: the stack's pages
+are inside it (`build/scratch/statm/d.c`: at rest `84 == 51 + 33`; a 1 MiB
+stack frame reads `310 == 51 + 259` as `VmStk` moves and `VmData` does not).
+
+**Landed.** `src/vfs/procfs.rs`: `text_span_pages` (the one expression both
+readers share) and `statm_text` rewritten; `text_and_lib_kb` now clamps that
+span rather than recomputing it. **Pins:** `user/tests/src/bin/t-statm.rs`, 9
+claims — counterfactually **5 red** with the file stashed and both kernel and
+loader rebuilt (`build/boot-statm-cf1.log`), green on host and machine
+(`build/boot-statm1.log`, `build/boot-statm2.log`). Measurement and reasoning:
+`docs/notes/` §6.118.

@@ -864,6 +864,18 @@ One-glance status of the whole roadmap.
   space, so it reports no `Vm*` line at all and three zeros. Pinned by `t-stat-bounds` and
   `t-status-vm` (10 + 12 claims, counterfactually 6 + 7 red) (§6.117, item 231)
 
+- [x] `statm`'s seven fields are four books, two of Linux's own zeros and one named gap —
+  the file printed two counts and five zeros, and two of those zeros were the books §6.117
+  had just made answerable, while the second field was a resident count where Linux puts
+  `data_vm + stack_vm`. Its fourth field is the place `statm` and `status` deliberately
+  *disagree*: `task_mem` clamps the text span to the executable book and `task_statm` does
+  not, so one `mm` with two one-page segments 1 MiB apart reads `1281` pages here and
+  `VmExe: 16 kB` there — sharing one clamped number would answer 4. Its sixth field is the
+  stack's book too (`84 == VmData/4 + VmStk/4` at rest; a 1 MiB stack frame reads `310`
+  with `VmData` unmoved). `shared` stays an honest `0`: no counter here splits residency
+  into file-backed/shmem pages. Pinned by `t-statm` (9 claims, counterfactually 5 red)
+  (§6.118, item 232)
+
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 
 - [x] 11.A subtract · 11.B device seam · 11.C per-open-file registry · 11.D terminal out of `vfs` · 11.F host-test criterion · 11.G depgraph ratchet (§11.2)

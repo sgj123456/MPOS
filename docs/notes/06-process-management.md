@@ -9300,3 +9300,152 @@ a span is not a sum. Where a rule has a *clamp*, the clamp is part of the rule:
 `min(text, exec_vm)` is why a program with scattered segments reports 16 kB of
 text rather than a stretched span, and reading the formula without it produces
 a number no probe ever produced.
+
+## §6.118 `/proc/<pid>/statm`'s seven fields are four books and three of Linux's zeros
+
+`statm` answered `"<virtual_pages> <rss_pages> 0 0 0 0 0"` — two counts this
+kernel keeps and five borrowed zeros, and the two it did keep were the wrong
+two: Linux's first field is the address space and its second is the resident
+set, but its fourth (`text`), sixth (`data`) and third (`shared`) are books
+`/proc/<pid>/status` had just been taught to keep (§6.117). This section is the
+reader that *disagrees* with `status` and is right to.
+
+### What Linux answers
+
+`fs/proc/task_mmu.c`'s `task_statm` is four assignments and a return:
+
+```c
+unsigned long task_statm(struct mm_struct *mm, unsigned long *shared, unsigned long *text,
+                         unsigned long *data, unsigned long *resident)
+{
+	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) + get_mm_counter_sum(mm, MM_SHMEMPAGES);
+	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK)) >> PAGE_SHIFT;
+	*data = mm->data_vm + mm->stack_vm;
+	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
+	return mm->total_vm;
+}
+```
+
+The seven words the file prints are
+`total_vm · (*shared + *resident's anon half) · *shared · *text · 0 · *data · 0`
+— `lib` and `dt` are literal zeros in the printer, not books with no pages
+(`fs/proc/base.c`'s `ONE("statm", …)` entry names `proc_pid_statm`).
+
+Three of the four live numbers are **not** what `status` prints beside them,
+and the differences are all Linux's:
+
+| `statm` field | `status`'s nearest line | the difference |
+|---|---|---|
+| 4 `text` | `VmExe:` | `task_mem` clamps to the executable book (`min(text, exec_vm << PAGE_SHIFT)`); `task_statm` does not |
+| 6 `data` | `VmData:` + `VmStk:` | `data_vm + stack_vm` in one number, where `status` splits the stack out |
+| 3 `shared` | `RssFile:` + `RssShmem:` | the file/shmem half of the resident set — a counter this kernel does not keep |
+
+Measured on Linux 7.2.14 before a line was written.
+
+**The span against the clamp** is the decisive one, because it is one `mm`
+read through two doors at one instant. A custom linker script
+(`build/scratch/vmlines/far.ld`) puts two one-page `PT_LOAD`s at `0x400000` and
+`0x900000`:
+
+```
+statm:  43 4 2 1281 0 33 0
+status: VmExe:  16 kB     VmLib:  0 kB     VmSize:  172 kB
+```
+
+`1281` pages is the span `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`;
+`16 kB` is what remains of the four-page executable book after the clamp. The
+same tree's adjacent version (`near.ld`, `0x400000` + `0x500000`) reads
+`statm: 43 4 2 257 0 33 0` with the same `VmExe: 16 kB`. A kernel that prints
+`VmExe / 4` in field 4 answers 4 for a binary whose text spans 1281 pages, and
+a kernel that prints the span in `VmExe:` breaks the split `VmLib` needs.
+
+**The stack is inside `data`.** `build/scratch/statm/d.c` at rest:
+
+```
+statm:  744 463 438 1 0 84 0
+status: VmData 51 pages  VmStk 33 pages  VmExe 1 page
+                           84 == 51 + 33
+```
+
+A one-megabyte `alloca` touched moves `data` to `310 = 51 + 259` as `VmStk`
+goes 33 → 259 with `VmData` unmoved — the page-count relation
+`data == VmData/4 + VmStk/4` is the honest claim, not a number.
+
+**Mapping moves `data`, residency moves `resident`.** A 1 MiB anonymous
+`MAP_PRIVATE` mapping, untouched, moves `data` 84 → 340 (256 pages) and leaves
+`resident` alone; touching it moves `resident`. That is the same
+mapped-vs-resident split §6.103 taught `statm`'s `size`/`resident` pair.
+
+**A zombie is seven zeros** (`build/scratch/statm/z.c`): `task_statm` is
+reachable only through an `mm`, and a zombie has none. `status` prints no `Vm*`
+line at all for the same reason (§6.117).
+
+### What was wrong here
+
+`src/vfs/procfs.rs`'s `statm_text` was
+`format!("{} {} 0 0 0 0 0\n", task.virtual_pages, task.rss_pages)` — five
+literal zeros, and its doc comment said so honestly ("the remaining five are a
+named gap"), which is why this was a documented gap and not a lie. But the
+`docs/notes/` line named the wrong five: `text`, `data` and `shared` became
+answerable the moment §6.117 gave the kernel `ImageBounds` and three mapping
+books. Only `shared` (a residency counter) and the two fields Linux itself
+prints as zeros are still not this kernel's to answer.
+
+### The fix
+
+- `src/vfs/procfs.rs`: `text_span_pages(bounds)` is the expression both
+  readers share, computed once — the unclamped span, in pages.
+  `text_and_lib_kb` now calls it and clamps, which is the one place the two
+  doors differ, and the doc comment on each names the other.
+- `statm_text` prints `virtual_pages · rss_pages · 0 · text_span_pages · 0 ·
+  (data_pages + stack_pages) · 0`, with `state == 'Z'` short-circuiting to
+  seven zeros. `shared` stays `0` as a named gap: no counter here splits the
+  resident set into its file-backed and shared half (`docs/uapi/` Item 232).
+
+### The pin
+
+`user/tests/src/bin/t-statm.rs`, 9 claims, green on the host and on the
+machine (`build/boot-statm1.log`, `build/boot-statm2.log`, `exit=0`):
+
+- `/proc/self/statm answers seven numbers`
+- `lib and the page-table tick are Linux's own zeros`
+- `a megabyte of private mapping is 256 more pages of statm data (24 -> 280 pages)`
+- `and status's VmData moved too (32 kB -> Some(1056) kB)`
+- `statm's data is VmData's pages plus the stack's`
+- `statm's text is the image's executable span, in pages (80)`
+- `and never fewer pages than status's clamped VmExe reports`
+- `statm's size is stat's vsize in pages`
+- `a zombie's statm is seven zeros`
+
+The movement claim is written as a **relation and a direction**
+(`after > before`, `<= 4096`), not an exact page count, for a measured reason:
+the same natively-linked Rust test binary reports `41 -> 299` pages on the host
+against the guest's `24 -> 280`, because its own baseline differs. The exact
+numbers belong where two readers can be compared to each other — claim five
+(`data == VmData/4 + VmStk/4`) holds on both machines and does not hold for
+any kernel that prints one book in both places.
+
+Counterfactual (`git stash push` of `src/vfs/procfs.rs`, kernel *and* loader
+rebuilt — `build/boot-statm-cf1.log`): **5 red**.
+
+```
+FAIL:  a megabyte of private mapping is 256 more pages of statm data (0 -> 0 pages)
+FAIL:  statm's data is VmData's pages plus the stack's
+FAIL:  statm's text is the image's executable span, in pages (0)
+FAIL:  and never fewer pages than status's clamped VmExe reports
+FAIL:  a zombie's statm is seven zeros
+FAILED
+```
+
+The four that stayed green are the honest limit of this pin: the *shape*
+(field count, the two Linux zeros, `size` against `stat`'s `vsize`) is
+satisfied by the old file too, and `status`'s `VmData` moved because §6.117
+already made it real. Only the three fields this commit filled fail without it.
+
+**The rule.** A file that prints a number next to another file's number is
+making a claim about how the two agree. `statm` and `status` disagree in three
+measured places and agree in the rest, and each disagreement is a Linux
+decision with a probe behind it — the clamp, the stack's book, and which half
+of residency is counted. Reading "seven fields, five are zeros" as one gap hid
+that the three answerable ones were being reported *wrongly* (a resident count
+in `data`'s place) rather than not at all.

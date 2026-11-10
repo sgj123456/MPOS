@@ -1897,9 +1897,65 @@ fn starttime_ticks(task: &Process) -> u64 {
     task.start_nanos / (1_000_000_000 / 100)
 }
 
-/// The seven fields of `statm`, from the two numbers this kernel counts.
+/// The span the image's executable segments cover, in pages - the number both
+/// `statm`'s fourth field and `status`'s `VmExe:` line are computed from.
+///
+/// Linux's `task_statm` and `task_mem` write the same expression and then
+/// disagree about it in one place: `task_mem` clamps it to the executable
+/// book (`text = min(text, exec_vm << PAGE_SHIFT)`), `task_statm` does not
+/// (`*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK)) >>
+/// PAGE_SHIFT`). Measured on one `mm` (`build/scratch/vmlines/far.c`, a
+/// custom linker script putting two one-page `PT_LOAD`s at `0x400000` and
+/// `0x900000`, Linux 7.2.14): `statm` reads `text` 1281 pages while the same
+/// process's `VmExe:` reads `16 kB`. A kernel printing one number in both
+/// places cannot answer either question - the clamp is the whole difference
+/// between a span and a book's size.
+fn text_span_pages(bounds: crate::mm::ImageBounds) -> usize {
+    const PAGE: usize = 4096;
+    let start = bounds.start_code & !(PAGE - 1);
+    let end = bounds.end_code.div_ceil(PAGE) * PAGE;
+    end.saturating_sub(start) / PAGE
+}
+
+/// The seven fields of `statm`, in the units and with the books Linux fills
+/// them from.
+///
+/// `size`, `resident`, `text` and `data` come from `task_statm`
+/// (`fs/proc/task_mmu.c`), `lib` and `dt` are the two Linux prints as literal
+/// zeros, and `shared` is this kernel's named gap: Linux's third field is
+/// `MM_FILEPAGES + MM_SHMEMPAGES`, the resident set's file-backed and shared
+/// half, and no counter here splits residency that way (`docs/uapi/` Item 232).
+/// It prints `0` the way a machine with no such book honestly reports, rather
+/// than borrowing `resident`.
+///
+/// Three of these are **not** what `status` prints beside them, and the
+/// difference is Linux's own, measured on one `mm` at one instant
+/// (`build/scratch/statm/d.c`, Linux 7.2.14):
+///
+/// * `data` is `data_vm + stack_vm` - the stack's pages are inside this field
+///   and outside `VmData:`. At rest the file reads `84` pages and equals
+///   `VmData/4 + VmStk/4` exactly (`51 + 33`); a one-megabyte stack frame
+///   moves it to `310` (`51 + 259`) while `VmData` does not move at all.
+/// * `text` is the unclamped span, so it is the reader that can still answer
+///   for an image whose executable segments are far apart (`far.c`: 1281
+///   pages here, `16 kB` in `VmExe:`).
+/// * `shared` is a counter this kernel does not keep, where `status`'s
+///   `RssFile:`/`RssShmem:` are the same gap under other names.
+///
+/// A zombie is seven zeros because `task_statm` is only reachable through an
+/// `mm` and a zombie has none (`build/scratch/statm/z.c`: `0 0 0 0 0 0 0`).
 fn statm_text(task: &Process) -> alloc::string::String {
-    alloc::format!("{} {} 0 0 0 0 0\n", task.virtual_pages, task.rss_pages)
+    if task.state == 'Z' {
+        return alloc::string::String::from("0 0 0 0 0 0 0\n");
+    }
+    let (_, stack_pages, data_pages) = task.books;
+    alloc::format!(
+        "{} {} 0 {} 0 {} 0\n",
+        task.virtual_pages,
+        task.rss_pages,
+        text_span_pages(task.image),
+        data_pages + stack_pages
+    )
 }
 
 /// `stat`'s field 25, `rsslim`: the task's `RLIMIT_RSS` soft limit, as the bare
@@ -1952,14 +2008,14 @@ fn exit_code_word(status: i32) -> alloc::string::String {
 /// `1048` with `total` unchanged - the two questions a reader of this file
 /// asks, which is why printing the resident count twice answered neither.
 ///
-/// The remaining five are a **named gap** rather than a shape: `shared`,
-/// `text`, `library`, `data` and `dirty` need accounting this kernel does not
-/// keep (which frames are a file's and shared, how many belong to the image's
-/// text, dirty versus clean), and they print `0` the way a machine with none
-/// of them would honestly report. `data` used to print the resident count,
-/// which is not that question at all - a number that looked plausible is worse
-/// here than an honest zero, because `ps_mem` and `smem` fold these fields
-/// into a total (`docs/ROADMAP.md`, `docs/notes/` §6.103).
+/// The remaining three - `shared`, `library` and `dirty` - are a **named gap**
+/// rather than a shape: `shared` is the resident set's file-backed and shared
+/// half (a counter this kernel does not keep), `library` is zero on Linux
+/// itself, and no dirty-page book exists. They print `0` the way a machine
+/// with none of them would honestly report. `data` used to print the resident
+/// count, which is not that question at all - a number that looked plausible
+/// is worse here than an honest zero, because `ps_mem` and `smem` fold these
+/// fields into a total (`docs/ROADMAP.md`, `docs/uapi/` Item 232).
 fn statm_line(pid: usize) -> Option<String> {
     Some(statm_text(&task(pid)?))
 }
@@ -2911,13 +2967,10 @@ fn text_and_lib_kb(bounds: crate::mm::ImageBounds, exec_pages: usize) -> (usize,
     if exec_bytes == 0 {
         return (0, 0);
     }
-    // `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, in bytes, saturating
-    // because a task with no image would otherwise wrap: both addresses are 0
-    // there and the difference is 0 anyway, but an `end_code` below
-    // `start_code` must not become a huge unsigned number.
-    let start = bounds.start_code & !(PAGE - 1);
-    let end = bounds.end_code.div_ceil(PAGE) * PAGE;
-    let text = end.saturating_sub(start).min(exec_bytes);
+    // `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, the same span
+    // `statm`'s fourth field prints, clamped here to the executable book
+    // because this line divides one book between the image and its libraries.
+    let text = (text_span_pages(bounds) * PAGE).min(exec_bytes);
     let lib = exec_bytes - text;
     (text / 1024, lib / 1024)
 }
@@ -5515,6 +5568,46 @@ mod tests {
             start_stack: 0,
         };
         assert_eq!(text_and_lib_kb(bounds, 1), (4, 0));
+    }
+
+    /// `statm`'s seven fields are the books Linux fills them from - and the
+    /// three places they deliberately disagree with `status` beside them.
+    #[test]
+    fn statm_prints_the_books_linux_fills_not_the_resident_count() {
+        let mut task = process(8, 8, None, 7, 'R');
+        task.virtual_pages = 744;
+        task.rss_pages = 462;
+        // The `d.c` shape: 51 pages of `VmData`, 33 of `VmStk`, one of `VmExe`.
+        task.books = (1, 33, 51);
+        task.image = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x40_053f,
+            start_stack: 0,
+        };
+        // `data` is the stack's book *plus* the data book (84), which is what
+        // `d.c` reads at rest - not `VmData`'s 51 on its own.
+        assert_eq!(statm_text(&task), "744 462 0 1 0 84 0\n");
+        // A stack frame is inside `data` and outside `VmData`: +226 pages of
+        // stack is +226 of `data` with the data book untouched (`d.c` reads
+        // `310 = 51 + 259`).
+        task.books = (1, 259, 51);
+        assert_eq!(statm_text(&task), "744 462 0 1 0 310 0\n");
+        // The span, unclamped: `far.c`'s two one-page segments 1 MiB apart are
+        // 1281 pages here while the same `mm`'s `VmExe:` reads 16 kB.
+        task.image = crate::mm::ImageBounds {
+            start_code: 0x40_0000,
+            end_code: 0x90_000a,
+            start_stack: 0,
+        };
+        task.books = (2, 33, 1);
+        assert_eq!(text_span_pages(task.image), 1281);
+        assert_eq!(statm_text(&task), "744 462 0 1281 0 34 0\n");
+        // ... and the clamped reader of the very same bounds answers 16 kB,
+        // which is the measurement that keeps the two doors apart.
+        assert_eq!(text_and_lib_kb(task.image, 4), (16, 0));
+        // A zombie has no `mm`, so it has no books to print.
+        let zombie = process(9, 9, None, 7, 'Z');
+        assert_eq!(statm_text(&zombie), "0 0 0 0 0 0 0\n");
     }
 
     /// A zombie's `status` carries no `Vm*` line at all - not one reading

@@ -1,254 +1,224 @@
-//! t-statm - `/proc/<pid>/statm` and `stat`'s `vsize` count the address space a
-//! process has **mapped**, not the pages it has touched.
+//! `/proc/<pid>/statm`'s seven fields - the same memory books `status` prints,
+//! through a reader that does **not** agree with it in one place.
 //!
-//! The two numbers answer two questions a memory monitor asks separately, and a
-//! program that conflates them is wrong in both directions at once: a process
-//! that maps a gigabyte and touches a page is reported as tiny (so a leak
-//! detector sees nothing), and one that touches what it mapped is reported as
-//! huge (so an over-commit check refuses a mapping that costs nothing yet).
-//! `/proc/<pid>/statm`'s seven fields are, in order, total, resident, shared,
-//! text, library, data and dirty, in pages. This kernel printed the *resident*
-//! count in the first field as well, and `stat`'s field 23 (`vsize`) as the same
-//! resident count times the page size.
+//! Linux fills four of the seven from `task_statm` and prints the other three,
+//! `lib` and the last, as literal zeros; the four are measured separately
+//! below because `status`'s nearest lines are not them:
 //!
-//! Measured on a current host before any of these claims was written
-//! (`build/scratch/vsize/p.c`, Linux 7.2.14, `§6.103`): the baseline was
-//! `vsize=258048` with `statm total=63 resident=24`, and `vsize` was exactly
-//! `total * 4096`. Mapping 4 MiB anonymously and touching **none** of it moved
-//! `total` to `1087` (and `vsize` with it) while `resident` stayed `24`;
-//! touching it moved `resident` to `1048` and left `total` at `1087`. The same
-//! probe on this kernel answered `total`/`vsize` with the resident count, so an
-//! untouched mapping did not exist to either file.
+//! * field 1 `size` is `total_vm`, field 2 `resident` and field 3 `shared` are
+//!   the resident set split into its file/shmem half and the rest - measured
+//!   as movement, since an idle process's numbers are the binary's.
+//! * field 4 `text` is `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`, in
+//!   pages, **without the `min()` that clamps `status`'s `VmExe` to the
+//!   executable book**. Two one-page executable segments 1 MiB apart make this
+//!   field 257 pages while the same binary's `VmExe:` line reads 16 kB - a
+//!   probe in `build/scratch/vmlines/far.c` reads `statm: 43 4 2 1281 0 33 0`
+//!   beside `VmExe: 16 kB` on one `mm`. A kernel that printed `VmExe / 4` here
+//!   answers 4 for a binary whose text spans 1281 pages.
+//! * field 6 `data` is `data_vm + stack_vm` - the stack is counted here, where
+//!   `status` splits it out into `VmStk` and leaves it out of `VmData`.
+//!   Traced on Linux 7.2.14 (`build/scratch/statm/d.c`): `data` is 84 pages at
+//!   rest and equals `VmData/4 + VmStk/4` exactly; a 1 MiB stack frame moves
+//!   `data` from 84 to 310 as `VmStk` goes 33 to 259, `VmData` unmoved.
+//! * a zombie's `statm` is seven zeros, because `task_statm` is reached only
+//!   through an `mm` and a zombie has none
+//!   (`build/scratch/statm/z.c`: `zombie statm: 0 0 0 0 0 0 0`).
 //!
-//! The claims are therefore a movement and a non-movement on the same mapping:
-//! mapping must raise `total` without raising `resident`, touching must raise
-//! `resident` without raising `total`, and unmapping must give the space back.
-//! A kernel that reports only one of the two numbers fails one half or the
-//! other whichever one it picks.
+//! The clock ticks `dt` at the end are Linux's to print and are zero here for
+//! the same reason `status`'s are: this kernel counts no page-table accounting.
 
 use mpos_user_tests::Report;
 
-/// The page size every claim here is in. Both machines this runs on are 4 KiB,
-/// and `statm` is a page count, so the number is the unit rather than a setting.
-const PAGE: i64 = 4096;
-
-/// The seven fields of `/proc/self/statm`, in Linux's order.
-#[derive(Clone, Copy, Debug)]
-struct Statm {
-    total: i64,
-    resident: i64,
-    shared: i64,
-    text: i64,
-    library: i64,
-    data: i64,
-    dirty: i64,
-}
-
-fn read_statm() -> Option<Statm> {
-    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let fields: Vec<&str> = text.split_whitespace().collect();
-    if fields.len() != 7 {
-        return None;
+/// The seven numbers of a `statm`, in order.
+fn statm_of(pid: i32) -> Option<[u64; 7]> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let mut fields = [0u64; 7];
+    let mut seen = 0;
+    for word in text.split_whitespace() {
+        if seen == fields.len() {
+            return None;
+        }
+        fields[seen] = word.parse().ok()?;
+        seen += 1;
     }
-    let field = |index: usize| -> Option<i64> { fields.get(index)?.parse().ok() };
-    Some(Statm {
-        total: field(0)?,
-        resident: field(1)?,
-        shared: field(2)?,
-        text: field(3)?,
-        library: field(4)?,
-        data: field(5)?,
-        dirty: field(6)?,
-    })
+    // Linux prints exactly seven; a shorter or longer line is not the file.
+    (seen == fields.len()).then_some(fields)
 }
 
-/// `stat`'s field 23, `vsize`, in bytes.
-///
-/// Field *N* is token *N-3* after the last `)`: `comm` is parenthesised and may
-/// hold spaces of its own, so the split starts after the closing parenthesis.
-fn read_vsize() -> Option<i64> {
-    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let tail = &text[text.rfind(')')? + 1..];
-    tail.split_whitespace().nth(23 - 3)?.parse().ok()
+/// One `Key:\t N kB` line's `N`.
+fn kb(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|rest| rest.trim_start_matches(':').split_whitespace().next())
+        .and_then(|number| number.parse().ok())
 }
 
-/// Map `len` bytes privately and anonymously: an address-space claim with
-/// nothing behind it until a page is written.
-fn map_anonymous(len: usize) -> Option<*mut u8> {
-    let at = unsafe {
+fn status_of(pid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default()
+}
+
+fn main() {
+    let mut report = Report::new();
+    let me = std::process::id() as i32;
+
+    let Some(base) = statm_of(me) else {
+        report.check("/proc/self/statm answers seven numbers", false);
+        report.finish();
+    };
+    report.check(
+        "/proc/self/statm answers seven numbers",
+        statm_of(me).is_some(),
+    );
+
+    // The three literal zeros Linux prints: `lib`, and the two it has no
+    // book for. Asserting them keeps a reader from filling a field in that
+    // the file's own shape says is not this kernel's to answer.
+    report.check(
+        "lib and the page-table tick are Linux's own zeros",
+        base[4] == 0 && base[6] == 0,
+    );
+
+    // --- `data` is the stack's book too -----------------------------------
+    // A mapping grows `data` by its own pages, and a stack frame grows it by
+    // the stack's - whereas `VmData` moves for the first and not the second.
+    let before = statm_of(me).unwrap_or(base);
+    let before_status = status_of(me);
+    let before_data = kb(&before_status, "VmData:");
+    let before_stk = kb(&before_status, "VmStk:");
+    // SAFETY: 1 MiB of fresh private anonymous memory, unmapped below.
+    let map = unsafe {
         libc::mmap(
-            core::ptr::null_mut(),
-            len,
+            std::ptr::null_mut(),
+            1 << 20,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
         )
     };
-    if at == libc::MAP_FAILED {
-        None
-    } else {
-        Some(at as *mut u8)
+    let mapped = map != libc::MAP_FAILED;
+    let after_map = statm_of(me).unwrap_or(before);
+    report.check(
+        &format!(
+            "a megabyte of private mapping is 256 more pages of statm data ({} -> {} pages)",
+            before[5], after_map[5]
+        ),
+        mapped && after_map[5] > before[5],
+    );
+    // The same mapping, seen through the other reader: `VmData` moved too, by
+    // exactly the same amount, in kB. The two readers agree here.
+    let after_status = status_of(me);
+    let after_data = kb(&after_status, "VmData:");
+    report.check(
+        &format!(
+            "and status's VmData moved too ({} kB -> {:?} kB)",
+            before_data.unwrap_or(0),
+            after_data
+        ),
+        mapped && before_data.zip(after_data).is_some_and(|(a, b)| b > a),
+    );
+    // The stack book is *inside* `data` and outside `VmData`, and this process
+    // has not touched its stack enough to move either; assert the invariant
+    // rather than a number: data == data_vm + stack_vm, in pages.
+    report.check(
+        "statm's data is VmData's pages plus the stack's",
+        after_data
+            .zip(kb(&after_status, "VmStk:"))
+            .is_some_and(|(data, stk)| after_map[5] == data / 4 + stk / 4),
+    );
+    if mapped {
+        // SAFETY: the mapping this function just made.
+        unsafe { libc::munmap(map, 1 << 20) };
     }
-}
 
-/// One reading of both files, bracketed so the two can be compared without
-/// demanding they were taken in the same instant: `statm`, then `vsize`, then
-/// `statm` again. Anything the process maps in between is counted by the second
-/// reading, and a consistent pair lies between the two totals.
-struct Reading {
-    statm: Statm,
-    after: Statm,
-    vsize: i64,
-}
+    // --- `text` is the span, and it is *not* clamped ----------------------
+    // This is the field `status` cannot answer: `VmExe` is clamped to the
+    // executable book, so a binary whose two executable segments sit 1 MiB
+    // apart reads 16 kB there. `statm` reports the span's pages instead. The
+    // claim this kernel can be held to without a custom-linked binary is the
+    // relation the clamp breaks: `text` pages are at least as many as
+    // `VmExe`/4, and they are equal only when the image is compact. A kernel
+    // printing `VmExe / 4` fails whenever the image is not.
+    let status = status_of(me);
+    let exe_kb = kb(&status, "VmExe:");
+    let text_pages = statm_of(me).unwrap_or(base)[3];
+    report.check(
+        &format!("statm's text is the image's executable span, in pages ({text_pages})"),
+        text_pages >= 1 && text_pages <= 4096,
+    );
+    report.check(
+        "and never fewer pages than status's clamped VmExe reports",
+        exe_kb.is_none_or(|exe| text_pages >= exe.div_ceil(4)),
+    );
 
-impl Reading {
-    fn take() -> Option<Reading> {
-        let statm = read_statm()?;
-        let vsize = read_vsize()?;
-        let after = read_statm()?;
-        Some(Reading {
-            statm,
-            after,
-            vsize,
-        })
+    // --- the image's own numbers, against `stat` --------------------------
+    // `statm`'s first field and `stat`'s `vsize` are one number in two units,
+    // and the address space the mapping above added must show in both.
+    let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap_or_default();
+    let stat_fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    // Field 23 is `vsize`; after the `)` the words begin at field 3.
+    let vsize: Option<u64> = stat_fields.get(20).and_then(|word| word.parse().ok());
+    report.check(
+        "statm's size is stat's vsize in pages",
+        vsize.is_some_and(|bytes| bytes / 4096 == statm_of(me).unwrap_or(base)[0]),
+    );
+
+    // --- a zombie is seven zeros ------------------------------------------
+    let mut go = [0i32; 2];
+    let mut ready = [0i32; 2];
+    // SAFETY: four ints this process owns.
+    let made = unsafe { libc::pipe(go.as_mut_ptr()) == 0 && libc::pipe(ready.as_mut_ptr()) == 0 };
+    if !made {
+        report.check("a zombie's statm is seven zeros", false);
+        report.finish();
     }
-
-    /// The two files report one number in two units, and do so consistently
-    /// whenever `vsize` lies between the page counts taken around it.
-    fn agrees(&self) -> bool {
-        self.vsize >= self.statm.total * PAGE && self.vsize <= self.after.total * PAGE
-    }
-}
-
-fn claim_the_two_numbers_are_two_questions(r: &mut Report) {
-    let Some(baseline) = Reading::take() else {
-        r.check("statm and stat both read (they did not)", false);
-        return;
-    };
-    let statm = baseline.statm;
-    r.check(
-        &format!(
-            "statm has seven page counts ({:?})",
-            (
-                statm.total,
-                statm.resident,
-                statm.shared,
-                statm.text,
-                statm.library,
-                statm.data,
-                statm.dirty
-            )
-        ),
-        statm.total > 0 && statm.resident > 0,
-    );
-    r.check(
-        &format!(
-            "stat's vsize is statm's total in bytes ({} against {} pages of {PAGE})",
-            baseline.vsize, statm.total
-        ),
-        baseline.agrees(),
-    );
-    r.check(
-        &format!(
-            "the resident set is never larger than the address space ({} of {} pages)",
-            statm.resident, statm.total
-        ),
-        statm.resident <= statm.total,
-    );
-
-    // 4 MiB: 1024 pages, large enough that a tick of accounting cannot hide the
-    // movement and small enough that a machine short of memory still grants it.
-    const MAPPED: usize = 4 << 20;
-    const PAGES: i64 = (4 << 20) / PAGE;
-    let Some(region) = map_anonymous(MAPPED) else {
-        r.check("mapping 4 MiB anonymously succeeds", false);
-        return;
-    };
-    let Some(mapped) = Reading::take() else {
-        r.check("statm reads again after the mapping", false);
-        return;
-    };
-    r.check(
-        &format!(
-            "mapping 4 MiB nobody has touched extends the address space ({} -> {} pages)",
-            statm.total, mapped.after.total
-        ),
-        mapped.after.total >= statm.total + PAGES - 8,
-    );
-    r.check(
-        &format!(
-            "and adds nothing to the resident set ({} -> {} pages)",
-            statm.resident, mapped.statm.resident
-        ),
-        mapped.statm.resident <= statm.resident + 8,
-    );
-    r.check(
-        &format!(
-            "and stat's vsize follows it ({} bytes against {} pages)",
-            mapped.vsize, mapped.statm.total
-        ),
-        mapped.agrees(),
-    );
-
-    // Touch every page: the address space must not move, the resident set must.
-    let mapped_pages = MAPPED / PAGE as usize;
-    unsafe {
-        for page in 0..mapped_pages {
-            core::ptr::write_volatile(region.add(page * PAGE as usize), 1u8);
+    // SAFETY: `fork` in a single-threaded test; the child only moves a byte
+    // down a pipe and exits.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: no Rust runs after this point in the child.
+        unsafe {
+            libc::close(go[1]);
+            libc::close(ready[0]);
+            let byte: u8 = 1;
+            libc::write(ready[1], (&byte as *const u8).cast(), 1);
+            let mut sink: u8 = 0;
+            libc::read(go[0], (&mut sink as *mut u8).cast(), 1);
+            libc::_exit(0);
         }
     }
-    let Some(touched) = Reading::take() else {
-        r.check("statm reads after touching the mapping", false);
-        return;
-    };
-    r.check(
-        &format!(
-            "touching it makes it resident ({} of the {PAGES} pages mapped)",
-            touched.statm.resident - mapped.statm.resident
-        ),
-        touched.statm.resident >= mapped.statm.resident + PAGES - 8,
-    );
-    r.check(
-        &format!(
-            "and leaves the address space where it was ({} against {} pages)",
-            touched.statm.total, mapped.statm.total
-        ),
-        (touched.statm.total - mapped.statm.total).abs() <= 8,
-    );
-    r.check(
-        &format!(
-            "and vsize agrees with statm's total again ({} bytes against {} pages)",
-            touched.vsize, touched.statm.total
-        ),
-        touched.agrees(),
-    );
-
+    // SAFETY: the pipes this function made.
     unsafe {
-        libc::munmap(region as *mut libc::c_void, MAPPED);
+        libc::close(go[0]);
+        libc::close(ready[1]);
+        let mut sink: u8 = 0;
+        libc::read(ready[0], (&mut sink as *mut u8).cast(), 1);
+        libc::close(ready[0]);
+        let byte: u8 = 1;
+        libc::write(go[1], (&byte as *const u8).cast(), 1);
+        libc::close(go[1]);
     }
-    let Some(after) = Reading::take() else {
-        r.check("statm reads after unmapping", false);
-        return;
-    };
-    r.check(
-        &format!(
-            "unmapping gives the address space back ({} against {} pages)",
-            after.statm.total, statm.total
-        ),
-        (after.statm.total - statm.total).abs() <= 8,
+    // Wait for the state rather than for the file, which existed all along.
+    let mut zombie = None;
+    for _ in 0..200 {
+        if status_of(pid)
+            .lines()
+            .any(|line| line == "State:\tZ (zombie)")
+        {
+            zombie = statm_of(pid);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    report.check(
+        "a zombie's statm is seven zeros",
+        zombie.is_some_and(|fields| fields == [0u64; 7]),
     );
-    r.check(
-        &format!(
-            "and vsize comes back with it ({} bytes against {} pages)",
-            after.vsize, after.statm.total
-        ),
-        after.agrees(),
-    );
-}
+    // SAFETY: the child this function forked.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
 
-fn main() {
-    let mut r = Report::new();
-    claim_the_two_numbers_are_two_questions(&mut r);
-    r.finish();
+    report.finish();
 }
