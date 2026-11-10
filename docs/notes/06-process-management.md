@@ -10196,8 +10196,10 @@ Two traps were paid for here:
   [a register file]". The first machine run of the pin burned 400 chunks (over 200 ms of CPU,
   `timer_gettime` reading 0 left) and the handler never ran, so two claims were red for a reason
   that had nothing to do with the clock. The loop now makes one cheap `getpid` per chunk, which is
-  what an ordinary program's loop does. Linux also hands the signal over on an interrupt return,
-  where this kernel does not - that difference is §7.4h's, and it is named there, not here.
+  what an ordinary program's loop does. Linux also hands a handled signal over on an interrupt's
+  return to ring 3, which this kernel does not: **`docs/notes/` §2.13 measures that difference and
+  names it as a gap** (`build/scratch/timerclock/iret.c` on the host, `build/boot-iret1.log` here).
+  §7.4h is about a different question - which thread a delivered signal went to.
 - **A test's contract moves when the kernel starts serving the field it measured.** `t-timer-create`
   carried a claim written as `a clock with no accounting behind it is EOPNOTSUPP`, which was true
   and is now false; it became `a timer can be built on the process's own CPU clock`, an agreement

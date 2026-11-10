@@ -853,3 +853,81 @@ unblocks; Linux's shared group pending set would let another thread take it
 first. And the pick is `wants_signal` without its "prefer a thread not
 already handling it" half - one copy, one handler run is what the pin's
 third claim reads, and nothing in the sweep depends on the finer choice yet.
+
+### 2.13 A handled signal waits for a system call — **NAMED GAP**
+
+**The question.** A task in ring 3 that computes and never makes a system call: does a signal with a
+handler reach it? Linux says yes, at the next trap. This kernel says no: the signal is queued and
+waits for the task's next kernel entry.
+
+**Measured on Linux first** (`build/scratch/timerclock/iret.c`, gcc -O1, musl static, host 7.2.14).
+The loop is `for (i = 0; i < limit && !got; i++) x += (double)i;` with a `volatile double`
+accumulator and a `sig_atomic_t` the handler sets - **nothing in it is a syscall**, and it leaves
+either because the handler ran or because the counter ran out:
+
+```
+create(PROCESS_CPUTIME, SIGUSR1) = 0 errno=0
+settime(30 ms) = 0 errno=0
+loop left by THE SIGNAL after 4257819 iteration(s) (limit 400000000)
+```
+
+So the handler ran while the task was still in its own ring-3 code, 4 257 819 iterations into a
+400-million-iteration limit: the signal did not have to wait for a kernel entry.
+
+**The same program, asked of this machine** (`build/scratch/timerclock/iret2.c` staged as `t-iret`,
+budget 5 ms so the deadline is certainly reached, `build/boot-iret1.log`,
+`build/probe/oneshot/serial.log:163-166`):
+
+```
+iret: create(PROCESS_CPUTIME, SIGUSR1) = 0 errno=0
+iret: settime(5 ms) = 0 errno=0
+iret: loop left by count exhaustion after 20000000 iteration(s) (limit 20000000)
+iret: gettime = 0 errno=0 remaining 0 ms
+```
+
+The deadline was reached - `timer_gettime`'s remaining is 0 ms, so the CPU the loop burned was
+charged and the expiry scan fired - and the handler still never ran: the loop ran to its iteration
+limit. The report line after it is the next syscall the task makes, and that is where the signal
+would have been handed over.
+
+**Mechanism, in the code.** `preempt_now` (`src/sched/runtime/task.rs:3741`) is the clock's hook,
+and it calls `check_itimer()`, then `deliver_pending_signal()`, then `schedule`. But
+`deliver_pending_signal` (`:3766`) only takes a **fatal** signal - `take_fatal_signal()` then
+`die_of_fatal_signal(sig)` - so a `SIGKILL` or a default-disposition `SIGTERM` ends a spinning task
+at the next tick. A signal with a *handler* needs the interrupted task's register file to build a
+frame on, and the clock's hook has no such image, so the signal goes back into the pending set,
+where `src/syscall/mod.rs:284`'s `linux::deliver_signal(regs_ptr, nr, ret)` finds it on the task's
+next syscall. `deliver_pending_signal`'s own doc says so: "the syscall return path is the only place
+that has one".
+
+Why the frame is the blocker, per machine - both read from the code:
+
+- **x86_64**: `extern "x86-interrupt"` handlers receive an `InterruptStackFrame`, which is
+  `RIP`/`CS`/`RFLAGS`/`RSP`/`SS` only. Entering a handler rewrites the task's `sigcontext` and
+  resumes it at the handler's own `PC`, so the general-purpose registers the trap interrupted are
+  needed, and the hardware saved none of them; the ABI relies on the handler preserving the
+  registers it happens to use, which leaves no memory image to rewrite.
+- **aarch64**: the IRQ stubs save `x0..x18`, `x29` and `x30` - "exactly the registers a Rust callee
+  may clobber" (`arch/src/arch/aarch64/vectors.rs:16-19`) - and `x19..x28` are callee-saved, so the
+  handler restores them itself. The interrupted image on the stack is therefore not complete there
+  either.
+
+**What closing it would take.** Each machine's tick vector would need a full user-register image at
+trap time - x86_64 a naked stub that pushes a `pt_regs` before calling the handler (the same shape
+the syscall gate already uses), aarch64 saving `x19..x28` as well - and then a delivery path that
+installs the frame on *that* image, obeying the restart and `sigcontext` rules `deliver_signal`
+already encodes. That is a change to both machines' trap entry, not a field, which is why it is
+named here instead of approximated.
+
+**Who this is visible to.** A program that computes without entering the kernel - a tensor loop, a
+numeric solver, a spin-wait on a shared page - holds a `SIGINT`, `SIGALRM` or `SIGUSR1` until it
+next calls anything. Ordinary programs rarely notice, because their loops poll something; a
+compute-heavy one notices, and its operator sees a process that ignores `Ctrl-C` until it decides to
+print. §6.123's pin hit this first from the other side: its CPU-time timer had to call `getpid()`
+once per burn chunk for the handler to run at all (`docs/notes/` §6.123, "two traps were paid for
+here"), which is the workaround a program would need and should not have to write.
+
+**The rule.** **A signal that is only visible at a system call is a signal a computing program does
+not get.** Linux's delivery point is "on the way back to ring 3", and every trap has that way back;
+this kernel's is "on the way back from a syscall", which is a subset. The gap is not in the queue or
+the handler - both are correct and pinned (§2.12) - it is in *where the frame comes from*.

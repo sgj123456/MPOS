@@ -40,8 +40,13 @@ One-glance status of the whole roadmap.
   and re-checks the record after every wake, so a wake that is not a resume does
   not hand a `SIGSTOP`ped task back with the stop still installed (§6.88, item
   201); the named
-  residues are the kernel-spawned program path's `SIG_DFL` start and the
-  alternate-stack pin's shape, not a missing rule
+  residues are the kernel-spawned program path's `SIG_DFL` start, the
+  alternate-stack pin's shape, and one **named gap**: a handled signal is handed
+  over on the return from a *system call*, not on the return from any trap, so a
+  task that computes in ring 3 without entering the kernel holds it until it next
+  calls something - Linux hands it over at the next tick (`iret.c`'s burn loop
+  leaves `by THE SIGNAL` on the host, this machine's runs to its iteration limit
+  with the timer reading `remaining 0 ms`: §2.13, `build/boot-iret1.log`)
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
@@ -1284,6 +1289,10 @@ its 900 s budget with no summary has no reading yet.
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
+the delivery *point* is the one open item in the signal surface - a handled
+signal waits for a system call, where Linux hands it over on the way back to ring 3 from any trap,
+so a task computing without kernel entries ignores `Ctrl-C` until its next call (§2.13, measured on
+both sides);  
 `memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs keep `user.*` on the memory filesystems and refuse the other namespaces by name (item 132, §3.15);  
 the datagram lines are Linux's now - 65 507 for a datagram, and `EMSGSIZE` from the  
 destination link's MTU where Linux's default would fragment it - while IP fragmentation  
