@@ -9926,3 +9926,162 @@ its corollary: **a slot is not a name, and every door that hands one to userspac
 from userspace - is a door where the two can be confused.** The audit cannot be done by grepping
 `as i32`; it has to ask, per field, which of the two the *reader* needs, because a value can be
 stored as one and rendered as the other.
+
+## §6.122 The policy word: a policy number with an optional flag, and the band judged before support
+
+`sched_setscheduler`'s second argument is not a policy number. It is a policy number with
+`SCHED_RESET_ON_FORK` optionally OR-ed into it, and Linux takes the flag off before it asks which
+policy the rest names. Around that word Linux has three separate judgements in a measured order, and
+until this section this kernel answered two of them with the wrong errno:
+
+1. **Is the word a policy at all?** `0, 1, 2, 3, 5, 6, 7` are Linux's `valid_policy()` numbers after
+   the flag is masked. `4` is unused; `6` is `SCHED_DEADLINE`, which this door refuses outright (its
+   shape belongs to `sched_setattr`); `7` is `SCHED_EXT`, the extensible class, which the reference
+   host serves and whose band answers 0. Anything else is `EINVAL`.
+2. **Is the priority inside that policy's band?** `1..=99` for `SCHED_FIFO`/`SCHED_RR`,
+   `0..=0` for every fair policy *and for the deadline policy*, which is why
+   `sched_get_priority_max(6)` answers 0 even though the scheduler door refuses 6.
+3. **Can this kernel serve that policy?** Only here does support matter - and it is the *last* thing
+   asked, because a bad word and a bad priority are bad arguments whatever the kernel can run.
+
+The two wrong answers were (1) and (2) crossed over: a policy that exists was refused with `EINVAL`
+- "that is not a policy" - where the honest answer is `EOPNOTSUPP`, "present, cannot do that"; and a
+priority outside its band was refused with `EOPNOTSUPP` where Linux refuses the argument itself.
+
+### What Linux answers (measured, one `fork` per case)
+
+```text
+build/scratch/statpolicy/d.c   (sched_setscheduler, fresh process per row)
+  sched_setscheduler(0, SCHED_OTHER,    {0})  -> 0
+  sched_setscheduler(0, SCHED_BATCH,    {0})  -> 0
+  sched_setscheduler(0, SCHED_IDLE,     {0})  -> 0
+  sched_setscheduler(0, SCHED_EXT(7),   {0})  -> 0
+  sched_setscheduler(0, RESET|SCHED_OTHER)    -> 0
+  sched_setscheduler(0, RESET|SCHED_BATCH)    -> 0
+  sched_setscheduler(0, SCHED_FIFO,     {0})  -> EINVAL(22)      the band first
+  sched_setscheduler(0, SCHED_FIFO,   {100})  -> EINVAL(22)
+  sched_setscheduler(0, SCHED_FIFO,    {10})  -> EPERM(1)        a legal band, then authority
+  sched_setscheduler(0, SCHED_RR,       {0})  -> EINVAL(22)
+  sched_setscheduler(0, SCHED_DEADLINE, {0})  -> EINVAL(22)      deadline has its own door
+  sched_setscheduler(0, RESET|DEADLINE)       -> EINVAL(22)
+  sched_setscheduler(0, 8) / (9) / (0x10000000) -> EINVAL(22)
+
+build/scratch/statpolicy/e.c   (the boundary, and the sibling table)
+  policy 6 -> EINVAL, 7 -> 0, 8..12 -> EINVAL, 0x10000000 -> EINVAL
+  sched_get_priority_max: 0/1/2/3/5/6/7 -> 0/99/99/0/0/0/0, 8 -> EINVAL(22)
+  sched_getattr(48) -> policy 0, nice 0, rtprio 0
+
+build/scratch/statpolicy/f.c   (the *other* door reads the field raw)
+  sched_setattr(policy 0/3/5/7)      -> 0          (one struct, four servable policies)
+  sched_setattr(policy RESET|0)      -> EINVAL(22) the flag is not in this field
+  sched_setattr(policy RESET|3)      -> EINVAL(22)
+  sched_setattr(policy 1, prio 10)   -> EPERM(1)
+  sched_setattr(policy 1, prio 0)    -> EINVAL(22)
+  sched_setattr(policy 6) / (8)      -> EINVAL(22)
+  sched_get_priority_max(RESET|0)    -> EINVAL(22) this door does not mask the flag
+  sched_get_priority_max(RESET|1)    -> EINVAL(22)
+
+build/scratch/statpolicy/g.c   (the attribute door judges the band too)
+  sched_setattr(OTHER, prio 1)             -> EINVAL(22)
+  sched_setattr(OTHER, prio 0, nice 5)     -> 0
+  sched_setattr(BATCH / IDLE / EXT, prio 1) -> EINVAL(22)
+  sched_setattr(RR, prio 0)                -> EINVAL(22)
+  sched_setattr(FIFO, prio 100)            -> EINVAL(22)
+  sched_getattr(48) -> policy 0, nice 0, rtprio 0
+```
+
+Two rows are worth reading twice. `sched_get_priority_max(RESET|SCHED_OTHER)` is `EINVAL` while
+`sched_setscheduler(RESET|SCHED_OTHER)` is served: **the mask belongs to the door, not to the
+number.** And `sched_setattr`'s policy field is a plain policy number - the reset behaviour travels
+in its `sched_flags` word - so the same `RESET|OTHER` word that is legal at the scheduler door is
+`EINVAL` in that struct.
+
+### What this kernel answered before (§6.122's before-reading)
+
+`build/boot-schedpolicy0.log`, the new pin on the kernel as it stood at `0df1e62`:
+
+```text
+FAIL:  SCHED_BATCH is a policy, so the answer is about support (22)
+FAIL:  SCHED_IDLE likewise (22)
+FAIL:  SCHED_EXT is a policy number too, so its band is the fair one (-1)
+FAIL:  and its door is a support refusal, not a bad word (22)
+FAIL:  SCHED_RESET_ON_FORK|SCHED_OTHER is a policy word too (22)
+FAIL:  SCHED_FIFO at priority 0 is EINVAL, the band before support (95)
+FAIL:  and 100 is outside the band too (95)
+FAIL:  SCHED_RR at priority 0 is EINVAL as well (95)
+FAIL:  sched_setattr's SCHED_EXT is a support refusal too (22)
+```
+
+Nine wrong answers in three shapes: four policies that exist called "not a policy", three
+out-of-band priorities called "not supportable", one policy number refused at the modern door, and
+`sched_get_priority_max(7)` called a bad word. `SCHED_OTHER` and every genuine `EINVAL` row were
+already right, which is exactly why no existing pin caught it: every program in the suite asks for
+`SCHED_OTHER` or a real-time policy at a legal priority, and those rows agree.
+
+### The fix
+
+The judgements are pure facts about Linux's ABI, so they live in the host-compiled `abi.rs` beside
+§6.116's `sched_attr` verdicts, and the two handlers only read the caller's memory and dispatch:
+
+- `Policy` + `policy_number(word)` - the raw reading, for the doors that switch on the word;
+- `scheduler_policy(word)` - mask `SCHED_RESET_ON_FORK` off, then read the number, for the one door
+  that masks;
+- `policy_band(policy)` - `(1, 99)` or `(0, 0)`, the table the sibling door prints;
+- `sched_setscheduler_verdict(word, priority)` - `Ok(true)` serve, `Ok(false)` `EOPNOTSUPP`, `Err`
+  the word or the band;
+- `sched_setattr_policy_verdict(policy, priority, nice)` - the same three, raw and then the nice;
+- `priority_bound_verdict(policy, max)` - the band's end or `EINVAL`, raw.
+
+`handle_sched_setscheduler` now reads the priority out of the param (it used to read it only on the
+`SCHED_OTHER` arm) and asks the verdict; `handle_sched_setattr` now reads the struct's `priority`
+field at offset 20, which it had never read at all - so `sched_setattr(SCHED_OTHER, priority 1)` is
+now the `EINVAL` Linux gives instead of a 0 that dropped the priority, and the nice range check
+moved inside the verdict where it belongs (after the band, before the apply).
+
+### The pin
+
+`user/tests/src/bin/t-sched-policy.rs`, 21 claims, every one of them a row of the tables above. Two
+of the claims are *agreements* rather than counterfactuals and say so: `/proc/<pid>/stat`'s
+`policy` field is the policy `sched_getscheduler` names (both 0), and its `rt_priority` is 0 -
+honest zeros of a scheduler with one band, one policy and no real-time class, not a stub that was
+never written. `processor` is 0 for the same kind of reason (one CPU), and is the one claim that is
+machine-only, since the measuring host has many and moves a task between them.
+
+Host run: 21/21 `PASS`. Machine run (`build/boot-schedpolicy2.log`): 21/21 `PASS`, exit 0.
+
+Two traps were paid for on the way to that pin:
+
+- **The Rust target's musl does not enter the kernel for these doors.** `libc::sched_setscheduler`
+  and `libc::sched_getscheduler` answer `ENOSYS`(38) without issuing a syscall - measured by calling
+  the wrapper and the raw `SYS_*` number from the same binary, where the raw call succeeds. A pin
+  written with the wrappers would have measured the stub, on both arms. Every policy call in the pin
+  is a raw syscall, the same shape §6.116's pin uses.
+- **`/proc/self/stat`'s field index is (N-3) from the tokens after `)`.** A first draft used (N-4)
+  and reported field 39 (`processor`) as 17 - which is field 38, `exit_signal`'s SIGCHLD. The tell
+  was a claim failing with a plausible-looking number: 17 is a real value in that line, just the
+  neighbour's.
+
+### The counterfactual
+
+`git stash push -q -m cf-schedpolicy -- src/syscall/linux/abi.rs src/syscall/linux/posix.rs`,
+kernel and loader rebuilt, the pin booted (`build/boot-schedpolicy-cf1.log`): **9 of 21 red** - the
+nine rows above, unchanged. Restored, rebuilt, 21/21 green.
+
+### Named gaps this does not close
+
+`SCHED_RESET_ON_FORK` is now *recognised* and refused rather than being called a bad word, but it is
+not remembered: this scheduler has no per-task policy to reset at a fork, because it has no policies
+but one. `SCHED_BATCH`, `SCHED_IDLE` and `SCHED_EXT` are likewise recognised and refused with
+`EOPNOTSUPP`; serving any of them is the same named gap as serving `SCHED_FIFO` (no priorities, no
+bands). `sched_rr_get_interval` still answers this kernel's own slice (`1_000_000_000 / TICK_HZ`,
+4 ms) where the reference host answers its own (2 ms) - both are "this machine's round-robin
+timeslice", and the host's value is tuned, not fixed.
+
+### The rule
+
+**A word that names a thing and a word that modifies it are different questions, and the errno has
+to say which one failed.** `EINVAL` means "that is not a thing"; `EOPNOTSUPP` means "that is a
+thing, and this kernel cannot do it". A caller retries an `EOPNOTSUPP` differently from an
+`EINVAL`: `SCHED_BATCH` at `EINVAL` reads as "no such policy in this ABI" and loses the program its
+fallback. And the order of the questions is part of the answer, because the first refusal is the one
+that gets reported - which is why the band is asked before support, and the word before them both.

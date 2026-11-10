@@ -10336,7 +10336,7 @@ place of three atomics), `src/vfs/procfs.rs` (fields 45-51 render from it).
 **6 red** (`build/boot-statimage-cf1.log`), green on host and machine.
 Measurement and reasoning: `docs/notes/` §6.120.
 
-## Item 232 — a pid number is a promise: the init namespace allocates its own
+### Item 235 — a pid number is a promise: the init namespace allocates its own
 
 Rows: every door that turns a number into a task or a task into a number, because
 the whole question is which of the two each one carries. The allocator half is
@@ -10404,3 +10404,62 @@ is witnessed by the existing pins it broke and then fixed: `t-signal-frame`
 `build/cf-serial-t-cgroupfs.log`) - and `t-ns-net`, `t-ns-pid`, `t-rseq`,
 `t-keyctl`, `t-unix-scm`, `t-scm` and `t-nsnumbers` all green again on the final
 kernel. Measurement and reasoning: `docs/notes/` §6.121.
+
+### Item 236 — the policy word: a policy number with an optional flag, and the band before support
+
+Rows: the three `sched_*` doors that take or answer a policy number, plus the two
+that print the policy back. The ABI facts are `abi.rs`'s verdicts; the handlers
+only read the caller's memory.
+
+| row | Linux | this kernel before | now |
+|---|---|---|---|
+| `sched_setscheduler(0, SCHED_BATCH, {0})` | `0` | `EINVAL` - "that is not a policy" | `EOPNOTSUPP` - present, not served |
+| `sched_setscheduler(0, SCHED_IDLE, {0})` | `0` | `EINVAL` | `EOPNOTSUPP` |
+| `sched_setscheduler(0, SCHED_EXT(7), {0})` | `0` (`SCHED_EXT` is a policy) | `EINVAL` | `EOPNOTSUPP` |
+| `sched_setscheduler(0, RESET\|SCHED_OTHER, {0})` | `0` | `EINVAL` | `EOPNOTSUPP` |
+| `sched_setscheduler(0, SCHED_FIFO, {0})` | `EINVAL` - the band | `EOPNOTSUPP` - "cannot" | `EINVAL` |
+| `sched_setscheduler(0, SCHED_FIFO, {100})` | `EINVAL` | `EOPNOTSUPP` | `EINVAL` |
+| `sched_setscheduler(0, SCHED_FIFO, {10})` | `EPERM` (authority; a legal band) | `EOPNOTSUPP` | `EOPNOTSUPP` (the same "present, not served") |
+| `sched_setscheduler(0, SCHED_RR, {0})` | `EINVAL` | `EOPNOTSUPP` | `EINVAL` |
+| `sched_get_priority_max(7)` | `0` | `EINVAL` | `0` |
+| `sched_get_priority_max(RESET\|0)` | `EINVAL` (this door does not mask) | `EINVAL` | `EINVAL`, from the same table |
+| `sched_setattr(policy 7)` | `0` | `EINVAL` | `EOPNOTSUPP` |
+| `sched_setattr(policy 8)` | `EINVAL` | `EINVAL` | `EINVAL` |
+| `sched_setattr(SCHED_OTHER, priority 1)` | `EINVAL` | `0` - the priority was never read | `EINVAL` |
+| `sched_setattr(policy RESET\|OTHER)` | `EINVAL` (the flag lives in `sched_flags`, not here) | `EINVAL`, by accident of `_ =>` | `EINVAL`, by the raw reading |
+| `/proc/<pid>/stat` field 41 (`policy`) | the policy in force | `0` (and still `0`) | `0`, agreeing with `sched_getscheduler` |
+| `/proc/<pid>/stat` field 40 (`rt_priority`) | the task's real-time priority | `0` (and still `0`) | `0`: one band, so no real-time priority exists |
+| `/proc/<pid>/stat` field 39 (`processor`) | the CPU the task is on | `0` (and still `0`) | `0`: one CPU, and it does not move |
+
+**Why the errno order is the fix.** All three judgements exist in Linux in a
+measured order - the word, then the policy's band, then whether the kernel can
+serve it - and this kernel had the first and third crossed. A policy that exists
+was answered `EINVAL`, which reads to a caller as "no such policy in this ABI"
+and costs it the fallback it would have taken for a refusal with a name; a
+priority outside its band was answered `EOPNOTSUPP`, which reads as "correct
+request, cannot run it" when Linux refuses the argument itself. `SCHED_EXT` (7)
+was on the wrong side of both: a real policy number whose band answers 0, called
+a bad word at two of the three doors.
+
+**The mask belongs to the door, not to the number.** `SCHED_RESET_ON_FORK` is
+masked off `sched_setscheduler`'s word and served there; the same word is
+`EINVAL` at `sched_get_priority_max`, which switches on the raw number; and
+`sched_setattr`'s policy field is a plain number, with the reset behaviour in
+its `sched_flags` word. Three doors, three readings of one bit, each measured
+(`build/scratch/statpolicy/{d,e,f,g}.c`, 7.2.14).
+
+**Where it landed.** `src/syscall/linux/abi.rs`: `Policy`, `policy_number`,
+`scheduler_policy`, `policy_band`, `sched_setscheduler_verdict`,
+`sched_setattr_policy_verdict`, `priority_bound_verdict` (+3 host tests).
+`src/syscall/linux/posix.rs`: `handle_sched_setscheduler` reads the param's
+priority and asks the verdict; `handle_sched_setattr` reads the struct's
+`priority` at offset 20 and judges band then nice; the two `priority_bound`
+doors delegate to the table. Pin `user/tests/src/bin/t-sched-policy.rs` (21
+claims, host 21/21, machine 21/21, counterfactually 9 red).
+
+**Named gaps this does not close.** `SCHED_RESET_ON_FORK` is recognised and
+refused, not remembered (there is one policy to reset). `SCHED_BATCH`,
+`SCHED_IDLE` and `SCHED_EXT` are recognised and refused with `EOPNOTSUPP`;
+running them is the same named gap as running `SCHED_FIFO` - no priority bands,
+no real-time class. `sched_rr_get_interval` answers this kernel's own slice
+(4 ms) where the reference host answers its own (2 ms).

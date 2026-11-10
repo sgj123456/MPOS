@@ -438,7 +438,7 @@ One-glance status of the whole roadmap.
   plus the pid namespace it was minted in and answers `pid_vnr` — the number inside that namespace,
   `0` outside it. `t-stale-pid` (8 claims, **6 red** counterfactually, `build/boot-stalepid-cf1.log`)
   pins the allocator; the existing `t-signal-frame`, `t-udev-worker` and `t-cgroupfs` pins are the
-  witnesses for the doors (§6.121, item 232)
+  witnesses for the doors (§6.121, item 235)
 - [x] a pidfd can fetch a descriptor — `pidfd_getfd` duplicates the target's **open file
   description** into the caller's table, with Linux's refusal order (flags, pidfd, task,
   authority, target fd), `FD_CLOEXEC` unconditionally and `ESRCH` for a zombie or a leader
@@ -910,6 +910,28 @@ One-glance status of the whole roadmap.
   one base (argv, environment, `AT_EXECFN`), so the pin can assert the byte
   range `arg_start..arg_end` *is* this program's `argv` in order. Pinned by
   `t-stat-image` (11 claims, counterfactually 6 red) (§6.120, item 234)
+- [x] the `sched_*` policy word is a policy number with an optional flag, and the
+  band is judged before support — `sched_setscheduler`'s second argument is a
+  policy number with `SCHED_RESET_ON_FORK` OR-ed into it, and Linux masks the
+  flag off before it asks which policy the rest names. Around that word it asks
+  three separate questions in a measured order: is it a policy at all
+  (`0,1,2,3,5,6,7` after the mask, so `4` and `8+` are `EINVAL`; `6` is a policy
+  whose band is 0 but whose door is `sched_setattr`), is the priority inside
+  that policy's band (`1..=99` only for `FIFO`/`RR`), and can *this* kernel serve
+  it. This kernel had the first and the third crossed: `SCHED_BATCH`,
+  `SCHED_IDLE`, `SCHED_EXT` and `RESET|*` — four policies that exist — answered
+  `EINVAL`, "that is not a policy", where the honest answer is `EOPNOTSUPP`; and
+  an out-of-band `SCHED_FIFO`/`SCHED_RR` priority answered `EOPNOTSUPP` where
+  Linux refuses the argument itself. `sched_get_priority_max(7)` answered
+  `EINVAL` for a policy number Linux bands at 0, and `sched_setattr` never read
+  the struct's `priority` at all, so `sched_setattr(SCHED_OTHER, 1)` answered 0
+  and dropped it. The judgements are `abi.rs` verdicts now — `Policy`,
+  `scheduler_policy` (the one door that masks), `policy_band`, and three
+  `*_verdict` functions — and the handlers only read the caller's memory.
+  Pinned by `t-sched-policy` (21 claims, counterfactually 9 red); its two
+  `/proc/<pid>/stat` rows are *agreements*, not counterfactuals: `policy` field
+  agrees with `sched_getscheduler`, `rt_priority` and `processor` are honest
+  zeros of a scheduler with one band, one policy and one CPU (§6.122, item 236)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

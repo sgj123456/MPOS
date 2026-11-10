@@ -4011,6 +4011,156 @@ pub(crate) fn sched_setattr_size_verdict(size: u32) -> Result<(), isize> {
     Ok(())
 }
 
+/// `SCHED_RESET_ON_FORK`: the one flag a caller may OR into
+/// `sched_setscheduler`'s policy word. It is not a policy number - Linux masks
+/// it off the word before it reads which policy that is - and at the modern
+/// `sched_setattr` door the same behaviour travels in the struct's
+/// `sched_flags` word, *not* in its policy field: `build/scratch/statpolicy/f.c`
+/// measured `policy = RESET|SCHED_OTHER` refused with `EINVAL` there.
+pub(crate) const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+
+/// The scheduling policy a number names. The set is Linux's `valid_policy()`:
+/// `0, 1, 2, 3, 5, 6, 7`. The holes are not typos - 4 is unused, 6 is
+/// `SCHED_DEADLINE`, and 7 is `SCHED_EXT`, the extensible class that this
+/// kernel's own 7.2.14 reference host serves (`build/scratch/statpolicy/e.c`:
+/// `sched_get_priority_max(7) = 0`, while `policy 8` and `0x10000000` are
+/// `EINVAL` on every door).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Policy {
+    Other,
+    Fifo,
+    Rr,
+    Batch,
+    Idle,
+    Deadline,
+    Ext,
+}
+
+/// Reads a policy number with no flag handling - the reading
+/// `sched_get_priority_max`/`_min` and `sched_setattr` do.
+fn policy_number(word: usize) -> Result<Policy, isize> {
+    Ok(match word as u32 {
+        0 => Policy::Other,
+        1 => Policy::Fifo,
+        2 => Policy::Rr,
+        3 => Policy::Batch,
+        5 => Policy::Idle,
+        6 => Policy::Deadline,
+        7 => Policy::Ext,
+        _ => return Err(err::EINVAL),
+    })
+}
+
+/// `sched_setscheduler`'s reading of its policy word: the
+/// `SCHED_RESET_ON_FORK` bit comes off first, so `RESET|SCHED_OTHER` is a
+/// policy word and `RESET|8` still is not. `build/scratch/statpolicy/d.c`
+/// measured both (`RESET|OTHER` and `RESET|7` are served, `0x10000000` is
+/// `EINVAL`), and `f.c` measured that `sched_get_priority_max(RESET|0)` is
+/// `EINVAL`: this door masks the flag, its sibling switches on the raw word,
+/// so the mask belongs to the door rather than to the number.
+pub(crate) fn scheduler_policy(word: usize) -> Result<(Policy, bool), isize> {
+    let word = word as u32;
+    let flagged = word & SCHED_RESET_ON_FORK != 0;
+    Ok((
+        policy_number((word & !SCHED_RESET_ON_FORK) as usize)?,
+        flagged,
+    ))
+}
+
+/// The priority band a policy's tasks may name: `1..=99` for the two
+/// real-time policies, `0..=0` for everything else - `SCHED_DEADLINE`
+/// included, because `d.c` measured `sched_get_priority_max` answering 0 for
+/// it even though `sched_setscheduler` refuses the policy itself.
+pub(crate) fn policy_band(policy: Policy) -> (i32, i32) {
+    match policy {
+        Policy::Fifo | Policy::Rr => (1, 99),
+        _ => (0, 0),
+    }
+}
+
+/// What `sched_setscheduler` owes the policy word and the priority it read:
+/// `Ok(true)` serve it, `Ok(false)` refuse it with `EOPNOTSUPP` because the
+/// word names a policy this scheduler does not run, `Err` for a word or a
+/// priority that is not a request at all.
+///
+/// The order is the one `build/scratch/statpolicy/d.c` measured, one `fork`
+/// per case: the word first (`policy 8` is `EINVAL` whatever the priority),
+/// then the policy's own band (`SCHED_FIFO` at 0 and at 100 are both
+/// `EINVAL`, where 10 gets as far as authority and answers `EPERM`), and only
+/// then whether this kernel can serve it. So a priority outside the band is a
+/// bad argument, not a statement about support - and the policy a caller can
+/// name but this kernel cannot run is a statement about support, not a bad
+/// argument. Before §6.122 the handler answered `EINVAL` for `SCHED_BATCH`,
+/// `SCHED_IDLE`, `SCHED_EXT` and every `RESET|*` word (telling a caller its
+/// correct word was not a policy) and answered `EOPNOTSUPP` for `SCHED_FIFO`
+/// at priority 0 (telling it the argument was fine when Linux refuses it).
+pub(crate) fn sched_setscheduler_verdict(word: usize, priority: i32) -> Result<bool, isize> {
+    let (policy, flagged) = scheduler_policy(word)?;
+    // Deadline is a policy number whose band this door answers 0 for, and
+    // this door refuses the policy outright: Linux routes deadline through
+    // `sched_setattr`, so `DEADLINE` and `RESET|DEADLINE` are `EINVAL`.
+    if policy == Policy::Deadline {
+        return Err(err::EINVAL);
+    }
+    let (min, max) = policy_band(policy);
+    if !(min..=max).contains(&priority) {
+        return Err(err::EINVAL);
+    }
+    // The one policy this scheduler is - and only without the reset flag. A
+    // request to reset a forked child's policy is one this kernel would have
+    // to remember and cannot, so it is a refusal with a name rather than a
+    // zero that drops it.
+    Ok(policy == Policy::Other && !flagged)
+}
+
+/// What `sched_setattr` owes the in-struct policy word, priority and nice:
+/// `Ok(true)` apply the nice, `Ok(false)` `EOPNOTSUPP`, `Err` `EINVAL`.
+///
+/// This door reads its policy field *raw* - no reset-flag masking, because
+/// the flag travels in `sched_flags` here (`build/scratch/statpolicy/f.c`:
+/// `RESET|OTHER` is `EINVAL` at this door while `sched_setscheduler` serves
+/// the same word) - and it judges the band the same way (`g.c`:
+/// `OTHER`/`BATCH`/`IDLE`/`EXT` with priority 1, `RR` at 0 and `FIFO` at 100
+/// are all `EINVAL`). Before this the handler never read the priority at all,
+/// so `sched_setattr(SCHED_OTHER, priority 1)` was served with the priority
+/// silently dropped, and policy 7 was refused with `EINVAL` rather than the
+/// `EOPNOTSUPP` a policy number that exists deserves.
+pub(crate) fn sched_setattr_policy_verdict(
+    policy: usize,
+    priority: i32,
+    nice: i32,
+) -> Result<bool, isize> {
+    let policy = policy_number(policy)?;
+    if policy == Policy::Deadline {
+        return Err(err::EINVAL);
+    }
+    let (min, max) = policy_band(policy);
+    if !(min..=max).contains(&priority) {
+        return Err(err::EINVAL);
+    }
+    if policy != Policy::Other {
+        return Ok(false);
+    }
+    if !(-20..=19).contains(&nice) {
+        return Err(err::EINVAL);
+    }
+    Ok(true)
+}
+
+/// The number `sched_get_priority_max`/`_min` answers for a policy word: the
+/// end of its band, or `EINVAL` for a word that is not a policy number. The
+/// word is read raw here (`RESET|0` is `EINVAL`, `f.c`), where
+/// `sched_setscheduler` masks the flag off first.
+pub(crate) fn priority_bound_verdict(policy: usize, max: bool) -> isize {
+    match policy_number(policy) {
+        Ok(policy) => {
+            let (min, upper) = policy_band(policy);
+            if max { upper as isize } else { min as isize }
+        }
+        Err(e) => e,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7089,5 +7239,96 @@ mod diskstat_tests {
                 "size {size}"
             );
         }
+    }
+    /// The policy word is a policy number with an optional flag, and which
+    /// door masks the flag is part of the promise: `sched_setscheduler` does
+    /// (`RESET|OTHER` is served), the priority table does not
+    /// (`priority_max(RESET|OTHER)` is `EINVAL`). `build/scratch/statpolicy`
+    /// measured both on 7.2.14.
+    #[test]
+    fn the_policy_word_is_masked_by_the_door_and_not_by_the_number() {
+        assert_eq!(scheduler_policy(0), Ok((Policy::Other, false)));
+        assert_eq!(
+            scheduler_policy(SCHED_RESET_ON_FORK as usize),
+            Ok((Policy::Other, true))
+        );
+        assert_eq!(
+            scheduler_policy((SCHED_RESET_ON_FORK | 7) as usize),
+            Ok((Policy::Ext, true))
+        );
+        assert_eq!(scheduler_policy(3), Ok((Policy::Batch, false)));
+        assert_eq!(scheduler_policy(4), Err(err::EINVAL));
+        assert_eq!(scheduler_policy(8), Err(err::EINVAL));
+        assert_eq!(scheduler_policy(0x1000_0000), Err(err::EINVAL));
+        // The sibling door reads the raw word.
+        assert_eq!(priority_bound_verdict(7, true), 0);
+        assert_eq!(priority_bound_verdict(6, true), 0);
+        assert_eq!(
+            priority_bound_verdict(SCHED_RESET_ON_FORK as usize, true),
+            err::EINVAL
+        );
+        assert_eq!(priority_bound_verdict(8, false), err::EINVAL);
+        assert_eq!(priority_bound_verdict(1, true), 99);
+        assert_eq!(priority_bound_verdict(1, false), 1);
+    }
+
+    /// The door's three judgements in Linux's order: word, then band, then
+    /// whether this scheduler can serve the policy. `d.c` measured every row.
+    #[test]
+    fn the_scheduler_door_judges_the_band_before_it_judges_support() {
+        assert_eq!(sched_setscheduler_verdict(0, 0), Ok(true));
+        assert_eq!(sched_setscheduler_verdict(3, 0), Ok(false));
+        assert_eq!(sched_setscheduler_verdict(5, 0), Ok(false));
+        assert_eq!(sched_setscheduler_verdict(7, 0), Ok(false));
+        assert_eq!(
+            sched_setscheduler_verdict(SCHED_RESET_ON_FORK as usize, 0),
+            Ok(false)
+        );
+        // The band is a bad argument, whatever the policy could do.
+        assert_eq!(sched_setscheduler_verdict(1, 0), Err(err::EINVAL));
+        assert_eq!(sched_setscheduler_verdict(1, 100), Err(err::EINVAL));
+        assert_eq!(sched_setscheduler_verdict(2, 0), Err(err::EINVAL));
+        assert_eq!(sched_setscheduler_verdict(3, 1), Err(err::EINVAL));
+        assert_eq!(sched_setscheduler_verdict(0, 1), Err(err::EINVAL));
+        // A valid band gets as far as support.
+        assert_eq!(sched_setscheduler_verdict(1, 10), Ok(false));
+        assert_eq!(sched_setscheduler_verdict(2, 50), Ok(false));
+        // Deadline has its own door, and words that are not policies never
+        // reach the band at all.
+        assert_eq!(sched_setscheduler_verdict(6, 0), Err(err::EINVAL));
+        assert_eq!(
+            sched_setscheduler_verdict((SCHED_RESET_ON_FORK | 6) as usize, 0),
+            Err(err::EINVAL)
+        );
+        assert_eq!(sched_setscheduler_verdict(8, 0), Err(err::EINVAL));
+    }
+
+    /// The modern door reads its policy field raw and judges the band, which
+    /// it used not to read at all: `f.c`/`g.c` measured every row.
+    #[test]
+    fn the_attribute_door_reads_the_policy_field_without_the_flag() {
+        assert_eq!(sched_setattr_policy_verdict(0, 0, 0), Ok(true));
+        assert_eq!(sched_setattr_policy_verdict(0, 0, 5), Ok(true));
+        assert_eq!(sched_setattr_policy_verdict(1, 10, 0), Ok(false));
+        assert_eq!(sched_setattr_policy_verdict(3, 0, 0), Ok(false));
+        assert_eq!(sched_setattr_policy_verdict(5, 0, 0), Ok(false));
+        assert_eq!(sched_setattr_policy_verdict(7, 0, 0), Ok(false));
+        // The band, at both ends and in the middle.
+        assert_eq!(sched_setattr_policy_verdict(0, 1, 0), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(3, 1, 0), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(7, 1, 0), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(2, 0, 0), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(1, 100, 0), Err(err::EINVAL));
+        // Raw, so the flag this door carries elsewhere is not a policy here.
+        assert_eq!(
+            sched_setattr_policy_verdict(SCHED_RESET_ON_FORK as usize, 0, 0),
+            Err(err::EINVAL)
+        );
+        // Deadline and words above it.
+        assert_eq!(sched_setattr_policy_verdict(6, 0, 0), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(8, 0, 0), Err(err::EINVAL));
+        // The nice is the last judgement, and only OTHER carries one.
+        assert_eq!(sched_setattr_policy_verdict(0, 0, 20), Err(err::EINVAL));
+        assert_eq!(sched_setattr_policy_verdict(0, 0, -21), Err(err::EINVAL));
     }
 }

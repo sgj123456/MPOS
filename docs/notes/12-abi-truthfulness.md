@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, a pid number is a promise §6.121):** stage 1 `1256 tests,
+**Latest measured gate (2026-11-10, the `sched_*` policy word §6.122):** stage 1 `1259 tests, 0
+failed` (70.65 s); x86_64 `pass=286 fail=0 (286 built)`, `mpos-kunit 35 passed, 0 failed` (52.17 s,
+previous green 63.70 s); aarch64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed, 0 failed`
+(123.95 s) — `GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-schedpolicy.log`). One new program: `t-sched-policy` (21 claims), which fails 9 of
+them against the kernel before this change (`build/boot-schedpolicy-cf1.log`). Two rows of that pin
+are agreements rather than counterfactuals and are stated as such — `/proc/<pid>/stat`'s `policy`
+field agreeing with `sched_getscheduler`, and `rt_priority`/`processor` being 0 because this
+scheduler has one band, one policy and one CPU.
+
+**Measured gate before it (2026-11-10, a pid number is a promise §6.121):** stage 1 `1256 tests,
 0 failed` (63.50 s); x86_64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed, 0 failed`
 (47.42 s, previous green 47.61 s); aarch64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35 passed,
 0 failed` — `GATE EXIT=0`, both arms in one command with the lane count forced to two

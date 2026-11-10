@@ -575,16 +575,21 @@ pub fn handle_sched_getparam(args: [usize; ARG_COUNT], from_user: bool) -> isize
     0
 }
 
-/// `sched_setscheduler(pid, policy, param)` — the policy. `SCHED_OTHER` is
-/// the one this scheduler is, and setting it is the no-op success it is on
-/// Linux. The real-time policies are known but unservable - this
-/// scheduler has no priority inheritance, no bands above the four it
-/// schedules - and the errno for a known request no kernel beneath it can
-/// keep is EOPNOTSUPP.
+/// `sched_setscheduler(pid, policy, param)` — the policy word and the
+/// priority inside it, each judged before the other.
+///
+/// The word is a policy number *or* a policy number with
+/// `SCHED_RESET_ON_FORK` in it, and Linux masks the flag off before it reads
+/// which policy that is; the priority is then judged against that policy's
+/// band, and only then does the question of support arise. All three steps
+/// are [`abi::sched_setscheduler_verdict`]'s, whose doc carries the
+/// `build/scratch/statpolicy/d.c` measurements: this scheduler serves
+/// `SCHED_OTHER` alone, so `SCHED_BATCH`, `SCHED_IDLE`, `SCHED_EXT` and every
+/// `RESET|*` word answer `EOPNOTSUPP` ("present, cannot do that") rather than
+/// `EINVAL` ("that is not a policy"), while a priority outside the policy's
+/// band - including `SCHED_FIFO` at 0 - answers `EINVAL`, which is what
+/// Linux answers before it ever asks whether the caller may.
 pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const SCHED_OTHER: usize = 0;
-    const SCHED_FIFO: usize = 1;
-    const SCHED_RR: usize = 2;
     let (word, policy, param) = (args[0], args[1], args[2]);
     // The NULL-buffer guard runs before the pid lookup and before the policy
     // is examined (§6.115): a NULL param is EINVAL on every policy, not
@@ -592,34 +597,16 @@ pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> i
     if let Err(e) = sched_buffered_target(word, param) {
         return e;
     }
-    match policy {
-        // SCHED_OTHER is this scheduler, so switching to it is the success it
-        // is on Linux - but only with the priority zero the policy's band
-        // allows. Measured on a real host: `sched_setscheduler(0, SCHED_OTHER,
-        // &{.sched_priority = 5})` answers `EINVAL`, the same answer
-        // `sched_setparam` gives for a nonzero priority. Returning `0` while
-        // ignoring the param was an accept-and-drop - a caller that set a
-        // priority and read `sched_getparam` to confirm it would have been
-        // handed a `0` that was never actually asked for. The `EFAULT`/range
-        // checks mirror `setparam` exactly.
-        SCHED_OTHER => {
-            if param == 0 || !buffer_ok(param, 4, false, from_user) {
-                return err::EFAULT;
-            }
-            if unsafe { (param as *const i32).read_unaligned() } != 0 {
-                return err::EINVAL;
-            }
-            0
-        }
-        // The param is still validated for the refused policies, the same
-        // way Linux validates before refusing with EPERM.
-        SCHED_FIFO | SCHED_RR => {
-            if param != 0 && !buffer_ok(param, 4, false, from_user) {
-                return err::EFAULT;
-            }
-            err::EOPNOTSUPP
-        }
-        _ => err::EINVAL,
+    // A readable param is judged before the policy word: Linux copies the
+    // struct first, so a bad non-NULL pointer is EFAULT on every policy.
+    if !buffer_ok(param, 4, false, from_user) {
+        return err::EFAULT;
+    }
+    let priority = unsafe { (param as *const i32).read_unaligned() };
+    match super::abi::sched_setscheduler_verdict(policy, priority) {
+        Ok(true) => 0,
+        Ok(false) => err::EOPNOTSUPP,
+        Err(e) => e,
     }
 }
 
@@ -633,30 +620,18 @@ pub fn handle_sched_getscheduler(args: [usize; ARG_COUNT]) -> isize {
 }
 
 /// `sched_get_priority_max(policy)` / `sched_get_priority_min(policy)` —
-/// the priority range a policy's band allows, in the table the man page
-/// spells. SCHED_OTHER and its batch and idle relatives run at the static
-/// zero; the real-time policies would span 1..99, and the answer here is
-/// the table's, whatever the scheduler does with it.
+/// the end of a policy's band, in the table Linux spells: SCHED_OTHER, its
+/// batch, idle and ext relatives and SCHED_DEADLINE all answer 0, the two
+/// real-time policies span 1..99. This door reads the word raw, unlike
+/// `sched_setscheduler`: `build/scratch/statpolicy/f.c` measured
+/// `priority_max(RESET|SCHED_OTHER)` as `EINVAL`, so a flag that makes a
+/// policy word at the other door makes a bad word here.
 pub fn handle_sched_get_priority_max(args: [usize; ARG_COUNT]) -> isize {
-    priority_bound(args[0], true)
+    super::abi::priority_bound_verdict(args[0], true)
 }
 
 pub fn handle_sched_get_priority_min(args: [usize; ARG_COUNT]) -> isize {
-    priority_bound(args[0], false)
-}
-
-fn priority_bound(policy: usize, max: bool) -> isize {
-    match policy {
-        0 | 3 | 5 | 6 => 0, // SCHED_OTHER, BATCH, IDLE, DEADLINE
-        1 | 2 => {
-            if max {
-                99
-            } else {
-                1
-            }
-        } // SCHED_FIFO, SCHED_RR
-        _ => err::EINVAL,
-    }
+    super::abi::priority_bound_verdict(args[0], false)
 }
 
 /// `sched_rr_get_interval(pid, tp)` — the round-robin slice, as the
@@ -693,9 +668,11 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
 ///    handler answered `EINVAL` for every short size and accepted sizes
 ///    above a page;
 /// 4. the pid lookup (`ESRCH` when it names nobody);
-/// 5. `SCHED_OTHER` with the zero priority and an in-range nice is the
-///    accepted shape; the deadline policies are known but unservable, and
-///    the answer is the same `EOPNOTSUPP` the plain family gives.
+/// 5. the in-struct policy word and priority, judged by
+///    [`super::abi::sched_setattr_policy_verdict`]: `SCHED_OTHER` with the
+///    zero priority and an in-range nice is the accepted shape, the other
+///    policies this scheduler does not run (`1`, `2`, `3`, `5`, `7`) answer
+///    `EOPNOTSUPP`, and `SCHED_DEADLINE` (6) or a word above 7 is `EINVAL`.
 pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (word, attr, flags) = (args[0], args[1], args[2]);
     // The NULL-buffer guard runs before the pid lookup (§6.115): a NULL attr
@@ -712,11 +689,12 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     if !buffer_ok(attr, super::abi::SCHED_ATTR_SIZE_V1, false, from_user) {
         return err::EFAULT;
     }
-    let (size, policy, nice) = unsafe {
+    let (size, policy, nice, priority) = unsafe {
         (
             (attr as *const u32).read_unaligned(),
             ((attr + 4) as *const u32).read_unaligned(),
             ((attr + 16) as *const i32).read_unaligned(),
+            ((attr + 20) as *const u32).read_unaligned() as i32,
         )
     };
     // The in-struct size guard also beats the lookup: `q.c` measured E2BIG
@@ -729,24 +707,26 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         Ok(target) => target,
         Err(e) => return e,
     };
-    match policy {
-        // SCHED_OTHER: apply the nice to the same per-task slot `setpriority`
-        // writes and `sched_getattr` reads, so the value is real and round-trips
-        // - B5's fix for `getpriority` applied to this modern door. Returning `0`
-        // while dropping the nice (as this arm used to) was the §4.2
-        // success-for-a-thing-not-done. The scheduler's bands stay the policy's,
-        // so the nice carries no weight effect here (the named sub-gap
-        // `setpriority` shares), but the stored value is honest.
-        0 if (-20..=19).contains(&nice) => {
+    // The in-struct policy field and priority are judged as Linux judges them
+    // - raw policy number, band before support (`build/scratch/statpolicy/g.c`
+    // measured `OTHER`/`BATCH`/`IDLE`/`EXT` at priority 1, `RR` at 0 and
+    // `FIFO` at 100 as `EINVAL`, and `f.c` measured that this door does not
+    // mask `SCHED_RESET_ON_FORK` out of the field). SCHED_OTHER then applies
+    // the nice to the same per-task slot `setpriority` writes and
+    // `sched_getattr` reads, so the value is real and round-trips - B5's fix
+    // for `getpriority` applied to this modern door. Returning `0` while
+    // dropping the nice (as this arm once did) was the §4.2
+    // success-for-a-thing-not-done.
+    match super::abi::sched_setattr_policy_verdict(policy as usize, priority, nice) {
+        Ok(true) => {
             if crate::sched::set_nice(target, nice) {
                 0
             } else {
                 err::ESRCH
             }
         }
-        0 => err::EINVAL,
-        1..=6 => err::EOPNOTSUPP,
-        _ => err::EINVAL,
+        Ok(false) => err::EOPNOTSUPP,
+        Err(e) => e,
     }
 }
 
