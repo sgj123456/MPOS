@@ -9602,3 +9602,132 @@ no-op says too. Only the claims that name *what a pin does* are red.
 way this family was found is the way it will be found again — by measuring
 the *limit* and the *refusals*, not the happy path, because the happy path is
 the one thing a stub and a kernel agree on.
+
+---
+
+### 6.120 `/proc/<pid>/stat`'s data, break and string addresses
+
+Fields 45-51 (`start_data`, `end_data`, `start_brk`, `arg_start`, `arg_end`,
+`env_start`, `env_end`) were seven literal `Cow::Borrowed("0")` in
+`src/vfs/procfs.rs`'s `stat_fields`. They are the other half of §6.117's
+`ImageBounds`: the same ELF load knows all of them, and the same `exec`
+replaces them.
+
+**What Linux answers, from its own source.** `fs/binfmt_elf.c`'s
+program-header walk is one loop with five accumulators:
+
+```c
+k = elf_ppnt->p_vaddr;
+if ((p_flags & PF_X) && k < start_code) start_code = k;
+if (start_data < k) start_data = k;
+k = elf_ppnt->p_vaddr + elf_ppnt->p_filesz;
+if ((p_flags & PF_X) && end_code < k) end_code = k;
+if (end_data < k) end_data = k;
+k = elf_ppnt->p_vaddr + elf_ppnt->p_memsz;
+if (k > elf_brk) elf_brk = k;
+```
+
+then `mm->start_brk = mm->brk = ELF_PAGEALIGN(elf_brk)`. So `start_data` is
+the maximum `p_vaddr`, `end_data` the maximum `p_vaddr + p_filesz`, and
+`start_brk` the page-aligned maximum `p_vaddr + p_memsz`.
+
+The four string fields come from `create_elf_tables`, which walks one cursor
+`p` upward through the strings it just copied: `mm->arg_start = p` before the
+`argv` loop, `mm->arg_end = p` after it, `mm->env_end = mm->env_start = p`
+immediately after that, and `mm->env_end = p` after the environment loop.
+**`arg_end` and `env_start` are the same address**, and the strings run
+ascending - `argv` in order, then the environment, then the `AT_EXECFN` path.
+
+**Measured on the host** (Linux 7.2.14, `build/scratch/stataddr/`):
+
+| probe | what it read |
+|---|---|
+| `a.c` (static) | `startcode=401000 endcode=47fa3d start_data=4b5168 end_data=4baa18 start_brk=4c1000`, `arg_start=…75e arg_end=…762 env_start=…762 env_end=…ff4` |
+| `a.c` after `malloc(1 MiB)` + 8 KiB local | **all seven unchanged** - they are a record, not a live view |
+| `b.c` | `arg_start == argv[0]`, `env_start == environ[0]`, `env_end - env_start == 2194 == sum(strlen(env)+1)`, `sbrk(0)` (`0x2d4df000`) ≠ `start_brk` (`0x2d4bd000`) |
+| `c.c` `./c alpha beta gamma` | `argv[0] < argv[1] < argv[2] < argv[3]` - **ascending**, `arg_start == argv[0]`, `env_start == arg_end` |
+| `d.c` | `AT_EXECFN == env_end` (`execfn - env_end = 0`) |
+| `e.c` (dynamic) | `start_data=…7dd0 end_data=…8050 start_brk=…9000` - the **program's** loads, not the interpreter's |
+| `zombiev/z.c` | a zombie's seven are `0` |
+
+Against `readelf -lW a`'s loads (`0x400000 FileSiz 0x518`, `0x401000
+0x7ea3d`, `0x480000 0x344e0`, `0x4b5168 FileSiz 0x58b0 MemSiz 0xb180`) each
+of the six image rules reproduces its measured value exactly: `max(p_vaddr) =
+0x4b5168`, `0x4b5168 + 0x58b0 = 0x4baa18`, `PAGE_ALIGN(0x4b5168 + 0xb180) =
+0x4c1000`.
+
+**The layout this kernel had was not Linux's.** `write_arg_block` wrote the
+strings *downward* from the top of the block: `argv` first, so `argv[0]` ended
+up highest, then the environment below it, then `AT_EXECFN` lowest. The
+resulting order, low to high, was `[execfn][env…][argv…]` - which is not only
+the reverse of Linux's but makes `start_data`-style reporting impossible to do
+honestly: any `arg_start`/`env_end` pair read off that layout describes an
+argument area *above* the environment, which no Linux program expects and
+which would put `arg_start > env_end`.
+
+So the fix is in two places, and the second is the load-bearing one:
+
+- **`src/sched/runtime/load.rs`** - `write_arg_block` now sums the three
+  string areas first (`argv_bytes`, `env_bytes`, `execfn_bytes`), computes
+  `string_at = random_at - total`, and then writes **upward**: `argv` in
+  order, the environment, then `AT_EXECFN`. `arg_start` is where the first
+  string landed, `arg_end`/`env_start` are the cursor after the last argument,
+  `env_end` the cursor after the last environment entry. The four are returned
+  in an `ArgBounds` and merged into the same `ImageBounds` the reader takes
+  the image addresses from.
+- **`src/sched/runtime/load.rs`** - `load_user`'s program-header walk now
+  feeds all five accumulators from the same loop over `image.segments` (the
+  main image only, as `load_elf_binary` does), producing `start_data`,
+  `end_data` and `start_brk` alongside the two it already had.
+- **`src/mm/vma.rs`** - `ImageBounds` grows from three fields to ten, plus an
+  `ArgBounds` and `with_strings`, so a reader still takes the whole record as
+  one value. `Mm` stores it under **one lock** rather than the three atomics it
+  had: a `fork`/`exec` replacing the record while a reader took the fields one
+  at a time would report `arg_start` from one program and `env_end` from
+  another, and Linux has the same shape for the same reason.
+- **`src/vfs/procfs.rs`** - fields 45-51 render from `task.image` through the
+  existing `address_word`. A zombie's `ImageBounds::default()` is already all
+  zeros by the time it gets there (§6.117's branch).
+
+**Pin:** `user/tests/src/bin/t-stat-image.rs`, 11 claims. The two that carry
+the layout are the byte-level ones: the range `arg_start..arg_end` must *be*
+this program's `argv`, NUL-separated and in order, and the range
+`env_start..env_end` must be entries each containing `=`. A hardcoded zero
+fails them; so does the old descending layout, because the bytes between its
+bounds do not read as the arguments in order. The other witnesses: all seven
+non-zero and inside user space, `end_data >= start_data`, `start_brk`
+page-aligned and at or above `end_data`, all four string bounds inside the
+`[stack]` mapping, a `malloc(1 MiB)` moving none of the seven, a forked child
+reporting the parent's seven, and a zombie reporting seven zeros.
+
+Green on host (`MPOS_ON_HOST=1`) and on the machine
+(`build/boot-statimage1.log`, `build/boot-statimage2.log`).
+
+**Counterfactual:** the six source files stashed, kernel and loader rebuilt
+(`4345 KiB -> 1160 KiB` against `4337 KiB -> 1153 KiB`), booted -
+**6 of 11 red** (`build/boot-statimage-cf1.log`):
+
+```
+FAIL:  the seven fields are addresses, not zeros
+FAIL:  the data segment ends at or above where it starts
+FAIL:  the bytes from arg_start to arg_end are this program's argv
+FAIL:  and argv[0] is the first string, so the strings ascend
+FAIL:  and the bytes from env_start to env_end are environment entries
+FAIL:  all four string bounds are inside the stack's mapping
+FAILED
+```
+
+The five that stay green are the honest limit, and each for its own reason: a
+page-aligned `0` is still page-aligned; `env_start == arg_end` holds trivially
+when both are `0`; none of the seven moves under a `malloc` when all seven are
+constants; a forked child inherits the parent's zeros as it inherits anything
+else; and a zombie's seven zeros are what the counterfactual kernel says for
+every task. Only the claims that name *what the numbers are* are red.
+
+**The rule.** Two readers of one record must not each own half of it. The
+temptation here was to report `arg_start`/`env_end` off the existing
+descending layout - which "works" in the sense that both are addresses inside
+the stack, and fails in the sense that a Linux program scanning
+`arg_start..arg_end` would read its environment instead of its arguments. The
+layout had to move to Linux's before the numbers could be Linux's; the fields
+were the instrument that showed it.

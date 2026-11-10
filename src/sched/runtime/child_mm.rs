@@ -1772,29 +1772,35 @@ pub struct Mm {
     /// which is what `getrusage(RUSAGE_CHILDREN)` reports.
     pub(crate) cnvcsw: core::sync::atomic::AtomicU64,
     pub(crate) cnivcsw: core::sync::atomic::AtomicU64,
-    /// Where the program image sits in this address space, and where its stack
-    /// pointer started: the three absolute addresses `/proc/<pid>/stat` fields
-    /// 26-28 report as `startcode`, `endcode` and `startstack`.
+    /// Where the program image sits in this address space: the ten absolute
+    /// addresses `/proc/<pid>/stat` reports as fields 26-28 and 45-51.
     ///
-    /// Recorded at load rather than derived, because none of the three is
+    /// One lock over the whole record, not ten atomics, because the record is
+    /// read as a set: a `fork`/`exec` that replaced it while a reader took the
+    /// fields one at a time would report `arg_start` from one program and
+    /// `env_end` from another. Linux has the same shape for the same reason -
+    /// `fs/binfmt_elf.c` writes the `mm`'s fields back to back and
+    /// `fs/proc/task_mmu.c` prints them back.
+    ///
+    /// Recorded at load rather than derived, because none of them is
     /// recoverable from the mapping tables. `endcode` is `p_filesz`'s end, not
     /// the page the text *occupies* - a segment with a 1 MiB `.bss` behind it
     /// still ends at `start_code + p_filesz` (measured:
     /// `build/scratch/statcode/x.c`, a single `RWE` load with `FileSiz 0x640`
-    /// and `MemSiz 0x100648` reads `endcode - startcode = 0x640`). And
-    /// `startstack` is the `rsp` the process was *entered* with, which no
-    /// current register and no `[stack]` VMA boundary answers: measured
+    /// and `MemSiz 0x100648` reads `endcode - startcode = 0x640`). `startstack`
+    /// is the `rsp` the process was *entered* with, which no current register
+    /// and no `[stack]` VMA boundary answers: measured
     /// `build/scratch/statcode/start.S`, a program that saves `%rsp` in its
     /// first instruction reads exactly that value back out of `/proc/self/stat`
-    /// while its own `main` is 5024 bytes deeper.
+    /// while its own `main` is 5024 bytes deeper. And `start_brk` is the
+    /// page-aligned end of the image's `p_memsz`, not the live break: measured
+    /// `build/scratch/stataddr/a.c`, a `malloc(1 MiB)` leaves it where it was.
     ///
-    /// `fork` copies all three - a child's address space is its parent's, and
-    /// Linux's `copy_mm` takes `start_code`/`end_code`/`start_stack` with it
-    /// (`build/scratch/statcode/inherit2.c`) - while `execve` replaces them
-    /// with the new image's. A task with no user address space keeps zeros.
-    pub(crate) start_code: core::sync::atomic::AtomicUsize,
-    pub(crate) end_code: core::sync::atomic::AtomicUsize,
-    pub(crate) start_stack: core::sync::atomic::AtomicUsize,
+    /// `fork` copies the whole record - a child's address space is its
+    /// parent's, and Linux's `copy_mm` takes these with it
+    /// (`build/scratch/statcode/inherit2.c`) - while `execve` replaces it with
+    /// the new image's. A task with no user address space keeps zeros.
+    pub(crate) image: Mutex<RefCell<ImageBounds>>,
     /// Whether `mlockall(MCL_FUTURE)` is in force: for this group every mapping
     /// made from now on is locked as it is made, which is Linux's
     /// `mm->def_vma_flags`' `VM_LOCKED` bit.
@@ -1880,34 +1886,24 @@ impl Mm {
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             cnvcsw: core::sync::atomic::AtomicU64::new(0),
             cnivcsw: core::sync::atomic::AtomicU64::new(0),
-            start_code: core::sync::atomic::AtomicUsize::new(image.start_code),
-            end_code: core::sync::atomic::AtomicUsize::new(image.end_code),
-            start_stack: core::sync::atomic::AtomicUsize::new(image.start_stack),
+            image: Mutex::new(RefCell::new(image)),
             lock_future: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Take another address space's image bounds: what `fork` and
     /// `clone(CLONE_VM)` do, whose child is running the same program from the
-    /// same stack. Linux's `copy_mm` copies `start_code`, `end_code` and
-    /// `start_stack` with the rest of the `mm`, so a child's report is its
-    /// parent's down to these three addresses
-    /// (`build/scratch/statcode/inherit2.c`).
+    /// same stack. Linux's `copy_mm` copies the `mm`'s image addresses with
+    /// the rest of it, so a child's report is its parent's down to these ten
+    /// addresses (`build/scratch/statcode/inherit2.c`).
     pub(crate) fn set_image_bounds(&self, bounds: ImageBounds) {
-        let ordering = Ordering::Relaxed;
-        self.start_code.store(bounds.start_code, ordering);
-        self.end_code.store(bounds.end_code, ordering);
-        self.start_stack.store(bounds.start_stack, ordering);
+        critical_section::with(|cs| *self.image.borrow(cs).borrow_mut() = bounds);
     }
 
-    /// This address space's image bounds, for a child about to inherit them.
+    /// This address space's image bounds, for a child about to inherit them and
+    /// for the ten `stat` fields that report them.
     pub(crate) fn image_bounds(&self) -> ImageBounds {
-        let ordering = Ordering::Relaxed;
-        ImageBounds {
-            start_code: self.start_code.load(ordering),
-            end_code: self.end_code.load(ordering),
-            start_stack: self.start_stack.load(ordering),
-        }
+        critical_section::with(|cs| *self.image.borrow(cs).borrow())
     }
 
     /// Put a whole VMA table in place: what `fork` hands its child, whose

@@ -412,23 +412,87 @@ impl Vma {
     }
 }
 
-/// The three absolute addresses of a loaded program image that
-/// `/proc/<pid>/stat` reports as `startcode`, `endcode` and `startstack`, plus
-/// the two page books those addresses split.
+/// The absolute addresses of a loaded program image that `/proc/<pid>/stat`
+/// reports as fields 26–28 and 45–51, plus the two page books those addresses
+/// split.
 ///
-/// One value rather than three fields threaded separately: the loader is the
-/// only place that knows the addresses, and every construction site that takes
-/// them has to take all three or a process would report a coherent-looking mix
-/// of two programs. Host-compiled so `/proc`'s rendering can be unit-tested
-/// against values that came from a real load.
+/// One value rather than ten fields threaded separately, and stored under one
+/// lock rather than ten atomics: the loader is the only place that knows the
+/// addresses, and a reader that took them one at a time could report a
+/// coherent-looking mix of two programs across a `fork`/`exec`. Host-compiled
+/// so `/proc`'s rendering can be unit-tested against values that came from a
+/// real load.
 ///
-/// What each means, and the measurements behind each, is
-/// [`crate::sched::Mm`]'s `start_code`/`end_code`/`start_stack`.
+/// Every field is a *placed* address (the load bias is already added) and a
+/// record of what the load did, not a live view: `start_brk` does not move as
+/// the heap grows and `env_end` does not move as the program scribbles on its
+/// stack. That is Linux's own shape - `fs/binfmt_elf.c` writes these into the
+/// `mm` once per `exec`, and `fs/proc/task_mmu.c` prints them back. Measured,
+/// `build/scratch/stataddr/a.c`: a `malloc(1 MiB)` and an 8 KiB local leave
+/// all of them unchanged.
+///
+/// What each means, and the measurement behind each, is
+/// [`crate::sched::Mm`]'s `image` field.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ImageBounds {
+    /// Field 26: the lowest `PF_X` segment's `p_vaddr`.
     pub start_code: usize,
+    /// Field 27: the highest `PF_X` segment's `p_vaddr + p_filesz`. File
+    /// bytes, not memory bytes - a single `RWE` load with `FileSiz 0x640` and
+    /// a 1 MiB `.bss` behind it reads `endcode - startcode = 0x640`.
     pub end_code: usize,
+    /// Field 28: the `rsp` the program was entered with.
     pub start_stack: usize,
+    /// Field 45: the highest `p_vaddr` over every `PT_LOAD` - the data
+    /// segment's linked start, unaligned.
+    pub start_data: usize,
+    /// Field 46: the highest `p_vaddr + p_filesz` over every `PT_LOAD`.
+    pub end_data: usize,
+    /// Field 47: the page-aligned end of the highest `p_vaddr + p_memsz`,
+    /// which is where `brk(0)` answered before the program ran.
+    pub start_brk: usize,
+    /// Field 48: the lowest `argv` string.
+    pub arg_start: usize,
+    /// Field 49: one past the last byte of the highest `argv` string, which
+    /// is exactly `env_start`.
+    pub arg_end: usize,
+    /// Field 50: the lowest environment string.
+    pub env_start: usize,
+    /// Field 51: one past the last byte of the highest environment string.
+    pub env_end: usize,
+}
+
+impl ImageBounds {
+    /// Add the four string bounds the argument block only learns once it has
+    /// been built.
+    ///
+    /// Two steps rather than one because the addresses come from two places:
+    /// the image's addresses from the ELF load, the string bounds from the
+    /// entry block written afterwards on the same stack. Both end up in the
+    /// same record so a reader still takes them as one value.
+    pub fn with_strings(mut self, strings: ArgBounds) -> Self {
+        self.arg_start = strings.arg_start;
+        self.arg_end = strings.arg_end;
+        self.env_start = strings.env_start;
+        self.env_end = strings.env_end;
+        self
+    }
+}
+
+/// The four string addresses the entry block places on the user stack, which
+/// `/proc/<pid>/stat` reports as fields 48-51.
+///
+/// They are produced by the writer that lays the strings out and consumed by
+/// the reader that prints them, so they travel as one value: `arg_end` and
+/// `env_start` are the same address by construction, and a reader that took
+/// them separately could report an argument area that overlaps the
+/// environment's.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ArgBounds {
+    pub arg_start: usize,
+    pub arg_end: usize,
+    pub env_start: usize,
+    pub env_end: usize,
 }
 
 /// Which of `/proc/<pid>/status`'s `Vm*` books one mapping is counted in.

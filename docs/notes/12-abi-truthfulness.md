@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-10, the `mlock` family §6.119):** stage 1 `1255 tests,
+**Latest measured gate (2026-11-10, `stat`'s data, break and string addresses §6.120):** stage 1
+`1255 tests, 0 failed` (61.72 s); x86_64 `pass=285 fail=0 (285 built)`, `mpos-kunit 35 passed,
+0 failed` (61.92 s, previous green 65.11 s); aarch64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35
+passed, 0 failed` (181.79 s, previous green 192.03 s) — `GATE EXIT=0`, both arms in one command
+with the lane count forced to two (`build/gate-statimage2.log`). The new program is the point:
+`t-stat-image` (11 claims) runs on both machines and fails 6 of them against the previous kernel
+(`build/boot-statimage-cf1.log`). One earlier gate on this change
+(`build/gate-statimage.log`) was green on the same numbers before the argument block's layout
+assertion was tightened from a debug-only check to an equality; the tree then changed, so the gate
+and the pin's machine boot were both re-run rather than quoted from the stale run.
+
+**Measured gate before it (2026-11-10, the `mlock` family §6.119):** stage 1 `1255 tests,
 0 failed` (48.02 s); x86_64 `pass=284 fail=0 (284 built)`, `mpos-kunit 35 passed, 0 failed`;
 aarch64 `pass=283 fail=0 (283 built)`, `mpos-kunit 35 passed, 0 failed` — `GATE EXIT=0` on the
 x86_64 arm (`build/gate-mlock-x1.log`), and the aarch64 arm green inside the combined run

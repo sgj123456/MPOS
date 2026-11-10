@@ -1756,7 +1756,7 @@ pub fn exec_replace(
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
-        let loaded = load_user(
+        let mut loaded = load_user(
             &mut space,
             &image,
             interp.as_ref(),
@@ -1766,7 +1766,7 @@ pub fn exec_replace(
             user_rsp,
         );
 
-        write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
 
         // --- Reset process state ---
         //

@@ -10296,3 +10296,42 @@ pinned range), `src/sched/runtime/child_exit.rs` (fork clears the bits),
 `Locked:`). **Pins:** `user/tests/src/bin/t-mlock.rs`, 25 claims, counter-
 factually **13 red** (`build/boot-mlock-cf1.log`), green on host and machine.
 Measurement and reasoning: `docs/notes/` §6.119.
+
+### Item 234 — `/proc/<pid>/stat` fields 45-51: the data segment, the break and the string bounds
+
+Seven fields that were literal zeros now answer from the load record.
+
+| field | name | was | now |
+|---|---|---|---|
+| 45 | `start_data` | `0` | the highest `p_vaddr` over the main image's `PT_LOAD`s |
+| 46 | `end_data` | `0` | the highest `p_vaddr + p_filesz` |
+| 47 | `start_brk` | `0` | `PAGE_ALIGN(highest p_vaddr + p_memsz)` |
+| 48 | `arg_start` | `0` | the lowest `argv` string's address |
+| 49 | `arg_end` | `0` | one past the last byte of the highest `argv` string |
+| 50 | `env_start` | `0` | the lowest environment string's address (= `arg_end`) |
+| 51 | `env_end` | `0` | one past the last byte of the highest environment string |
+
+**Why these are a record and not a live view.** All seven are written once at
+`exec` and never again - a `malloc(1 MiB)` moves none of them, and `sbrk(0)`
+is not `start_brk` (`build/scratch/stataddr/a.c`, `b.c`). A reader that
+substituted the live break or a VMA boundary would answer a question nobody
+asked.
+
+**Why the string fields forced the entry block to change.** `arg_end` and
+`env_start` are the same address in Linux because `create_elf_tables` walks
+one cursor upward through `argv` then the environment, recording both bounds
+from it. This kernel's `write_arg_block` wrote the strings *downward*, placing
+`argv[0]` highest and the environment below it - a layout where any
+`arg_start`/`env_end` pair read honestly would report an argument area above
+the environment. The strings now ascend from one base, `argv` in order then
+the environment then `AT_EXECFN`, which is Linux's order and the only one in
+which these four numbers can be right.
+
+**Landed.** `src/mm/vma.rs` (`ImageBounds` grown to ten fields, new
+`ArgBounds`, `with_strings`), `src/sched/runtime/load.rs` (the five-accumulator
+program-header walk, and `write_arg_block`'s upward layout returning the four
+bounds), `src/sched/runtime/child_mm.rs` (`Mm::image` as one locked record in
+place of three atomics), `src/vfs/procfs.rs` (fields 45-51 render from it).
+**Pin:** `user/tests/src/bin/t-stat-image.rs`, 11 claims, counterfactually
+**6 red** (`build/boot-statimage-cf1.log`), green on host and machine.
+Measurement and reasoning: `docs/notes/` §6.120.

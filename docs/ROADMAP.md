@@ -896,6 +896,18 @@ One-glance status of the whole roadmap.
   inherits none of it — `dup_mmap` clears the bit and the child can `munlock` what it
   never pinned. Pinned by `t-mlock` (25 claims, counterfactually 13 red) (§6.119,
   item 233)
+- [x] `/proc/<pid>/stat`'s data segment, break and string bounds are the load's
+  record — fields 45-51 were seven literal zeros while §6.117 had already given
+  the image addresses the record they come from. All seven are written once at
+  `exec` and never again: a `malloc(1 MiB)` moves none of them and `sbrk(0)` is
+  not `start_brk`. The four string fields forced a change this kernel needed
+  anyway — `arg_end` and `env_start` are *the same address* in Linux because
+  `create_elf_tables` walks one cursor upward through `argv` then the
+  environment, and this kernel's entry block wrote them downward, putting
+  `argv[0]` highest and the environment below it. The strings now ascend from
+  one base (argv, environment, `AT_EXECFN`), so the pin can assert the byte
+  range `arg_start..arg_end` *is* this program's `argv` in order. Pinned by
+  `t-stat-image` (11 claims, counterfactually 6 red) (§6.120, item 234)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

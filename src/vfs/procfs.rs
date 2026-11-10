@@ -1842,13 +1842,20 @@ fn stat_fields(task: &Process, tid: usize, whole: bool) -> [alloc::borrow::Cow<'
         Cow::Borrowed("0"), // delayacct_blkio_ticks
         Cow::Borrowed("0"), // guest_time
         Cow::Borrowed("0"), // cguest_time
-        Cow::Borrowed("0"), // start_data
-        Cow::Borrowed("0"), // end_data
-        Cow::Borrowed("0"), // start_brk
-        Cow::Borrowed("0"), // arg_start
-        Cow::Borrowed("0"), // arg_end
-        Cow::Borrowed("0"), // env_start
-        Cow::Borrowed("0"), // env_end
+        // Fields 45-51: where the image was loaded and where its entry block's
+        // strings sit, all recorded at load. Linux writes them from
+        // `fs/binfmt_elf.c`'s program-header walk once per `exec` and prints
+        // them back unchanged - `build/scratch/stataddr/a.c`, where a
+        // `malloc(1 MiB)` moves none of the seven. A zombie has no `mm` and
+        // reads seven zeros (`build/scratch/zombiev/z.c`), which is what
+        // `ImageBounds::default` already carries by the time it gets here.
+        Cow::Owned(address_word(task.image.start_data)),
+        Cow::Owned(address_word(task.image.end_data)),
+        Cow::Owned(address_word(task.image.start_brk)),
+        Cow::Owned(address_word(task.image.arg_start)),
+        Cow::Owned(address_word(task.image.arg_end)),
+        Cow::Owned(address_word(task.image.env_start)),
+        Cow::Owned(address_word(task.image.env_end)),
         // exit_code (field 52): the encoded wait status of this task's death,
         // computed once by `retired_status` from the `Retired` record. A live
         // task has no record and reads `0`, which is also what Linux reads for
@@ -5511,6 +5518,7 @@ mod tests {
             start_code: 0x55a3_e90f_c000,
             end_code: 0x55a3_e90f_c4f5,
             start_stack: 0x7ffc_8266_d990,
+            ..crate::mm::ImageBounds::default()
         };
         let line = stat_text(&stat_fields(&p, p.tid, true), p.pid);
         let fields: alloc::vec::Vec<&str> = line.split(' ').skip(2).collect();
@@ -5545,6 +5553,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x40_053f,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 3), (4, 8));
         // A: two adjacent executable pages at 0x400000 - one VMA once ld has
@@ -5553,6 +5562,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x40_2000,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 4), (8, 8));
         // D: one page at 0x400000 and two at 0x500000. The book is three pages
@@ -5561,6 +5571,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x50_2000,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 5), (20, 0));
         // C is the same rule with a six-page second segment: `VmExe 36`.
@@ -5568,6 +5579,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x50_6000,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 9), (36, 0));
         // The `twos` probe: two *one-page* segments 1 MiB apart report 16 kB,
@@ -5577,6 +5589,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x50_000a,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 4), (16, 0));
         // A task with no executable mapping at all: no book, so no split.
@@ -5590,6 +5603,7 @@ mod tests {
             start_code: 0x401_000,
             end_code: 0x401_4f5,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         assert_eq!(text_and_lib_kb(bounds, 1), (4, 0));
     }
@@ -5607,6 +5621,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x40_053f,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         // `data` is the stack's book *plus* the data book (84), which is what
         // `d.c` reads at rest - not `VmData`'s 51 on its own.
@@ -5622,6 +5637,7 @@ mod tests {
             start_code: 0x40_0000,
             end_code: 0x90_000a,
             start_stack: 0,
+            ..crate::mm::ImageBounds::default()
         };
         task.books = (2, 33, 1);
         assert_eq!(text_span_pages(task.image), 1281);

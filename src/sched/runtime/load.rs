@@ -17,7 +17,7 @@ use crate::hal;
 use crate::hal::AddressSpace;
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
-use crate::mm::vma::{ImageBounds, MappedRange, merge_ranges};
+use crate::mm::vma::{ArgBounds, ImageBounds, MappedRange, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{ARGS_BYTES_MAX, ARGV_MAX};
 use crate::sched::policy::{Priority, TaskId};
@@ -92,7 +92,7 @@ pub(crate) fn write_arg_block(
     argv: &[String],
     env: &[String],
     exe: &str,
-    loaded: &Loaded,
+    loaded: &mut Loaded,
 ) {
     // The block is built here and copied to the user stack in one piece. It
     // may span pages - a *program* is not a pathname, and a completion helper
@@ -127,12 +127,39 @@ pub(crate) fn write_arg_block(
     crate::rand::fill(&mut random);
     block[random_at..random_at + 16].copy_from_slice(&random);
 
-    // Strings, descending from just below the random bytes: argv first, then
-    // the environment, then the AT_EXECFN path.
-    let mut string_at = random_at;
+    // Strings, laid out the way Linux lays them out: `argv` first, in order,
+    // then the environment, then the AT_EXECFN path - all ascending from one
+    // base, so `arg_start` is `argv[0]`, `arg_end` is the byte after the last
+    // argument string and is exactly `env_start`, and `env_end` is the byte
+    // after the last environment string (`fs/binfmt_elf.c`'s
+    // `create_elf_tables` walks `p` upward through the strings in that order,
+    // recording `arg_start`/`arg_end`/`env_start`/`env_end` as it passes
+    // them; measured `build/scratch/stataddr/c.c`, where `arg_start` is
+    // `argv[0]`'s address and `env_start == arg_end`).
+    //
+    // The area grows *down* from the random bytes, so its base has to be
+    // known before the first string is placed: the sizes are summed first and
+    // the strings then written upward from `random_at - total`. Writing them
+    // downward in `argv` order - which is what this did - put `argv[0]`
+    // highest and the environment below it, a layout no Linux reader expects
+    // and one that makes `arg_start < env_end` impossible to report honestly.
+    let argv_bytes: usize = argv.iter().map(|arg| arg.len() + 1).sum();
+    let env_bytes: usize = env.iter().map(|var| var.len() + 1).sum();
+    // The AT_EXECFN string is the path the program was executed through when
+    // the caller knew it, `argv[0]` itself when it did not, and an empty
+    // string when neither exists - the block must never point the libc's
+    // progname scan at unterminated data.
+    let execfn_bytes = if !exe.is_empty() {
+        exe.len() + 1
+    } else if argc == 0 {
+        1
+    } else {
+        0
+    };
+    let mut string_at = random_at - (argv_bytes + env_bytes + execfn_bytes);
+    let arg_start = base + string_at;
     let mut argv0_vaddr = 0usize;
     for (i, arg) in argv.iter().enumerate() {
-        string_at -= arg.len() + 1;
         block[string_at..string_at + arg.len()].copy_from_slice(arg.as_bytes());
         block[string_at + arg.len()] = 0;
         // argv[i] pointer: virtual address of the string.
@@ -142,37 +169,62 @@ pub(crate) fn write_arg_block(
         }
         block[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
         off += 8;
+        string_at += arg.len() + 1;
     }
     // NULL argv terminator (zero-filled block).
     off += size_of::<usize>();
 
+    // `arg_end` is where the argument strings stop, which is where the
+    // environment's begin: Linux records both from the same cursor.
+    let arg_end = base + string_at;
+    let env_start = arg_end;
     for var in env.iter() {
-        string_at -= var.len() + 1;
         block[string_at..string_at + var.len()].copy_from_slice(var.as_bytes());
         block[string_at + var.len()] = 0;
         let vaddr = base + string_at;
         block[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
         off += 8;
+        string_at += var.len() + 1;
     }
     // NULL envp terminator (zero-filled block).
     off += size_of::<usize>();
+    let env_end = base + string_at;
 
-    // The AT_EXECFN string: the path the program was executed through when
-    // the caller knew it, argv[0] itself when it did not, and an empty
-    // string when neither exists - the block must never point the libc's
-    // progname scan at unterminated data.
     let execfn_vaddr = if !exe.is_empty() {
-        string_at -= exe.len() + 1;
         block[string_at..string_at + exe.len()].copy_from_slice(exe.as_bytes());
         block[string_at + exe.len()] = 0;
-        base + string_at
+        let vaddr = base + string_at;
+        string_at += exe.len() + 1;
+        vaddr
     } else if argv0_vaddr != 0 {
         argv0_vaddr
     } else {
-        string_at -= 1;
         block[string_at] = 0;
-        base + string_at
+        let vaddr = base + string_at;
+        string_at += 1;
+        vaddr
     };
+    // The strings must land exactly against the random bytes, with the
+    // pointer words filling everything below them: [`initial_stack_rsp`] sized
+    // this block from the same three string lengths, and a layout that drifted
+    // from that sizing would leave a hole (wasted stack, invisible) or overlap
+    // the words (a corrupt entry block, very visible). This is the one place
+    // the two computations meet.
+    assert_eq!(
+        string_at, random_at,
+        "the argument block's strings did not fill the space it sized for them"
+    );
+
+    // The four string bounds are part of what `/proc/<pid>/stat` reports, so
+    // the block records them into the same value the reader takes the image
+    // addresses out of - one record, one reader, no chance of reporting the
+    // two halves of two different programs.
+    loaded.bounds = loaded.bounds.with_strings(ArgBounds {
+        arg_start,
+        arg_end,
+        env_start,
+        env_end,
+    });
 
     // Auxiliary vector entries.
     auxv(&mut block[off..], loaded, random_vaddr, execfn_vaddr);
@@ -505,21 +557,45 @@ pub(crate) fn load_user(
     // (`build/scratch/statcode/x.c`). A program with no executable segment (a
     // badly linked one) leaves both zero, which is what Linux's `~0UL`/`0`
     // pair degrades to once `end_code` is `0` - there is nothing to report.
-    let executable = image
-        .segments
-        .iter()
-        .filter(|segment| segment.flags.contains(MapFlags::EXEC));
+    //
+    // Fields 45-47 come out of the same walk, and it is deliberately the same
+    // walk over *every* `PT_LOAD` rather than over the executable ones:
+    // `start_data` takes the maximum `p_vaddr`, `end_data` the maximum
+    // `p_vaddr + p_filesz`, and `start_brk` the page-aligned maximum
+    // `p_vaddr + p_memsz`. Measured against a static binary whose loads are
+    // `0x400000/0x518`, `0x401000/0x7ea3d`, `0x480000/0x344e0`,
+    // `0x4b5168/0x58b0 memsz 0xb180` (`build/scratch/stataddr/a.c`):
+    // `start_data 0x4b5168`, `end_data 0x4baa18`, `start_brk 0x4c1000` - each
+    // one that rule and nothing else.
+    //
+    // Only the main image: Linux's `load_elf_binary` runs this over the
+    // *program*'s program headers, having mapped the interpreter separately,
+    // and a dynamic binary's `end_data` stays inside its own `0x...58050`
+    // rather than jumping to the loader's segments
+    // (`build/scratch/stataddr/e.c`).
     let mut start_code = usize::MAX;
     let mut end_code = 0usize;
-    for segment in executable {
+    let mut start_data = 0usize;
+    let mut end_data = 0usize;
+    let mut memsz_end = 0usize;
+    for segment in &image.segments {
         let start = layout.bias + segment.vaddr;
-        start_code = start_code.min(start);
-        end_code = end_code.max(start + segment.data.len());
+        if segment.flags.contains(MapFlags::EXEC) {
+            start_code = start_code.min(start);
+            end_code = end_code.max(start + segment.data.len());
+        }
+        start_data = start_data.max(start);
+        end_data = end_data.max(start + segment.data.len());
+        memsz_end = memsz_end.max(start + segment.memsz);
     }
-    let bounds = ImageBounds {
+    let mut bounds = ImageBounds {
         start_code: if end_code == 0 { 0 } else { start_code },
         end_code,
         start_stack: user_rsp,
+        start_data,
+        end_data,
+        start_brk: pframe::align_up(memsz_end, PAGE_SIZE),
+        ..ImageBounds::default()
     };
 
     Loaded {
@@ -674,7 +750,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         drop_retired(INIT_PID);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(
+        let mut loaded = load_user(
             &mut space,
             &image,
             interp.as_ref(),
@@ -683,7 +759,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             interp_name,
             user_rsp,
         );
-        write_arg_block(space.root(), user_rsp, argv, env, "", &loaded);
+        write_arg_block(space.root(), user_rsp, argv, env, "", &mut loaded);
 
         let root = space.root();
 
@@ -865,7 +941,7 @@ pub fn try_spawn_user(
         child_time_ns.freeze();
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(
+        let mut loaded = load_user(
             &mut space,
             &image,
             interp.as_ref(),
@@ -883,7 +959,7 @@ pub fn try_spawn_user(
         // towards the program's entry point - and it may span pages, so the
         // write resolves the stack's frames as it crosses them rather than
         // assuming the block lives in one.
-        write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
