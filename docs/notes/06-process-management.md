@@ -10812,3 +10812,168 @@ checked whether Linux varied it. The tell was in the existing notes: the differe
 as "the host's value is tuned, not fixed", which explained the *number* while quietly assuming the
 *answer* was the same shape. When a divergence is explained by "the figure differs per machine", the
 next question is whether anything besides the figure differs.
+
+## §6.128 `getcpu`'s two output pointers are two writes, and neither cancels the other (LANDED 2026-11-11)
+
+`getcpu(cpu, node, tcache)` answers two numbers. On these boards there is nothing to watch move — the
+image configures `qemu.cpus = 1` (`assets/configs/machine.toml:45`) and no machine model here has a
+NUMA node — so both numbers are `0`, and both were `0` before this change too. The defect was not in
+the values. It was in **how many of the two pointers get written when one of them cannot be**.
+
+### The shape this kernel had
+
+```rust
+for ptr in [cpu, node] {
+    if ptr != 0 && !buffer_ok(ptr, 4, true, from_user) {
+        return err::EFAULT;
+    }
+}
+for ptr in [cpu, node] {
+    if ptr != 0 {
+        unsafe { (ptr as *mut u32).write_unaligned(0) };
+    }
+}
+```
+
+Two loops: judge both pointers, then write both. A single unreadable pointer answers `EFAULT` and
+**neither word is written** — including the one that was perfectly readable. That is the shape
+`AGENTS.md` §3 rule 4 names: refusing is fine, but refusing a call does not license the kernel to
+skip the part of it that was legitimate, because the caller cannot tell the difference between "your
+number is stale" and "your number is what I would have told you".
+
+### What Linux does — measured
+
+`build/scratch/getcpu/p.c`, `q.c`, `r.c` on the host (7.2.14), raw `syscall(SYS_getcpu, …)`, both
+buffers reset to a sentinel before each call so "was it written" is a comparison rather than an
+assumption:
+
+```text
+== getcpu(ptr_cpu, ptr_node, tcache) ==
+(good, good):  rc=0  errno=0  cpu=0x0000000e node=0x00000000
+(good, BAD):   rc=-1 errno=14 cpu=0x0000000e node=0xbbbbbbbb   -> cpu WRITTEN
+(BAD, good):   rc=-1 errno=14 cpu=0xaaaaaaaa node=0x00000000   -> node WRITTEN
+(BAD, BAD):    rc=-1 errno=14 cpu=0xaaaaaaaa node=0xbbbbbbbb   -> neither
+(NULL, NULL):  rc=0  errno=0  cpu=0xaaaaaaaa node=0xbbbbbbbb
+(NULL, good):  rc=0  errno=0  cpu=0xaaaaaaaa node=0x00000000
+(good, NULL):  rc=0  errno=0  cpu=0x0000000e node=0xbbbbbbbb
+tcache=BAD with both NULL:     rc=0 errno=0
+tcache=BAD with both good:     rc=0 errno=0
+2000 reads: cpu range 14..14  sysconf(_SC_NPROCESSORS_ONLN)=16
+```
+
+`r.c` is the clean re-run of the two discriminating rows, printing only the verdict:
+
+```text
+(good,BAD) ret=-1 errno=14 cpu=0x0000000b node=0xbbbbbbbb  -> cpu WRITTEN
+(BAD,good) ret=-1 errno=14 cpu=0xaaaaaaaa node=0x00000000  -> node WRITTEN
+```
+
+Four facts fall out, and only the first is the bug:
+
+1. **Two `put_user`s, or'ed errors.** A bad `node` does not stop `cpu` being written, and a bad `cpu`
+   does not stop `node` being written. The errno is `EFAULT` in every half-bad case; the side effect
+   is what differs.
+2. **Both unreadable is still one `EFAULT`** and neither word moves — so the fix must not turn a
+   total refusal into a partial write.
+3. **NULL is not an error.** `(NULL, good)` answers `0` and writes only `node`; `(NULL, NULL)`
+   answers `0` and writes nothing. "Tell me only the half I asked for" is a legal query, and the
+   pre-existing code already got that right.
+4. **`tcache` is never read.** A `tcache` of `1` answers `0` both with readable outputs and with
+   NULL ones. The pre-existing code already ignored it, and that is now pinned so a later "let us
+   validate every pointer" change cannot regress it.
+
+A fifth fact is worth writing down because it is the reason the *value* half is not this entry's
+business: the host answers `cpu = 14` on a 16-CPU machine, so `getcpu` reports a real processor
+number rather than a constant — but a kernel that answered the literal `0` would be indistinguishable
+from a correct one **on a one-CPU machine**, which is what this image is. The value half therefore
+gets no claim, only a stable-across-calls one.
+
+### The fix
+
+`src/syscall/linux/posix.rs::handle_getcpu`: one loop, Linux's order (`cpu` then `node`), each
+pointer attempted independently, the failures accumulated and answered at the end.
+
+```rust
+let mut failed = false;
+for ptr in [cpu, node] {
+    if ptr == 0 { continue; }
+    if !buffer_ok(ptr, 4, true, from_user) { failed = true; continue; }
+    unsafe { (ptr as *mut u32).write_unaligned(0) };
+}
+if failed { err::EFAULT } else { 0 }
+```
+
+The handler's doc now carries the measured table and says why the two writes are independent, so the
+next person to "tidy" the loop into a pre-check has the reading in front of them.
+
+**No pure function was extracted, and that is deliberate.** §6.127's fix had a genuinely pure half
+(`rr_interval_nanos(runnable, hz)`) and put it in `abi.rs` with a host test. Here the whole rule is
+"attempt each pointer, or the errors" — the only thing standing between the code and a host test is
+`buffer_ok`, which answers `true` on the host for every pointer (`src/uaccess.rs:118`), so a host
+unit test could not tell the fixed kernel from the broken one. This rule's witness has to be a
+machine.
+
+### The pin: `user/tests/src/bin/t-getcpu.rs`, 15 claims
+
+| claim | before | after |
+|---|---|---|
+| `getcpu(self, self) answers 0` | green | green |
+| `and it filled both words` | green | green |
+| `an unreadable node beside a good cpu is EFAULT` | green | green |
+| **`and the good cpu was written anyway`** | **`0xaaaaaaaa` (sentinel)** | **`0x00000000`** |
+| `an unreadable cpu beside a good node is EFAULT` | green | green |
+| **`and the good node was written anyway`** | **`0xaaaaaaaa`** | **`0x00000000`** |
+| `two unreadable pointers are still just EFAULT` | green | green |
+| `a NULL cpu is not an error` / `and it still filled node` | green | green |
+| `a NULL node is not an error` / `and it still filled cpu` | green | green |
+| `two NULLs are a legal query` | green | green |
+| `an unreadable tcache … is ignored` (×2) | green | green |
+| `the processor is stable across calls` | green | green |
+
+Every claim is written as the **pair** (errno, side effect) because either half alone is satisfied by
+the wrong kernel: the broken one answers the right `EFAULT`, and a hypothetical kernel that wrote
+both words unconditionally would satisfy the side-effect half. The sentinel is `0xAAAA_AAAA`, not
+`0`, because `0` is a legal answer and would make "written" indistinguishable from "untouched".
+
+**Host 15/15** (`cpu 0x00000002` — on a 16-CPU host that is the processor the run happened to be
+scheduled on, which is why the value is read into a buffer and never asserted against a constant).
+**Machine 15/15** (`build/boot-getcpu1.log`, `cpu 0x00000000`, `exit=0`).
+
+**Counterfactually 2 red** (`git stash push -q -m cf-getcpu -- src/syscall/linux/posix.rs`, both
+kernel and loader rebuilt, `build/boot-getcpu-cf1.log`):
+
+```text
+FAIL:  and the good cpu was written anyway (0xaaaaaaaa)
+FAIL:  and the good node was written anyway (0xaaaaaaaa)
+```
+
+The other 13 claims are green on both kernels — the honest boundary, and exactly the shape this
+entry is about: the refusal half was never wrong, only the half that survives it.
+
+### Gate
+
+`build/gate-getcpu.log`, `GATE EXIT=0`, both arms in one command with the lane count forced to two:
+stage 1 `1263 tests, 0 failed` (69.01 s — unchanged, this change adds no host-testable half);
+x86_64 `pass=292 fail=0 (292 built)` over 2 lanes in 51.67 s, `mpos-kunit 35 passed, 0 failed`,
+total 69.37 s (-2.9%); aarch64 `pass=291 fail=0 (291 built)` over 2 lanes in 133.81 s,
+`mpos-kunit 35 passed, 0 failed`, total 225.09 s (-5.2%), both lanes on `=== END`. The new program
+ran on both arms: `build/test-lane-x86_64-0/serial.log:3825` / `:3842` and
+`build/test-lane-aarch64-1/serial.log:4907` / `:4924` (`RUN` / `PASS`).
+
+### Named gaps this does not close
+
+- **The processor number is a constant because the machine has one CPU.** A second vCPU is what makes
+  this field a reading rather than a correct-looking zero; `qemu.cpus` is a machine-config question,
+  not a syscall one.
+- **The node is always zero** for the same reason — no machine model here exposes a NUMA topology.
+- **`tcache` is accepted and ignored.** Linux ignores it too (measured above), so this is not a
+  divergence; `rseq` is where the per-thread cache actually lives on Linux, and this kernel's `rseq`
+  support (§6.90 area) is separate.
+
+### The rule
+
+*A refusal is not permission to skip the rest of the call.* When a syscall reports `EFAULT` for one
+of several output pointers, the caller still receives the pointers it did not ask about being
+wrong — and a kernel that pre-checks them all converts a partial success into a total failure the
+program has no way to detect. The measured table above is the specification: attempt each, or the
+errors, answer the accumulated verdict.

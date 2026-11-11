@@ -1410,21 +1410,49 @@ pub fn handle_vhangup(_args: [usize; ARG_COUNT]) -> isize {
 }
 
 /// `getcpu(cpu, node, tcache)` — which processor and NUMA node the caller
-/// runs on. One core, node zero, and the tcache the man page retires is
-/// accepted and forgotten.
+/// runs on. One core, so both answers are the number zero; `tcache` is the
+/// parameter the man page retires, and Linux never reads it (`tcache` at
+/// address `1` answers `0` both when the two output pointers are readable and
+/// when they are NULL: `build/scratch/getcpu/p.c`).
+///
+/// **The two output pointers are two separate `put_user`s, and the errors are
+/// or'ed together** — a bad `node` does not stop the kernel writing `cpu`, and
+/// a bad `cpu` does not stop it writing `node`. Measured on the host
+/// (`build/scratch/getcpu/r.c`, both buffers reset to a sentinel before the
+/// call):
+///
+/// ```text
+/// (good,BAD) ret=-1 errno=14 cpu=0x0000000b node=0xbbbbbbbb  -> cpu WRITTEN
+/// (BAD,good) ret=-1 errno=14 cpu=0xaaaaaaaa node=0x00000000  -> node WRITTEN
+/// ```
+///
+/// and with both unreadable both stay untouched (`(BAD,BAD)` is `EFAULT`).
+/// `(NULL, …)` is not an error at all — "tell me only the half I asked for" is
+/// a legal query, and `(NULL,NULL)` answers `0` (`q.c`). This used to check
+/// both pointers before writing either, which made the *good* half of a
+/// half-bad call silently not happen — a caller that keeps the CPU it read
+/// would have kept a stale number with no way to know.
 pub fn handle_getcpu(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (cpu, node) = (args[0], args[1]);
+    // The two writes are independent, in Linux's order (`cpu` first), and a
+    // refusal on one does not cancel the other — so the answer is the or of
+    // the two verdicts, not the first failure.
+    let mut failed = false;
     for ptr in [cpu, node] {
-        if ptr != 0 && !buffer_ok(ptr, 4, true, from_user) {
-            return err::EFAULT;
+        if ptr == 0 {
+            continue;
         }
-    }
-    for ptr in [cpu, node] {
-        if ptr != 0 {
-            unsafe { (ptr as *mut u32).write_unaligned(0) };
+        if !buffer_ok(ptr, 4, true, from_user) {
+            failed = true;
+            continue;
         }
+        // Zero is the honest answer, not a placeholder: these boards boot one
+        // CPU (the image says `qemu.cpus = 1`) and no machine model here has a
+        // NUMA node, so the processor that ran the caller is 0 and its node is
+        // 0. A caller that needs to see the numbers move needs a second CPU.
+        unsafe { (ptr as *mut u32).write_unaligned(0) };
     }
-    0
+    if failed { err::EFAULT } else { 0 }
 }
 
 /// Move the wall clock's anchor so it reads `epoch` now: the tick

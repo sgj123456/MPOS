@@ -2256,3 +2256,11 @@ is a test-side lesson, not a gap: it lives with §10.4's measurement.
 predated Phases 12–15 landing, and "Recommended order: P1 → … → P9" orders work the status board  
 above marks done. What is open lives in the board and the moves above; `docs/notes/`'s appendix  
 carries the per-phase history.*
+- [x] **`getcpu`'s two output pointers are two writes** — a bad `node` answered `EFAULT` and threw
+  away the `cpu` word the caller had a legal pointer for, because the handler judged both pointers
+  and then wrote both. Linux attempts each and or's the errors: `(good,BAD)` = `EFAULT` with `cpu`
+  written, `(BAD,good)` = `EFAULT` with `node` written, `(BAD,BAD)` = `EFAULT` with neither
+  (`build/scratch/getcpu/r.c`). One loop in Linux's order with an accumulated verdict; the values
+  were never the divergence (one CPU, no NUMA node, so both are `0` before and after). Pin
+  `t-getcpu` 15 claims, 2 red counterfactually; host 762 unchanged (no pure half — `buffer_ok` is
+  always true on the host). (§6.128, item 242)

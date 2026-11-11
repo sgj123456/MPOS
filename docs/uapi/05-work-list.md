@@ -10671,3 +10671,43 @@ missed the *shape*; it is corrected there. Host unit tests `761 → 762`.
 **Named gaps this does not close.** The slice value remains this kernel's own tick (Linux's derives
 from the `sched_rr_timeslice_ms` sysctl, which this kernel does not have); there is no round-robin
 band to report on. §2.13's delivery path is untouched.
+
+### Item 242 — `getcpu` writes each of its two output pointers, and one `EFAULT` does not undo the other
+
+Rows: `getcpu`'s output side effects, which both looked like "answers 0" until the two pointers were
+made to disagree.
+
+| promise | Linux (host 7.2.14, `build/scratch/getcpu/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| `(good cpu, bad node)` | `EFAULT`, and `cpu` **is written** (`r.c`) | `EFAULT`, `cpu` untouched | `EFAULT`, `cpu` written |
+| `(bad cpu, good node)` | `EFAULT`, and `node` **is written** (`r.c`) | `EFAULT`, `node` untouched | `EFAULT`, `node` written |
+| both unreadable | `EFAULT`, neither written | `EFAULT`, neither written | `EFAULT`, neither written |
+| `(NULL, good)` / `(good, NULL)` | `0`, the good half written | same | same |
+| `(NULL, NULL)` | `0`, nothing written | same | same |
+| `tcache` unreadable | `0` — never read (`p.c`) | same | same |
+| the processor number | a real reading (`cpu = 14` on a 16-CPU host) | `0` (correct here: one CPU) | `0` |
+
+**Why this is not a "returns 0" gap.** The values were never the divergence — this image runs one
+CPU (`assets/configs/machine.toml:45 qemu.cpus = 1`), so `0` is the honest processor and node. What
+was wrong is that the handler judged both pointers in one loop and wrote both in another, so a bad
+`node` silently threw away the `cpu` answer the caller had a legal pointer for. A caller that keeps
+the word it read keeps a stale one and has no way to learn it.
+
+**Measurement.** `build/scratch/getcpu/{p,q,r}.c` on 7.2.14: `p.c` prints each buffer before judging
+the verdict (the first probe wrote them in one `printf`, which had already taught this session not to
+do that); `r.c` is the clean two-row re-run with a fresh sentinel per call and prints `-> cpu
+WRITTEN` / `-> node WRITTEN` beside the errno; `q.c` covers the NULL and `tcache` matrix and confirms
+the value is a real processor (`cpu range 14..14`, `sysconf(_SC_NPROCESSORS_ONLN)=16`). Pin
+`t-getcpu` 15 claims, host 15/15, machine 15/15 (`build/boot-getcpu1.log`), counterfactually **2
+red** (`build/boot-getcpu-cf1.log`) — the two "and the good … was written anyway" claims; both arms
+green in `build/gate-getcpu.log`.
+
+**Landed.** `src/syscall/linux/posix.rs` (`handle_getcpu`: one loop, Linux's order, accumulated
+errors, doc carrying the measured table), `user/tests/src/bin/t-getcpu.rs`, §6.128. **No pure
+function** — `buffer_ok` answers `true` for every pointer on the host (`src/uaccess.rs:118`), so this
+rule has no host-testable half and the machine is its only witness. Host unit tests unchanged at
+`762`.
+
+**Named gaps this does not close.** The processor number is constant because the machine has one
+CPU, and the node is zero because no model here has a NUMA topology — both are machine-config
+questions, not syscall ones. `tcache` remains accepted and ignored, as it is on Linux.
