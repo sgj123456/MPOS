@@ -292,7 +292,21 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s `flags` §6.131):** stage 1 `1268 tests,
+**Latest measured gate (2026-11-11, `sched_rr_get_interval`'s pin §6.132):** stage 1 `1268 tests,
+0 failed` (53.73 s); x86_64 `pass=295 fail=0 (295 built)`, `mpos-kunit 35 passed, 0 failed` (51.26 s over
+2 lane(s)); aarch64 `pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (123.41 s over
+2 lane(s), `the machine reached === END and was stopped`) — `GATE EXIT=0`, both arms in one command with
+the lane count forced to two (`build/gate-statflags2.log`). No behaviour changed in this one: §6.127's
+answer is the same and `t-rr-interval` reads `=== PASS` on both arms
+(`build/test-lane-x86_64-1/serial.log`, `build/test-lane-aarch64-0/serial.log`). What moved is the pin.
+Its blocked-child and zombie claims are now machine-only, because `build/scratch/rrstate/r.c` showed the
+reference host answering its own 2 ms slice for a child whose `/proc` letter read `S` both before and
+after the call — 689 to 5586 of 30000 samples, the rate tracking load — so "read the letter once, demand
+zero" was a claim the host fails too. The host-visible half is now the asymmetry measured beside a
+runnable control in the same window (a runnable child is never answered zero), and twelve consecutive
+host runs are green. §6.132 records the measurement.
+
+**Measured gate before it (2026-11-11, `/proc/<pid>/stat`'s `flags` §6.131):** stage 1 `1268 tests,
 0 failed` (53.73 s — the +2 are the `stat_flags` leaf test in `crates/abi` and the `stat` rendering test
 in `vfs::procfs`); x86_64 `pass=295 fail=0 (295 built)`, `mpos-kunit 35 passed, 0 failed` (51.26 s over
 2 lane(s)); aarch64 `pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (123.41 s over

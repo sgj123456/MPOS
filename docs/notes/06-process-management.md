@@ -11382,3 +11382,97 @@ this shape.
 *A bit is a claim about now, and a zero is a claim about never.* The counters before this one were
 wrong in a way only a busy process noticed; this one was wrong for every process at every instant, and
 it went unseen because a reader that does not compare the column cannot tell a mask from a zero.
+
+## §6.132 `sched_rr_get_interval`'s blocked child is a machine claim, because the host's is not stable (LANDED 2026-11-11)
+
+§6.131's gate went red on one line, on one arm:
+
+```
+FAIL:  a child blocked in a read is answered zero (state S, got 0, 4000000 ns)
+```
+
+`state S` and `4000000 ns` in the same line is the shape the pin existed to catch — §6.127 built this
+door to answer zero for a task that cannot run, and here a blocked child was answered the slice. The
+same line had reddened §6.127's own gate a few hours earlier, which by this session's standing rule
+(a flake re-measured is a bug) meant it had to be chased down rather than re-run.
+
+It was not a bug in the kernel. It was a bug in the claim, and the reference host is what proved it.
+
+### The measurement
+
+`build/scratch/rrstate/p.c` is the pin's fixture transplanted to the host: fork a child that blocks in
+a `read` on a pipe nobody writes to, sleep 150 ms, then per iteration read `/proc/<pid>/stat` field 3,
+call `sched_rr_get_interval`, and read field 3 again.
+
+```
+DISAGREE  S/S -> 2000000 ns
+samples=20000  S/S answered zero=19872  S/S answered a slice=128  state moved=0  other=0
+```
+
+128 of 20000 samples answered the 2 ms slice for a child whose letter read `S` **both before and after
+the call**. `q.c` asked only the letter, 20000 times, and got `S` every time — so "the letter moved to
+`R` between the reads and back" is not the explanation. `r.c` classified the same way over three
+30000-sample runs under different loads:
+
+```
+n=30000 zero=24414 slice=5586 (of which both-reads-S=5586, letter moved=0)
+n=30000 zero=29311 slice=689  (of which both-reads-S=689,  letter moved=0)
+n=30000 zero=28015 slice=1985 (of which both-reads-S=1985, letter moved=0)
+```
+
+Every slice was answered while both reads said `S`, and the letter never moved. The rate itself is a
+function of load: 2% to 19% depending on what else the box was doing.
+
+`build/scratch/rrstate/s.c` then sampled the blocked child *beside* a spinner in the same window, eight
+runs of 200 samples each:
+
+```
+blocked zero=200 slice=0 | spinner zero=0 slice=200
+blocked zero=164 slice=36 | spinner zero=0 slice=200
+```
+
+and `z.c` sampled a zombie 200 times per round over five rounds:
+
+```
+round 0: zombie zero=200 slice=0
+round 3: zombie zero=0 slice=200
+```
+
+The runnable and the stopped child are stable (`w.c`: 5/5 rounds `stopped zero=200 slice=0`, 5/5 rounds
+`spinner zero=0 slice=200`). The blocked child and the zombie are not: their answers come in whole
+runs of one shape or the other, and a 200-sample run here once read 0 zeros and 200 slices.
+
+### Why the host is allowed to do that, and what the ABI actually says
+
+`/proc/<pid>/stat`'s letter and `sched_rr_get_interval`'s answer are two reads of one moving record.
+Every one of the host's slices was answered while the letter said `S`, so the disagreement is not a
+race the reader lost — the kernel's own `task_is_running`-style test at the instant of the call is a
+different instant from the `/proc` render, and for a `TASK_INTERRUPTIBLE` task the two can differ for
+as long as a scheduler tick. Sampling strategy cannot fix that: with a 19% rate at the top end and 0%
+at the bottom, no threshold over one letter and one number is stable, and a threshold picked to pass
+the loud case fails the quiet one.
+
+What *is* an ABI promise is the asymmetry, and it needs a control in the same window to be a claim at
+all: a target that can run is never answered zero, a target that cannot run is answered zero far more
+often than not. The first half held in 8/8 pairable runs and 5/5 rounds; the second half is what moves.
+
+### The fix, and where each half is pinned
+
+- `t-rr-interval`'s blocked-child claim is **machine-only** (`!host_run()`), and asserts `blocked_zero
+  == SAMPLES` — 200 of 200. That is legitimate because this kernel's answer is not a sample of a moving
+  record: `handle_sched_rr_get_interval` asks `task_state` inside the same table lock that decides the
+  answer, so there is no window between the letter and the number. `build/scratch/rrstate/m.c` read
+  1500 of 1500 zeros on the machine.
+- The **paired** claim replaces it as the host-visible one: the runnable child beside the blocked one
+  must read `runnable_zero == 0 && runnable_slice == SAMPLES`, and the blocked child's counts are
+  printed in the same line so a reader sees them without a second run. That line fails a kernel that
+  answers one constant to everything — which is what this kernel did before §6.127.
+- The **zombie** claim is machine-only for the same measurement: `z.c` read 0 of 200 zeros in one host
+  round and 200 of 200 in others.
+- The stopped child's claim stays unconditional: 5/5 rounds stable on the host, and the machine agrees.
+
+### The rule
+
+*Two reads of one moving record are not an invariant, and a pin that needs a control in the same
+window is telling you which half is the contract.* The direction is the promise; the rate is the
+host's load average wearing a syscall's name.

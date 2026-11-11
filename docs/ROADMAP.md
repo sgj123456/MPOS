@@ -2298,3 +2298,14 @@ carries the per-phase history.*
   `0x40844c` a `SIGTERM` zombie, `0x40864c` a `SIGSEGV` one — the dump bit follows the signal, not the
   file. Pin `t-stat-flags` 16 claims, **7 red** counterfactually. Host unit tests `764 -> 765`.
   (§6.131, item 245)
+- [x] **`sched_rr_get_interval`'s blocked child is a machine claim** — §6.131's gate reddened on
+  `a child blocked in a read is answered zero (state S, got 0, 4000000 ns)` on the loaded aarch64 arm,
+  the same line §6.127's gate had reddened on earlier. It was the pin, not the kernel: the reference
+  host fails that claim itself — `build/scratch/rrstate/r.c` read `S` both before *and* after the call
+  and still got the 2 ms slice in 689 to 5586 of 30000 samples, the rate tracking load. `/proc`'s letter
+  and the call's answer are two reads of one moving record, so no threshold over the two is stable. The
+  pin now asserts the asymmetry instead (a runnable child beside a blocked one is never answered zero,
+  and the blocked child's counts print in the same line), holds `blocked_zero == 200` and the zombie
+  claim only on the machine — where the answer is taken under the same table lock, so there is no
+  window — and leaves the stopped child's claim unconditional (stable 5/5 rounds on the host). Twelve
+  consecutive host runs green, machine 13/13. (§6.132, item 246)

@@ -50,6 +50,11 @@ const ESRCH: i32 = 3;
 const EFAULT: i32 = 14;
 const EINVAL: i32 = 22;
 
+/// How many `state -> answer` pairs the blocked-child claim takes before it
+/// judges the rate rather than one pair. See that claim for why one pair is
+/// not enough.
+const SAMPLES: usize = 200;
+
 /// The one `sched_*` door that takes a `struct timespec *`. The number is the
 /// machine's — 148 on x86_64, 127 on aarch64 — so it comes from `libc` rather
 /// than from this file.
@@ -168,15 +173,71 @@ fn main() {
     // Give the child a moment to reach the read, then ask.
     unsafe { libc::usleep(120_000) };
 
-    let state = state_of(pid as usize);
-    let (code, nsec) = interval(pid as usize);
+    // A runnable control, created here so the two answers below are sampled
+    // in the same window and under the same load.
+    let spinner = unsafe { libc::fork() };
+    assert!(spinner >= 0, "fork");
+    if spinner == 0 {
+        let mut spin: u64 = 1;
+        loop {
+            spin = spin.wrapping_mul(6364136223846793005).wrapping_add(1);
+            unsafe { core::ptr::read_volatile(&spin) };
+        }
+    }
+    unsafe { libc::usleep(120_000) };
+
+    // The blocked child is a **machine** claim, not a host one, and §6.132 is
+    // the measurement that says why. The host's answer here is not stable
+    // enough to pin: `build/scratch/rrstate/r.c` read `S` both before *and
+    // after* the call and still got the 2 ms slice in 689 to 5586 of 30000
+    // samples, and whole 200-sample runs here landed anywhere from 0 to 200
+    // zeros depending on what else was running. Two reads of one moving record
+    // are not an invariant in the host's own kernel.
+    //
+    // This kernel's answer *is* stable, and structurally so: it asks
+    // `task_state` once, inside the same table lock that decides the answer, so
+    // there is no window between the letter and the number. `build/scratch/
+    // rrstate/m.c` read 1500 of 1500 zeros on the machine. So the claim is
+    // held where it means something — and the paired runnable line below is
+    // the control that keeps a kernel answering one constant to everything
+    // from passing it.
+    //
+    // Until §6.131's gate the single-sample form of this claim was written for
+    // both, and a loaded aarch64 lane failed it with `state S, got 4000000 ns`.
+    let mut blocked_zero = 0usize;
+    let mut blocked_slice = 0usize;
+    let mut runnable_zero = 0usize;
+    let mut runnable_slice = 0usize;
+    for _ in 0..SAMPLES {
+        if let (OK, nsec) = interval(pid as usize) {
+            if nsec == 0 {
+                blocked_zero += 1;
+            } else {
+                blocked_slice += 1;
+            }
+        }
+        if let (OK, nsec) = interval(spinner as usize) {
+            if nsec == 0 {
+                runnable_zero += 1;
+            } else {
+                runnable_slice += 1;
+            }
+        }
+    }
     r.check(
         &format!(
-            "a child blocked in a read is answered zero (state {}, got {code}, {nsec} ns)",
-            state.unwrap_or('?')
+            "a runnable child is never answered zero, beside a blocked one ({runnable_zero} zeros, {runnable_slice} of {SAMPLES} slices; the blocked child read {blocked_zero} zeros and {blocked_slice} slices)"
         ),
-        code == OK && nsec == 0,
+        runnable_zero == 0 && runnable_slice == SAMPLES,
     );
+    if !mpos_user_tests::host_run() {
+        r.check(
+            &format!(
+                "and the blocked child is answered zero every time ({blocked_zero} of {SAMPLES})"
+            ),
+            blocked_zero == SAMPLES,
+        );
+    }
 
     // The same number one instruction after the caller's own, which the first
     // claim above already showed is non-zero: the two answers differ only in
@@ -226,15 +287,23 @@ fn main() {
     // Let it die without collecting it: the slot stays, the task does not run.
     unsafe { libc::usleep(150_000) };
 
-    let state = state_of(zombie as usize);
-    let (code, nsec) = interval(zombie as usize);
-    r.check(
-        &format!(
-            "a zombie is answered zero (state {}, got {code}, {nsec} ns)",
-            state.unwrap_or('?')
-        ),
-        code == OK && nsec == 0,
-    );
+    // Another machine claim, for the same reason: `build/scratch/rrstate/z.c`
+    // sampled a zombie 200 times per round on the reference host and read
+    // anywhere from 0 to 200 zeros across rounds of the same program. The
+    // host's zombie is on a runqueue transiently as it is reaped; this
+    // kernel's `task_state` reports `Z` for as long as the slot holds the
+    // record, so its answer is fixed. §6.132.
+    if !mpos_user_tests::host_run() {
+        let state = state_of(zombie as usize);
+        let (code, nsec) = interval(zombie as usize);
+        r.check(
+            &format!(
+                "a zombie is answered zero (state {}, got {code}, {nsec} ns)",
+                state.unwrap_or('?')
+            ),
+            code == OK && nsec == 0,
+        );
+    }
 
     unsafe { libc::waitpid(zombie, &mut status, 0) };
 
@@ -246,21 +315,12 @@ fn main() {
         reaped == ESRCH,
     );
 
-    // -- a runnable child, the control that keeps the claims above honest --
+    // -- the runnable control, asked once more after everything above ------
     //
-    // Without this, a kernel that answered zero for *everything* would pass
-    // every state claim above. `d.c` measured the slice for a spinning child.
-    let spinner = unsafe { libc::fork() };
-    assert!(spinner >= 0, "fork");
-    if spinner == 0 {
-        let mut spin: u64 = 1;
-        loop {
-            spin = spin.wrapping_mul(6364136223846793005).wrapping_add(1);
-            unsafe { core::ptr::read_volatile(&spin) };
-        }
-    }
-
-    unsafe { libc::usleep(120_000) };
+    // The paired claim above is the one that keeps a kernel answering zero for
+    // *everything* from passing, and it samples under one load; this asks the
+    // same child again after the stop and the reap, so the control is not a
+    // property of that one window.
     let state = state_of(spinner as usize);
     let (code, nsec) = interval(spinner as usize);
     r.check(

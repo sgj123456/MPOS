@@ -10844,3 +10844,33 @@ dumped, randomized) -> u32`.
 **Named gaps:** the `0x8000` bit in every dead task's word is folded into `PF_DEAD` because this
 repository cannot verify Linux's name for it; `PF_RANDOMIZE` is reported as set unconditionally, which
 is a lie only on a machine built without ASLR (there is none today).
+
+### Item 246 — `sched_rr_get_interval`'s answer for a blocked child is pinned on the machine, because the host's answer moves
+
+| | Linux | this kernel, before | this kernel, now |
+|---|---|---|---|
+| blocked child, one sample | `0` or the slice, load-dependent | always the slice | always `0` |
+| blocked child, 200 samples | 0 to 200 zeros depending on load | 200 slices | 200 zeros |
+| zombie, 200 samples | 0 to 200 zeros depending on load | always the slice | 200 zeros |
+| runnable child | always the slice | always the slice | always the slice |
+| stopped child | always `0` | always the slice | always `0` |
+
+**Not a behaviour change.** §6.127 already made this door answer zero for a task off the runqueue; what
+§6.132 fixes is the *pin*, which held a claim the reference host itself fails. `build/scratch/rrstate/r.c`
+read `S` both before and after the call and still got the host's 2 ms slice in 689 to 5586 of 30000
+samples; `z.c` sampled a zombie 200 times per round and read anywhere from 0 to 200 zeros across rounds.
+
+**Why the host is allowed to differ.** The `/proc` letter and the syscall's answer are two reads of one
+moving record, and for a `TASK_INTERRUPTIBLE` task the kernel's own test at the instant of the call is
+not the render's instant. No threshold over one letter and one number is stable.
+
+**What the pin now says.** The machine half is unconditional (`blocked_zero == 200`, `zombie == 0`) —
+this kernel's answer is taken under the same table lock as the state, so there is no window to catch.
+The host-visible half is the *asymmetry*, measured beside a runnable control in the same window: a
+runnable child is never answered zero, and the blocked child's counts print in the same line.
+
+**Measurement:** `build/scratch/rrstate/{p,q,r,s,z,w,m}.c`, host 7.2.14, `build/boot-rr3.log` on the
+machine (13 claims, `PASS`), twelve consecutive host runs green.
+
+**Landed:** `user/tests/src/bin/t-rr-interval.rs`. **Named gap:** none — this is a pin correction, and
+the kernel behaviour it guards was already landed by §6.127.
