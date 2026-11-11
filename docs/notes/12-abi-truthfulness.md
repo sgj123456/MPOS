@@ -292,7 +292,25 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, the `timer_*` refusal order §6.124):** stage 1 `1260 tests, 0
+**Latest measured gate (2026-11-11, `setitimer`/`getitimer` §6.125):** stage 1 `1261 tests, 0
+failed` (69.69 s — the +1 is §6.125's host-testable `which` verdict); x86_64 `pass=289 fail=0 (289
+built)`, `mpos-kunit 35 passed, 0 failed` (51.09 s, total 70.04 s, +3.2%); aarch64 `pass=288 fail=0
+(288 built)`, `mpos-kunit 35 passed, 0 failed` (132.67 s, total 134.32 s, -41.6% against the
+previous two-arm green) — a **single-arm rerun** of `cargo xtask test --arch aarch64`
+(`build/gate-itimer-aarch64-rerun.log`), because the combined both-arm run
+(`build/gate-itimer.log`) reddened one aarch64 lane on `t-starttime`'s bracket claim alone: two
+forks 1.5 s apart read `150` centisecond ticks (correct) inside an `uptime_ms()` bracket of
+`1860 ms` built from the 4 ms tick counter, while `start_nanos` comes from the finer
+`since_boot_nanos()` clock — the §6.96/§6.108 "two moving records must be bracketed" shape under
+single-core TCG contention, not a regression (the same program passed on the other three lanes and
+on the single-arm rerun). `t-itimer-order` passed on **both** arms of the combined run
+(`build/test-lane-x86_64-0/serial.log:3916`, `build/test-lane-aarch64-1/serial.log:2908`) and on
+the rerun. One new program: `t-itimer-order` (27 claims), 8 of which fail against the kernel before
+this change (`build/boot-itimer-cf1.log`) — including the arm-with-`EFAULT` side effect that a
+kernel merely returning the right errno would still miss (`armed false` red, `armed true` green).
+Nineteen shape/control rows are green on both kernels by design and are stated as such in §6.125.
+
+**Measured gate before it (2026-11-11, the `timer_*` refusal order §6.124):** stage 1 `1260 tests, 0
 failed` (67.54 s — the +1 is §6.124's host-testable flags verdict); x86_64 `pass=288 fail=0 (288
 built)`, `mpos-kunit 35 passed, 0 failed` (50.30 s, total 67.87 s, -5.1%); aarch64 `pass=287 fail=0
 (287 built)`, `mpos-kunit 35 passed, 0 failed` (138.65 s, total 229.82 s, `16 not run - see

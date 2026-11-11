@@ -10564,3 +10564,39 @@ counterfactually 11 red on `build/boot-timerorder-cf1.log`).
 monotonic clock, no absolute domain); signal numbers still stop at `SIGRTMIN`,
 alarm clocks still answer `EOPNOTSUPP` for Linux's `EPERM`, and the timer table
 is still eight fixed slots with reused ids. None is a refusal *order*.
+
+### Item 239 — `setitimer`/`getitimer`: `which` is a 32-bit `int`, the refusal order, and the arm-before-`EFAULT` side effect
+
+| promise | Linux (host 7.2.14, `build/scratch/itimer/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| `setitimer(2^32, new, NULL)` | `0`, and a following `getitimer` reads `armed=yes it_value=9.999976` (`which` truncates to `ITIMER_REAL`) | `EINVAL(22)` — whole-`usize` `which > ITIMER_PROF` | `0`, arms REAL |
+| `setitimer(2^32+3, new, NULL)` / `getitimer(2^32+3)` | `EINVAL(22)` | `EINVAL(22)` | `EINVAL(22)` |
+| `setitimer(3, BAD, 0)` / `setitimer(-1, BAD, 0)` | `EFAULT(14)` (bad `new_value` outranks a bogus `which`) | `EINVAL(22)` (`which` judged first) | `EFAULT(14)` |
+| `setitimer(0, bad tv_usec, old=BAD)` | `EINVAL(22)` (timeval shape outranks a bad `old_value`) | `EFAULT(14)` (`old_value` checked up front) | `EINVAL(22)` |
+| `setitimer(0, {10s}, old=BAD)` then `getitimer(0)` | `EFAULT(14)` **but** `armed=yes it_value=9.999998` (`side.c`: arm happens before the `old_value` copy) | `EFAULT(14)` and **disarmed** | `EFAULT(14)` and **armed** |
+| `getitimer(3, BAD)` / `getitimer(0, BAD)` | `EINVAL(22)` / `EFAULT(14)` (`which` before buffer) | same order, but `2^32` refused | same + 32-bit `which` |
+| `setitimer(0, NULL, old)` | `0`, disarms, reports the old value (`nullvalue.c`) | `0`, disarms | unchanged |
+
+**Why the word lives in one pure function.** `proc.rs` is `#[cfg(target_os = "none")]`, so the
+32-bit truncation went into `src/syscall/linux/abi.rs` as
+`itimer_which_verdict(word: usize) -> Result<usize, isize>` (`word as u32 as i32`, literal `0..=2`,
+`Err(err::EINVAL)` otherwise) with a host `#[test]` (host tests `759 → 760`); the *order* lives in
+the handlers' statement sequence. `handle_setitimer` now runs new-pointer → `itimerval_ms` →
+`itimer_which_verdict` → `itimer_swap` (arm) → old-pointer → `write_itimerval`; `handle_getitimer`
+runs the verdict before `buffer_ok`. Three stale docs that blamed a missing per-task CPU accounting
+were corrected: CPU time *is* charged (§6.95/§6.99/§6.123), but `check_itimers` scans
+`ITIMER_REAL` only.
+
+**Measurement.** `build/scratch/itimer/{width,final,side,nullvalue,order3}.c`; the discarded
+`order.c` used a readable stack address as its "bad" pointer and every `EFAULT` row came back
+`rc=0` — the bad pointer must be unmapped `((void*)1)`.
+
+**Landed.** `src/syscall/linux/abi.rs` (verdict + test), `src/syscall/linux/proc.rs` (two handlers),
+`src/sched/runtime/task.rs` and `src/sched/runtime/mod.rs` (honest gap docs), pin
+`user/tests/src/bin/t-itimer-order.rs` (27 claims: host 27/27, machine 27/27,
+counterfactually 8 red on `build/boot-itimer-cf1.log`, restored green on `build/boot-itimer2.log`),
+§6.125. AGENTS.md got no new §5 row — it is over the 65536-byte workspace budget (§6.104).
+
+**Named gaps this does not close.** `ITIMER_VIRTUAL`/`ITIMER_PROF` are installed and read back but
+never expire (the expiry scan covers REAL only; closing it also needs §2.13's delivery path).
+`TIMER_ABSTIME` for `timer_*` stays `EINVAL` (§6.124). None is a refusal order or a word width.

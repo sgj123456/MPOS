@@ -4315,20 +4315,33 @@ unsafe fn write_itimerval(at: usize, snapshot: Option<crate::sched::ItimerSnapsh
 /// `setitimer(which, new_value, old_value)`.
 ///
 /// Only `ITIMER_REAL` ever fires: it counts the wall-clock ticks the board
-/// actually has. The virtual and profiling timers would need per-task CPU
-/// accounting, which does not exist yet, so they are installed and read
-/// back faithfully but never expire - the shape a caller that probes and
-/// then cancels cannot distinguish from the real thing.
+/// actually has. Since §6.95/§6.99/§6.123 the kernel does charge per-task and
+/// per-group CPU time (`Task::cpu_user/cpu_system`, `Mm::cpu_all()`), but
+/// `check_itimers` still scans only the REAL slot, so `ITIMER_VIRTUAL` and
+/// `ITIMER_PROF` are installed and read back faithfully and never expire. That
+/// is a named gap of the expiry scan, not a missing clock (§6.125); closing it
+/// also needs a CPU-time timer whose signal can reach a thread between system
+/// calls, which §2.13 still refuses. The old reason here - "no per-task CPU
+/// accounting" - stopped being true three phases ago.
+///
+/// The judgement order is Linux's, measured in `build/scratch/itimer/final.c`
+/// and `width.c`: an unreadable `new_value` is `EFAULT` *before* a bad `which`
+/// (`setitimer(3, BAD, 0) = 14`), the `timeval` shape is validated and `which`
+/// is resolved, then the timer is **armed**, and only then is `old_value`
+/// copied out. `side.c` measured the side effect that makes the last step
+/// load-bearing: `setitimer(0, {10s}, old = BAD)` answers `EFAULT(14)` yet a
+/// following `getitimer` reads `armed=yes it_value=9.999998` - Linux armed the
+/// timer before it failed to write the old one. Checking `old_value` up front
+/// (as this door used to) returns the same errno while leaving the timer
+/// disarmed, which is a different machine state behind an identical answer.
+/// Which question a door asks first is as much a promise as the errno it
+/// returns (§6.124's rule, again).
 pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
     let (which, new_ptr, old_ptr) = (args[0], args[1], args[2]);
-    if which > crate::sched::ITIMER_PROF {
-        return err::EINVAL;
-    }
-    if old_ptr != 0 && !buffer_ok(old_ptr, ITIMERVAL_SIZE, true, true) {
-        return err::EFAULT;
-    }
+    // `new_value` first: a bad pointer is EFAULT even when `which` is bogus.
     let (value_ticks, interval_ticks) = if new_ptr == 0 {
-        // A NULL new_value is Linux's spelling of "just tell me the old one".
+        // A NULL new_value disarms (the host's `nullvalue.c` read `armed=no`
+        // after `setitimer(0, NULL, &old)`), and still reports the old value.
         (0, 0)
     } else {
         if !buffer_ok(new_ptr, ITIMERVAL_SIZE, false, true) {
@@ -4345,13 +4358,21 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
             (word(0), word(1), word(2), word(3))
         };
         // The `tv_usec < 1s` checks and the round-up fold into milliseconds
-        // are the man page's contract, spelled in `abi`.
+        // are the man page's contract, spelled in `abi`. Linux validates the
+        // shape before it resolves `which`; both answer EINVAL, so the order
+        // is only observable through the side effect it does *not* leave.
         let (value_ms, interval_ms) = match abi::itimerval_ms(vsec, vusec, isec, iusec) {
             Ok(pair) => pair,
             Err(e) => return e,
         };
         let hz = crate::hal::TICK_HZ as u64;
         (value_ms * hz / 1000, interval_ms * hz / 1000)
+    };
+    // `which` is a 32-bit int: `2^32` names REAL, `2^32 + 3` is EINVAL. The
+    // verdict returns the bounded index `itimer_swap` will use.
+    let which = match abi::itimer_which_verdict(which) {
+        Ok(w) => w,
+        Err(e) => return e,
     };
     let new = if value_ticks == 0 {
         // A zero it_value disarms, exactly as the man page words it.
@@ -4362,19 +4383,27 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
             deadline: crate::hal::ticks() + value_ticks.max(1),
         })
     };
+    // Arm first, copy `old_value` second: the EFAULT on a bad old pointer is
+    // about the copy, not about the timer Linux has already installed.
     let old = crate::sched::itimer_swap(which, new);
     if old_ptr != 0 {
+        if !buffer_ok(old_ptr, ITIMERVAL_SIZE, true, true) {
+            return err::EFAULT;
+        }
         unsafe { write_itimerval(old_ptr, old) };
     }
     0
 }
 
-/// `getitimer(which, curr_value)`.
+/// `getitimer(which, curr_value)`. Linux resolves `which` before it writes
+/// `curr_value`: `getitimer(3, BAD)` is `EINVAL(22)`, while `getitimer(0, BAD)`
+/// is `EFAULT(14)` (`final.c`). `which` is the same 32-bit int as above.
 pub(super) fn handle_getitimer(args: [usize; ARG_COUNT]) -> isize {
     let (which, ptr) = (args[0], args[1]);
-    if which > crate::sched::ITIMER_PROF {
-        return err::EINVAL;
-    }
+    let which = match abi::itimer_which_verdict(which) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
     if !buffer_ok(ptr, ITIMERVAL_SIZE, true, true) {
         return err::EFAULT;
     }

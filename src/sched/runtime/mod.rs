@@ -98,9 +98,12 @@ pub(crate) const STACK_CANARY: u64 = 0x6d70_6f73_5f73_746b;
 /// none - so it can be wrong only in the direction of "run the scan", never in
 /// the direction of "skip a timer that is due".
 ///
-/// Only `ITIMER_REAL` is tracked, because only `ITIMER_REAL` is a wall-clock
-/// deadline the scheduler has to honour; the virtual and profiling timers are
-/// charged against consumed CPU time and are checked where that time is counted.
+/// Only `ITIMER_REAL` is tracked, because `check_itimers` scans that one slot
+/// - the wall-clock deadline the scheduler has to honour. The virtual and
+/// profiling timers are installed and read back but never expire (§6.125's
+/// named gap); CPU time *is* charged now (§6.95/§6.99/§6.123), the scan simply
+/// does not consult it. The flag is about whether the REAL scan has work, not
+/// about which of the three clocks the kernel can measure.
 pub(crate) static ITIMER_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

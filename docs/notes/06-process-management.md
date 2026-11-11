@@ -10411,3 +10411,143 @@ and one of them changed a side effect (arm) as well as an answer. Measure the or
 whose rows cannot contaminate each other, then reorder the checks; a verdict about a *word* belongs
 in one host-testable pure function, but a verdict about *which of two bad things wins* belongs in
 the handler's statement order, pinned by a program that hands both bad things at once.
+
+## §6.125 `setitimer`/`getitimer`: `which` is an `int`, the order is Linux's, and the arm survives an `EFAULT`
+
+Two old interval-timer calls answer three questions at once — *is this request well-formed*,
+*which clock does it name*, *what did the previous timer look like*. Which question is asked first
+is a promise, and one of the four checks changes a **side effect** as well as an errno. Everything
+here was measured on a host Linux 7.2.14 with raw `SYS_setitimer`/`SYS_getitimer` probes in
+`build/scratch/itimer/` before this kernel was touched; a man page does not say which half of a
+refusal the caller branches on.
+
+`src/syscall/linux/proc.rs`'s `handle_setitimer` doc had been wrong for some time. It said the
+virtual and profiling timers "would need per-task CPU accounting, which does not exist yet". That
+reason went stale in §6.95/§6.99/§6.123: `Task::cpu_user`/`cpu_system` and `Mm::cpu_all()` *do*
+charge CPU. The truth is smaller and worse: `check_itimers` (`src/sched/runtime/task.rs:2084`)
+scans **only** `itimers[ITIMER_REAL]`, so `ITIMER_VIRTUAL`/`ITIMER_PROF` are installed and read
+back faithfully but never expire. Three stale doc claims (that `proc.rs` doc, the `itimers` field's
+"for want of per-task CPU accounting", and `runtime/mod.rs`'s "checked where that time is counted"
+— there is no such code) were corrected to that honest, named gap. Closing the expiry scan is a
+larger change that also collides with §2.13 (a handled signal is delivered only on a syscall
+return), so it is **not** done here.
+
+### Linux's answers (host 7.2.14, `build/scratch/itimer/`)
+
+`which` is a 32-bit `int`, not the `usize` register it arrives in. `width.c` passes the full 64-bit
+word as a vararg so the kernel does the `(int)` truncation:
+
+```
+setitimer(which=2^32=0x100000000, new, NULL) = 0 errno=0
+   after 2^32 arm: armed=yes it_value=9.999976
+setitimer(which=2^32+3=0x100000003, new, NULL) = -1 errno=22
+getitimer(which=2^32=0x100000000, ok) = 0 errno=0
+getitimer(which=2^32+3=0x100000003, ok) = -1 errno=22
+setitimer(which=(int)-1 sign-extended=0xffffffffffffffff, new, NULL) = -1 errno=22
+setitimer(which=3 + new=BAD=0x3, new, NULL) = -1 errno=14
+setitimer(which=-1 + new=BAD=0xffffffffffffffff, new, NULL) = -1 errno=14
+```
+
+The whole-register comparison this kernel used (`which > ITIMER_PROF`) refused `2^32` where Linux
+armed a timer — and a large word indexed `itimers[which]` past the three-slot array in
+`itimer_swap`. `final.c` (`BAD = ((void*)1)` — never the address of a stack variable, which is
+readable and turns every `EFAULT` claim into a green `rc=0`, the lesson of the discarded `order.c`)
+measured the refusal order:
+
+```
+== refusal order (host 7.2.14) ==
+setitimer(which=3 bogus, new=BAD, old=0)                  rc=-1 errno=14   (new beats which)
+setitimer(which=3, new ok, old=0)                         rc=-1 errno=22
+setitimer(which=3, new=0, old=BAD)                        rc=-1 errno=22   (which beats old)
+setitimer(which=3, new ok, old=BAD)                       rc=-1 errno=22
+setitimer(0, new=BAD, old=0)                              rc=-1 errno=14
+setitimer(0, new ok, old=BAD)                             rc=-1 errno=14
+setitimer(0, new=0, old=BAD)                              rc=-1 errno=14
+setitimer(0, new=bad usec 2e6, old=BAD)                   rc=-1 errno=22   (timeval beats old)
+setitimer(0, new=bad usec -1, old ok)                     rc=-1 errno=22
+getitimer(which=3, ptr=BAD)                               rc=-1 errno=22   (which beats buffer)
+getitimer(0, ptr=BAD)                                     rc=-1 errno=14
+```
+
+So `do_setitimer`'s order is `copy_from_user(new)` [`EFAULT`] → `timeval_valid` [`EINVAL`] →
+`which` switch [`EINVAL`] → **arm** → `copy_to_user(old)` [`EFAULT`]. The timeval check and the
+`which` check both return `EINVAL`, so their relative order cannot be discriminated by errno; the
+two that *can* be are "bad new pointer beats bogus which" and "bad timeval beats bad old pointer".
+`getitimer` judges `which` before its output buffer (already right here). And `side.c` is the
+effect that makes the last step load-bearing:
+
+```
+   before: it_value=0.000000 armed=no
+setitimer(0, {10s}, old=BAD)                              rc=-1 errno=14
+   after EFAULT: it_value=9.999998 armed=yes
+```
+
+Linux armed the timer before failing to write `old_value`. This kernel checked `old_ptr` up front:
+the same `EFAULT`, a disarmed machine. `nullvalue.c` also overturned a remembered man-page line —
+a NULL `new_value` **disarms** and still reports the old timer (`armed=no` afterwards); the kernel
+already did this, so those are control claims, not a new behaviour.
+
+### What changed
+
+- `src/syscall/linux/abi.rs`: new host-testable `pub(crate) fn itimer_which_verdict(word: usize)
+  -> Result<usize, isize>` = `let which = word as u32 as i32; if (0..=2).contains(&which) { Ok(..) }
+  else { Err(err::EINVAL) }`. It uses literal `0..=2` because `crate::sched::ITIMER_*` are exported
+  only under `#[cfg(target_os = "none")]`, and `proc.rs` (which calls it) is likewise bare-metal
+  only while `abi.rs` is host-compiled. A host `#[test]` covers `0,1,2,2^32,2^32+1,2^32+2 → Ok`
+  and `3,2^32+3,usize::MAX,0xffff_ffff → Err(err::EINVAL)`. Host unit tests `759 → 760`.
+- `handle_setitimer` reordered to exactly the measured sequence: `new` pointer + `itimerval_ms`
+  (so `EFAULT`/`EINVAL` come first) → `itimer_which_verdict(which)` (`EINVAL`, and its `Ok` value
+  is the truncated index that `itimer_swap` actually uses) → build `new` → **`itimer_swap` (arm)**
+  → `old_ptr` check (`EFAULT`) → `write_itimerval`. The two leading checks (`which > ITIMER_PROF`
+  and the `old_ptr` pre-check) are deleted. Now a bad `old_value` answers `EFAULT` *after* the
+  timer is armed, matching `side.c`.
+- `handle_getitimer` calls `itimer_which_verdict` before `buffer_ok(ptr)`, keeping its existing
+  which-before-buffer order and adding the 32-bit truncation.
+- Three stale comments now name the real gap (`check_itimers` scans one slot; CPU time *is*
+  charged, the scan just does not consult it) and point here.
+
+### Pin — `user/tests/src/bin/t-itimer-order.rs` (27 claims)
+
+Raw `libc::syscall` with a self-spelled, size-asserted `struct itimerval` (musl has no binding for
+these), the bad pointer `1`, and `Report`'s `ok:`/`FAIL:` per claim. Two plain doors, six `which`
+truncation claims, five new-pointer/which and bogus-which order claims, two timeval claims, the
+three-step **arm-before-old witness** (disarm → `setitimer(0, hour, BAD)` = `EFAULT` → `getitimer`
+still armed), four `getitimer` order claims, and five NULL-`new_value` controls. Host 27/27
+`PASS`; machine 27/27 `PASS` (`build/boot-itimer1.log`, `exit=0`, `=== END`).
+
+Counterfactual = stash the four source files, rebuild the kernel **and** the UEFI loader that
+embeds it, boot the same binary (`build/boot-itimer-cf1.log`): **8/27 red** —
+
+```
+FAIL: 2^32 names ITIMER_REAL and arms it (got 22, want 0)
+FAIL: 2^32 + 1 names ITIMER_VIRTUAL and is served (got 22, want 0)
+FAIL: getitimer(2^32) is served (got 22, want 0)
+FAIL: an unreadable new_value outranks a bogus which (got 22, want 14)
+FAIL: an unreadable new_value outranks a sign-extended -1 (got 22, want 14)
+FAIL: an unreadable new_value outranks 2^32's clock too (got 22, want 14)
+FAIL: a malformed tv_usec outranks a bad old_value (got 14, want 22)
+FAIL: and that EFAULT still armed the timer (read Ok(0), armed false)
+```
+
+The `arm-before-old` claim is the one a kernel that merely returned the right errno would still
+miss. Rows that are green on both kernels are stated as honest boundaries: `2^32+3` and the
+sign-extended `-1` are `EINVAL` either way, and all four `getitimer` order rows were already right
+(only the truncation was missing). Restored, rebuilt both, 27/27 green again
+(`build/boot-itimer2.log`).
+
+### Named gaps this does not close
+
+`ITIMER_VIRTUAL`/`ITIMER_PROF` are installed and read back but never expire — the expiry scan
+covers `ITIMER_REAL` only. Doing them properly needs a CPU-time deadline in `check_itimers` and a
+delivery path that does not wait for a syscall return (§2.13). `TIMER_ABSTIME` for the `timer_*`
+family stays `EINVAL` (§6.124). `ITIMER_REAL`'s expiry still delivers `SIGALRM` at whichever door
+the interrupted task next reaches.
+
+### The rule
+
+**A word's width is as much an ABI promise as its value.** `which` and `flags` arrived in a 64-bit
+register and were compared as `usize`; Linux truncates both to 32 bits first, so a caller passing
+`2^32` names a real clock, not an error. A verdict about a *word* belongs in a host-testable pure
+function, but a verdict about *which of two bad things wins* — and above all about whether a
+refusal leaves a side effect behind — belongs in the handler's statement order, pinned by a
+program that hands both bad things at once and then reads the machine's state.

@@ -976,6 +976,20 @@ One-glance status of the whole roadmap.
   `CLOCK_REALTIME` epoch). Pinned by `t-timer-order` (23 claims, counterfactually
   11 red, including the arm-with-`EFAULT` side effect that a right errno alone
   would miss) (§6.124, item 238)
+- [x] `setitimer`/`getitimer` judge in Linux's order, and `which` is an `int` —
+  measured on the host, `which = 2^32` truncates back to `ITIMER_REAL` and arms
+  it (`2^32 + 3` is `EINVAL`, a sign-extended `-1` is `EINVAL`), while this
+  kernel compared the whole `usize` and refused them all; an unreadable
+  `new_value` answers `EFAULT` **before** a bogus `which` is judged, and a
+  malformed `tv_usec` answers `EINVAL` **before** a bad `old_value` answers
+  `EFAULT`; and a bad `old_value` still leaves the timer **armed** (the host
+  reads `armed=yes it_value=9.999998` after that `EFAULT`), which a kernel that
+  only returned the right errno would miss. The 32-bit word now lives in one
+  host-testable verdict, the order in the handlers' statements; the three stale
+  "no per-task CPU accounting" comments now name the real gap (CPU time is
+  charged, but the expiry scan covers `ITIMER_REAL` only, and closing it needs
+  §2.13's delivery path). Pinned by `t-itimer-order` (27 claims,
+  counterfactually 8 red) (§6.125, item 239)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

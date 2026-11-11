@@ -1472,8 +1472,11 @@ pub(crate) struct Task {
     pub(crate) tls: usize,
     /// The three interval timers `setitimer` arms, indexed by the ABI's
     /// `which`. `ITIMER_REAL` really expires - it counts the wall-clock
-    /// ticks the board has; the other two are recorded but never fire, for
-    /// want of per-task CPU accounting.
+    /// ticks the board has; `check_itimers` scans that one slot only, so the
+    /// virtual and profiling timers are recorded and read back faithfully
+    /// but never expire. That is a gap in the expiry scan (§6.125), not a
+    /// missing accounting: per-task and per-group CPU time has been charged
+    /// since §6.95/§6.99/§6.123.
     pub(crate) itimers: [Option<ItimerState>; 3],
     /// The POSIX interval timers `timer_create` made, indexed by the id the
     /// call answered with. The table is the **thread group's**: Linux keeps

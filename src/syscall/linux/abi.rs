@@ -4195,6 +4195,32 @@ pub(crate) fn timer_settime_flags_verdict(word: usize) -> Result<(), isize> {
     Ok(())
 }
 
+/// `setitimer`/`getitimer`'s `which` is a 32-bit `int`, not the `usize` the
+/// syscall register carries. Linux's `do_setitimer` takes it into an `int`, so
+/// a caller whose word has anything above bit 31 is really naming the low
+/// 32 bits: `build/scratch/itimer/width.c` measured `which = 2^32` arming
+/// `ITIMER_REAL` (`rc=0`, `getitimer` then reads `armed=yes it_value=9.999976`),
+/// `which = 2^32 + 3` answering `EINVAL(22)`, `getitimer(2^32) = 0`, and the
+/// sign-extended `-1` (`0xffff_ffff_ffff_ffff`) answering `EINVAL`. The three
+/// clocks are `REAL = 0`, `VIRTUAL = 1`, `PROF = 2`; a truncated word outside
+/// `0..=2` is the door's `EINVAL`.
+///
+/// Before §6.125 both handlers compared the whole register with
+/// `which > ITIMER_PROF`, so `2^32` was refused where Linux armed a timer, and
+/// `itimer_swap` would have indexed `task.itimers[which]` with the untruncated
+/// word - a panic rather than an errno. The verdict is pure and host-reachable
+/// (the bare-metal `proc` cannot be host-compiled), with the literal `0..=2`
+/// rather than `crate::sched::ITIMER_*`: those constants are exported only for
+/// `target_os = "none"`.
+pub(crate) fn itimer_which_verdict(word: usize) -> Result<usize, isize> {
+    let which = word as u32 as i32;
+    if (0..=2).contains(&which) {
+        Ok(which as usize)
+    } else {
+        Err(err::EINVAL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7386,5 +7412,30 @@ mod diskstat_tests {
         assert_eq!(timer_settime_flags_verdict(3), Err(err::EINVAL));
         assert_eq!(timer_settime_flags_verdict(0xffff_ffff), Err(err::EINVAL));
         assert_eq!(timer_settime_flags_verdict(0x1_0000_0001), Err(err::EINVAL));
+    }
+
+    /// `setitimer`/`getitimer`'s `which` is an `int`: the low 32 bits name the
+    /// clock, and every word the host's `width.c`/`final.c` passed above bit 31
+    /// behaved exactly as the truncated word does. Before §6.125 the two
+    /// handlers compared the whole `usize` register, so `2^32` was an `EINVAL`
+    /// where Linux armed `ITIMER_REAL`, and a large word reached `itimer_swap`
+    /// and indexed past the three-slot array.
+    #[test]
+    fn itimer_which_is_the_low_32_bits_of_the_register() {
+        // The three clocks, spelled as the register would carry them.
+        assert_eq!(itimer_which_verdict(0), Ok(0));
+        assert_eq!(itimer_which_verdict(1), Ok(1));
+        assert_eq!(itimer_which_verdict(2), Ok(2));
+        // `2^32`, `2^32 + 1`, `2^32 + 2` truncate back to the three clocks:
+        // the host armed a REAL timer for the first of these and read it back.
+        assert_eq!(itimer_which_verdict(0x1_0000_0000), Ok(0));
+        assert_eq!(itimer_which_verdict(0x1_0000_0001), Ok(1));
+        assert_eq!(itimer_which_verdict(0x1_0000_0002), Ok(2));
+        // Anything else - a plain 3, a truncated 3, a sign-extended -1, or all
+        // bits set - is EINVAL, not an out-of-bounds index.
+        assert_eq!(itimer_which_verdict(3), Err(err::EINVAL));
+        assert_eq!(itimer_which_verdict(0x1_0000_0003), Err(err::EINVAL));
+        assert_eq!(itimer_which_verdict(usize::MAX), Err(err::EINVAL));
+        assert_eq!(itimer_which_verdict(0xffff_ffff), Err(err::EINVAL));
     }
 }
