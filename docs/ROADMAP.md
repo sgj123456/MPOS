@@ -2288,3 +2288,13 @@ carries the per-phase history.*
   on the frame path says whether a page came in with I/O. Pin `t-stat-faults` 14 claims, **5 red**
   counterfactually, and three of its own claims had to be rewritten first because the act of measuring
   moved the counter being measured. Host unit tests `763 -> 764`. (§6.130, item 244)
+- [x] **`/proc/<pid>/stat`'s `flags` is the task-state bitmask** — field 9 printed a literal `0` for
+  every task. It is five facts in one word, and all four inputs already existed: `PF_FORKNOEXEC` is
+  `Task::user_resume.is_some()` (cleared at exactly one place, the exec path), the death bits are
+  `exited`, `PF_SIGNALED`/`PF_DUMPCORE` are bits of the wait status field 52 already computes (§6.112),
+  and `PF_RANDOMIZE` is the ASLR this kernel really implements. One leaf function
+  (`crates/abi::stat_flags`) beside `tty_nr` and `wait_status`; `sched` computes the word, `vfs` renders
+  it. Measured against the host with ASLR on and off: `0x400000` live, `0x400040` forked-not-execed,
+  `0x40844c` a `SIGTERM` zombie, `0x40864c` a `SIGSEGV` one — the dump bit follows the signal, not the
+  file. Pin `t-stat-flags` 16 claims, **7 red** counterfactually. Host unit tests `764 -> 765`.
+  (§6.131, item 245)

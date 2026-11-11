@@ -718,6 +718,105 @@ pub const fn tty_nr(dev: Option<(u32, u32)>) -> u32 {
     }
 }
 
+/// `PF_FORKNOEXEC`: this task was made by `fork`/`clone` and has not `exec`ed
+/// since, so it is still running its creator's image.
+///
+/// The three bits beside it are Linux's too, and the measurements below confirm
+/// each from a different state: `PF_DUMPCORE` only for a signal that dumps,
+/// `PF_SIGNALED` only for a death by signal at all, `PF_RANDOMIZE` only when the
+/// machine draws layouts.
+pub const PF_FORKNOEXEC: u32 = 0x0000_0040;
+/// `PF_DUMPCORE`: the signal that ended this task was one that dumps core.
+pub const PF_DUMPCORE: u32 = 0x0000_0200;
+/// `PF_SIGNALED`: a signal, not a `return`, ended this task.
+pub const PF_SIGNALED: u32 = 0x0000_0400;
+/// `PF_RANDOMIZE`: this task's layout was drawn at random rather than laid at
+/// fixed addresses.
+pub const PF_RANDOMIZE: u32 = 0x0040_0000;
+
+/// The bits every corpse carries and no live task does.
+///
+/// Measured, not looked up: `build/scratch/statflags2/flags4.c` under
+/// `setarch -R` (which clears `PF_RANDOMIZE` and isolates the rest) read a
+/// `fork` child that `_exit(0)`ed as `0x804c` while the same program running
+/// read `0x0`, and a child that `execl`ed before dying read `0x800c` - so the
+/// dying half, with `PF_FORKNOEXEC` taken out, is `0x800c`, three bits. The
+/// same three appear for a death by `SIGTERM` (`0x840c`) and for one by
+/// `SIGSEGV` (`0x864c`) and never for a live task, including one held at a
+/// `SIGSTOP` (`flags5.c` read `0x0` for that).
+///
+/// They are reported because they are **measured**, and named for what they
+/// mean to a reader of this file rather than for a Linux identifier this
+/// repository cannot check: the two the older kernels call `PF_EXITING` and
+/// `PF_EXITPIDONE` are the pair that says "dying" and "done dying", and the
+/// third (`0x8000`) is one this measurement cannot name at all - it is in
+/// every corpse and no live task, and nothing here says what else sets it. A
+/// bitmask cannot spell "I do not know", so the third bit rides with the other
+/// two under the honest heading: all three are Linux's word for "this task is
+/// over", and `docs/notes/` §6.131 records that the third one's name is the
+/// part this kernel does not know.
+pub const PF_DEAD: u32 = 0x0000_800c;
+
+/// `/proc/<pid>/stat`'s field 9, `flags`: the task-state bits this kernel can
+/// answer for.
+///
+/// The field was a literal `0`, and no live process reads `0` on Linux
+/// (`build/scratch/statflags2/flags2.c`, 7.2.14): a program the shell `exec`ed
+/// reads `0x400000`, a `fork` child that has not `exec`ed reads `0x400040`, and
+/// a corpse that died of `SIGSEGV` reads `0x40864c`. Under `setarch -R` -
+/// `ADDR_NO_RANDOMIZE`, which this kernel's `personality` refuses - the same
+/// three read `0x0`, `0x40` and `0x864c`, so **`PF_RANDOMIZE` is the machine's
+/// layout and everything else is state the task carries either way**. That is
+/// why the pin's claims are relations between two words rather than one word
+/// compared to a constant: the bits a plain process carries depend on the
+/// machine's ASLR setting, and the bits that say "forked, not yet `exec`ed",
+/// "died of a signal", "that signal dumped core" and "this task is over" do
+/// not.
+///
+/// Every argument is a fact this kernel tracks, and none is inferred:
+///
+/// - `forked_not_execed` is `Task::user_resume.is_some()`, which is exactly
+///   "made by `fork`/`clone` and still holding the creator's register file";
+///   `exec` takes that field, so the bit clears at the one moment Linux clears
+///   it (`flags5.c`: `0x40800c` for a child that `execl`ed and exited, against
+///   `0x40804c` for one that never did).
+/// - `dead` is `Task::exited`, which outlives the address space for exactly as
+///   long as the `/proc` file does.
+/// - `signalled` and `dumped` come from the wait status already computed for
+///   field 52 ([`wait_status`]): `WIFSIGNALED` is the low seven bits being
+///   non-zero, `WCOREDUMP` bit 7 - so the two fields cannot disagree about how
+///   the task died.
+/// - `randomized` is true for every task this kernel runs: `new_layout` draws
+///   all four landmarks from `crate::rand` at every `exec`.
+///
+/// The leaf holds it for [`tty_nr`]'s reason: `sched` builds the word and `vfs`
+/// renders it, and one definition is what keeps those two agreeing.
+pub const fn stat_flags(
+    forked_not_execed: bool,
+    dead: bool,
+    signalled: bool,
+    dumped: bool,
+    randomized: bool,
+) -> u32 {
+    let mut word = 0;
+    if forked_not_execed {
+        word |= PF_FORKNOEXEC;
+    }
+    if randomized {
+        word |= PF_RANDOMIZE;
+    }
+    if dead {
+        word |= PF_DEAD;
+        if signalled {
+            word |= PF_SIGNALED;
+            if dumped {
+                word |= PF_DUMPCORE;
+            }
+        }
+    }
+    word
+}
+
 /// Which `ru_maxrss` a `struct rusage` reports for a process, in KB.
 ///
 /// There are two books and three readers, measured on Linux 7.2.14
@@ -1175,6 +1274,59 @@ mod tests {
         // gets wrong.
         assert_eq!(tty_nr(Some((136, 0x101))), 1 | (136 << 8) | (0x100 << 12));
         assert_eq!(tty_nr(Some((0, 0))), 0);
+    }
+
+    #[test]
+    fn stat_flags_reproduces_every_word_the_host_printed() {
+        // §6.131: each constant below is a Linux 7.2.14 reading from
+        // `build/scratch/statflags2/flags2.c` and `flags3.c`, ASLR on and off.
+        // A live, exec'd, single-threaded process: `0x400000` with ASLR,
+        // `0x0` without, because the only bit is PF_RANDOMIZE.
+        assert_eq!(stat_flags(false, false, false, false, true), 0x40_0000);
+        assert_eq!(stat_flags(false, false, false, false, false), 0);
+        // Forked and not yet exec'd: PF_FORKNOEXEC on top, nothing else moves.
+        assert_eq!(stat_flags(true, false, false, false, true), 0x40_0040);
+        assert_eq!(stat_flags(true, false, false, false, false), 0x40);
+        // `fork` + `_exit(0)` under ASLR off: `0x804c` - the death bits and
+        // PF_FORKNOEXEC, and no PF_SIGNALED because nothing signalled it.
+        assert_eq!(stat_flags(true, true, false, false, false), 0x804c);
+        // The same child after an `execl` and an exit: `0x800c`. This is the
+        // pair that proves the fork bit is `user_resume` and not "is a child".
+        assert_eq!(stat_flags(false, true, false, false, false), 0x800c);
+        // A `fork` child killed by SIGTERM before it ever execed: `0x844c`,
+        // which is the death bits, PF_SIGNALED and **also** PF_FORKNOEXEC -
+        // the corpse was made by `fork` and never got to `exec`, so all three
+        // facts are true of it at once.
+        assert_eq!(stat_flags(true, true, true, false, false), 0x844c);
+        // The same child killed by SIGSEGV: `0x864c`, PF_DUMPCORE on top of
+        // PF_SIGNALED, because SIGSEGV is a signal that dumps.
+        assert_eq!(stat_flags(true, true, true, true, false), 0x864c);
+        // And the pair that proves the dump bit is the signal and not the
+        // death: same corpse, no dump (SIGTERM), is exactly `0x200` short.
+        assert_eq!(
+            stat_flags(true, true, true, true, false) - stat_flags(true, true, true, false, false),
+            PF_DUMPCORE
+        );
+        // A `SIGSTOP`ped live task reads `0x0` under ASLR off: a stop is not a
+        // death, and a word that called it one would fail here.
+        assert_eq!(stat_flags(false, false, false, false, false), 0);
+        // The ASLR halves are the same word modulo PF_RANDOMIZE, which is what
+        // makes a pin able to assert relations rather than magic constants.
+        for (forked, dead, signalled, dumped) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (false, true, true, true),
+        ] {
+            assert_eq!(
+                stat_flags(forked, dead, signalled, dumped, true),
+                stat_flags(forked, dead, signalled, dumped, false) | PF_RANDOMIZE
+            );
+        }
+        // "Dumped" without "signalled" is not a state; it must not invent
+        // PF_DUMPCORE on a task that returned from main.
+        assert_eq!(stat_flags(false, true, false, true, false), 0x800c);
     }
 
     #[test]

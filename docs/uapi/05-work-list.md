@@ -10813,3 +10813,34 @@ two words + the three-way split), `user/tests/src/bin/t-stat-faults.rs`, §6.130
 kernel's frame path says whether a page came in with I/O — `MappedObject::frame_at` answers *which
 frame*, never *how*. Frame-backed faults are therefore not counted at all: counting them as minor
 would be a guess. And the per-page count is this machine's, not Linux's, whose allocator batches.
+
+### Item 245 — `/proc/<pid>/stat`'s `flags` is the task-state bitmask, not a literal zero
+
+| | Linux | this kernel, before | this kernel, now |
+|---|---|---|---|
+| `flags` (field 9), exec'd process | `0x400000` | `"0"` | `4194304` |
+| forked child, never exec'd | `0x400040` | `"0"` | `4194368` |
+| a worker thread | `0x400040` | `"0"` | `4194368` |
+| zombie, `exit(0)` | `0x40804c` | `"0"` | `4227148` |
+| zombie, killed by `SIGTERM` | `0x40844c` | `"0"` | `4228172` |
+| zombie, killed by `SIGSEGV` | `0x40864c` | `"0"` | `4228684` |
+| the same, ASLR off (`setarch -R`) | `0x0` … `0x864c` | `"0"` | the same minus `PF_RANDOMIZE` |
+
+**Why it lasted.** The literal was not observably wrong for a plain running process on a machine whose
+readers never compare the column — and the one bit that *is* discriminating, `PF_FORKNOEXEC`, exists
+only in the window between `fork` and `exec`, which almost nothing this kernel runs spends time in.
+
+**Where the inputs already were.** Four facts, all present: `Task::user_resume: Option<UserFrame>`
+(`src/sched/runtime/task.rs:1126`, set by fork, cleared only by exec at
+`src/sched/runtime/child_exit.rs:1748`), `Task::exited` (`:1110`), the wait status already computed for
+field 52 (§6.112), and the ASLR this kernel already implements
+(`src/sched/runtime/task.rs:392 fn random_pages`, `:454 fn new_layout`). No new state, one leaf
+function: `crates/abi/src/lib.rs`'s `pub const fn stat_flags(forked_not_execed, dead, signalled,
+dumped, randomized) -> u32`.
+
+**Measurement:** `build/scratch/statflags2/{flags,flags2,flags3,flags4,flags5,inherit}.c`, host 7.2.14;
+`build/boot-statflags1.log` on the machine. **Pin:** `t-stat-flags`, 16 claims, 7 red counterfactually.
+
+**Named gaps:** the `0x8000` bit in every dead task's word is folded into `PF_DEAD` because this
+repository cannot verify Linux's name for it; `PF_RANDOMIZE` is reported as set unconditionally, which
+is a lie only on a machine built without ASLR (there is none today).

@@ -11280,4 +11280,105 @@ to read.
 this fixture compared two numbers that the act of measuring moved — and the file it was measuring was
 the one whose reading cost the fault. The claim had to become a bound or a movement, and the two
 literals that had stood for four phases were never once asked to move.
+*A counter the reader cannot compare against itself is a counter with no pin.* Every wrong version of
+this fixture compared two numbers that the act of measuring moved — and the file it was measuring was
+the one whose reading cost the fault. The claim had to become a bound or a movement, and the two
+literals that had stood for four phases were never once asked to move.
 
+## §6.131 `/proc/<pid>/stat`'s flags is a task-state bitmask, and every input was already there (LANDED 2026-11-11)
+
+Field 9 of `stat` is `flags`, and this kernel printed `0`. It is the last of the columns §6.101–§6.130
+worked through, and unlike the counters before it this one is not a number at all: it is a bitmask of
+what the task *is* at this moment, which is why a literal cannot be approximately right.
+
+### What the reference host prints
+
+`build/scratch/statflags2/flags2.c` and its siblings, at the raw `/proc` level, decoding field 9 as a
+**decimal** word (`flags3.c` first read it as hex and produced `0x4194304`, an artefact of the probe,
+not of the kernel):
+
+```
+self (exec'd by the shell)      flags=0x400000
+forked, never exec'd child      flags=0x400040
+forked, then exec'd child       flags=0x400000
+zombie killed by SIGKILL        flags=0x40844c  state=0
+after reaping it                field9=-1
+child stopped by SIGSTOP        flags=0x400040  state=0
+task/<tid> spelling of it       flags=0x400000
+```
+
+`flags4.c` runs the same program under `setarch -R` (ASLR off) and every word loses exactly `0x400000`;
+`flags5.c` separates the deaths: `SIGTERM` gives `0x40840c` and `SIGSEGV` `0x40864c`, a difference of
+`0x200`; an exec'd child that is merely stopped reads `0x0` with ASLR off — **a stop is not a death**.
+`flags3.c` reads a worker thread's own `task/<tid>/stat` as `0x400040` while its leader reads
+`0x400000`: the thread was made by `clone` and has never exec'd.
+
+So the word is five facts: `PF_FORKNOEXEC` (`0x40`, set between fork/clone and exec), `PF_RANDOMIZE`
+(`0x400000`, a property of the machine's layout), the death bits (`0x4|0x8|0x8000`), `PF_SIGNALED`
+(`0x400`, only when a signal killed it) and `PF_DUMPCORE` (`0x200`, only when that signal was a
+core-dumping one). `build/scratch/statflags2/nolimit.c` confirms the dump bit follows the *signal*, not
+the file: `RLIMIT_CORE` 0 and unlimited both read `0x40864c` and both report `WCOREDUMP`, which is the
+same rule `wait_status` already encodes (§6.112).
+
+### Why this was contained rather than a feature
+
+Nothing new had to be counted. All four inputs existed:
+
+* **forked-not-execed** is `Task::user_resume.is_some()` — `src/sched/runtime/task.rs:1126`, set by
+  `fork`, cleared at exactly one place, `src/sched/runtime/child_exit.rs:1748 task.user_resume = None`,
+  which is the exec path;
+* **dead** is `Task::exited` (`src/sched/runtime/task.rs:1110`);
+* **signalled/dumped** come from the wait-status word already computed for field 52 — `retired_status`
+  (§6.112) — so `signalled` is `(status & 0x7f)` neither 0 nor `0x7f`, and `dumped` is its `0x80` bit;
+* **randomized** is this kernel's own ASLR, which it really does (`src/sched/runtime/task.rs:392 fn
+  random_pages`, `:454 fn new_layout`, called from three places), so it is reported as `true`: honest
+  for every image this tree builds, and the reason it is a named gap rather than a proof.
+
+The encoding is one leaf function, `pub const fn stat_flags(forked_not_execed: bool, dead: bool,
+signalled: bool, dumped: bool, randomized: bool) -> u32` in `crates/abi/src/lib.rs`, beside `tty_nr`
+(§6.129) and `wait_status` (§6.112) and for the same reason: `sched` and `vfs` both need the number and
+neither should own the definition.
+
+### Two arguments with my own test, both wrong in the same direction
+
+The leaf's unit test is a set of literals copied from the host's output, so it is only as good as the
+copy. Two mistakes surfaced while writing it, and both were the test being wrong rather than the
+function:
+
+1. The first version passed `forked_not_execed = false` for the `SIGTERM` and `SIGSEGV` zombies, and
+   failed with `left: 34316, right: 34380` — `0x860c` against `0x864c`. Re-deriving all four measured
+   words showed every one of them carries `0x40`: `flags2.c`'s zombies are children that forked and
+   never exec'd, so the bit is rightly set. The function was right and the expectation was not.
+2. The first constants were `PF_DEAD_BEGIN`/`PF_DEAD_END` covering only `0x4|0x8`, which made every
+   dead word `0x8000` short. The bit is real and in every dead task's word in every probe, but this
+   repository cannot verify Linux's name for it, so it became one `PF_DEAD = 0x0000_800c` with the
+   naming gap recorded in the doc comment rather than guessed at.
+
+### The pin, and the trap that cost the most time
+
+`t-stat-flags` has 16 claims: a live process is not zero and carries no fork or death bit; a forked
+child carries `PF_FORKNOEXEC` and *only* that bit more than its parent; a stopped child carries no death
+bit and still carries the fork bit; `SIGTERM` sets `PF_SIGNALED` and not `PF_DUMPCORE`; `SIGSEGV` sets
+both and the difference between the two words is exactly `PF_DUMPCORE`; a worker thread carries the fork
+bit while its leader does not; a reaped child has no file.
+
+The fixture's hardest bug was not in either kernel. The `SIGSEGV` claim hung **the host** — not failed,
+hung — and `strace -f` showed `kill(…, SIGSEGV) = 0`, the child still alive, and the parent parked in
+`wait4`. The cause is that **`fork` copies signal dispositions**: Rust's standard library installs a
+`SIGSEGV` handler for stack-overflow reporting, the child inherited it, the signal was caught, the
+handler returned, and the child went back to `pause()`. `build/scratch/statflags2/inherit.c` isolates
+it: without a reset the child survives the signal, with `signal(SIGSEGV, SIG_DFL)` it dies with
+`signaled=1 sig=11 core=128`. The fixture now resets the disposition explicitly, and says in a comment
+why a test that wants the default death has to ask for it.
+
+Counterfactually the pin is **7 red of 16**, all reading `Some(0)`: the live word, the fork bit, the
+death bits, `PF_SIGNALED`, `PF_DUMPCORE`, the stop-is-not-an-exec claim, and the thread's fork bit. The
+nine that stay green either way are the negative halves — "no fork bit here", "no death bit on a live
+task", "no file after the reap" — which a literal zero satisfies, and that is the honest boundary of
+this shape.
+
+### The rule
+
+*A bit is a claim about now, and a zero is a claim about never.* The counters before this one were
+wrong in a way only a busy process noticed; this one was wrong for every process at every instant, and
+it went unseen because a reader that does not compare the column cannot tell a mask from a zero.

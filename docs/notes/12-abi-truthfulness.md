@@ -292,7 +292,17 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s minor-fault columns §6.130):** stage 1
+**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s `flags` §6.131):** stage 1 `1268 tests,
+0 failed` (53.73 s — the +2 are the `stat_flags` leaf test in `crates/abi` and the `stat` rendering test
+in `vfs::procfs`); x86_64 `pass=295 fail=0 (295 built)`, `mpos-kunit 35 passed, 0 failed` (51.26 s over
+2 lane(s)); aarch64 `pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (123.41 s over
+2 lane(s), `the machine reached === END and was stopped`) — `GATE EXIT=0`, both arms in one command with
+the lane count forced to two (`build/gate-statflags2.log`). Field 9 now answers the task-state bitmask
+instead of a literal zero: `t-stat-flags` reads 16/16 on both arms and is **7 red of 16** against the
+pre-§6.131 kernel, every red reading `Some(0)`. §6.131 records the five facts, the four inputs that
+already existed, and the two places where my own unit test was the thing that was wrong.
+
+**Measured gate before it (2026-11-11, `/proc/<pid>/stat`'s minor-fault columns §6.130):** stage 1
 `1266 tests, 0 failed` (53.91 s — the +1 is the `stat` rendering test in `vfs::procfs`); x86_64
 `pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (54.27 s total, +1.7% against 53.37 s);
 aarch64 `pass=293 fail=0 (293 built)`, `mpos-kunit 35 passed, 0 failed` (190.89 s total, +1.4%

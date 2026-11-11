@@ -506,6 +506,21 @@ pub struct TaskSnapshot {
     /// `pgrp`/`ppid` beside it go through. `None` is "no controlling
     /// terminal", which the file prints as `-1`.
     pub terminal_foreground: Option<usize>,
+    /// `/proc/<pid>/stat`'s field 9, `flags`: the task-state bits this kernel
+    /// can answer for, built by [`crate::abi::stat_flags`] from facts already
+    /// stored on the task.
+    ///
+    /// The field was a literal `0`, and no live process reads `0` on Linux
+    /// (`build/scratch/statflags2/flags2.c`, 7.2.14): a program the shell
+    /// `exec`ed reads `0x400000` and a `fork` child that has not `exec`ed
+    /// reads `0x400040`. The four inputs are the task's own:
+    /// `user_resume` is set by `fork`/`clone` and taken by `exec`, which is
+    /// exactly Linux's `PF_FORKNOEXEC`; `exited` outlives the address space
+    /// for as long as the file does; and the signal half is read off the wait
+    /// status field 52 already reports, so the two fields cannot disagree
+    /// about how a task died. The layout bit is this kernel's own
+    /// `new_layout`, which draws every landmark at random (§6.131).
+    pub flags: u32,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -717,6 +732,24 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .minor_faults_both()
             .saturating_sub(task.mm.minor_faults_own()),
         minflt_own: task.minflt.load(core::sync::atomic::Ordering::Relaxed),
+        // Field 9 is a bitmask over facts this table already holds, so it is
+        // built rather than stored: the fork bit is the register file `exec`
+        // takes away, the death bits are what the field-52 status already
+        // encoded (`WIFSIGNALED` is the low seven bits naming a signal,
+        // `WCOREDUMP` bit 7), and the layout bit is every task this kernel
+        // runs - `new_layout` draws all four landmarks at every `exec`. One
+        // word, one definition, in the leaf (§6.131).
+        flags: {
+            let status = retired_status(task.tgid).unwrap_or(0);
+            let signalled = task.exited && (status & 0x7f) != 0 && (status & 0x7f) != 0x7f;
+            crate::abi::stat_flags(
+                task.user_resume.is_some(),
+                task.exited,
+                signalled,
+                signalled && (status & 0x80) != 0,
+                true,
+            )
+        },
     }
 }
 

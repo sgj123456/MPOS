@@ -1612,6 +1612,9 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::minflt_own`] - field 10 of the
     /// `task/<tid>/` spelling, this thread's own count.
     pub minflt_own: u64,
+    /// See [`crate::sched::TaskSnapshot::flags`] - `stat`'s field 9, the
+    /// task-state bitmask.
+    pub flags: u32,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1774,7 +1777,12 @@ fn stat_fields(task: &Process, tid: usize, whole: bool) -> [alloc::borrow::Cow<'
             Some(group) => alloc::format!("{}", reader_number(group)),
             None => alloc::string::String::from("-1"),
         }),
-        Cow::Borrowed("0"), // flags
+        // The task-state bitmask, built in the leaf from facts `sched` already
+        // keeps: forked-not-yet-execed, dead, died of a signal, that signal
+        // dumped, and this kernel's randomized layout. Linux's word here is
+        // real state and reads `0x400000` for a plain process, so a literal
+        // `0` was wrong for every live task (§6.131).
+        Cow::Owned(alloc::format!("{}", task.flags)), // flags
         // minflt: the group's own for `/proc/<pid>/stat`, this thread's for the
         // `task/<tid>/` spelling - `utime`'s split, for `utime`'s reason. A
         // single-threaded process reads the same number from both; only a
@@ -5729,6 +5737,62 @@ mod tests {
         assert_eq!(as_group[10 - 3], "5401", "the same group it shares");
     }
 
+    /// §6.131: `stat`'s field 9 was a borrowed `"0"`. What this pins is that
+    /// the column is a number the kernel computes from task state, and that the
+    /// two facts a reader branches on - "forked and not yet `exec`ed" and "this
+    /// task is over" - reach the file.
+    ///
+    /// Linux's words are `build/scratch/statflags2/flags2.c` and `flags3.c`
+    /// (7.2.14), read twice, with ASLR on and under `setarch -R`: a plain
+    /// process is `0x400000`/`0x0`, a `fork` child that has not `exec`ed is
+    /// `0x400040`/`0x40`, and a corpse is `0x40804c`/`0x804c`. The layout half
+    /// is the machine's, so what is asserted here is the word this kernel
+    /// builds, not a constant a different machine would spell differently.
+    #[test]
+    fn stat_prints_the_task_state_bitmask_not_a_literal_zero() {
+        let fields_of = |p: &Process| -> alloc::vec::Vec<alloc::string::String> {
+            let line = stat_text(&stat_fields(p, p.tid, true), p.pid);
+            line.split(' ')
+                .skip(2)
+                .map(alloc::string::String::from)
+                .collect()
+        };
+
+        // The fixture is a quiet process on a layout-drawing machine, which is
+        // Linux's `0x400000`: not zero, and that is the whole defect.
+        let plain = process(7, 7, None, 0, 'R');
+        let f = fields_of(&plain);
+        assert_eq!(f[9 - 3], "4194304", "flags, field 9 (0x400000)");
+        assert_ne!(f[9 - 3], "0", "the literal this replaced");
+
+        // A forked child that has not exec'd: the bit goes on, and comes off
+        // again for a task that has exec'd - which is the field's only
+        // state-dependent bit this kernel can answer.
+        let mut forked = process(8, 8, Some(1), 1, 'R');
+        forked.flags = crate::abi::stat_flags(true, false, false, false, true);
+        assert_eq!(
+            fields_of(&forked)[9 - 3],
+            "4194368",
+            "0x400040: forked, not yet execed"
+        );
+
+        // A corpse: the death bits, and no `PF_SIGNALED` because it returned.
+        let mut corpse = process(9, 9, None, 0, 'Z');
+        corpse.flags = crate::abi::stat_flags(true, true, false, false, true);
+        assert_eq!(fields_of(&corpse)[9 - 3], "4227148", "0x40804c, a zombie");
+
+        // And a stop is **not** a death: the word keeps the fork bit and gains
+        // nothing, which is the claim a kernel that called any non-running
+        // task dead would fail.
+        let mut stopped = process(10, 10, None, 0, 'T');
+        stopped.flags = crate::abi::stat_flags(true, false, false, false, true);
+        assert_eq!(
+            fields_of(&stopped)[9 - 3],
+            "4194368",
+            "a SIGSTOPped task reads its live word"
+        );
+    }
+
     /// §6.117: `stat`'s fields 26-28 were three borrowed `"0"`s. The addresses
     /// themselves are the loader's, so what this pins is the rendering and the
     /// three facts a constant cannot have: a loaded image reports its own
@@ -7006,6 +7070,11 @@ mod tests {
             minflt: 0,
             cminflt: 0,
             minflt_own: 0,
+            // A quiet, exec'd, single-threaded process on a machine that draws
+            // its layouts: Linux reads `0x400000` for exactly this shape
+            // (`build/scratch/statflags2/flags2.c`), and a test that wants a
+            // corpse or a forked child sets the field itself (§6.131).
+            flags: crate::abi::stat_flags(false, false, false, false, true),
         }
     }
 
