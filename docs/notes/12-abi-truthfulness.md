@@ -292,7 +292,26 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `getcpu`'s two output pointers §6.128):** stage 1 `1263
+**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s `tty_nr`/`tpgid`/`session` §6.129):** stage 1
+`1265 tests, 0 failed` (53.01 s — the +2 are `tty_nr`'s host test in the `abi` leaf and the `stat`
+rendering test in `vfs::procfs`); x86_64 `pass=293 fail=0 (293 built)`, `mpos-kunit 35 passed, 0
+failed` (53.37 s total, -23.1% against 69.37 s); aarch64 `pass=292 fail=0 (292 built)`, `mpos-kunit
+35 passed, 0 failed` (188.25 s total, -14.8% against 220.98 s, `16 not run - see tests.toml`) —
+`GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-stattty2.log`). One new program: `t-stat-tty` (12 claims), **8 of which fail** against
+the kernel before this change — the two `tty_nr` rows, three `tpgid` rows, and the grandchild's
+session (`build/boot-stattty-cf1.log`). The `session 12 … leader 11` line is the discriminating one:
+the old file printed the grandchild's own group in the session column, and nothing else in the run
+would have said so. Four claims are green on both kernels — no terminal still reads `0`/`-1`, which is
+the honest boundary. `t-stat-tty` passed on **both** arms of this gate
+(`build/test-lane-x86_64-1/serial.log:1442`, `build/test-lane-aarch64-0/serial.log:1573`). Two
+mistakes were paid for writing it, both recorded in §6.129: a background process that calls
+`tcsetpgrp` is stopped by `SIGTTOU` (the harness killed the first version after it hung), and
+`libc::ioctl`'s request parameter is `c_int` in the musl bindings and `c_ulong` in the gnu ones — this
+gate builds the suite both ways, so the request goes through `libc::syscall(SYS_ioctl)` as `t-pty`
+already does.
+
+**Measured gate before it (2026-11-11, `getcpu`'s two output pointers §6.128):** stage 1 `1263
 tests, 0 failed` (69.01 s — unchanged: this change has no host-testable half, because `buffer_ok`
 answers `true` for every pointer on the host); x86_64 `pass=292 fail=0 (292 built)`, `mpos-kunit 35
 passed, 0 failed` (51.67 s, total 69.37 s, -2.9%); aarch64 `pass=291 fail=0 (291 built)`,

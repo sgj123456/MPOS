@@ -10977,3 +10977,170 @@ of several output pointers, the caller still receives the pointers it did not as
 wrong — and a kernel that pre-checks them all converts a partial success into a total failure the
 program has no way to detect. The measured table above is the specification: attempt each, or the
 errors, answer the accumulated verdict.
+
+## §6.129 `/proc/<pid>/stat`'s `tty_nr`, `tpgid` and `session` are three answers, not two literals and a copy (LANDED 2026-11-11)
+
+Fields 6, 7 and 8 of `stat` are `session`, `tty_nr` and `tpgid`. This file answered field 6 with
+`pgid`, field 7 with the literal `0`, and field 8 with the literal `-1`. The two literals carried a
+comment saying why: *"no controlling terminal — everything on this machine types at the one
+console"*. The copy carried a second: *"no `setsid` has ever been answered with a group of its own"*.
+
+Both reasons had expired, and neither had noticed:
+
+- `setsid` **is** served, and `TIOCSCTTY` with it, so a task's session and its group are two stored
+  numbers now (`src/sched/runtime/task.rs:1212 session`, `:1218 ctty`).
+- The machine has a console, and it also has ptys — `t-TIOCGPTPEER`/`t-aa-ptyprobe` open them — so
+  "everything types at one console" was a claim about the *boot*, not about a file a caller reads
+  per process. `src/vfs/tty.rs:2546 by_dev_id` exists precisely to find the terminal a device id
+  names, and `:2237 foreground()` reads its foreground group.
+
+### What Linux answers — measured
+
+`build/scratch/ttynr/b.c` on the host (7.2.14). The probe forks, because a container's shell is
+already a process-group leader and `setsid` then answers `EPERM`; it also sets
+`setvbuf(stdout, NULL, _IONBF, 0)`, because a child that exits with buffered output loses exactly the
+lines the measurement needs. The first word after the **last** `)` is field 3, so field `n` is at
+zero-based index `n − 3` of that split (the first attempt indexed `n − 3` off a list that began at
+field 1 and so read one field to the left everywhere).
+
+```text
+no controlling terminal          tty_nr=0        tpgid=-1       pgrp=54880  session=54880  state=R
+slave /dev/pts/1 rdev=0x8801 major=136 minor=1 -> Linux tty_nr encoding 34817
+--- child: after setsid + TIOCSCTTY ---
+child with a controlling terminal tty_nr=34817    tpgid=54894    pgrp=54894  session=54894  state=R
+the child (fg holder)            tty_nr=34817    tpgid=54894    pgrp=54894  session=54894  state=R
+grandchild pid=54895
+the grandchild (same tty, not fg) tty_nr=34817    tpgid=54894    pgrp=54895  session=54894  state=S
+tcgetpgrp before = 54894
+tcsetpgrp(grandchild) = ok
+tcgetpgrp after  = 54895
+the child after handing fg away  tty_nr=34817    tpgid=54895    pgrp=54894  session=54894  state=R
+the grandchild now foreground    tty_nr=34817    tpgid=54895    pgrp=54895  session=54894  state=S
+the dead grandchild              tty_nr=34817    tpgid=54895    pgrp=54895  session=54894  state=Z
+tcgetpgrp with a dead fg group = 54895
+```
+
+Four facts come out of it, and each one is a different question:
+
+1. **`tty_nr` is the terminal's device id recoded, not its `st_rdev`.**
+   `(minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)` — `0x8801` becomes `34817`. This is
+   `new_encode_dev`, the same word `/proc/self/mountinfo` and `statx`'s `st_rdev` users expect.
+2. **No terminal means `0` and `-1`.** Both literals were right *for that case* — which is why they
+   survived: every process that never opened a pty reads them as the truth.
+3. **`tpgid` belongs to the terminal, not to the reading task.** The grandchild holds group `54895`
+   and still prints `tpgid=54894`; after `tcsetpgrp` both files print `54895`, the leader's
+   included. It is one number with as many readers as the terminal has.
+4. **`session` is not `pgid`.** The leader reads its own id in both fields; the grandchild reads the
+   leader's id in 6 and its own in 5. A death does not move either — the dead foreground group still
+   reads `tpgid=54895`, which is why `tcgetpgrp` agrees with it.
+
+### The shape this kernel had
+
+```rust
+Cow::Owned(alloc::format!("{}", reader_number(task.pgid))), // 6: session
+Cow::Borrowed("0"),                                          // 7: tty_nr
+Cow::Borrowed("-1"),                                         // 8: tpgid
+```
+
+The copy is the interesting half. Field 6 printed the *group* number in a file whose field 5 is the
+group number — so for every process that never called `setsid` the two columns agree, and the file
+looks right. It stops looking right exactly where the answer matters: a session leader's grandchild.
+That is the shape §6.129's counterfactual produced, `session 12` where the leader is `11`.
+
+### The fix
+
+- **`crates/abi/src/lib.rs`** — `pub const fn tty_nr(dev: Option<(u32, u32)>) -> u32`, the recoding
+  above and `0` for `None`. It lives in the leaf because two layers need the same word: `sched`
+  produces the snapshot, and a future `statx` caller would want it too, and one definition is
+  cheaper than two that must agree.
+- **`src/sched/runtime/procfs.rs`** — `TaskSnapshot` gains `tty_nr: u32` (from `task.ctty` through
+  that function) and `terminal_foreground: Option<usize>` (the **slot** of the terminal's foreground
+  group, found with `task.ctty.and_then(crate::vfs::tty::by_dev_id).and_then(|tty| tty.foreground())`).
+  It stores the slot, not the number, because the file renders numbers through the *reader's* pid
+  namespace and only `vfs` knows which namespace that is.
+- **`src/vfs/procfs.rs`** — field 6 renders `task.session`, field 7 `task.tty_nr`, field 8
+  `Some(slot) => reader_number(slot)` else `-1`. The three comments were rewritten to say what the
+  fields *are*, rather than why they were constants.
+
+### The pin — `user/tests/src/bin/t-stat-tty.rs`, 12 claims
+
+It mints a pty pair (`/dev/ptmx` + `TIOCGPTN` + `TIOCSPTLCK`), forks a child that `setsid`s and
+takes the slave with `TIOCSCTTY`, then forks a grandchild that `setpgid`s itself, and moves the
+foreground to it. Two mistakes were paid for writing it:
+
+- **The grandchild must not call `tcsetpgrp`.** A background process that touches the terminal's
+  foreground gets `SIGTTOU`, whose default action is *stop* — so the first version did not measure
+  anything, it hung until the harness killed it. The move is made by whoever currently holds the
+  foreground; the grandchild only sleeps.
+- **"different from the naive encoding" is not a claim.** The recoding only diverges past minor 255,
+  and a pty's number is small, so on the host the two encodings are equal and the assertion passes
+  vacuously. What is testable is that the answer is derived from *this pair's* device id.
+
+A third assertion was removed rather than repaired: *"session and group are two different questions"*
+holds for a program the runner forks into its own group (host) and fails for the machine's pid 1,
+which leads both its group and its session — a fact about the launcher, not about the file. Field 6's
+discriminator is the grandchild line, which is green on the fix and red without it.
+
+**Host 12/12**, `slave 136/1, want tty_nr 34817`, `session 60014 pid 60014`, `pgrp 60015`,
+`moving the foreground moves the grandchild's tpgid (60014 -> 60015)` and the leader's file with it.
+**Machine 12/12** (`build/boot-stattty2.log`, `exit=0`): `slave 136/7, want tty_nr 34823`,
+`session 11 pid 11`, `pgrp 12`, `(11 -> 12)` on both files.
+
+### Counterfactually 8 of 12 red
+
+`git stash push -q -m cf-stat-tty -- crates/abi/src/lib.rs src/sched/runtime/procfs.rs
+src/vfs/procfs.rs`, both kernel and loader rebuilt, `build/boot-stattty-cf1.log`:
+
+```text
+FAIL:  the child acquired the terminal (slave 136/7, want tty_nr 34823)
+FAIL:  tty_nr is the recoded device id, not its st_rdev (0, want 34823)
+FAIL:  and the answer is this pair's device, not a literal (0 vs 136:7)
+FAIL:  and tpgid is the terminal's foreground, which it just took (tpgid -1, pgrp 11)
+FAIL:  its session is the leader's, its group its own (session 12, pgrp 12, leader 11)
+FAIL:  and its tpgid is the terminal's, not its own group (tpgid -1, pgrp 12)
+FAIL:  moving the foreground moves the grandchild's tpgid (-1 -> -1)
+FAIL:  and the leader's file follows the terminal too (-1 -> -1)
+```
+
+The `session 12 … leader 11` line is the one this entry is about: the old file printed the
+grandchild's own group in the session column, and nothing else in the run would have said so. The
+four green-on-both claims are the honest boundary — no terminal still reads `0`/`-1`, and the
+grandchild still shares its leader's `tty_nr` (both `0` before the fix).
+
+### Gate
+
+`build/gate-stattty2.log`, `GATE EXIT=0`, both arms in one command with the lane count forced to two:
+stage 1 `1265 tests, 0 failed` (53.01 s — the +2 are `tty_nr`'s host test in the `abi` leaf and the
+`stat` rendering test in `vfs::procfs`); x86_64 `pass=293 fail=0 (293 built)` over 2 lanes in 53.37 s
+(-23.1%), `mpos-kunit 35 passed, 0 failed`; aarch64 `pass=292 fail=0 (292 built)` over 2 lanes in
+188.25 s (-14.8%), `mpos-kunit 35 passed, 0 failed`, `16 not run - see tests.toml`. The new program
+ran on both arms: `build/test-lane-x86_64-1/serial.log:1442` and
+`build/test-lane-aarch64-0/serial.log:1573`.
+
+**The first gate run failed, and not on the machine.** `build/gate-stattty.log` came back
+`GATE EXIT=1` with every kernel-side number green (`mpos-kunit 35 passed`, `pass=293 fail=0`,
+`exit 33`) — the red was the *host user suite's build*: this gate compiles `user/tests` for
+`x86_64-unknown-linux-gnu` as well as musl, and `libc::ioctl`'s request parameter is `c_int` in the
+musl bindings and `c_ulong` in the gnu ones. A cast that satisfies one fails the other, which is why
+every existing probe in this tree that needs an ioctl goes through `libc::syscall(SYS_ioctl)` —
+`t-pty`'s helper spells the reason out. The pin now uses that helper. The lesson is not "cast
+wider": it is that **a program the gate builds two ways has to compile both ways**, and a
+machine-only build (`cargo build -p mpos-user-tests --target x86_64-unknown-linux-musl`) cannot see
+it.
+
+### Named gaps this does not close
+
+- **`tpgid` for a task whose terminal has no foreground group** reads `-1`, which the measurement
+  above does not cover on Linux (a pty with no `tcsetpgrp` yet). It is the same word a terminal-less
+  task prints, so the two cases are indistinguishable from the file.
+- **`stat`'s field 8 is a `int` in Linux, so a group id past `INT_MAX` would wrap.** This kernel's
+  ids come from a task table, so the case is unreachable here and untested rather than handled.
+- **`tty_nr` recoding is `new_encode_dev`; the "old" encoding Linux used before 2.6.25 is not
+  produced.** Nothing that runs here asks for it.
+
+### The rule
+
+*A column that copies its neighbour is a column nobody can test.* Field 6 was wrong for as long as
+`setsid` worked, and it stayed invisible because the process that reads a file is almost never the
+process that called `setsid`. A literal is at least honest about being one; a copy looks like an
+answer.

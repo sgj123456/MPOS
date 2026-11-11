@@ -446,6 +446,38 @@ pub struct TaskSnapshot {
     /// `RLIMIT_MEMLOCK` bounds, `VmLck` prints and `smaps`'s `Locked:` splits
     /// per mapping. A zombie reads zero, like the books above.
     pub locked_pages: usize,
+    /// `/proc/<pid>/stat`'s field 7, `tty_nr`: the controlling terminal this
+    /// task acquired with `TIOCSCTTY`, encoded the way Linux encodes it, or
+    /// `0` for a task that has acquired none.
+    ///
+    /// The device id has been on the task since `TIOCSCTTY` was first served
+    /// (`Task::ctty`, which `/dev/tty` already resolves through); what was
+    /// missing was the file's encoding of it. Measured on a current host
+    /// (`build/scratch/ttynr/b.c`, Linux 7.2.14): a child that did `setsid` +
+    /// `TIOCSCTTY` on `pts/1` reads `34817` - `st_rdev` `0x8801` recoded by
+    /// `(minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)` - while the
+    /// same process before acquiring reads `0`. The recoding lives in
+    /// [`crate::abi::tty_nr`] so this field and anything else that names a
+    /// terminal encode it one way (§6.129).
+    pub tty_nr: u32,
+    /// `/proc/<pid>/stat`'s field 8, `tpgid`: the process group the terminal
+    /// would send its interrupt to, or `-1` for a task with no controlling
+    /// terminal.
+    ///
+    /// Deliberately **not** the task's own group: measured on the same host
+    /// (`build/scratch/ttynr/b.c`), a parent and its grandchild sharing one
+    /// terminal read the *same* `tpgid` while their `pgrp` values differ, and
+    /// after `tcsetpgrp` moved the foreground to the grandchild both files
+    /// moved to the grandchild's group - so the field is the terminal's
+    /// state, read once, and every task holding that terminal answers it.
+    /// A foreground group that has died keeps the answer too: the file still
+    /// carries the dead group's number, and `tcgetpgrp` agrees.
+    ///
+    /// Held as the group's **slot**, not as a number, because the file reports
+    /// the reader's namespace's number for it - the same translation
+    /// `pgrp`/`ppid` beside it go through. `None` is "no controlling
+    /// terminal", which the file prints as `-1`.
+    pub terminal_foreground: Option<usize>,
 }
 
 /// The two disposition sets `/proc/<pid>/stat` reports as fields 33 and 34.
@@ -631,6 +663,20 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         // record is what names its encoded status. A live task has no record,
         // so it answers `None` and the field reads `0` (§6.112).
         exit_code: retired_status(task.tgid).unwrap_or(0),
+        // Fields 7 and 8 are one fact about one terminal: the id this task
+        // acquired with `TIOCSCTTY`, and the group that terminal would
+        // interrupt. Both are read here, inside the same look, because they
+        // have to describe one instant - a task that has just acquired a
+        // terminal must not show the id with the old foreground beside it.
+        // The id is recoded rather than printed raw (`abi::tty_nr`), and a
+        // task with no terminal reads `0`/`None`, which the file spells `0`
+        // and `-1` (§6.129).
+        tty_nr: crate::abi::tty_nr(task.ctty),
+        terminal_foreground: task
+            .ctty
+            .and_then(crate::vfs::tty::by_dev_id)
+            .and_then(|tty| tty.foreground())
+            .map(|group| group.0),
     }
 }
 

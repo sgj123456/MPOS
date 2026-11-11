@@ -2264,3 +2264,15 @@ carries the per-phase history.*
   were never the divergence (one CPU, no NUMA node, so both are `0` before and after). Pin
   `t-getcpu` 15 claims, 2 red counterfactually; host 762 unchanged (no pure half — `buffer_ok` is
   always true on the host). (§6.128, item 242)
+
+- [x] **`/proc/<pid>/stat`'s `tty_nr`, `tpgid` and `session` are three answers** — fields 6, 7 and 8
+  were `pgid` copied into the session column and the borrowings `"0"`/`"-1"`, on the reasoning that
+  no `setsid` had ever been served and that everything types at one console. Both had expired:
+  `setsid`, `TIOCSCTTY` and ptys are all served. Linux recodes the terminal's device id into
+  `tty_nr` (`0x8801 -> 34817`), answers **the terminal's** foreground group in `tpgid` — the same
+  number for every task on the line, and one that moves for both files at once on `tcsetpgrp` — and
+  puts the task's session in field 6, which is the leader's id for its descendants
+  (`build/scratch/ttynr/b.c`). The copy was the invisible half: it is right for every process that
+  never unshared, and wrong exactly where the answer carries information. Pin `t-stat-tty` 12
+  claims, 8 red counterfactually (the `session 12` where the leader is `11` is the discriminating
+  one); host unit tests `762 -> 763`. (§6.129, item 243)

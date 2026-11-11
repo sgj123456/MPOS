@@ -695,6 +695,29 @@ pub fn wait_status(code: isize, dumped: bool) -> i32 {
     }
 }
 
+/// The word `/proc/<pid>/stat`'s field 7 (`tty_nr`) carries for a controlling
+/// terminal, or `0` for a process that has acquired none.
+///
+/// This is Linux's `new_encode_dev`, not the raw `st_rdev`. Measured on a
+/// current host (`build/scratch/ttynr/b.c`, Linux 7.2.14): a child that did
+/// `setsid` + `TIOCSCTTY` on `/dev/pts/1` - whose `st_rdev` is `0x8801`, that
+/// is major 136 and minor 1 - reads `tty_nr=34817`, and `34817` is exactly
+/// `(minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)`. A process that
+/// never acquired a terminal reads `0`, and so does its `tpgid` read `-1`;
+/// the two fields are one fact about one terminal, so a file that answers one
+/// of them has to answer the other.
+///
+/// The encoding lives in the leaf because two layers need the same number:
+/// `sched` builds the snapshot from the task's stored `ctty` device id, and
+/// `vfs` renders it. A second copy would be the way `/proc` and a driver
+/// started disagreeing about which terminal a number names.
+pub const fn tty_nr(dev: Option<(u32, u32)>) -> u32 {
+    match dev {
+        Some((major, minor)) => (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12),
+        None => 0,
+    }
+}
+
 /// Which `ru_maxrss` a `struct rusage` reports for a process, in KB.
 ///
 /// There are two books and three readers, measured on Linux 7.2.14
@@ -1136,6 +1159,22 @@ mod tests {
         // `WEXITSTATUS` keeps only the low byte, as Linux does.
         assert_eq!(wait_status(256, false), 0);
         assert_eq!(wait_status(257, false), 1 << 8);
+    }
+
+    #[test]
+    fn tty_nr_is_the_encoded_dev_and_zero_without_a_terminal() {
+        // §6.129: field 7 is Linux's `new_encode_dev`, and every number below
+        // is a Linux 7.2.14 reading from `build/scratch/ttynr/b.c`.
+        assert_eq!(tty_nr(None), 0); // no controlling terminal
+        assert_eq!(tty_nr(Some((136, 1))), 34817); // /dev/pts/1, st_rdev 0x8801
+        // The console both machines boot with, `(4, 64)`: major 4, minor 64
+        // fits in the low byte, so the third term contributes nothing.
+        assert_eq!(tty_nr(Some((4, 64))), (64) | (4 << 8));
+        // A minor past 0xff splits: the low byte stays in place and the rest
+        // shifts up by 12, which is the half a naive `major << 8 | minor`
+        // gets wrong.
+        assert_eq!(tty_nr(Some((136, 0x101))), 1 | (136 << 8) | (0x100 << 12));
+        assert_eq!(tty_nr(Some((0, 0))), 0);
     }
 
     #[test]

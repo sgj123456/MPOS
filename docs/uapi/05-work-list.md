@@ -10711,3 +10711,53 @@ rule has no host-testable half and the machine is its only witness. Host unit te
 **Named gaps this does not close.** The processor number is constant because the machine has one
 CPU, and the node is zero because no model here has a NUMA topology — both are machine-config
 questions, not syscall ones. `tcache` remains accepted and ignored, as it is on Linux.
+
+### Item 243 — `/proc/<pid>/stat`'s `tty_nr`, `tpgid` and `session` are three answers
+
+Rows: fields 6, 7 and 8 of `/proc/<pid>/stat`. Two were borrowed literals and the third copied its
+neighbour's column.
+
+| promise | Linux (host 7.2.14, `build/scratch/ttynr/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| `tty_nr` with a controlling terminal | the dev id recoded (`0x8801 -> 34817`) | literal `0` | the recoded dev id |
+| `tty_nr` with none | `0` | `0` | `0` |
+| `tpgid` with a terminal | the **terminal's** foreground group (`54894` for every task on the line) | literal `-1` | the terminal's foreground group |
+| `tpgid` with none | `-1` | `-1` | `-1` |
+| `tpgid` after `tcsetpgrp` | both files move at once (`54894 -> 54895`) | never moves | both move |
+| `tpgid` when the foreground group dies | unchanged (`54895`, and `tcgetpgrp` agrees) | never moves | unchanged |
+| `session` for a `setsid` leader | its own id (same as field 5) | its `pgid` (same, by accident) | `task.session` |
+| `session` for the leader's child | the **leader's** id beside the child's own `pgid` | the child's own `pgid` | the leader's id |
+| `tty_nr` for two tasks on one line | the same number | `0` for both | the same number |
+
+**Why this is not a "one field" gap.** Field 6 was not blank and not zero: it printed a real number
+that is right in the one case everybody checks by hand — a process that never unshared, where the
+session and the group really are the same id. It went wrong exactly where the answer carries
+information, which is a session leader's descendant. Fields 7 and 8 were honest zeros, but honest
+about the wrong machine: this kernel serves `setsid`, serves `TIOCSCTTY`, and serves ptys, so a task
+can hold a controlling terminal that is not the console.
+
+**A copy is worse than a literal.** A literal is visibly a placeholder; `reader_number(task.pgid)` in
+the session column reads as an implementation. That is why the counterfactual's `session 12, leader
+11` line is the one this item exists for.
+
+**Where the answer comes from.** `session` is `task.session`, which `setsid` has been writing all
+along; `tty_nr` is `task.ctty` through `mpos_abi::tty_nr` (`(minor & 0xff) | (major << 8) | ((minor &
+!0xff) << 12)`, `0` for `None`); `tpgid` is the terminal's `foreground()` found by
+`crate::vfs::tty::by_dev_id(task.ctty)`, carried as a **slot** in the snapshot and rendered through the
+reader's pid namespace at print time. The recoding went into the `abi` leaf because two layers can
+want that word and one definition is cheaper than two that must agree.
+
+**Measurement.** `build/scratch/ttynr/b.c` and `c.c` on 7.2.14 — fork + `setsid` + `TIOCSCTTY` (a
+container's shell is already a group leader, so `setsid` answers `EPERM` in place), then a grandchild
+with a group of its own, then `tcsetpgrp`. Pin `t-stat-tty` 12 claims, host 12/12, machine 12/12
+(`build/boot-stattty2.log`), counterfactually **8 red** (`build/boot-stattty-cf1.log`), both arms
+green in `build/gate-stattty2.log`.
+
+**Landed.** `crates/abi/src/lib.rs` (`tty_nr` + host test), `src/sched/runtime/procfs.rs`
+(`TaskSnapshot::tty_nr` / `terminal_foreground`), `src/vfs/procfs.rs` (three fields + host test),
+`user/tests/src/bin/t-stat-tty.rs`, §6.129. Host unit tests `762 -> 763`.
+
+**Named gaps this does not close.** A terminal with no foreground group reads `-1`, the same word a
+terminal-less task prints, so the two cases cannot be told apart from the file. Linux's field 8 is an
+`int`, so a group id past `INT_MAX` would wrap — unreachable from this kernel's task table and
+therefore untested. Only `new_encode_dev` is produced; the pre-2.6.25 encoding is not.

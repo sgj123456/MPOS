@@ -1597,6 +1597,12 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::locked_pages`] - the pages pinned by
     /// `mlock`, which `VmLck` prints in kilobytes.
     pub locked_pages: usize,
+    /// See [`crate::sched::TaskSnapshot::tty_nr`] - `stat`'s field 7, the
+    /// controlling terminal's encoded device id, or `0`.
+    pub tty_nr: u32,
+    /// See [`crate::sched::TaskSnapshot::terminal_foreground`] - `stat`'s field
+    /// 8 as the foreground group's **slot**, or `None` for no terminal.
+    pub terminal_foreground: Option<usize>,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1740,20 +1746,30 @@ fn stat_fields(task: &Process, tid: usize, whole: bool) -> [alloc::borrow::Cow<'
         Cow::Owned(alloc::format!("{}", task.state)),
         Cow::Owned(alloc::format!("{}", reader_number(task.ppid))),
         Cow::Owned(alloc::format!("{}", reader_number(task.pgid))),
-        // session: no `setsid` has ever been answered with a group of its
-        // own, so the process group is the closest thing there is.
-        Cow::Owned(alloc::format!("{}", reader_number(task.pgid))),
-        // tty_nr: 0, "no controlling terminal". Everything on this machine
-        // types at the one console, and claiming a terminal number that no
-        // entry in /dev carries would send `ps` looking for a name it cannot
-        // find.
-        Cow::Borrowed("0"),
-        Cow::Borrowed("-1"), // tpgid
-        Cow::Borrowed("0"),  // flags
-        Cow::Borrowed("0"),  // minflt
-        Cow::Borrowed("0"),  // cminflt
-        Cow::Borrowed("0"),  // majflt
-        Cow::Borrowed("0"),  // cmajflt
+        // session: the session this task is in, as its leader's number. This
+        // used to print `pgid` on the reasoning that no `setsid` had ever been
+        // served - which stopped being true long before this field was fixed,
+        // and a session leader whose two numbers differ was answered wrong
+        // (§6.129).
+        Cow::Owned(alloc::format!("{}", reader_number(task.session))),
+        // tty_nr: the controlling terminal's encoded device id, `0` when the
+        // task has acquired none. The encoding is `abi::tty_nr`'s, not a
+        // number this file may invent - measured, a `pts/1` that reads
+        // `st_rdev=0x8801` has to appear as `34817` (§6.129).
+        Cow::Owned(alloc::format!("{}", task.tty_nr)),
+        // tpgid: the group the terminal would interrupt, in the reader's
+        // numbers, or `-1` for a task with no terminal. It is the terminal's
+        // answer, not this task's own group: two tasks on one line print the
+        // same number and different `pgrp` (§6.129).
+        Cow::Owned(match task.terminal_foreground {
+            Some(group) => alloc::format!("{}", reader_number(group)),
+            None => alloc::string::String::from("-1"),
+        }),
+        Cow::Borrowed("0"), // flags
+        Cow::Borrowed("0"), // minflt
+        Cow::Borrowed("0"), // cminflt
+        Cow::Borrowed("0"), // majflt
+        Cow::Borrowed("0"), // cmajflt
         // utime/stime: the group's CPU for `/proc/<pid>/stat`, this thread's
         // for the `task/<tid>/` spelling - and always the group's children in
         // cutime/cstime, because the child totals live in the group.
@@ -5566,6 +5582,65 @@ mod tests {
         assert_eq!(exit_code_word(process(7, 7, None, 0, 'R').exit_code), "0");
     }
 
+    /// §6.129: fields 6, 7 and 8 were a `pgid` copy and two borrowed literals
+    /// (`"0"`, `"-1"`). The readings this pins are `build/scratch/ttynr/b.c` on
+    /// Linux 7.2.14, and every one of them is a number a constant cannot be.
+    #[test]
+    fn stat_prints_the_session_the_encoded_terminal_and_its_foreground() {
+        let fields_of = |p: &Process| -> alloc::vec::Vec<alloc::string::String> {
+            let line = stat_text(&stat_fields(p, p.tid, true), p.pid);
+            line.split(' ')
+                .skip(2)
+                .map(alloc::string::String::from)
+                .collect()
+        };
+
+        // No controlling terminal: `0` and `-1`, and a session that is this
+        // process's own group (the shell that never unshared).
+        let mut p = process(7, 7, None, 0, 'R');
+        p.session = 7;
+        let f = fields_of(&p);
+        assert_eq!(f[5 - 3], "7", "pgrp, field 5");
+        assert_eq!(f[6 - 3], "7", "session, field 6");
+        assert_eq!(f[7 - 3], "0", "tty_nr, field 7");
+        assert_eq!(f[8 - 3], "-1", "tpgid, field 8");
+
+        // A session leader on `/dev/pts/1`: session and group are its own id,
+        // the terminal is `34817` (`st_rdev` `0x8801` recoded), and the
+        // foreground is its own group.
+        let mut leader = process(9, 9, None, 0, 'R');
+        leader.session = 9;
+        leader.tty_nr = crate::abi::tty_nr(Some((136, 1)));
+        leader.terminal_foreground = Some(9);
+        let f = fields_of(&leader);
+        assert_eq!(f[6 - 3], "9", "session is the leader's own id");
+        assert_eq!(f[7 - 3], "34817", "tty_nr is the recoded device id");
+        assert_eq!(f[8 - 3], "9", "tpgid");
+
+        // Its grandchild: a *different* group and the *same* session, terminal
+        // and foreground - the whole point of the field being the terminal's.
+        // `10` is in the same session `9`, group `11`.
+        let mut grandchild = process(11, 11, Some(9), 9, 'S');
+        grandchild.session = 9;
+        grandchild.tty_nr = crate::abi::tty_nr(Some((136, 1)));
+        grandchild.terminal_foreground = Some(11);
+        let f = fields_of(&grandchild);
+        assert_eq!(f[5 - 3], "11", "its own group");
+        assert_eq!(f[6 - 3], "9", "but the leader's session");
+        assert_eq!(f[7 - 3], "34817", "the same terminal");
+        assert_eq!(f[8 - 3], "11", "and the foreground, which moved to it");
+
+        // A task still in the leader's session whose terminal is the console:
+        // `(4, 64)` has a minor under `0x100`, so the recoding is just
+        // `major << 8 | minor` - the third term only bites past 255.
+        let mut console = process(12, 12, None, 0, 'R');
+        console.session = 12;
+        console.tty_nr = crate::abi::tty_nr(Some((4, 64)));
+        console.terminal_foreground = Some(12);
+        let f = fields_of(&console);
+        assert_eq!(f[7 - 3], "1088", "the console's encoded id");
+    }
+
     /// §6.117: `stat`'s fields 26-28 were three borrowed `"0"`s. The addresses
     /// themselves are the loader's, so what this pins is the rendering and the
     /// three facts a constant cannot have: a loaded image reports its own
@@ -6835,6 +6910,11 @@ mod tests {
             image: crate::mm::ImageBounds::default(),
             books: (0, 0, 0),
             locked_pages: 0,
+            // No controlling terminal: field 7 is the zero and field 8 the
+            // `-1` Linux prints for a process that has acquired none. A test
+            // that wants a terminal sets both itself (§6.129's host test does).
+            tty_nr: 0,
+            terminal_foreground: None,
         }
     }
 
