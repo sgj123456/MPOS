@@ -297,11 +297,20 @@ pub(crate) fn populate_in(
     if !vma.permits(write) {
         return FaultAnswer::Refused;
     }
+    let mut minor = false;
     let frame = match &vma.kind {
         VmaKind::Anon => {
             let Some(frame) = mm::alloc_user_frame() else {
                 return FaultAnswer::OutOfMemory;
             };
+            // A fresh anonymous frame costs no I/O, so this is a *minor*
+            // fault and Linux counts it as one (`build/scratch/statflags/j.c`).
+            // The frame-backed arm below deliberately does not: whether that
+            // page came from the page cache or from the device is exactly the
+            // signal `MappedObject::frame_at` does not carry, so counting it
+            // either way would be a guess - the named gap `Mm::minflt`
+            // documents.
+            minor = true;
             // A page nobody has written reads as zeros - it is a hole in the
             // program's memory, not whatever the frame's last owner left there.
             unsafe { core::ptr::write_bytes(mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
@@ -340,6 +349,19 @@ pub(crate) fn populate_in(
         return FaultAnswer::Refused;
     }
     mm.own(frame);
+    if minor {
+        mm.charge_minor_fault();
+        // The thread half of the same fault: `/proc/<pid>/task/<tid>/stat`'s
+        // field 10 is the faulting thread's, while `/proc/<pid>/stat`'s is the
+        // group's (`build/scratch/statflags/r.c` - one worker faulting 400
+        // pages left the leader filing 4525 of its own and the group 5401).
+        let faulting = t.current;
+        if let Some(taker) = t.tasks[faulting.0].as_ref() {
+            taker
+                .minflt
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     FaultAnswer::Resolved
 }
 
@@ -1515,7 +1537,12 @@ pub fn resolve_cow_fault(virt: usize) -> bool {
         let Some(space) = task.space.as_mut() else {
             return false;
         };
-        split_cow(space, &mm, virt)
+        let split = split_cow(space, &mm, virt);
+        drop(space);
+        if split {
+            charge_thread_minor_fault(t, t.current);
+        }
+        split
     })
 }
 
@@ -1536,7 +1563,26 @@ pub(crate) fn split_cow(space: &mut crate::hal::AddressSpace, mm: &Mm, virt: usi
         mm.own(new_phys);
     }
     crate::mm::free_frames(old_phys, 0);
+    // A copy-on-write split is a minor fault: the new frame is a copy, no
+    // device was read. Linux counts it as one and so does
+    // `build/scratch/statflags/k.c` (256 COW writes moved the child's `minflt`
+    // by 259, its own write to the parent's count by none).
+    mm.charge_minor_fault();
     true
+}
+
+/// Charge one minor fault to a thread's own column, beside the group's.
+///
+/// Two books because Linux keeps two: the group's is what `/proc/<pid>/stat`'s
+/// field 10 and `RUSAGE_SELF` read, the thread's is what
+/// `/proc/<pid>/task/<tid>/stat` and `RUSAGE_THREAD` read, and one worker
+/// faulting 400 pages made them differ by exactly that much
+/// (`build/scratch/statflags/r.c`).
+pub(crate) fn charge_thread_minor_fault(t: &Table, id: TaskId) {
+    if let Some(task) = t.tasks[id.0].as_ref() {
+        task.minflt
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Grow the main stack to cover `addr` - the fault Linux answers by mapping one
@@ -1609,42 +1655,57 @@ pub fn resolve_stack_growth(addr: usize) -> bool {
         // The group's space, for the same reason a copy-on-write fault looks
         // there: a thread's stack is a mapping the group shares, and only the
         // leader's slot holds the tables that describe it.
-        let owner = t.space_owner(id);
-        let Some(task) = t.tasks[owner.0].as_mut() else {
-            return false;
+        //
+        // The group's books are kept inside this block and the faulting
+        // thread's after it, because they are two slots of one table and the
+        // borrow of the leader's is still live here.
+        let charged = {
+            let owner = t.space_owner(id);
+            let Some(task) = t.tasks[owner.0].as_mut() else {
+                return false;
+            };
+            let Some(space) = task.space.as_mut() else {
+                return false;
+            };
+            let Some(frame) = mm::alloc_frames(0) else {
+                return false;
+            };
+            // A stack page nobody has written reads as zeros. It is a hole in the
+            // program's memory, not whatever the frame's last owner left there -
+            // and a program that reads uninitialised stack expects zeros.
+            let dest = unsafe {
+                core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
+            };
+            dest.fill(0);
+            let mapped = space.try_map(Mapping {
+                virt: page,
+                phys: frame,
+                length: PAGE_SIZE,
+                flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+            });
+            if mapped.is_err() {
+                // Something is already mapped there, so this was not a stack
+                // growth fault after all: leave the page as it was.
+                mm::free_frames(frame, 0);
+                return false;
+            }
+            task.mm.own(frame);
+            // A new stack page is a minor fault, like any other anonymous frame -
+            // Linux counts it (`build/scratch/statflags/m.c`: 48 fresh stack pages
+            // moved `minflt` by exactly 48). Both books: the group's here, and the
+            // faulting thread's below, because a thread growing its stack charges
+            // itself and not its neighbours.
+            task.mm.charge_minor_fault();
+            // recursion does not read a `[stack]` line that stops 64 KiB below
+            // where it is actually standing. Linux's `[stack]` line covers the
+            // VMA, which grows the same way.
+            task.mm.grow_stack_range(page);
+            true
         };
-        let Some(space) = task.space.as_mut() else {
-            return false;
-        };
-        let Some(frame) = mm::alloc_frames(0) else {
-            return false;
-        };
-        // A stack page nobody has written reads as zeros. It is a hole in the
-        // program's memory, not whatever the frame's last owner left there -
-        // and a program that reads uninitialised stack expects zeros.
-        let dest = unsafe {
-            core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
-        };
-        dest.fill(0);
-        let mapped = space.try_map(Mapping {
-            virt: page,
-            phys: frame,
-            length: PAGE_SIZE,
-            flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
-        });
-        if mapped.is_err() {
-            // Something is already mapped there, so this was not a stack
-            // growth fault after all: leave the page as it was.
-            mm::free_frames(frame, 0);
-            return false;
+        if charged {
+            charge_thread_minor_fault(t, id);
         }
-        task.mm.own(frame);
-        // The stack's reported range follows it down, so a program deep in a
-        // recursion does not read a `[stack]` line that stops 64 KiB below
-        // where it is actually standing. Linux's `[stack]` line covers the
-        // VMA, which grows the same way.
-        task.mm.grow_stack_range(page);
-        true
+        charged
     })
 }
 
@@ -1772,6 +1833,25 @@ pub struct Mm {
     /// which is what `getrusage(RUSAGE_CHILDREN)` reports.
     pub(crate) cnvcsw: core::sync::atomic::AtomicU64,
     pub(crate) cnivcsw: core::sync::atomic::AtomicU64,
+    /// How many minor faults this group's pages have taken: a page the kernel
+    /// brought in without reading it from a device.
+    ///
+    /// This is `/proc/<pid>/stat`'s field 10 (`minflt`) and `getrusage`'s
+    /// `ru_minflt`, one book behind both doors for `utime`'s reason - measured
+    /// on Linux 7.2.14 (`build/scratch/statflags/o.c`), `RUSAGE_SELF`'s
+    /// `ru_minflt` and the leader's `stat` field 10 read the same number.
+    ///
+    /// The *major* half - a page the kernel had to read back from a device - is
+    /// a named gap, not an oversight: the frame installers cannot tell one from
+    /// the other. `MappedObject::frame_at` answers "here is the frame" and never
+    /// "and it cost an I/O", so a kernel that counted this path as major would
+    /// be guessing (`docs/notes/` §6.103's named gap, unchanged by §6.130).
+    pub(crate) minflt: core::sync::atomic::AtomicU64,
+    /// These for this process's *reaped* children, folded in by
+    /// [`Mm::absorb_child_faults`] at the reap - Linux's `cminflt`, which is
+    /// `/proc/<pid>/stat`'s field 11 and `getrusage(RUSAGE_CHILDREN)`'s
+    /// `ru_minflt`.
+    pub(crate) cminflt: core::sync::atomic::AtomicU64,
     /// Where the program image sits in this address space: the ten absolute
     /// addresses `/proc/<pid>/stat` reports as fields 26-28 and 45-51.
     ///
@@ -1886,6 +1966,8 @@ impl Mm {
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             cnvcsw: core::sync::atomic::AtomicU64::new(0),
             cnivcsw: core::sync::atomic::AtomicU64::new(0),
+            minflt: core::sync::atomic::AtomicU64::new(0),
+            cminflt: core::sync::atomic::AtomicU64::new(0),
             image: Mutex::new(RefCell::new(image)),
             lock_future: core::sync::atomic::AtomicBool::new(false),
         })
@@ -2751,6 +2833,66 @@ impl Mm {
             su.saturating_add(csu),
             core::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Charge one minor fault this group took - a page the kernel brought in
+    /// without reading it from a device.
+    ///
+    /// Called from the four places that install a user frame (`populate_in`'s
+    /// two arms, `split_cow`'s copy, `resolve_stack_growth`'s new stack page),
+    /// which is every way a page this kernel did not copy in at `exec` becomes
+    /// the program's. Linux counts the same set: a fresh anonymous page, a
+    /// copy-on-write split and a stack growth are all minor faults, while a
+    /// page read back from a file after being evicted is a major one
+    /// (`build/scratch/statflags/j.c`, `k.c`, `m.c`, Linux 7.2.14).
+    ///
+    /// The group and the faulting thread are charged separately for
+    /// `Task::cpu_user`'s reason: `/proc/<pid>/stat` reports the group's count
+    /// and `/proc/<pid>/task/<tid>/stat` the thread's. Measured on the same host
+    /// (`build/scratch/statflags/r.c`): one thread faulting 400 pages moved the
+    /// group's `minflt` by 400 and the main thread's own by 0.
+    pub(crate) fn charge_minor_fault(&self) {
+        self.minflt
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This group's own minor faults, no children folded in - `/proc`'s field
+    /// 10 and `RUSAGE_SELF`'s `ru_minflt` both read this one, and a faulting
+    /// process is the only way to tell it from a literal zero
+    /// (`build/scratch/statflags/o.c`: `stat` `5230`, `RUSAGE_SELF` `5227`,
+    /// the same counter read a few faults apart).
+    pub(crate) fn minor_faults_own(&self) -> u64 {
+        self.minflt.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// This group's own minor faults **plus its reaped children's** - what a
+    /// `wait`'s `struct rusage` reports for the child it just collected, and
+    /// what `RUSAGE_CHILDREN` reports. The same own-plus-children shape
+    /// [`Self::cpu_both`] has, and for the same reason.
+    pub(crate) fn minor_faults_both(&self) -> u64 {
+        self.minflt
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(self.cminflt.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Fold a reaped child's minor faults into this process's child total:
+    /// the parent's `cminflt` grows by the child's own count plus the child's
+    /// own child count, so a grandchild reaches the grandparent through the
+    /// child that collected it. Measured on Linux 7.2.14
+    /// (`build/scratch/statflags/l.c`): reaping a child that faulted 50 pages
+    /// moved `cminflt` by 71, and `RUSAGE_CHILDREN`'s `ru_minflt` read the same
+    /// number - the two doors report one book.
+    pub(crate) fn absorb_child_faults(&self, child_minor: u64) {
+        self.cminflt
+            .fetch_add(child_minor, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this group has a reaped child's faults to fold into - the guard
+    /// the reap path asks before taking the group's books, the shape
+    /// [`Self::has_child_switches`] has.
+    pub(crate) fn has_child_faults(&self) -> bool {
+        self.cminflt.load(core::sync::atomic::Ordering::Relaxed) != 0
+            || self.minflt.load(core::sync::atomic::Ordering::Relaxed) != 0
     }
 
     /// Swap one frame for another, in place: the copy-on-write path replaces

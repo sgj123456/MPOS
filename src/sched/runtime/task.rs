@@ -733,6 +733,13 @@ pub(crate) struct Retired {
     /// Measured on Linux 7.2.14 (`build/scratch/maxrss/r.c`): a child with a
     /// ~2060 KB own peak that reaped an 8 MiB grandchild is reported `8204`.
     pub(crate) maxrss: u64,
+    /// The dying group's minor faults, its own **plus** its reaped children's -
+    /// what a `wait4`/`waitid` caller's `struct rusage` carries in `ru_minflt`.
+    /// Off the `mm` at the death for `utime`'s reason: the counters go with the
+    /// slot, and the wait reads the record afterwards
+    /// (`build/scratch/statflags/l.c`: a child reporting `minflt=99` moved the
+    /// parent's `cminflt` by 99 and `RUSAGE_CHILDREN.ru_minflt` read the same).
+    pub(crate) minflt: u64,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -1071,6 +1078,16 @@ pub(crate) struct Task {
     /// find a switch counted in neither column or both.
     pub(crate) nvcsw: core::sync::atomic::AtomicU64,
     pub(crate) nivcsw: core::sync::atomic::AtomicU64,
+    /// How many minor faults *this thread* took - `/proc/<pid>/task/<tid>/stat`'s
+    /// field 10, the thread half of [`super::child_mm::Mm::minflt`].
+    ///
+    /// Kept on the task for `nvcsw`'s reason and with the same measured split:
+    /// on Linux 7.2.14 (`build/scratch/statflags/r.c`) one worker faulting 400
+    /// pages left the leader's `/proc/<pid>/stat` reading the group's 400 above
+    /// its own zero, while that worker's `task/<tid>` spelling read 403 - its
+    /// own. A group's figure is `Mm::minflt`; this is the per-thread one, and
+    /// the two differ the moment a process has two threads.
+    pub(crate) minflt: core::sync::atomic::AtomicU64,
     /// The moment this task came into being, in `since_boot_nanos` - what
     /// `/proc/<pid>/stat`'s field 22 (`starttime`) reports, in the `USER_HZ`
     /// ticks Linux counts it in.
@@ -1650,6 +1667,7 @@ impl Task {
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
+            minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo: None,
@@ -2431,6 +2449,7 @@ impl Table {
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
+            minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             // A kernel task has no System V adjustments to record or apply.
@@ -2727,8 +2746,13 @@ impl Table {
                 named[task.tgid.0] += 1;
             }
         }
-        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64), (u64, u64, u64, u64), u64)> =
-            alloc::vec::Vec::new();
+        let mut folds: alloc::vec::Vec<(
+            TaskId,
+            (u64, u64, u64, u64),
+            (u64, u64, u64, u64),
+            u64,
+            u64,
+        )> = alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
             if !task.exited {
@@ -2772,11 +2796,18 @@ impl Table {
                 // pairs' sums: Linux's `RUSAGE_CHILDREN` reports the largest
                 // reaped child's peak, not their total (`build/scratch/maxrss/
                 // u.c`). Read while the child's `mm` is still reachable.
+                // Its minor faults fold beside them for the same reason:
+                // Linux accumulates `cminflt` on `wait` beside `cutime`, and
+                // `RUSAGE_CHILDREN`'s `ru_minflt` reports it - measured as one
+                // book with `/proc`'s field 11 (`build/scratch/statflags/l.c`).
+                // Own-plus-children, so a grandchild reaches the grandparent
+                // through the child that collected it.
                 folds.push((
                     parent,
                     task.mm.cpu_all(),
                     task.mm.switches_all(),
                     task.mm.maxrss_both(),
+                    task.mm.minor_faults_both(),
                 ));
             }
 
@@ -2802,11 +2833,12 @@ impl Table {
         // Saturating, so a child cannot wrap the parent's counter; a parent whose
         // slot is already gone has nobody left to report the child to (the
         // reparent-to-init edge, beyond what the waited case needs).
-        for (parent, child, switches, maxrss) in folds {
+        for (parent, child, switches, maxrss, faults) in folds {
             if let Some(parent_task) = self.tasks.get(parent.0).and_then(|slot| slot.as_ref()) {
                 parent_task.mm.absorb_child(child);
                 parent_task.mm.absorb_child_switches(switches);
                 parent_task.mm.absorb_child_maxrss(maxrss);
+                parent_task.mm.absorb_child_faults(faults);
             }
         }
     }
@@ -3030,6 +3062,10 @@ pub enum WaitEvent {
         /// see the enum's own note and [`Retired::maxrss`]. A stop or a resume
         /// names a live task and asks it through `maxrss_of`.
         maxrss: u64,
+        /// The death's `ru_minflt`, own-plus-children, off the record for the
+        /// same reason - see [`Retired::minflt`]. A stop or a resume asks the
+        /// live task through `minflt_of`.
+        minflt: u64,
     },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.

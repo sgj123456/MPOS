@@ -427,6 +427,34 @@ pub struct TaskSnapshot {
     /// from the `Retired` record's raw code and core-dump classification, so
     /// `/proc` and `wait` cannot disagree about one death (§6.112).
     pub exit_code: i32,
+    /// This task's minor faults - `/proc/<pid>/stat`'s field 10, and the group's
+    /// own half of `getrusage`'s `ru_minflt`.
+    ///
+    /// Own plus collected children, one book behind both doors for `utime`'s
+    /// reason: Linux 7.2.14 (`build/scratch/statflags/o.c`) read `minflt=5230`
+    /// from `/proc/<pid>/stat` while `RUSAGE_SELF` answered `5227`, the same
+    /// counter a few faults later, and `o.c`'s offsets put `ru_minflt` at
+    /// `wire[64..72]`. A process that faulted nothing reads `0`, so this is
+    /// only distinguishable from the literal it replaced by a program that
+    /// faulted (`j.c`: an untouched 3 MiB mapping moves nothing, three written
+    /// pages moved it by two, six more by one - the kernel allocates in
+    /// batches, so the *count* is the claim, not the per-page one).
+    pub minflt: u64,
+    /// The minor faults of the children this group has collected - field 11,
+    /// `cminflt`, `ru_minflt`'s `RUSAGE_CHILDREN` half. Folds at the reap
+    /// (`build/scratch/statflags/l.c`: a child reporting `minflt=99` moved the
+    /// parent's `cminflt` `4312 -> 4411`, the same number
+    /// `RUSAGE_CHILDREN.ru_minflt` then read).
+    pub cminflt: u64,
+    /// *This thread's* minor faults - field 10 of
+    /// `/proc/<pid>/task/<tid>/stat`, the half `minflt` above is not.
+    ///
+    /// Two books because Linux keeps two: `r.c` had a worker fault 400 pages in
+    /// its own thread and read the group's `5401` from `/proc/<pid>/stat`, the
+    /// leader's own `4525` from `task/<leader>`, and the worker's `403` from
+    /// `task/<worker>`. A single-threaded process reads the same number from
+    /// both spellings, which is why only a threaded reader can tell them apart.
+    pub minflt_own: u64,
     /// The program image's three addresses - `stat`'s fields 26, 27 and 28.
     ///
     /// A zombie has no address space at all and reads zeros for all three:
@@ -677,6 +705,18 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .and_then(crate::vfs::tty::by_dev_id)
             .and_then(|tty| tty.foreground())
             .map(|group| group.0),
+        // Fields 10, 11 and 12 are faults: the group's own, the group's
+        // collected children, and this thread's own. Fields 12 and 13
+        // (`majflt`/`cmajflt`) stay zero and are the named gap `Mm::minflt`
+        // documents - `MappedObject::frame_at` answers "the frame is here" and
+        // not "this page needed the device", so splitting the two would be a
+        // guess (§6.130).
+        minflt: task.mm.minor_faults_own(),
+        cminflt: task
+            .mm
+            .minor_faults_both()
+            .saturating_sub(task.mm.minor_faults_own()),
+        minflt_own: task.minflt.load(core::sync::atomic::Ordering::Relaxed),
     }
 }
 

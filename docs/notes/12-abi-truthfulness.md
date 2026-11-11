@@ -292,7 +292,24 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s `tty_nr`/`tpgid`/`session` §6.129):** stage 1
+**Latest measured gate (2026-11-11, `/proc/<pid>/stat`'s minor-fault columns §6.130):** stage 1
+`1266 tests, 0 failed` (53.91 s — the +1 is the `stat` rendering test in `vfs::procfs`); x86_64
+`pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (54.27 s total, +1.7% against 53.37 s);
+aarch64 `pass=293 fail=0 (293 built)`, `mpos-kunit 35 passed, 0 failed` (190.89 s total, +1.4%
+against 188.25 s, `16 not run - see tests.toml`) — `GATE EXIT=0`, both arms in one command with the
+lane count forced to two (`build/gate-faults2.log`). One new program: `t-stat-faults` (14 claims),
+**5 of which fail** against the kernel before this change — three faulting claims and the child's own
+reading (`build/boot-faults-cf2.log`). `t-stat-faults` passed on **both** arms of this gate
+(`build/test-lane-x86_64-0/serial.log:4260`, `build/test-lane-aarch64-1/serial.log:4154`). Four
+versions of the fixture were needed before it was honest, all recorded in §6.130: an equality between
+two readings of the file that itself costs faults, then that equality's widened bound failing on a
+loaded lane's deeper `task/<tid>/` path, a `Vec` standing in for an untouched mapping (its heap pages
+are already resident, so it faults nothing), and a `cminflt` bound that would have passed a kernel
+counting nothing. The same run caught `t-wait4`'s stale "eleven counters are zero" claim — `ru_minflt`
+is served now — which was narrowed to the block-I/O and IPC counters with `ru_minflt > 0` asserted
+beside them.
+
+**Measured gate before it (2026-11-11, `/proc/<pid>/stat`'s `tty_nr`/`tpgid`/`session` §6.129):** stage 1
 `1265 tests, 0 failed` (53.01 s — the +2 are `tty_nr`'s host test in the `abi` leaf and the `stat`
 rendering test in `vfs::procfs`); x86_64 `pass=293 fail=0 (293 built)`, `mpos-kunit 35 passed, 0
 failed` (53.37 s total, -23.1% against 69.37 s); aarch64 `pass=292 fail=0 (292 built)`, `mpos-kunit

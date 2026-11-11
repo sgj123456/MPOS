@@ -70,32 +70,33 @@ pub use runtime::{
     child_event_pending, child_visible_to, claim_anon_gaps, clone, continued_report_pending,
     controlling_tty_of_current, credentials_of, current, current_blocked, current_cgroup_root,
     current_child_subreaper, current_comm_bytes, current_cpu_ticks, current_credentials,
-    current_cwd, current_cwd_path, current_diskstat, current_disposition, current_exe, current_fds,
-    current_fs_context, current_fs_owner, current_groups, current_identity, current_ipc_ns,
-    current_is_root, current_is_seccomp_strict, current_is_session_leader, current_map_user,
-    current_maxrss, current_net_ns, current_no_new_privs, current_owner, current_pdeathsig,
-    current_pending, current_pgid, current_pid_ns_id, current_pid_number, current_real_owner,
-    current_rlimit, current_root, current_stack_range, current_switches, current_tgid,
-    current_thread_cpu_ticks, current_thread_switches, current_tid_address, current_tls,
-    current_umask, current_user_ns, current_uts, deliver_pending_signal, descriptor_access,
-    descriptor_inode_of, descriptor_numbers, descriptors_of, destructive_advice_refused,
-    detach_traced, die_of_fatal_signal, discard_exit_code, exec_replace, exit, exit_code,
-    exit_group, fill_owner, fork, frames_range_free, get_mmap_cursor, group_members, has_children,
-    has_deliverable_signal, has_live_child, has_matching_children, has_seccomp_filter, has_tracer,
-    identity_of, init, insert_vma, is_child, is_exited, is_running, is_stopped, itimer_snapshot,
-    itimer_swap, kernel_lazy_accessible, last_syscall, lock_current, lock_future,
-    locked_advice_refused, locked_pages, locked_within, madvise_dontneed, map_anon, map_facts,
-    map_frames, mapped_pages, mapping_name_at, mapping_span_at, maxrss_of, may_inspect,
-    may_mint_pid_ns, may_signal, membarrier_registrations, move_eager_ranges, move_user_page,
-    munmap_user, name_user_range, named_process, named_thread, nice_of, note_blk_counts,
-    note_blk_mailbox, note_blk_wait, note_claim_registration, note_claim_wake,
-    note_claim_wake_result, note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner,
-    note_run_begin, note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of,
-    out_of_memory, own_pid_number, page_present_in, parent_group_of, parent_of, park_site,
-    parks_of, pause, pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table,
-    pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names,
-    pidfd_task_alive, poll_any_child_event, poll_child_event, populate_user_page_at, preempt,
-    preempt_at, prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
+    current_cwd, current_cwd_path, current_diskstat, current_disposition, current_exe,
+    current_faults, current_fds, current_fs_context, current_fs_owner, current_groups,
+    current_identity, current_ipc_ns, current_is_root, current_is_seccomp_strict,
+    current_is_session_leader, current_map_user, current_maxrss, current_net_ns,
+    current_no_new_privs, current_owner, current_pdeathsig, current_pending, current_pgid,
+    current_pid_ns_id, current_pid_number, current_real_owner, current_rlimit, current_root,
+    current_stack_range, current_switches, current_tgid, current_thread_cpu_ticks,
+    current_thread_switches, current_tid_address, current_tls, current_umask, current_user_ns,
+    current_uts, deliver_pending_signal, descriptor_access, descriptor_inode_of,
+    descriptor_numbers, descriptors_of, destructive_advice_refused, detach_traced,
+    die_of_fatal_signal, discard_exit_code, exec_replace, exit, exit_code, exit_group, fill_owner,
+    fork, frames_range_free, get_mmap_cursor, group_members, has_children, has_deliverable_signal,
+    has_live_child, has_matching_children, has_seccomp_filter, has_tracer, identity_of, init,
+    insert_vma, is_child, is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, last_syscall, lock_current, lock_future, locked_advice_refused,
+    locked_pages, locked_within, madvise_dontneed, map_anon, map_facts, map_frames, mapped_pages,
+    mapping_name_at, mapping_span_at, maxrss_of, may_inspect, may_mint_pid_ns, may_signal,
+    membarrier_registrations, minflt_of, move_eager_ranges, move_user_page, munmap_user,
+    name_user_range, named_process, named_thread, nice_of, note_blk_counts, note_blk_mailbox,
+    note_blk_wait, note_claim_registration, note_claim_wake, note_claim_wake_result,
+    note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner, note_run_begin,
+    note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of, out_of_memory,
+    own_pid_number, page_present_in, parent_group_of, parent_of, park_site, parks_of, pause,
+    pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation,
+    pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive,
+    poll_any_child_event, poll_child_event, populate_user_page_at, preempt, preempt_at,
+    prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
     range_is_mapped, read_user, read_user_of, record_eager_range, register_membarrier,
     release_controlling_tty, release_pid, release_user_frames, reset_disposition, resident_pages,
     resolve_anon_fault, resolve_cow_fault, resolve_pid, resolve_script, resolve_stack_growth,
@@ -586,6 +587,19 @@ pub fn current_thread_switches() -> (u64, u64) {
 #[cfg(not(target_os = "none"))]
 pub fn current_maxrss() -> (u64, u64) {
     (0, 0)
+}
+
+/// The host build resolves no fault through `runtime`'s counters, so all three
+/// books read zero - the honest answer for a host test, not a claim that a
+/// program never faulted.
+#[cfg(not(target_os = "none"))]
+pub fn current_faults() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn minflt_of(_id: TaskId) -> Option<u64> {
+    None
 }
 
 /// The host build has one task and it is always the caller, so the runnable

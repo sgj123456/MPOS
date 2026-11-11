@@ -2276,3 +2276,15 @@ carries the per-phase history.*
   never unshared, and wrong exactly where the answer carries information. Pin `t-stat-tty` 12
   claims, 8 red counterfactually (the `session 12` where the leader is `11` is the discriminating
   one); host unit tests `762 -> 763`. (§6.129, item 243)
+
+- [x] **`/proc/<pid>/stat`'s minor-fault columns are counters** — fields 10/11 (`minflt`/`cminflt`)
+  and `struct rusage`'s `ru_minflt` (offset 64) were literals. Linux keeps two books: the group's own
+  faults and each thread's own (`/proc/<pid>/stat` and `/proc/<pid>/task/<leader>/stat` read `5401`
+  and `4525` while a worker's `task/<worker>/stat` reads `403`), and a reaped child's total folds into
+  `cminflt`, which *is* `RUSAGE_CHILDREN.ru_minflt` (`build/scratch/statflags/{j,k,l,m,o,r}.c`).
+  `Mm` gained `minflt`/`cminflt` and `Task` gained `minflt`, charged at the three sites where this
+  kernel actually takes a frame (`populate_in`, `split_cow`, `resolve_stack_growth`) and folded at
+  reap; `getrusage` splits three ways. `majflt`/`cmajflt`/`ru_majflt` stay a named-gap zero: nothing
+  on the frame path says whether a page came in with I/O. Pin `t-stat-faults` 14 claims, **5 red**
+  counterfactually, and three of its own claims had to be rewritten first because the act of measuring
+  moved the counter being measured. Host unit tests `763 -> 764`. (§6.130, item 244)

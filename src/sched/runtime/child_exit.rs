@@ -277,6 +277,11 @@ pub fn exit(code: isize) -> ! {
         // (Linux's `RUSAGE_BOTH`, `build/scratch/maxrss/r.c`/`u.c`). The `mm`
         // is still the live group's here; read once and carry it.
         let maxrss = t.task(id).mm.maxrss_both();
+        // Its `ru_minflt` folds exactly like the CPU and the peak: own plus its
+        // reaped children's, read here while the `mm` is still the group's
+        // (`build/scratch/statflags/l.c` measured one book behind both
+        // `/proc`'s `cminflt` and `RUSAGE_CHILDREN`).
+        let minflt = t.task(id).mm.minor_faults_both();
 
         // The process's death is recorded once, when its last thread leaves,
         // and it is **the leader's** record: the pid a parent can name is the
@@ -331,6 +336,7 @@ pub fn exit(code: isize) -> ! {
                 nvcsw,
                 nivcsw,
                 maxrss,
+                minflt,
                 tracer: leader.trace.tracer,
                 parent,
             });
@@ -1341,6 +1347,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
+            minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo,
@@ -2089,6 +2096,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
+            minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),
             start_nanos: crate::hal::since_boot_nanos(),
             sem_undo,
@@ -2578,6 +2586,7 @@ fn scan_child_event(
                 nvcsw: retired.nvcsw,
                 nivcsw: retired.nivcsw,
                 maxrss: retired.maxrss,
+                minflt: retired.minflt,
             })
     })
 }
@@ -2612,6 +2621,7 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 nvcsw: retired.nvcsw,
                 nivcsw: retired.nivcsw,
                 maxrss: retired.maxrss,
+                minflt: retired.minflt,
             })
         }
         WaitEvent::Stopped {
@@ -2908,6 +2918,7 @@ pub fn block_until_child_event(
             nvcsw: retired.nvcsw,
             nivcsw: retired.nivcsw,
             maxrss: retired.maxrss,
+            minflt: retired.minflt,
         }),
         None => WaitPark::NoChild,
     }

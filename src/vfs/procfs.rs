@@ -1603,6 +1603,15 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::terminal_foreground`] - `stat`'s field
     /// 8 as the foreground group's **slot**, or `None` for no terminal.
     pub terminal_foreground: Option<usize>,
+    /// See [`crate::sched::TaskSnapshot::minflt`] - `stat`'s field 10, the
+    /// group's own minor faults.
+    pub minflt: u64,
+    /// See [`crate::sched::TaskSnapshot::cminflt`] - field 11, the same count
+    /// for the children this group has collected.
+    pub cminflt: u64,
+    /// See [`crate::sched::TaskSnapshot::minflt_own`] - field 10 of the
+    /// `task/<tid>/` spelling, this thread's own count.
+    pub minflt_own: u64,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1766,8 +1775,22 @@ fn stat_fields(task: &Process, tid: usize, whole: bool) -> [alloc::borrow::Cow<'
             None => alloc::string::String::from("-1"),
         }),
         Cow::Borrowed("0"), // flags
-        Cow::Borrowed("0"), // minflt
-        Cow::Borrowed("0"), // cminflt
+        // minflt: the group's own for `/proc/<pid>/stat`, this thread's for the
+        // `task/<tid>/` spelling - `utime`'s split, for `utime`'s reason. A
+        // single-threaded process reads the same number from both; only a
+        // reader with a sibling can tell them apart (`statflags/r.c`).
+        Cow::Owned(alloc::format!(
+            "{}",
+            if whole { task.minflt } else { task.minflt_own }
+        )), // minflt
+        Cow::Owned(alloc::format!("{}", task.cminflt)), // cminflt
+        // majflt/cmajflt stay zero: a major fault is one the kernel answered by
+        // reading the device, and `MappedObject::frame_at` answers only "the
+        // frame is here". Splitting the two would be a guess, so the fields
+        // wait for a signal that says which arm brought the page in - the
+        // named gap §6.130 records. Linux's own `majflt` is zero on a machine
+        // with no swap and a warm page cache, so no fixture could tell a
+        // correct zero from this one either.
         Cow::Borrowed("0"), // majflt
         Cow::Borrowed("0"), // cmajflt
         // utime/stime: the group's CPU for `/proc/<pid>/stat`, this thread's
@@ -5641,6 +5664,71 @@ mod tests {
         assert_eq!(f[7 - 3], "1088", "the console's encoded id");
     }
 
+    /// §6.130: `stat`'s fields 10 and 11 were two borrowed `"0"`s. What this
+    /// pins is the rendering and the split a constant cannot have: field 10 is
+    /// the group's own count on the process spelling and this thread's on the
+    /// `task/<tid>/` one, while field 11 is always the group's children.
+    ///
+    /// Linux's numbers are `build/scratch/statflags/r.c`: one worker faulting
+    /// 400 pages read the group's `5401` from `/proc/<pid>/stat`, the leader's
+    /// own `4525` from `task/<leader>`, and the worker's `403` from
+    /// `task/<worker>`. So a group of two threads has three different answers
+    /// for one column, and which one a caller gets is the spelling it used -
+    /// exactly the rule `utime` already follows (`cpu_fields`).
+    #[test]
+    fn stat_prints_the_groups_minor_faults_and_the_threads_own() {
+        let fields_of = |p: &Process, whole: bool| -> alloc::vec::Vec<alloc::string::String> {
+            let line = stat_text(&stat_fields(p, p.tid, whole), p.pid);
+            line.split(' ')
+                .skip(2)
+                .map(alloc::string::String::from)
+                .collect()
+        };
+
+        // A process that has faulted nothing: the literal this replaced and a
+        // real zero are the same string, which is why the fixture below is the
+        // one that pins anything.
+        let quiet = process(7, 7, None, 0, 'R');
+        let f = fields_of(&quiet, true);
+        assert_eq!(f[10 - 3], "0", "minflt, field 10");
+        assert_eq!(f[11 - 3], "0", "cminflt, field 11");
+        assert_eq!(f[12 - 3], "0", "majflt, field 12 - the named gap");
+        assert_eq!(f[13 - 3], "0", "cmajflt, field 13");
+
+        // A leader with a faulting worker beside it: the group's count is the
+        // process spelling's, the leader's own is the thread spelling's, and a
+        // child's faults are filed separately.
+        let mut leader = process(9, 9, None, 0, 'R');
+        leader.minflt = 5401;
+        leader.minflt_own = 4525;
+        leader.cminflt = 4411;
+        let group = fields_of(&leader, true);
+        assert_eq!(group[10 - 3], "5401", "the process spelling is the group's");
+        assert_eq!(group[11 - 3], "4411", "the children's, field 11");
+        let thread = fields_of(&leader, false);
+        assert_eq!(
+            thread[10 - 3],
+            "4525",
+            "the task/<tid>/ spelling is this thread's own"
+        );
+        assert_eq!(
+            thread[11 - 3],
+            "4411",
+            "but cminflt belongs to the group either way"
+        );
+
+        // The `task/<tid>/` spelling of a *worker* facet: field 10 is its own
+        // count and the group's stays where it was. Two threads, one group, and
+        // three answers for one column is the whole claim.
+        let mut worker = process(10, 10, Some(9), 9, 'R');
+        worker.minflt = 5401;
+        worker.minflt_own = 403;
+        let own = fields_of(&worker, false);
+        assert_eq!(own[10 - 3], "403", "the worker's own");
+        let as_group = fields_of(&worker, true);
+        assert_eq!(as_group[10 - 3], "5401", "the same group it shares");
+    }
+
     /// §6.117: `stat`'s fields 26-28 were three borrowed `"0"`s. The addresses
     /// themselves are the loader's, so what this pins is the rendering and the
     /// three facts a constant cannot have: a loaded image reports its own
@@ -6915,6 +7003,9 @@ mod tests {
             // that wants a terminal sets both itself (§6.129's host test does).
             tty_nr: 0,
             terminal_foreground: None,
+            minflt: 0,
+            cminflt: 0,
+            minflt_own: 0,
         }
     }
 

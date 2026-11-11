@@ -11144,3 +11144,140 @@ it.
 `setsid` worked, and it stayed invisible because the process that reads a file is almost never the
 process that called `setsid`. A literal is at least honest about being one; a copy looks like an
 answer.
+
+## §6.130 `/proc/<pid>/stat`'s minor-fault columns are counters, and `getrusage` reads the same book (LANDED 2026-11-11)
+
+Fields 10 and 11 of `stat` are `minflt` and `cminflt`; offsets 64 and 72 of `struct rusage` are
+`ru_minflt` and `ru_majflt`. All four were written as constants — `Cow::Borrowed("0")` in the file,
+an untouched zero in `write_rusage`. Unlike §6.129's literals these were not *wrong* about a machine
+that never faults, which is exactly why they lasted: a process's own minor faults are dominated by
+the ones it took starting up, and nothing this kernel runs reads its own count differently for
+having thirty thousand.
+
+What made them fixable was that the counting half already existed in the shape of a counter:
+`Mm::nvcsw`/`nivcsw` (§6.105) proved the pattern — an `AtomicU64` on the address space for the group,
+one on the task for the thread, and a reap that folds a dead child's total into the parent.
+
+### What Linux answers — measured
+
+`build/scratch/statflags/` on the host (7.2.14). `field(pid, n)` is the zero-based index `n - 3` of
+the split that starts after the **last** `)`; the first attempt in this session indexed from field 1
+and read one column to the left everywhere.
+
+```text
+j.c  at start                                  minflt=4997 majflt=0
+     after mmap of 3 MiB (untouched)            minflt=4997
+     after writing 3 pages                      minflt=4999
+     after writing 3 more pages                 minflt=5000
+k.c  child's own minflt 23 -> 282 for 256 COW writes (delta 259)
+     parent's minflt 5257 -> 5266 (delta 9) -- child COW does not appear here
+m.c  48 fresh stack pages:                 minflt 5003 -> 5051 (delta 48)
+l.c  parent at start                       minflt=5002 cminflt=4312
+     a child reporting minflt=99, then reaped: minflt=5008 cminflt=4411
+     RUSAGE_CHILDREN: minflt=4411 majflt=0
+o.c  struct rusage offsets: 32 = maxrss, 64 = minflt, 72 = majflt
+     RUSAGE_SELF 5227 / RUSAGE_THREAD 4557 / RUSAGE_CHILDREN 4281
+r.c  worker faulted 400 pages in its own thread; main faulted none
+     /proc/<pid>/stat            5401
+     /proc/<pid>/task/<leader>   4525
+     /proc/<pid>/task/<worker>    403
+     /proc/<worker-tid>/stat     5402     <- the tid spelling is the GROUP's
+```
+
+Five facts, and each one is a separate thing the file has to get right:
+
+1. **Mapping is not faulting.** 3 MiB untouched moved nothing; three pages moved two.
+2. **The count is the kernel's, not the caller's.** Frame allocation is batched, so a claim of "one
+   per page" is a claim about the wrong machine.
+3. **Two accounts, not one.** `/proc/<pid>/stat` and `/proc/<tid>/stat` read the group's count;
+   `/proc/<pid>/task/<tid>/stat` reads that thread's own. A worker's 400 faults left the leader's own
+   column at its old figure.
+4. **`cminflt` is `RUSAGE_CHILDREN`.** One reap moved both to `4411`, and no other event moves either.
+5. **A copy-on-write split and a grown stack page are minor faults**, charged where they happen.
+
+`majflt` and `cmajflt` (fields 12, 13) stayed zero, and that is still honest — see the gaps below.
+
+### What changed
+
+- **`Mm` gained `minflt`/`cminflt`** (`src/sched/runtime/child_mm.rs`), the group's own count and what
+  its reaped children added, plus `charge_minor_fault()`, `minor_faults_own()`,
+  `minor_faults_both()`, `absorb_child_faults()` and `has_child_faults()` — the same five shapes
+  `nvcsw`/`nivcsw` already had. `Task` gained `minflt` for the thread's own column, initialised at all
+  six construction points.
+- **A fault is charged at the three places one is taken**, not at the page-fault entry: `populate_in`
+  for an anonymous frame, `split_cow` for a copy-on-write split, `resolve_stack_growth` for a grown
+  stack page. Charging at the entry would count the frame-backed case, which this kernel cannot
+  classify — see the gaps.
+- **The thread's column is charged beside the group's**, at those same three sites. `split_cow` has no
+  `Table`, so `resolve_cow_fault` charges the thread after the split returns; `resolve_stack_growth`
+  had to finish its mutable borrow of the task before calling the charging helper — the borrow
+  checker found that, not a review.
+- **The reap folds.** `reap` already collected `(child, cpu, switches)` per dead task; the tuple grew
+  a `faults` word and `absorb_child_faults` adds it to `cminflt`. `Retired` and `WaitEvent::Exited`
+  carry `minflt` so a `wait4`/`waitid` caller gets the same number `getrusage` would.
+- **`TaskSnapshot` carries three**, not two: `minflt` (group own), `cminflt`, and `minflt_own` (this
+  thread). Fields 10 and 11 pick by the `whole` flag `cpu_fields` already used, so `/proc/<pid>/stat`
+  and `task/<tid>/stat` read different columns without the file knowing anything about threads.
+- **`getrusage` splits three ways.** `sched::current_faults()` answers `(group own, group children,
+  thread own)`; `RUSAGE_THREAD` takes the third, `RUSAGE_CHILDREN` the second, everything else the
+  first. `write_rusage` now fills `wire[64..72]` and `wire[72..80]`.
+
+### The pin, and the four things it got wrong first
+
+`user/tests/src/bin/t-stat-faults.rs`, 14 claims. Host 14/14 `PASS`; machine 14/14 `PASS`
+(`build/boot-faults4.log`); counterfactually **5 red** of 14 (`build/boot-faults-cf2.log`) — the
+faulting claims and the child's own reading, which is what a kernel with four literals can answer.
+Both arms green in `build/gate-faults2.log`.
+
+Four claims were wrong before they were right, and all four for the same reason: **a counter that
+the test itself charges is not a constant the test can compare against.**
+
+- *Equality between the two spellings* failed by one (`Some(31) / Some(32)`) because opening and
+  reading the file allocates in the measuring process. The claim became `|difference| <= 4`.
+- *That wider bound then failed on the gate's loaded lane by six* (`Some(1) / Some(7)`) — the
+  `task/<tid>/` path resolves two directory levels where the process spelling resolves one, so the
+  control case pays more than the case it is a control for. The two readings are now six samples
+  each of the smallest value seen, compared within sixteen: measurement cost only ever adds, so the
+  minimum is the count with the tax taken off, and what remains is slack for the path's own depth.
+- *A `Vec` as the untouched mapping* failed because a `Vec` of 3 MiB can be cut out of heap the
+  process has already touched, so writing it faults nothing and the measurement reads as a kernel
+  that does not count. The fixture became `mmap` + `write_volatile` per page (`struct Fresh`), which
+  has no history.
+- *The `cminflt` bound was `a >= b + seen`*, where `seen` was the child's own reading — so a kernel
+  that counted nothing passed by reporting nothing. The bound is now the 64 pages the child was told
+  to touch; the child's own reading is asserted separately, where a zero is already red.
+
+The same gate run also caught a **stale contract in another test**: `t-wait4` asserted that eleven
+of `struct rusage`'s counters were zero, and `ru_minflt` had just stopped being one of them. That
+claim now covers the block-I/O and IPC counters (`counters[1..4]` and `counters[5..12]`) and asserts
+`ru_minflt > 0` beside them — the third time this session a served field had to be moved out of an
+"unmeasured" set (§6.105, §6.113 and now here), which is the cost of writing a shrinking set as a
+range rather than as a list of names.
+
+Reading the worker's `task/<tid>/` file had the same shape as `statflags/o.c`'s trap: it has to be
+read **inside** the worker and before it returns, because a returned thread has no `task/<tid>/` left
+to read.
+
+### Named gaps this does not close
+
+- **`majflt`/`cmajflt` (fields 12, 13) and `ru_majflt` stay `0`.** A major fault is one the kernel
+  answered by reading the backing device, and nothing on this kernel's frame path carries that fact —
+  `MappedObject::frame_at` answers *which frame*, never *how it got there*
+  (`src/mm/vma.rs:56`). Splitting them would need a hit/miss signal on the block cache, which is a
+  feature and not a field. The zero is honest: this machine's only file-backed frames come from an
+  image that is resident, so a real major fault is not a case it can reach either.
+- **Frame-backed faults are not counted at all.** `populate_in`'s `VmaKind::Frames` branch charges
+  nothing, because the same missing signal is what would decide whether it was minor. A file-backed
+  page brought in without I/O is a minor fault on Linux; this kernel cannot tell, and counting it as
+  one would be the guess the "refuse rather than approximate" rule forbids.
+- **The per-page count is not Linux's.** Linux batches frame allocation, so three pages can cost two.
+  This kernel charges once per taken frame, which is its own machine's truth; the pin asserts movement
+  and never a page-for-page delta.
+
+### The rule
+
+*A counter the reader cannot compare against itself is a counter with no pin.* Every wrong version of
+this fixture compared two numbers that the act of measuring moved — and the file it was measuring was
+the one whose reading cost the fault. The claim had to become a bound or a movement, and the two
+literals that had stood for four phases were never once asked to move.
+

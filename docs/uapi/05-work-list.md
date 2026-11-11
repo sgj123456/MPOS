@@ -10761,3 +10761,55 @@ green in `build/gate-stattty2.log`.
 terminal-less task prints, so the two cases cannot be told apart from the file. Linux's field 8 is an
 `int`, so a group id past `INT_MAX` would wrap — unreachable from this kernel's task table and
 therefore untested. Only `new_encode_dev` is produced; the pre-2.6.25 encoding is not.
+
+### Item 244 — `/proc/<pid>/stat`'s minor-fault columns are counters, and there is one book per account
+
+Rows: `stat` fields 10 (`minflt`) and 11 (`cminflt`); `struct rusage` offsets 64 (`ru_minflt`) and 72
+(`ru_majflt`). Two literals and two untouched zeros, all four of them honest about a process that
+never faults.
+
+| promise | Linux (host 7.2.14, `build/scratch/statflags/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| field 10, group spelling (`/proc/<pid>/stat`) | the group's own faults (`5401` with a worker faulting 400) | literal `0` | the group's own count |
+| field 10, `task/<leader>/stat` | that thread's own (`4525`) | literal `0` | that thread's own count |
+| field 10, `task/<worker>/stat` | the worker's own (`403`) | literal `0` | the worker's own count |
+| field 10, `/proc/<tid>/stat` | the **group's** figure again (`5402`) | literal `0` | the group's |
+| field 11 (`cminflt`) | what reaped children added (`4312 -> 4411` for one child that faulted 99) | literal `0` | the folded child total |
+| `ru_minflt`, `RUSAGE_SELF` / `THREAD` / `CHILDREN` | three different numbers a moment apart (`5227`/`4557`/`4281`) | `0` for all three | three books |
+| mapping 3 MiB without touching | no change | `0` | no change |
+| a copy-on-write split, a grown stack page | one fault each, charged where they happen | uncounted | charged |
+| fields 12/13, `ru_majflt` | `0` on a machine with no swap and a warm cache | `0` | `0` (still honest — see the gaps) |
+
+**Why this is one item and not four.** `minflt` and `cminflt` are the same counter read one reap
+apart; `ru_minflt` is the name that counter has in `struct rusage`, and `cminflt`'s value *is*
+`RUSAGE_CHILDREN.ru_minflt` (`l.c` read one number from both doors). Filling the file without the
+`struct` would have left the same number unavailable at the second door, which is the shape §6.105
+and §6.113 both started from.
+
+**Where the answer comes from.** `Mm::minflt`/`cminflt` (group and its reaped children) and
+`Task::minflt` (this thread's own), charged at the three sites where this kernel actually takes a
+frame — `populate_in`, `split_cow`, `resolve_stack_growth` — and folded at reap by
+`absorb_child_faults`. `TaskSnapshot` carries all three; `stat_fields` picks by the `whole` flag
+`cpu_fields` already used, and `getrusage` splits three ways through `sched::current_faults()`.
+
+**Measurement.** `build/scratch/statflags/{j,k,l,m,o,r}.c` on 7.2.14: the mmap-without-touching
+control, the batched three-pages-cost-two reading, the COW and stack deltas, the `cminflt` fold against
+`RUSAGE_CHILDREN`, the two `rusage` offsets, and the three spellings of one thread's count. Pin
+`t-stat-faults` 14 claims, host 14/14, machine 14/14 (`build/boot-faults4.log`), counterfactually
+**5 red** (`build/boot-faults-cf2.log`), both arms green in `build/gate-faults2.log` (stage 1 `1266
+tests, 0 failed`; x86_64 `pass=294 fail=0`; aarch64 `pass=293 fail=0`; both `mpos-kunit 35 passed, 0
+failed`). The same run caught `t-wait4`'s now-stale "eleven counters are zero" claim, narrowed to the
+block-I/O and IPC group with `ru_minflt > 0` asserted beside it.
+
+**Landed.** `src/sched/runtime/child_mm.rs` (two `Mm` counters + four methods + the three charge
+sites), `src/sched/runtime/task.rs` (`Task::minflt`, `Retired::minflt`, `WaitEvent::Exited::minflt`,
+the reap fold), `src/sched/runtime/child_exit.rs`, `src/sched/runtime/child_signal.rs`
+(`current_faults`, `minflt_of`), `src/sched/mod.rs`, `src/sched/runtime/procfs.rs` (three snapshot
+fields), `src/vfs/procfs.rs` (two fields + a host test), `src/syscall/linux/proc.rs` (`write_rusage`'s
+two words + the three-way split), `user/tests/src/bin/t-stat-faults.rs`, §6.130. Host unit tests
+`763 -> 764`.
+
+**Named gaps this does not close.** `majflt`/`cmajflt`/`ru_majflt` stay `0` because nothing on this
+kernel's frame path says whether a page came in with I/O — `MappedObject::frame_at` answers *which
+frame*, never *how*. Frame-backed faults are therefore not counted at all: counting them as minor
+would be a guess. And the per-page count is this machine's, not Linux's, whose allocator batches.

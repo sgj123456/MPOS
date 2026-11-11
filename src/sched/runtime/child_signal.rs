@@ -1406,6 +1406,46 @@ pub fn current_thread_switches() -> (u64, u64) {
     )
 }
 
+/// The running process's minor faults as `getrusage` splits them:
+/// `(group own, group children, this thread own)`.
+///
+/// Three numbers because Linux keeps three: `RUSAGE_SELF` reads the group's
+/// own count, `RUSAGE_CHILDREN` the total the reap folded in, and
+/// `RUSAGE_THREAD` this thread's own - measured as one book with `/proc`'s
+/// fields 10 and 11 (`build/scratch/statflags/o.c`: `5227`/`4281`/`4557` from
+/// the three `who` values a moment apart, and `statflags/r.c` for the thread
+/// half). `(0, 0, 0)` before the scheduler runs or if `current` names no live
+/// task.
+#[cfg(target_os = "none")]
+pub fn current_faults() -> (u64, u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => (
+                task.mm.minor_faults_own(),
+                task.mm
+                    .minor_faults_both()
+                    .saturating_sub(task.mm.minor_faults_own()),
+                task.minflt.load(Ordering::Relaxed),
+            ),
+            None => (0, 0, 0),
+        },
+    )
+}
+
+/// A live task's own-plus-children minor faults by id - the [`switches_of`]
+/// shape, for the two `wait` event classes reported while the child is still
+/// in the table (a stop and a resume). `None` when the slot is gone, which a
+/// caller reads as the zero a cleared record carries.
+#[cfg(target_os = "none")]
+pub fn minflt_of(id: TaskId) -> Option<u64> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| task.mm.minor_faults_both())
+    })
+}
+
 /// The running process's resident-set peak in KB, `(own, reaped-children)`.
 /// `getrusage(RUSAGE_SELF)` and `RUSAGE_THREAD` both read the first: Linux
 /// keeps the peak on the process's shared signal struct, so a thread has no

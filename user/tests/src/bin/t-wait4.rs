@@ -361,16 +361,31 @@ fn main() {
                 true,
             );
         } else {
-            // The eleven fault/block-I/O/IPC counters are still not measured by
-            // this kernel, and the record is zeroed before it is filled - an
-            // honest "nothing measured" rather than a plausible number. Two
-            // ranges have moved out of this claim as their fields were served:
-            // `ru_nvcsw`/`ru_nivcsw` since `§6.105` (the last two), and
-            // `ru_maxrss` since `§6.113` (the first). Each is asked about
-            // separately below, so "unmeasured" stays a shrinking, named set.
+            // The block-I/O and IPC counters are still not measured by this
+            // kernel, and the record is zeroed before it is filled - an honest
+            // "nothing measured" rather than a plausible number. Three ranges
+            // have moved out of this claim as their fields were served:
+            // `ru_nvcsw`/`ru_nivcsw` since `§6.105` (the last two), `ru_maxrss`
+            // since `§6.113` (the first), and `ru_minflt` since `§6.130` (the
+            // fifth). Each is asked about separately, so "unmeasured" stays a
+            // shrinking, named set rather than a claim that quietly stops
+            // meaning anything.
             r.check(
-                "the eleven unmeasured counters are zero, not the caller's own seed",
-                ru.counters[1..12].iter().all(|c| *c == 0),
+                "the unmeasured block-I/O and IPC counters are zero, not the caller's own seed",
+                ru.counters[1..4]
+                    .iter()
+                    .chain(ru.counters[5..12].iter())
+                    .all(|c| *c == 0),
+            );
+            // `ru_minflt` is the child's own fault count, filed by the reap -
+            // the fifth counter, and the one `§6.130` moved out of the set
+            // above. A zero here would be the old literal.
+            r.check(
+                &format!(
+                    "and ru_minflt is the child's fault count ({})",
+                    ru.counters[4]
+                ),
+                ru.counters[4] > 0,
             );
             // `ru_maxrss` is the child's resident-set high water in KB. The
             // burner inherited the loaded image's frames through fork, so its

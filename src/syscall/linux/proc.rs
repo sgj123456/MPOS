@@ -588,6 +588,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             (retired.utime, retired.stime),
             retired.maxrss,
             (retired.nvcsw, retired.nivcsw),
+            retired.minflt,
             status,
             rusage,
             from_user,
@@ -629,6 +630,7 @@ fn finish_wait_event(
             nvcsw,
             nivcsw,
             maxrss,
+            minflt,
             ..
         } => finish_wait(
             id,
@@ -638,6 +640,7 @@ fn finish_wait_event(
             (utime, stime),
             maxrss,
             (nvcsw, nivcsw),
+            minflt,
             status,
             rusage,
             from_user,
@@ -659,6 +662,7 @@ fn finish_wait_event(
             (utime, stime),
             crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
+            crate::sched::minflt_of(id).unwrap_or(0),
             status,
             rusage,
             from_user,
@@ -670,6 +674,7 @@ fn finish_wait_event(
             (utime, stime),
             crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
+            crate::sched::minflt_of(id).unwrap_or(0),
             status,
             rusage,
             from_user,
@@ -686,6 +691,7 @@ fn write_wait_status(
     cpu: (u64, u64),
     maxrss_kb: u64,
     switches: (u64, u64),
+    faults: u64,
     status: usize,
     rusage: usize,
     from_user: bool,
@@ -696,7 +702,7 @@ fn write_wait_status(
         }
         unsafe { (status as *mut i32).write_unaligned(word) };
     }
-    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, from_user) {
+    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, (faults, 0), from_user) {
         Some(e) => e,
         None => pid_answer(id, numbers),
     }
@@ -750,6 +756,7 @@ fn finish_wait(
     cpu: (u64, u64),
     maxrss_kb: u64,
     switches: (u64, u64),
+    faults: u64,
     status: usize,
     rusage: usize,
     from_user: bool,
@@ -762,7 +769,7 @@ fn finish_wait(
         // it is spelled in `abi`, tested on the host.
         unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code, dumped)) };
     }
-    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, from_user) {
+    match write_wait_rusage(rusage, cpu, maxrss_kb, switches, (faults, 0), from_user) {
         Some(e) => e,
         None => pid_answer(id, numbers),
     }
@@ -787,12 +794,13 @@ fn write_wait_rusage(
     cpu: (u64, u64),
     maxrss_kb: u64,
     switches: (u64, u64),
+    faults: (u64, u64),
     from_user: bool,
 ) -> Option<isize> {
     if ptr == 0 {
         return None;
     }
-    write_rusage(ptr, cpu.0, cpu.1, maxrss_kb, switches, from_user)
+    write_rusage(ptr, cpu.0, cpu.1, maxrss_kb, switches, faults, from_user)
 }
 
 /// Write `struct rusage` from a pair of internal clock ticks: the two opening
@@ -820,6 +828,7 @@ fn write_rusage(
     stime: u64,
     maxrss_kb: u64,
     switches: (u64, u64),
+    faults: (u64, u64),
     from_user: bool,
 ) -> Option<isize> {
     const RUSAGE_BYTES: usize = 144; // 2 timevals + 14 longs
@@ -845,6 +854,14 @@ fn write_rusage(
     // children's (`build/scratch/maxrss/r.c`, `u.c`) - both of which the
     // snapshot/record hands us already folded.
     wire[32..40].copy_from_slice(&maxrss_kb.to_le_bytes()); // ru_maxrss
+    // The fault pair sits between `ru_maxrss` and the switch pair: Linux's
+    // `struct rusage` puts `ru_minflt` at 64 and `ru_majflt` at 72 - two of the
+    // ten counters this kernel used to leave zero (`build/scratch/statflags/
+    // o.c` reads both offsets back). `minflt` is a real counter now (§6.130);
+    // `majflt` stays zero and is the named gap that section records, because
+    // `MappedObject::frame_at` cannot say whether a page came from the device.
+    wire[64..72].copy_from_slice(&faults.0.to_le_bytes()); // ru_minflt
+    wire[72..80].copy_from_slice(&faults.1.to_le_bytes()); // ru_majflt
     // Linux's `struct rusage` puts the two switch counters last:
     // `ru_nvcsw` at 128 and `ru_nivcsw` at 136, after ten counters this
     // kernel does not measure (the page-fault pair, block I/O, IPC).
@@ -5632,7 +5649,20 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     // waited for (`build/scratch/maxrss/u.c`).
     let (own, children) = crate::sched::current_maxrss();
     let maxrss_kb = abi::rusage_maxrss(own, children, who == RUSAGE_CHILDREN);
-    write_rusage(usage, utime, stime, maxrss_kb, switches, true).unwrap_or_default()
+    // The fault pair, by the same three-way split as the CPU and the switches:
+    // `SELF` is the group's own count, `THREAD` this thread's own, and
+    // `CHILDREN` the group's child total the reap folded in. Measured on Linux
+    // 7.2.14 (`build/scratch/statflags/o.c`): `RUSAGE_SELF 5227`,
+    // `RUSAGE_THREAD 4557`, `RUSAGE_CHILDREN 4281` - three different numbers
+    // for one field, which is what a constant cannot be. `ru_majflt` stays
+    // zero: see [`write_rusage`] and §6.130's named gap.
+    let (group_own, group_children, thread_own) = crate::sched::current_faults();
+    let faults = match who {
+        RUSAGE_THREAD => (thread_own, 0),
+        RUSAGE_CHILDREN => (group_children, 0),
+        _ => (group_own, 0),
+    };
+    write_rusage(usage, utime, stime, maxrss_kb, switches, faults, true).unwrap_or_default()
 }
 
 /// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
@@ -5780,6 +5810,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             reported.cpu,
             reported.maxrss,
             reported.switches,
+            (reported.minflt, 0),
             from_user,
         ) {
             return e;
@@ -5849,6 +5880,9 @@ struct Reported {
     cpu: (u64, u64),
     maxrss: u64,
     switches: (u64, u64),
+    /// The child's own-plus-children minor faults, `ru_minflt` - off the record
+    /// for a death, off the live task for a stop or a resume.
+    minflt: u64,
 }
 
 // `waitid`'s option word, and the two sets this kernel reads out of it.
@@ -6020,7 +6054,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
     // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRAPPED` and `CLD_CONTINUED`
     // all report the child's real uid) and reports `cred->uid` - the real id,
     // not the effective one.
-    let (child, si_code, status, uid, cpu, maxrss, switches) = match event {
+    let (child, si_code, status, uid, cpu, maxrss, switches, minflt) = match event {
         crate::sched::WaitEvent::Exited {
             id,
             code,
@@ -6032,6 +6066,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             nvcsw,
             nivcsw,
             maxrss,
+            minflt,
             ..
         } => {
             let (si_code, status) = abi::exit_chld(code, dumped);
@@ -6043,6 +6078,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
                 (utime, stime),
                 maxrss,
                 (nvcsw, nivcsw),
+                minflt,
             )
         }
         // A stop under a tracer and a stop for the parent are two codes
@@ -6064,6 +6100,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             (utime, stime),
             crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
+            crate::sched::minflt_of(id).unwrap_or(0),
         ),
         crate::sched::WaitEvent::Continued { id, utime, stime } => (
             pid_answer(id, &[]),
@@ -6073,6 +6110,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             (utime, stime),
             crate::sched::maxrss_of(id).unwrap_or(0),
             crate::sched::switches_of(id).unwrap_or((0, 0)),
+            crate::sched::minflt_of(id).unwrap_or(0),
         ),
     };
 
@@ -6086,6 +6124,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             cpu,
             maxrss,
             switches,
+            minflt,
         }),
     }
 }
