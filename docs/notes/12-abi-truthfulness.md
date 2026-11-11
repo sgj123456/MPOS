@@ -292,7 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `read`/`write`'s judgement order §6.133):** stage 1 `1269 tests,
+**Latest measured gate (2026-11-11, `/proc/<pid>/wchan` and the sweep's root size §6.134):** stage 1
+`1274 tests, 0 failed` (52.60 s — the +5 are `wchan`'s four vocabulary tests and
+`disk::tree_bytes`'s); x86_64 `pass=297 fail=0 (297 built)`, `mpos-kunit 35 passed, 0 failed`
+(52.87 s over 2 lane(s), `+0.0%`); aarch64 `pass=296 fail=0 (296 built)`, `mpos-kunit 35 passed, 0
+failed` (192.60 s over 2 lane(s), `+48.8%` — the same image now holds a 32 MiB larger root, which is
+the `ROOT_SLACK_BYTES` the fix added) — `GATE EXIT=0`, both arms in one command with the lane count
+forced to two (`build/gate-wchan3.log`). `t-wchan` reads `=== PASS` on both arms. **Two claims in
+that pin moved under the gate and both are recorded in §6.134**: "a task we may not inspect reads 0"
+is false on the machine because the payload runs as root (it *may* inspect `pid 1`), and "it is
+asleep while it says so" was a race against this kernel's timed pipe park, so it now samples the
+pair. **The gate's second finding was not in this change at all**: `t-mmap-file-lazy` went red on
+aarch64 because the sweep's root was a 196 MiB filesystem holding a 196.58 MiB tree with 1.89 MiB
+free, where that program writes 2 MiB — `SWEEP_DISK_BYTES`'s comment still said "~57 MB today" and
+the payload is 111.82 MiB. The root is now sized from the tree; the same image went from 485 free
+blocks to 8371.
+
+**Measured gate before it (2026-11-11, `read`/`write`'s judgement order §6.133):** stage 1 `1269 tests,
 0 failed` (69.01 s — the +1 is `abi::iov_count_verdict`'s host test); x86_64 `pass=296 fail=0 (296
 built)`, `mpos-kunit 35 passed, 0 failed` (51.64 s over 2 lane(s)); aarch64 `pass=295 fail=0 (295 built)`,
 `mpos-kunit 35 passed, 0 failed` (141.11 s over 2 lane(s), `the machine reached === END and was

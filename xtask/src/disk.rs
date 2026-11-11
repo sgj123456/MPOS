@@ -323,6 +323,46 @@ fn ext4_staging(build_dir: &Path, arch: Arch) -> PathBuf {
     build_dir.join(format!("{}-sweep-staging", arch.name()))
 }
 
+/// How much room a root filesystem leaves over after its contents.
+///
+/// Not zero: a sweep's root is a *writable* filesystem, and the programs that run
+/// on it write files. `t-mmap-file-lazy` is the one that measured this - it
+/// writes 512 pages (2 MiB) of scratch into `/`, and a root sized to exactly its
+/// contents answered the write short with 1.89 MiB free. 32 MiB is room for that
+/// plus the other tests' scratch, and it is a floor rather than a size: a payload
+/// that grows still gets a root that fits it, because [`tree_bytes`] is measured
+/// on every build.
+const ROOT_SLACK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The bytes a staged tree occupies, as the filesystem will hold them.
+///
+/// Every file's own length, plus one block per *directory*: a directory is a
+/// block of its own on ext4, and a tree with thousands of tiny entries (the
+/// applet farm is one such) costs more than the sum of its files. Rounded up to
+/// a block, so the answer is in whole filesystem blocks rather than bytes that
+/// then get rounded somewhere else.
+fn tree_bytes(tree: &Path) -> Result<u64> {
+    const BLOCK: u64 = 4096;
+    let mut total = 0u64;
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                // The directory inode's own block, then its children.
+                total += BLOCK;
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total.div_ceil(BLOCK) * BLOCK)
+}
+
 /// Where the medium's ESP volume is staged before it becomes a partition.
 fn esp_dir(build_dir: &Path, arch: Arch) -> PathBuf {
     build_dir.join(format!("{}-sweep-esp", arch.name()))
@@ -594,7 +634,24 @@ pub fn sweep_medium(build_dir: &Path, into: &Path, arch: Arch, boot: &Boot<'_>) 
     for (name, bytes) in entries {
         stage_program(&staging, name, bytes)?;
     }
-    lay_ext4(&ext4_image(into, arch), &staging, disk_bytes)?;
+    // The filesystem is sized from the tree it is about to hold, not from the
+    // constant the caller asked for. That constant is a *floor* - a payload the
+    // caller did not predict still gets a root that fits it - while the tree
+    // itself is what decides, because a root that is exactly as big as its
+    // contents has no room for what a *test* writes into it. `t-mmap-file-lazy`
+    // is the one that found this: it writes 512 pages (2 MiB) of scratch under
+    // `/`, and a root with 1.89 MiB free answered the write short. Sizing the
+    // filesystem to its contents is the bug - `mkfs.ext4` would have said "no
+    // blocks" only if the tree did not fit at all, which is a different failure
+    // from a root that fits and leaves nothing over.
+    //
+    // The fingerprint still carries the caller's `disk_bytes`, not this measured
+    // size: the tree is a function of the entries, the overlays and the archive,
+    // all of which that fingerprint already names, so a measured size in it
+    // would make every run stale against a value it cannot recompute before
+    // deciding. The size is derived, so it cannot drift from its inputs.
+    let root_bytes = disk_bytes.max(tree_bytes(&staging)? + ROOT_SLACK_BYTES);
+    lay_ext4(&ext4_image(into, arch), &staging, root_bytes)?;
 
     // The ESP half: `mkfs.fat` makes the empty volume and `fat::populate` fills
     // it, which is the root-free way to do what `mcopy` or a mount would.
@@ -620,7 +677,7 @@ pub fn sweep_medium(build_dir: &Path, into: &Path, arch: Arch, boot: &Boot<'_>) 
         &esp_img,
         ESP_BYTES,
         &ext4_image(into, arch),
-        disk_bytes,
+        root_bytes,
     )?;
 
     // Written last, so the mtime the next run reads as its "since" is strictly
@@ -808,6 +865,52 @@ mod tests {
         // And the two machines never share one: a sweep's medium carries the
         // payload built for its own machine's target.
         assert_ne!(medium(build, Arch::X86_64), medium(build, Arch::Aarch64));
+    }
+
+    /// A root filesystem is sized from the tree it holds, and always leaves room
+    /// over: a sweep's root is writable and its programs write into it.
+    ///
+    /// The measurement is the counterfactual for the bug this replaced. The size
+    /// used to be the caller's constant alone, and the constant had gone stale
+    /// against the payload: `build/aarch64-sweep-ext4.img` held 196.58 MiB of
+    /// tree in a 196 MiB filesystem with 485 free blocks (1.89 MiB) left, and
+    /// `t-mmap-file-lazy` - which writes 512 pages of scratch under `/` - had
+    /// its write answered short. The old shape passes a size *below* the tree
+    /// here; the new one cannot, because it measures.
+    #[test]
+    fn a_roots_size_is_measured_from_the_tree_and_leaves_room_over() {
+        let base = std::env::temp_dir().join("mpos-tree-bytes-test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("bin")).expect("make the tree");
+        fs::create_dir_all(base.join("etc/deep")).expect("make a nested tree");
+        // Two files of a known size, one of them small enough that rounding is
+        // what the claim is about.
+        fs::write(base.join("bin/one"), vec![0u8; 10 * 1024 * 1024]).expect("write one");
+        fs::write(base.join("etc/deep/two"), vec![0u8; 4097]).expect("write two");
+
+        let measured = tree_bytes(&base).expect("measure the tree");
+        // The two files, plus one block per *subdirectory* - `bin`, `etc` and
+        // `etc/deep`; the tree's own root is the filesystem's root inode and
+        // costs nothing here - rounded up to whole blocks.
+        let files = 10 * 1024 * 1024 + 4097;
+        let dirs = 3 * 4096;
+        let want = ((files + dirs) as u64).div_ceil(4096) * 4096;
+        assert_eq!(
+            measured, want,
+            "a tree is its files plus one block per directory, rounded to blocks"
+        );
+
+        // And the floor a caller asks for is a floor: a size below the tree is
+        // raised to the tree plus the slack, never honoured as given.
+        let floor = 1024 * 1024;
+        let root = floor.max(measured + ROOT_SLACK_BYTES);
+        assert!(
+            root >= measured + ROOT_SLACK_BYTES,
+            "a root smaller than its contents plus slack is not a size to honour"
+        );
+        assert_eq!(ROOT_SLACK_BYTES, 32 * 1024 * 1024);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// §10.5's fixture is laid once and reused: the cached builder runs its

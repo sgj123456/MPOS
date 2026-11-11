@@ -11596,3 +11596,109 @@ it closes.
 *Which question a door asks first is part of the answer it gives.* Two things can be wrong at once
 and the caller branches on the errno; a kernel that judges the cheap argument first hands back a
 refusal about something the caller had not yet committed to.
+
+## §6.134 `/proc/<pid>/wchan` is the wait a task is in now, and the sweep's root had no room to say so (LANDED 2026-11-11)
+
+`/proc/<pid>/stat`'s field 35 records the *last* park a task entered - it is the stuck-machine
+instrument, and it is meant to stay set after the task wakes. `/proc/<pid>/wchan` is the other
+question: what is this task waiting on *now*. This kernel had no such file at all, and the two
+answers are measurably different (host 7.2.14, `build/scratch/wchan/`):
+
+```
+running (self)                     n=1  text="0"
+blocked in a pipe read             n=14 text="anon_pipe_read"
+blocked in nanosleep               n=17 text="hrtimer_nanosleep"
+SIGSTOPped                         n=14 text="do_signal_stop"
+ptrace-stopped                     n=11 text="ptrace_stop"
+zombie (unreaped)                  n=1  text="0"
+reaped                             open errno=2 (ENOENT)
+spinning (runnable)                n=1  text="0"
+```
+
+and the two files on one task that slept and then woke (`stale.c`, `f35.c`):
+
+```
+asleep in a pipe read            f35=1   wchan="anon_pipe_read"
+woken, running                   f35=1   wchan="0"      <- field 35 is stale, and right to be
+zombie                           f35=1   wchan="0"
+```
+
+Three shapes the file has, each measured:
+
+* **No trailing newline.** The content is the word and nothing else - 14 bytes for
+  `anon_pipe_read`, 1 for `0`. `/proc/<pid>/comm` ends in `\n`; this file does not (`perm.c`).
+* **A target the caller may not inspect reads `0`, not `EACCES`.** `perm3.c`: a child dropped to
+  uid 65534 and `pid 1` both read `0` from an unprivileged parent. The same target makes
+  `maps`/`smaps` answer `EACCES`, so refusing here would be copying the wrong neighbour's rule.
+* **Per-thread, not per-group.** `threaded.c`: with a worker blocked in a pipe read and the leader
+  running, `/proc/<pid>/wchan` and `task/<leader>/wchan` both read `0` while `task/<worker>/wchan`
+  reads `anon_pipe_read`.
+
+### The change
+
+`src/sched/wchan.rs` (new, host-compiled) holds the vocabulary: `pub enum Wait { Nothing,
+Parked(u8), GroupStop, TraceStop }`, `wchan_word`, and `PARK_SITES` - the park-site table **moved
+out of `src/sched/runtime/task.rs`**, because the stall dump and this file were about to be two
+readers of one list. `src/sched/runtime/procfs.rs` answers it as `task_wait(id)`: an exited task is
+`Nothing`, an uninspectable one is `Nothing` (not a refusal), a trace-stop is `TraceStop` or
+`GroupStop`, a sleeping task is `Parked(park_site)`, and a running one is `Nothing`. `src/vfs/procfs.rs`
+adds the file at both spellings - `process_dir` and `thread_dir` - through one `wchan_text`.
+
+### The pin (`user/tests/src/bin/t-wchan.rs`, 12 claims)
+
+Shape and movement, not this kernel's vocabulary: the file exists; carries no newline; a running
+task reads `0`; a child parked in a pipe read names a wait that is neither empty nor `0`; a sample
+of the two files together finds the task asleep *with* its wait named; `stat` field 35 records a
+number for the same park; both spellings exist and agree; a zombie reads `0`; a collected task has
+no file; a task the caller does not own is answered rather than refused; and every word is either
+`0` or a single name with no space.
+
+Two claims moved while the pin was being written, both because the machine disagreed with the host:
+
+* **"a task we may not inspect reads 0"** was false on the machine: the payload runs as root, so it
+  *may* inspect `pid 1` and reads that task's real wait - which is also Linux's answer for root. The
+  claim that holds for any caller is the rule itself, "answered, not refused", plus "the word is one
+  of the two Linux has".
+* **"and it is asleep, not running, while it says so"** was a race, not a state. This kernel's pipe
+  read is a *timed* park, so a blocked reader alternates between parked and briefly runnable;
+  sampling `stat` and `wchan` in two reads caught `block_until_nanos` beside `R`. It now samples the
+  pair until a sample agrees, which is the property the two files exist to describe and not a
+  promise a timed park makes.
+
+Host 12/12; machine 12/12 (`build/boot-wchan4.log`); counterfactual with the file removed and the
+scheduler changes stashed, `7/12` red (`build/boot-wchan-cf1.log`) - every `None` answer: the file
+absent, the running read, the parked child, the thread spelling, the two spellings agreeing, the
+zombie, and the uninspectable target.
+
+### The gate found the second bug, and it was not in this change
+
+The first both-arm gate went red on `t-mmap-file-lazy` on aarch64 with `FAIL: the file is written in
+full`. The arithmetic is exact: `build/aarch64-sweep-ext4.img` was a 196 MiB filesystem holding a
+196.58 MiB tree, leaving **485 free blocks = 1.89 MiB**, and that program writes 512 pages (2 MiB) of
+scratch under `/`. Adding this pin's 423 KiB binary pushed it over. The pin had existed since
+`4930158` and no gate had reached it, because the earlier sweeps did not stage it.
+
+The cause is a constant that drifted from its contents: `SWEEP_DISK_BYTES` was `96 MiB` with a
+comment saying the payload was "~57 MB today", and the payload is now 111.82 MiB of `/bin` in a
+196.58 MiB tree. `mkfs.ext4` only refuses when the tree does not fit at all; a root that fits
+*exactly* leaves nothing for what a test writes, and that is the failure that was invisible.
+
+The fix sizes the filesystem from the tree (`xtask/src/disk.rs`): a new `tree_bytes` walks the
+staging tree summing file lengths plus one block per directory, `ROOT_SLACK_BYTES` (32 MiB) is the
+room a writable root leaves over, and `root_bytes = disk_bytes.max(tree_bytes + ROOT_SLACK_BYTES)` -
+so the caller's constant is a **floor** rather than the answer. The medium's fingerprint still
+carries the caller's `disk_bytes` and not the measured one: the tree is a function of the entries,
+overlays and archive the fingerprint already names, so a measured size in it would make every run
+stale against a value it cannot recompute before deciding. After the fix the same image holds 58598
+blocks with **8371 free (32.7 MiB)**, and `t-mmap-file-lazy` passes on both machines.
+
+Host test `disk::tests::a_roots_size_is_measured_from_the_tree_and_leaves_room_over` pins the
+measurement: a tree of two files (10 MiB and 4097 B) in three subdirectories measures its files plus
+one block per directory, rounded to blocks, and a floor below the tree is raised rather than honoured.
+
+### The rule
+
+*A column that says "now" and a column that says "last time" are two answers, and a machine with
+only the second is missing the one a debugger reads first.* The gate's second finding is the other
+half of the lesson: a size constant with a comment saying what the payload was is a measurement with
+an expiry date, and the way to keep it honest is to derive it from the thing it is supposed to hold.

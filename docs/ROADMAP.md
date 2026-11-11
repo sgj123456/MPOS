@@ -2324,3 +2324,18 @@ carries the per-phase history.*
   **4 of 11 red** counterfactually. Named gap: `write(/dev/null, BAD, 8)` still answers `EFAULT` where
   Linux answers `8`, because the fault-in happens once up front rather than at the copy site — a
   VFS-wide change, carried as a printed observation in the pin. (§6.133, item 247)
+- [x] **`/proc/<pid>/wchan` is the wait a task is in now** — the file did not exist. `stat` field 35
+  is the *last* park and stays set after a wake (measured: one task asleep reads `f35=1
+  wchan="anon_pipe_read"`, the same task awake reads `f35=1 wchan="0"`), so serving the file from it
+  would have looked finished and been wrong for every running task. New `src/sched/wchan.rs` holds
+  `Wait`/`wchan_word` and the park-site table, **moved out of `src/sched/runtime/task.rs`** so the
+  stall dump and this file read one list; `task_wait` in `src/sched/runtime/procfs.rs` answers it, and
+  the file is at both spellings. Pin `t-wchan` (12 claims) is `PASS` on both arms and **7 of 12 red**
+  counterfactually. Two claims moved while writing it: "a task we may not inspect reads 0" is false
+  on the machine (the payload is root, so it *may* inspect `pid 1`), and "it is asleep while it says
+  so" was a race — this kernel's pipe read is a *timed* park, so the claim samples the pair instead of
+  comparing two reads. **The gate then found a second, unrelated bug**: the aarch64 sweep's root was a
+  196 MiB filesystem holding a 196.58 MiB tree, leaving 1.89 MiB free where `t-mmap-file-lazy` writes
+  2 MiB — `SWEEP_DISK_BYTES`'s comment still said the payload was "~57 MB" and it is 111.82 MiB. The
+  root is now sized from the tree (`tree_bytes` + `ROOT_SLACK_BYTES`, 32 MiB of room, the caller's
+  constant as a floor), which took the same image from 485 free blocks to 8371. (§6.134, item 248)

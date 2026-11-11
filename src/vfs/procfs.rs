@@ -1662,6 +1662,38 @@ fn task(_pid: usize) -> Option<Process> {
 /// that means "nothing to name" - the same split `vfs::ext4`'s `claim_park`
 /// takes, and for the same reason: the field's *shape* is host-testable and the
 /// number is the machine's.
+/// `/proc/<pid>/wchan`'s whole content: the wait the task is in **now**.
+///
+/// The word comes from [`crate::sched::wchan`], which is host-compiled and
+/// carries the measurements; this function is only the machine's half, for the
+/// same reason [`wchan_of`] is: the host build has no task table and nothing
+/// there sleeps in a kernel park.
+///
+/// Two shapes it keeps deliberately:
+///
+/// * **No newline.** Linux's file is the word and nothing else - measured
+///   (`build/scratch/wchan/w.c`), where `read` of the whole file answers 14
+///   bytes for `anon_pipe_read` and 1 for `0`. That is the one place this file
+///   differs from `/proc/<pid>/comm`, which does end in a newline.
+/// * **`None` only for a task that is gone**, so the read answers `ENOENT` for
+///   a collected pid. A task the caller may not inspect is *not* `None`: Linux
+///   answers `0` there rather than refusing (`build/scratch/wchan/perm3.c`), and
+///   that distinction is the one thing a naive "ptrace gate" would get wrong.
+fn wchan_text(tid: usize) -> Option<String> {
+    #[cfg(target_os = "none")]
+    {
+        let wait = crate::sched::task_wait(crate::sched::TaskId(tid))?;
+        Some(alloc::string::String::from(
+            crate::sched::wchan::wchan_word(wait),
+        ))
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = tid;
+        None
+    }
+}
+
 fn wchan_of(tid: usize) -> u8 {
     #[cfg(target_os = "none")]
     return crate::sched::park_site(tid);
@@ -3423,6 +3455,13 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // the same `0400`.
     node.add("environ", NodeKind::File, env_file(move || environ_of(tid)));
     node.add("status", NodeKind::File, maybe_file(move || status_of(tid)));
+    // The wait *this thread* is in, by the thread's own name - the one file
+    // whose answer is per-thread rather than per-group. Measured
+    // (`build/scratch/wchan/threaded.c`, Linux 7.2.14): with a worker blocked
+    // in a pipe read and the leader running, `/proc/<pid>/wchan` and
+    // `/proc/<pid>/task/<leader>/wchan` both read `0` while
+    // `/proc/<pid>/task/<worker>/wchan` reads `anon_pipe_read`.
+    node.add("wchan", NodeKind::File, maybe_file(move || wchan_text(tid)));
     node.add(
         "children",
         NodeKind::File,
@@ -3777,6 +3816,15 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         "statm",
         NodeKind::File,
         maybe_file(move || statm_line(slot)),
+    );
+    // The wait *this thread* is in now - `stat`'s field 35 is the same task's
+    // *last* park, and the two are different answers on purpose
+    // ([`wchan_text`] carries the measurement). The tid's own directory gets
+    // it too, because Linux answers it there: a thread's wait is the thread's.
+    node.add(
+        "wchan",
+        NodeKind::File,
+        maybe_file(move || wchan_text(slot)),
     );
     node.add(
         "maps",

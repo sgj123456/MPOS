@@ -10915,3 +10915,33 @@ kernel validates the caller's buffer once, up front, so a node that copies nothi
 the validation; closing it means moving the fault-in to the copy site, which is a VFS-wide change (every
 reader and writer would own its own faulting copy) and not a field. The pin carries the divergence as a
 printed observation that accepts both answers, so it turns green when the gap closes.
+
+### Item 248 — `/proc/<pid>/wchan` is the wait a task is in now
+
+| | Linux | this kernel, before |
+|---|---|---|
+| the file | exists at `/proc/<pid>/wchan` and `/proc/<pid>/task/<tid>/wchan`, mode 0444 | absent - the node was never added |
+| a running task | `0` | - |
+| a parked task | the kernel's own wait name, no trailing newline (`anon_pipe_read`, `hrtimer_nanosleep`) | - |
+| a group stop / trace stop | `do_signal_stop` / `ptrace_stop` | - |
+| a zombie | `0` (the file survives until the reaped) | - |
+| a task the caller may not inspect | `0`, not `EACCES` | - |
+| `stat` field 35 | the **last** park, stays set after a wake | already right |
+
+**Why it was a gap and not a stub.** The two files answer different questions: field 35 is the
+stuck-machine instrument and is *supposed* to be stale, so serving `wchan` from it would have looked
+finished and been wrong for every running task. Measured on the host: one task asleep in a pipe read
+reads `f35=1, wchan="anon_pipe_read"`, and the same task after waking reads `f35=1, wchan="0"`.
+
+**Measurement:** `build/scratch/wchan/{w,stale,f35,threaded,perm,perm3,ptrace}.c` on host 7.2.14 -
+the eight-row table in §6.134, plus the side-by-side pair that settles the staleness question.
+
+**Landed:** `src/sched/wchan.rs` (new: `Wait`, `wchan_word`, and the park-site table moved out of
+`src/sched/runtime/task.rs`), `task_wait` in `src/sched/runtime/procfs.rs`, the file at both
+spellings in `src/vfs/procfs.rs`, pin `user/tests/src/bin/t-wchan.rs` (12 claims, 7 red
+counterfactually). The gate's own second finding is `xtask/src/disk.rs`'s root sizing - see §6.134.
+
+**Named gaps:** the names are this kernel's park vocabulary and not Linux's symbol table; a task
+blocked in a path this kernel has no park site for would read `0` where Linux names the function.
+The table has 12 entries today and is the one list the stall dump and this file share.
+

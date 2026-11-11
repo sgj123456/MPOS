@@ -55,26 +55,11 @@ pub const MAX_TASKS: usize = 256;
 /// one store per park, not one per wake.
 pub static PARK_SITE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_TASKS];
 
-/// The names behind [`PARK_SITE`]'s ids, for the humans reading `wchan`.
-///
-/// `/proc/<pid>/stat`'s field is a *number* in Linux (a kernel address), so the
-/// id goes there verbatim and keeps the field's shape; these names are what the
-/// number means, and they live here so the mapping cannot drift from the
-/// primitives that write it.
-pub const PARK_SITES: [&str; 12] = [
-    "0",
-    "block_until_on",
-    "block_until_nanos",
-    "block_until_interruptible_rolling_back",
-    "block_until_uninterruptible",
-    "block_until_code",
-    "block_until_deadline",
-    "ext4_slot_wait",
-    "ext4_scratch_wait",
-    "ext4_set_wait",
-    "ext4_reentry_wait",
-    "blk_claim_wait",
-];
+/// The names behind [`PARK_SITE`]'s ids live in [`crate::sched::wchan`], which
+/// is host-compiled: the table is a name table, `/proc/<pid>/wchan` serves it
+/// from a machine and a host unit test checks it, and a second copy here would
+/// be the drift that module exists to prevent. `/proc/<pid>/stat`'s field 35
+/// still carries the *number*, because Linux's field is one.
 
 /// The park site a slot last slept in, `0` for never - `wchan`'s answer.
 pub fn park_site(slot: usize) -> u8 {
@@ -4084,7 +4069,10 @@ fn heartbeat() {
         };
         crate::hal::kernel::print_line(format_args!(
             "mpos:   slot {slot} pid {pid} name={name} park {park} ({}) syscall {nr} parks={}{}\n",
-            PARK_SITES.get(park as usize).copied().unwrap_or("?"),
+            crate::sched::wchan::PARK_SITES
+                .get(park as usize)
+                .copied()
+                .unwrap_or("?"),
             parks_of(slot),
             if slot == running { "  <-- running" } else { "" }
         ));

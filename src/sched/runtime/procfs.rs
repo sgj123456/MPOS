@@ -595,6 +595,62 @@ pub fn task_state(id: TaskId) -> Option<char> {
     })
 }
 
+/// The wait `id` is in **right now**, for `/proc/<pid>/wchan`.
+///
+/// This is not [`super::task::park_site`], and the difference is measured
+/// rather than argued (`build/scratch/wchan/{stale,f35}.c`, Linux 7.2.14): a
+/// task asleep in a pipe read prints `anon_pipe_read` from `wchan`, and the
+/// same task one moment after it woke prints `0` - while `stat`'s field 35
+/// still reads `1`, because that field is the *last* park a task took and is
+/// instrumentation for a stuck machine. `wchan` is Linux's live answer, so a
+/// task that is not asleep right now has nothing to say.
+///
+/// The four states, each from a measurement:
+///
+/// * **Running, runnable or a zombie** - `Nothing`, which prints `0`
+///   (`build/scratch/wchan/w.c`: a running task, a zombie and a spinner all
+///   read `0`).
+/// * **A task the caller may not inspect** - `Nothing` again, *not* a refusal:
+///   Linux answers `0` for another user's task and for `pid 1`
+///   (`build/scratch/wchan/perm3.c`). The gate is the same
+///   `ptrace_may_access` question `maps`/`smaps` ask, and the *answer* is the
+///   difference: those refuse with `EACCES`, this one reports nothing.
+/// * **Parked in one of the scheduler's waits** - `Parked`, by the id
+///   `park_site` holds.
+/// * **Held at a stop** - `TraceStop` when a tracer is attached and
+///   `GroupStop` otherwise, which is Linux's own split between `ptrace_stop`
+///   and `do_signal_stop` (`build/scratch/wchan/{w,ptrace}.c`).
+///
+/// `None` when the number no longer names a live task, so the file can answer
+/// `ENOENT` for a collected one rather than inventing a word.
+#[cfg(target_os = "none")]
+pub fn task_wait(id: TaskId) -> Option<crate::sched::wchan::Wait> {
+    use crate::sched::wchan::Wait;
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(|entry| entry.as_ref())?;
+        if task.exited {
+            return Some(Wait::Nothing);
+        }
+        // Linux's `wchan` never refuses; it reports nothing for a task the
+        // caller may not inspect. `None` from `may_inspect` is "that slot
+        // holds no live task", which the zombie arm above already answered.
+        if crate::sched::may_inspect(id) == Some(false) {
+            return Some(Wait::Nothing);
+        }
+        if let Some(stop) = task.trace.stop {
+            return Some(if stop.traced {
+                Wait::TraceStop
+            } else {
+                Wait::GroupStop
+            });
+        }
+        if t.sched.is_sleeping(id) {
+            return Some(Wait::Parked(super::task::park_site(id.0)));
+        }
+        Some(Wait::Nothing)
+    })
+}
+
 /// The facts about `task`, in the shape `/proc` reports them.
 pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     let state = state_of(t, id, task);
