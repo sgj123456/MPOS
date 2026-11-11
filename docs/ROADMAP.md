@@ -990,6 +990,13 @@ One-glance status of the whole roadmap.
   charged, but the expiry scan covers `ITIMER_REAL` only, and closing it needs
   §2.13's delivery path). Pinned by `t-itimer-order` (27 claims,
   counterfactually 8 red) (§6.125, item 239)
+- [x] `/proc/uptime`'s two columns are two `%lu.%02lu` words and the idle column is a live counter,
+  not a literal `0.0`: an unpadded `S.4` was read by `atof` as `S+0.4` (360 ms high) on ~9% of reads,
+  which is the real cause of `t-starttime`'s long-running "flake" — §6.108's "180 ms fork latency"
+  and the §6.125 ledger's "single-core TCG contention, not a regression" were both misdiagnoses and
+  are corrected in place. Pinned by `t-uptime-shape` (8 claims, counterfactually 4 red, a 2600-read
+  shape loop deterministically crossing the bad centisecond window); host renderer test `760 → 761`
+  (§6.126, item 240)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

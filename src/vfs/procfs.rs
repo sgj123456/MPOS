@@ -4190,19 +4190,48 @@ impl Inode for ProcConfig {
     }
 }
 
-/// Seconds since boot, split the way `/proc/uptime` spells them: whole seconds
-/// and centiseconds. The kernel answers from its tick counter; the host (where
-/// these generators are unit-tested) has no ticks, and reports zero.
+/// `/proc/uptime`'s two numbers, each split the way the file spells them:
+/// whole seconds and centiseconds. The first is the machine's uptime from the
+/// tick counter; the second is the time the CPU spent idle, from the same
+/// `sched::cpustat` counters `/proc/stat` reads. Linux sums idle across CPUs,
+/// so on this uniprocessor the one idle counter is the whole sum. The host
+/// (where these generators are unit-tested) has no ticks, and reports zeros.
+///
+/// Both columns are returned in the tick domain's own centiseconds, so the
+/// pure [`uptime_line`] below is the only place that decides their printed
+/// shape; the tick-to-centisecond conversion stays beside the `hal` tick
+/// source it belongs to.
 #[cfg(target_os = "none")]
-fn uptime() -> (u64, u64) {
-    let ticks = crate::hal::ticks();
+fn uptime() -> (u64, u64, u64, u64) {
     let hz = crate::hal::TICK_HZ as u64;
-    (ticks / hz, (ticks % hz) * 100 / hz)
+    let ticks = crate::hal::ticks();
+    let idle = crate::sched::cpustat::counters().idle;
+    (
+        ticks / hz,
+        (ticks % hz) * 100 / hz,
+        idle / hz,
+        (idle % hz) * 100 / hz,
+    )
 }
 
 #[cfg(not(target_os = "none"))]
-fn uptime() -> (u64, u64) {
-    (0, 0)
+fn uptime() -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
+}
+
+/// Render `/proc/uptime`'s two columns in Linux's `%lu.%02lu` shape.
+///
+/// The zero-padding is load-bearing, not cosmetic: Linux prints a fraction of
+/// four centiseconds as `04`, and a caller that parses the file with `atof`
+/// reads an un-padded `S.4` as `S + 0.4 s` instead of `S + 0.04 s` - a
+/// 360 ms error on that one read. `t-starttime` builds a bracket out of two
+/// such readings, and a 360 ms error on each of its short endpoints showed up
+/// as its `150 ticks inside 1860 ms` red; §6.126 has the arithmetic and the
+/// correction of §6.108/§6.125's earlier "TCG contention" diagnosis. The
+/// second column is the idle counter for the same reason: a literal `0.0`
+/// claims a number the kernel actually keeps, which `AGENTS.md` §3 forbids.
+fn uptime_line(secs: u64, centis: u64, idle_secs: u64, idle_centis: u64) -> alloc::string::String {
+    alloc::format!("{secs}.{centis:02} {idle_secs}.{idle_centis:02}\n")
 }
 
 /// Free and total page frames. Host builds have no allocator; their
@@ -4640,8 +4669,8 @@ impl ProcFs {
             "uptime",
             NodeKind::File,
             file(|| {
-                let (secs, centis) = uptime();
-                alloc::format!("{}.{} 0.0\n", secs, centis)
+                let (secs, centis, idle_secs, idle_centis) = uptime();
+                uptime_line(secs, centis, idle_secs, idle_centis)
             }),
         );
         self.root.add(
@@ -5297,6 +5326,37 @@ mod tests {
         );
         assert_eq!(text.split_whitespace().count(), 20);
     }
+
+    /// `/proc/uptime`'s two columns are Linux's `%lu.%02lu` shape, byte for
+    /// byte. The zero-padding is the whole point: a fraction of four
+    /// centiseconds printed as `S.4` is parsed by `atof` as `S + 0.4 s`, not
+    /// Linux's `S.04` (`S + 0.04 s`). §6.126 measures the 360 ms error that
+    /// mis-read put into `t-starttime`'s bracket, and the old rendering also
+    /// printed a literal `0.0` for the idle column this kernel actually
+    /// counts. Both columns, every boundary of the two-digit fraction, and the
+    /// trailing newline are pinned here rather than in a booted machine: the
+    /// widths are a rendering fact, and this function is host-compiled.
+    #[test]
+    fn uptime_is_two_zero_padded_columns_and_a_real_idle_number() {
+        assert_eq!(super::uptime_line(5, 4, 304616, 14), "5.04 304616.14\n");
+        assert_eq!(super::uptime_line(5, 40, 304616, 14), "5.40 304616.14\n");
+        // The fraction's low end is the case the old `{centis}` lost: 4 and 0
+        // are one digit in decimal, and both must still occupy two columns.
+        assert_eq!(super::uptime_line(0, 0, 0, 0), "0.00 0.00\n");
+        assert_eq!(super::uptime_line(9, 9, 9, 9), "9.09 9.09\n");
+        // The high end must not grow a third digit, and 99 centiseconds is the
+        // last value a `TICK_HZ` division can produce before the second rolls.
+        assert_eq!(super::uptime_line(1, 99, 2, 99), "1.99 2.99\n");
+        let text = super::uptime_line(7, 7, 8, 8);
+        let mut columns = text.trim_end().split_whitespace();
+        let up = columns.next().unwrap();
+        let idle = columns.next().unwrap();
+        assert!(columns.next().is_none());
+        assert_eq!(up.split_once('.').unwrap().1.len(), 2);
+        assert_eq!(idle.split_once('.').unwrap().1.len(), 2);
+        assert!(text.ends_with('\n'));
+    }
+
     use super::*;
 
     /// `/proc/<pid>/fd/<N>`'s own permission bits come from the direction its

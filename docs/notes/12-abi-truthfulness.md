@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `setitimer`/`getitimer` §6.125):** stage 1 `1261 tests, 0
+**Latest measured gate (2026-11-11, `/proc/uptime`'s shape §6.126):** stage 1 `1262 tests, 0
+failed` (68.98 s — the +1 is the host renderer test); x86_64 `pass=290 fail=0 (290 built)`,
+`mpos-kunit 35 passed, 0 failed` (52.16 s, total 69.35 s, -1.0%); aarch64 `pass=289 fail=0 (289
+built)`, `mpos-kunit 35 passed, 0 failed` (130.08 s, total 221.65 s, +65.0% against the previous
+single-arm quick green) — `GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-uptime.log`). One new program: `t-uptime-shape` (8 claims), 4 of which fail against the
+kernel before this change (`build/boot-uptime-cf2.log`) — including the 2600-read shape loop that
+deterministically crosses the bad centisecond window. **Correction:** the `t-starttime` red recorded
+in the §6.125 block below as "TCG contention" was a real bug, `/proc/uptime`'s unpadded fraction
+reading `S.4` as `S+0.4` (360 ms high) on ~9% of reads; §6.126 closes it, and §6.108's "180 ms of
+fork latency" was the same bug. `t-uptime-shape` passed on **both** arms of this gate
+(`build/test-lane-x86_64-1/serial.log:4571`, `build/test-lane-aarch64-1/serial.log:4433`).
+
+**Measured gate before it (2026-11-11, `setitimer`/`getitimer` §6.125):** stage 1 `1261 tests, 0
 failed` (69.69 s — the +1 is §6.125's host-testable `which` verdict); x86_64 `pass=289 fail=0 (289
 built)`, `mpos-kunit 35 passed, 0 failed` (51.09 s, total 70.04 s, +3.2%); aarch64 `pass=288 fail=0
 (288 built)`, `mpos-kunit 35 passed, 0 failed` (132.67 s, total 134.32 s, -41.6% against the
@@ -300,10 +313,10 @@ previous two-arm green) — a **single-arm rerun** of `cargo xtask test --arch a
 (`build/gate-itimer-aarch64-rerun.log`), because the combined both-arm run
 (`build/gate-itimer.log`) reddened one aarch64 lane on `t-starttime`'s bracket claim alone: two
 forks 1.5 s apart read `150` centisecond ticks (correct) inside an `uptime_ms()` bracket of
-`1860 ms` built from the 4 ms tick counter, while `start_nanos` comes from the finer
-`since_boot_nanos()` clock — the §6.96/§6.108 "two moving records must be bracketed" shape under
-single-core TCG contention, not a regression (the same program passed on the other three lanes and
-on the single-arm rerun). `t-itimer-order` passed on **both** arms of the combined run
+`1860 ms`. The paragraph that originally followed diagnosed this as "single-core TCG contention,
+not a regression"; **§6.126 proved that wrong** — `1860 = 1500 + 360` is `/proc/uptime` printing
+`S.4` where Linux prints `S.04`, a ~9% formatting bug that a single-arm rerun happened to miss.
+`t-itimer-order` passed on **both** arms of the combined run
 (`build/test-lane-x86_64-0/serial.log:3916`, `build/test-lane-aarch64-1/serial.log:2908`) and on
 the rerun. One new program: `t-itimer-order` (27 claims), 8 of which fail against the kernel before
 this change (`build/boot-itimer-cf1.log`) — including the arm-with-`EFAULT` side effect that a

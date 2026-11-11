@@ -10600,3 +10600,34 @@ counterfactually 8 red on `build/boot-itimer-cf1.log`, restored green on `build/
 **Named gaps this does not close.** `ITIMER_VIRTUAL`/`ITIMER_PROF` are installed and read back but
 never expire (the expiry scan covers REAL only; closing it also needs §2.13's delivery path).
 `TIMER_ABSTIME` for `timer_*` stays `EINVAL` (§6.124). None is a refusal order or a word width.
+
+### Item 240 — `/proc/uptime`: two zero-padded columns, and the idle column is a counter
+
+| promise | Linux (host 7.2.14, `build/scratch/uptime/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| first column's fraction | `%02lu`, always exactly two digits (`20300.67`); 3000 reads `one-digit=0 two-digit=3000` | `{centis}` — nine of 100 centisecond values print one digit (`S.4`), which `atof` reads as `S+0.4` instead of `S+0.04` (360 ms high) | `{centis:02}` |
+| second column | sum of per-CPU idle time, a live counter (`304616.14` → `304630.73` after a 1 s sleep) | literal `0.0` (one digit, never moves) | `sched::cpustat::counters().idle` rendered as `%lu.%02lu` |
+| `t-starttime`'s bracket | `150 ticks inside ~1500 ms` | `150 ticks inside 1860 ms` on ~9% of boots, recorded twice as "TCG contention" / "fork latency" | `150 ticks inside 1500 ms` |
+
+**Why a pure function.** `src/vfs/procfs.rs`'s `mod tests` is host-compiled, so the renderer
+`fn uptime_line(secs, centis, idle_secs, idle_centis) -> String` is a host `#[test]` that asserts
+the bytes (`5.04 304616.14\n`, two columns, two digits each, trailing `\n`) — the
+`the_diskstats_row_is_linuxs_twenty_fields` shape. `uptime()` returns four words; the idle pair is
+the same counter `/proc/stat`'s idle column has read since §6.100 (one CPU, so it *is* Linux's
+per-CPU sum). Host unit tests `760 → 761`.
+
+**Measurement.** `build/scratch/uptime/{shape,probe}.c`; `build/boot-starttime-cf.log` proves
+`t-starttime` *passes* on the broken kernel (the flake is the 9%), while `t-uptime-shape`'s batched
+2600-read loop is deterministically red on it (`build/boot-uptime-cf2.log`, 4/8 claims red) and
+green on the fixed kernel (`build/boot-uptime3.log`, 8/8). Both arms of `build/gate-uptime.log`
+ran the pin green (`GATE EXIT=0`, x86_64 `pass=290 fail=0`, aarch64 `pass=289 fail=0`).
+
+**Landed.** `src/vfs/procfs.rs` (four-word `uptime`, pure `uptime_line`, host test, generator),
+`user/tests/src/bin/t-uptime-shape.rs` (8 claims), §6.126. **Correction:** §6.108's "180 ms fork
+latency" and the §6.125 ledger's "single-core TCG contention, not a regression" were misdiagnoses
+of this bug; both are corrected in those sections and in `docs/notes/12-abi-truthfulness.md`'s
+latest-gate block. AGENTS.md got no new §5 row — it is over the 65536-byte workspace budget (§6.104).
+
+**Named gaps this does not close.** The idle counter advances in 4 ms tick steps, not Linux's finer
+accounting; the uptime column is the tick counter, not `since_boot_nanos()`. Both are honest readings
+of the one clock this machine has. §2.13's delivery path is untouched.

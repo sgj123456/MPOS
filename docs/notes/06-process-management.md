@@ -8300,18 +8300,21 @@ move when a test is added. Both are registered now (740 host tests), and the les
 neighbour: **a test that does not move the count did not run**, and "it passed" from a suite whose
 count is unchanged is a statement about nothing.
 
-### A claim this gate had to reshape, in the same commit
+### A claim this gate had to reshape, in the same commit (corrected by §6.126)
 
 `t-starttime`'s "the difference is the wait, a tick per centisecond" compared one number (`delta*10`)
-to one number (`late_at - born_at`) with 60 ms of slop. On the loaded aarch64 arm it read
-`150 ticks against 1320 ms` (`build/gate-groups.log`) - the first child's stamp is taken **inside**
-`create`, before `fork` returns to the parent, so on a contended TCG lane the child is born up to
-180 ms before `born_at` and the one-number comparison calls a true difference a wrong one. The claim
-now measures a bracket - `before_first`, `born_at`, `before_second`, `late_at` - and asks whether
-`delta*10` lies inside `[before_second - born_at, late_at - before_first]` widened by the same 60 ms.
+to one number (`late_at - born_at`) with 60 ms of slop. On the aarch64 arm it read
+`150 ticks against 1320 ms` (`build/gate-groups.log`). This section originally called that "fork
+latency on a contended TCG lane" — **that diagnosis was wrong**, and §6.126 closes the real cause:
+`/proc/uptime` printed an unpadded centisecond fraction (`S.2` where Linux prints `S.02`), and a
+bracket whose two endpoints fell on opposite sides of that bad window read `1500 - 180` ms. The
+claim now measures a bracket - `before_first`, `born_at`, `before_second`, `late_at` - and asks
+whether `delta*10` lies inside `[before_second - born_at, late_at - before_first]` widened by 60 ms.
 Green arm reads `151 ticks inside Some((1500, 1500)) ms, Some(1500) ms apart`
-(`build/gate-groups-a.log`). This is §6.97's rule again, in a place that predates it: **two stamps
-whose moment lies inside an interval cannot be compared as two numbers.**
+(`build/gate-groups-a.log`). The bracket is still the right shape (§6.97's rule: **two stamps whose
+moment lies inside an interval cannot be compared as two numbers**), but the 60 ms of slop was
+papering over a 180 ms formatting error, not over scheduler load. §6.126 fixed the file; the
+`t-starttime` reds were a ~9% probabilistic bug, which is why a single-arm rerun could pass.
 
 **The rule.** A list field is a promise about *order and separators* as much as about membership:
 `Groups:` is gids in `setgroups` order with a space each, not a set, and a reader that rebuilds the
@@ -10551,3 +10554,125 @@ register and were compared as `usize`; Linux truncates both to 32 bits first, so
 function, but a verdict about *which of two bad things wins* — and above all about whether a
 refusal leaves a side effect behind — belongs in the handler's statement order, pinned by a
 program that hands both bad things at once and then reads the machine's state.
+
+## §6.126 `/proc/uptime` was two wrong shapes, and a "flake" was the bug (LANDED 2026-11-11)
+
+**Correction to §6.108 and §6.125's ledger.** Twice this session a red on `t-starttime`'s
+"a tick per centisecond" claim was written down as a timing artefact — "the child is born up to
+180 ms before `born_at` on a contended TCG lane" (§6.108) and "the §6.96/§6.108 two-moving-records
+shape under single-core TCG contention, not a regression" (the §6.125 gate ledger). **Both were
+wrong.** The red was a real bug in `/proc/uptime`, and the reason it looked like a flake is that
+the bug fires on only ~9% of reads. This section closes it and carries the correction into the two
+places the wrong diagnosis was committed.
+
+### What Linux prints, measured
+
+`/proc/uptime` is two columns, each `%lu.%02lu`: seconds plus a **zero-padded two-digit**
+centisecond fraction. The second column is the sum of per-CPU idle time, a live counter — not a
+constant. `build/scratch/uptime/shape.c` (1200 reads across a second boundary, host 7.2.14):
+
+```
+after 1200 reads: every first fraction had exactly 2 digits
+start up=20299.67 frac_digits=2 idle=304616.14 frac_digits=2 idle<=up=no
+after 1s sleep up=20300.67 idle=304630.73
+```
+
+`probe.c` (3000 reads): `one-digit=0 two-digit=3000 other=0`, `backwards=0 biggest-forward=0.010 s`.
+The idle column grew by 14.59 across that one second of sleep on a many-CPU host.
+
+This kernel rendered the file as `format!("{}.{} 0.0\n", secs, centis)` — the first column's
+fraction was **not** zero-padded and the second column was the **literal `0.0`**. Two wrong shapes,
+one of them the `AGENTS.md` §3 violation: a live number served as a constant zero.
+
+### The mechanism, and why it read as a flake
+
+`uptime()` computes `centis = (ticks % 250) * 100 / 250` (TICK_HZ = 250 on both machines), which
+walks `0..=99`. Nine of those hundred values are one digit. For those nine, the file printed `S.4`
+and a caller's `atof("S.4")` reads `S + 0.4`, where Linux's `S.04` is `S + 0.04` — **360 ms too
+high** (`90 ms * centis`, with centis = 4). The other 91 values happen to print two digits and read
+correctly. So the error is a ~9% probabilistic over-read, not a clock that runs fast.
+
+`t-starttime` brackets a child's `starttime` (in centisecond ticks from `since_boot_nanos()`) against
+two `/proc/uptime` millisecond readings. When both bracket endpoints fall inside the same bad
+centisecond window but the two "before" readings do not, the whole bracket shifts by exactly
+`90 * centis` ms. The §6.125 gate's `150 ticks inside 1860 ms` is `1500 + 360` (centis 4); §6.108's
+`150 ticks against 1320 ms` is `1500 - 180` (centis 2, the endpoints falling on opposite sides of
+the wrap). Neither is fork latency, neither is TCG contention: both are this file's missing zero.
+Running `t-starttime` on the *broken* kernel (`build/boot-starttime-cf.log`) passed with
+`Some(151) ticks inside Some((1500, 1520)) ms` — the flake is the 9%, which is exactly why two
+sessions mistook it for load.
+
+### What changed
+
+- `src/vfs/procfs.rs`: `uptime()` now returns four words `(secs, centis, idle_secs, idle_centis)`;
+  the idle pair comes from `crate::sched::cpustat::counters().idle` — the same counter `/proc/stat`'s
+  idle column has read since §6.100, charged by `charge_cpu` on both machines (Linux sums per-CPU
+  idle; this machine has one CPU, so that counter *is* the sum). The host version returns zeros so
+  the pure renderer is still callable from host tests.
+- A host-testable pure function `fn uptime_line(secs, centis, idle_secs, idle_centis) -> String`
+  renders `format!("{secs}.{centis:02} {idle_secs}.{idle_centis:02}\n")`. Its long doc keeps the
+  `S.4` / 360 ms arithmetic, the `t-starttime` numbers, the correction above, and the §3 reason a
+  literal `0.0` cannot stand. A host `#[test]` asserts `5.04 304616.14\n`, `5.40 304616.14\n`,
+  `0.00 0.00\n`, `9.09 9.09\n`, `1.99 2.99\n` byte-for-byte, plus "two columns, each fraction
+  exactly two digits, ends in `\n`" — the same shape as `the_diskstats_row_is_linuxs_twenty_fields`.
+  Host unit tests `760 -> 761`.
+- The `/proc/uptime` generator now calls `uptime_line` on those four words. No reader expected the
+  literal `0.0` (`t-procstat`'s `uptime_seconds`, `t-starttime`'s `uptime_ms` both `parse` the first
+  column only), so nothing else moves.
+
+### Pin — `user/tests/src/bin/t-uptime-shape.rs` (8 claims)
+
+Two columns; a shape loop of `130 batches x 20 reads`, each batch followed by a 10 ms sleep, so
+2600 reads cover a **whole 1.3 s centisecond cycle** from any starting point; both columns' fractions
+always exactly two digits; the first column never goes backwards; the idle column grows across a
+200 ms sleep; the first column's delta stays inside its own `Instant` sleep bracket (40 x 5 ms,
+±300 ms); and `Report::finish`. Host 8/8 `PASS`, machine 8/8 `PASS` (`build/boot-uptime3.log`,
+`exit=0`, `=== END`).
+
+Counterfactual = stash `src/vfs/procfs.rs`, rebuild the kernel **and** the UEFI loader that embeds
+it, boot the same binary (`build/boot-uptime-cf2.log`): **4/8 red** —
+
+```
+FAIL: every first-column fraction has exactly two digits (2600 reads)
+FAIL: every idle-column fraction has exactly two digits
+FAIL: the first column never goes backwards
+FAIL: the idle column grows while the machine has nothing to run (Some(0) -> Some(0))
+```
+
+The four control rows (two columns, loop ran, delta bracket, `finish`) are green on both kernels by
+design and are stated as such: the delta bracket is too short to reliably enter the 9% window, so
+the discrimination lives in the shape loop and the idle growth, not in a timing comparison. Restored,
+rebuilt both, 8/8 green again (`build/boot-uptime3.log`).
+
+Two pin mistakes worth their lesson. (1) An `idle_nonzero` claim reddened on the *fixed* machine:
+`0.00` is a legitimate reading before any idle tick has been charged, so that claim pinned nothing —
+the one-digit `0.0` width and the growth claim are what discriminate a literal from a counter.
+(2) The first shape loop was a tight 3000-read burst; on the broken kernel it stayed inside one tick
+and the first-column width claim passed. A burst of reads is not a span of time: batching across
+1.3 s of sleeps makes the bad window deterministic.
+
+### The gate
+
+`build/gate-uptime.log`, `GATE EXIT=0`: stage 1 `1262 tests, 0 failed` (68.98 s, the +1 is the host
+renderer test); x86_64 `pass=290 fail=0 (290 built)`, `mpos-kunit 35 passed, 0 failed` (52.16 s,
+total 69.35 s, -1.0%); aarch64 `pass=289 fail=0 (289 built)`, `mpos-kunit 35 passed, 0 failed`
+(130.08 s, total 221.65 s, +65.0% against the single-arm quick green). The pin ran and passed on
+**both** arms (`build/test-lane-x86_64-1/serial.log:4571`,
+`build/test-lane-aarch64-1/serial.log:4433`).
+
+### Named gaps this does not close
+
+The idle counter is a per-tick accumulator, so the second column advances in 4 ms steps rather than
+Linux's finer accounting; the first column is still the tick counter, not `since_boot_nanos()`. Both
+are honest readings of the one clock this machine has. §2.13's delivery path and the
+`ITIMER_VIRTUAL`/`ITIMER_PROF` expiry scan (§6.125) are untouched.
+
+### The rule
+
+**A formatting bug is a behaviour bug.** `{centis}` and `{centis:02}` return the same *number* to a
+reader who parses a decimal point as a decimal point only when the number has two digits; on the
+other nine values out of a hundred they differ by 360 ms. A file that is wrong 9% of the time is not
+a flake to be waited out — it is the thing to measure. And a diagnosis written into the ledger after
+a green single-arm rerun is a claim like any other: §6.108 and §6.125's ledger said "TCG contention"
+without a number that could only come from that cause; `1860 - 1500 = 360 = 90 * 4` was the number
+that named `/proc/uptime` instead.
