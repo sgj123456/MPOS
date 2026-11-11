@@ -635,20 +635,47 @@ pub fn handle_sched_get_priority_min(args: [usize; ARG_COUNT]) -> isize {
 }
 
 /// `sched_rr_get_interval(pid, tp)` — the round-robin slice, as the
-/// timespec the caller filled. The scheduler's slice is one tick, the
-/// 10ms the timer runs at.
+/// timespec the caller filled, or **all zeros when the target cannot run**.
+///
+/// This door looks like a constant and is not one. `build/scratch/rrslice/`
+/// measured the shapes on 7.2.14 before this kernel was touched: a child
+/// blocked in `read()` (`d.c`), a child held at a `SIGSTOP` (`e.c`) and a
+/// zombie not yet reaped (`d.c`) all answer `tv_nsec = 0`, while the caller
+/// itself and a spinning child answer the machine's slice (2 ms there).
+/// `f.c` (nice 0/19/-20), `c.c` (SCHED_BATCH/SCHED_IDLE) and `g.c` (1..9
+/// runnable tasks on a pinned cpu) all leave the slice unchanged, so this is
+/// a **runqueue** question and not a class, priority or load one. Upon a
+/// reaped number the answer is `ESRCH`, which the pid lookup gives first.
+///
+/// The runnability half is the same question `/proc/<pid>/stat`'s state
+/// field answers, so both read [`crate::sched::task_state`] and cannot drift
+/// (§6.127). This handler answered the constant 4 ms for every target until
+/// then — and the notes called the difference "this machine's timeslice tuned
+/// differently from the host's", which those readings refute: zero is not a
+/// small slice, it is Linux saying "not on the runqueue".
+///
+/// The slice value itself stays this kernel's own: one tick, `1e9 / TICK_HZ`.
 pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (word, tp) = (args[0], args[1]);
-    if let Err(e) = sched_target(word) {
-        return e;
-    }
+    let target = match sched_target(word) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
     if tp == 0 || !buffer_ok(tp, 16, true, from_user) {
         return err::EFAULT;
     }
+    // `'R'` is the only letter that means "on the runqueue"; `S`, `T` and `Z`
+    // are all off it. A number that no longer names a live task is `ESRCH` -
+    // the same answer a reaped pid gets, and the one Linux gave in `d.c`.
+    let runnable = match crate::sched::task_state(crate::sched::TaskId(target)) {
+        Some(letter) => letter == 'R',
+        None => return err::ESRCH,
+    };
     let hz = crate::hal::TICK_HZ as u64;
+    let nanos = super::abi::rr_interval_nanos(runnable, hz);
     unsafe {
         (tp as *mut i64).write_unaligned(0);
-        ((tp + 8) as *mut i64).write_unaligned(1_000_000_000 / hz as i64);
+        ((tp + 8) as *mut i64).write_unaligned(nanos as i64);
     }
     0
 }

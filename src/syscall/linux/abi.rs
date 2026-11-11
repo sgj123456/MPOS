@@ -3945,6 +3945,35 @@ pub(crate) fn sched_buffered_pid_verdict(word: usize, buffer: usize) -> Result<i
     Ok(pid)
 }
 
+/// `sched_rr_get_interval`'s answer: the round-robin slice, or **zero**.
+///
+/// This door looks like a constant and is not one. `build/scratch/rrslice/`
+/// measured all four shapes on 7.2.14 before this kernel was touched:
+///
+/// * a task that is **not on the runqueue** answers a `timespec` of all
+///   zeros — a child blocked in `read()` (`d.c`), a child held at a `SIGSTOP`
+///   (`e.c`), and a zombie not yet reaped (`d.c`) all read `tv_nsec = 0`,
+///   while the caller itself and a spinning child read `2000000` (2 ms).
+/// * `which` does not matter: `d.c`'s four children differ only in state, and
+///   `f.c` shows nice 0/19/-20 and `c.c` shows SCHED_BATCH/SCHED_IDLE all
+///   still answering the slice, so this is a runqueue question and not a
+///   class one. `g.c` pins the process to cpu 0 and counts 1..9 runnable
+///   tasks with no change, so it is not a function of queue length either.
+/// * a reaped number is `ESRCH` (`d.c`, after the wait), which the pid lookup
+///   already answers before this is ever consulted.
+///
+/// The distinction is load-bearing because zero is not "a very small slice":
+/// a caller that reads zero concludes the target is not runnable, which is
+/// exactly what Linux told it. This kernel answered the same constant 4 ms
+/// for every target until §6.127 — the docs called the difference "this
+/// machine's timeslice tuned differently", which the readings above refute.
+///
+/// `hz` is the machine's `TICK_HZ`, so the served value stays this kernel's
+/// own slice (one tick); only the runnability half is Linux's rule.
+pub(crate) fn rr_interval_nanos(runnable: bool, hz: u64) -> u64 {
+    if runnable { 1_000_000_000 / hz } else { 0 }
+}
+
 /// The first `sched_attr` version's size in bytes. Both `sched_getattr`'s
 /// `usize` argument and `sched_setattr`'s in-struct `size` are measured
 /// against it; a caller that offers less cannot be served the fields this
@@ -7437,5 +7466,28 @@ mod diskstat_tests {
         assert_eq!(itimer_which_verdict(0x1_0000_0003), Err(err::EINVAL));
         assert_eq!(itimer_which_verdict(usize::MAX), Err(err::EINVAL));
         assert_eq!(itimer_which_verdict(0xffff_ffff), Err(err::EINVAL));
+    }
+
+    /// The two halves of §6.127 as one table: a runqueue answer is the
+    /// machine's slice, and every other answer is zero — not a small slice.
+    ///
+    /// The readings this encodes (`build/scratch/rrslice/{d,e}.c`) are 2 ms
+    /// for a runnable target and 0 for a blocked, stopped or zombie one, on a
+    /// host whose HZ makes its own slice 2 ms. The value is the machine's;
+    /// only "zero or not" is a contract, which is why this test asks both
+    /// halves against a `hz` the test chooses rather than a constant.
+    #[test]
+    fn a_runqueue_answer_is_the_slice_and_everything_else_is_zero() {
+        // One tick at 250 Hz, the rate both machines run their timer at.
+        assert_eq!(rr_interval_nanos(true, 250), 4_000_000);
+        // Off the runqueue: blocked, held at a stop, or a zombie. All zero.
+        assert_eq!(rr_interval_nanos(false, 250), 0);
+        // The value follows `hz` rather than a baked-in milliseconds figure -
+        // a second machine with a different tick still answers its own slice.
+        assert_eq!(rr_interval_nanos(true, 1000), 1_000_000);
+        assert_eq!(rr_interval_nanos(true, 100), 10_000_000);
+        // And zero is zero at every rate: this half must not scale.
+        assert_eq!(rr_interval_nanos(false, 1000), 0);
+        assert_eq!(rr_interval_nanos(false, 100), 0);
     }
 }

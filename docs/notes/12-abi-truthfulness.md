@@ -292,7 +292,19 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `/proc/uptime`'s shape §6.126):** stage 1 `1262 tests, 0
+**Latest measured gate (2026-11-11, `sched_rr_get_interval`'s runqueue answer §6.127):** stage 1
+`1263 tests, 0 failed` (71.20 s — the +1 is `rr_interval_nanos`'s host test); x86_64 `pass=291
+fail=0 (291 built)`, `mpos-kunit 35 passed, 0 failed` (52.33 s, total 71.45 s, +3.0%); aarch64
+`pass=290 fail=0 (290 built)`, `mpos-kunit 35 passed, 0 failed` (143.20 s, total 237.42 s, +7.1%,
+both lanes on `=== END`, `16 not run - see tests.toml`) — `GATE EXIT=0`, both arms in one command
+with the lane count forced to two (`build/gate-rr.log`). One new program: `t-rr-interval` (12
+claims), 3 of which fail against the kernel before this change — exactly the blocked, stopped and
+zombie claims (`build/boot-rr-cf1.log`), with the four shape claims and the runnable-child control
+green on both kernels. `t-rr-interval` passed on **both** arms of this gate
+(`build/test-lane-x86_64-0/serial.log:4538`, `build/test-lane-aarch64-1/serial.log:4407`), and
+`t-mmap-count` (45.24 s) was the heaviest program.
+
+**Measured gate before it (2026-11-11, `/proc/uptime`'s shape §6.126):** stage 1 `1262 tests, 0
 failed` (68.98 s — the +1 is the host renderer test); x86_64 `pass=290 fail=0 (290 built)`,
 `mpos-kunit 35 passed, 0 failed` (52.16 s, total 69.35 s, -1.0%); aarch64 `pass=289 fail=0 (289
 built)`, `mpos-kunit 35 passed, 0 failed` (130.08 s, total 221.65 s, +65.0% against the previous

@@ -997,6 +997,17 @@ One-glance status of the whole roadmap.
   are corrected in place. Pinned by `t-uptime-shape` (8 claims, counterfactually 4 red, a 2600-read
   shape loop deterministically crossing the bad centisecond window); host renderer test `760 → 761`
   (§6.126, item 240)
+- [x] `sched_rr_get_interval` answers a slice for a target on the runqueue and **zero** for one that
+  is not — blocked in a syscall, held at a `SIGSTOP`, or a zombie not yet reaped — which is Linux's
+  rule (`build/scratch/rrslice/d.c`, `e.c`; nice, policy and queue length do not move it, `f.c`,
+  `c.c`, `g.c`). This kernel answered the constant `1_000_000_000 / TICK_HZ` for every number it
+  accepted, and §6.122 had explained the divergence as "the value is tuned, not fixed" — which
+  described the figure and missed that the answer's *shape* differs. The runnability question is the
+  same one `/proc/<pid>/stat`'s state field answers, so its ladder moved out of `snapshot_of` into
+  one `state_of`/`task_state` pair rather than being derived twice. Pinned by `t-rr-interval` (12
+  claims, counterfactually 3 red — exactly the three state claims; the runnable-child control is
+  what stops a kernel that answered zero for everything from passing); host unit tests `761 → 762`
+  (§6.127, item 241)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

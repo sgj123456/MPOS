@@ -10462,7 +10462,9 @@ refused, not remembered (there is one policy to reset). `SCHED_BATCH`,
 `SCHED_IDLE` and `SCHED_EXT` are recognised and refused with `EOPNOTSUPP`;
 running them is the same named gap as running `SCHED_FIFO` - no priority bands,
 no real-time class. `sched_rr_get_interval` answers this kernel's own slice
-(4 ms) where the reference host answers its own (2 ms).
+(4 ms) where the reference host answers its own (2 ms) — and, since §6.127,
+**zero** for a target that is not on the runqueue, which is the half that was
+missing (Item 241).
 
 ### Item 237 — a POSIX timer is built on a clock, and one of those clocks is CPU time
 
@@ -10631,3 +10633,41 @@ latest-gate block. AGENTS.md got no new §5 row — it is over the 65536-byte wo
 **Named gaps this does not close.** The idle counter advances in 4 ms tick steps, not Linux's finer
 accounting; the uptime column is the tick counter, not `since_boot_nanos()`. Both are honest readings
 of the one clock this machine has. §2.13's delivery path is untouched.
+
+### Item 241 — `sched_rr_get_interval` answers zero for a task that cannot run
+
+Rows: `sched_rr_get_interval`'s answer, which looked like a machine constant and is a runqueue
+question.
+
+| promise | Linux (host 7.2.14, `build/scratch/rrslice/`) | this kernel before | this kernel now |
+|---|---|---|---|
+| a target blocked in a syscall | `tv_nsec = 0` (`d.c`) | `4000000` (constant slice) | `0` |
+| a target held at a `SIGSTOP` | `0` (`e.c`) | `4000000` | `0` |
+| a zombie not yet reaped | `0` (`d.c`) | `4000000` | `0` |
+| a runqueue target | the machine's slice (`2000000` there) | `4000000` | `4000000` |
+| a reaped number | `ESRCH(3)` | `ESRCH(3)` | `ESRCH(3)` |
+| nice / policy / queue length | no effect (`f.c`, `c.c`, `g.c`) | no effect | no effect |
+
+**Why one derivation, not two.** The question "can this task run" is the same one `/proc/<pid>/stat`'s
+`state` field answers, and this kernel had exactly one ladder for it, inline in `snapshot_of`. It is
+now `state_of(t, id, task)` with `snapshot_of` calling it, plus a `task_state(id)` door for callers
+outside the table — so a program cannot be told two things about its own child. The slice half is
+`abi::rr_interval_nanos(runnable, hz)`, host-tested to be zero at every rate.
+
+**Measurement.** `build/scratch/rrslice/{a..h}.c` on 7.2.14: `d.c` varies only the target's state
+(blocked = 0, running = 2 ms, spinning = 2 ms, zombie = 0, reaped = `ESRCH`); `e.c` adds the stop;
+`f.c`/`c.c`/`g.c` rule out nice, policy and runqueue length; `b.c` confirms 16 bytes is the buffer
+width this kernel already used; `a.c` confirms the refusal order it already had (pid lookup before
+the buffer — `(0, NULL)` = `EFAULT`, `(999999, NULL)` = `ESRCH`). Pin `t-rr-interval` 12 claims,
+host 12/12, machine 12/12 (`build/boot-rr1.log`), counterfactually **3 red**
+(`build/boot-rr-cf1.log`) — exactly the three state claims; both arms green in `build/gate-rr.log`.
+
+**Landed.** `src/sched/runtime/procfs.rs` (`state_of`, `task_state`), `src/sched/mod.rs` (export),
+`src/syscall/linux/abi.rs` (`rr_interval_nanos` + host test), `src/syscall/linux/posix.rs` (handler
+and doc), `user/tests/src/bin/t-rr-interval.rs`, §6.127. **Correction:** §6.122's "both are this
+machine's round-robin timeslice, and the host's value is tuned, not fixed" described the *number* and
+missed the *shape*; it is corrected there. Host unit tests `761 → 762`.
+
+**Named gaps this does not close.** The slice value remains this kernel's own tick (Linux's derives
+from the `sched_rr_timeslice_ms` sysctl, which this kernel does not have); there is no round-robin
+band to report on. §2.13's delivery path is untouched.

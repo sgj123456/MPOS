@@ -10076,9 +10076,12 @@ nine rows above, unchanged. Restored, rebuilt, 21/21 green.
 not remembered: this scheduler has no per-task policy to reset at a fork, because it has no policies
 but one. `SCHED_BATCH`, `SCHED_IDLE` and `SCHED_EXT` are likewise recognised and refused with
 `EOPNOTSUPP`; serving any of them is the same named gap as serving `SCHED_FIFO` (no priorities, no
-bands). `sched_rr_get_interval` still answers this kernel's own slice (`1_000_000_000 / TICK_HZ`,
+bands). `sched_rr_get_interval`'s slice **value** is still this kernel's own (`1_000_000_000 / TICK_HZ`,
 4 ms) where the reference host answers its own (2 ms) - both are "this machine's round-robin
-timeslice", and the host's value is tuned, not fixed.
+timeslice", and the host's value is tuned, not fixed. **`§6.127` corrected the rest of that
+sentence:** the divergence was not only the value. Linux answers **zero** for a target that is not
+on the runqueue (blocked, held at a stop, a zombie) and this door answered the constant for every
+number it accepted, so the *shape* of the answer differs too, not just the figure.
 
 ### The rule
 
@@ -10676,3 +10679,136 @@ a flake to be waited out — it is the thing to measure. And a diagnosis written
 a green single-arm rerun is a claim like any other: §6.108 and §6.125's ledger said "TCG contention"
 without a number that could only come from that cause; `1860 - 1500 = 360 = 90 * 4` was the number
 that named `/proc/uptime` instead.
+
+## §6.127 `sched_rr_get_interval` answers a slice for a task on the runqueue and zero for one that is not (LANDED 2026-11-11)
+
+**Correction to §6.122's named gaps.** That section recorded this door's difference from the
+reference host as *"`sched_rr_get_interval` still answers this kernel's own slice (`1_000_000_000 /
+TICK_HZ`, 4 ms) where the reference host answers its own (2 ms) - both are 'this machine's
+round-robin timeslice', and the host's value is tuned, not fixed."* The value being machine-specific
+is true; treating the **whole** difference as the value was wrong. Linux answers **zero** for any
+target that is not on the runqueue, and this kernel answered 4 ms for every number it accepted. Zero
+is not a small slice — it is the answer "that task cannot run", and a program polling this door to
+see whether a child is making progress reads a constant as "running" forever.
+
+### What Linux answers, measured
+
+`build/scratch/rrslice/` — eight probes on host 7.2.14 (`nproc` 16, `sched_rr_timeslice_ms = 100`),
+raw syscall, uid 1000:
+
+| probe | shape it varies | answer |
+|---|---|---|
+| `a.c` | the door's own arguments | self = `2000000` ns; `pid 1` = `0`; `999999` = `ESRCH(3)`; `-1` = `EINVAL(22)`; `(0, NULL)` = `EFAULT(14)`; `(999999, NULL)` = `ESRCH(3)` |
+| `d.c` | **only the target's state** | blocked in `read()` = **0**; parent (running) = `2000000`; spinning child = `2000000`; zombie not reaped = **0**; after the reap = `ESRCH(3)` |
+| `e.c` | `SIGSTOP` / `SIGCONT` | a child held at a stop = **0**; after `SIGCONT` still **0** (it stays blocked in `pause()`) |
+| `b.c` | buffer length, via guard pages | 4/8/12-byte windows = `EFAULT(14)`; **16 bytes succeeds** |
+| `c.c` | scheduling policy | `SCHED_BATCH`, `SCHED_IDLE` still `2000000` (`sched_setscheduler` itself is `EPERM` for uid 1000) |
+| `f.c` | nice | 0/19/-20 and a runnable child at nice 0/19: all `2000000` |
+| `g.c` | runqueue length, pinned to cpu 0 | 1..9 runnable tasks: all `2000000` |
+| `h.c` | pid vs tid | a thread's tid is accepted exactly like a process's pid |
+
+So the rule is one question — **is the target on the runqueue** — and nice, policy, queue length and
+which number the caller passed are all irrelevant to it. `b.c` also confirms this kernel's 16-byte
+`buffer_ok` was already the right width, and `a.c` confirms the refusal order this door already had
+(no shared NULL-buffer guard, pid lookup first: `(0, NULL)` = `EFAULT`, `(999999, NULL)` = `ESRCH`).
+
+### What this kernel did
+
+```rust
+let hz = crate::hal::TICK_HZ as u64;
+unsafe {
+    (tp as *mut i64).write_unaligned(0);
+    ((tp + 8) as *mut i64).write_unaligned(1_000_000_000 / hz as i64);
+}
+```
+The `tv_nsec` was the constant `1_000_000_000 / TICK_HZ` for every target — a blocked read, a
+`SIGSTOP`ped child, a zombie and a running task all read `4000000`. Its doc comment was wrong too:
+"the 10ms the timer runs at", where `TICK_HZ` is 250 (4 ms).
+
+### The fix: the state letter, derived once
+
+The runnability question is the same one `/proc/<pid>/stat`'s `state` field answers, and this kernel
+had exactly one derivation of it — inside `snapshot_of`. Writing a second one in the syscall layer
+would have created a door that could tell a program two different things about its own child, so the
+derivation moved out:
+
+- `src/sched/runtime/procfs.rs` — `pub(crate) fn state_of(t, id, task) -> char` holds the `Z`/`T`/`S`/`R`
+  ladder that `snapshot_of` used to inline; `snapshot_of` now calls it. New
+  `#[cfg(target_os = "none")] pub fn task_state(id: TaskId) -> Option<char>` asks it from outside the
+  table, answering `None` for a number that no longer names a live task (that caller is owed `ESRCH`).
+- `src/sched/mod.rs` — `task_state` joins the `pub use runtime::{…}` list.
+- `src/syscall/linux/abi.rs` — `pub(crate) fn rr_interval_nanos(runnable: bool, hz: u64) -> u64`
+  (`if runnable { 1_000_000_000 / hz } else { 0 }`), host-tested:
+  `a_runqueue_answer_is_the_slice_and_everything_else_is_zero` pins 4 ms at 250 Hz, 1 ms at 1000 Hz,
+  10 ms at 100 Hz, and **zero at every rate** — the half that must not scale.
+- `src/syscall/linux/posix.rs` — `handle_sched_rr_get_interval` resolves the pid as before, judges
+  the 16-byte buffer as before, then asks `task_state`: only `'R'` gets the slice, `S`/`T`/`Z` get
+  `tv_nsec = 0`, and `None` is `ESRCH`. Its doc now carries the `d.c`/`e.c`/`f.c`/`g.c` readings.
+
+### The pin — `user/tests/src/bin/t-rr-interval.rs`, 12 claims
+
+One child read in three states, plus controls, so a red line names which question was answered
+wrongly. Each state claim prints the letter the kernel reported, which is what makes a red
+diagnosable rather than merely red:
+
+```
+ok:    a running task is answered a slice (got 0, 4000000 ns)
+ok:    a child blocked in a read is answered zero (state S, got 0, 0 ns)
+ok:    and the caller is answered a slice in the same breath (0, 4000000 ns)
+ok:    a child held at a stop is answered zero (state T, got 0, 0 ns)
+ok:    a zombie is answered zero (state Z, got 0, 0 ns)
+ok:    and the same number after the reap is ESRCH (got 3)
+ok:    a runnable child is answered a slice (state R, got 0, 4000000 ns)
+```
+
+The **runnable-child control** is load-bearing: without it a kernel answering zero for everything
+would pass all three state claims. The four shape claims (`null buffer`, `nobody`, `negative pid`,
+`unreadable buffer`) are controls too — they were already right and stay right.
+
+The **value** is deliberately not claimed. This machine's slice is 4 ms and the reference host's is
+2 ms; both are that machine's round-robin timeslice, and asserting the number would turn a tuning
+difference into a failure while passing happily on a kernel that answered a constant forever. What
+is a contract is zero versus non-zero.
+
+The syscall number comes from `libc::SYS_sched_rr_get_interval` (148 on x86_64, **127** on aarch64) —
+a literal 148 would have been silently wrong on the second arm.
+
+### Counterfactual
+
+`git stash push -q -m cf-rr -- src/syscall/linux/abi.rs src/syscall/linux/posix.rs
+src/sched/runtime/procfs.rs src/sched/mod.rs`, kernel and loader rebuilt, `build/boot-rr-cf1.log`:
+**3 of 12 red**, exactly the three state claims —
+
+```
+FAIL:  a child blocked in a read is answered zero (state S, got 0, 4000000 ns)
+FAIL:  a child held at a stop is answered zero (state T, got 0, 4000000 ns)
+FAIL:  a zombie is answered zero (state Z, got 0, 4000000 ns)
+FAILED / === t-rr-interval exit=1
+```
+
+The other nine — including all four shape claims and the runnable control — are green on both
+kernels, because the refusal order and the slice value were never the defect. Restored, rebuilt,
+`build/boot-rr2.log`: 12/12 `PASS`, `exit=0`.
+
+### Host and machine
+
+Host (`MPOS_ON_HOST=1`): 12/12, and the states read `S`, `T`, `Z`, `R` exactly as Linux's own
+`/proc/<pid>/stat` reports them — the same letter this kernel now derives. Machine
+(`build/boot-rr1.log`): 12/12, `exit=0`, slice `4000000` ns (this machine's one tick at 250 Hz).
+Host unit tests `761 → 762`.
+
+### Named gaps this does not close
+
+The slice **value** stays this kernel's own (one tick). Linux's is `sched_rr_timeslice_ms`
+(sysctl-tunable, 100 ms on the reference host) divided by its HZ; this kernel has no tunable and
+one round-robin band, so serving its tick is the honest reading. That is a different gap from this
+one, which was about *which* answer a target's state earns. §2.13's delivery path is untouched.
+
+### The rule
+
+**A constant that is right for one state is a wrong answer for every other state.** The door looked
+like a getter for a machine constant, and a machine constant has no reason to vary — so nobody
+checked whether Linux varied it. The tell was in the existing notes: the difference was written down
+as "the host's value is tuned, not fixed", which explained the *number* while quietly assuming the
+*answer* was the same shape. When a divergence is explained by "the figure differs per machine", the
+next question is whether anything besides the figure differs.

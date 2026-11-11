@@ -475,13 +475,23 @@ fn disposition_sets(actions: signal::Actions) -> (signal::Pending, signal::Pendi
     (ignored, caught)
 }
 
-/// The facts about `task`, in the shape `/proc` reports them.
-pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
+/// The one letter this kernel uses for a task's state, and the only place it
+/// is decided.
+///
+/// Two doors ask this question and they must not answer it differently:
+/// `/proc/<pid>/stat`'s `state` field prints the letter, and
+/// `sched_rr_get_interval` asks whether the target is `'R'` to decide between
+/// the slice and a zero `timespec` (§6.127). Linux's rule for the second is
+/// exactly the first one: a task off the runqueue — blocked (`S`), held at a
+/// stop (`T`) or a zombie (`Z`) — is not running, and only `R` gets a slice.
+/// Deriving it once is what keeps a program from being told two things about
+/// its own child.
+pub(crate) fn state_of(t: &Table, id: TaskId, task: &Task) -> char {
     // Exited-but-uncollected is a zombie, and it is still in the table
     // because it is still someone's child to collect. Sleeping is a question
     // only the scheduler's own queue can answer: a task blocked in a read is
     // waiting for a driver to wake it, and nothing about the task says so.
-    let state = if task.exited {
+    if task.exited {
         'Z'
     } else if task.trace.stop.is_some() {
         // Stopped, not sleeping: the stop is a state a SIGCONT undoes and a
@@ -493,7 +503,26 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         'S'
     } else {
         'R'
-    };
+    }
+}
+
+/// The state letter of a task named by the caller's own pid numbering, for a
+/// door that needs to know whether it can run.
+///
+/// `None` when the number no longer names a live task: an exited-and-reaped
+/// slot has nothing to report, and its caller is owed `ESRCH` rather than a
+/// made-up letter.
+#[cfg(target_os = "none")]
+pub fn task_state(id: TaskId) -> Option<char> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(|entry| entry.as_ref())?;
+        Some(state_of(t, id, task))
+    })
+}
+
+/// The facts about `task`, in the shape `/proc` reports them.
+pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
+    let state = state_of(t, id, task);
     let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
     let peak_pages = task.mm.peak_pages();
     let hwm_frames = task.mm.hwm_frames();
