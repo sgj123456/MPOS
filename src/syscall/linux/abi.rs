@@ -4161,6 +4161,40 @@ pub(crate) fn priority_bound_verdict(policy: usize, max: bool) -> isize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// timer_settime's flags: one meaningful bit, read as Linux's `unsigned int`
+// ---------------------------------------------------------------------------
+
+/// `timer_settime`'s `flags` word, read the way Linux reads it: a 32-bit
+/// `unsigned int` whose only named bit is `TIMER_ABSTIME` (1). Every other bit
+/// is **ignored**, not refused - measured on the host
+/// (`build/scratch/timerorder/final.c`, 7.2.14): `flags = 0, 2, 4, 6, 8,
+/// 0x7ffffffe, -2, 2^32, 2^32|2` all arm the timer and answer 0, while
+/// `2^32|1` is truncated to `TIMER_ABSTIME` and interpreted as an absolute
+/// deadline. A word with a bit the kernel does not know is not an invalid
+/// argument; asking for one is how a caller discovers that.
+///
+/// Bit 0 is the one bit this kernel cannot serve: it keeps one monotonic clock
+/// and has no `CLOCK_REALTIME` epoch to name an absolute deadline against, so
+/// the answer is an honest `EINVAL` and a named gap (`§6.124`) rather than a
+/// relative arm dressed up as an absolute one. That refusal is *this kernel's*
+/// answer, not Linux's - the host arms the timer - and it is the whole of the
+/// divergence this verdict leaves. Everything else is the contract the two
+/// share, which is why the function lives here where the host tests reach it.
+///
+/// Before this, `handle_timer_settime` refused every word carrying a bit past
+/// `TIMER_ABSTIME` with `EINVAL`: a caller setting a harmless high bit got a
+/// refusal where Linux armed the timer. `§6.124` moved the unknown bits to
+/// "ignored" and kept only the one bit this kernel cannot honour.
+pub(crate) fn timer_settime_flags_verdict(word: usize) -> Result<(), isize> {
+    const TIMER_ABSTIME: u32 = 1;
+    let flags = word as u32;
+    if flags & TIMER_ABSTIME != 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7330,5 +7364,27 @@ mod diskstat_tests {
         // The nice is the last judgement, and only OTHER carries one.
         assert_eq!(sched_setattr_policy_verdict(0, 0, 20), Err(err::EINVAL));
         assert_eq!(sched_setattr_policy_verdict(0, 0, -21), Err(err::EINVAL));
+    }
+
+    /// `timer_settime`'s flags word: a 32-bit `unsigned int` whose only named
+    /// bit is `TIMER_ABSTIME`. The host measured `final.c` arming the timer for
+    /// every word here except the ABSTIME ones, and `2^32` truncating to 0 —
+    /// before §6.124 the door refused all but `flags = 0`.
+    #[test]
+    fn timer_settime_flags_ignore_every_bit_but_abstime() {
+        assert_eq!(timer_settime_flags_verdict(0), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(2), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(4), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(6), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(8), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(0x7fff_fffe), Ok(()));
+        assert_eq!(timer_settime_flags_verdict(0xffff_fffe), Ok(()));
+        // The word is 32-bit: a bit above the truncation point is ignored.
+        assert_eq!(timer_settime_flags_verdict(0x1_0000_0002), Ok(()));
+        // Bit 0 is the one bit this kernel refuses (a named gap, §6.124).
+        assert_eq!(timer_settime_flags_verdict(1), Err(err::EINVAL));
+        assert_eq!(timer_settime_flags_verdict(3), Err(err::EINVAL));
+        assert_eq!(timer_settime_flags_verdict(0xffff_ffff), Err(err::EINVAL));
+        assert_eq!(timer_settime_flags_verdict(0x1_0000_0001), Err(err::EINVAL));
     }
 }

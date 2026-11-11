@@ -4451,6 +4451,30 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     const CLOCK_TAI: usize = 11;
 
     let (clockid, event, out) = (args[0], args[1], args[2]);
+
+    // Linux copies the caller's `struct sigevent` in **before** it judges the
+    // clock: a `sevp` it cannot read is `EFAULT` even when the clock number is
+    // one it would refuse (`build/scratch/timerorder/final.c`: `create(999,
+    // sevp=1)` and `create(4, sevp=1)` both answer 14 on the host, 7.2.14).
+    // Copy the validated bytes now, but judge their *meaning* only after the
+    // clock, because `create(4, bad notify)` is `EOPNOTSUPP` there, not
+    // `EINVAL` — the clock's refusal outranks a broken sigevent (`§6.124`).
+    let event_words = if event == 0 {
+        None
+    } else {
+        if !buffer_ok(event, SIGEVENT_SIZE, false, from_user) {
+            return err::EFAULT;
+        }
+        Some(unsafe {
+            (
+                (event as *const u64).read_unaligned(),
+                ((event + 8) as *const i32).read_unaligned(),
+                ((event + 12) as *const i32).read_unaligned(),
+                ((event + 16) as *const i32).read_unaligned(),
+            )
+        })
+    };
+
     // The clocks whose timeout this kernel can honour. `REALTIME` and
     // `MONOTONIC` (and `BOOTTIME`/`TAI`, which name the same tick counter with
     // a different epoch) are measured against the one clock the machine keeps.
@@ -4489,26 +4513,14 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
         | 9 /* CLOCK_BOOTTIME_ALARM */ => return err::EOPNOTSUPP,
         _ => return err::EINVAL,
     };
-    if out == 0 || !buffer_ok(out, 4, true, from_user) {
-        return err::EFAULT;
-    }
 
     // A NULL `sigevent` is the man page's own spelling of the default: a
-    // `SIGALRM` to the process with a null payload.
-    let (signo, value, notify) = if event == 0 {
-        (crate::sched::signal::SIGALRM, 0u64, TimerNotify::Signal)
-    } else {
-        if !buffer_ok(event, SIGEVENT_SIZE, false, from_user) {
-            return err::EFAULT;
-        }
-        let (value, signo, kind, tid) = unsafe {
-            (
-                (event as *const u64).read_unaligned(),
-                ((event + 8) as *const i32).read_unaligned(),
-                ((event + 12) as *const i32).read_unaligned(),
-                ((event + 16) as *const i32).read_unaligned(),
-            )
-        };
+    // `SIGALRM` to the process with a null payload. Its *content* is judged
+    // after the clock (a refused clock wins over a broken sigevent) but before
+    // the output pointer (a broken sigevent wins over a bad `timer_t*`) — the
+    // host measures `create(0, bad notify, out=1)` as `EINVAL`, and
+    // `create(0, NULL, out=1)` as `EFAULT` (`§6.124`).
+    let (signo, value, notify) = if let Some((value, signo, kind, tid)) = event_words {
         let kind = kind as u32;
         if kind != SIGEV_NONE && kind != SIGEV_SIGNAL && kind != SIGEV_THREAD_ID {
             return err::EINVAL;
@@ -4536,7 +4548,15 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
                 (signo as u8, value, TimerNotify::Signal)
             }
         }
+    } else {
+        (crate::sched::signal::SIGALRM, 0u64, TimerNotify::Signal)
     };
+
+    // The output pointer is the last thing judged: Linux has already decided
+    // the clock and the sigevent by the time it copies the new `timer_t` out.
+    if out == 0 || !buffer_ok(out, 4, true, from_user) {
+        return err::EFAULT;
+    }
 
     // The tid is validated against the caller's thread group inside the
     // scheduler's table, where the group is known.
@@ -4552,27 +4572,47 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
 
 /// `timer_settime(timerid, flags, new_value, old_value)`.
 ///
-/// `TIMER_ABSTIME` is `EINVAL`, for the same reason `clock_nanosleep` refuses
-/// it: this kernel keeps one clock and has no absolute time domain to measure
-/// an absolute deadline against. A relative deadline is what every caller in
-/// this image asks for, and the honest refusal is the man page's own errno.
+/// The `flags` word is Linux's 32-bit `unsigned int`: every bit past
+/// `TIMER_ABSTIME` is **ignored**, not refused, and the verdict lives in
+/// `abi::timer_settime_flags_verdict` where the host tests can reach it.
+/// `TIMER_ABSTIME` itself stays `EINVAL` — this kernel keeps one monotonic
+/// clock and has no `CLOCK_REALTIME` epoch to name an absolute deadline
+/// against, so the honest refusal is a named gap (`§6.124`), not a relative arm
+/// dressed up as an absolute one. Linux *does* arm an absolute timer; that
+/// half is the gap. The refusal is checked after the new-value pointer (a
+/// broken pointer still answers `EFAULT`) but before any arm, so an `EINVAL`
+/// never leaves a relative timer running behind it. A bad id or malformed
+/// `timespec` answers `EINVAL` on both machines, so the flag's placement is
+/// invisible there; the one corner the gap cannot share is `ABSTIME` with a
+/// broken `old_value`, where this kernel's honest `EINVAL` stands in for a
+/// call the host would have armed.
+///
+/// The judgement order is the host's, not a convenient one
+/// (`build/scratch/timerorder/{final,oldarm}.c`, 7.2.14): the new-value
+/// pointer and the flags word first, then the id and both `timespec`s, then
+/// the `old_value` pointer. A bad id with a bad `old_value` is `EINVAL`, not `EFAULT`; a
+/// malformed `tv_nsec` with a bad `old_value` is `EINVAL`, not `EFAULT`. And
+/// Linux arms the timer **before** writing `old_value`: a call that answers
+/// `EFAULT` there still leaves the timer running — measured as
+/// `remaining=3599.999944756` seconds after a 3600 s arm. So the arm happens
+/// under the scheduler's table borrow first, and only then does this layer
+/// check and fill `old_value`.
+///
 /// Both fields of the new `itimerspec` are validated (a `tv_nsec` outside
 /// `[0, 1e9)`, a negative second) before anything is armed, and a zero
 /// `it_value` disarms without clearing the interval, exactly as Linux's does.
 pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    use crate::sched::TIMER_ABSTIME;
     let (id, flags, new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
-    if flags & !(TIMER_ABSTIME as usize) != 0 {
-        return err::EINVAL;
-    }
-    if flags & TIMER_ABSTIME as usize != 0 {
-        return err::EINVAL;
-    }
     if new_ptr == 0 || !buffer_ok(new_ptr, ITIMERSPEC_SIZE, false, from_user) {
         return err::EFAULT;
     }
-    if old_ptr != 0 && !buffer_ok(old_ptr, ITIMERSPEC_SIZE, true, from_user) {
-        return err::EFAULT;
+    // `flags` is judged after the new pointer (Linux's `settime(good, ABSTIME,
+    // new=1)` is `EFAULT`, not an errno about the flag) but before any arm: a
+    // refused `TIMER_ABSTIME` must not leave a relative timer running behind
+    // its `EINVAL`. The only bit refused here is bit 0 — every other bit is
+    // ignored (`abi::timer_settime_flags_verdict`, `§6.124`).
+    if let Err(e) = abi::timer_settime_flags_verdict(flags) {
+        return e;
     }
     let (isec, insec, vsec, vnsec) = unsafe {
         let word = |n: usize| (new_ptr as *const i64).add(n).read_unaligned();
@@ -4595,13 +4635,18 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
     //
     // The old state is read and replaced under one table borrow, so a caller
     // that arms and reads back in one call cannot see a state that never
-    // existed.
+    // existed. The id is judged here (a bad id answers `EINVAL`) and the timer
+    // is armed here — before `old_value` is looked at, which is where Linux
+    // puts the copy-out (`oldarm.c`).
     let Some((old_interval, old_remaining)) =
         crate::sched::timer_arm(id, interval_ticks, value_ticks)
     else {
         return err::EINVAL;
     };
     if old_ptr != 0 {
+        if !buffer_ok(old_ptr, ITIMERSPEC_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
         unsafe { write_itimerspec(old_ptr, old_interval, old_remaining) };
     }
     0
@@ -4610,14 +4655,20 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
 /// `timer_gettime(timerid, curr_value)` — the interval and the time left, in
 /// a `struct itimerspec`. A disarmed or expired-then-one-shot timer answers a
 /// zero value with its interval intact, which is what Linux reports.
+///
+/// The id is judged **before** the output buffer: the host measures
+/// `gettime(bad, curr=1)` as `EINVAL`, not `EFAULT`
+/// (`build/scratch/timerorder/final.c`, 7.2.14). A bad pointer with a good id
+/// is `EFAULT`; the two questions are not asked in the same order here as
+/// `timer_settime` asks its `old_value`, and that asymmetry is Linux's (`§6.124`).
 pub(super) fn handle_timer_gettime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (id, ptr) = (args[0], args[1]);
-    if ptr == 0 || !buffer_ok(ptr, ITIMERSPEC_SIZE, true, from_user) {
-        return err::EFAULT;
-    }
     let Some((interval, remaining)) = crate::sched::timer_state(id) else {
         return err::EINVAL;
     };
+    if ptr == 0 || !buffer_ok(ptr, ITIMERSPEC_SIZE, true, from_user) {
+        return err::EFAULT;
+    }
     unsafe { write_itimerspec(ptr, interval, remaining) };
     0
 }

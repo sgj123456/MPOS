@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, a timer on a CPU clock §6.123):** stage 1 `1259 tests, 0
+**Latest measured gate (2026-11-11, the `timer_*` refusal order §6.124):** stage 1 `1260 tests, 0
+failed` (67.54 s — the +1 is §6.124's host-testable flags verdict); x86_64 `pass=288 fail=0 (288
+built)`, `mpos-kunit 35 passed, 0 failed` (50.30 s, total 67.87 s, -5.1%); aarch64 `pass=287 fail=0
+(287 built)`, `mpos-kunit 35 passed, 0 failed` (138.65 s, total 229.82 s, `16 not run - see
+tests.toml`) — `GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-timerorder.log`). One new program: `t-timer-order` (23 claims), 11 of which fail
+against the kernel before this change (`build/boot-timerorder-cf1.log`) — including the
+arm-with-`EFAULT` side effect that a kernel merely returning the right errno would still miss
+(`left 0 ms` red, `left 3600000 ms` green). Four shape/control rows are green on both kernels by
+design and are stated as such in §6.124. `t-timer-create`'s `TIMER_ABSTIME` label was left
+untouched: the behaviour (EINVAL here, armed on the host) did not change, only the reason in the
+appendix did.
+
+**Measured gate before it (2026-11-11, a timer on a CPU clock §6.123):** stage 1 `1259 tests, 0
 failed` (71.23 s); x86_64 `pass=287 fail=0 (287 built)`, `mpos-kunit 35 passed, 0 failed` (51.78 s,
 previous green 71.31 s); aarch64 `pass=286 fail=0 (286 built)`, `mpos-kunit 35 passed, 0 failed`
 (134.30 s; `16 of 302` left out by `tests.toml`) — `GATE EXIT=0`, both arms in one command with the

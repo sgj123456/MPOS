@@ -10244,3 +10244,170 @@ woven through four places that each looked right on its own; the defect was that
 the timer it was subtracted from were stored in different objects. Storing the clock *with* the
 timer, and making the arm take a value rather than a deadline, is what turned four opportunities
 for the same mistake into one place the compiler insists on.
+
+## §6.124 The `timer_*` doors judge in Linux's order, and their flags carry one bit
+
+§6.123 gave a POSIX timer a clock. This section is about the *shape of a refusal*: the five calls
+of the family each answer two questions - is the request well-formed, and is the thing it names
+there - and a man page does not say which is asked first. It matters because a wrong errno sends
+the caller down a fallback for a problem it does not have. All of it was measured at the raw-syscall
+level on a host 7.2.14 before any code was touched
+(`build/scratch/timerorder/{final,truth,gaps,both,oldarm,abstime,edges}.c`); several early probes
+had to be thrown away because a `timer_t` corrupted by an earlier bad `create` made a later
+`settime` read as success. The confound-free probes each use a fresh timer for every row.
+
+### What Linux does, measured
+
+`timer_create`: an unreadable `sevp` is `EFAULT` **before** the clock is judged.
+
+```text
+create(999 bogus clock,    sevp=1,  out ok/bad)  -> EFAULT(14)   not EINVAL(22)
+create(4  MONOTONIC_RAW,   sevp=1,  out ok/bad)  -> EFAULT(14)   not EOPNOTSUPP(95)
+create(999, NULL, out=0/1)                        -> EINVAL(22)
+create(4,   NULL, out=0/1)                        -> EOPNOTSUPP(95)
+create(4,   bad notify/signo/tid, out=1)          -> EOPNOTSUPP(95)  clock before sigevent meaning
+create(0,   bad notify/signo/tid, out=1/0)        -> EINVAL(22)      sigevent meaning before out
+create(0,   NULL, out=1)                          -> EFAULT(14)
+create(0,   NULL, out=0)                          -> EFAULT(14)
+```
+
+So the order is **sevp pointer readability -> clock -> sigevent content -> `timer_t*`**. A refused
+clock outranks a broken sigevent's *meaning* but not the unreadability of its bytes; a broken
+sigevent's meaning outranks a bad output pointer. This kernel judged the clock first, then `out`,
+then the sigevent content - the first and third of those are reversed.
+
+`timer_settime`'s `flags` is a 32-bit `unsigned int` whose only meaningful bit is
+`TIMER_ABSTIME` (bit 0). Every other bit is **ignored** and the timer is armed (`final.c`):
+
+```text
+flags = 0, 2, 4, 6, 8, 0x7ffffffe, -2 (0xfffffffe)  -> 0, timer_gettime remaining ~0.099999 s
+flags = 2^32, 2^32|2                                  -> 0   (truncated to 0 and 2, armed)
+flags = 1 (ABSTIME), -1 (0xffffffff), 2^32|1          -> 0, but an ABSOLUTE value already past
+flags = 2^32|ABSTIME                                   -> 0, truncated to ABSTIME
+```
+
+This kernel refused **every** word carrying a bit past `TIMER_ABSTIME` with `EINVAL`, so a caller
+that set a harmless future-flag bit could not arm a timer at all. `TIMER_ABSTIME` itself Linux
+*arms* (for a `CLOCK_REALTIME` timer, +1 h reads back `remaining 3599.999996794`); this kernel
+still answers `EINVAL` for it, but that is now a **named gap** with a truthful reason - one
+monotonic clock, no `CLOCK_REALTIME` epoch to name an absolute deadline against - not a claim
+that other bits are invalid.
+
+`timer_settime`'s judgement order, and a side effect a probe would miss:
+
+```text
+settime(bad id, 0, new=1)             -> EFAULT(14)   new pointer before id
+settime(bad id, 0, new ok)            -> EINVAL(22)
+settime(good,   0, bad nsec 2e9)      -> EINVAL(22)
+settime(good,   0, new ok, old=1)     -> EFAULT(14)   BUT the timer is already armed
+settime(bad id, 0, new ok, old=1)     -> EINVAL(22)   id before old_value
+settime(good,   0, bad nsec, old=1)   -> EINVAL(22)   timespec before old_value
+```
+
+`oldarm.c`: `settime(good, it_value=3600 s, old=1)` answers `-1 errno=14`, yet the very next
+`timer_gettime` reads `remaining=3599.999944756` - Linux armed the timer *before* it tried to copy
+the old state out to a broken pointer. `both.c` pins that the `TIMER_ABSTIME` decision does not
+outrank the new pointer, the id or the timespecs either (`ABSTIME + good + new ok + old=1` is 14,
+`ABSTIME + bad id` is 22, `ABSTIME + bad nsec` is 22). This kernel checked `old_value` *before*
+the timespecs and before `timer_arm`, so a good arm with a bad `old_value` answered `EFAULT`
+**without ever arming the timer** - a refusal with the wrong side effect, not just the wrong
+errno.
+
+`timer_gettime`: the id is judged **before** the output buffer.
+
+```text
+gettime(bad id, curr=1)   -> EINVAL(22)
+gettime(bad id, curr=0)   -> EINVAL(22)
+gettime(good id, curr=1)  -> EFAULT(14)
+```
+
+This kernel asked the buffer first, so `gettime(bad, curr=1)` answered `EFAULT`. `timer_getoverrun`
+and `timer_delete` already answer `EINVAL` for a bogus id on both, and a deleted id is not reused
+as a live one.
+
+### What this kernel answered before
+
+`handle_timer_create` matched the `clockid` at the very top, then checked `timer_t*`, then copied
+and validated the `sigevent`. `handle_timer_settime` began with two checks - `flags &
+!TIMER_ABSTIME != 0` and `flags & TIMER_ABSTIME != 0` - refusing every unknown bit and ABSTIME
+alike, then checked `new_value`, then `old_value`, then the timespecs, then `timer_arm`.
+`handle_timer_gettime` checked `curr_value` before `timer_state(id)`. None of the individual
+answers was a wild invention; the defect was the *order*, which is exactly the sort of wrong shape
+that sends musl's `timer_create` helper or a program probing capabilities down an unrecoverable
+fallback.
+
+### The fix
+
+- `src/syscall/linux/abi.rs`: `pub(crate) fn timer_settime_flags_verdict(word: usize) ->
+  Result<(), isize>` truncates to `u32` and refuses only bit 0 (`Err(err::EINVAL)`), returning
+  `Ok(())` for every other word. It lives in the host-compiled `abi.rs` because `proc.rs` is
+  `#[cfg(target_os = "none")]` and cannot be host-tested; a `#[test]`
+  `timer_settime_flags_ignore_every_bit_but_abstime` pins the eight accepted words and the four
+  refused ones. The 32-bit truncation is measured, not assumed (`edges.c`: `2^32` and `2^32|2`
+  are served, `2^32|1` is ABSTIME).
+- `src/syscall/linux/proc.rs::handle_timer_create`: the `sigevent` pointer is now checked for
+  readability and its four words copied **at the top** (before the `clockid` match), the clock is
+  judged second, the sigevent content third, and `timer_t*` last - with `timer_alloc` after all of
+  them. The wording that split "readability" from "meaning" is the point: Linux answers `EFAULT`
+  for unreadable bytes but `EOPNOTSUPP` for a refused clock even when those bytes would have been
+  nonsense.
+- `src/syscall/linux/proc.rs::handle_timer_settime`: the two flags checks are gone, replaced by the
+  verdict after the `new_value` pointer check but **before any arm** (so an `EINVAL` never leaves a
+  relative timer running behind it - a self-correction made after an early draft put it after
+  `timer_arm`). The order is now `new_value` -> flags -> the two `timespec_ticks` -> `timer_arm`
+  (which validates the id and arms) -> `old_value` -> `write_itimerspec`. Putting `old_value`
+  after `timer_arm` is what reproduces Linux's `EFAULT`-with-an-armed-timer side effect.
+- `src/syscall/linux/proc.rs::handle_timer_gettime`: `timer_state(id)` is now called before the
+  `curr_value` buffer check.
+- The `TIMER_ABSTIME` doc comment moves its reason to the named gap and points here; §6.124 does
+  not implement an absolute deadline, it stops claiming that other flag bits are refusals.
+
+### The pin and its counterfactual
+
+`user/tests/src/bin/t-timer-order.rs` (23 claims, raw `libc::syscall` with self-spelled
+`SigEvent`/`Itimerspec` wire records, errno compared as plain numbers so neither arm's `Errno`
+spelling decides a verdict): host 23/23, machine 23/23 (`build/boot-timerorder1.log`). A no-op
+`SIGALRM` handler is installed because `timer_create(..., NULL)` defaults to that signal and the
+*host* arms an already-expired `ABSTIME` timer that fires at once - without it the host probe died
+of its own default disposition mid-run. This kernel refuses `ABSTIME`, so only the host needs it.
+
+`git stash push -q -m cf-timerorder -- src/syscall/linux/abi.rs src/syscall/linux/proc.rs`, kernel
+**and** the UEFI loader that embeds it rebuilt, the same pin booted (`build/boot-timerorder-cf1.log`):
+**11 of 23 red** -
+
+```text
+FAIL: an unreadable sigevent outranks a bogus clock (got 22, want 14)
+FAIL: an unreadable sigevent outranks a refused clock (got 95, want 14)
+FAIL: a broken sigevent outranks a bad timer_t* (got 14, want 22)
+FAIL: an unknown flag bit is ignored and the timer is armed (set Err(22), ...)
+FAIL: many unknown flag bits are ignored and the timer is armed (set Err(22), ...)
+FAIL: the flags word is 32-bit, so its high bits are ignored and the timer is armed (set Err(22), ...)
+FAIL: a bad id outranks a bad old_value (got 14, want 22)
+FAIL: a malformed tv_nsec outranks a bad old_value (got 14, want 22)
+FAIL: and that EFAULT still armed the timer (read Ok(0), left 0 ms)
+FAIL: a bad id outranks a bad curr_value buffer (got 14, want 22)
+FAIL: a bad id outranks a NULL curr_value too (got 14, want 22)
+```
+
+The `arm-before-copy` claim is the one that would pass on a kernel that merely returned the right
+`EFAULT`: it is **red on the broken kernel** (`left 0 ms`) because the old code checked `old_value`
+before `timer_arm` and never armed at all. Four shape/control claims stay green on both kernels by
+design (the two plain doors, the refused-clock-before-meaning row, ABSTIME's named gap), and are
+stated as such. Restored, rebuilt, 23/23 green again (`build/boot-timerorder2.log`).
+
+### Named gaps this does not close
+
+`TIMER_ABSTIME` stays `EINVAL` (one monotonic clock, no `CLOCK_REALTIME` epoch). `timer_create`
+still stops signal numbers at `SIGRTMIN` (32) and the alarm clocks still answer `EOPNOTSUPP`
+where Linux answers `EPERM`; the table is still eight fixed slots (`EAGAIN` on full, `edges.c`'s
+`RLIMIT_SIGPENDING=0` corner) rather than Linux's rlimit-backed allocation, and ids are the lowest
+free slot rather than never-reused. None of those is a refusal *order*, so none is touched here.
+
+### The rule
+
+**A refusal is part of the ABI: which question a door asks first is as much a promise as the errno
+it returns.** Four independent doors here each held a locally-sensible check in the wrong position,
+and one of them changed a side effect (arm) as well as an answer. Measure the order with a probe
+whose rows cannot contaminate each other, then reorder the checks; a verdict about a *word* belongs
+in one host-testable pure function, but a verdict about *which of two bad things wins* belongs in
+the handler's statement order, pinned by a program that hands both bad things at once.

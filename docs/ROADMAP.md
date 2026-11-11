@@ -958,6 +958,24 @@ One-glance status of the whole roadmap.
   the group, and a frozen reading has nowhere to live in this table. Pinned by
   `t-timer-cpuclock` (16 claims, counterfactually 7 red); `t-timer-create`'s old
   divergence claim became an agreement on both arms (§6.123, item 237)
+- [x] the `timer_*` doors judge in Linux's order, and `timer_settime`'s flags
+  carry one bit — a refusal's *order* is an errno promise: measured on the
+  host, `timer_create` judges an unreadable `sigevent` (`EFAULT`) before the
+  clock (so a bogus or refused clock cannot answer `EINVAL`/`EOPNOTSUPP` over
+  it), and a broken sigevent's meaning (`EINVAL`) before a bad `timer_t*`
+  (`EFAULT`); `timer_settime`'s `flags` is a 32-bit word whose only meaningful
+  bit is `TIMER_ABSTIME` (every other bit is ignored and the timer arms — this
+  kernel used to refuse them all with `EINVAL`), and its order is new-value
+  pointer → flags → id and both timespecs → arm → `old_value`, so a bad
+  `old_value` answers `EFAULT` **after** the timer is already armed (the host
+  reads `remaining=3599.999944756` right after such a call) rather than leaving
+  the timer unarmed; `timer_gettime` judges the id (`EINVAL`) before its output
+  buffer (`EFAULT`). The flags word now lives in one host-testable pure
+  verdict, the four check orders are the handler's statement sequence, and
+  `TIMER_ABSTIME` stays an honest `EINVAL` named gap (one monotonic clock, no
+  `CLOCK_REALTIME` epoch). Pinned by `t-timer-order` (23 claims, counterfactually
+  11 red, including the arm-with-`EFAULT` side effect that a right errno alone
+  would miss) (§6.124, item 238)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

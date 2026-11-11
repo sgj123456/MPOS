@@ -10514,3 +10514,53 @@ reading for a dead thread has nowhere to live in this table. `TIMER_ABSTIME`
 stays `EINVAL` (one clock, no absolute domain). The alarm clocks answer
 `EOPNOTSUPP` where Linux answers `EPERM`, because there is no wake-from-suspend
 and no capability to gate it.
+
+### Item 238 — the `timer_*` doors judge in Linux's order, and flags carry one bit
+
+Rows: `timer_create`'s `sigevent`/clock/`timer_t*` order, `timer_settime`'s
+`flags` word and `new`/id/`timespec`/`old_value` order, `timer_gettime`'s
+id-versus-buffer order. Refusal *order* is an errno promise, not a cosmetic
+detail (`§6.124`).
+
+| row | Linux | this kernel before | now |
+|---|---|---|---|
+| `timer_create(bogus clock, unreadable sevp)` | `EFAULT(14)` | `EINVAL(22)` (clock judged first) | `EFAULT(14)` |
+| `timer_create(refused clock, unreadable sevp)` | `EFAULT(14)` | `EOPNOTSUPP(95)` | `EFAULT(14)` |
+| `timer_create(refused clock, broken sigevent content)` | `EOPNOTSUPP(95)` | `EOPNOTSUPP(95)` | `EOPNOTSUPP(95)` (clock still outranks content) |
+| `timer_create(good clock, broken sigevent, bad timer_t*)` | `EINVAL(22)` | `EFAULT(14)` (`out` checked before content) | `EINVAL(22)` |
+| `timer_create(good, NULL, bad timer_t*)` | `EFAULT(14)` | `EFAULT(14)` | `EFAULT(14)` |
+| `timer_settime(flags = 2 / 0x7ffffffe / 2^32\|2)` | `0`, timer armed | `EINVAL(22)` (every unknown bit refused) | `0`, timer armed |
+| `timer_settime(flags = TIMER_ABSTIME)` | arms an absolute timer | `EINVAL(22)` | `EINVAL(22)` — named gap: no `CLOCK_REALTIME` epoch |
+| `timer_settime(bad id, new ok, bad old_value)` | `EINVAL(22)` | `EFAULT(14)` (`old` checked first) | `EINVAL(22)` |
+| `timer_settime(good, bad nsec, bad old_value)` | `EINVAL(22)` | `EFAULT(14)` | `EINVAL(22)` |
+| `timer_settime(good, new ok, bad old_value)` | `EFAULT(14)` **and the timer is armed** | `EFAULT(14)`, timer **not** armed | `EFAULT(14)` and the timer is armed |
+| `timer_gettime(bad id, bad curr_value)` | `EINVAL(22)` | `EFAULT(14)` (buffer checked first) | `EINVAL(22)` |
+| `timer_gettime(good id, bad curr_value)` | `EFAULT(14)` | `EFAULT(14)` | `EFAULT(14)` |
+
+**Measured, not read off a man page** (`build/scratch/timerorder/{final,truth,gaps,both,oldarm,abstime,edges}.c`,
+host 7.2.14, each row with a fresh timer so a corrupted `timer_t` cannot fake a
+success): `timer_create` judges sevp readability -> clock -> content -> out;
+`settime`'s `flags` is a 32-bit word whose only meaningful bit is `TIMER_ABSTIME`
+(every other bit ignored, `2^32` truncates), and its order is `new_value` ->
+flags -> id + both timespecs -> arm -> `old_value` (so a bad `old_value` answers
+`EFAULT` **after** the arm: `oldarm.c` reads `remaining=3599.999944756` right
+after such a call); `timer_gettime` judges the id before the output buffer. The
+old kernel's `handle_timer_gettime` reversed that last pair, and its
+`handle_timer_settime` checked `old_value` before the timespecs and before
+`timer_arm`, which lost Linux's arm-with-an-EFAULT side effect.
+
+**Where it landed.** `src/syscall/linux/abi.rs`:
+`timer_settime_flags_verdict(word) -> Result<(), isize>` (host-compiled, truncates
+to `u32`, refuses only bit 0) plus a host `#[test]`.
+`src/syscall/linux/proc.rs`: `handle_timer_create` copies and readability-checks
+the sigevent at the top, then judges clock, content and out last;
+`handle_timer_settime` runs the verdict after the new pointer but before any
+arm, then `timespec_ticks` -> `timer_arm` -> old pointer -> `write_itimerspec`;
+`handle_timer_gettime` calls `timer_state(id)` before the buffer check. Pin
+`user/tests/src/bin/t-timer-order.rs` (23 claims, host 23/23 and machine 23/23,
+counterfactually 11 red on `build/boot-timerorder-cf1.log`).
+
+**Named gaps this does not close.** `TIMER_ABSTIME` stays `EINVAL` (one
+monotonic clock, no absolute domain); signal numbers still stop at `SIGRTMIN`,
+alarm clocks still answer `EOPNOTSUPP` for Linux's `EPERM`, and the timer table
+is still eight fixed slots with reused ids. None is a refusal *order*.
