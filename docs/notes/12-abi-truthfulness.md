@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `sched_rr_get_interval`'s pin §6.132):** stage 1 `1268 tests,
+**Latest measured gate (2026-11-11, `read`/`write`'s judgement order §6.133):** stage 1 `1269 tests,
+0 failed` (69.01 s — the +1 is `abi::iov_count_verdict`'s host test); x86_64 `pass=296 fail=0 (296
+built)`, `mpos-kunit 35 passed, 0 failed` (51.64 s over 2 lane(s)); aarch64 `pass=295 fail=0 (295 built)`,
+`mpos-kunit 35 passed, 0 failed` (141.11 s over 2 lane(s), `the machine reached === END and was
+stopped`) — `GATE EXIT=0`, both arms in one command with the lane count forced to two
+(`build/gate-rworder.log`). `t-rw-precedence` reads `=== PASS` on both arms
+(`build/test-lane-x86_64-1/serial.log`, and the aarch64 lane's own log). Against the pre-§6.133 kernel
+the pin is **4 red of 11** (`build/boot-rworder-cf1.log`), every red reading `(14, -1)` where Linux
+answers `(9, -1)` or `(21, -1)`; the other seven are controls that hold on both kernels. The one claim
+that is not a claim — `write(/dev/null, BAD, 8)` answering `EFAULT` where Linux answers 8 — prints as an
+observation that accepts both answers, because closing it means moving the fault-in to the copy site
+rather than the door. §6.133 records the measurement and the gap.
+
+**Measured gate before it (2026-11-11, `sched_rr_get_interval`'s pin §6.132):** stage 1 `1268 tests,
 0 failed` (53.73 s); x86_64 `pass=295 fail=0 (295 built)`, `mpos-kunit 35 passed, 0 failed` (51.26 s over
 2 lane(s)); aarch64 `pass=294 fail=0 (294 built)`, `mpos-kunit 35 passed, 0 failed` (123.41 s over
 2 lane(s), `the machine reached === END and was stopped`) — `GATE EXIT=0`, both arms in one command with

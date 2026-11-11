@@ -354,9 +354,10 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
-        // Wrong-mode first, before the empty-buffer short-circuit: Linux answers a
-        // `read(2)` on an `O_WRONLY` descriptor with `EBADF` even for length 0.
-        self.check_readable()?;
+        // The whole prefix, in Linux's order and through the one place that
+        // spells it: wrong mode, then the descriptor-with-no-file case, then
+        // the node's kind.
+        self.pre_read()?;
         // Then the kind, and still before the buffer: a directory is not a byte
         // stream, and Linux asks *which kind* before it asks how many bytes -
         // measured on a current host (`.workbuddy/probe_dir_io.c`, Linux 7.2.9),
@@ -375,12 +376,6 @@ impl File {
         // kind is asked: a mount descriptor reports the root directory, and
         // Linux's `read(2)` on one is `EBADF` rather than `EISDIR` - the object
         // is a descriptor with no file behind it, not a directory being read.
-        if self.inode.refuses_file_io() {
-            return Err(VfsError::BadFd);
-        }
-        if self.inode.metadata().kind == NodeKind::Dir {
-            return Err(VfsError::IsDir);
-        }
         // A zero-length read is `vfs_read`'s own short-circuit: the file is not
         // touched at all, and here that is a rule with a consequence rather
         // than a courtesy. A *message* - what a datagram socket holds - is
@@ -447,9 +442,50 @@ impl File {
     /// path (`read`/`readv`/`pread`/`preadv2`) shares it. A zero-length read still
     /// short-circuits first only when the mode permits reading at all; Linux
     /// refuses the wrong-mode `read(2, buf, 0)` with `EBADF` too.
-    fn check_readable(&self) -> VfsResult<()> {
+    pub(crate) fn check_readable(&self) -> VfsResult<()> {
         if self.access() == ACC_WRONLY {
             return Err(VfsError::BadFd);
+        }
+        Ok(())
+    }
+
+    /// Every judgement a `read`-shaped call makes **before** it looks at the
+    /// caller's buffer, in the order Linux makes them.
+    ///
+    /// This exists because the buffer is judged by the syscall layer - it is
+    /// the layer that holds the user pointer - while the descriptor and the
+    /// node are judged here, and Linux asks them in this order. Measured on a
+    /// current host (Linux 7.2.14, `build/scratch/rworder/{o,z,x}.c`):
+    /// `read(-1, BAD, 8)` is `EBADF`, `read(dir, BAD, 8)` is `EISDIR`, and
+    /// only a describable, readable, non-directory node goes on to answer
+    /// `EFAULT` for a buffer the caller cannot write. A door that validated
+    /// the buffer first answered `EFAULT` to all three - the divergence
+    /// `docs/notes/` §6.133 records.
+    ///
+    /// It is the same set of questions [`Self::read`] asks, in the same order,
+    /// called from both because two spellings of one prefix is how the two
+    /// doors come to disagree.
+    pub(crate) fn pre_read(&self) -> VfsResult<()> {
+        self.check_readable()?;
+        if self.inode.refuses_file_io() {
+            return Err(VfsError::BadFd);
+        }
+        if self.inode.metadata().kind == NodeKind::Dir {
+            return Err(VfsError::IsDir);
+        }
+        Ok(())
+    }
+
+    /// The write half of [`Self::pre_read`]: the wrong-mode refusal, the
+    /// inode's own flags, and the append-only rule, all of which Linux answers
+    /// before it touches the caller's bytes.
+    pub(crate) fn pre_write(&self) -> VfsResult<()> {
+        self.check_writable()?;
+        crate::vfs::may_modify(&self.inode)?;
+        if crate::vfs::is_append_only(&self.inode)
+            && self.status.load(Ordering::Relaxed) & O_APPEND == 0
+        {
+            return Err(VfsError::NotPermitted);
         }
         Ok(())
     }
@@ -457,7 +493,7 @@ impl File {
     /// The `write(2)` door refuses an `O_RDONLY` descriptor with `EBADF`, the same
     /// per-description rule as [`Self::check_readable`], covering
     /// `write`/`writev`/`pwrite`/`pwritev2`/`splice`/`copy_file_range`.
-    fn check_writable(&self) -> VfsResult<()> {
+    pub(crate) fn check_writable(&self) -> VfsResult<()> {
         if self.may_write() {
             Ok(())
         } else {
@@ -509,21 +545,14 @@ impl File {
     }
 
     fn write_reporting(&self, buf: &[u8], report: bool) -> VfsResult<usize> {
-        // Wrong-mode first, as for `read`: Linux answers a `write(2)` on an
-        // `O_RDONLY` descriptor with `EBADF`, including for a zero-length write.
-        self.check_writable()?;
-        // Then the inode's own flags, which is Linux's `rw_verify_area` and the
-        // reason the check is here rather than only at the open: an inode can
-        // become immutable between the two, and the flag is a fact about the
-        // *file*, not about the description. The two flags differ, and the
-        // difference is the whole of what they mean: an immutable file refuses
-        // the write, an append-only one refuses a write that is not going to its
-        // end.
-        crate::vfs::may_modify(&self.inode)?;
+        // Wrong mode, then the inode's own flags - Linux's `rw_verify_area`,
+        // which is a fact about the *file* and so is re-asked on every write
+        // rather than trusted from the open. Both live in `pre_write` because
+        // the syscall layer has to ask the same two questions before it looks
+        // at the caller's bytes, and one prefix spelled twice is how the two
+        // doors come to disagree.
+        self.pre_write()?;
         let status = self.status.load(Ordering::Relaxed);
-        if crate::vfs::is_append_only(&self.inode) && status & O_APPEND == 0 {
-            return Err(VfsError::NotPermitted);
-        }
         // `O_APPEND` decides the position here rather than at the open,
         // because that is what the flag promises: the end of the file *now*,
         // re-read on every write, so a description held open while somebody
@@ -1062,6 +1091,40 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>, flags: usize) -> VfsR
         None => inode,
     };
     current_table().install(Arc::new(File::new(inode)))
+}
+
+/// Everything a `read`-shaped call answers **before** it looks at the caller's
+/// buffer: the description's mode, whether it names a file at all, and the
+/// node's kind.
+///
+/// The syscall layer holds the user pointer, so it is the layer that judges the
+/// buffer - but it can only judge it in Linux's order if it can ask these three
+/// questions first. Measured on a current host (Linux 7.2.14,
+/// `build/scratch/rworder/o.c`): `read(-1, BAD, 8)` is `EBADF` and
+/// `read(dir, BAD, 8)` is `EISDIR`, where a door that validated the buffer first
+/// answers `EFAULT` to both. `docs/notes/` §6.133.
+pub fn pre_read(fd: RawFd) -> VfsResult<()> {
+    current_table().get(fd)?.pre_read()
+}
+
+/// [`pre_read`]'s write half: the wrong-mode refusal, the inode's flags and the
+/// append-only rule, all of which Linux answers before it reads a byte.
+pub fn pre_write(fd: RawFd) -> VfsResult<()> {
+    current_table().get(fd)?.pre_write()
+}
+
+/// The mode half of [`pre_read`], for the vectored doors - which ask the
+/// descriptor and the `iovcnt` before the *node's kind*, because Linux imports
+/// the iovec array first and only meets the kind inside the transfer it drives
+/// (`readv(dir, BAD, 1)` is `EFAULT`, `readv(dir, one, 1)` is `EISDIR`;
+/// `build/scratch/rworder/{z,x}.c`).
+pub fn pre_read_mode(fd: RawFd) -> VfsResult<()> {
+    current_table().get(fd)?.check_readable()
+}
+
+/// The mode half of [`pre_write`], for the same reason and the same doors.
+pub fn pre_write_mode(fd: RawFd) -> VfsResult<()> {
+    current_table().get(fd)?.check_writable()
 }
 
 /// Read at the description's cursor, advancing it.

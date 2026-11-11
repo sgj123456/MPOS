@@ -4900,8 +4900,14 @@ fn stream_len(len: usize) -> usize {
 pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf) = (args[0], args[1]);
     let len = stream_len(args[2]);
-    if !buffer_ok(buf, len, true, from_user) {
-        return err::EFAULT;
+    // The descriptor and the node come first, the buffer last: Linux asks
+    // "is this a readable description of something that can be read" before it
+    // asks "can I write to the caller's bytes". Measured on a current host
+    // (Linux 7.2.14, `build/scratch/rworder/o.c`): `read(-1, BAD, 8)` is
+    // `EBADF` and `read(dir, BAD, 8)` is `EISDIR`, where this door used to
+    // answer `EFAULT` to both - the divergence `docs/notes/` §6.133 records.
+    if let Err(e) = crate::vfs::pre_read(fd as i32) {
+        return err_of(e);
     }
     // A socket descriptor reads like a file to `read(2)` - the same call,
     // routed to the stack. `recvfrom` with null source slots is exactly the
@@ -4913,11 +4919,17 @@ pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if is_socket {
         return socket_read([fd, buf, len, 0, 0, 0], from_user);
     }
+    // A zero-length read is a success for a description that can read at all,
+    // and the buffer is not looked at: `read(mut, BAD, 0)` is 0 on the host
+    // (`build/scratch/rworder/z.c`).
     if len == 0 {
         return match crate::vfs::read(fd as i32, &mut []) {
             Ok(_) => 0,
             Err(e) => err_of(e),
         };
+    }
+    if !buffer_ok(buf, len, true, from_user) {
+        return err::EFAULT;
     }
     let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
     match crate::vfs::read(fd as i32, bytes) {
@@ -4969,8 +4981,11 @@ pub(crate) fn raise_sigpipe(_fd: i32, _suppressed: bool) {}
 pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf) = (args[0], args[1]);
     let len = stream_len(args[2]);
-    if !buffer_ok(buf, len, false, from_user) {
-        return err::EFAULT;
+    // The write half of the same order, and the same measurement: `write(-1,
+    // BAD, 8)` is `EBADF` and `write(dir, one, 8)` is `EBADF` before the
+    // buffer is ever looked at (`build/scratch/rworder/{o,z2}.c`).
+    if let Err(e) = crate::vfs::pre_write(fd as i32) {
+        return err_of(e);
     }
     // The write half of the socket split: `sendto` with no destination,
     // which for a connected socket is the whole of `write`'s contract.
@@ -4986,6 +5001,9 @@ pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             Ok(_) => 0,
             Err(e) => err_of(e),
         };
+    }
+    if !buffer_ok(buf, len, false, from_user) {
+        return err::EFAULT;
     }
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
     match crate::vfs::write(fd as i32, bytes) {
@@ -5463,9 +5481,23 @@ pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 fn writev_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
-    if iov_cnt > 1024 {
-        return err::EINVAL;
+    // Linux's order for the vectored doors, measured on a current host (Linux
+    // 7.2.14, `build/scratch/rworder/{v,x,z2}.c`): the *description* first
+    // (`writev(ro, BAD, 1)` and `writev(-1, one, 1025)` are both `EBADF`), then
+    // the count (`writev(mut, BAD, 1025)` is `EINVAL` - the count is judged
+    // before the array it describes), then the array itself
+    // (`writev(mut, BAD, 1)` is `EFAULT`), and only then each iovec's buffer.
+    //
+    // The count is an `int` on the wire, so a value that is negative when read
+    // as one is `EINVAL` - but only after the descriptor has answered, which is
+    // why `writev(-1, one, -1)` is `EBADF` rather than `EINVAL`.
+    if let Err(e) = crate::vfs::pre_write_mode(fd) {
+        return err_of(e);
     }
+    let iov_cnt = match abi::iov_count_verdict(iov_cnt) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
     let iov_size = 16;
     if !buffer_ok(iov_ptr, iov_cnt * iov_size, false, from_user) {
         return err::EFAULT;
@@ -5548,9 +5580,17 @@ pub fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 fn readv_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
-    if iov_cnt > 1024 {
-        return err::EINVAL;
+    // The read half of `writev_inner`'s order, and the same measurement:
+    // `readv(-1, one, 1025)` is `EBADF`, `readv(mut, BAD, 1025)` is `EINVAL`,
+    // `readv(mut, BAD, 1)` is `EFAULT`, and only a good array reaches the kind
+    // (`readv(dir, BAD, 1)` is `EFAULT` where `readv(dir, one, 1)` is `EISDIR`).
+    if let Err(e) = crate::vfs::pre_read_mode(fd) {
+        return err_of(e);
     }
+    let iov_cnt = match abi::iov_count_verdict(iov_cnt) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
     let iov_size = 16;
     if !buffer_ok(iov_ptr, iov_cnt * iov_size, false, from_user) {
         return err::EFAULT;
@@ -5684,11 +5724,15 @@ pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return err::EINVAL;
     }
     let len = stream_len(args[2]);
+    // The offset is judged first (above), then the description, and only then
+    // the caller's buffer: `pread64(ro, BAD, 8, 0)` is `EFAULT` but
+    // `pread64(-1, BAD, 8, 0)` is `EBADF` and `pread64(ro, BAD, 8, -1)` is
+    // `EINVAL` (`build/scratch/rworder/{p,y}.c`).
+    if let Err(e) = crate::vfs::pre_read(fd) {
+        return err_of(e);
+    }
     if !buffer_ok(buf, len, true, from_user) {
         return err::EFAULT;
-    }
-    if !crate::sched::current_fds().clone_at(fd).is_ok() {
-        return err::EBADF;
     }
     at_position(fd, offset, || {
         let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
@@ -5711,11 +5755,15 @@ pub fn handle_pwrite64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return err::EINVAL;
     }
     let len = stream_len(args[2]);
+    // Same three questions as `handle_pread64`, in the same order and for the
+    // same measurement: `pwrite64(ro, BAD, 8, 0)` is `EBADF` where
+    // `pwrite64(mut, BAD, 8, 0)` copies and answers 8
+    // (`build/scratch/rworder/{p,copy}.c`).
+    if let Err(e) = crate::vfs::pre_write(fd) {
+        return err_of(e);
+    }
     if !buffer_ok(buf, len, false, from_user) {
         return err::EFAULT;
-    }
-    if !crate::sched::current_fds().clone_at(fd).is_ok() {
-        return err::EBADF;
     }
     at_position(fd, offset, || {
         let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
@@ -5745,8 +5793,18 @@ fn io_at_position(
     if offset < 0 {
         return err::EINVAL;
     }
-    if !crate::sched::current_fds().clone_at(fd).is_ok() {
-        return err::EBADF;
+    // The offset, then the description's mode; the `iovcnt`, the array and each
+    // iovec follow inside `readv`/`writev`, which is Linux's order too - and
+    // the kind is asked only inside the transfer, which is why
+    // `readv(dir, BAD, 1)` is `EFAULT` rather than `EISDIR`
+    // (`build/scratch/rworder/{w,x}.c`).
+    let mode = if writing {
+        crate::vfs::pre_write_mode(fd)
+    } else {
+        crate::vfs::pre_read_mode(fd)
+    };
+    if let Err(e) = mode {
+        return err_of(e);
     }
     at_position(fd, offset, || {
         if writing {

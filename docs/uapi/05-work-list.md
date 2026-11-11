@@ -10874,3 +10874,44 @@ machine (13 claims, `PASS`), twelve consecutive host runs green.
 
 **Landed:** `user/tests/src/bin/t-rr-interval.rs`. **Named gap:** none — this is a pin correction, and
 the kernel behaviour it guards was already landed by §6.127.
+
+### Item 247 — `read`/`write` answer about the descriptor before they answer about the buffer
+
+| | Linux | this kernel, before | this kernel, now |
+|---|---|---|---|
+| `read(-1, BAD, 8)` | `EBADF` | `EFAULT` | `EBADF` |
+| `write(-1, BAD, 8)` | `EBADF` | `EFAULT` | `EBADF` |
+| `read(dir, BAD, 8)` | `EISDIR` | `EFAULT` | `EISDIR` |
+| `read(fd, BAD, 8)` | `EFAULT` | `EFAULT` | `EFAULT` |
+| `read(-1, BAD, 0)` | `EBADF` | `EBADF` | `EBADF` |
+| `readv(-1, bad1, 1)` | `EBADF` | `EFAULT` | `EBADF` |
+| `readv(dir, BAD, 1)` | `EFAULT` (array before kind) | `EFAULT` | `EFAULT` |
+| `readv(mut, one, 1025)` | `EINVAL` | `EINVAL` | `EINVAL` |
+| `pread64(ro, BAD, 8, -1)` | `EINVAL` (offset first) | `EINVAL` | `EINVAL` |
+| `write(/dev/null, BAD, 8)` | `8` (the node copies nothing) | `EFAULT` | `EFAULT` — **named gap** |
+
+**Why the order is part of the ABI.** Two things can be wrong with one call and the caller branches on
+the single errno it gets. Linux resolves the descriptor first, so a caller that also passed a garbage
+pointer is told about the descriptor it also got wrong; this kernel validated the buffer in the door's
+first statement, so the same caller was told to fix a pointer it had not yet handed to anything.
+
+**What the fix moved.** The prefix lived *inlined* in `File::read`/`File::write_reporting` — correct
+order, unreachable from the doors above. It is now `File::pre_read`/`File::pre_write`, with
+`crate::vfs::pre_read`/`pre_write` (whole prefix) and `pre_read_mode`/`pre_write_mode` (mode only, which
+is what the vectored doors need because Linux judges their array before their kind). `handle_read`/
+`handle_write` ask the prefix and only then validate the buffer; the two `*_inner` vectored loops ask
+mode, then count (`abi::iov_count_verdict`, host-tested: the register is a `usize`, so `-1` arrives as
+`usize::MAX`), then the array; `handle_pread64`/`handle_pwrite64` keep the offset first; `io_at_position`
+asks the mode after the offset.
+
+**Measurement:** `build/scratch/rworder/{o,z,p,v,w,x,y,z2,copy,copy2}.c`, host 7.2.14, every call at the
+raw-syscall level. **Pin:** `user/tests/src/bin/t-rw-precedence.rs`, eleven `(errno, value)` claims;
+`PASS` on the machine (`build/boot-rworder2.log`) and on the host; **4 of 11 red** counterfactually with
+the four source files reverted (`build/boot-rworder-cf1.log`), every red reading `(14, -1)` where Linux
+answers `(9, -1)` or `(21, -1)`.
+
+**Named gap:** `write(/dev/null, BAD, 8)` still answers `EFAULT` here where Linux answers `8`. This
+kernel validates the caller's buffer once, up front, so a node that copies nothing still passes through
+the validation; closing it means moving the fault-in to the copy site, which is a VFS-wide change (every
+reader and writer would own its own faulting copy) and not a field. The pin carries the divergence as a
+printed observation that accepts both answers, so it turns green when the gap closes.

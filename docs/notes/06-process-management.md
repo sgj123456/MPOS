@@ -11476,3 +11476,123 @@ often than not. The first half held in 8/8 pairable runs and 5/5 rounds; the sec
 *Two reads of one moving record are not an invariant, and a pin that needs a control in the same
 window is telling you which half is the contract.* The direction is the promise; the rate is the
 host's load average wearing a syscall's name.
+
+## §6.133 `read`/`write` ask about the descriptor before they ask about the buffer (LANDED 2026-11-11)
+
+`read(-1, bad_pointer, 8)` has two things wrong with it and only one answer. Linux answers `EBADF`:
+the descriptor is resolved first, and a caller that got its buffer from an arithmetic bug is told
+about the descriptor it also got wrong. This kernel answered `EFAULT`, because all four of
+`handle_read`/`handle_write`/`handle_readv`/`handle_writev` validated the caller's buffer in their
+first statement — before they had looked at the descriptor at all. A caller told to fix a pointer
+never learns that the number it passed is not open.
+
+### What Linux does, measured
+
+`build/scratch/rworder/{o,z,p,v,w,x,y,z2,copy,copy2}.c`, a current host (Linux 7.2.14), `BAD =
+(void *)1`, every call at the raw-syscall level:
+
+```text
+read(-1, BAD, 8)        = -1 errno=9    (EBADF)
+read(fd, BAD, 8)        = -1 errno=14   (EFAULT)
+read(dir, BAD, 8)       = -1 errno=21   (EISDIR)   <- the descriptor wins
+read(dir, BAD, 0)       = -1 errno=21              <- kind is judged before the length
+read(mut, BAD, 0)       =  0 errno=0               <- length zero short-circuits the buffer
+read(-1, BAD, 0)        = -1 errno=9               <- but never the descriptor
+write(-1, BAD, 8)       = -1 errno=9
+write(rw=/dev/null, BAD, 8) =  8 errno=0           <- the node copies nothing
+readv(-1, bad1, 1)      = -1 errno=9               <- descriptor before the array
+readv(mut, bad1, 1)     = -1 errno=14
+readv(dir, BAD, 1)      = -1 errno=14              <- the array before the kind
+readv(dir, one, 1)      = -1 errno=21
+readv(-1, one, 1025)    = -1 errno=9               <- descriptor before the count
+readv(mut, one, 1025)   = -1 errno=22              <- the count before the array
+readv(mut, BAD, 1025)   = -1 errno=22
+pread64(ro, BAD, 8, -1) = -1 errno=22              <- the offset before everything
+pread64(-1, BAD, 8, 0)  = -1 errno=9
+pread64(ro, BAD, 8, 0)  = -1 errno=14
+pwrite64(mut=/dev/null, BAD, 8, 0) = 8 errno=0
+write(null, BAD, 8)     =  8 errno=0
+write(full, BAD, 8)     = -1 errno=28              (ENOSPC, still no dereference)
+read(null, BAD, 8)      =  0 errno=0
+read(empty pipe, BAD, 8)=  0 errno=0
+read(zero, BAD, 8)      = -1 errno=14              <- /dev/zero does write the buffer
+```
+
+Four questions in a fixed order, and the answers are separable because the host distinguishes them:
+
+1. **the offset**, when the call has one — `offset < 0` is `EINVAL` before the descriptor is even
+   resolved (`pread64(-1, BAD, 8, -1)` is `EINVAL`, not `EBADF`);
+2. **the descriptor** — `EBADF`, including the wrong mode (`O_WRONLY` read, `O_RDONLY` write) and
+   including length zero;
+3. **the kind** for the scalar doors (`EISDIR`), but *after* the iovec array for the vectored ones;
+4. **the caller's buffer** — and only a node that actually moves bytes ever asks. `/dev/null`'s
+   write answers its length without reading the buffer, `/dev/full` answers `ENOSPC` without reading
+   it, an empty pipe's read answers 0 without writing it. `/dev/zero` does write it, and faults.
+
+### Why this kernel was wrong, and what the fix moved
+
+The VFS layer was already right and said so in a comment: `File::read` checked readability, then
+`refuses_file_io`, then `NodeKind::Dir`, and only then looked at `buf.is_empty()`. The syscall doors
+above it jumped the queue with `buffer_ok(...)` in their first statement, so the layer that knew the
+order never got asked. Two things were missing rather than wrong:
+
+- the prefix was **inlined** in `File::read`/`File::write_reporting`, so no caller could ask for it
+  without also performing the transfer;
+- there was no way to ask for **just the mode**, which is what the vectored doors need, because Linux
+  judges their array before their kind.
+
+So the fix splits the prefix out of both:
+
+- `File::pre_read` / `File::pre_write` (`src/vfs/file.rs`) hold the whole scalar prefix in Linux's
+  order; `File::read` and `File::write_reporting` now open with `self.pre_read()?` /
+  `self.pre_write()?`, so the two doors and the two transfer paths cannot drift apart.
+- `crate::vfs::pre_read`/`pre_write` (the full prefix) and `pre_read_mode`/`pre_write_mode` (mode
+  only) are the two questions the syscall layer can ask, re-exported from `src/vfs/mod.rs`.
+- `handle_read`/`handle_write` ask `pre_read`/`pre_write` first and move `buffer_ok` to after the
+  zero-length short-circuit; `readv_inner`/`writev_inner` ask the *mode* first, then the count, then
+  the array; `handle_pread64`/`handle_pwrite64` keep the offset first and then ask the full prefix;
+  `io_at_position` (the `preadv`/`pwritev` pair) asks the mode after the offset, and the count and
+  array follow inside `readv`/`writev`.
+- `abi::iov_count_verdict` (`src/syscall/linux/abi.rs`) is the count question, host-tested: the
+  register carries a `usize`, so a caller's `-1` arrives as `usize::MAX` and a plain `> 1024` test
+  calls it too large rather than negative. The answer is the same `EINVAL` either way — by accident,
+  which is not a rule. The verdict reads it as `i32`, keeps `0..=1024`, and returns the count so
+  every caller uses the vetted number rather than re-deriving it.
+
+### The pin, and the claim that had to become an observation
+
+`user/tests/src/bin/t-rw-precedence.rs`, eleven claims, each written as an `(errno, value)` pair
+because the errno alone does not say whether the call did any work: descriptor-before-buffer for
+`read` and `write`, directory-before-buffer, buffer-is-`EFAULT`-when-the-descriptor-is-good, the same
+call with a real buffer, both zero-length `EBADF`s, descriptor-before-array for `readv`, array-is-
+`EFAULT` when the descriptor is good, and the same `readv` with a real vector.
+
+Two of them moved during the work:
+
+- the real-`readv` claim was `got.1 == 8`; on the machine it reads 2, because the scalar read before
+  it already advanced `/proc/uptime`'s position. A door promises a short read, not a particular
+  count, so the claim is now `got.1 > 0 && got.1 <= 8`.
+- the `/dev/null` claim started as `write(rw, BAD, 8) == (0, 8)`, which is Linux's answer and this
+  kernel's *named gap* (§6.133, below). It is now a printed observation that accepts both answers,
+  so the divergence stays visible in the log instead of being hidden by a document. A claim that
+  passes on both kernels pins nothing, and pretending otherwise would be the worse error.
+
+Counterfactually, with the four source files reverted and both binaries rebuilt, **4 of 11 are red**:
+the three descriptor-before-buffer claims and `readv`'s descriptor-before-array — every one reading
+`(14, -1)` where Linux answers `(9, -1)`/`(21, -1)`. The other seven are green on both kernels and
+are controls, not evidence.
+
+### The named gap this leaves
+
+`write(/dev/null, BAD, 8)` still answers `EFAULT` here where Linux answers 8, and the reason is not
+the door: this kernel validates the caller's buffer **once, up front**, and a node that copies
+nothing still passes through that validation. Closing it means moving the fault-in to the copy site —
+every reader and writer would own its own faulting copy, which is a VFS-wide change and not a field.
+It stays named rather than approximated, and the pin's observation line is what will turn green when
+it closes.
+
+### The rule
+
+*Which question a door asks first is part of the answer it gives.* Two things can be wrong at once
+and the caller branches on the errno; a kernel that judges the cheap argument first hands back a
+refusal about something the caller had not yet committed to.

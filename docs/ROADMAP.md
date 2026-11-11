@@ -2309,3 +2309,18 @@ carries the per-phase history.*
   claim only on the machine — where the answer is taken under the same table lock, so there is no
   window — and leaves the stopped child's claim unconditional (stable 5/5 rounds on the host). Twelve
   consecutive host runs green, machine 13/13. (§6.132, item 246)
+- [x] **`read`/`write` ask about the descriptor before the buffer** — `read(-1, bad_pointer, 8)` has two
+  things wrong with it and Linux answers `EBADF`; this kernel answered `EFAULT` because all four of
+  `handle_read`/`handle_write`/`handle_readv`/`handle_writev` validated the caller's buffer in their
+  first statement, before resolving the descriptor. `build/scratch/rworder/{o,z,p,v,w,x,y,z2,copy,
+  copy2}.c` measured the host's whole order: offset (`pread` only) → descriptor (`EBADF`, including
+  wrong mode and length zero) → kind for the scalar doors (`EISDIR`, but *after* the iovec array for the
+  vectored ones) → the caller's buffer, and only a node that actually moves bytes ever asks. The VFS
+  layer already had the order right and said so in a comment, but the prefix was inlined in
+  `File::read`/`File::write_reporting`, unreachable from the doors above; it is now `File::pre_read`/
+  `pre_write` behind `vfs::pre_read`/`pre_write` and `pre_read_mode`/`pre_write_mode` (mode only, what
+  the vectored doors need), with `abi::iov_count_verdict` reading the count as Linux's `int` rather than
+  the register's `usize`. Pin `t-rw-precedence` (11 `(errno, value)` claims) is `PASS` on both arms and
+  **4 of 11 red** counterfactually. Named gap: `write(/dev/null, BAD, 8)` still answers `EFAULT` where
+  Linux answers `8`, because the fault-in happens once up front rather than at the copy site — a
+  VFS-wide change, carried as a printed observation in the pin. (§6.133, item 247)

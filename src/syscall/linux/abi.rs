@@ -4224,6 +4224,28 @@ pub(crate) fn timer_settime_flags_verdict(word: usize) -> Result<(), isize> {
     Ok(())
 }
 
+/// `readv`/`writev`'s `iovcnt` is a 32-bit `int`, and the range Linux accepts
+/// is `0..=1024` (`UIO_MAXIOV`).
+///
+/// Three separate facts make this a function rather than an `if`: the register
+/// carries a `usize`, so a caller's `-1` arrives as `usize::MAX` and a plain
+/// `> 1024` test would call it too large rather than negative - the same
+/// `EINVAL` either way, but only by accident; the bound is inclusive of a
+/// thousand and twenty-four; and the answer is **the count**, because every
+/// caller that has one has to use it afterwards. Measured on a current host
+/// (Linux 7.2.14, `build/scratch/rworder/{v,x}.c`): `readv(mut, one, 1025)`
+/// and `readv(mut, one, -1)` are both `EINVAL`, while `readv(-1, one, -1)` is
+/// `EBADF` - the descriptor answers before the count, which is why this is
+/// asked *after* the mode in both doors.
+pub(crate) fn iov_count_verdict(count: usize) -> Result<usize, isize> {
+    const MAX_IOV: i32 = 1024;
+    let n = count as i32;
+    if !(0..=MAX_IOV).contains(&n) {
+        return Err(err::EINVAL);
+    }
+    Ok(n as usize)
+}
+
 /// `setitimer`/`getitimer`'s `which` is a 32-bit `int`, not the `usize` the
 /// syscall register carries. Linux's `do_setitimer` takes it into an `int`, so
 /// a caller whose word has anything above bit 31 is really naming the low
@@ -7424,6 +7446,20 @@ mod diskstat_tests {
     /// `timer_settime`'s flags word: a 32-bit `unsigned int` whose only named
     /// bit is `TIMER_ABSTIME`. The host measured `final.c` arming the timer for
     /// every word here except the ABSTIME ones, and `2^32` truncating to 0 —
+    /// `readv`/`writev`'s count is Linux's `int` and Linux's `UIO_MAXIOV`:
+    /// `1024` is the last count that is a count, and a register holding `-1`
+    /// is negative rather than enormous (`build/scratch/rworder/{v,x}.c`).
+    #[test]
+    fn an_iov_count_is_an_int_up_to_unixs_own_bound() {
+        assert_eq!(iov_count_verdict(0), Ok(0));
+        assert_eq!(iov_count_verdict(1), Ok(1));
+        assert_eq!(iov_count_verdict(1024), Ok(1024));
+        assert_eq!(iov_count_verdict(1025), Err(err::EINVAL));
+        assert_eq!(iov_count_verdict(usize::MAX), Err(err::EINVAL));
+        assert_eq!(iov_count_verdict(0x1_0000_0000), Ok(0));
+        assert_eq!(iov_count_verdict(0x1_0000_0401), Err(err::EINVAL));
+    }
+
     /// before §6.124 the door refused all but `flags = 0`.
     #[test]
     fn timer_settime_flags_ignore_every_bit_but_abstime() {
