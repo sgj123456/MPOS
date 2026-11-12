@@ -1073,6 +1073,42 @@ pub(crate) struct Task {
     /// own. A group's figure is `Mm::minflt`; this is the per-thread one, and
     /// the two differ the moment a process has two threads.
     pub(crate) minflt: core::sync::atomic::AtomicU64,
+    /// What this thread has asked the kernel to move, and how many times -
+    /// `/proc/<pid>/io`'s first four lines, per thread.
+    ///
+    /// Linux keeps four counters and they answer four different questions:
+    /// `rchar`/`wchar` are the **bytes returned to (or taken from) the caller**,
+    /// and `syscr`/`syscw` are the **calls**, counted once per system call
+    /// whatever the vector's length. Measured on a current host (Linux 7.2.14,
+    /// `build/scratch/pidio/charge3.c`, a child performing one call per round
+    /// while its parent reads `/proc/<pid>/io` around it):
+    ///
+    /// ```text
+    /// read(8) from a file           ret=8   drchar=9   dsyscr=2
+    /// read(fd, buf, 0)              ret=0   drchar=1   dsyscr=2
+    /// read(8) bad buffer (EFAULT)   ret=-1  drchar=1   dsyscr=2
+    /// read(dir) (EISDIR)            ret=-1  drchar=1   dsyscr=2
+    /// read(-1) (EBADF)              ret=-1  drchar=1   dsyscr=1
+    /// readv(2 x 2 bytes)            ret=4   drchar=5   dsyscr=2
+    /// write(/dev/null, 8)           ret=8   dwchar=25  dsyscw=3
+    /// write(ro fd) (EBADF)          ret=-1  dwchar=17  dsyscw=2
+    /// ```
+    ///
+    /// The `+1` on every row is the child's own `read` of its command byte, and
+    /// the `+2` on `syscr` is that read plus the call under test; what matters
+    /// is which rows move the *call* column and which do not. So the charge sits
+    /// **after** the descriptor and mode checks and **at the point the answer is
+    /// known**: `EBADF` never reaches it, while `EISDIR` and `EFAULT` do - a
+    /// refused call was still a call, and Linux counts it as one. `rchar` takes
+    /// the **return value**, which is why a failed read adds zero bytes but a
+    /// successful one adds exactly what it returned.
+    ///
+    /// Atomics for `cpu_user`'s reason: the charge happens in the syscall path
+    /// with interrupts maskable and must not allocate.
+    pub(crate) rchar: core::sync::atomic::AtomicU64,
+    pub(crate) wchar: core::sync::atomic::AtomicU64,
+    pub(crate) syscr: core::sync::atomic::AtomicU64,
+    pub(crate) syscw: core::sync::atomic::AtomicU64,
     /// The moment this task came into being, in `since_boot_nanos` - what
     /// `/proc/<pid>/stat`'s field 22 (`starttime`) reports, in the `USER_HZ`
     /// ticks Linux counts it in.
@@ -1651,6 +1687,10 @@ impl Task {
             context: Context::empty(),
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            rchar: core::sync::atomic::AtomicU64::new(0),
+            wchar: core::sync::atomic::AtomicU64::new(0),
+            syscr: core::sync::atomic::AtomicU64::new(0),
+            syscw: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
             minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),
@@ -2433,6 +2473,10 @@ impl Table {
             context,
             cpu_user: core::sync::atomic::AtomicU64::new(0),
             cpu_system: core::sync::atomic::AtomicU64::new(0),
+            rchar: core::sync::atomic::AtomicU64::new(0),
+            wchar: core::sync::atomic::AtomicU64::new(0),
+            syscr: core::sync::atomic::AtomicU64::new(0),
+            syscw: core::sync::atomic::AtomicU64::new(0),
             nvcsw: core::sync::atomic::AtomicU64::new(0),
             minflt: core::sync::atomic::AtomicU64::new(0),
             nivcsw: core::sync::atomic::AtomicU64::new(0),

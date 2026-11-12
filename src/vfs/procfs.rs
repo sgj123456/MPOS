@@ -873,6 +873,26 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
     })
 }
 
+/// [`maybe_file`] whose own permission word is `0400`, for the two files Linux
+/// narrows that way.
+///
+/// `/proc/<pid>/io` is the second one: it reports another process's activity -
+/// which files it touched and how much - so it belongs to its owner exactly as
+/// `environ` does. Measured on a current host (`build/scratch/pidio/perm.c`,
+/// Linux 7.2.14): `/proc/1/io` read by uid 1000 answers `EACCES`. `env_file`
+/// above is the first; the two differ only in the generator they carry.
+fn owner_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(generate),
+        mode: 0o400,
+        size: 0,
+        describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
+    })
+}
+
 /// A file whose length is known when the tree is built rather than when it is
 /// read.
 ///
@@ -1690,6 +1710,72 @@ fn wchan_text(tid: usize) -> Option<String> {
     #[cfg(not(target_os = "none"))]
     {
         let _ = tid;
+        None
+    }
+}
+
+/// `/proc/<pid>/io`'s seven lines, rendered from the counters.
+///
+/// A pure function so the shape is pinned by a host test - the numbers come from
+/// a task table the host does not have, but the *format* is this file's whole
+/// contract and is checkable anywhere. Measured on a current host (Linux 7.2.14,
+/// `build/scratch/pidio/shape.c`), byte for byte:
+///
+/// ```text
+/// rchar: 2026894
+/// wchar: 23323
+/// syscr: 772
+/// syscw: 58
+/// read_bytes: 0
+/// write_bytes: 24576
+/// cancelled_write_bytes: 0
+/// ```
+///
+/// Seven lines, `name: value`, one space after the colon, a newline after every
+/// line including the last, and no padding or alignment - the numbers are plain
+/// decimal and the names are exactly these.
+///
+/// The last three are **zero here, and that is a named gap rather than an
+/// answer**: they count bytes that actually reached or came from a device
+/// (`read_bytes`/`write_bytes`) and writes that were cancelled before they did
+/// (`cancelled_write_bytes`). This kernel's ext4 cache knows a fill from a hit,
+/// but nothing counts *device-layer* bytes per task, so a number would be
+/// invented. Linux's own measurement (`build/scratch/pidio/storage.c`): a cold
+/// 4 KiB read moved `read_bytes` by 4096, a second read of the same file moved it
+/// again, and `read(/dev/zero)` moved `rchar` by 8528 while `read_bytes` stayed
+/// put. See `docs/notes/` §6.135.
+fn io_text(rchar: u64, wchar: u64, syscr: u64, syscw: u64) -> alloc::string::String {
+    alloc::format!(
+        "rchar: {rchar}\n\
+         wchar: {wchar}\n\
+         syscr: {syscr}\n\
+         syscw: {syscw}\n\
+         read_bytes: 0\n\
+         write_bytes: 0\n\
+         cancelled_write_bytes: 0\n"
+    )
+}
+
+/// The `io` file's body for one task, or `None` when it is not there.
+///
+/// Two readings, one per spelling: `/proc/<pid>/io` is the **group's** totals and
+/// `/proc/<pid>/task/<tid>/io` is that thread's own - measured on a current host
+/// (`build/scratch/pidio/shape.c`): a process whose worker had read 352402 bytes
+/// read `rchar: 2026894` in its own file and `352402` in the worker's.
+fn io_body(slot: usize, whole: bool) -> Option<alloc::string::String> {
+    #[cfg(target_os = "none")]
+    {
+        let id = crate::sched::TaskId(slot);
+        let (rchar, wchar, syscr, syscw) = if whole {
+            crate::sched::io_of_group(id)?
+        } else {
+            crate::sched::io_of(id)?
+        };
+        Some(io_text(rchar, wchar, syscr, syscw))
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (slot, whole);
         None
     }
 }
@@ -3462,6 +3548,15 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // `/proc/<pid>/task/<leader>/wchan` both read `0` while
     // `/proc/<pid>/task/<worker>/wchan` reads `anon_pipe_read`.
     node.add("wchan", NodeKind::File, maybe_file(move || wchan_text(tid)));
+    // The bytes and calls *this thread* moved - the per-thread spelling, where
+    // `/proc/<pid>/io` is the group's. Measured (`build/scratch/pidio/shape.c`,
+    // Linux 7.2.14): a process whose worker had read 352402 bytes read
+    // `rchar: 2026894` in its own file and `352402` here.
+    node.add(
+        "io",
+        NodeKind::File,
+        owner_file(move || io_body(tid, false)),
+    );
     node.add(
         "children",
         NodeKind::File,
@@ -3816,6 +3911,14 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         "statm",
         NodeKind::File,
         maybe_file(move || statm_line(slot)),
+    );
+    // The group's byte and call counters - `/proc/<pid>/io`'s seven lines. The
+    // three device-layer lines are a named gap and print zero rather than a
+    // number nothing counts ([`io_text`] carries the measurement).
+    node.add(
+        "io",
+        NodeKind::File,
+        owner_file(move || io_body(slot, true)),
     );
     // The wait *this thread* is in now - `stat`'s field 35 is the same task's
     // *last* park, and the two are different answers on purpose
@@ -6186,6 +6289,59 @@ mod tests {
         assert_eq!(file(|| String::new()).mode(), PROC_RO_FILE_MODE);
         assert_eq!(maybe_file(|| None).mode(), PROC_RO_FILE_MODE);
         assert_eq!(env_file(|| None).mode(), 0o400);
+        // `/proc/<pid>/io` is the other 0400 file, and for the same reason: it
+        // reports another process's activity. Measured (`build/scratch/pidio/perm.c`):
+        // `/proc/1/io` read by uid 1000 is `EACCES`.
+        assert_eq!(owner_file(|| None).mode(), 0o400);
+    }
+
+    /// The seven lines are the file's whole contract, so they are pinned here byte
+    /// for byte against a reading taken on a current host
+    /// (`build/scratch/pidio/shape.c`, Linux 7.2.14):
+    ///
+    /// ```text
+    /// rchar: 2026894
+    /// wchar: 23323
+    /// syscr: 772
+    /// syscw: 58
+    /// read_bytes: 0
+    /// write_bytes: 24576
+    /// cancelled_write_bytes: 0
+    /// ```
+    ///
+    /// The last three are zero on purpose - this kernel counts no device-layer
+    /// bytes per task, which is §6.135's named gap - so a test that only checked
+    /// "seven lines exist" would pass for a file that printed the wrong three
+    /// numbers. This asserts the whole body instead.
+    #[test]
+    fn the_io_file_is_linuxs_seven_lines() {
+        let body = io_text(2026894, 23323, 772, 58);
+        assert_eq!(
+            body,
+            "rchar: 2026894\n\
+         wchar: 23323\n\
+         syscr: 772\n\
+         syscw: 58\n\
+         read_bytes: 0\n\
+         write_bytes: 0\n\
+         cancelled_write_bytes: 0\n"
+        );
+        assert_eq!(body.lines().count(), 7);
+        // Every line ends in a newline, the last one included, and the separator is
+        // one space after a colon - not a tab, not padding.
+        assert!(body.ends_with('\n'));
+        for line in body.lines() {
+            let (name, value) = line.split_once(": ").expect("`name: value`");
+            assert!(!name.contains(' '), "the name carries no space: {name:?}");
+            assert!(
+                value.parse::<u64>().is_ok(),
+                "the value is decimal: {value:?}"
+            );
+        }
+        // And a zero reading is seven zeros, not an empty file: a task that has
+        // moved nothing still has an io file.
+        assert_eq!(io_text(0, 0, 0, 0).lines().count(), 7);
+        assert!(io_text(0, 0, 0, 0).contains("rchar: 0\n"));
         assert_eq!(
             ctl(|| String::new(), |_| Ok(())).mode(),
             PROC_RW_FILE_MODE,

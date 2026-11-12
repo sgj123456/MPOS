@@ -10945,3 +10945,40 @@ counterfactually). The gate's own second finding is `xtask/src/disk.rs`'s root s
 blocked in a path this kernel has no park site for would read `0` where Linux names the function.
 The table has 12 entries today and is the one list the stall dump and this file share.
 
+
+### Item 249 — `/proc/<pid>/io` reports the bytes and calls a task made
+
+| | Linux | this kernel, before |
+|---|---|---|
+| the file | `/proc/<pid>/io`, seven lines, mode **0400** | absent - the node was never added |
+| `rchar` / `wchar` | the **bytes returned to / taken from** the caller | - |
+| `syscr` / `syscw` | the **calls**, one per system call whatever the vector's length | - |
+| a refused call | `EBADF` moves neither column; `EISDIR`/`EFAULT` still move the call column | - |
+| a vectored call | one call, not one per iovec | - |
+| `task/<tid>/io` | that **thread's** own book, where the process file is the group's | - |
+| `read_bytes` / `write_bytes` / `cancelled_write_bytes` | bytes that reached / came from a device | zero, as a named gap |
+| a task another owner owns | `EACCES` (`/proc/1/io` read by uid 1000) | - |
+
+**Why the charge point is the whole item.** The plausible kernel counts bytes where the transfer
+happens, and then a refused call is invisible and a vectored call counts twice. Measured with a child
+that performs one call per round while its parent reads `/proc/<pid>/io` around it
+(`build/scratch/pidio/charge3.c`): `read(8)` moves `rchar +8, syscr +1`; a zero-length read and an
+`EFAULT` and an `EISDIR` all move `syscr +1` with `rchar +0`; an `EBADF` moves neither; a two-iovec
+read of four bytes moves `rchar +4, syscr +1`.
+
+**Why the two books are two claims.** A worker that had read 352402 bytes left the process's file
+reading `2026894` and its own reading `352402` (`build/scratch/pidio/shape.c`). A kernel with one book
+served twice would pass any single-spelling test.
+
+**Measurement:** `build/scratch/pidio/{shape,charge,charge3,storage,perm,perm2}.c` on host 7.2.14 -
+the seven-line reading, the charge table, and the storage-column behaviour in §6.135.
+
+**Landed:** `Task`'s and `Mm`'s four counters (`src/sched/runtime/{task,child_mm,child_signal}.rs`),
+the charge in the seven byte-moving doors (`src/syscall/linux/fs/file.rs`), `io_text`/`io_body`/
+`owner_file` in `src/vfs/procfs.rs` and the node at both spellings, host tests for the seven lines and
+the `0400` word, pin `user/tests/src/bin/t-proc-io.rs` (13 claims, 10 red counterfactually).
+
+**Named gaps:** the three device-layer lines print zero (nothing counts device-layer bytes per task -
+`crates/blk`'s counters are per-device, and the ext4 cache knows a fill from a hit but not its cost);
+and there is no `crchar`/`crwchar` because Linux has none either - a child's io does not fold into
+the parent, so the absence is the answer.

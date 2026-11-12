@@ -1406,6 +1406,103 @@ pub fn current_thread_switches() -> (u64, u64) {
     )
 }
 
+/// Charge one completed I/O call to the running thread and its group.
+///
+/// Called from the seven doors that move bytes - `read`, `write`, `readv`,
+/// `writev`, `pread64`, `pwrite64` and the vectored-at-position pair - at the
+/// point where the answer is known, which is what makes the counters mean what
+/// Linux's mean. `chars` is the **return value**: zero for a refusal, the count
+/// for a transfer. `calls` is always one, because Linux counts a call whether or
+/// not it moved anything - measured (`build/scratch/pidio/charge3.c`): a
+/// `read` that answered `EISDIR` or `EFAULT` still moved `syscr`, while one that
+/// answered `EBADF` did not (it never got past the descriptor).
+///
+/// `reading` picks which pair of counters moves; the other pair is untouched, so
+/// a read can never land in `wchar`.
+#[cfg(target_os = "none")]
+pub fn charge_io(reading: bool, chars: u64) {
+    with_table(|t| {
+        let current = t.tasks.get(t.current.0).and_then(|slot| slot.as_ref());
+        if let Some(task) = current {
+            // Two books, one call: the group's (`/proc/<pid>/io`) and the
+            // thread's (`/proc/<pid>/task/<tid>/io`), for `charge_cpu`'s reason.
+            task.mm.charge_io(reading, chars);
+            let (chars_counter, calls_counter) = if reading {
+                (&task.rchar, &task.syscr)
+            } else {
+                (&task.wchar, &task.syscw)
+            };
+            chars_counter.fetch_add(chars, Ordering::Relaxed);
+            calls_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// The running process's `(rchar, wchar, syscr, syscw)` - `/proc/<pid>/io`'s
+/// first four lines, the group's totals.
+#[cfg(target_os = "none")]
+pub fn current_io() -> (u64, u64, u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => task.mm.io_all(),
+            None => (0, 0, 0, 0),
+        },
+    )
+}
+
+/// The running **thread**'s own `(rchar, wchar, syscr, syscw)` -
+/// `/proc/<pid>/task/<tid>/io`. Distinct from [`current_io`], which is the
+/// group's, and the difference is what a process with two threads shows.
+#[cfg(target_os = "none")]
+pub fn current_thread_io() -> (u64, u64, u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => (
+                task.rchar.load(Ordering::Relaxed),
+                task.wchar.load(Ordering::Relaxed),
+                task.syscr.load(Ordering::Relaxed),
+                task.syscw.load(Ordering::Relaxed),
+            ),
+            None => (0, 0, 0, 0),
+        },
+    )
+}
+
+/// A task's own `(rchar, wchar, syscr, syscw)` by id - the per-thread reading
+/// for a target that is not the caller, which is what
+/// `/proc/<pid>/task/<tid>/io` needs. `None` when the slot is gone.
+#[cfg(target_os = "none")]
+pub fn io_of(id: TaskId) -> Option<(u64, u64, u64, u64)> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| {
+                (
+                    task.rchar.load(Ordering::Relaxed),
+                    task.wchar.load(Ordering::Relaxed),
+                    task.syscr.load(Ordering::Relaxed),
+                    task.syscw.load(Ordering::Relaxed),
+                )
+            })
+    })
+}
+
+/// A task's **group's** `(rchar, wchar, syscr, syscw)` by any member's id - what
+/// `/proc/<pid>/io` prints. `None` when the slot is gone.
+///
+/// The group book, not the task's: `/proc/<pid>/io` is the process's totals even
+/// when the pid names a thread, and `/proc/<pid>/task/<tid>/io` is the thread's.
+#[cfg(target_os = "none")]
+pub fn io_of_group(id: TaskId) -> Option<(u64, u64, u64, u64)> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| task.mm.io_all())
+    })
+}
+
 /// The running process's minor faults as `getrusage` splits them:
 /// `(group own, group children, this thread own)`.
 ///

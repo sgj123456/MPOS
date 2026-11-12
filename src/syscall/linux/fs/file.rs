@@ -4916,31 +4916,36 @@ pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         .clone_at(fd as i32)
         .map(|file| file.inode().socket_handle() != 0)
         .unwrap_or(false);
-    if is_socket {
-        return socket_read([fd, buf, len, 0, 0, 0], from_user);
-    }
-    // A zero-length read is a success for a description that can read at all,
-    // and the buffer is not looked at: `read(mut, BAD, 0)` is 0 on the host
-    // (`build/scratch/rworder/z.c`).
-    if len == 0 {
-        return match crate::vfs::read(fd as i32, &mut []) {
+    let answer = if is_socket {
+        socket_read([fd, buf, len, 0, 0, 0], from_user)
+    } else if len == 0 {
+        // A zero-length read is a success for a description that can read at
+        // all, and the buffer is not looked at: `read(mut, BAD, 0)` is 0 on the
+        // host (`build/scratch/rworder/z.c`).
+        match crate::vfs::read(fd as i32, &mut []) {
             Ok(_) => 0,
             Err(e) => err_of(e),
-        };
-    }
-    if !buffer_ok(buf, len, true, from_user) {
-        return err::EFAULT;
-    }
-    let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-    match crate::vfs::read(fd as i32, bytes) {
-        Ok(n) => {
-            if n > 0 {
-                notice_access(fd as i32);
-            }
-            n as isize
         }
-        Err(e) => err_of(e),
-    }
+    } else if !buffer_ok(buf, len, true, from_user) {
+        err::EFAULT
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+        match crate::vfs::read(fd as i32, bytes) {
+            Ok(n) => {
+                if n > 0 {
+                    notice_access(fd as i32);
+                }
+                n as isize
+            }
+            Err(e) => err_of(e),
+        }
+    };
+    // `/proc/<pid>/io`: the call is counted here, past the descriptor check and
+    // wherever the answer landed, with the *return value* as the byte count -
+    // `read(dir)` is `EISDIR` and still one call, `read(-1)` is `EBADF` and no
+    // call at all (`build/scratch/pidio/charge3.c`).
+    crate::sched::charge_io(true, answer.max(0) as u64);
+    answer
 }
 
 /// Raise the `SIGPIPE` a write-family door owes when it answers `EPIPE`.
@@ -4993,29 +4998,32 @@ pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         .clone_at(fd as i32)
         .map(|file| file.inode().socket_handle() != 0)
         .unwrap_or(false);
-    if is_socket {
-        return socket_write([fd, buf, len, 0, 0, 0], from_user);
-    }
-    if len == 0 {
-        return match crate::vfs::write(fd as i32, &[]) {
+    let answer = if is_socket {
+        socket_write([fd, buf, len, 0, 0, 0], from_user)
+    } else if len == 0 {
+        match crate::vfs::write(fd as i32, &[]) {
             Ok(_) => 0,
             Err(e) => err_of(e),
-        };
-    }
-    if !buffer_ok(buf, len, false, from_user) {
-        return err::EFAULT;
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-    match crate::vfs::write(fd as i32, bytes) {
-        Ok(n) => n as isize,
-        Err(crate::vfs::VfsError::BrokenPipe) => {
-            // `write(2)` carries no flags word, so nothing can suppress the
-            // signal a broken pipe or stream owes (`MSG_NOSIGNAL` is a send's).
-            raise_sigpipe(fd as i32, false);
-            err::EPIPE
         }
-        Err(e) => err_of(e),
-    }
+    } else if !buffer_ok(buf, len, false, from_user) {
+        err::EFAULT
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+        match crate::vfs::write(fd as i32, bytes) {
+            Ok(n) => n as isize,
+            Err(crate::vfs::VfsError::BrokenPipe) => {
+                // `write(2)` carries no flags word, so nothing can suppress the
+                // signal a broken pipe or stream owes (`MSG_NOSIGNAL` is a
+                // send's).
+                raise_sigpipe(fd as i32, false);
+                err::EPIPE
+            }
+            Err(e) => err_of(e),
+        }
+    };
+    // The write half of the io charge, for `handle_read`'s reason.
+    crate::sched::charge_io(false, answer.max(0) as u64);
+    answer
 }
 
 /// `close(2)` — close `fd`.
@@ -5467,6 +5475,11 @@ pub fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
 pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let n = writev_inner(args, from_user);
+    // `/proc/<pid>/io` counts a vectored call once, not once per iovec -
+    // measured (`build/scratch/pidio/charge3.c`): a two-iovec `readv` moved
+    // `syscr` by one and `rchar` by the four bytes it returned. This is also the
+    // body `pwritev`/`pwritev2` run through, so all three are charged once.
+    crate::sched::charge_io(false, n.max(0) as u64);
     // One `IN_MODIFY` for the whole call, not one per iovec: Linux reports a
     // write, and a vectored write is one however many iovecs carried it
     // (measured, `.workbuddy/probe_inotify_modify.c` - a two-iovec `writev`
@@ -5568,6 +5581,8 @@ fn writev_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 pub fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let n = readv_inner(args, from_user);
+    // The read half of the `handle_writev` charge, and the same measurement.
+    crate::sched::charge_io(true, n.max(0) as u64);
     // One `IN_ACCESS` for the whole call, not one per iovec: Linux reports a
     // read, and a vectored read is one (measured, `.workbuddy/probe_inotify_access.c`
     // scenario L - two full iovecs still answer one record). This is also the
@@ -5734,7 +5749,7 @@ pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if !buffer_ok(buf, len, true, from_user) {
         return err::EFAULT;
     }
-    at_position(fd, offset, || {
+    let answer = at_position(fd, offset, || {
         let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
         match crate::vfs::read(fd, bytes) {
             Ok(n) => {
@@ -5745,7 +5760,11 @@ pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             Err(e) => err_of(e),
         }
-    })
+    });
+    // The at-position pair is charged here rather than in `handle_read` because
+    // it does not run through it: same charge, same place in the order.
+    crate::sched::charge_io(true, answer.max(0) as u64);
+    answer
 }
 
 /// `pwrite64(fd, buf, count, offset)` — write at a position without moving it.
@@ -5765,13 +5784,15 @@ pub fn handle_pwrite64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if !buffer_ok(buf, len, false, from_user) {
         return err::EFAULT;
     }
-    at_position(fd, offset, || {
+    let answer = at_position(fd, offset, || {
         let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
         match crate::vfs::write(fd, bytes) {
             Ok(n) => n as isize,
             Err(e) => err_of(e),
         }
-    })
+    });
+    crate::sched::charge_io(false, answer.max(0) as u64);
+    answer
 }
 
 /// `preadv(fd, iov, iovcnt, offset)` / `pwritev`: the vectored pair at a

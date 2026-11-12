@@ -292,7 +292,19 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-11, `/proc/<pid>/wchan` and the sweep's root size §6.134):** stage 1
+**Latest measured gate (2026-11-12, `/proc/<pid>/io` §6.135):** stage 1 `1275 tests, 0 failed`
+(70.04 s — the +1 is `the_io_file_is_linuxs_seven_lines`); x86_64 `pass=298 fail=0 (298 built)`,
+`mpos-kunit 35 passed, 0 failed` (70.39 s over 2 lane(s), `+33.1%`); aarch64 `pass=297 fail=0 (297
+built)`, `mpos-kunit 35 passed, 0 failed` (218.81 s over 2 lane(s), `+13.6%`) — `GATE EXIT=0`, both
+arms in one command with the lane count forced (`MPOS_TEST_LANES=2`, the container being pinned to
+one CPU). `t-proc-io` ran on both arms. Counterfactually **10 of 13 red**
+(`build/boot-pidio-cf1.log`): every shape claim, the thread spelling, and all four movement claims —
+the three that stay green either way are honest boundaries ("every value is plain decimal" is true of
+the empty string, the group-holds-thread relation is true of 0/0, and the `/proc/1` claim takes the
+root branch). The three device-layer lines print zero and the pin claims nothing about their value:
+that is §6.135's named gap, not a served column.
+
+**Measured gate before it (2026-11-11, `/proc/<pid>/wchan` and the sweep's root size §6.134):** stage 1
 `1274 tests, 0 failed` (52.60 s — the +5 are `wchan`'s four vocabulary tests and
 `disk::tree_bytes`'s); x86_64 `pass=297 fail=0 (297 built)`, `mpos-kunit 35 passed, 0 failed`
 (52.87 s over 2 lane(s), `+0.0%`); aarch64 `pass=296 fail=0 (296 built)`, `mpos-kunit 35 passed, 0

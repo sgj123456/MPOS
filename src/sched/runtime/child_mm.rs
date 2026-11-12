@@ -1852,6 +1852,21 @@ pub struct Mm {
     /// `/proc/<pid>/stat`'s field 11 and `getrusage(RUSAGE_CHILDREN)`'s
     /// `ru_minflt`.
     pub(crate) cminflt: core::sync::atomic::AtomicU64,
+    /// The group's `/proc/<pid>/io` byte and call counters, folded the way
+    /// `RUSAGE_SELF` folds the threads' CPU: a process's `rchar` is its
+    /// threads' sum, and `/proc/<pid>/task/<tid>/io` is that one thread's.
+    ///
+    /// Measured on a current host (Linux 7.2.14,
+    /// `build/scratch/pidio/shape.c`): a process whose worker had read 352402
+    /// bytes read `rchar: 2026894` in its own `/proc/<pid>/io` and `352402` in
+    /// `task/<tid>/io`. A **child's** io does *not* fold into the parent -
+    /// unlike `cminflt`/`cnvcsw`, which are the reaped children's totals - so
+    /// there is no `crchar` here, and the absence is the answer: Linux has no
+    /// such line either.
+    pub(crate) rchar: core::sync::atomic::AtomicU64,
+    pub(crate) wchar: core::sync::atomic::AtomicU64,
+    pub(crate) syscr: core::sync::atomic::AtomicU64,
+    pub(crate) syscw: core::sync::atomic::AtomicU64,
     /// Where the program image sits in this address space: the ten absolute
     /// addresses `/proc/<pid>/stat` reports as fields 26-28 and 45-51.
     ///
@@ -1901,6 +1916,33 @@ pub struct Mm {
 /// themselves stay on the task that owns them, because threading is the only
 /// case where two tasks reach the same ones.
 impl Mm {
+    /// Charge one completed I/O call to this group: the bytes the call returned
+    /// and one call, in the pair `reading` selects.
+    ///
+    /// The group half of [`Task::rchar`]; a process's `/proc/<pid>/io` is this,
+    /// and its `task/<tid>/io` is the thread's.
+    pub(crate) fn charge_io(&self, reading: bool, chars: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if reading {
+            self.rchar.fetch_add(chars, Relaxed);
+            self.syscr.fetch_add(1, Relaxed);
+        } else {
+            self.wchar.fetch_add(chars, Relaxed);
+            self.syscw.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// The group's four io counters, as `/proc/<pid>/io` prints them.
+    pub(crate) fn io_all(&self) -> (u64, u64, u64, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            self.rchar.load(Relaxed),
+            self.wchar.load(Relaxed),
+            self.syscr.load(Relaxed),
+            self.syscw.load(Relaxed),
+        )
+    }
+
     /// The paging root of the group's address space.
     pub(crate) fn root(&self) -> usize {
         self.root_value
@@ -1968,6 +2010,10 @@ impl Mm {
             cnivcsw: core::sync::atomic::AtomicU64::new(0),
             minflt: core::sync::atomic::AtomicU64::new(0),
             cminflt: core::sync::atomic::AtomicU64::new(0),
+            rchar: core::sync::atomic::AtomicU64::new(0),
+            wchar: core::sync::atomic::AtomicU64::new(0),
+            syscr: core::sync::atomic::AtomicU64::new(0),
+            syscw: core::sync::atomic::AtomicU64::new(0),
             image: Mutex::new(RefCell::new(image)),
             lock_future: core::sync::atomic::AtomicBool::new(false),
         })

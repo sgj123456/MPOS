@@ -11702,3 +11702,125 @@ one block per directory, rounded to blocks, and a floor below the tree is raised
 only the second is missing the one a debugger reads first.* The gate's second finding is the other
 half of the lesson: a size constant with a comment saying what the payload was is a measurement with
 an expiry date, and the way to keep it honest is to derive it from the thing it is supposed to hold.
+
+## §6.135 `/proc/<pid>/io` reports the bytes and calls a task made (LANDED 2026-11-12)
+
+This kernel had no `/proc/<pid>/io` at all (`grep -c '"io"' src/vfs/procfs.rs` was 0), which meant a
+program asking how much it had read got `ENOENT` where Linux gives it seven numbers. The file is one
+answering five questions, and the answers are not the ones a kernel gets by counting at the obvious
+places (host 7.2.14, `build/scratch/pidio/`):
+
+```
+rchar: 2026894      <- bytes this task asked to receive
+wchar: 23323        <- bytes it asked to send
+syscr: 772          <- read-family calls it made
+syscw: 58           <- write-family calls it made
+read_bytes: 0       <- bytes that came from storage
+write_bytes: 24576  <- bytes that went to storage
+cancelled_write_bytes: 0
+```
+
+Seven lines, `name: value`, one space after the colon, a newline after every line **including the
+last**, no alignment, and the whole file is mode `0400`: `/proc/1/io` read by uid 1000 answers
+`EACCES` (`perm.c`).
+
+### What the numbers are
+
+Three rules, each a place a plausible kernel is wrong. Measured with a child performing one call per
+round while its parent reads `/proc/<pid>/io` around it (`charge3.c`; the child's own read of its
+command byte is the `+1` that every row shares, so the *differences* are the measurement):
+
+```
+read(8) from a file           ret=8   drchar=9   dsyscr=2
+read(fd, buf, 0)              ret=0   drchar=1   dsyscr=2
+read(8) bad buffer (EFAULT)   ret=-1  drchar=1   dsyscr=2
+read(dir) (EISDIR)            ret=-1  drchar=1   dsyscr=2
+read(-1) (EBADF)              ret=-1  drchar=1   dsyscr=1
+readv(2 x 2 bytes)            ret=4   drchar=5   dsyscr=2
+write(/dev/null, 8)           ret=8   dwchar=25  dsyscw=3
+write(ro fd) (EBADF)          ret=-1  dwchar=17  dsyscw=2
+```
+
+1. **`rchar`/`wchar` are the return value, `syscr`/`syscw` are the calls.** A read that answered
+   `EFAULT` or `EISDIR` still moved the call column by one and the byte column by zero; one that
+   answered `EBADF` moved neither, because it never got past the descriptor. So the charge belongs
+   **after** the descriptor and mode checks and **at the point the answer is known** - not at the
+   entry of the call, and not inside the VFS layer where a short transfer is not yet a return value.
+2. **A vectored call is one call.** Two iovecs of two bytes moved `rchar` by four and `syscr` by one.
+   Charging per iovec would be the plausible wrong answer and reads as `syscr` growing with the
+   vector's shape.
+3. **The group and the thread are two books.** `/proc/<pid>/io` is the process's totals and
+   `/proc/<pid>/task/<tid>/io` is that thread's own: a worker that had read 352402 bytes left its
+   process's file reading `rchar: 2026894` and its own reading `352402` (`shape.c`). A **child's** io
+   does not fold into the parent, unlike `cminflt`/`cnvcsw` - so there is no `crchar`, and the absence
+   is the answer: Linux has no such line either.
+
+### The fix
+
+`Task` gains `rchar`/`wchar`/`syscr`/`syscw` (the thread's book) and `Mm` gains the same four (the
+group's), charged together by one `sched::charge_io(reading, chars)` so the two doors cannot disagree
+about how many bytes there were - `charge_cpu`'s shape. The seven doors that move bytes
+(`read`, `write`, `readv`, `writev`, `pread64`, `pwrite64`, and the vectored-at-position pair) were
+restructured so the answer is computed into a binding first and charged at the end; the vectored pair
+charges once, in `handle_readv`/`handle_writev`, which is also the body `preadv`/`pwritev` run
+through.
+
+`/proc/<pid>/io` renders through a pure `io_text`, so the seven lines are pinned by a host test that
+compares the whole body byte for byte against the reading above. The file is `0400` through a new
+`owner_file` beside `env_file`, which already existed for exactly this reason.
+
+### The three storage lines are a named gap
+
+`read_bytes`, `write_bytes` and `cancelled_write_bytes` print **zero**, and that is a refusal rather
+than an answer. They count bytes that actually reached or came from a device, and nothing here counts
+**device-layer** bytes per task: `crates/blk`'s `Counted` keeps `reads`/`writes`/`sectors_*` for
+`/proc/diskstats`, which is per-device and not per-task, and the ext4 cache knows a fill from a hit
+(`begin_fill`) but not how many bytes the fill cost. Linux's own measurement (`storage.c`): a cold
+4 KiB read moved `read_bytes` by 4096, a second read of the same file moved it **again**, and
+`read(/dev/zero)` moved `rchar` by 8528 while `read_bytes` stayed put. A kernel that guessed would be
+printing a number it does not have; the pin asserts these three lines are *present and numeric* and
+claims nothing about their value.
+
+### The pin
+
+`user/tests/src/bin/t-proc-io.rs`, 13 claims: the file exists with exactly Linux's seven names in
+Linux's order; every value is plain decimal; the last line ends in a newline; the three storage lines
+are present as numbers; the thread spelling exists; a child reports; and then **movement** - `rchar >=
+returned > 0`, `syscr >= 12`, `wchar >= 1`, `syscw >= 1`, the group's book holding the thread's, and
+`/proc/1/io` answered-or-refused by the caller's euid.
+
+Two claims moved while writing it, both because **the fixture charges what it measures**:
+
+- Reading the group's file first made the *thread's* figure exceed it, since reading either file is
+  itself a read charged to both books. The fixture now reads the thread's book first, so the group's
+  is the superset by construction.
+- `readv(0, ...)` on the machine reads fd 0 as the console, which never returns EOF: the first boot
+  printed no claim at all and the stall dump showed the task parked in `block_until_nanos` on syscall
+  0. Both the vectored read and the refused-by-buffer read now name the regular file.
+
+Counterfactually **10 of 13 are red** (`build/boot-pidio-cf1.log`): all six shape claims, the storage
+lines, the thread spelling, and all four movement claims. The three that stay green either way are
+honest boundaries - "every value is plain decimal" is true of the empty string, "the group's book
+holds the thread's" is true of 0/0, and the `/proc/1` claim takes the root branch on a payload that
+is root.
+
+### The gate
+
+```
+stage 1  host unit tests   1275 tests, 0 failed            70.04 s
+x86_64   pass=298 fail=0 (298 built)  kunit 35/0  total 70.39 s  (+33.1%)
+aarch64  pass=297 fail=0 (297 built)  kunit 35/0  total 218.81 s (+13.6%)
+```
+
+`t-proc-io` ran on both arms (`=== PASS t-proc-io`). The x86_64 figure is the whole sweep's, not this
+pin's: the aarch64 sweep had just been given a root sized from its tree (§6.134), so both arms built
+and staged more programs than the previous green.
+
+### The rule
+
+*The bytes a caller was handed and the bytes a device moved are two different questions, and a file
+that answers the second with the first is worse than one that refuses it.* The charge point is the
+other half: it belongs where the answer is known, which is why a refused call still counts as a call
+and a failed transfer still counts as zero bytes. And the fixture lesson is the one this file keeps
+teaching - an instrument that reads the counter it is measuring charges what it measures, and the
+reading is then true and useless.

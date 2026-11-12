@@ -2339,3 +2339,14 @@ carries the per-phase history.*
   2 MiB — `SWEEP_DISK_BYTES`'s comment still said the payload was "~57 MB" and it is 111.82 MiB. The
   root is now sized from the tree (`tree_bytes` + `ROOT_SLACK_BYTES`, 32 MiB of room, the caller's
   constant as a floor), which took the same image from 485 free blocks to 8371. (§6.134, item 248)
+- **`/proc/<pid>/io` exists, and its numbers are the ones Linux counts.** The file was absent
+  entirely, so a program asking how much it had read got `ENOENT`. It is seven lines, mode `0400`,
+  and the three rules that make the numbers Linux's are each a place a plausible kernel is wrong:
+  `rchar`/`wchar` take the **return value** while `syscr`/`syscw` count the **calls** (so an `EFAULT`
+  or `EISDIR` still counts as a call and an `EBADF` does not); a vectored call counts **once**; and
+  `/proc/<pid>/io` is the group's book where `task/<tid>/io` is the thread's. `Task` and `Mm` carry
+  the four counters and one `sched::charge_io` feeds both, `charge_cpu`'s shape; the charge sits at
+  the point the answer is known in all seven byte-moving doors. The three device-layer lines print
+  zero as a **named gap** - nothing counts device-layer bytes per task. Pin `t-proc-io` (13 claims)
+  is `PASS` on both arms and **10 of 13 red** counterfactually; two claims moved while writing it
+  because the fixture charged what it measured. (§6.135, item 249)
