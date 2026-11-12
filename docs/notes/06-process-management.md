@@ -12917,6 +12917,44 @@ property is a state the kernel reports, assert the state and let the poll only
 prove it is reachable - never make "one sample happened to land on the right
 side" the claim.
 
+## §6.144a `t-rr-interval`'s blocked-child claim, the same shape one sweep later (2026-11-12)
+
+The next full sweep after `/proc/<pid>/oom_score` landed had its own single red,
+and it was the *second* instance of §6.144's class found in two consecutive
+sweeps:
+
+```text
+FAIL:  and the blocked child is answered zero every time (199 of 200)
+```
+
+The program's own comment already says why, and had said it since §6.132: this
+kernel's parks are **timed**, so a task blocked in a pipe read alternates
+between parked and briefly runnable. Measured on the host during this fix, with
+the same child: `197 zeros and 3 slices` out of 200 samples. In that runnable
+moment a slice answer is the *correct* answer, because the task can run - the
+call is not lying, the claim was asking the park to be continuous, which a timed
+park does not promise.
+
+So the claim is now the **conditional** one, which is the promise the kernel
+actually owes: a sample that finds the task **asleep** must answer zero. The
+program reads `/proc/<pid>/stat`'s state letter in the same breath as the call
+and counts the two moments apart (`blocked_asleep`, `blocked_slice`), and the
+claim fails if *any* asleep sample is answered a slice - so a kernel that
+answered a slice for a task it also called sleeping is still caught. It also
+requires at least a quarter of the samples to have found it asleep, so the claim
+cannot pass vacuously on a child that was never parked.
+
+Measured in the guest: `200 asleep of 200, 0 disagreed` - the machine's park is
+continuous in practice, so the conditional claim is *stronger* evidence there
+than the old one was, and 13/13 passed three boots running
+(`build/boot-rr-fix{1,2,3}.log`).
+
+**Two in two sweeps is the signal**: the suite's remaining *unconditional*
+samples of a parkable task are the same defect waiting to fire. The rule from
+§6.144 bears repeating because it keeps being violated in a new file: assert the
+state the kernel reports, and let sampling only establish that the state is
+reachable.
+
 ## §6.145 `/proc/<pid>/oom_score`: the resident set and the adjustment, as a view (LANDED 2026-11-12)
 
 The OOM killer's badness score for a task, the file a supervisor or a monitor

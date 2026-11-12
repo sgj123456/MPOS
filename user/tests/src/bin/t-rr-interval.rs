@@ -89,6 +89,21 @@ fn raw(nr: libc::c_long, a1: usize, a2: usize) -> Result<isize, i32> {
 /// Ask the door about `who`, returning the errno (0 on success) and the
 /// `tv_nsec` it wrote. A failed call leaves the buffer untouched, so the
 /// second half is only meaningful when the first is zero.
+/// The state letter `/proc/<pid>/stat` reports, or `None` if it could not be
+/// read.
+///
+/// The companion every state-sensitive claim here needs: this kernel's parks
+/// are **timed**, so a task blocked in a pipe read alternates between parked
+/// and briefly runnable, and a claim that samples it must know which moment it
+/// caught - not assume it always caught the asleep one (§6.144).
+fn state_letter(pid: usize) -> Option<char> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `<pid> (<comm>) <S> ...` - the comm can contain spaces and parentheses,
+    // so the state is the first field after the last `)`.
+    let tail = &text[text.rfind(')')? + 1..];
+    tail.split_whitespace().next()?.chars().next()
+}
+
 fn interval(who: usize) -> (i32, i64) {
     let mut ts = TimeSpec::zeroed();
     let code = match raw(
@@ -206,13 +221,36 @@ fn main() {
     // both, and a loaded aarch64 lane failed it with `state S, got 4000000 ns`.
     let mut blocked_zero = 0usize;
     let mut blocked_slice = 0usize;
+    // Samples in which the blocked child was confirmed **asleep** when the call
+    // was made, and the ones where it was momentarily runnable instead.
+    //
+    // This split is the fix for the claim's second form (§6.144): the child is
+    // parked in a pipe read that will never be satisfied, but the park is
+    // **timed**, so between two park windows it is briefly runnable - and in
+    // that moment a slice answer is the *correct* one, because the task can
+    // run. Sampling 200 times and demanding 200 zeros therefore reddens under
+    // load through no fault of the kernel: measured, one full sweep with six
+    // TCG lanes saw it fail while the program passed 3/3 booted alone.
+    //
+    // What the kernel does owe is conditional, and that is what is claimed: a
+    // sample that finds the task **asleep** must answer zero. A kernel that
+    // answered a slice for a task it also called sleeping is wrong, and this
+    // still catches it - it just no longer asks the park to be continuous,
+    // which a timed park does not promise.
+    let mut blocked_asleep = 0usize;
     let mut runnable_zero = 0usize;
     let mut runnable_slice = 0usize;
     for _ in 0..SAMPLES {
+        let asleep = state_letter(pid as usize) == Some('S');
         if let (OK, nsec) = interval(pid as usize) {
+            if asleep {
+                blocked_asleep += 1;
+            }
             if nsec == 0 {
                 blocked_zero += 1;
-            } else {
+            } else if asleep {
+                // A slice answer *while the same moment reads asleep*: this is
+                // the disagreement the claim exists for.
                 blocked_slice += 1;
             }
         }
@@ -230,12 +268,15 @@ fn main() {
         ),
         runnable_zero == 0 && runnable_slice == SAMPLES,
     );
+    // The conditional form, machine-only for the reason §6.132 gives: the
+    // host's own answer here is not stable enough to pin (its two reads of one
+    // moving record landed anywhere from 0 to 200 zeros across runs).
     if !mpos_user_tests::host_run() {
         r.check(
             &format!(
-                "and the blocked child is answered zero every time ({blocked_zero} of {SAMPLES})"
+                "a sample that finds the blocked child asleep is answered zero ({blocked_asleep} asleep of {SAMPLES}, {blocked_slice} disagreed, {blocked_zero} zeros overall)"
             ),
-            blocked_zero == SAMPLES,
+            blocked_asleep >= SAMPLES / 4 && blocked_slice == 0,
         );
     }
 
