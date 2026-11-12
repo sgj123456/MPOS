@@ -1877,3 +1877,92 @@ downstream `=== first exit=134` — the collision back in the same shape.
 **Rule:** a hierarchy that is the machine's is shared by every mount of it, so "unmount" is not how a test
 gives its groups back. A program that makes a group removes it, and the claim for that is the tree's
 state, not the call's answer.
+
+### 3.29 An inode's indirect-block word is disk data too, and nothing vetted it — **FOUND BY RUNNING A FUZZER** (2026-11-12)
+
+`fuzz_targets/ext4_image.rs` did not compile for a month (§1.4's lesson in its own shape, and the
+reason `fuzz/` had no gate step). Brought back to building and then actually **run**, the target died
+at `-runs=400`, 6 times out of 6:
+
+```
+thread '<unnamed>' panicked at src/vfs/ext4/mod.rs:739:
+ext2 block 1869902697 is past the end of the filesystem (128 blocks)
+```
+
+That line is `read_bytes`' own net, `debug_assert!(self.block_is_live(block), …)`, whose comment
+claims the invariant "the somewhere that knows what to do has already had its chance". The measured
+call chain says otherwise:
+
+```
+Ext4Ino::read_at      (src/vfs/ext4/mod.rs:1793)
+  bmap_lookup         (src/vfs/ext4/mapping.rs:36)
+    block_map_lookup  (src/vfs/ext4/mapping.rs:95)
+      ptr_at          (src/vfs/ext4/mapping.rs:14)
+        read_bytes    (src/vfs/ext4/mod.rs:739)   <- the net fires here
+```
+
+**The mechanism.** `ptr_at(block, i)` had two jobs and only did one. It vetted its **result** —
+`(value != 0 && self.block_is_live(value as u64)).then_some(value as u64)` — and `bmap_lookup`
+filtered once more on the way out. But its **argument**, the block it reads the pointer *out of*, is
+`d.block[12]` / `d.block[13]` taken verbatim from the on-disk inode. That word is a 32-bit number in
+an image nobody validated: 1869902697 on a filesystem 128 blocks wide. A map entry is a number the
+caller may report as a hole; the block the entry lives *in* is a read the caller never asked for and
+cannot express a refusal for. Vetting the value one level down is vetted too late.
+
+**Why nothing in a boot ever saw it.** In a release build `debug_assert!` compiles out, `read_bytes`
+fills the caller's buffer with zeros, `le32` answers 0, `ptr_at` answers `None` and `bmap_lookup`
+answers "hole" — the same answer a sparse file gives. The kernel survives the input by accident of
+the fallback it already had, which is *why* the invariant was written down as true: every reading
+taken through it looked right. A dev-profile fuzz run is the first instrument that asks the question
+the net asks.
+
+**Fix, in the one place the number is consumed** (`ptr_at`, src/vfs/ext4/mapping.rs):
+
+```rust
+if !self.block_is_live(block) {
+    return None;
+}
+```
+
+Release behaviour is unchanged — `None` either way — so no boot reading moves; what changes is that
+the invariant `read_bytes` asserts is now true of every caller, which is what makes a
+`debug_assertions` build of the kernel a legitimate gate subject.
+
+**The same defect one level over, fixed in the same pass.** `ensure_slot(indirect, i, allocated)`
+(src/vfs/ext4/mapping.rs) took the same `d.block[12]`/`d.block[13]` word and asked for a *writable*
+slot in it. `put_ptr` to a block the volume lacks is dropped by `update_block`'s own vet — so the
+write reported success while changing no pointer, and the caller kept a block number nothing
+recorded. It now begins:
+
+```rust
+if !self.block_is_live(indirect) {
+    return Err(VfsError::Corrupt);
+}
+```
+
+The **read** path answers `None` (a hole, which is what a caller of a read can act on) and the
+**write** path answers `Corrupt` (which is what a caller of a write can act on). Two doors over one
+bad number, two honest refusals — the shape AGENTS.md §3 rule 2 asks for, rather than one answer
+reused because it was nearer.
+
+**Counterfactuals, both directions, both measured.** With the fix, the saved crashing corpus runs
+clean 6/6 (and 3/3 from a cold `CARGO_TARGET_DIR`, with the binary's mtime confirmed newer than the
+source it came from). Without it — the file restored byte-identically from `build/scratch/` — 2/2
+runs exit 77 with `ext2 block 1869902697 is past`. The pin
+`an_indirect_block_past_the_volume_reads_as_a_hole` (src/vfs/ext4/mod.rs, `mod tests`) seeds inode 11
+with `i_block[12] = 5000` on a 128-block image and asserts a 1 KiB read at offset 12 KiB answers 1024
+zero bytes: **without** the fix it panics with exactly the fuzzer's message, **with** it the whole
+host suite is 793 passed / 0 failed.
+
+**Lessons, in the order they cost time.**
+
+1. *Compiling is not coverage.* These targets had been broken for a month and, once repaired, one of
+   them found a real invariant violation on its first four hundred runs. The repair was cheap; the
+   reason it was needed for a month is that nothing built the workspace (§1.4).
+2. *A fallback is not a vet.* `read_bytes`' zero-fill made the kernel correct in release while the
+   invariant above it was false. The check that finds this class is the one that asks the invariant,
+   not the one that asks the output — and a `debug_assertions` build is that check.
+3. *A net that fires tells you the number is unvetted somewhere upstream; it does not tell you where.*
+   The backtrace named `read_bytes`; the defect was two frames up in `ptr_at`, and the same word had a
+   second consumer (`ensure_slot`) that no crash had reached yet. Fix the **number's** journey, then
+   walk every other reader of that word.

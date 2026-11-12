@@ -11365,3 +11365,67 @@ claims only the relations both machines keep. Notes: `§6.145`.
 **Pin:** `user/tests/src/bin/t-oom-score.rs`, 13 claims, green on the host first
 and in the guest; counterfactually 10/13 red without the file. Full gate green on
 both arms.
+
+### Item 260 The fuzz workspace - a gate that never built it, and the ext4 invariant that was false
+
+`fuzz/` is its own cargo workspace (`[workspace]` in `fuzz/Cargo.toml`, because
+the kernel's `[build] target = x86_64-unknown-none` cannot link a libFuzzer
+binary). Nothing in `cargo xtask test` ever built it. Measured 2026-11-12: **8 of
+22 targets had stopped compiling**, over a month in which kernel APIs moved out
+from under them (`vfs::term` became a leaf crate, `Vfs` became `MountTable`,
+`Inode::create` gained an `rdev`, `Pending` widened to `u64`, `pci::Device`,
+`evdev::Records` and `uevent::Event`/`Numbering` all gained fields). AGENTS.md §3
+rule 2 asks every parser for a fuzz target; for those eight parsers that was true
+of the file and false of the coverage.
+
+**What running them then found.** `ext4_image` at `-runs=400`, 6 times out of 6:
+
+```
+ext2 block 1869902697 is past the end of the filesystem (128 blocks)
+  at src/vfs/ext4/mod.rs:739   (read_bytes' debug_assert!)
+```
+
+`ptr_at` vetted its **result** and never its **argument**, and the argument is
+`d.block[12]`/`d.block[13]` read straight off an unvalidated on-disk inode. In a
+release build `read_bytes` zero-fills and the read answers "hole", so nothing a
+boot did ever showed it - the invariant the net asserts was false and the
+fallback hid it. Fixed where the number is consumed (`ptr_at` answers `None`;
+`ensure_slot` answers `Corrupt`, because a `put_ptr` into a block the volume
+lacks is dropped by `update_block`'s vet and reports success while moving
+nothing). Notes: `§3.29`.
+
+| claim | before | after |
+| --- | --- | --- |
+| `fuzz cargo check --bins` | 8/22 error | 22/22 build |
+| `ext4_image -runs=400` on the saved corpus | exit 77, 6/6 | exit 0 |
+| host suite | 792 passed | 793 passed (the new pin) |
+| `cd fuzz && cargo fmt --check` | exit 1, 11 diffs / 5 files | exit 0 |
+
+**Two gates added, because there are two claims.** `fuzz_targets_declared`
+(`xtask/src/gates.rs`, wired at `xtask/src/selftest.rs`) reports a
+`fuzz_targets/*.rs` no `[[bin]]` names, and a `[[bin]]` whose `path` names
+nothing - cheap, two walks and one TOML scan, so it runs beside the sweeps.
+`run_fuzz_workspace` builds all 22 with sancov-instrumented `RUSTFLAGS` (**13.4 s**
+cold, the same as a plain build) and then runs each: a seeded target executes its
+corpus (`-runs=0`, deterministic, 0.15 s for all of them), an unseeded one takes a
+short bare run. Corpus copies go to `build/`, never the repo - libFuzzer appends
+to whatever corpus it is handed (measured: 2 files grew to 36).
+
+**Why instrumented and not plain.** An uninstrumented build is the same 13 s and
+libFuzzer answers `exec/s: 0` with "no interesting inputs were found" - a smoke
+test wearing a fuzz run's clothes.
+
+**Why `-runs=N` alone is not coverage.** libFuzzer ramps its input length with the
+run count: `lim: 4` at 200 runs, `lim: 11` at 1000, `lim: 53` at 5000, `lim: 198`
+at 20000. `-runs=200` therefore only ever feeds ~4-byte inputs, and `-max_len` does
+not move it. A seeded corpus does - which is why every target that has seeds
+executes them instead.
+
+**Pin:** `xtask/src/gates.rs` `mod tests` - `a_fuzz_target_is_reported_when_it_is_not_declared_and_when_it_is_missing`
+(fixture, both directions) and `every_fuzz_target_is_declared` (the real tree,
+which reddens when a `[[bin]]` block is deleted: verified). The kernel fix is
+pinned by `an_indirect_block_past_the_volume_reads_as_a_hole` (fails without the
+`mapping.rs` change with exactly the fuzzer's message). A new target
+`seccomp_filter` (221 lines, 11 seeds) closes the one rule-2 debt the audit found:
+`seccomp::Program::parse` validates classic BPF from user bytes and had no fuzzer.
+Full gate green on both arms.

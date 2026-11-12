@@ -2464,3 +2464,24 @@ carries the per-phase history.*
   conditions, so the fix reads the letter on **both sides** of it (`blocked_moved` counts a letter
   that moved apart, a slice with `S` on both sides is the disagreement) and requires a floor. Host
   PASS and 3/3 boots per changed program; no kernel behaviour touched. (§6.146, item 259)
+- the **fuzz workspace** is in the gate, and running it found a real defect on the first day. `fuzz/`
+  is its own cargo workspace (it must be - the kernel's `[build] target = x86_64-unknown-none` cannot
+  link a libFuzzer binary), so nothing in `cargo xtask test` had ever built it: measured 2026-11-12,
+  **8 of 22 targets had stopped compiling** over the month after the last commit that touched the
+  directory. Repaired, then *run* - and `ext4_image` at `-runs=400` panicked 6/6 in `read_bytes`'
+  own net, with a block number of `1869902697` on a 128-block image. The cause was one level up:
+  `ptr_at` vetted its result and never its argument, and its argument is `i_block[12]`/`i_block[13]`
+  straight off an unvalidated on-disk inode. Release builds survived it by accident (the zero-fill
+  fallback turns it into a hole), which is why the invariant that net asserts had been false without
+  anyone knowing - and why a `debug_assertions` fuzz run is the instrument that asks. Fixed at both
+  consumers of that word: the read answers `None` (a hole) and the write path answers `Corrupt`,
+  because a `put_ptr` into a block the volume lacks is dropped by `update_block`'s vet and reports
+  success while moving nothing. Two gate steps now hold it there: a declaration check (a
+  `fuzz_targets/*.rs` no `[[bin]]` names, and a `[[bin]]` naming nothing) and a build-and-run step
+  (**13.4 s** cold, sancov-instrumented - the same as a plain build, and an uninstrumented one only
+  ever reports `exec/s: 0`), where a seeded target executes its corpus from a copy under `build/`
+  because libFuzzer appends to whatever corpus it is given. The `lim:` measurement matters here:
+  libFuzzer ramps input length with the run count (`lim: 4` at 200 runs, `lim: 198` at 20000), so a
+  bare `-runs=N` exercises the shortest inputs and nothing else. A new `seccomp_filter` target closes
+  the one rule-2 debt the audit found. The same week's sibling finding: `cargo fmt --check` never saw
+  `fuzz/` either, and eleven diffs across five files were sitting in it. (§3.29, §1.5, item 260)

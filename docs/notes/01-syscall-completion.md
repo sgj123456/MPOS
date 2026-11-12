@@ -138,3 +138,31 @@ document.
 
 **Not a code change.** No behaviour moved: the dispatch was complete and correct throughout, and
 every one of the 301 arms still answers what it answered. What was wrong was the record of it.
+
+### 1.5 The same blindness, twice more: the fuzz workspace and `cargo fmt`
+
+§1.4 recorded a document that stated its own invariant beside a check nobody ran. Two more
+instruments turned out to have the same shape, found the same week by asking of each "what would
+make this go red?":
+
+**`fuzz/` was in no gate.** It is its own cargo workspace (correctly - the kernel's
+`[build] target = x86_64-unknown-none` cannot link a libFuzzer binary), and nothing in
+`cargo xtask test` built it. Eight of its twenty-two targets had not compiled since the kernel's
+APIs moved underneath them. The workspace's own build cost **13.4 s cold, 9.9 s to merely check** -
+versus a gate that spends 28 s on stage 1 and 116 s per arm - so the check was affordable the whole
+time and simply was not there. Fixed in item 260 (`docs/uapi/05-work-list.md`), with the two claims
+kept apart: declarations are a file walk, builds-and-runs are a cargo invocation, and only the
+second can find a defect that compiles.
+
+**`cargo fmt --check` never saw `fuzz/` either.** The root `Cargo.toml`'s `members` list does not
+include it (`fuzz/` is its own workspace root), so "the tree is fmt-clean" was a claim about a tree
+that excluded twelve percent of the repository's source files - and those files were not clean
+(eleven diffs across five targets). The instrument was right; its subject was smaller than the
+sentence it was quoted for.
+
+**Rule, and it is §1.4's rule generalised:** for every convention this repository states, the
+question to ask is *which command makes this false?* A convention whose command does not exist, or
+whose command cannot see the subject, is a claim - and the cheap ones (a file walk, a `fmt --check`,
+a `cargo check`) belong in the gate, because the gate is the only place a convention is re-measured.
+The tell in all three cases was identical: prose with a command beside it, and nobody running the
+command.
