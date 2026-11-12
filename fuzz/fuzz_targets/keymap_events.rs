@@ -10,7 +10,7 @@
 
 use arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use mpos::vfs::term::keymap::Keymap;
+use mpos::term::keymap::Keymap;
 
 #[derive(Arbitrary, Debug)]
 struct Input {

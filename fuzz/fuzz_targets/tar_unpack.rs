@@ -13,21 +13,23 @@
 mod support;
 
 use libfuzzer_sys::fuzz_target;
-use mpos::vfs::mount::Vfs;
+use mpos::vfs::NodeKind;
+use mpos::vfs::mount::MountTable;
 use mpos::vfs::ramfs::RamFs;
 use mpos::vfs::tar::{self, EntryKind};
-use mpos::vfs::{Inode, NodeKind};
 
 fuzz_target!(|data: &[u8]| {
-    let vfs = Vfs::new();
-    let rootfs = RamFs::new();
-    vfs.mount_root(&*rootfs);
+    let vfs = MountTable::new();
+    vfs.mount_root(RamFs::new());
+    // The walk the syscall doors use, reaching this tree's root: the unpack
+    // path is `init`'s, which has no caller context, so `root_inode` is the
+    // start every resolution below hands the walk.
+    let root = vfs.root_inode();
 
     // `unpack_into` is what `init` runs against the archive it was booted
     // with; the count is what it reports to the log.
     let Ok(count) = tar::unpack_into(&vfs, data) else {
         // A refused archive still has to leave a usable tree.
-        let root = vfs.root_inode();
         let _ = root.lookup("etc");
         return;
     };
@@ -47,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         // checked is the thing that would actually matter - that the bytes the
         // archive names for a path are the bytes that path now holds.
         let path = format!("/{}", member.path);
-        let Ok(inode) = vfs.resolve(&path) else {
+        let Ok(inode) = vfs.resolve_caller(&path, root.clone()) else {
             continue;
         };
         match member.kind {
@@ -100,7 +102,7 @@ fuzz_target!(|data: &[u8]| {
     // of this archive has.
     for _ in 0..4 {
         let path = support::text(data, 64);
-        let _ = vfs.resolve(&path);
-        let _ = vfs.resolve(&format!("/{}", path));
+        let _ = vfs.resolve_caller(&path, root.clone());
+        let _ = vfs.resolve_caller(&format!("/{}", path), root.clone());
     }
 });

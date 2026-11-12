@@ -12,7 +12,7 @@
 
 use arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use mpos::vfs::term::{self, Grid};
+use mpos::term::{self, Grid};
 
 #[derive(Arbitrary, Debug)]
 struct Input {

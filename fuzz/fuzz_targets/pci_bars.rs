@@ -45,6 +45,11 @@ struct Ident {
     subsys_vendor: u16,
     subsys_id: u16,
     irq: u8,
+    /// Which configuration-space size this function publishes, and whether a
+    /// driver declared it a DRM card. Both are fields of the kernel's
+    /// `Device` that a fuzzed identity should be able to move.
+    cfg_size: u8,
+    drm_card: u8,
 }
 
 fuzz_target!(|input: Input| {
@@ -79,6 +84,11 @@ fuzz_target!(|input: Input| {
         irq: ident.irq,
         bars,
         driver: None,
+        // The configuration space a function publishes: a whole 4 KiB window
+        // or the 256 bytes a legacy function gets. Both are legal and the
+        // renderers must not care which.
+        cfg_size: if ident.cfg_size & 1 == 0 { 256 } else { 4096 },
+        drm_card: ident.drm_card & 1 != 0,
     };
 
     // The names are path components: a space or a slash in one of them puts a

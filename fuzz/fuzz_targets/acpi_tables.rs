@@ -20,8 +20,15 @@ fuzz_target!(|data: &[u8]| {
 
     if let Some(header) = acpi::parse_header(data) {
         let length = header.length as usize;
-        assert!(length <= data.len(), "a table claims {length} of {} bytes", data.len());
-        assert!(length >= acpi::SDT_HEADER_LEN, "a table shorter than its header");
+        assert!(
+            length <= data.len(),
+            "a table claims {length} of {} bytes",
+            data.len()
+        );
+        assert!(
+            length >= acpi::SDT_HEADER_LEN,
+            "a table shorter than its header"
+        );
     }
 
     // A body of `n` bytes holds at most `n / 16` windows, and every window must

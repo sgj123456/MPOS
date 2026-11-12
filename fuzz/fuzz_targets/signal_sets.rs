@@ -46,7 +46,7 @@ fuzz_target!(|input: Input| {
         }
         let _ = signal::default_action(sig);
         let _ = signal::stops_by_default(sig);
-        let _ = action.handler_mask(sig, input.blocked);
+        let _ = action.handler_mask(sig, input.blocked as u64);
     }
 
     // Only the signals a process may catch have a disposition that means

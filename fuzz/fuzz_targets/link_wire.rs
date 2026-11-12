@@ -20,9 +20,7 @@
 
 use arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use mpos::link::{
-    self, Frames, AF_PACKET, ETH_HEADER_LEN, RING_FRAMES, SOCKADDR_LL_LEN,
-};
+use mpos::link::{self, AF_PACKET, ETH_HEADER_LEN, Frames, RING_FRAMES, SOCKADDR_LL_LEN};
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -55,8 +53,8 @@ fuzz_target!(|input: Input| {
     // whole of the rule, and a caller cannot read the ordering off one refusal.
     let parsed = link::parse_sll(&input.bytes);
     let long_enough = input.bytes.len() >= SOCKADDR_LL_LEN;
-    let right_family = long_enough
-        && u16::from_ne_bytes([input.bytes[0], input.bytes[1]]) == AF_PACKET;
+    let right_family =
+        long_enough && u16::from_ne_bytes([input.bytes[0], input.bytes[1]]) == AF_PACKET;
     assert_eq!(
         parsed.is_some(),
         right_family,
@@ -77,7 +75,10 @@ fuzz_target!(|input: Input| {
                 input.bytes[7]
             ]),
         );
-        assert_eq!(sll.hatype, u16::from_ne_bytes([input.bytes[8], input.bytes[9]]));
+        assert_eq!(
+            sll.hatype,
+            u16::from_ne_bytes([input.bytes[8], input.bytes[9]])
+        );
         assert_eq!(sll.halen, input.bytes[11]);
         assert_eq!(&sll.addr[..], &input.bytes[12..20]);
     }
@@ -98,7 +99,11 @@ fuzz_target!(|input: Input| {
         input.bytes.len() >= ETH_HEADER_LEN,
         "a {}-byte frame answered {}",
         input.bytes.len(),
-        if eth.is_some() { "a header" } else { "no header" },
+        if eth.is_some() {
+            "a header"
+        } else {
+            "no header"
+        },
     );
 
     if let Some(frame) = eth {

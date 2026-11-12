@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     // A plain file, then a directory, then the removal of both. Every step is
     // allowed to fail - the image may have refused a read-write mount, or may
     // genuinely be full - and none of them is allowed to panic.
-    if let Ok(file) = root.create(&name, NodeKind::File) {
+    if let Ok(file) = root.create(&name, NodeKind::File, None) {
         let _ = file.write_at(0, payload);
         let _ = file.write_at(1 << 12, &payload[..payload.len().min(64)]);
         let _ = file.truncate(payload.len() as u64);
@@ -46,12 +46,12 @@ fuzz_target!(|data: &[u8]| {
         let _ = root.unlink(&name);
     }
 
-    if let Ok(dir) = root.create("d", NodeKind::Dir) {
+    if let Ok(dir) = root.create("d", NodeKind::Dir, None) {
         // Enough entries to reach a directory index, whose split is the
         // recursive half of this module. Bounded so a slow image stays cheap.
         for i in 0..40u32 {
             let child = alloc_name(i);
-            if let Ok(file) = dir.create(&child, NodeKind::File) {
+            if let Ok(file) = dir.create(&child, NodeKind::File, None) {
                 let _ = file.write_at(0, payload);
             }
         }

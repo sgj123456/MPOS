@@ -15,7 +15,7 @@
 mod support;
 
 use libfuzzer_sys::fuzz_target;
-use mpos::uevent::{Event, Numbering};
+use mpos::uevent::{BlockEntry, Event, Numbering};
 
 const ACTIONS: [&str; 3] = ["add", "remove", "change"];
 const SUBSYSTEMS: [&str; 4] = ["block", "virtio", "input", "drm"];
@@ -41,6 +41,15 @@ fuzz_target!(|data: &[u8]| {
         devname,
         major: support::u32_at(data, 0),
         minor: support::u32_at(data, 4),
+        // The subsystem-specific lines beyond the words every event carries.
+        // `HOTPLUG=1` is the one this kernel sends; a target that only ever
+        // exercised the empty case would not prove the extras stay separated
+        // from the forged-name guard below.
+        extra: if data.len() % 2 == 0 {
+            &[("HOTPLUG", "1")]
+        } else {
+            &[]
+        },
     };
 
     let (block, seq) = event.encode_seq();
@@ -73,23 +82,55 @@ fuzz_target!(|data: &[u8]| {
             String::from_utf8_lossy(&key[..key.len() - 1])
         );
     }
-    // What a name must not be able to do is change how many records the block
-    // holds. Splitting on the NUL that ends each line therefore has to yield a
-    // fixed count - seven keys, plus `DEVNAME` when the event carries one - and
-    // every record after the message line has to open with a key this kernel
-    // knows. A value that merely *contains* an `=` is a different matter, and
-    // allowed: the reader splits a line on its first `=`, so an `=` inside
-    // `DEVPATH` changes nothing about where the records start, while a second
-    // `SEQNUM=` line would be a whole event udevd never sent.
-    let expected = 7 + usize::from(!event.devname.is_empty());
+    // What a name must not be able to do is forge a record: neither a new line
+    // nor a key that is not the kernel's. So the block after the message line
+    // must be exactly the key sequence the event asked for, in order - the
+    // three words every event carries, the device-node triple as a unit (all
+    // three or none: `MAJOR=0 MINOR=0` is an answer, not a missing one), the
+    // subsystem's own extras, and `SEQNUM` last.
+    //
+    // This list is derived from the *event*, not from the encoder: an earlier
+    // version asserted a count (`7 + has_devname`) that was wrong in both
+    // directions - it counted `DEVNAME` twice and had no room for `MAJOR`,
+    // `MINOR` or an extra - and nobody knew, because nothing in this repo ran
+    // the binary for a month. A key sequence is the stronger claim anyway: it
+    // says where each record starts, which is what udevd acts on.
+    let mut expected: Vec<Vec<u8>> = vec![
+        b"ACTION=".to_vec(),
+        b"DEVPATH=".to_vec(),
+        b"SUBSYSTEM=".to_vec(),
+    ];
+    if !event.devname.is_empty() {
+        expected.extend([b"DEVNAME=".to_vec(), b"MAJOR=".to_vec(), b"MINOR=".to_vec()]);
+    }
+    for (name, _) in event.extra {
+        let mut key = name.as_bytes().to_vec();
+        key.push(b'=');
+        expected.push(key);
+    }
+    expected.push(b"SEQNUM=".to_vec());
+    let got: Vec<Vec<u8>> = lines
+        .iter()
+        .skip(1)
+        .map(|line| {
+            let end = line.iter().position(|b| *b == b'=').map_or(0, |i| i + 1);
+            line[..end].to_vec()
+        })
+        .collect();
     assert_eq!(
-        lines.len(),
-        expected,
-        "a device name changed how many records one uevent holds"
+        got, expected,
+        "the uevent's records are not the keys the event asked for"
     );
+    // Every key is still one of the ones this kernel is allowed to write: the
+    // sequence above could not have said `FOO=` unless an extra asked for it,
+    // and an extra may not invent a line the reader would take for the
+    // kernel's own.
     for line in lines.iter().skip(1) {
         assert!(
-            KEYS.iter().any(|key| line.starts_with(key.as_bytes())),
+            KEYS.iter().any(|key| line.starts_with(key.as_bytes()))
+                || event.extra.iter().any(|(name, _)| {
+                    line.starts_with(name.as_bytes()) && line.get(name.len()) == Some(&b'=')
+                }),
             "a uevent record that opens with no known key: {:?}",
             String::from_utf8_lossy(line)
         );
@@ -111,25 +152,33 @@ fuzz_target!(|data: &[u8]| {
     assert!(seq2 > seq, "seqnum did not advance: {seq} then {seq2}");
 
     // The numbering table: what `/sys/class/block/*/dev` and `/dev` agree on.
-    let devices: Vec<(String, u32, u32, bool)> = (0..8u32)
+    let shape: Vec<(String, u32, u32, bool)> = (0..8u32)
         .map(|i| {
             (
                 format!("vd{}", i % 4),
-                254,
+                mpos::uevent::VIRTIO_BLK_MAJOR,
                 i,
                 support::u32_at(data, 8) & (1 << (i % 8)) != 0,
             )
         })
         .collect();
-    let numbering = Numbering {
-        devices: devices.clone(),
-    };
+    let entries: Vec<BlockEntry> = shape
+        .iter()
+        .map(|(name, major, minor, whole)| BlockEntry {
+            name: name.clone(),
+            major: *major,
+            minor: *minor,
+            whole: *whole,
+            devpath: mpos::uevent::VIRTIO_BLK_DEVPATH,
+            sectors: support::u32_at(data, 12) as u64,
+        })
+        .collect();
+    let numbering = Numbering { devices: entries };
     for name in ["vd0", "vd1", "vda", "", "virtio0"] {
         if let Some((major, minor, whole)) = numbering.find(name) {
-            let (want_major, want_minor, want_whole) = devices
+            let &(_, want_major, want_minor, want_whole) = shape
                 .iter()
                 .find(|(n, ..)| n == name)
-                .map(|&(_, major, minor, whole)| (major, minor, whole))
                 .expect("find answered for a name the table does not hold");
             assert_eq!((major, minor, whole), (want_major, want_minor, want_whole));
         }

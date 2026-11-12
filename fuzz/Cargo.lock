@@ -235,9 +235,12 @@ dependencies = [
  "mpos-gpu",
  "mpos-link",
  "mpos-pci",
+ "mpos-pidns",
  "mpos-seccomp",
  "mpos-term",
+ "mpos-timens",
  "mpos-uinput",
+ "mpos-userns",
  "mpos-uts",
  "mpos-vm",
  "rand_chacha",
@@ -347,6 +350,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpos-pidns"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
 name = "mpos-seccomp"
 version = "0.1.0"
 
@@ -358,10 +368,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpos-timens"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "mpos-err",
+]
+
+[[package]]
 name = "mpos-uinput"
 version = "0.1.0"
 dependencies = [
  "mpos-evdev",
+]
+
+[[package]]
+name = "mpos-userns"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "mpos-cred",
+ "mpos-err",
 ]
 
 [[package]]

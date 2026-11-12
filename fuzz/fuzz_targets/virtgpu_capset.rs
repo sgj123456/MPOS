@@ -36,8 +36,8 @@ use mpos::gpu::abi::{self, CtrlHeader, RESP_ERR_INVALID_PARAMETER, RESP_OK_CAPSE
 fn control() {
     let mut reply = [0u8; 24 + 8];
     reply[..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
-    let payload = abi::resp_capset_payload(&reply)
-        .expect("a well-formed cap set reply must read as one");
+    let payload =
+        abi::resp_capset_payload(&reply).expect("a well-formed cap set reply must read as one");
     assert_eq!(
         payload.len(),
         8,

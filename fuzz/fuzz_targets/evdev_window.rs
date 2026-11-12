@@ -15,8 +15,7 @@
 
 use arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
-use mpos::evdev::{RECORD, Records};
-use mpos::sched::policy::TaskId;
+use mpos::evdev::{RECORD, Records, WaiterId};
 
 #[derive(Arbitrary, Debug)]
 enum Op {
@@ -69,7 +68,7 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut records = Records::new();
     // The target's own picture of who subscribed, so `due_waiters` - which
     // answers ids only - can be checked against the client each id belongs to.
-    let mut subscribed: Vec<(TaskId, u64)> = Vec::new();
+    let mut subscribed: Vec<(WaiterId, u64)> = Vec::new();
     let mut buf = [0u8; RECORD * 4];
     let mut tag = 0u8;
 
@@ -137,14 +136,14 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::Subscribe { ofd, id } => {
                 let ofd = ofd_of(ofd);
-                let id = TaskId(id as usize);
+                let id = id as WaiterId;
                 records.subscribe(ofd, id);
                 if !subscribed.contains(&(id, ofd)) {
                     subscribed.push((id, ofd));
                 }
             }
             Op::Unsubscribe { id } => {
-                let id = TaskId(id as usize);
+                let id = id as WaiterId;
                 records.unsubscribe(id);
                 subscribed.retain(|&(waiter, _)| waiter != id);
             }
