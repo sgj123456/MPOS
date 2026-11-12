@@ -1,19 +1,24 @@
 //! t-iret - where a handled signal is handed over: at a trap, or at a system call.
 //!
-//! **Not a check: a reading**, and it is in the `diagnostic` group for that
-//! reason. It measures roadmap item §2.13 - the one named gap left in the
-//! signal surface - which `docs/notes/`'s appendix currently describes as
-//! *"staged as `t-iret`"* (`build/boot-iret1.log`) while the program did not
-//! exist in the tree, so the reading could not be reproduced by anybody. This is
-//! that program.
+//! **A claim, with an expectation per kernel rather than per architecture.**
+//! The question is a single sentence: *does a handler run for a task that has
+//! not entered the kernel since the signal was posted?* Linux hands a handled
+//! signal over on the return to ring 3 from **any** trap, so a task that
+//! computes in a tight loop and makes no calls is interrupted at the next tick.
 //!
-//! The question is a single sentence: **does a handler run for a task that has
-//! not entered the kernel since the signal was posted?** Linux hands a handled
-//! signal over on the return to ring 3 from *any* trap, so a task that computes
-//! in a tight loop and makes no calls is interrupted at the next tick. This
-//! kernel's `deliver_signal` is called from the syscall gate's return path,
-//! because that is the only place with a user register file to build a frame
-//! on - so a caught signal waits for the task's next system call.
+//! This kernel does that on aarch64 since 2026-11-12 (`docs/notes/` §2.13): the
+//! EL0 interrupt stub builds a whole `UserFrame` and the entry hands it to
+//! `hal::kernel::deliver_at_trap` before it preempts. It does **not** on
+//! x86_64, where the interrupt entry is an `extern "x86-interrupt"` fn whose
+//! frame carries `RIP`/`CS`/`RFLAGS`/`RSP`/`SS` only - the general-purpose
+//! registers are saved below it, where Rust has no name for them - so
+//! `Gate::capture_trap_regs` answers `false` and the signal goes back to the
+//! pending set for the next syscall to find.
+//!
+//! So the expectation is not `cfg!(target_arch)`: a *host* run is Linux on
+//! either architecture and does hand over at a trap, while the x86_64 *guest*
+//! does not. `expect_trap` below asks which kernel is running instead, which is
+//! the thing the reading is about.
 //!
 //! The difference is not academic: it is why `Ctrl-C` does not interrupt a
 //! program that is computing rather than calling.
@@ -50,17 +55,18 @@
 //! syscall would answer the question by asking it, because returning from the
 //! handler goes back through the same path.
 //!
-//! ## What the two machines print
+//! ## What each kernel prints
 //!
-//! On Linux (measured, `build/scratch/timerclock/iret.c`, and this program on
-//! that host): `loop left by THE SIGNAL after N iteration(s)` with N far below
-//! the limit. On this kernel: `loop left by count exhaustion`, with the timer
-//! already expired - the gap, stated as a reading rather than as a failure.
+//! Linux (measured, `build/scratch/timerclock/iret.c`, and this program on that
+//! host): `loop left by THE SIGNAL after N iteration(s)` with N far below the
+//! limit. This kernel on aarch64: the same shape - measured 11 337 551 of
+//! 400 000 000 (`build/test-lane-aarch64-4/serial.log`, 2026-11-12). This kernel
+//! on x86_64: `loop left by count exhaustion`, with the timer already expired.
 //!
-//! When §2.13's x86_64 half lands, this program's own output changes to the
-//! Linux shape, and *that* is the evidence the fix works; it stays a diagnostic
-//! until the aarch64 half lands too, because a `t-` claim that reddens on one
-//! machine is a claim about the port rather than about the ABI.
+//! The x86_64 arm asserts *that* - the gap, stated as the current measured
+//! behaviour rather than left unpinned - so the day the naked tick stub lands
+//! this program reddens and says which line to change. A claim that quietly
+//! accepted either answer would pin nothing on either machine.
 
 use mpos_user_tests::Report;
 
@@ -145,15 +151,22 @@ fn main() {
     // The handler must be installed *before* the timer is armed, or the default
     // action for `SIGUSR1` ends the process and the reading is about a corpse.
     let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
-    sa.sa_sigaction = handler as usize;
+    sa.sa_sigaction = handler as *const () as usize;
     sa.sa_flags = 0;
     unsafe {
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut());
     }
 
+    // Which door this machine has, asked of the *kernel* rather than of the
+    // architecture: a host run is Linux, which delivers at a trap on both
+    // machines; the x86_64 guest cannot yet (`Gate::capture_trap_regs` is
+    // `false` there, `docs/notes/` §2.13).
+    let expect_trap = mpos_user_tests::host_run() || cfg!(target_arch = "aarch64");
+
     // 1. The control first, so the two readings are printed in the order that
     //    makes the contrast readable: what the loop does with no signal at all.
+    //    This claim holds on every kernel - the loop must be able to finish.
     let (control_done, control_got) = burn(false);
     r.check(
         &format!(
@@ -162,40 +175,36 @@ fn main() {
         control_done == LIMIT && !control_got,
     );
 
-    // 2. The measurement. Whatever it says is a reading, not a failure - the
-    //    `check` below only asserts that the *instrument* worked (the loop ran
-    //    and the flag has a definite value), never which answer the machine
-    //    gave, because that answer is the item.
+    // 2. The measurement, against the door this kernel has.
     let (armed_done, armed_got) = burn(true);
     let left_by = if armed_got {
         "THE SIGNAL"
     } else {
         "count exhaustion"
     };
-    r.check(
-        &format!(
-            "with a 30 ms CPU-time signal armed, nothing in the loop but arithmetic: it left by {left_by} after {armed_done} iteration(s)"
-        ),
-        armed_done >= 0,
-    );
-    r.check(
-        &format!(
-            "the reading: delivered at a trap = {}, delivered only at a system call = {}",
-            armed_got,
-            !armed_got && armed_done == LIMIT
-        ),
-        // Always true: this claim exists to print the verdict in one line, and
-        // a `Report` needs a claim to print it. The *reading* is the line above.
-        armed_done != i64::MIN,
-    );
+    if expect_trap {
+        r.check(
+            &format!(
+                "with a 30 ms CPU-time signal armed, the loop leaves at the signal: {left_by} after {armed_done} of {LIMIT} iteration(s)"
+            ),
+            armed_got && armed_done < LIMIT,
+        );
+    } else {
+        r.check(
+            &format!(
+                "with a 30 ms CPU-time signal armed, the loop runs to its limit ({armed_done} of {LIMIT}) because this kernel hands a handled signal over only at a system call (§2.13)"
+            ),
+            !armed_got && armed_done == LIMIT,
+        );
+    }
 
     if armed_got {
         println!(
-            "t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this machine)"
+            "t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this kernel)"
         );
     } else {
         println!(
-            "t-iret: the signal waited for a system call (the §2.13 gap, named in docs/notes/)"
+            "t-iret: the signal waited for a system call (the §2.13 gap remaining on this kernel)"
         );
     }
     r.finish();
