@@ -2442,3 +2442,14 @@ carries the per-phase history.*
   runs on every syscall. Pin `t-proc-syscall` (14 claims): its strongest claims are that the file,
   read *by* a `read(2)` of the test's own, describes that very call and its descriptor. (§6.143, item
   257)
+- `/proc/<pid>/oom_score` exists - the OOM killer's badness for a task, a **view** computed on each
+  read from the resident pages `statm` already counts and the one `oom_score_adj` word, with the
+  proportion taken against the managed frame total `/proc/meminfo` prints: `clamp(rss*1000/total +
+  adj, 0..=1000)`. `0444`, read-only and `EACCES` at a write-open for root too. The reference host
+  measured here does not obey the documented formula literally at all - at a fixed small resident set
+  its score moved by two thirds of the adjustment (`200 -> 800`, `1000 -> 1333`) and went past the top
+  of the scale - so no absolute score is claimed: the implemented arithmetic is the documented formula
+  on this machine's own numbers, and the pin's 13 claims are relations (a larger adjustment scores
+  higher, a larger resident set scores higher, another task readable, a gone pid `ENOENT`) that both
+  machines keep. `t-oom-score` is green on the host first and in the guest, 10/13 counterfactually
+  red without the file. (§6.145, item 258)

@@ -3904,6 +3904,72 @@ fn oom_adj_ctl(pid: usize) -> Arc<dyn Inode> {
     })
 }
 
+/// Linux's OOM badness, as the scale `/proc/<pid>/oom_score` prints it: the
+/// task's resident set as a proportion of the machine, in thousandths, plus its
+/// `oom_score_adj`, clamped to `0..=1000`.
+///
+/// **This is a view, not a number this kernel can match byte for byte.** The
+/// formula's two inputs are Linux's `get_mm_rss` and `totalram_pages +
+/// total_swap_pages`, and neither is this kernel's: the numerator here is the
+/// resident-page count `/proc/<pid>/statm` already prints (a frame count, with
+/// no swap and no page-table term - this kernel has neither), and the
+/// denominator is the frame total the page allocator manages, which is what
+/// `/proc/meminfo` reports and not what a Linux host calls `totalram_pages`.
+/// So the *absolute* score is this machine's own arithmetic, and the honest
+/// claim is the shape of it, which the host measurement below confirms and the
+/// pin tests as relations.
+///
+/// Measured on the host first (`build/scratch/oomscore/m.c`, Linux 7.2.14):
+/// the body is a bare decimal plus one newline (`800\n`, no padding, width =
+/// digits), the mode is `0444` and a write-open is `EACCES`, another process's
+/// file is readable (pid 1 included), a reaped pid is `ENOENT`, a larger
+/// `oom_score_adj` reads a larger score, and 256 MiB more resident moved it
+/// `800 -> 804` at a fixed adjustment. The host's number is **not** this
+/// formula and cannot be reproduced: at a fixed small RSS it read `800` at
+/// `oom_score_adj` 200 and `1333` at `1000` (a step of two thirds of the
+/// adjustment, and above the scale's top, where Linux clamps at 1000). A
+/// fabricated `800` here would be worse than the relation, so the relation is
+/// what is served and what is pinned.
+fn oom_score_from(rss_pages: usize, total_pages: usize, adj: i32) -> i32 {
+    // The proportion in thousandths is Linux's normalisation, and the
+    // adjustment is added on the same scale afterwards. `u64` because a wide
+    // resident set times a thousand does not fit a 32-bit word on a machine
+    // whose frame total is a million pages.
+    let proportion = if total_pages == 0 {
+        0
+    } else {
+        (rss_pages as u64 * 1000 / total_pages as u64) as i64
+    };
+    (proportion + adj as i64).clamp(0, OOM_SCORE_ADJ_MAX as i64) as i32
+}
+
+/// The page-frame total `/proc/<pid>/oom_score` divides by - the same number
+/// `/proc/meminfo` prints as `MemTotal`, from the allocator itself.
+#[cfg(target_os = "none")]
+fn total_pages() -> usize {
+    crate::mm::frame_stats().total
+}
+
+/// `/proc/<pid>/oom_score`: the OOM killer's badness for this task, as a view
+/// of the resident set and the one `oom_score_adj` word.
+///
+/// It is a [`maybe_file`] and therefore `0444` and read-only, which is Linux's
+/// word and refusal (measured: `open(O_WRONLY)` answered `EACCES`). Nothing is
+/// stored: the two inputs belong to the task, and a second copy of the score
+/// would be a number that could disagree with the adjustment it was computed
+/// from the moment either moved.
+#[cfg(target_os = "none")]
+fn oom_score_file(pid: usize) -> Arc<dyn Inode> {
+    maybe_file(move || {
+        let task = task(pid)?;
+        let (adj, _) = crate::sched::oom_score_adj_of(pid)?;
+        Some(alloc::format!(
+            "{}\n",
+            oom_score_from(task.rss_pages, total_pages(), adj)
+        ))
+    })
+}
+
 /// `/proc/<pid>/syscall`: the call a task is inside, or the word `running`.
 ///
 /// The file `strace -p` and every "what is this process stuck in" tool reads,
@@ -4399,6 +4465,13 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // procfs invents no file to answer it.
     #[cfg(target_os = "none")]
     node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(leader));
+    // `/proc/<pid>/oom_score` - the badness the adjustment above is added to,
+    // and the file a monitor or a supervisor reads before it decides whom to
+    // spare. It is not a second store: it is computed on each read from the
+    // resident pages the kernel already counts and that one adjustment word,
+    // so it cannot drift from either.
+    #[cfg(target_os = "none")]
+    node.add("oom_score", NodeKind::File, oom_score_file(leader));
     // The **deprecated** fifteen-step scale, a view of the word above and a
     // write that converts into it - Linux keeps one adjustment and two names,
     // which is why this file has no store of its own.
@@ -5963,7 +6036,7 @@ impl FileSystem for ProcFs {
 
 #[cfg(test)]
 mod tests {
-    use super::{oom_adj_from_score_adj, oom_score_adj_from_adj};
+    use super::{oom_adj_from_score_adj, oom_score_adj_from_adj, oom_score_from};
 
     /// The two `oom_adj` conversions, against Linux 7.2.14's measured round
     /// trips (`build/scratch/procsyscall/oomadj.c`).
@@ -5989,6 +6062,48 @@ mod tests {
         // A value the modern file can hold but the old scale cannot represent
         // exactly reads back to the nearest step, never as a sentinel.
         assert_eq!(oom_adj_from_score_adj(999), 14);
+    }
+
+    /// `/proc/<pid>/oom_score` is the resident proportion plus the adjustment,
+    /// and the relations are the claim rather than any absolute number.
+    ///
+    /// Measured on the host first (`build/scratch/oomscore/m.c`, Linux 7.2.14):
+    /// the file reads a decimal plus one newline, is `0444`, refuses a
+    /// write-open with `EACCES`, reads `800` at `oom_score_adj` 200 and `1333`
+    /// at `1000` at a fixed small resident set (a step of two thirds of the
+    /// adjustment, and past the top of the scale), and `800 -> 804` when 256
+    /// MiB more became resident. Two of those are the host's own arithmetic and
+    /// cannot be this kernel's: its total is machine-sized, and it has no swap
+    /// or page-table term. What both can keep is the shape pinned here - the
+    /// thousandths proportion, the adjustment added on the same scale by
+    /// exactly itself where nothing clamps, a larger resident set scoring
+    /// higher, and the two ends at `0` and `1000`.
+    #[test]
+    fn the_oom_score_is_the_resident_proportion_plus_the_adjustment() {
+        // A machine of 1000 pages, so the proportion is the resident count in
+        // thousandths and the arithmetic is visible.
+        assert_eq!(oom_score_from(0, 1000, 0), 0);
+        assert_eq!(oom_score_from(500, 1000, 0), 500);
+        assert_eq!(oom_score_from(1000, 1000, 0), 1000);
+
+        // The adjustment moves the score by exactly itself wherever the result
+        // stays inside the scale - the relation the host's measurement could
+        // not give (its step was two thirds of the adjustment).
+        for rss in [0usize, 7, 250, 600, 900] {
+            for adj in [-400, -1, 0, 1, 400] {
+                let want = (oom_score_from(rss, 1000, 0) + adj).clamp(0, 1000);
+                assert_eq!(oom_score_from(rss, 1000, adj), want, "rss {rss}, adj {adj}");
+            }
+        }
+
+        // A larger resident set scores higher...
+        assert!(oom_score_from(600, 1000, 0) > oom_score_from(100, 1000, 0));
+        // ...and the scale's ends are Linux's clamp.
+        assert_eq!(oom_score_from(900, 1000, -1000), 0);
+        assert_eq!(oom_score_from(900, 1000, 1000), 1000);
+        // A machine whose allocator has counted no frames yet must not divide
+        // by zero: the proportion is nothing and the adjustment still reads.
+        assert_eq!(oom_score_from(500, 0, 250), 250);
     }
 
     /// A generated file read in chunks stays one snapshot.

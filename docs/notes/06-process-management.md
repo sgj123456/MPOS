@@ -12916,3 +12916,126 @@ Verified: 12/12 on the host, 12/12 three times running in the guest
 property is a state the kernel reports, assert the state and let the poll only
 prove it is reachable - never make "one sample happened to land on the right
 side" the claim.
+
+## §6.145 `/proc/<pid>/oom_score`: the resident set and the adjustment, as a view (LANDED 2026-11-12)
+
+The OOM killer's badness score for a task, the file a supervisor or a monitor
+reads before it decides whom to spare. It did not exist here - a read was
+`ENOENT` - while everything it needs already was: the per-task `oom_score_adj`
+(with the floor beside it), the resident-page count `/proc/<pid>/statm` prints,
+and the frame total `/proc/meminfo` prints.
+
+Measured on the reference host first (`build/scratch/oomscore/m.c`, Linux
+7.2.14, page 4096):
+
+```text
+body                 800\n        4 bytes: decimal, no padding, one newline
+mode                 0444, st_size 0
+open(O_WRONLY)       EACCES(13)
+pid 1                readable as uid 1000 - score 800, adj 200
+reaped / absent pid  ENOENT(2)
+
+adj sweep (rss ~510 pages):   200 -> 800    300 -> 866    400 -> 933
+                              500 -> 1000   600 -> 1066   700 -> 1133
+                              800 -> 1200   900 -> 1266   1000 -> 1333
+rss sweep (adj 200):          526 pages -> 800   16910 -> 800
+                              33294 -> 802       66062 -> 804   (+256 MiB: +4)
+a child, from its parent:     score 806; raise its adj 200 -> 400, score 939
+```
+
+### What the host's number is, and is not
+
+The documented shape is `(rss + swap) * 1000 / total_pages + oom_score_adj`,
+clamped to `0..=1000`. The host measured here obeys none of that literally: at a
+fixed small resident set the score moved by exactly **two thirds** of the
+adjustment (200 -> 800, 300 -> 866, ..., 1000 -> 1333), and it went *past* the
+top of the scale instead of clamping. So the reference host's absolute number is
+not reproducible by the formula, and a kernel that printed the "plausible" `200`
+for the same process would be printing a number this host does not print either.
+What both do obey is the shape: the file is a decimal plus one newline, is
+`0444` and read-only, a larger adjustment scores higher, a larger resident set
+scores higher, another task's is readable, and a gone pid is `ENOENT`. Those are
+the claims the pin makes; no absolute score is claimed for either machine.
+
+### The implementation
+
+One pure function, host-tested:
+
+```text
+oom_score_from(rss_pages, total_pages, adj)
+    = clamp(rss_pages * 1000 / total_pages + adj, 0, 1000)
+```
+
+plus a zero-total guard for a machine whose allocator has counted no frames yet.
+It is a **view**: `oom_score_file(pid)` asks `TaskSnapshot::rss_pages` (the very
+number `statm` prints) and `sched::oom_score_adj_of` (the very word
+`oom_score_adj` reads) on every read, so the score cannot drift from either and
+there is no second store to keep in step. It is a `maybe_file`, hence Linux's
+`0444` and a write-open that is `EACCES` for root too (`ProcFile` has no write
+method - §6.142's finding). The denominator is `mm::frame_stats().total`, which
+is the number `/proc/meminfo` already reports.
+
+Named divergences, each with the measurement above:
+
+* the denominator is this kernel's managed frame total, not Linux's
+  `totalram_pages + total_swap_pages` - there is no swap here - so the resident
+  proportion is a different fraction of a different whole;
+* the numerator has no swap and no page-table term, for the same reason;
+* the reference host's own value is neither the formula nor clamped (1333 at
+  `oom_score_adj` 1000), so no absolute score is claimed at all; the committed
+  claim is the relation, and `docs/notes/` here is the record of why.
+
+### The pin, and a probe that measured the compiler
+
+`user/tests/src/bin/t-oom-score.rs`, 13 claims, all relations: the body's shape
+(decimal, one newline, no padding), `0444` and the `EACCES` write-open, the
+score rising when `oom_score_adj` rises by 200 and returning when it is written
+back, another process's file readable and following the adjustment written for
+it, a reaped pid `ENOENT`, pid 1 readable, and a larger resident set scoring
+higher. Green on the host first (`800\n` at adj 200), then in the guest: `0\n`
+at adj 0, `0 -> 200` when the adjustment moved, and `0 -> 100` when 256 MiB
+became resident.
+
+The resident-set claim's first guest run read `0 -> 0` while the host read
+`800 -> 804`. The probe had touched its 256 MiB through a `Vec` dropped
+immediately after the read, so the stores were dead and the allocator's pages
+were never faulted in: the reading was of how the optimiser treated the probe,
+not of the kernel. It now writes one byte per page through a raw mapping with
+`write_volatile`, which cannot be elided, and the same claim read `0 -> 100`.
+A reminder that the probe is part of the measurement, and a green host run did
+not catch it because the host's own allocator happened to commit the pages.
+
+### Counterfactual
+
+With `src/vfs/procfs.rs` stashed and the kernel **and loader** rebuilt
+(`build/boot-oomscore-counterfactual.log`), the same staged pin read `ENOENT`
+for its own score and went `FAILED` - 10 of 13 claims red (the three that still
+pass are the starting-adjustment precondition and two claims that are trivially
+true when the file is absent: `None == None`, and the reaped pid's `ENOENT`):
+
+```text
+FAIL:  oom_score is a bare decimal word and one newline (got None)
+FAIL:  oom_score parses as a decimal integer (got None)
+FAIL:  oom_score is 0444 (got None)
+FAIL:  oom_score refuses a write-open with EACCES (got 2)
+FAIL:  raising oom_score_adj by 200 raises the score (None -> None)
+FAIL:  another process's oom_score is readable (got None)
+FAIL:  pid 1's oom_score is readable
+FAIL:  a larger resident set scores higher (None -> None)
+FAILED
+```
+
+Restored and rebuilt, it is green again (`build/boot-oomscore-restored.log`,
+13/13), and the full gate is green (`build/gate-oomscore2.log`: stage 1 1296
+tests 0 failed; x86_64 `pass=306 fail=0`; aarch64 `pass=305 fail=0`;
+`GATE_EXIT=0`).
+
+### The one red the first gate produced was not this file
+
+The first full sweep after this change went `x86_64 pass=... fail=1` on
+`t-rr-interval`'s "the blocked child is answered zero every time (176 of 200)".
+That program alone was green 3/3 boots (200/200 each), and its claim is the
+200-sample poll window §6.78a/§6.144 record as load-sensitive - it samples a
+*blocked* child that this kernel's timed park wakes periodically. Six TCG lanes
+make the runnable moment likelier; nothing in this change touches the scheduler.
+The second sweep was green on both arms.

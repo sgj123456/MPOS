@@ -11330,3 +11330,38 @@ guest, which print different addresses under the same claims.
 
 **Named gaps:** a task stopped by a tracer reports its last call rather than the
 stop's state; a `vDSO` call has no number to report. Notes: `§6.143`.
+
+### Item 258 `/proc/<pid>/oom_score` - a view of the resident set and one adjustment
+
+**Before:** `ENOENT`. The OOM killer's badness score for a task - what a
+supervisor reads before deciding whom to spare - did not exist, though the
+adjustment it is added to, the resident-page count and the frame total all did.
+
+**Now:** the file exists beside `oom_score_adj` in `/proc/<pid>`, `0444` and
+read-only, a bare decimal and one newline. It is computed on every read from
+`TaskSnapshot::rss_pages` and `sched::oom_score_adj_of` - one function,
+`oom_score_from(rss_pages, total_pages, adj) = clamp(rss_pages * 1000 /
+total_pages + adj, 0, 1000)`, host-tested - so there is no second store.
+
+| | reference host (Linux 7.2.14) | this kernel before | now |
+|---|---|---|---|
+| a small process, adj 200 | `800\n` | `ENOENT` | this kernel's proportion + 200 |
+| mode / write-open | `0444` / `EACCES` | - | `0444` / `EACCES` |
+| another process, pid 1 | readable as uid 1000 | `ENOENT` | readable |
+| reaped or absent pid | `ENOENT` | `ENOENT` | `ENOENT` |
+| larger `oom_score_adj` | score rises | - | score rises |
+| 256 MiB more resident | `800 -> 804` | - | score rises (`0 -> 100` in the guest at adj 0) |
+
+**Why the absolute value is not claimed.** The documented formula is
+`(rss + swap) * 1000 / total_pages + oom_score_adj`, clamped to `0..=1000`. The
+host measured here does not follow it: at a fixed small resident set its score
+moved by two thirds of the adjustment (`200 -> 800`, `1000 -> 1333`) and went
+past the top of the scale instead of clamping. That number cannot be reproduced,
+and this kernel's own total and resident count are not Linux's either (no swap,
+no page-table term, a different managed-frame total). So the implemented
+arithmetic is the documented formula on this machine's own numbers, and the pin
+claims only the relations both machines keep. Notes: `§6.145`.
+
+**Pin:** `user/tests/src/bin/t-oom-score.rs`, 13 claims, green on the host first
+and in the guest; counterfactually 10/13 red without the file. Full gate green on
+both arms.
