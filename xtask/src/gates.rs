@@ -466,6 +466,25 @@ mod tests {
         );
     }
 
+    /// The real tree's inventory holds the invariant its document states.
+    ///
+    /// The fixture test above proves the checker can *see* drift; this one is
+    /// the claim about this repository, and it is the one that would have
+    /// reddened on 2026-11-12 (three arms without rows, two rows without arms).
+    /// Both are needed and neither substitutes for the other: a checker that
+    /// only ever runs on a synthetic tree can agree with itself forever.
+    #[test]
+    fn the_syscall_inventory_covers_every_dispatch_arm() {
+        let root = crate::utils::project_root().expect("the workspace root");
+        let drift = syscall_inventory(&root).expect("the inventory read");
+        assert!(
+            drift.is_empty(),
+            "the dispatch and docs/uapi/01-syscall-table.md disagree: {drift:#?}\n\
+             A served call without a §1.0 row is the review finding that document \
+             exists to make (docs/uapi/index.md)."
+        );
+    }
+
     /// The boot's own code, with every listed file present and empty, so a test
     /// can give one of them the shape it is about.
     fn scratch_boot_tree(name: &str) -> PathBuf {
@@ -542,4 +561,146 @@ mod tests {
              rather than `M*` markers (§15.24)."
         );
     }
+
+    /// The inventory check finds both directions of drift, and only drift.
+    ///
+    /// Built as a two-file tree so the checker is exercised on a shape that
+    /// *has* the defect - the point this file's header makes about the
+    /// `RNDADDENTROPY` constant: a checker that cannot tell a correct tree from
+    /// a broken one agrees with itself and pins nothing. The fixture carries one
+    /// arm with no row and one row with no arm, and the check must report
+    /// exactly those two.
+    #[test]
+    fn inventory_drift_is_reported_in_both_directions() {
+        let dir = std::env::temp_dir().join(format!("mpos-xtask-inventory-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("docs/uapi")).unwrap();
+        fs::create_dir_all(dir.join("src/syscall/linux")).unwrap();
+        fs::write(
+            dir.join("src/syscall/linux/mod.rs"),
+            "match nr {\n    nr::READ => 1,\n    nr::WRITE => 2,\n    nr::GHOST => 3,\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("docs/uapi/01-syscall-table.md"),
+            "### 1.0 Every served call\n\n| Syscall | Nr |\n|---|---|\n| `read` | 0 |\n| `write` | 1 |\n| `phantom` | 9 |\n\n### 1.1 Refused\n\n| `ignored` | 9 |\n",
+        )
+        .unwrap();
+        let drift = syscall_inventory(&dir).unwrap();
+        let said: Vec<&str> = drift.iter().map(|d| d.what.as_str()).collect();
+        assert!(
+            said.iter()
+                .any(|w| w.contains("`ghost`") && w.contains("no §1.0 row")),
+            "an arm with no row must be reported: {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|w| w.contains("`phantom`") && w.contains("no dispatch arm")),
+            "a row with no arm must be reported: {said:?}"
+        );
+        // §1.1's rows are not this count, and neither is a matched correct pair.
+        assert!(!said.iter().any(|w| w.contains("`ignored`")), "{said:?}");
+        assert!(!said.iter().any(|w| w.contains("`read`")), "{said:?}");
+        assert_eq!(drift.len(), 2, "exactly the two defects: {said:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The uapi inventory's own invariant
+// ---------------------------------------------------------------------------
+
+/// One way the syscall inventory and the dispatch disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryDrift {
+    /// The section of `docs/uapi/01-syscall-table.md` the row lives in.
+    pub section: &'static str,
+    /// What is wrong, in the words the gate prints.
+    pub what: String,
+}
+
+/// Every syscall the dispatch has an arm for must have exactly one row in
+/// §1.0 of `docs/uapi/01-syscall-table.md`, and every §1.0 row must name an arm.
+///
+/// This is the inventory's stated invariant - "what matters is *arms = rows*: a
+/// syscall landing without a row here is the review finding" - and until this
+/// function existed it was a sentence nobody re-ran. Re-measured 2026-11-12 it
+/// was false in **both** directions: three arms had no row (`sync_file_range`,
+/// `futex2_wake`, `futex2_wait`) and two rows named numbers that are not
+/// syscalls at all (`futex_wake`/`futex_wait` at 454/455 - operation words,
+/// listed again correctly under their real names beside them).
+///
+/// The check is textual and crude for the reason the rest of this file is: it
+/// costs a file read, so it can run on every sweep, and a check that is not run
+/// is a check that has already failed (the `RNDADDENTROPY` lesson in this file's
+/// header - a checker that agrees with itself pins nothing).
+///
+/// Two exclusions, each stated rather than silent:
+/// * a name numbered in the machine tables but deliberately unserved still has
+///   its own row, which is why the comparison is against the *dispatch arms*
+///   and not against the number tables - a number with a `_ => ENOSYS`
+///   fall-through and no row is the finding;
+/// * `### 1.1`/`### 1.2` rows are the refusals and the sub-gaps, and they are
+///   not part of this count, so only `### 1.0`'s table is read.
+pub fn syscall_inventory(root: &Path) -> Result<Vec<InventoryDrift>, String> {
+    let doc = root.join("docs/uapi/01-syscall-table.md");
+    let dispatch = root.join("src/syscall/linux/mod.rs");
+    let text = fs::read_to_string(&doc).map_err(|e| format!("{}: {e}", doc.display()))?;
+    let dispatch_text =
+        fs::read_to_string(&dispatch).map_err(|e| format!("{}: {e}", dispatch.display()))?;
+
+    // The arms: every `nr::NAME` the dispatch matches on.
+    let mut arms: HashSet<String> = HashSet::new();
+    for line in dispatch_text.lines() {
+        let mut rest = line;
+        while let Some(at) = rest.find("nr::") {
+            rest = &rest[at + 4..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                arms.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+
+    // §1.0's rows only: the section runs from its heading to the next one.
+    let mut rows: HashSet<String> = HashSet::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if line.starts_with("### ") || line.starts_with("## ") {
+            in_section = line.trim_start_matches('#').trim_start().starts_with("1.0");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let name: String = rest.chars().take_while(|c| *c != '`').collect();
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            rows.insert(name);
+        }
+    }
+
+    let mut drift = Vec::new();
+    for arm in arms.difference(&rows) {
+        drift.push(InventoryDrift {
+            section: "1.0",
+            what: format!("`{arm}` has a dispatch arm but no §1.0 row"),
+        });
+    }
+    for row in rows.difference(&arms) {
+        drift.push(InventoryDrift {
+            section: "1.0",
+            what: format!("`{row}` has a §1.0 row but no dispatch arm"),
+        });
+    }
+    drift.sort_by(|a, b| a.what.cmp(&b.what));
+    Ok(drift)
 }

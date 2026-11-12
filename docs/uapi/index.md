@@ -100,13 +100,27 @@ repository root.
 # 3. the magic bytes filtered by `family_nr` in `src/syscall/linux/fs/ioctl.rs` are
 #    exactly the families §2 lists.
 grep -oE 'pub const [A-Z0-9_]+: u64' src/syscall/linux/nr_x86_64.rs | wc -l   # names numbered
-grep -c '^| `' docs/uapi/01-syscall-table.md                                  # rows across §1.0–§1.2
+grep -oE 'nr::[A-Z0-9_]+' src/syscall/linux/mod.rs | sort -u | wc -l          # distinct arms
 ```
 
-§1.0 currently holds **251** rows — one per dispatch arm, including the kernel's own
+**Counting is not checking**, which is how the paragraph below came to be wrong: the old second
+command here counted rows across §1.0–§1.2 together, so 318 rows against 301 arms read as
+*over*-coverage when four of those rows were the refusals §1.1 is supposed to carry and five of
+the 301 arms were not in §1.0 at all. The defect is a **set difference**, not a count. It is a
+function now - `xtask/src/gates.rs::syscall_inventory`, run by `cargo xtask test` - so the rule
+below is enforced rather than documented.
+
+§1.0 holds **301** rows — one per dispatch arm, including the kernel's own
 `cleanup_after_kthread` (number 999 on both machines' tables: not a Linux syscall, but named so
 the ABI stays Linux-shaped). The refusals in §1.1 carry their own rows, so what matters is
-*arms = rows*: a syscall landing without a row here is the review finding. A simple generator:
+*arms = rows*: a syscall landing without a row here is the review finding.
+
+That sentence is checkable rather than a claim, and re-checked mechanically on 2026-11-12 it was
+**false**: §1.0 held 297 rows against 301 arms. Three arms had no row at all
+(`sync_file_range`, `futex2_wake`, `futex2_wait`) and two rows named numbers that are not
+syscalls (`futex_wake`/`futex_wait` at 454/455, which are the `futex2_*` syscalls, listed again
+correctly beside them). All five are fixed and the check below now returns zero in both
+directions, so a recurrence is a regression rather than drift nobody looked for. A simple generator:
 extract `pub const NAME: u64 = N` from `nr_x86_64.rs`, keep the names appearing as `nr::NAME`
 arms in `mod.rs`'s dispatch, map each to the handler module named on its arm line (`fs` / `proc` /
 `posix` / `net` / `abi` / `kernel`), sort by number, print rows.

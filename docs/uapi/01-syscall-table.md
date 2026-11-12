@@ -8,7 +8,8 @@ section numbers are unchanged from the original `UAPI.md`.
 `src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **301** x86_64
 syscall numbers, `nr_aarch64.rs` the same **301** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **293** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
+explicit arm for **every one** of them - 301 arms, no orphans, measured 2026-11-12 - plus a
+`_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
 
@@ -304,8 +305,13 @@ A call absent from those is served as its phase section records.
 | `process_madvise` | 440 | proc | 440 |
 | `epoll_pwait2` | 441 | fs | 441 |
 | `futex_waitv` | 449 | proc | 449 |
-| `futex_wake` | 454 | proc | 454 |
-| `futex_wait` | 455 | proc | 455 |
+> This list carried `futex_wake`/`futex_wait` rows at **454/455** and then again, correctly, as
+> `futex2_wake`/`futex2_wait` at the same two numbers - one pair named from the *operation*
+> constants rather than from the syscalls. `FUTEX_WAIT`/`FUTEX_WAKE` are opcodes of the one
+> `futex(2)` call (declared `usize` in `nr_x86_64.rs` for that reason), not numbers; 454/455 are
+> `futex_wake`/`futex_wait` in Linux's own `syscall_64.tbl`, which is where the right names come
+> from. The wrong pair is gone as of 2026-11-12 - found by running the mechanical completeness
+> check below rather than by reading, which is what that check is for.
 | `futex_requeue` | 456 | proc | 456 |
 | `open_tree` | 428 | mount | 428 |
 | `move_mount` | 429 | mount | 429 |
@@ -320,6 +326,12 @@ A call absent from those is served as its phase section records.
 | `io_uring_setup` | 425 | io_uring | 425 |
 | `io_uring_enter` | 426 | " | " |
 | `io_uring_register` | 427 | " | " |
+| `sync_file_range` | 277 | fs | 84 |
+| `futex2_wake` | 454 | proc | 454 |
+| `futex2_wait` | 455 | proc | 455 |
+| `fsopen` | 430 | fs | 430 |
+| `fsconfig` | 431 | fs | 431 |
+| `fsmount` | 432 | fs | 432 |
 | `cleanup_after_kthread` | 999 | kernel | 999 | (the kernel's own kthread-cleanup hook, named by number so the ABI stays Linux-shaped; there is no Linux syscall at 999 on either machine's table)
 
 ### 1.1 Deliberately `ENOSYS` — refused, pinned
@@ -327,11 +339,12 @@ A call absent from those is served as its phase section records.
 `user/abitest/src/bin/syscall/t-enosys.rs` walks these and asserts `ENOSYS`, plus a console
 note printed once per number (`note_enosys`):
 
+None of these three is refused any more: `fsopen`, `fsconfig` and `fsmount` are **served**
+(§1.0 carries their rows), so what follows is one genuine refusal and the three served calls
+recorded here for their history.
+
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
-| `fsopen` | 430 | served: names one of the types this kernel can build and answers a context descriptor (`ENODATA` on `read(2)`, `EINVAL` on `write(2)`, `FD_CLOEXEC` on request, `ENODEV` for a type it cannot build) | `src/vfs/fscontext.rs`, pin `t-fsmount`, `docs/notes/` §3.16 |
-| `fsconfig` | 431 | served: one option per call into the context, `FSCONFIG_CMD_CREATE` builds the filesystem through the same factory `mount(2)` uses. an option the type does not read is `EINVAL` (Linux's answer); the keys accepted are `source` for every type, `mode`/`uid`/`gid` for `devpts`, and `size`/`nr_inodes`/`mode`/`uid`/`gid` for `tmpfs`/`ramfs` (item 139, §3.18) | same |
-| `fsmount` | 432 | served: spends the context once and answers a mount descriptor that `move_mount` attaches as a first mount. `EINVAL` before creation, `EBUSY` after one mount, `MOUNT_ATTR_IDMAP` `EINVAL` | same |
 | `fspick` | 433 | **`ENOSYS`**: what it picks a mount for is reconfiguration, and no filesystem here can be reconfigured | the gap named; needs per-filesystem reconfigure support first |
 | `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page; measured on Linux 7.2.11 first — `0600` file, no `FD_CLOEXEC`, size fixed once, `MAP_SHARED` only, `PROT_EXEC` `EACCES`, `pread` `ESPIPE`, inherited by a child (item 131, §8.4) | a per-page direct-map carve-out (remove + restore around a page-table walk), plus `SECRETMEM` accounting in `/proc/meminfo`, the fixed-once size / shared-only / no-exec / no-coredump rules, and `t-secretmem` as the pin |
 

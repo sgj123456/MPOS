@@ -175,6 +175,7 @@ pub fn run(
     let gate_started = Instant::now();
     check_target_gates()?;
     check_boot_openings()?;
+    check_syscall_inventory()?;
 
     // Stage 1 starts here and is *joined* at the first arm's report. The two
     // share no file - the host suite writes cargo's `target/`, the sweeps
@@ -493,6 +494,34 @@ fn check_boot_openings() -> Result<()> {
         "{} test opening(s) in the boot's own code; whether a kernel carries tests \
          is the build's to say, not a word's or a run-time check's (NOTES.md §15.19)",
         openings.len()
+    );
+}
+
+/// The third structural check, and the same species as the two above: a claim
+/// in a document that nothing re-measures. `docs/uapi/` states the inventory's
+/// invariant as "what matters is *arms = rows*: a syscall landing without a row
+/// here is the review finding" - and on 2026-11-12 that sentence was false in
+/// both directions (three arms with no row, two rows naming numbers that are not
+/// syscalls). A document that says how it should be checked, beside a check
+/// nobody runs, is how that happens.
+///
+/// It costs two file reads, so it belongs beside the other two: cheap enough for
+/// every sweep, loud when it fires.
+fn check_syscall_inventory() -> Result<()> {
+    println!("Target gates: the syscall inventory covers every dispatch arm");
+    let drift =
+        crate::gates::syscall_inventory(&utils::project_root()?).map_err(|e| anyhow::anyhow!(e))?;
+    if drift.is_empty() {
+        return Ok(());
+    }
+    for item in &drift {
+        eprintln!("  §{}: {}", item.section, item.what);
+    }
+    bail!(
+        "{} row(s) of disagreement between the dispatch and docs/uapi/01-syscall-table.md; \
+         a served call without a row is the review finding that document exists to make \
+         (AGENTS.md §4, `cargo xtask test`)",
+        drift.len()
     );
 }
 
