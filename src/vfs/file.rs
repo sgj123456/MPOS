@@ -31,6 +31,23 @@ pub const FD_CLOEXEC: u32 = 1;
 /// timeout loop is built on.
 pub const O_NONBLOCK: u32 = 0o4000;
 
+/// The `O_CLOEXEC` **open** flag - not [`FD_CLOEXEC`], which is the
+/// per-*descriptor* bit `fcntl(F_SETFD)` keeps.
+///
+/// The two are different numbers and different questions, and the one place
+/// they meet is `/proc/<pid>/fdinfo`'s `flags:` line: Linux prints
+/// `f_flags`, and `f_flags` carries `O_CLOEXEC` when the open asked for it or
+/// a later `F_SETFD` set `FD_CLOEXEC` - measured on Linux 7.2.14
+/// (`build/scratch/fdinfo/cloexec.c`): `open(O_RDONLY|O_CLOEXEC)` reports
+/// `02100000` where `F_GETFL` answers `0100000`, and `F_SETFD(0)` takes the
+/// bit back out. So the line is `F_GETFL | (FD_CLOEXEC ? O_CLOEXEC : 0)` and
+/// neither half alone answers it.
+///
+/// It lives here rather than in the syscall layer because the number is the
+/// same on both machines (`asm-generic`'s) and because `File` is what a
+/// renderer of that line has in its hand.
+pub const O_CLOEXEC: u32 = 0o200_0000;
+
 /// The `O_NOATIME` open flag: a read through this description does not move
 /// the file's access clock. Measured on a current host
 /// (`.workbuddy/probe_atime.c`, Linux 7.2.11): a description opened with it

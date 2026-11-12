@@ -592,6 +592,49 @@ fn report(entry: &Entry, ready: Ready, hup: bool, err: bool) -> u32 {
     bits
 }
 
+/// One `tfd:` line of `/proc/<pid>/fdinfo/<epfd>`, rendered from the six facts
+/// an interest-list entry holds.
+///
+/// The format is Linux's `ep_show_fdinfo`, and every width and radix in it was
+/// measured on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`, an epoll over two
+/// pipe ends) rather than read off a man page:
+///
+/// ```text
+/// tfd:       10 events:       1c data:               2a  pos:0 ino:57687 sdev:10
+/// tfd:        9 events: 80000019 data:             aabb  pos:0 ino:57687 sdev:10
+/// ```
+///
+/// Five details in those bytes are easy to get wrong, which is why this is a
+/// function of its arguments - the rendering half - and the walk below only
+/// answers where the numbers come from:
+///
+/// * `tfd` is the descriptor number the caller spelled at `epoll_ctl`, which is
+///   the number a later `epoll_wait` reports back; it is **not** a number in the
+///   asking process's table, and it is right-aligned in eight columns.
+/// * `events` is the stored interest word verbatim - the input flags (`EPOLLET`,
+///   `EPOLLONESHOT`, ...) included, because that is what Linux prints from
+///   `epi->event.events` - in hex, right-aligned in eight.
+/// * `data` is the caller's `u64` verbatim, in hex, right-aligned in sixteen.
+/// * the gap between the `data` field and `pos:` is **two** spaces, not one:
+///   Linux's `seq_printf` is two adjacent literals, one ending and the next
+///   beginning with a space. A single space there is a difference no reader of
+///   the file notices until a diff.
+/// * `pos` is decimal where `ino` and `sdev` are hex - and the measured numbers
+///   make a radix slip visible in the bytes: `ino:57687` is `0x57687` = 358023
+///   decimal and `sdev:10` is `0x10` = 16 decimal.
+fn tfd_line(
+    fd: RawFd,
+    events: u32,
+    data: u64,
+    pos: u64,
+    ino: u64,
+    sdev: u64,
+) -> alloc::string::String {
+    alloc::format!(
+        "tfd: {fd:8} events: {events:8x} data: {data:16x}  pos:{pos} ino:{ino:x} sdev:{sdev:x}\n"
+    )
+}
+
 /// `epoll_ctl(2)`'s ELOOP: would adding `target` under `self` make a
 /// circle, or a chain of epoll instances deeper than the man page's five?
 ///
@@ -656,6 +699,90 @@ impl Inode for Epoll {
         Some(alloc::string::String::from("anon_inode:[eventpoll]"))
     }
 
+    /// The `tfd:` lines Linux's epoll `show_fdinfo` adds after the generic
+    /// four - one per watched description, in the order the interest list
+    /// holds them.
+    ///
+    /// [`tfd_line`] carries the measured bytes, their widths and their radixes;
+    /// this method answers only *where each number comes from*, and the answer
+    /// is the watched description rather than the epfd. Every entry holds the
+    /// `Arc<File>` its descriptor named at ADD time, which is the same open
+    /// file description a `dup` or an `exec` keeps alive, so the `pos`/`ino`/
+    /// `sdev` reported here are the ones that description has now, exactly as
+    /// Linux's `epi->ffd.file` gives it.
+    ///
+    /// `sdev` is decided the way `fstat(2)` decides the same question for the
+    /// same descriptor: the device the open recorded (`File::dev`), else the
+    /// one the recorded label's path names, else the mount-table fallback for
+    /// the inode. Two doors agreeing is the point - a tool that reads `fdinfo`
+    /// and `fstat` for one descriptor and compares the filesystem number must
+    /// not be told there are two.
+    ///
+    /// Two divergences are named rather than papered over:
+    ///
+    /// * **`sdev`'s number space.** Linux prints `i_sb->s_dev`, the
+    ///   superblock's raw device number - `(major << 20) | minor` for a
+    ///   device-backed filesystem - while this kernel records and prints
+    ///   `st_dev`, the `makedev` word `stat(2)` reports. The two are the same
+    ///   number for a major-0 pseudo-filesystem when its minor fits the low
+    ///   byte, which is every filesystem this kernel mounts without a disk
+    ///   behind it (`mount::next_anon_dev` mints them as `makedev(0, minor)`);
+    ///   they are different for a device-backed mount - `254:0` reads `fe00`
+    ///   here and `fe00000` in Linux's line. The value printed is the one the
+    ///   description holds, because `st_dev` is the number this kernel keeps
+    ///   and re-encoding it into the superblock's private form would be a
+    ///   second rule for a field a reader only compares against `stat`.
+    /// * **an anonymous target has no recorded device.** A pipe end, an
+    ///   `eventfd`, a socket - most of what epoll exists to watch - was never
+    ///   opened by a path, so `File::dev()` is `None` and the fallback answers
+    ///   the root filesystem's number. Linux prints the *pseudo-filesystem's*
+    ///   own superblock device there: the measured `sdev:10` above is
+    ///   `pipefs`'s anonymous one, because both targets were pipe ends. The
+    ///   fallback is at least the number `fstat` gives the same description, so
+    ///   the two doors still agree; it is named because it is not the number
+    ///   Linux's line would carry.
+    ///
+    /// The order is the list's own - the order the `epoll_ctl` ADDs arrived -
+    /// and Linux's is not: it walks a red-black tree keyed by the watched
+    /// `(file, fd)` pair, which is why the two measured lines above come out
+    /// `10` before `9` although `9` was registered first. No tool may depend on
+    /// either order; a caller that must identify a watch reads `tfd`.
+    ///
+    /// One more honesty: an entry whose descriptor was closed is reaped at the
+    /// *next* epoll operation, not at the close (the descriptor table has no
+    /// close hook), so a descriptor closed since the last `epoll_wait` can
+    /// still produce a line. Linux removes the entry at close.
+    ///
+    /// The block is bounded like the list it renders: at most [`MAX_WATCHES`]
+    /// lines, so a user can steer the allocation volume only as far as the
+    /// interest list's own cap. `Some("")` for an empty list - the kind has a
+    /// block, it is just empty, which is what Linux's `seq_file` answers for an
+    /// epoll watching nothing.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
+        let mut text = alloc::string::String::new();
+        critical_section::with(|cs| {
+            for entry in self.state.borrow(cs).borrow().iter() {
+                let inode = entry.file.inode();
+                let dev = match entry.file.dev() {
+                    Some(dev) => dev,
+                    None => match entry.file.label() {
+                        Some(path) => crate::vfs::mount::dev_of_path(&path),
+                        None => crate::vfs::mount::dev_of_inode(&inode),
+                    },
+                };
+                text.push_str(&tfd_line(
+                    entry.fd,
+                    entry.events,
+                    entry.data,
+                    entry.file.pos(),
+                    inode.number(),
+                    dev,
+                ));
+            }
+        });
+        Some(text)
+    }
+
     /// The answer `poll` on the epfd itself reads: readable when something
     /// in the list could report, never writable - nobody writes to an
     /// epoll, and a writable answer would invite a caller to try.
@@ -689,7 +816,7 @@ mod tests {
         EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLL_EVENT_DATA, EPOLL_EVENT_SIZE, EPOLLERR,
         EPOLLET, EPOLLEXCLUSIVE, EPOLLHUP, EPOLLIN, EPOLLMSG, EPOLLONESHOT, EPOLLOUT, EPOLLPRI,
         EPOLLRDBAND, EPOLLRDHUP, EPOLLRDNORM, EPOLLWAKEUP, EPOLLWRBAND, EPOLLWRNORM, Epoll,
-        MAX_EVENTS, MAX_WATCHES, collect_capacity,
+        MAX_EVENTS, MAX_WATCHES, collect_capacity, tfd_line,
     };
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -698,7 +825,7 @@ mod tests {
     use crate::vfs::file::{FdTable, File};
     use crate::vfs::pipe::{self, DuplexEnd};
     use crate::vfs::ramfs::RamFs;
-    use crate::vfs::{FileSystem, Inode, NodeKind};
+    use crate::vfs::{FileSystem, Ino, Inode, Metadata, NodeKind};
 
     /// A table with a fresh epoll instance installed, handing back the
     /// table, the instance and its descriptor number.
@@ -713,6 +840,43 @@ mod tests {
     /// Install a node in `table` and hand back its number.
     fn watch(table: &FdTable, node: Arc<dyn Inode>) -> i32 {
         table.install(Arc::new(File::new(node))).unwrap()
+    }
+
+    /// A watched node that answers a chosen inode number and calls itself a
+    /// socket, so `epoll_ctl`'s "can this descriptor ever make a caller wait"
+    /// gate lets it in.
+    ///
+    /// A real pipe end would answer this kernel's inode number, and the point
+    /// of the test below is Linux's bytes: the two measured lines carry
+    /// `ino:57687` on device `10`, so those two facts are test inputs here -
+    /// the inode number through [`Inode::metadata`], the device through
+    /// [`File::set_dev`] on the description, which is exactly where the line
+    /// says they come from.
+    struct Target {
+        ino: Ino,
+    }
+
+    impl Inode for Target {
+        fn metadata(&self) -> Metadata {
+            Metadata {
+                ino: self.ino,
+                kind: NodeKind::File,
+                size: 0,
+            }
+        }
+
+        /// One of the four proofs `epoll_ctl` accepts; the cheapest for a node
+        /// that is never polled - `fdinfo_lines` never asks this.
+        fn socket_handle(&self) -> usize {
+            1
+        }
+    }
+
+    /// Install a [`Target`] with a chosen inode number and recorded device.
+    fn install_target(table: &FdTable, ino: u64, dev: u64) -> i32 {
+        let file = Arc::new(File::new(Arc::new(Target { ino })));
+        file.set_dev(dev);
+        table.install(file).unwrap()
     }
 
     /// The ABI is not a choice: every bit and offset is the value the
@@ -1226,5 +1390,91 @@ mod tests {
         for asked in [MAX_WATCHES as i64 + 1, 89_478_485, MAX_EVENTS as i64] {
             assert_eq!(collect_capacity(asked), Ok(MAX_WATCHES));
         }
+    }
+
+    /// The `tfd:` line is Linux's measured bytes, width for width and radix for
+    /// radix.
+    ///
+    /// Both strings are the ground truth from `build/scratch/fdinfo/pertype.c`
+    /// (Linux 7.2.14, an epoll over two pipe ends), with the values that
+    /// produced them: descriptor 10 with events `0x1c` and data `0x2a`,
+    /// descriptor 9 with events `0x80000019` and data `0xaabb`, both watching
+    /// inode `0x57687` on device `0x10`. A width or a radix off by one fails
+    /// here rather than in a tool's parser: `ino` and `sdev` would read
+    /// `358023` and `16` in decimal, and `events:` would carry one space too
+    /// many if its field were wider than eight.
+    #[test]
+    fn the_tfd_line_is_linuxs_measured_bytes() {
+        assert_eq!(
+            tfd_line(10, 0x1c, 0x2a, 0, 0x57687, 0x10),
+            "tfd:       10 events:       1c data:               2a  pos:0 ino:57687 sdev:10\n"
+        );
+        assert_eq!(
+            tfd_line(9, 0x8000_0019, 0xaabb, 0, 0x57687, 0x10),
+            "tfd:        9 events: 80000019 data:             aabb  pos:0 ino:57687 sdev:10\n"
+        );
+        // `pos` is decimal like Linux's `%lli`, not hex: a `{:x}` slip there is
+        // invisible while every target sits at 0, which every pipe does.
+        assert_eq!(
+            tfd_line(3, 1, 0, (1 << 32) + 17, 0, 0),
+            "tfd:        3 events:        1 data:                0  pos:4294967313 ino:0 sdev:0\n"
+        );
+    }
+
+    /// The block is one line per entry, in the interest list's order, rendered
+    /// off the target description the entry has held since ADD - and `Some("")`
+    /// for an empty list, because the kind has a block, just an empty one.
+    ///
+    /// The descriptors are padded up to the measured numbers (`9` and `10`) so
+    /// the bytes asserted are the measured block itself; the padding files are
+    /// never watched, never polled and never read - they exist for their
+    /// numbers alone.
+    #[test]
+    fn the_interest_list_renders_the_measured_block_in_list_order() {
+        let (table, ep, epfd) = epoll_fd();
+        for _ in 0..8 {
+            let _ = table
+                .install(Arc::new(File::new(Arc::new(Target { ino: 1 }))))
+                .unwrap();
+        }
+        let first = install_target(&table, 0x57687, 0x10);
+        let second = install_target(&table, 0x57687, 0x10);
+        assert_eq!((first, second), (9, 10), "the measured descriptors");
+
+        assert_eq!(
+            ep.fdinfo_lines(),
+            Some(alloc::string::String::new()),
+            "an empty interest list is an empty block, not no opinion"
+        );
+
+        // Added in the measured order - 10 first - so the list's order is the
+        // measured one. The `tfd` numbers are the numbers the caller spelled at
+        // ADD, never numbers in the asking process's table.
+        assert_eq!(
+            ep.ctl(&table, epfd, EPOLL_CTL_ADD, second, 0x1c, 0x2a),
+            Ok(())
+        );
+        assert_eq!(
+            ep.ctl(&table, epfd, EPOLL_CTL_ADD, first, 0x8000_0019, 0xaabb),
+            Ok(())
+        );
+        assert_eq!(
+            ep.fdinfo_lines().unwrap(),
+            concat!(
+                "tfd:       10 events:       1c data:               2a  pos:0 ino:57687 sdev:10\n",
+                "tfd:        9 events: 80000019 data:             aabb  pos:0 ino:57687 sdev:10\n",
+            )
+        );
+
+        // The position is the *description's*, read on each ask: advancing it
+        // moves the line, which is what a reader watching a shared offset
+        // expects.
+        table.clone_at(first).unwrap().set_pos(17);
+        assert!(
+            ep.fdinfo_lines()
+                .unwrap()
+                .ends_with("pos:17 ino:57687 sdev:10\n"),
+            "the line follows the target description's position"
+        );
     }
 }

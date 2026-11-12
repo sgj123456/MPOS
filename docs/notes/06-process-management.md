@@ -12512,3 +12512,202 @@ caller can act on is the second. A kernel that cannot do a thing but knows the
 shape of the thing owes the caller the refusal that names *what* is missing -
 here, a filesystem with no handles - rather than the refusal that says the
 kernel has never heard of the question.
+
+## §6.141 `/proc/<pid>/fdinfo/<n>` exists, and its four lines are Linux's relations (LANDED 2026-11-12)
+
+`/proc/<pid>/fd` answers *which* descriptors a process has and what each one
+names; it does not answer where one is positioned or what flags it carries. That
+is what `/proc/<pid>/fdinfo/<n>` is for, and this kernel built none of it: a
+tool that opened the file got `ENOENT`, the same answer as for a process that
+does not exist. It is not a debugging convenience - `F_GETFL` and `F_GETFD`
+answer only for a descriptor the *asking* process holds, so a debugger, a
+supervisor or `lsof` has no other door to ask about somebody else's descriptor.
+
+Linux renders it from `seq_file`: four generic lines every kind has, then
+whatever the node's own `show_fdinfo` adds. Measured whole on Linux 7.2.14
+(`build/scratch/fdinfo/*.c`):
+
+```text
+pos:	7
+flags:	0100000
+mnt_id:	634
+ino:	27001799
+```
+
+### Four lines, four radixes, four relations
+
+Each line is a *relation* to a door this kernel already serves, which is why the
+pin claims the relation rather than the number - a host and this guest do not
+agree on any of the four values, and both agree on every relation:
+
+| line | Linux's shape | what it is a relation to |
+|---|---|---|
+| `pos:` | decimal | `lseek(SEEK_CUR)`'s answer; a `read` moves it, and a `dup` shares it |
+| `flags:` | **a literal `0` then octal** | `F_GETFL` **or** `O_CLOEXEC` when `FD_CLOEXEC` is set |
+| `mnt_id:` | decimal | the **first column** of `/proc/self/mountinfo`'s line for that mount |
+| `ino:` | decimal | `fstat`'s `st_ino` |
+
+Two of those hold more than they look like they do.
+
+**`flags` is not `F_GETFL`.** It is `F_GETFL | (FD_CLOEXEC ? O_CLOEXEC : 0)`, and
+the two halves have different owners: the access mode and the status bits live on
+the *description*, `FD_CLOEXEC` on the *descriptor*. Measured
+(`build/scratch/fdinfo/cloexec.c`): `open(O_RDONLY|O_CLOEXEC)` answers
+`02100000` from this line while `F_GETFL` answers `0100000`, `F_SETFD(0)` takes
+the bit back out, and `dup` of an `O_CLOEXEC` descriptor gives a number without
+it. A renderer that printed `F_GETFL` would lose the half that tells a tool the
+descriptor will not survive an `exec`; a renderer that printed the *open's* saved
+word would keep claiming it after the caller cleared it.
+
+**The `0` before the octal digits is a literal.** Linux's format string is
+`"flags:\t0%o\n"`, not `"flags:\t%o\n"`, which is why `O_RDWR` prints `02` and a
+zero word `00` rather than `2` and `0`. This was the one real bug the host unit
+tests caught while writing it: `generic_lines` used `{:o}` and produced
+`0100000` for a word whose octal spelling already began with zero, then `100000`
+for one that did not - so the line was right for some descriptors and wrong for
+others. The measured table above is now a `#[cfg(test)]` claim on the whole
+string rather than a substring a shared prefix would satisfy.
+
+**`mnt_id` is the *reused* id, not `statx`'s.** Measured: for the same file,
+`/proc/self/fdinfo` printed `634` and `statx(STATX_MNT_ID_UNIQUE)` answered
+`2147491621`. They are different number spaces on purpose, and this file is the
+one that takes the mountinfo spelling because correlating the two files is what
+the number is for.
+
+### What an anonymous descriptor reports
+
+An `epoll`, an `eventfd`, a pipe end, a socket and a `memfd` have no mount, and
+Linux reports a **pseudo** id there rather than 0 - measured, `19` for every
+`anon_inodefs` kind, `18` for `pipefs`, `12` for `sockfs`, and `0` for a `memfd`
+whose `shmem` inode has no mount at all. None of the four appears in
+`/proc/self/mountinfo`, which is why they are constants in
+`vfs::fdinfo` rather than a table lookup: a reader that compared them against the
+mount table would find nothing, and Linux's own answer is that they are not
+mounts.
+
+The kinds are decided through the accessors the tree already had
+(`as_eventfd`, `as_epoll`, `as_timerfd`, `as_inotify`, `as_pidfd`,
+`as_fanotify`, `as_pipe`, `as_duplex`, `socket_handle`), plus one this item
+*added* - `as_signalfd` - because the `signalfd` node was the only one of the
+five `anon_inodefs` kinds the tree could not name. The `memfd` and `io_uring`
+checks are split by `target_os` behind small helpers: both modules are gated on
+the machine build (they hand out physical pages), so the host build has no
+`memfd` to find - which is the honest answer rather than a missing one.
+
+### The directory is not the `fd` one
+
+Measured (`build/scratch/fdinfo/{edge,size}.c`), Linux's two directories have
+different words, and both halves matter:
+
+| | `/proc/<pid>/fd` | `/proc/<pid>/fdinfo` |
+|---|---|---|
+| mode | `0500` | `0555` |
+| entries | symlinks | regular files, `0444` |
+| `st_size` | the descriptor count (`3 -> 6 -> 3` as three were opened and closed) | `0`, always |
+
+The name rule is not "parses as a number": `abc`, `-1`, `00`, ` 3`, `3x`, `0x10`
+and `4294967296` all answer `ENOENT`, and `00` in particular parses to `0` while
+Linux still refuses it. So the test is that re-rendering the decimal gives the
+name back, which is the same rule the listing produces names by.
+
+The directory is wired into both builders - `/proc/<pid>` and
+`/proc/<pid>/task/<tid>` - because Linux answers `task/<tid>/fdinfo/<n>`
+measured, and it is the same descriptor set the `fd` beside it lists.
+
+### The per-kind half
+
+Each node answers for itself through a new `Inode::fdinfo_lines` hook, for the
+reason `fd_name` is a hook: the state a line reports lives on the object the
+descriptor opens, and the node is the only thing procfs has. Four kinds serve a
+block, each measured line by line:
+
+| kind | block | measured details |
+|---|---|---|
+| `eventfd` | `eventfd-count`, `-id`, `-semaphore` | the count is **hex**, right-aligned in **sixteen** columns; the semaphore word is decimal |
+| `signalfd` | `sigmask:` | sixteen zero-padded hex digits of the wire `sigset_t` (signal *n* in bit *n-1*) |
+| `timerfd` | `clockid`, `ticks`, `settime flags`, `it_value`, `it_interval` | `it_value` is the time **remaining**, not the stored deadline - a 100 s arm read `(99, 999987917)` moments later |
+| `epoll` | one `tfd:` line per watch | five widths and two radixes; the gap before `pos:` is **two** spaces because Linux's `seq_printf` is two adjacent literals |
+
+`eventfd-semaphore` is always `0` here, and that is honest rather than stale:
+this kernel's `eventfd2` refuses `EFD_SEMAPHORE` with `EOPNOTSUPP`, so the shape
+it would report cannot exist. `eventfd-id` reports the inode's own number, which
+has the property Linux's id has (it names one instance for its lifetime) rather
+than Linux's numbering; a second counter existing only for a debug line was the
+rejected alternative. `timerfd`'s `settime flags` needed a new field on
+`TimerState`: the arm's *word* is what the line reports, and the state machine
+kept only the `cancel_on_set` boolean it acted on.
+
+**`inotify` is a named refusal, and it is the interesting one.** Linux prints one
+line per watch whose tail is a **file handle** built with `exportfs_encode_fid` -
+and this kernel's filesystems have no export operations at all, which is
+`name_to_handle_at`'s finding (item 254, §6.140) one item later. On such a
+filesystem Linux omits only that tail. But the *head* has a column this kernel
+cannot fill honestly: `sdev`. The watch table keys a watch by
+`(fs_id_of_inode, inode number)`, and that first element is the filesystem
+*instance* id - `0` for every inode that is not some mount's root - not the
+`st_dev` Linux prints. Printing it under Linux's field name would be a private
+dialect. So the whole block is refused rather than one column approximated, and
+what a reader sees for a watched inotify is the four generic lines: Linux's shape
+for a zero-watch instance. That cost is named here and in the code, with its
+missing prerequisite (the watch table would have to keep the watched inode's
+`st_dev`, which is `key_of`'s second question rather than its first).
+
+### How it is verified
+
+Host unit tests cover the renderers: `vfs::fdinfo` (four), `vfs::eventfd::tests`,
+`vfs::signalfd::tests`, `vfs::timerfd::tests`, `vfs::epoll::tests` (two) and
+`vfs::inotify::tests` - each comparing **whole measured lines**, because a
+substring claim lets a prefix-valid mistake through (and did: the flags bug above
+was green under a `contains("flags:")` shape until the whole string was
+compared).
+
+The machine pin is `user/tests/src/bin/t-fdinfo.rs`, 24 claims, green on the host
+first: the four relations (including the `FD_CLOEXEC` round trip and the
+`F_GETFL`-does-not-report-it half), a `dup` sharing the position while a second
+open does not, the `mnt_id`-against-mountinfo correlation, the six refused
+spellings, the two modes, the file-not-a-link claim, and the per-kind values
+(`eventfd` hex, `signalfd` wire mask, `timerfd` against `timerfd_gettime`, and
+the two *different* pseudo ids a pipe end and a socketpair end report).
+
+**One claim was written wrong and the host caught it**: `timerfd`'s `it_value`
+was first pinned *equal* to a later `timerfd_gettime`, and the two doors are read
+at two instants of a running clock - the host answered `99999976165` ns against
+`99999957450`, both correct and both different. The claim is now the relation
+that actually holds (the earlier read is the larger, and both are inside the
+arm's span), which is the same lesson §12.4a already records: a test asserting a
+relationship between two live clocks must not invent either of them.
+
+**Counterfactual** (the twelve changed source files stashed, kernel and loader
+rebuilt, `build/boot-fdinfo-cf1.log`): the file does not exist, so the pin dies
+at its first claim - `fdinfo/<fd> of 10 is readable` - and every later claim that
+can still be made (`a dup reports the same position...`, `a read moves the
+position both names report`, `a second open has its own position`) reads `None`
+and reddens with it. Restored and rebuilt, 24 of 24 green
+(`build/boot-fdinfo1.log`).
+
+### The guest caught one the host could not see, and clippy caught another
+
+The **socketpair** claim went red on the machine while every host test was green:
+`/proc/<pid>/fdinfo` for a `socketpair(2)` end reported the pipe pseudo id
+instead of `sockfs`'s. The classifier had put `as_pipe` and `as_duplex` in one
+arm, on the reasonable-looking reading that a pipe and a socketpair are two
+spellings of a two-way channel - and they are two different *filesystems*:
+`pipe()` mints a `PipeEnd`, `socketpair(AF_UNIX, SOCK_STREAM)` mints a
+`DuplexEnd`, and Linux answers `18` and `12` respectively. No host unit test
+could have caught it, because the host build has no `socketpair` to classify; it
+took the machine. The classifier now separates them, and a host test pins the
+pair (`a_pipe_end_and_a_socketpair_end_get_different_pseudo_ids`, which builds
+both nodes through their real constructors).
+
+That is the shape to remember: a *classification* can be wrong in a way that a
+rendering test cannot see, because the test's own fixture supplies the class.
+
+
+
+`cargo clippy` found `timerfd`'s `fdinfo_lines` sitting in the **inherent**
+`impl TimerFd` rather than `impl Inode for TimerFd`, where the trait's default
+`None` shadowed it - the machines would have rendered no `timerfd` block while
+every host test that called the function directly stayed green. That is the value
+of the "never used" warning being a `warn` in a tree whose dead code is normally
+intentional: a hook that is *defined* somewhere no dispatch can reach is exactly
+what it is for.

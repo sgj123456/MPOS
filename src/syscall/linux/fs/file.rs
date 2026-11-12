@@ -7119,7 +7119,7 @@ pub fn handle_timerfd_settime(args: [usize; ARG_COUNT], from_user: bool) -> isiz
             Some(at)
         }
     };
-    let old = timer.set(now, deadline, interval_ticks, cancel_on_set);
+    let old = timer.set(now, deadline, interval_ticks, cancel_on_set, flags);
     if old_value != 0 {
         write_itimerspec(old_value, old, from_user);
     }

@@ -2315,6 +2315,21 @@ pub fn dev_of_inode(inode: &Arc<dyn Inode>) -> u64 {
     caller_table().dev_of_inode(inode)
 }
 
+/// The mount id `/proc/<pid>/fdinfo/<n>` reports for a descriptor on this
+/// inode: the deepest attachment covering the inode's path, which is the same
+/// record `/proc/self/mountinfo` lists and `statmount(STATMOUNT_BY_FD)` names.
+///
+/// `None` for an inode no mount covers - every anonymous one (`eventfd`,
+/// `epoll`, a pipe end, a socket, a `memfd`), which has no path for the table
+/// to match and whose `fdinfo` line therefore reports the pseudo id of the
+/// filesystem kind it lives on rather than a mount
+/// ([`crate::vfs::fdinfo::pseudo_mount_id`]).
+pub fn mount_id_containing(inode: &Arc<dyn Inode>) -> Option<u64> {
+    caller_table()
+        .record_containing(inode)
+        .map(|record| record.mount_id)
+}
+
 /// The space accounting of the filesystem that serves `path`, straight from
 /// the instance. `None` when the serving filesystem has no real numbers
 /// (ramfs and friends answer through the syscall layer instead).

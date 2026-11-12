@@ -82,25 +82,26 @@ pub use runtime::{
     current_pid_ns_id, current_pid_number, current_real_owner, current_rlimit, current_root,
     current_stack_range, current_switches, current_tgid, current_thread_cpu_ticks,
     current_thread_io, current_thread_switches, current_tid_address, current_tls, current_umask,
-    current_user_ns, current_uts, deliver_pending_signal, descriptor_access, descriptor_inode_of,
-    descriptor_numbers, descriptors_of, destructive_advice_refused, detach_traced,
-    die_of_fatal_signal, discard_exit_code, exec_replace, exit, exit_code, exit_group, fill_owner,
-    fork, frames_range_free, get_mmap_cursor, group_members, has_children, has_deliverable_signal,
-    has_live_child, has_matching_children, has_seccomp_filter, has_tracer, identity_of, init,
-    insert_vma, io_of, io_of_group, is_child, is_exited, is_running, is_stopped, itimer_snapshot,
-    itimer_swap, kernel_lazy_accessible, last_syscall, lock_current, lock_future,
-    locked_advice_refused, locked_pages, locked_within, madvise_dontneed, map_anon, map_facts,
-    map_frames, mapped_pages, mapping_name_at, mapping_span_at, maxrss_of, may_inspect,
-    may_mint_pid_ns, may_signal, membarrier_registrations, minflt_of, move_eager_ranges,
-    move_user_page, munmap_user, name_user_range, named_process, named_thread, nice_of,
-    note_blk_counts, note_blk_mailbox, note_blk_wait, note_claim_registration, note_claim_wake,
-    note_claim_wake_result, note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner,
-    note_run_begin, note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of,
-    out_of_memory, own_pid_number, page_present_in, parent_group_of, parent_of, park_site,
-    parks_of, pause, pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table,
-    pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names,
-    pidfd_task_alive, poll_any_child_event, poll_child_event, populate_user_page_at, preempt,
-    preempt_at, prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
+    current_user_ns, current_uts, deliver_pending_signal, descriptor_access, descriptor_file_of,
+    descriptor_flags_of, descriptor_inode_of, descriptor_numbers, descriptors_of,
+    destructive_advice_refused, detach_traced, die_of_fatal_signal, discard_exit_code,
+    exec_replace, exit, exit_code, exit_group, fill_owner, fork, frames_range_free,
+    get_mmap_cursor, group_members, has_children, has_deliverable_signal, has_live_child,
+    has_matching_children, has_seccomp_filter, has_tracer, identity_of, init, insert_vma, io_of,
+    io_of_group, is_child, is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, last_syscall, lock_current, lock_future, locked_advice_refused,
+    locked_pages, locked_within, madvise_dontneed, map_anon, map_facts, map_frames, mapped_pages,
+    mapping_name_at, mapping_span_at, maxrss_of, may_inspect, may_mint_pid_ns, may_signal,
+    membarrier_registrations, minflt_of, move_eager_ranges, move_user_page, munmap_user,
+    name_user_range, named_process, named_thread, nice_of, note_blk_counts, note_blk_mailbox,
+    note_blk_wait, note_claim_registration, note_claim_wake, note_claim_wake_result,
+    note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner, note_run_begin,
+    note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of, out_of_memory,
+    own_pid_number, page_present_in, parent_group_of, parent_of, park_site, parks_of, pause,
+    pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation,
+    pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive,
+    poll_any_child_event, poll_child_event, populate_user_page_at, preempt, preempt_at,
+    prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
     range_is_mapped, read_user, read_user_of, record_eager_range, register_membarrier,
     release_controlling_tty, release_pid, release_user_frames, reset_disposition, resident_pages,
     resolve_anon_fault, resolve_cow_fault, resolve_pid, resolve_script, resolve_stack_growth,
@@ -509,6 +510,29 @@ pub fn descriptor_inode_of(
     _pid: usize,
     _fd: usize,
 ) -> Option<alloc::sync::Arc<dyn crate::vfs::Inode>> {
+    None
+}
+
+/// The open **file description** another process's descriptor holds, which is
+/// what `/proc/<pid>/fdinfo/<n>` renders: its position, its open flag word and
+/// its node are three facts on the description, and the description is the
+/// only thing that has all three. The siblings above answer one fact each;
+/// this one hands the whole description over because the four lines are read
+/// from one description at one moment.
+#[cfg(not(target_os = "none"))]
+pub fn descriptor_file_of(_pid: usize, _fd: usize) -> Option<alloc::sync::Arc<crate::vfs::File>> {
+    None
+}
+
+/// The per-**descriptor** flag word `fcntl(F_SETFD)` writes - the
+/// `FD_CLOEXEC` bit, which is *not* on the description and so is not reachable
+/// from [`descriptor_file_of`].
+///
+/// It is the half of `/proc/<pid>/fdinfo`'s `flags:` line that `F_GETFL` does
+/// not report, `dup` does not copy, and `F_SETFD(0)` can take back out -
+/// measured on Linux 7.2.14 (`build/scratch/fdinfo/cloexec.c`).
+#[cfg(not(target_os = "none"))]
+pub fn descriptor_flags_of(_pid: usize, _fd: usize) -> Option<u32> {
     None
 }
 

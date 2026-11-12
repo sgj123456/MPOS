@@ -2410,3 +2410,15 @@ carries the per-phase history.*
   the capability is the discriminator the pin reads out of `/proc/self/status`, so the same program
   says `EPERM` on an unprivileged host and `EOPNOTSUPP` in the guest. 18 claims, 17/18 red
   counterfactually (`ENOSYS`). (§6.140, item 254)
+- `/proc/<pid>/fdinfo/<n>` exists - the directory and the file - with Linux's four generic lines
+  (`pos`, `flags`, `mnt_id`, `ino`) each a *relation* to a door that already answers the same fact:
+  `lseek`'s position, `F_GETFL | (FD_CLOEXEC ? O_CLOEXEC : 0)` (the second half is the descriptor's,
+  not the description's), the `mountinfo` column, and `fstat`'s `st_ino`. The per-kind lines are a new
+  `Inode` hook: `eventfd` (count in **hex**, width 16), `signalfd` (the wire `sigset_t` in 16 hex
+  digits), `timerfd` (the **remaining** span, not the stored deadline) and `epoll` (one `tfd:` line per
+  watch, five widths and two radixes). `inotify`'s block is a named refusal - the watch table keys
+  watches by the filesystem *instance* id rather than `st_dev`, so its `sdev` column has no honest
+  source, and the `f_handle` tail needs export operations no filesystem here has (item 254's finding).
+  Pin `t-fdinfo` (24 claims) is green on the host first; the host unit tests compare whole measured
+  lines, which is what caught a `flags:` rendered with `{:o}` instead of Linux's literal-`0` prefix.
+  (§6.141, item 255)

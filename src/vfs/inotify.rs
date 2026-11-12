@@ -408,6 +408,74 @@ impl Inode for InotifyInstance {
         Some(alloc::string::String::from("anon_inode:inotify"))
     }
 
+    /// The `inotify` block is **refused**: an instance with live watches adds
+    /// nothing after the generic four lines.
+    ///
+    /// Linux prints one line per watch (`fs/notify/fdinfo.c`'s
+    /// `inotify_fdinfo`), measured whole on Linux 7.2.14
+    /// (`build/scratch/fdinfo/pertype.c`, a watch on the host's tmpfs `/tmp` -
+    /// inode 1, a filesystem root):
+    ///
+    /// ```text
+    /// inotify wd:1 ino:1 sdev:50 mask:fff ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:0d607a9c0100000000000000
+    /// ```
+    ///
+    /// The `fhandle-bytes`/`fhandle-type`/`f_handle` tail is built from the
+    /// filesystem's **export operations**: `show_mark_fhandle` encodes a file
+    /// handle with `exportfs_encode_fid` and prints nothing when the filesystem
+    /// refuses the encode (`FILEID_INVALID`, the same answer
+    /// `name_to_handle_at(2)` gives as `EOPNOTSUPP`). This kernel's filesystems
+    /// have no export operations at all - that is the measurement behind commit
+    /// 22e51e1: `EOPNOTSUPP` for every one of them, where the host's tmpfs
+    /// answers 0 with a twelve-byte handle - the `c` that the tail of the
+    /// measured line above counts. So the tail cannot be built, and it is not
+    /// faked. On such a filesystem Linux omits *only* the tail: its format
+    /// string is `"inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 "`, so a
+    /// head with no handle after it is the head plus that literal's own
+    /// trailing space and then the newline. That is the shape this hook would
+    /// take - and the next two paragraphs are why the head cannot be spelled.
+    ///
+    /// Everything in the head but one column is answerable here. `wd` is the
+    /// instance's own number, `ino` the watched inode's number, and `mask` the
+    /// stored user mask (the watch list keeps the first two, the registry the
+    /// third); `ignored_mask` is answerable too, because Linux prints a
+    /// hardcoded `0` there - a watch's ignored mask is not part of this output
+    /// at all. The column this kernel cannot fill is **`sdev`**. The instance
+    /// records a watch as the `(wd, dev, ino)` triple [`key_of`] hands in, and
+    /// that pair's first element is not a device number: `key_of` asks
+    /// `mount::fs_id_of_inode`, the filesystem **instance id** the lock table
+    /// and `EXDEV` are decided by - `Mount::id` says in as many words that it
+    /// "is *not* what `stat`'s `st_dev` reports" - and it is `0` for every
+    /// inode that is not some mount's own root. Linux's column is
+    /// `inode->i_sb->s_dev`, the superblock's device. Printing the instance id
+    /// under `sdev:` would answer `0` for almost every watch and a mount
+    /// ordinal for the rest: a number with another meaning under Linux's field
+    /// name, which is a private dialect and worse than absent (`AGENTS.md` §3
+    /// rules 2 and 3).
+    ///
+    /// So the whole block is refused rather than the one column approximated.
+    /// What a reader sees is the four generic lines only - Linux's shape for an
+    /// inotify descriptor with **no** watches rather than for one with them.
+    /// That is the cost of the refusal, named here instead of hidden: a line
+    /// whose `sdev` is a filesystem identity would send a tool comparing it
+    /// against `stat` to a filesystem that does not exist.
+    ///
+    /// Named gaps, each with its missing prerequisite:
+    ///
+    /// * the watch table would have to keep the watched inode's `st_dev` (or
+    ///   the inode itself), which is `key_of`'s second question rather than its
+    ///   first - and it is the only thing standing between this hook and a
+    ///   head-only line of Linux's exact bytes; and
+    /// * the filesystems would need export operations (22e51e1's missing half)
+    ///   before a `f_handle` could exist at all.
+    ///
+    /// The pin is the unit test
+    /// `an_inotify_block_is_refused_rather_than_borrowing_an_sdev` below, which
+    /// goes red the moment somebody renders the head without the device.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
+        None
+    }
+
     /// The read: whole records, oldest first. Fewer bytes than one header
     /// is `EINVAL`, the man page's refusal; nothing queued is a park, or
     /// `EAGAIN` when nonblocking.
@@ -1522,5 +1590,44 @@ mod tests {
             .watches
             .iter()
             .any(|w| w.key == key && w.owner == owner)));
+    }
+
+    /// `/proc/<pid>/fdinfo/<inotify fd>` adds **nothing** after the generic
+    /// four lines, and this pins that refusal.
+    ///
+    /// The measured line is the ground truth (`build/scratch/fdinfo/pertype.c`,
+    /// a watch on the host's tmpfs `/tmp`, Linux 7.2.14):
+    ///
+    /// ```text
+    /// inotify wd:1 ino:1 sdev:50 mask:fff ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:0d607a9c0100000000000000
+    /// ```
+    ///
+    /// Two things stand between this kernel and that line, and the second one
+    /// is why the *head* cannot be printed either (see
+    /// [`InotifyInstance`]'s `fdinfo_lines` doc): the filesystems have no
+    /// export operations for the `f_handle` tail, and the watch table keeps the
+    /// watched inode's *filesystem identity* rather than its `st_dev`, a number
+    /// that is `0` for every inode that is not a mount's own root. The pin is
+    /// this none: a renderer that printed the head - borrowing the identity
+    /// number for `sdev`, as the measured column would look - turns this red,
+    /// and whoever does it has to give the watch the device in the same commit.
+    #[test]
+    fn an_inotify_block_is_refused_rather_than_borrowing_an_sdev() {
+        let fd = instance(9, false);
+        assert_eq!(fd.fdinfo_lines(), None, "no watches, and no line to add");
+
+        // A live watch, keyed exactly as the syscall layer keys one: the
+        // watched inode's `(filesystem instance id, number)` pair. The pair's
+        // first half is the identity `EXDEV` and the lock table are decided by,
+        // not the superblock device the `sdev` column asks for - which is the
+        // whole reason the line is refused even though the `f_handle` tail
+        // would be absent on Linux too.
+        let dir = watched_dir();
+        let key = key_of(&dir);
+        let wd = fd.alloc_wd();
+        fd.record_wd(wd, key);
+        assert_eq!(fd.watch_count(), 1);
+        assert_eq!(fd.existing_wd(key), Some(1), "the watch is live");
+        assert_eq!(fd.fdinfo_lines(), None);
     }
 }

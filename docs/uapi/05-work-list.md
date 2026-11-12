@@ -11185,3 +11185,65 @@ mask); `fs::handle_name_to_handle_at` and `fs::handle_open_by_handle_at`; the di
 is for `fanotify`, which this kernel does not have); with the capability Linux answers `ESTALE(116)`
 for an undecodable handle where this kernel answers `EOPNOTSUPP` (there is no handle here to be
 stale). §6.140.
+
+### Item 255 `/proc/<pid>/fdinfo/<n>` - four lines, four radixes, four relations
+
+**Before:** the file did not exist. A tool that opened it got `ENOENT` - the
+same answer as for a process that is not there - so the only door that reports a
+descriptor's position and flags for a process *other than the caller's* was
+missing entirely (`fcntl` answers only for descriptors the asking process
+holds).
+
+**Now:** the directory and the file are built for `/proc/<pid>` and for
+`/proc/<pid>/task/<tid>`, with Linux's generic four lines and a per-kind hook
+(`Inode::fdinfo_lines`) that four node types answer.
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| `/proc/self/fdinfo` | `0555`, size `0` | `ENOENT` | `0555`, size `0` |
+| `/proc/self/fdinfo/0` | `0444` regular file | `ENOENT` | `0444` regular file |
+| `pos:` | decimal, `lseek`'s answer | - | the description's position |
+| `flags:` | literal `0` + octal, `F_GETFL \| (FD_CLOEXEC ? O_CLOEXEC : 0)` | - | the same |
+| `mnt_id:` | decimal, `mountinfo`'s first column | - | the same, or the kind's pseudo id |
+| `ino:` | decimal, `fstat`'s `st_ino` | - | the same |
+| `eventfd` block | count (**hex**, width 16), id, semaphore | - | the same |
+| `signalfd` block | `sigmask:` 16 hex digits of the wire set | - | the same |
+| `timerfd` block | clockid, ticks, settime flags, remaining span, interval | - | the same |
+| `epoll` block | one `tfd:` line per watch, five widths/radixes | - | the same |
+| `inotify` block | one line per watch with an `f_handle` tail | - | **refused** - see the gaps |
+| name `00` / `abc` / `-1` / `3x` | `ENOENT` | - | `ENOENT` |
+
+**Why `flags:` is not `F_GETFL`.** It is `F_GETFL | (FD_CLOEXEC ? O_CLOEXEC :
+0)`, and the two halves have different owners - the mode and status bits on the
+description, `FD_CLOEXEC` on the descriptor. Measured: `open(O_RDONLY|O_CLOEXEC)`
+reports `02100000` where `F_GETFL` answers `0100000`, `F_SETFD(0)` takes it back
+out, and a `dup` gives a number without it.
+
+**Why the `0` is a literal.** Linux's format string is `"flags:\t0%o\n"`, so a
+zero word prints `00` and `O_RDWR` prints `02`. A renderer using `{:o}` alone is
+right for some descriptors and wrong for others - the mistake the host unit test
+caught during this item.
+
+**Landed:** `src/vfs/fdinfo.rs` (the pure renderer and the pseudo mount ids);
+`FdInfo`/`fdinfo_body` in `src/vfs/procfs.rs` with the directory wired into both
+pid-dir builders; `Inode::fdinfo_lines` and `Inode::as_signalfd`;
+`descriptor_file_of`/`descriptor_flags_of` in the scheduler;
+`mount::mount_id_containing`; `File::O_CLOEXEC`; the per-kind renderers in
+`eventfd.rs`, `signalfd.rs`, `timerfd.rs` (plus `TimerState::settime_flags`),
+`epoll.rs` and `inotify.rs`.
+
+**Pin:** `user/tests/src/bin/t-fdinfo.rs`, 24 claims, green on the host first -
+the four relations, the `FD_CLOEXEC` round trip, `dup`-shares/`open`-does-not,
+the mountinfo correlation, six refused spellings, the two modes, and the per-kind
+values. Host unit tests cover every renderer against whole measured lines.
+
+**Named gaps.** `inotify`'s block is refused: its line's tail is a file handle
+this kernel's filesystems cannot build (no export operations - item 254's
+finding), and the head's `sdev` column has no honest source here because the
+watch table keys watches by the filesystem *instance* id, not `st_dev`. The
+prerequisite is named in the code. Also: an `epoll` line's `sdev` is this
+kernel's `st_dev` word rather than Linux's raw `s_dev` (equal for major-0
+pseudo-filesystems, different for a device-backed mount), an anonymous epoll
+target falls back to the root filesystem's device where Linux prints the pseudo
+filesystem's own, and `eventfd-id` names the inode rather than a separate
+per-boot counter. §6.141.

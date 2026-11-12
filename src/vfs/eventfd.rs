@@ -78,6 +78,42 @@ impl Inode for EventFd {
         Some(alloc::string::String::from("anon_inode:[eventfd]"))
     }
 
+    /// The `eventfd` block Linux's `show_fdinfo` adds: the counter, an
+    /// identifier, and whether the semaphore shape is on.
+    ///
+    /// Measured whole on Linux 7.2.14 (`build/scratch/fdinfo/{pertype,radix2}.c`):
+    ///
+    /// ```text
+    /// eventfd-count:                5
+    /// eventfd-id: 291
+    /// eventfd-semaphore: 0
+    /// ```
+    ///
+    /// Three details, each measured rather than assumed. The counter prints in
+    /// **hex** (`255` reads `ff`, `4660` reads `1234`) right-aligned in a
+    /// sixteen-wide field, so the padding is part of the line. The id is a
+    /// decimal, unique per instance. And the semaphore word is decimal `0` or
+    /// `1`, which is the creation mode and not the current count.
+    ///
+    /// `eventfd-semaphore` is always `0` here, and that is honest rather than
+    /// stale: this kernel's `eventfd2` refuses `EFD_SEMAPHORE` with
+    /// `EOPNOTSUPP` (`handle_eventfd` in the syscall layer), so an instance that
+    /// was the semaphore shape cannot exist to be reported.
+    ///
+    /// `eventfd-id` reports [`EventFd::ino`], this instance's own number from
+    /// the machine's anonymous-inode counter. Linux's id comes from a separate
+    /// per-boot counter, so the *numbers* differ between the two kernels - what
+    /// the field promises is that an id names one instance for its lifetime,
+    /// and that is what this one does. The alternative was a second counter
+    /// existing only for a debug line.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
+        Some(alloc::format!(
+            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: 0\n",
+            self.value(),
+            self.ino
+        ))
+    }
+
     /// A read takes the counter and leaves zero behind - the semaphore shape,
     /// which is the only mode this kernel offers (no `EFD_SEMAPHORE`).
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -231,6 +267,35 @@ mod tests {
         fd.write_at(0, &1u64.to_ne_bytes()).unwrap();
         assert_eq!(fd.read_at(0, &mut buf).unwrap(), 8);
         assert!(matches!(fd.read_at(0, &mut buf), Err(VfsError::Again)));
+    }
+
+    /// The `eventfd` block is Linux's measured bytes, in Linux's radixes.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/fdinfo/radix2.c`): a counter of
+    /// 5, 255 and 4660 answered `eventfd-count:                5`,
+    /// `...               ff` and `...             1234` - sixteen-wide,
+    /// right-aligned, **hex** - which is why this compares whole lines rather
+    /// than a substring. A renderer using `{}` would print `255` where Linux
+    /// prints `ff`, and one using `{:16}` would pad with the wrong digit.
+    #[test]
+    fn the_eventfd_block_is_linuxs_measured_lines() {
+        let fd = EventFd::new(291, 5, false);
+        let text = fd.fdinfo_lines().expect("an eventfd has a block");
+        assert_eq!(
+            text,
+            "eventfd-count:                5\neventfd-id: 291\neventfd-semaphore: 0\n"
+        );
+
+        // 255 reads `ff`, the radix a decimal renderer would get wrong.
+        let hex = EventFd::new(7, 255, false);
+        let text = hex.fdinfo_lines().unwrap();
+        assert!(
+            text.starts_with("eventfd-count:               ff\n"),
+            "{text}"
+        );
+
+        // The semaphore word is always 0: `eventfd2` refuses EFD_SEMAPHORE.
+        assert!(text.contains("eventfd-semaphore: 0\n"), "{text}");
     }
 
     #[test]

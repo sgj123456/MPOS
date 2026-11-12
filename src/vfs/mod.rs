@@ -51,6 +51,10 @@ pub mod epoll;
 pub mod eventfd;
 pub mod ext4;
 pub mod fanotify;
+/// `/proc/<pid>/fdinfo/<n>`: the four lines every descriptor has, rendered in
+/// Linux's radixes. The per-kind lines after them are each node's own
+/// (`Inode::fdinfo_lines`), because that is where the state lives.
+pub mod fdinfo;
 pub mod file;
 /// The descriptor `open_tree(2)` hands out: a mount rather than a file, so
 /// `move_mount` can attach it by name later.
@@ -650,6 +654,15 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
+    /// The signal descriptor this node is, if it is one - the shape
+    /// [`Inode::as_eventfd`] has, for the same reason: `/proc/<pid>/fdinfo`'s
+    /// `mnt_id` line names the *filesystem* a descriptor is on, and a
+    /// `signalfd` lives on `anon_inodefs` like the four kinds beside it
+    /// (`build/scratch/fdinfo/rel.c`: all five answer `mnt_id: 19`).
+    fn as_signalfd(&self) -> Option<&crate::vfs::signalfd::SignalFd> {
+        None
+    }
+
     /// The POSIX message queue this node is one open descriptor for, if it is
     /// one.
     ///
@@ -682,6 +695,32 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// asks here after the recorded label and before searching the tree, so a
     /// descriptor that really was opened by a path still reports that path.
     fn fd_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+
+    /// The lines `/proc/<pid>/fdinfo/<n>` prints *after* the four every
+    /// descriptor has, when this node's kind has more to say.
+    ///
+    /// Linux's `seq_file` for one descriptor is the generic part - `pos`,
+    /// `flags`, `mnt_id`, `ino` - and then whatever the node's own `show_fdinfo`
+    /// adds, which is per-kind: an `eventfd` prints its counter and whether it
+    /// is the semaphore shape, a `timerfd` its clock and the arm it holds, an
+    /// `epoll` one line per watched description, an `unix` stream how many
+    /// descriptors are queued to be received. Measured whole on Linux 7.2.14
+    /// (`build/scratch/fdinfo/pertype.c`): each kind's block is a fixed set of
+    /// lines and each line has its own radix - `eventfd-count` is hex with a
+    /// 16-wide right-aligned field, `eventfd-id`/`eventfd-semaphore` decimal,
+    /// `timerfd`'s `it_value`/`it_interval` decimal pairs, `signalfd`'s
+    /// `sigmask` 16 hex digits.
+    ///
+    /// It is a hook on the *node* and not a table in procfs for the reason
+    /// [`Self::fd_name`] is: the state a line reports lives on the object the
+    /// descriptor opens, and the node is the only thing procfs has. The return
+    /// is the text to append, each line newline-terminated, `Some("")` when the
+    /// kind has nothing to add - which is different from `None` only in that
+    /// `None` means "this node has no opinion", so a kind that is asked but has
+    /// no extra lines says so without cost.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
         None
     }
 

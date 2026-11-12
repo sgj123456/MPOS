@@ -74,6 +74,19 @@ pub const CLOCK_BOOTTIME_ALARM: usize = 9;
 /// Whether `clockid` is one a timerfd may keep - the man page's five, and
 /// the clocks whose progress the machine can actually name. Anything else
 /// is `EINVAL`.
+/// The machine's tick rate, for the `timespec` conversion - and, on the host
+/// build, the harness's stand-in (100 Hz, so a test's arithmetic is readable).
+fn tick_hz() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        crate::hal::TICK_HZ as u64
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        100
+    }
+}
+
 pub fn clock_ok(clockid: usize) -> bool {
     matches!(
         clockid,
@@ -136,6 +149,15 @@ struct TimerState {
     canceled: bool,
     /// The last arm asked to be told about clock sets.
     cancel_on_set: bool,
+    /// The *word* the last arm was asked with - `TFD_TIMER_ABSTIME` and
+    /// `TFD_TIMER_CANCEL_ON_SET` as the caller spelled them, which is what
+    /// `/proc/<pid>/fdinfo`'s `settime flags:` line reports. Kept as the word
+    /// rather than as booleans because the field is a word: a reader compares
+    /// the printed number against the flags it passed and against the header's
+    /// constants, and two round-trips through `bool` would be a second spelling
+    /// of it. Measured on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`): a
+    /// plain arm answers `settime flags: 00`, an `ABSTIME` one `01`.
+    settime_flags: usize,
 }
 
 /// One timerfd: an anonymous inode holding one timer.
@@ -164,6 +186,7 @@ impl TimerFd {
                 expirations: 0,
                 canceled: false,
                 cancel_on_set: false,
+                settime_flags: 0,
             })),
         });
         register(timer.clone());
@@ -208,6 +231,7 @@ impl TimerFd {
         deadline: Option<u64>,
         interval: u64,
         cancel_on_set: bool,
+        settime_flags: usize,
     ) -> Option<(u64, u64)> {
         critical_section::with(|cs| {
             let mut state = self.state.borrow(cs).borrow_mut();
@@ -224,6 +248,7 @@ impl TimerFd {
             state.expirations = 0;
             state.canceled = false;
             state.cancel_on_set = cancel_on_set;
+            state.settime_flags = settime_flags;
             old
         })
     }
@@ -260,6 +285,21 @@ impl TimerFd {
                 return Err(VfsError::Again);
             }
             Ok(core::mem::take(&mut state.expirations))
+        })
+    }
+
+    /// The expirations a read would report right now, without taking them -
+    /// what `/proc/<pid>/fdinfo`'s `ticks:` line shows.
+    ///
+    /// Linux's `ticks` is `ctx->ticks`, the count a `read(2)` will hand over
+    /// and zero, so reading the line does not consume anything: this counts the
+    /// due expirations into a scratch copy of the state rather than calling
+    /// [`Self::take_expirations`], which would eat the very number it reported.
+    fn expiration_count(&self, now: u64) -> u64 {
+        critical_section::with(|cs| {
+            let mut state = *self.state.borrow(cs).borrow();
+            expire_up_to(&mut state, now);
+            state.expirations
         })
     }
 
@@ -386,6 +426,59 @@ impl Inode for TimerFd {
     /// `.workbuddy/probe_anon_fd_stat.c`).
     fn fd_name(&self) -> Option<alloc::string::String> {
         Some(alloc::string::String::from("anon_inode:[timerfd]"))
+    }
+
+    /// The `timerfd` block Linux's `show_fdinfo` adds: the clock, the ticks
+    /// waiting to be read, the last arm's flag word, and the two `timespec`s.
+    ///
+    /// Measured whole on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`):
+    ///
+    /// ```text
+    /// clockid: 1
+    /// ticks: 0
+    /// settime flags: 00
+    /// it_value: (9, 999987917)
+    /// it_interval: (0, 0)
+    /// ```
+    ///
+    /// Four things that shape the code below. `clockid` and `ticks` are
+    /// **decimal** and the flags word is **two hex digits** - the radixes are
+    /// per line, and a `{:x}` where Linux has `{}` prints `a` for ten where the
+    /// caller expects `10`. `it_value` is the time **remaining**, not the
+    /// absolute deadline (measured: a 10-second arm answers `(9, 999987917)`
+    /// moments later, not the clock's reading), which is the same number
+    /// `timerfd_gettime` reports - so it is [`TimerFd::snapshot`] and not the
+    /// stored deadline, and a signal or a read that moves the remaining span
+    /// moves this line with it. And a disarmed timer answers `(0, 0)` for both
+    /// timespecs, so the `None` from `snapshot` becomes zeros here.
+    ///
+    /// The tick-to-timespec conversion is
+    /// [`timespec_of_ticks`] - the same one `timerfd_gettime` writes its struct
+    /// with, so the two doors cannot disagree about a timer's clock.
+    ///
+    /// On the host build there is no tick counter to ask, so `now` is zero
+    /// there and the *remaining* span is the whole stored deadline. That is a
+    /// property of the host harness (it has no clock and no tasks) rather than
+    /// of the file, and no host test reads this line's `it_value` as a duration;
+    /// the machine's own pin (`t-fdinfo`) checks it against `timerfd_gettime`
+    /// instead.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
+        let hz = tick_hz();
+        let now = now_ticks();
+        let (remaining, interval) = self.snapshot(now).unwrap_or((0, 0));
+        let (rsec, rnsec) = timespec_of_ticks(remaining, hz);
+        let (isec, insec) = timespec_of_ticks(interval, hz);
+        let flags = critical_section::with(|cs| self.state.borrow(cs).borrow().settime_flags);
+        Some(alloc::format!(
+            "clockid: {}\nticks: {}\nsettime flags: {:02x}\nit_value: ({}, {})\nit_interval: ({}, {})\n",
+            self.clockid,
+            self.expiration_count(now),
+            flags,
+            rsec,
+            rnsec,
+            isec,
+            insec
+        ))
     }
 
     /// `poll`'s answer: readable when expirations are waiting or a
@@ -525,12 +618,54 @@ mod tests {
         assert_eq!(timespec_of_ticks(99, HZ), (0, 990_000_000));
     }
 
+    /// The `timerfd` block is Linux's measured lines, in Linux's radixes.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`): a disarmed
+    /// timer on `CLOCK_MONOTONIC` answered `clockid: 1`, `ticks: 0`,
+    /// `settime flags: 00`, `it_value: (0, 0)`, `it_interval: (0, 0)`; an armed
+    /// one read back the time **remaining** in `it_value` (a 100 s arm answered
+    /// `(99, 999987917)` moments later) and the span in `it_interval`; and an
+    /// `ABSTIME` arm answered `settime flags: 01`.
+    ///
+    /// The host build's clock is a 100 Hz stand-in with `now` pinned to zero
+    /// ([`now_ticks`]), so the numbers below are the harness's own - which is
+    /// what makes this a test of the *rendering*. The machine pins the values
+    /// against `timerfd_gettime` in `t-fdinfo`.
+    #[test]
+    fn the_timerfd_block_is_linuxs_measured_lines() {
+        let disarmed = TimerFd::new(1, CLOCK_MONOTONIC, false);
+        assert_eq!(
+            disarmed.fdinfo_lines().unwrap(),
+            "clockid: 1\nticks: 0\nsettime flags: 00\nit_value: (0, 0)\nit_interval: (0, 0)\n"
+        );
+
+        // 100 s and a 5.5 s interval at the harness's 100 Hz.
+        let armed = TimerFd::new(2, CLOCK_MONOTONIC, false);
+        armed.set(0, Some(100 * 100), 550, false, 0);
+        assert_eq!(
+            armed.fdinfo_lines().unwrap(),
+            "clockid: 1\nticks: 0\nsettime flags: 00\nit_value: (100, 0)\nit_interval: (5, 500000000)\n"
+        );
+
+        // An ABSTIME arm reports the word it was asked with: the field is the
+        // caller's flags, not a boolean this renderer reassembles.
+        let absolute = TimerFd::new(3, CLOCK_MONOTONIC, false);
+        absolute.set(0, Some(50 * 100), 0, false, TFD_TIMER_ABSTIME);
+        assert!(
+            absolute
+                .fdinfo_lines()
+                .unwrap()
+                .contains("settime flags: 01\n"),
+            "an ABSTIME arm reports 01"
+        );
+    }
+
     /// A one-shot: nothing before the deadline, one expiration after it,
     /// the read takes it, and the read after that finds none.
     #[test]
     fn a_one_shot_counts_once_and_the_read_takes_it() {
         let fd = TimerFd::new(1, CLOCK_MONOTONIC, false);
-        fd.set(0, Some(10), 0, false);
+        fd.set(0, Some(10), 0, false, 0);
 
         assert_eq!(fd.take_expirations(9), Err(VfsError::Again));
         assert!(!fd.pending(9));
@@ -555,7 +690,7 @@ mod tests {
     #[test]
     fn an_interval_timer_counts_while_nobody_reads() {
         let fd = TimerFd::new(2, CLOCK_MONOTONIC, false);
-        fd.set(0, Some(10), 5, false);
+        fd.set(0, Some(10), 5, false, 0);
 
         assert_eq!(fd.take_expirations(10), Ok(1));
         // Asleep for a while: 10, 15, 20 and 25 have all passed by 27.
@@ -571,7 +706,7 @@ mod tests {
     #[test]
     fn an_expiry_count_saturates_rather_than_wrapping() {
         let fd = TimerFd::new(3, CLOCK_MONOTONIC, false);
-        fd.set(0, Some(0), 1, false);
+        fd.set(0, Some(0), 1, false, 0);
         fd.advance(u64::MAX);
         assert_eq!(fd.take_expirations(u64::MAX), Ok(u64::MAX));
     }
@@ -582,17 +717,17 @@ mod tests {
     #[test]
     fn a_zero_value_disarms_and_reports_the_old_setting() {
         let fd = TimerFd::new(4, CLOCK_MONOTONIC, false);
-        fd.set(0, Some(100), 10, false);
-        assert_eq!(fd.set(50, None, 0, false), Some((50, 10)));
+        fd.set(0, Some(100), 10, false, 0);
+        assert_eq!(fd.set(50, None, 0, false, 0), Some((50, 10)));
         assert_eq!(fd.snapshot(50), None, "disarmed is nothing left");
         assert_eq!(fd.take_expirations(1000), Err(VfsError::Again));
 
         // Disarming also clears what had expired unread, matching the
         // "since the settings were last modified" wording; the old
         // setting reports the fired one-shot as spent - zero left.
-        fd.set(0, Some(10), 0, false);
+        fd.set(0, Some(10), 0, false, 0);
         fd.advance(20);
-        let old = fd.set(20, None, 0, false);
+        let old = fd.set(20, None, 0, false, 0);
         assert_eq!(old, Some((0, 0)));
         assert_eq!(fd.take_expirations(20), Err(VfsError::Again));
     }
@@ -604,19 +739,19 @@ mod tests {
     #[test]
     fn a_clock_set_cancels_only_the_timers_that_asked() {
         let canceled = TimerFd::new(5, CLOCK_REALTIME, false);
-        canceled.set(0, Some(100), 0, true);
+        canceled.set(0, Some(100), 0, true, 0);
 
         let uncanceled = TimerFd::new(6, CLOCK_REALTIME, false);
-        uncanceled.set(0, Some(100), 0, false);
+        uncanceled.set(0, Some(100), 0, false, 0);
 
         let monotonic = TimerFd::new(7, CLOCK_MONOTONIC, false);
-        monotonic.set(0, Some(100), 0, true);
+        monotonic.set(0, Some(100), 0, true, 0);
 
         // And a CANCEL_ON_SET timer that already fired: its expirations
         // are waiting to be read, and a clock set does not reach in and
         // erase news that has already happened.
         let fired = TimerFd::new(8, CLOCK_REALTIME, false);
-        fired.set(0, Some(10), 0, true);
+        fired.set(0, Some(10), 0, true, 0);
         fired.advance(20);
         assert_eq!(fired.take_expirations(20), Ok(1));
 
@@ -631,7 +766,7 @@ mod tests {
         assert_eq!(uncanceled.take_expirations(100), Ok(1));
         assert_eq!(monotonic.take_expirations(100), Ok(1));
         // And re-arming clears the cancellation.
-        canceled.set(100, Some(200), 0, false);
+        canceled.set(100, Some(200), 0, false, 0);
         assert_eq!(canceled.take_expirations(200), Ok(1));
     }
 
@@ -649,7 +784,7 @@ mod tests {
         );
 
         assert_eq!(fd.read_at(0, &mut [0u8; 8]).err(), Some(VfsError::Again));
-        fd.set(0, Some(10), 2, false);
+        fd.set(0, Some(10), 2, false, 0);
         fd.advance(35);
         let mut buf = [0u8; 8];
         assert_eq!(fd.read_at(0, &mut buf), Ok(8));
@@ -669,7 +804,7 @@ mod tests {
         let fd = TimerFd::new(10, CLOCK_MONOTONIC, false);
         assert!(!fd.poll_ready().read);
         assert!(!fd.poll_ready().write);
-        fd.set(0, Some(10), 0, false);
+        fd.set(0, Some(10), 0, false, 0);
         fd.advance(10);
         assert!(fd.poll_ready().read);
         assert!(!fd.poll_ready().write);

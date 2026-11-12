@@ -1145,6 +1145,40 @@ pub fn descriptor_inode_of(
     })
 }
 
+/// The open **file description** another process's descriptor holds.
+///
+/// `/proc/<pid>/fdinfo/<n>` renders four facts off one description at one
+/// moment - its position, its open flag word, its node's number, and the mount
+/// it is on - so it asks for the description rather than for each fact
+/// separately: four separate walks of the table could see the descriptor move
+/// between them (a `read` advancing the position, a `dup2` replacing the
+/// description), and a file that mixed two moments is worse than one that
+/// answers none.
+pub fn descriptor_file_of(pid: usize, fd: usize) -> Option<alloc::sync::Arc<crate::vfs::File>> {
+    with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
+        // `task.user` and not `task.exited`: a descriptor of a process that has
+        // died but not been reaped is still open and still readable, which is
+        // what lets a debugger drain one - the same clause `/proc/<pid>/fd`
+        // lists by.
+        Some(task) => task
+            .fds
+            .open_files()
+            .into_iter()
+            .find(|(number, _file)| *number as usize == fd)
+            .map(|(_number, file)| file),
+        _ => None,
+    })
+}
+
+/// The per-descriptor flag word - `FD_CLOEXEC`, which lives on the descriptor
+/// and not on the description, so `dup` gives the new number without it.
+pub fn descriptor_flags_of(pid: usize, fd: usize) -> Option<u32> {
+    with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
+        Some(task) => task.fds.fd_flags_get(fd as i32).ok(),
+        _ => None,
+    })
+}
+
 /// The descriptor numbers `pid` has open, without asking for any of their
 /// names.
 ///

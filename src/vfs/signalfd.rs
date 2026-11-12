@@ -122,6 +122,15 @@ impl Inode for SignalFd {
         false
     }
 
+    /// The signal descriptor this node is, if it is one - the shape
+    /// [`Inode::as_eventfd`] has, for the same reason: `/proc/<pid>/fdinfo`'s
+    /// `mnt_id` line names the *filesystem* a descriptor is on, and a
+    /// `signalfd` lives on `anon_inodefs` like the four kinds beside it
+    /// (`build/scratch/fdinfo/rel.c`: all five answer `mnt_id: 19`).
+    fn as_signalfd(&self) -> Option<&SignalFd> {
+        Some(self)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x6000_0000 + self.ino,
@@ -134,6 +143,25 @@ impl Inode for SignalFd {
     /// `.workbuddy/probe_anon_fd_stat.c`).
     fn fd_name(&self) -> Option<alloc::string::String> {
         Some(alloc::string::String::from("anon_inode:[signalfd]"))
+    }
+
+    /// The `signalfd` block Linux's `show_fdinfo` adds: the signal set this
+    /// descriptor reports, as sixteen hex digits.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`): a `signalfd`
+    /// for `{SIGUSR1, SIGTERM}` (`{10, 15}`) answers
+    /// `sigmask:\t0000000000004200`, one for `{1}` answers
+    /// `sigmask:\t0000000000000001`, and one for `{1, 31}` answers
+    /// `sigmask:\t0000000040000001`. So the field is the wire `sigset_t` -
+    /// signal *n* in bit *n-1*, 64 bits, sixteen lowercase hex digits,
+    /// zero-padded - not the kernel's internal numbering.
+    ///
+    /// That layout is already this kernel's: [`super::signal::Pending`] keeps a
+    /// signal at bit `n-1` too, and its `from_wire`/`to_wire` are the identity
+    /// for exactly that reason, so no shift belongs here. The three measured
+    /// masks above are the check: `bit(10) | bit(15)` is `0x4200`.
+    fn fdinfo_lines(&self) -> Option<alloc::string::String> {
+        Some(alloc::format!("sigmask:\t{:016x}\n", self.mask))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -201,5 +229,41 @@ impl SignalFd {
     #[cfg(not(target_os = "none"))]
     fn wait_for_signal(&self) -> VfsResult<()> {
         panic!("blocking on a signalfd needs the kernel scheduler");
+    }
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    /// The `sigmask` line is the wire `sigset_t`: sixteen zero-padded hex
+    /// digits, signal *n* in bit *n-1*.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/fdinfo/pertype.c`):
+    /// `{SIGUSR1, SIGTERM}` = `{10, 15}` read
+    /// `sigmask:\t0000000000004200`; `{1}` read `...0001`; `{1, 31}` read
+    /// `...0000000040000001`. The three are the check that no shift belongs
+    /// here - `bit(10) | bit(15)` is `0x4200` in this kernel's own numbering.
+    #[test]
+    fn the_sigmask_line_is_the_wire_sigset() {
+        let mut mask: signal::Pending = 0;
+        signal::add(&mut mask, 10);
+        signal::add(&mut mask, 15);
+        let fd = SignalFd::new(1, mask, false);
+        assert_eq!(fd.fdinfo_lines().unwrap(), "sigmask:\t0000000000004200\n");
+
+        let mut one: signal::Pending = 0;
+        signal::add(&mut one, 1);
+        let fd = SignalFd::new(2, one, false);
+        assert_eq!(fd.fdinfo_lines().unwrap(), "sigmask:\t0000000000000001\n");
+
+        // Signal 31 lands in bit 30, which is the high half of the low word:
+        // a renderer that printed bit `n` instead of `n-1` would answer
+        // `80000000`.
+        let mut high: signal::Pending = 0;
+        signal::add(&mut high, 1);
+        signal::add(&mut high, 31);
+        let fd = SignalFd::new(3, high, false);
+        assert_eq!(fd.fdinfo_lines().unwrap(), "sigmask:\t0000000040000001\n");
     }
 }

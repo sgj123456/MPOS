@@ -3728,6 +3728,11 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // names are the group's descriptors (`build/scratch/fdns/p2.c`). The
     // directory is the process's, asked for through the thread's name.
     node.add("fd", NodeKind::Dir, descriptor_dir(pid));
+    // The descriptors' *state*, one file per number - Linux gives a thread
+    // directory this spelling too, and it is the same set of descriptors the
+    // `fd` beside it lists, asked for through the thread's name (`/proc/self/
+    // task/<tid>/fdinfo/<n>` answered for a live thread, measured).
+    node.add("fdinfo", NodeKind::Dir, fdinfo_dir(pid));
     // Likewise the namespaces: `/proc/<pid>/task/<tid>/ns` is `0511` and its
     // names are the namespaces the process is in.
     node.add(
@@ -4237,6 +4242,12 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // path it was opened by.
     node.add("fd", NodeKind::Dir, descriptor_dir(slot));
 
+    // `/proc/<pid>/fdinfo`: one file per open descriptor, carrying its
+    // position, flags, mount and inode - the state the link beside it cannot
+    // report. Both are built of the process's descriptor set; only this one's
+    // entries are files rather than links.
+    node.add("fdinfo", NodeKind::Dir, fdinfo_dir(slot));
+
     // `/proc/<pid>/ns`: one link per namespace the process is in, naming the
     // namespace the way `readlink` reports it and handing `setns` the object
     // when it is opened.
@@ -4320,6 +4331,116 @@ impl Dynamic for Descriptors {
         let pid = self.pid;
         Some(fd_link(pid, fd, move || fd_target(pid, fd)))
     }
+}
+
+/// `/proc/<pid>/fdinfo`: one generated file per open descriptor, named by the
+/// descriptor's number.
+///
+/// A *different* directory from `/proc/<pid>/fd`, not a longer spelling of it,
+/// and the difference is the whole reason both exist: `fd`'s entries are magic
+/// **symlinks** whose `readlink` names the file, while these are regular
+/// **files** whose body reports the descriptor's state - the one place a
+/// program can ask "where is this descriptor positioned, and what flags does it
+/// carry" about a descriptor that belongs to *another* process. `F_GETFL` only
+/// answers for a descriptor the asking process holds, which is exactly the case
+/// a debugger, `lsof` or a supervisor does not have.
+///
+/// Linux's two directories have measured, different words: `/proc/<pid>/fd` is
+/// `0500` and a symlink per descriptor, `/proc/<pid>/fdinfo` is `0555` with a
+/// `0444` file per descriptor (`build/scratch/fdinfo/edge.c`, Linux 7.2.14).
+/// The same `0500`-style narrowing would be wrong here - a caller that may not
+/// read a descriptor's name may still read its state, which is what makes the
+/// file useful from outside - so this directory carries the tree's own `0555`
+/// and its files the read-only word every generated file here reports. Its
+/// `st_size` is **zero** where `/proc/<pid>/fd`'s is the entry count: measured
+/// (`build/scratch/fdinfo/size.c`), the `fd` directory's size moved `3 -> 6 ->
+/// 3` as three descriptors were opened and closed while `fdinfo`'s stayed `0`
+/// throughout, so the count-is-size rule is that one directory's and not this
+/// one's.
+fn fdinfo_dir(pid: usize) -> Arc<ProcDir> {
+    ProcDir::own(Some(Arc::new(FdInfos { pid })), 0, false)
+}
+
+struct FdInfos {
+    pid: usize,
+}
+
+impl Dynamic for FdInfos {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        fd_numbers(self.pid)
+            .into_iter()
+            .map(|name| (name, NodeKind::File))
+            .collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        // The name must be the descriptor *number*, in Linux's spelling: the
+        // one decimal form with no leading zeros. Measured on Linux 7.2.14
+        // (`build/scratch/fdinfo/edge.c`): `abc`, `-1`, `00`, ` 3`, `3x`,
+        // `0x10` and `4294967296` are all `ENOENT` from this directory, so a
+        // name that is merely *parseable* as a number is not enough - `00`
+        // parses to 0 and Linux still refuses it. The test is therefore
+        // "re-rendering the number gives this name back", which is the same
+        // rule `fd_numbers` produces the names by.
+        let fd = name.parse::<usize>().ok()?;
+        if alloc::format!("{fd}") != *name {
+            return None;
+        }
+        if !crate::sched::descriptor_numbers(self.pid).contains(&fd) {
+            return None;
+        }
+        let pid = self.pid;
+        Some(maybe_file(move || fdinfo_body(pid, fd)))
+    }
+}
+
+/// The body of `/proc/<pid>/fdinfo/<fd>`: the four lines every descriptor has,
+/// then whatever its kind adds.
+///
+/// The four are [`crate::vfs::fdinfo::generic_lines`], and where each number
+/// comes from is the whole of this function's job:
+///
+/// * `pos` is the description's position (`File::pos`), the number `lseek`
+///   reports and a read advances.
+/// * `flags` is `F_GETFL`'s word - [`crate::vfs::File::open_flags`] - and the
+///   `cloexec` half is read off the *descriptor*, not the description, because
+///   that is where `FD_CLOEXEC` lives: it is per-fd, so `dup` gives the copy
+///   without it, which is exactly what Linux's own `fdinfo` shows.
+/// * `mnt_id` is the **reused 32-bit** id `/proc/self/mountinfo` prints in its
+///   first column, and for an anonymous node it is the kind's pseudo id -
+///   `anon_inodefs`'s `19`, `pipefs`'s `18`, `sockfs`'s `12`, or `memfd`'s
+///   `0` - because those filesystems have no mount in the table to look up
+///   (measured: none of the four ids appears in `mountinfo`).
+/// * `ino` is the inode's own number, the same one `fstat` reports as
+///   `st_ino`.
+///
+/// `None` is the descriptor having gone away between the listing that named it
+/// and the read - the same `ENOENT` a `/proc/<pid>/fd` link answers, and the
+/// reason this is a generator rather than a fixed body.
+#[cfg(target_os = "none")]
+fn fdinfo_body(pid: usize, fd: usize) -> Option<String> {
+    let file = crate::sched::descriptor_file_of(pid, fd)?;
+    let cloexec = crate::sched::descriptor_flags_of(pid, fd)
+        .map(|flags| flags & crate::vfs::file::FD_CLOEXEC != 0)
+        .unwrap_or(false);
+    let meta = file.metadata();
+    let mnt_id = match crate::vfs::fdinfo::pseudo_mount_id(&file) {
+        Some(id) => id,
+        // A named node's mount is the deepest attachment covering it, which is
+        // the same record `statmount(STATMOUNT_BY_FD)` and `mountinfo` report.
+        None => crate::vfs::mount::mount_id_containing(&file.inode()).unwrap_or(0),
+    };
+    let mut body =
+        crate::vfs::fdinfo::generic_lines(file.pos(), file.open_flags(), cloexec, mnt_id, meta.ino);
+    if let Some(extra) = file.inode().fdinfo_lines() {
+        body.push_str(&extra);
+    }
+    Some(body)
+}
+
+#[cfg(not(target_os = "none"))]
+fn fdinfo_body(_pid: usize, _fd: usize) -> Option<String> {
+    None
 }
 
 /// One process's namespace, for the two readers that need the object rather
