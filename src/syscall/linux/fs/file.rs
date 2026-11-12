@@ -6472,30 +6472,45 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 
 /// `fadvise64(fd, offset, len, advice)` — a hint about coming access.
 ///
-/// Nothing here reads ahead or caches evictable pages, so every advice is
-/// accepted and does nothing - which is what Linux does for the advices it
-/// does not act on. The descriptor still has to be real.
+/// Nothing here reads ahead or caches evictable pages, so a *recognised* advice
+/// is answered 0 and does nothing, which is what Linux does with an advice it
+/// does not act on. What the door still owes is its three refusals, and the order
+/// between them - measured on a current host (Linux 7.2.14,
+/// `build/scratch/advice/{f,g,h,i,j}.c`):
+///
+/// * a descriptor that is not open is `EBADF`, and it outranks everything else
+///   (`(999, advice=6)` is `EBADF`, not `EINVAL`);
+/// * a **pipe** is `ESPIPE`, and that outranks both the range and the advice:
+///   `(pipe, advice=6)` and `(pipe, -1, 4096, 3)` are `ESPIPE` where the same
+///   pipe with a good advice and a good range is `ESPIPE` too. Only a pipe: a
+///   socket, a `socketpair`, a character device and a directory all answer 0,
+///   so this is `as_pipe()` and not `as_duplex()`;
+/// * then the range: a negative `offset` or `len` is `EINVAL`, and a sum that
+///   wraps is accepted (see [`crate::syscall::linux::abi::fadvise_range_verdict`]);
+/// * then the advice: the six words `0..=5`, with the register read as the
+///   32-bit `int` Linux reads.
+///
+/// Three separate shapes used to be wrong here at once. The old door answered a
+/// pipe's `EINVAL` before it looked at the kind, so `(pipe, advice=6)` was
+/// `EINVAL` where Linux answers `ESPIPE`; it did not look at the range at all,
+/// so `(-1, 4096)` was a success; and it compared the whole `usize`, so a
+/// caller's `0x1_0000_0003` - `POSIX_FADV_NORMAL` after Linux's truncation - was
+/// refused. Each is a claim in `t-range-advice`.
 pub fn handle_fadvise64(args: [usize; ARG_COUNT]) -> isize {
-    // `posix_fadvise(2)` is a hint, but the hint's vocabulary is closed and the
-    // descriptor's kind still matters. Measured on a current host: advice
-    // `0..=5` (`NORMAL`, `RANDOM`, `SEQUENTIAL`, `WILLNEED`, `DONTNEED`,
-    // `NOREUSE`) answers `0`, an advice past the set answers `EINVAL`, a number
-    // that is not open answers `EBADF`, and a pipe answers `ESPIPE` - there is
-    // no byte range to give advice about. Returning `0` for any advice on any
-    // open descriptor was the accept-and-drop this removes: an unknown advice
-    // got a success it was never owed, and a pipe was told it had a page cache.
-    // This kernel prefetches nothing, so a *recognised* hint answered `0` is
-    // truthful (best-effort, no observable promise); the refusals are what make
-    // the vocabulary honest.
     let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
-    if !matches!(args[3], 0..=5) {
-        return err::EINVAL;
-    }
+    // A pipe has no byte range to give advice about, and Linux says so before it
+    // judges either the range or the advice.
     if file.inode().as_pipe().is_some() {
         return err::ESPIPE;
+    }
+    if let Err(e) = abi::fadvise_range_verdict(args[1] as i64, args[2] as i64) {
+        return e;
+    }
+    if let Err(e) = abi::fadvise_advice_verdict(args[3]) {
+        return e;
     }
     0
 }

@@ -292,7 +292,18 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-12, `readahead`/`sync_file_range` §6.138):** stage 1
+**Latest measured gate (2026-11-12, `fadvise64`'s order §6.139):** stage 1 `1282 tests, 0 failed`
+(71.79 s - the +1 is `fadvise_has_six_advices_and_a_signed_range_that_may_wrap`); x86_64
+`pass=301 fail=0 (301 built)`, `mpos-kunit 35 passed, 0 failed` (52.91 s over 2 lane(s), total
+`72.16 s`, `+1.5%`); aarch64 `pass=300 fail=0 (300 built)`, kunit 35/0 (138.82 s, total `232.84 s`,
+`+5.1%`) - `GATE EXIT=0`, both arms in one command with the lane count forced. `t-fadvise`
+`=== PASS` on both arms (`build/test-lane-x86_64-0/serial.log:3740`,
+`build/test-lane-aarch64-0/serial.log:5178`). Counterfactually **5 of 18 red**
+(`build/boot-fadvise-cf1.log`): the advice-width claim, the three range claims and the order claim -
+one per defect - while the thirteen that hold on both kernels are the answers the old door already
+had right.
+
+**Measured gate before it (2026-11-12, `readahead`/`sync_file_range` §6.138):** stage 1
 `1281 tests, 0 failed` (70.73 s - the +3 are `readahead_judges_the_sign_of_its_range_and_nothing_else`,
 `readahead_lets_its_range_wrap_and_sync_file_range_refuses_to` and
 `sync_file_range_has_three_flag_bits_and_refuses_the_rest`); x86_64 `pass=301 fail=0 (301 built)`,

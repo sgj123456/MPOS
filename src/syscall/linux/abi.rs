@@ -4267,6 +4267,39 @@ pub(crate) fn readahead_range_verdict(offset: i64, count: i64) -> Result<(), isi
     Ok(())
 }
 
+/// `fadvise64(2)`'s range is judged by the same law as `readahead`'s: both
+/// words signed, both non-negative, and a wrapping sum **accepted**.
+///
+/// The call is a hint, which is why "everything is a hint, so nothing is
+/// refused" survived: the range is still a range, and Linux refuses one that
+/// runs backwards. Measured on a current host (Linux 7.2.14,
+/// `build/scratch/advice/{g,i}.c`): `fadvise(regular, -1, 0)`, `(0, -1)`,
+/// `(-1, -1)` and `(-4096, 4096)` are all `EINVAL`, while `(0, 0)`,
+/// `(0, i64::MAX)`, `(i64::MAX, 0)` and `(2^62, i64::MAX)` are all 0 - so this
+/// door, like `readahead`, lets its range wrap and unlike `sync_file_range` does
+/// not check the sum.
+pub(crate) fn fadvise_range_verdict(offset: i64, len: i64) -> Result<(), isize> {
+    if offset < 0 || len < 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
+/// `fadvise64(2)`'s `advice` is a 32-bit `int` with a closed vocabulary of six.
+///
+/// `POSIX_FADV_NORMAL`(0) through `POSIX_FADV_NOREUSE`(5) are the words Linux
+/// knows; anything else is `EINVAL`, including the sign-extended `-1`. The width
+/// matters as it does for every other word this kernel reads: a caller's
+/// `0x1_0000_0003` is `NORMAL` after the truncation Linux performs and was
+/// `EINVAL` before it (Linux 7.2.14, `build/scratch/advice/{f,j}.c`:
+/// `advice=0x100000003` is 0 and `advice=0x100000006` is `EINVAL`).
+pub(crate) fn fadvise_advice_verdict(word: usize) -> Result<(), isize> {
+    if word as u32 > 5 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
 /// `sync_file_range(2)`'s range is signed **and** must not overflow.
 ///
 /// The same two words `readahead` takes, judged by a stricter law: both must be
@@ -7588,6 +7621,26 @@ mod diskstat_tests {
         assert_eq!(sync_file_range_range_verdict(0, 4096), Ok(()));
         assert_eq!(sync_file_range_range_verdict(-1, 4096), Err(err::EINVAL));
         assert_eq!(sync_file_range_range_verdict(0, -1), Err(err::EINVAL));
+    }
+
+    /// `fadvise64`'s two words: the advice is a closed 32-bit vocabulary, the
+    /// range is signed and a wrapping sum is fine.
+    #[test]
+    fn fadvise_has_six_advices_and_a_signed_range_that_may_wrap() {
+        for advice in 0usize..=5 {
+            assert_eq!(fadvise_advice_verdict(advice), Ok(()));
+        }
+        for advice in [6usize, 7, 0xffff_ffff, 0x1_0000_0006] {
+            assert_eq!(fadvise_advice_verdict(advice), Err(err::EINVAL));
+        }
+        // The top half of the register is not part of the `int` Linux reads.
+        assert_eq!(fadvise_advice_verdict(0x1_0000_0003), Ok(()));
+        assert_eq!(fadvise_range_verdict(0, 4096), Ok(()));
+        assert_eq!(fadvise_range_verdict(0, 0), Ok(()));
+        assert_eq!(fadvise_range_verdict(1 << 62, i64::MAX), Ok(()));
+        assert_eq!(fadvise_range_verdict(-1, 0), Err(err::EINVAL));
+        assert_eq!(fadvise_range_verdict(0, -1), Err(err::EINVAL));
+        assert_eq!(fadvise_range_verdict(-4096, 4096), Err(err::EINVAL));
     }
 
     /// `sync_file_range`'s flag word is three bits wide: 1, 2 and 4 are the

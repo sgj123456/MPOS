@@ -11112,3 +11112,40 @@ kernel without the change.
 
 **Named gaps:** no `MAX_READAHEAD` window (nothing is read lazily to fill one) and no deferred
 writes, so `sync_file_range`'s three flush bits have nothing to wait on. Notes: `§6.138`.
+
+### Item 253 `fadvise64` - a hint's subject, range and word, in that order
+
+**Before:** the door accepted any advice on any open descriptor, refused a pipe, and compared the
+advice word as the whole `usize`. Three answers were wrong at once: `(pipe, advice=6)` was `EINVAL`
+where Linux answers `ESPIPE`; `(-1, 4096)` and `(0, -1)` were 0 where Linux answers `EINVAL`; and
+`advice = 0x1_0000_0003` was refused where Linux reads the low 32 bits and sees `POSIX_FADV_NORMAL`.
+
+**Now:** descriptor → kind → range → advice, each with its own verdict.
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| `fadvise(regular, 0, 4096, 0..=5)` | 0 | 0 | 0 |
+| `fadvise(regular, 0, 4096, 6 \| 7 \| -1)` | `EINVAL` | `EINVAL` | `EINVAL` |
+| `fadvise(regular, 0, 4096, 0x1_0000_0003)` | 0 | `EINVAL` | 0 |
+| `fadvise(regular, -1, 0)` / `(0, -1)` / `(-4096, 4096)` | `EINVAL` | 0 | `EINVAL` |
+| `fadvise(regular, 2^62, 2^62)` / `(0, i64::MAX)` | 0 | 0 | 0 |
+| `fadvise(pipe, 0, 4096, 9)` | `ESPIPE` | `EINVAL` | `ESPIPE` |
+| `fadvise(pipe, -1, 4096, 3)` | `ESPIPE` | `ESPIPE` | `ESPIPE` |
+| `fadvise(socketpair \| socket \| /dev/null \| dir, 0, 4096, 3)` | 0 | 0 | 0 |
+| `fadvise(999, 0, 4096, 9)` | `EBADF` | `EBADF` | `EBADF` |
+
+**Why the order is the interesting row.** `sync_file_range` (item 252) asks its flag word *before* the
+node's kind - `(pipe, flags=8)` is `EINVAL`; `fadvise64` asks the kind *before* its advice word -
+`(pipe, advice=9)` is `ESPIPE`. Two doors with identical arguments and identical errno vocabularies
+order their questions differently, so neither can share a validator.
+
+**Measurement:** `build/scratch/advice/{f,g,h,i,j}.c` on host 7.2.14 - the six-word vocabulary and
+its width, the signed range with a wrapping sum accepted, the pipe-only `ESPIPE`, and the two order
+witnesses.
+
+**Landed:** `fadvise_range_verdict`/`fadvise_advice_verdict` (`src/syscall/linux/abi.rs`);
+`handle_fadvise64` rewritten (`src/syscall/linux/fs/file.rs`). Pin: `user/tests/src/bin/t-fadvise.rs`,
+18 claims, **5 of 18 red** against the kernel without the change.
+
+**Named gaps:** every recognised advice is accepted and does nothing (nothing is cached evictably,
+nothing is read lazily). Notes: `§6.139`.

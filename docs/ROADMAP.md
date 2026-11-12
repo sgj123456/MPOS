@@ -2391,3 +2391,15 @@ carries the per-phase history.*
   (22 claims) is `PASS` on both arms and **19 of 22 red** counterfactually. Named gaps: no
   `MAX_READAHEAD` window and no deferred writes, so the three flush bits have nothing to wait on.
   (§6.138, item 252)
+- `fadvise64` was written on "it is only a hint, so every advice on every open descriptor succeeds",
+  and three answers came out of that sentence: the node's kind was asked *after* the advice word, so
+  `(pipe, advice=6)` was `EINVAL` where Linux answers `ESPIPE`; the range was not asked at all, so
+  `(-1, 4096)` and `(0, -1)` were 0 where Linux answers `EINVAL`; and the advice was compared as the
+  whole `usize`, so a caller's `0x1_0000_0003` was refused where Linux reads the low 32 bits and sees
+  `POSIX_FADV_NORMAL`. The door now asks descriptor → kind → range → advice, which is the **opposite**
+  order from `sync_file_range`'s flags-before-kind: two calls with the same arguments and the same
+  errno vocabulary order their four questions differently, so neither can share a validator. Only a
+  real pipe is `ESPIPE` (a `socketpair` end, a socket, a character device and a directory are all
+  served), and a wrapping range is accepted as it is by `readahead`. Pin `t-fadvise` (18 claims) is
+  `PASS` on both arms and **5 of 18 red** counterfactually. Named gap: every recognised advice is
+  accepted and does nothing, nothing being cached evictably. (§6.139, item 253)

@@ -12280,3 +12280,115 @@ its *subject*. "The descriptor exists" answers which object, never whether this
 call can do anything with that object - which is why both doors here had to be
 taught the four questions and the order between them, and why the two doors
 turned out to order them differently.
+
+## §6.139 `fadvise64` is a hint, and a hint still has an order (LANDED 2026-11-12)
+
+The door was written on a sentence: "it is only a hint, so every advice on every
+open descriptor is a success". Three separate answers came out of that one
+sentence, and each belonged to a caller with something to lose:
+
+- the **kind** was asked after the advice, so `fadvise64(pipe, advice=6)` was
+  `EINVAL` where Linux answers `ESPIPE` - a caller told its advice word was bad
+  when the advice was never the problem;
+- the **range** was not asked at all, so `(-1, 4096)` and `(0, -1)` were
+  answered 0 where Linux answers `EINVAL` - a hint about a range that does not
+  exist;
+- the **word width** was wrong, so `advice = 0x1_0000_0003` was refused while
+  Linux reads the low 32 bits and sees `POSIX_FADV_NORMAL` - the same width
+  question `§6.124` settled for `TIMER_ABSTIME` and `§6.138` settled for
+  `sync_file_range`'s flags.
+
+### What the host answers
+
+Measured on Linux 7.2.14 (`build/scratch/advice/{f,g,h,i,j}.c`):
+
+```
+fadvise(regular, 0, 4096, 0..=5)          = 0
+fadvise(regular, 0, 4096, 6 | 7 | -1)     = EINVAL
+fadvise(regular, 0, 4096, 0x1_0000_0003)  = 0        (the word is an int)
+fadvise(regular, 0, 4096, 0x1_0000_0006)  = EINVAL
+fadvise(regular, -1, 0)                   = EINVAL
+fadvise(regular, 0, -1)                   = EINVAL
+fadvise(regular, -4096, 4096)             = EINVAL
+fadvise(regular, 2^62, 2^62)              = 0        (a wrapping sum is fine)
+fadvise(regular, 0, i64::MAX)             = 0
+fadvise(pipe, 0, 4096, 9)                 = ESPIPE   (kind before advice)
+fadvise(pipe, -1, 4096, 3)                = ESPIPE   (kind before range)
+fadvise(socketpair | socket | /dev/null | dir, 0, 4096, 3) = 0
+fadvise(999, 0, 4096, 9)                  = EBADF    (descriptor before all)
+```
+
+The order is the part that cannot be guessed from the call's shape, and it is the
+opposite of the door next door. `sync_file_range` asks its flag word **before** the
+node's kind (`(pipe, flags=8)` is `EINVAL`); `fadvise64` asks the kind **before**
+its advice word (`(pipe, advice=9)` is `ESPIPE`). Two calls that both take `(fd,
+offset, len, word)` and both answer `EINVAL`/`ESPIPE` order their four questions
+differently - so a shared "validate then serve" helper would have had to pick one
+and be wrong for the other.
+
+The "only a pipe" clause is the other half of the kind question. A socket, a
+`socketpair` end, a character device and a directory all answer 0; only a pipe is
+`ESPIPE`. That is why the door tests `as_pipe()` and not `as_duplex()` - the two
+`as_*` families that `fsync` has to treat *together* are treated differently here.
+
+### The shape here
+
+Two verdicts in `abi.rs`, one per word, each with its own measurement:
+
+- `fadvise_range_verdict(offset, len)`: both signed, both non-negative, and a
+  wrapping sum **accepted** - the same law as `readahead`, and unlike
+  `sync_file_range`, which refuses `(2^62, 2^62)`.
+- `fadvise_advice_verdict(word)`: `word as u32 > 5` is `EINVAL`, which makes
+  `0x1_0000_0003` a `NORMAL` and a sign-extended `-1` an `EINVAL`.
+
+`handle_fadvise64` then asks: descriptor, kind, range, advice - in that order, and
+the order is the finding.
+
+### The pin
+
+`user/tests/src/bin/t-fadvise.rs`, 18 claims, host 18/18 and machine 18/18
+(`build/boot-fadvise1.log`). Against the kernel without the change
+(`build/boot-fadvise-cf1.log`, the two syscall-layer files stashed and both the
+kernel and the loader rebuilt) **5 of 18 red**:
+
+```
+FAIL: the advice is the low 32 bits of the register (got 22, want 0)
+FAIL: a negative offset is refused (got 0, want 22)
+FAIL: so is a negative length (got 0, want 22)
+FAIL: and so is a range that ends before it starts (got 0, want 22)
+FAIL: the kind is judged before the advice (got 22, want 29)
+```
+
+The five are one per defect plus the width, and the thirteen that hold on both
+kernels are the answers the old door already got right - which is what a
+counterfactual should show: the descriptor first, the six-word vocabulary, and
+"only a pipe is `ESPIPE`" were all true before this change.
+
+### The gate
+
+`GATE EXIT=0`. Stage 1 `1282 tests, 0 failed` (71.79 s; the +1 over the previous
+green is `fadvise_has_six_advices_and_a_signed_range_that_may_wrap`). x86_64
+`pass=301 fail=0 (301 built)` with `mpos-kunit 35 passed, 0 failed` (52.91 s over
+2 lane(s), total `72.16 s`, `+1.5%`); aarch64 `pass=300 fail=0 (300 built)` with
+kunit 35/0 (138.82 s, total `232.84 s`, `+5.1%`). `t-fadvise` is `=== PASS` on
+both arms (`build/test-lane-x86_64-0/serial.log:3740`,
+`build/test-lane-aarch64-0/serial.log:5178`).
+
+### Named gaps
+
+- **The advice does nothing.** `POSIX_FADV_WILLNEED` and `DONTNEED` are accepted
+  and have no effect, because this kernel reads eagerly and caches nothing
+  evictable. That is Linux's own contract for a hint - best effort, no promise -
+  so the answer is truthful, but a caller cannot tell that nothing was done.
+  `RANDOM`/`SEQUENTIAL`/`NOREUSE` likewise have nothing to tune.
+- **`preadv2`/`pwritev2`'s `RWF_*` words** are the same family of "word with a
+  closed vocabulary" and are handled in their own doors; they are not covered by
+  this item.
+
+### The rule
+
+"A hint has nothing to refuse" is false in a specific way: a hint still names a
+*subject*, a *range* and a *word*, and each of the three can be malformed. The
+order in which a door asks about them is part of its ABI - the caller who has two
+of them wrong is the only caller who can tell, and every single-fault test will
+agree with a door that asks in the wrong order.
