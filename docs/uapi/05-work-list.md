@@ -10982,3 +10982,42 @@ the `0400` word, pin `user/tests/src/bin/t-proc-io.rs` (13 claims, 10 red counte
 `crates/blk`'s counters are per-device, and the ext4 cache knows a fill from a hit but not its cost);
 and there is no `crchar`/`crwchar` because Linux has none either - a child's io does not fold into
 the parent, so the absence is the answer.
+
+### Item 250 — `/proc/<pid>/auxv` is the vector the program was handed
+
+| Linux | this kernel, before | this kernel, now |
+| --- | --- | --- |
+| `/proc/<pid>/auxv` exists, mode `0400`, `st_size` 0 | **absent** | present, `0400`, size 0 |
+| body: native-endian `(u64, u64)` pairs, `AT_NULL` last | - | the bytes the initial stack carries, terminator included |
+| content: what the program was executed with | - | the copy made at `exec`, inherited by `fork` |
+| a `setuid` after `exec` does not move `AT_UID` | - | same (the copy is not recomputed) |
+| `AT_EXECFN` points at the path string on the stack | - | follows back into the process's own memory |
+| `/proc/<pid>/task/<tid>/auxv` | - | same bytes (one copy per address space) |
+| a `fork` child that has not `exec`ed | - | its parent's bytes |
+| a zombie | `ESRCH` (its `mm` is gone) | `ENOENT`, a named gap |
+| another owner's file | `EACCES` | `EACCES` (the `0400` word) |
+
+**Why it is not one more formatted file.** The vector the loader pushes onto the initial stack *is*
+the vector the file must report - Linux keeps one copy (`mm->saved_auxv`) and the file is a read of
+it, which is the only reason a process that `setuid`s after `exec` still reads the ids it was
+executed with. A second builder would be free to drift, and the drift is invisible: the shape is
+right and one word is the current identity instead of the executed one.
+
+**Why the node's plumbing had to move.** A generated procfs file's body was an `Arc<str>`, and this
+one is not text: a `u64` value with `0x80` in it is not valid UTF-8, so the file could not have been
+served at all. `ProcFile` now renders bytes, the text helpers convert their `String` without a copy,
+and the two text-only node families keep their own alias.
+
+**Measurement:** `build/scratch/auxv/{p,q,r}.c` on host 7.2.14 - the entry table, the thread spelling,
+the partial reads, `st_size` 0, `0400`, a zombie's `ESRCH`, and `/proc/1/auxv`'s `EACCES`.
+
+**Landed:** `auxv()` recording its own bytes into `Loaded::auxv` and `Mm::saved_auxv`
+(`src/sched/runtime/{load,child_mm,child_exit,procfs}.rs`), the byte-carrying `ProcFile` and
+`owner_bytes_file` with the two nodes (`src/vfs/procfs.rs`), host tests for the node's byte serving
+and `772` host tests green, pin `user/tests/src/bin/t-proc-auxv.rs` (16 claims, 15 red
+counterfactually; the two greens are the honest boundaries §6.136 names).
+
+**Named gaps:** this kernel's vector is sixteen entries where Linux's is twenty-three - the file
+reports what this kernel actually handed a program (`AT_SYSINFO_EHDR`, `AT_MINSIGSTKSZ`, `AT_HWCAP2`,
+`AT_PLATFORM`, `AT_FLAGS` are not pushed), which is a gap in the loader's vector, not in this file;
+and a zombie answers `ENOENT` where Linux answers `ESRCH`.

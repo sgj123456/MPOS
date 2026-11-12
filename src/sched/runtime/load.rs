@@ -250,7 +250,7 @@ pub(crate) fn write_arg_block(
 /// the case where the two differ. `AT_BASE` is the one entry a dynamically linked
 /// program cannot do without - it is how the interpreter finds *itself*, since
 /// nothing told it where it was put - and zero means the program is static.
-fn auxv(buf: &mut [u8], loaded: &Loaded, random_vaddr: usize, execfn: usize) {
+fn auxv(buf: &mut [u8], loaded: &mut Loaded, random_vaddr: usize, execfn: usize) {
     let mut off = 0usize;
 
     // Helper: write one auxv entry (type, value) and advance.
@@ -298,7 +298,15 @@ fn auxv(buf: &mut [u8], loaded: &Loaded, random_vaddr: usize, execfn: usize) {
     entry!(25, random_vaddr); // AT_RANDOM
     entry!(31, execfn); // AT_EXECFN
     entry!(0, 0usize); // AT_NULL
-    let _ = off;
+
+    // The vector the stack carries is also the vector `/proc/<pid>/auxv`
+    // reports, and that is the whole promise of the file: Linux's `saved_auxv`
+    // is a copy of the words `create_elf_tables` pushed, made once at `exec`
+    // and never recomputed. Keeping the copy *here*, where the stack is built,
+    // is what makes the two doors one answer - a second builder would be free
+    // to drift (`docs/notes/` §6.136).
+    loaded.auxv.clear();
+    loaded.auxv.extend_from_slice(&buf[..off]);
 }
 
 /// Where the pieces of a loaded program ended up, which is what the initial
@@ -325,6 +333,15 @@ pub(crate) struct Loaded {
     pub(crate) at_phdr: usize,
     pub(crate) phnum: usize,
     pub(crate) phent: usize,
+    /// The bytes [`auxv`] wrote onto the initial stack, kept so
+    /// `/proc/<pid>/auxv` can report the same words without rebuilding them.
+    ///
+    /// Empty until the argument block is written, which is the only place the
+    /// vector exists at all; a `fork` child takes its parent's copy ([`Mm`]'s
+    /// `saved_auxv`), and an `exec` makes a new one.
+    ///
+    /// [`Mm`]: super::child_mm::Mm
+    pub(crate) auxv: alloc::vec::Vec<u8>,
     /// The interpreter's load address, reported on the initial stack as
     /// `AT_BASE`. Zero when the program is static, which is what the ABI uses
     /// to mean "there is no interpreter".
@@ -604,6 +621,7 @@ pub(crate) fn load_user(
         at_phdr: layout.bias + image.phdr_addr,
         phnum: image.phnum,
         phent: image.phent,
+        auxv: alloc::vec::Vec::new(),
         base,
         stack_top: layout.stack_top,
         // The heap starts on the page above the highest thing the image owns -
@@ -799,13 +817,20 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::with_image(
-                TaskId(slot),
-                root,
-                loaded.frames,
-                loaded.ranges,
-                loaded.bounds,
-            ),
+            mm: {
+                let mm = Mm::with_image(
+                    TaskId(slot),
+                    root,
+                    loaded.frames,
+                    loaded.ranges,
+                    loaded.bounds,
+                );
+                // The same words the loader just pushed onto this program's
+                // stack, kept so `/proc/<pid>/auxv` reports them rather than
+                // rebuilding a second vector (`docs/notes/` §6.136).
+                mm.set_saved_auxv(loaded.auxv.clone());
+                mm
+            },
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
@@ -1017,13 +1042,20 @@ pub fn try_spawn_user(
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::with_image(
-                TaskId(slot),
-                root,
-                loaded.frames,
-                loaded.ranges,
-                loaded.bounds,
-            ),
+            mm: {
+                let mm = Mm::with_image(
+                    TaskId(slot),
+                    root,
+                    loaded.frames,
+                    loaded.ranges,
+                    loaded.bounds,
+                );
+                // The same words the loader just pushed onto this program's
+                // stack, kept so `/proc/<pid>/auxv` reports them rather than
+                // rebuilding a second vector (`docs/notes/` §6.136).
+                mm.set_saved_auxv(loaded.auxv.clone());
+                mm
+            },
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),

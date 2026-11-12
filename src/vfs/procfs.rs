@@ -38,7 +38,19 @@ use crate::mm::vm::MapFlags;
 /// read that opened it. That is `ENOENT` and not a zero-byte file, because a
 /// `ps` that read an empty `/proc/57/stat` would print a process with no name
 /// and no parent rather than skipping one that has already gone.
-type Generator = Box<dyn Fn() -> Option<String> + Send + Sync>;
+/// What a generated file's body is.
+///
+/// Bytes rather than `String`, because not every file here is text:
+/// `/proc/<pid>/auxv` is a sequence of native-endian `u64` pairs, and a value
+/// like `0x0000_0080` puts bytes in it that are not valid UTF-8, so a `String`
+/// could not carry the file at all. Every other generator hands text, which
+/// converts without a copy (`String::into_bytes`), so only that one node knows
+/// the difference (`docs/notes/` §6.136).
+type Generator = Box<dyn Fn() -> Option<alloc::vec::Vec<u8>> + Send + Sync>;
+
+/// The generator of a node whose body is text and always was: `/proc/sys`'s
+/// knobs and the links, neither of which has a binary member.
+type TextGenerator = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// What a writable generated file does with a write: how `sysctl -w` and
 /// OpenRC's `hostname` service name the system.
@@ -113,7 +125,7 @@ struct ProcFile {
     /// (`docs/notes/` §6.68). Linux materialises a seq_file once per open for
     /// exactly this reason; here the snapshot is refreshed when a read starts at
     /// offset zero (a fresh open) and reused by the chunks that follow.
-    rendered: Mutex<RefCell<Option<Arc<str>>>>,
+    rendered: Mutex<RefCell<Option<Arc<[u8]>>>>,
 }
 
 impl Inode for ProcFile {
@@ -189,14 +201,14 @@ impl Inode for ProcFile {
         let content = match content.take() {
             Some(text) => text,
             None => {
-                let fresh: Arc<str> = (self.generate)().ok_or(VfsError::NoEntry)?.into();
+                let fresh: Arc<[u8]> = (self.generate)().ok_or(VfsError::NoEntry)?.into();
                 critical_section::with(|cs| {
                     *self.rendered.borrow(cs).borrow_mut() = Some(Arc::clone(&fresh));
                 });
                 fresh
             }
         };
-        let bytes = content.as_bytes();
+        let bytes: &[u8] = &content;
         let start = offset.min(bytes.len() as u64) as usize;
         let end = (start + buf.len()).min(bytes.len());
         buf[..end - start].copy_from_slice(&bytes[start..end]);
@@ -218,7 +230,7 @@ struct ProcCtl {
     ino: Ino,
     /// The owner this node inherits from the process it describes.
     owner: Inherited,
-    read: Generator,
+    read: TextGenerator,
     write: Writer,
 }
 
@@ -316,7 +328,7 @@ struct ProcLink {
     ino: Ino,
     /// The owner this node inherits from the process it describes.
     owner: Inherited,
-    target: Generator,
+    target: TextGenerator,
     /// The process whose descriptor this link is a second name for.
     pid: usize,
     /// The descriptor this link is a second name for, when it is one: every
@@ -737,7 +749,7 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(move || Some(generate())),
+        generate: Box::new(move || Some(generate().into_bytes())),
         mode: 0,
         size: 0,
         describes: None,
@@ -832,7 +844,7 @@ fn task_file(
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(generate),
+        generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
         mode: 0,
         size: 0,
         describes: Some(slot),
@@ -844,7 +856,7 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(generate),
+        generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
         mode: 0,
         size: 0,
         describes: None,
@@ -865,7 +877,7 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(generate),
+        generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
         mode: 0o400,
         size: 0,
         describes: None,
@@ -882,6 +894,30 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
 /// Linux 7.2.14): `/proc/1/io` read by uid 1000 answers `EACCES`. `env_file`
 /// above is the first; the two differ only in the generator they carry.
 fn owner_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
+        mode: 0o400,
+        size: 0,
+        describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
+    })
+}
+
+/// [`owner_file`] for a body that is not text: the generator answers bytes and
+/// this node hands them over as they are.
+///
+/// `/proc/<pid>/auxv` is the one file of that shape. Linux's own is `0400` -
+/// the vector carries the ids the process was executed with, which is
+/// privilege information - and its `st_size` is `0` because the length is only
+/// known when the file is read (`build/scratch/auxv/p.c`, Linux 7.2.14). The
+/// bytes are the `(u64, u64)` pairs the initial stack carries, terminator
+/// included, which is why a `String` cannot be the generator's return type
+/// ([`Generator`]).
+fn owner_bytes_file(
+    generate: impl Fn() -> Option<alloc::vec::Vec<u8>> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
@@ -909,7 +945,7 @@ fn file_of_size(
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(move || Some(generate())),
+        generate: Box::new(move || Some(generate().into_bytes())),
         mode: 0,
         size,
         describes: None,
@@ -1776,6 +1812,31 @@ fn io_body(slot: usize, whole: bool) -> Option<alloc::string::String> {
     #[cfg(not(target_os = "none"))]
     {
         let _ = (slot, whole);
+        None
+    }
+}
+
+/// The bytes of `/proc/<pid>/auxv`: the auxiliary vector the loader pushed
+/// onto this process's initial stack, terminator included.
+///
+/// Not reformatted and not rebuilt: the file is a read of the copy the address
+/// space keeps (Linux's `mm->saved_auxv`), which is the only way a reader can
+/// trust it. A process that changed its ids after `exec` still reads the ids
+/// it was executed with, because that is what its stack says
+/// (`docs/notes/` §6.136).
+///
+/// `None` for a task this kernel has no vector for: one that has exited (its
+/// address space is gone, which Linux refuses with `ESRCH`) and one whose
+/// number names nothing (which every sibling reports as `ENOENT`). The two
+/// collapse into this one answer, a divergence with a name.
+fn auxv_body(tid: usize) -> Option<alloc::vec::Vec<u8>> {
+    #[cfg(target_os = "none")]
+    {
+        crate::sched::saved_auxv_of(crate::sched::TaskId(tid))
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = tid;
         None
     }
 }
@@ -3557,6 +3618,15 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         owner_file(move || io_body(tid, false)),
     );
+    // The vector this thread was handed, under the thread's own name. Linux
+    // answers it here with the same bytes as the process's: the vector lives
+    // on the shared `mm`, so every thread of a group reads one copy
+    // (`build/scratch/auxv/q.c`).
+    node.add(
+        "auxv",
+        NodeKind::File,
+        owner_bytes_file(move || auxv_body(tid)),
+    );
     node.add(
         "children",
         NodeKind::File,
@@ -3928,6 +3998,15 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         "wchan",
         NodeKind::File,
         maybe_file(move || wchan_text(slot)),
+    );
+    // What the program was handed when it was executed, in the bytes its
+    // initial stack carries - the same copy a `fork` child inherits and an
+    // `exec` replaces. `0400`, like Linux's, and `st_size` 0 because the
+    // length is only known when the file is read ([`owner_bytes_file`]).
+    node.add(
+        "auxv",
+        NodeKind::File,
+        owner_bytes_file(move || auxv_body(slot)),
     );
     node.add(
         "maps",
@@ -5491,6 +5570,40 @@ mod tests {
         let mut again = [0u8; 16];
         let read = node.read_at(0, &mut again).unwrap();
         assert_eq!(&again[..read], b"AAAA\nBBBB\n");
+    }
+
+    /// A generated file whose body is not text is served byte for byte.
+    ///
+    /// `/proc/<pid>/auxv` is the one node of that shape: its body is the
+    /// native-endian `(u64, u64)` pairs the initial stack carries, and a value
+    /// with a byte like `0x80` in it is not valid UTF-8, so a text generator
+    /// could not carry the file at all (`docs/notes/` §6.136). This asserts the
+    /// node's own plumbing rather than a formatting rule: the bytes come out as
+    /// they went in, the mode is Linux's `0400`, and the size it reports is the
+    /// zero a generated file reports.
+    #[test]
+    fn a_file_whose_body_is_not_text_is_served_byte_for_byte() {
+        let body = alloc::vec![0x80u8, 0x00, 0xff, 0xfe, 0x7f, 0x00, 0x00, 0x00];
+        let node = owner_bytes_file({
+            let body = body.clone();
+            move || Some(body.clone())
+        });
+        assert_eq!(node.mode(), 0o400);
+        assert_eq!(node.metadata().size, 0);
+
+        let mut head = [0u8; 4];
+        assert_eq!(node.read_at(0, &mut head).unwrap(), 4);
+        assert_eq!(&head, &body[..4]);
+
+        // A chunk that starts past zero continues the snapshot the first read
+        // made - the same rule every generated file here follows.
+        let mut tail = [0u8; 8];
+        assert_eq!(node.read_at(4, &mut tail).unwrap(), 4);
+        assert_eq!(&tail[..4], &body[4..]);
+
+        // And past the end is a short read of nothing, not a panic.
+        let mut beyond = [0u8; 4];
+        assert_eq!(node.read_at(16, &mut beyond).unwrap(), 0);
     }
 
     /// `/proc/diskstats`' columns, byte for byte: the widths are Linux's

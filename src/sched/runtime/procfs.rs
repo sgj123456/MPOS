@@ -651,6 +651,33 @@ pub fn task_wait(id: TaskId) -> Option<crate::sched::wchan::Wait> {
     })
 }
 
+/// The auxiliary vector this task was handed, in the bytes its initial stack
+/// carries: what `/proc/<pid>/auxv` reports.
+///
+/// The answer is the group's copy (Linux's `mm->saved_auxv`), so every thread
+/// reads the same words, and a `fork` child that has not `exec`ed reads its
+/// parent's. `None` when the number no longer names a live task, so the file
+/// can answer with a refusal rather than an empty vector.
+///
+/// A zombie answers `None` as well, and that is a divergence with a name: Linux
+/// refuses a dead process's `auxv` with `ESRCH` because its `mm` is gone
+/// (`build/scratch/auxv/q.c`), while this kernel's node reports the same
+/// "nothing to say" a collected task does (`docs/notes/` §6.136).
+#[cfg(target_os = "none")]
+pub fn saved_auxv_of(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(|entry| entry.as_ref())?;
+        if task.exited {
+            return None;
+        }
+        let bytes = task.mm.saved_auxv();
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(bytes)
+    })
+}
+
 /// The facts about `task`, in the shape `/proc` reports them.
 pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     let state = state_of(t, id, task);

@@ -1397,6 +1397,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 // them: a process that had dropped a bounding capability or
                 // become non-dumpable must not hand its child the full set.
                 mm.set_credentials(t.task(parent_id).mm.credentials());
+                // A `fork` child runs the same program from the same stack, so
+                // it was handed the same vector. Linux's `copy_mm` copies
+                // `saved_auxv` with the rest of the `mm`; a child that has not
+                // `exec`ed therefore reads its parent's ids, even after
+                // `setuid` (`docs/notes/` §6.136).
+                mm.set_saved_auxv(t.task(parent_id).mm.saved_auxv());
                 // `CLONE_NEWUSER`: the child is born in the namespace this
                 // word made, and *making* a user namespace is the grant - the
                 // full capability set, scoped to it. Applied to the credentials
@@ -1823,6 +1829,10 @@ pub fn exec_replace(
         carried.on_exec(task.identity.euid);
         let next_mm = Mm::with_image(id, new_root, loaded.frames, loaded.ranges, loaded.bounds);
         next_mm.set_credentials(carried);
+        // The vector the loader just wrote onto the new stack is this
+        // process's from here on: Linux's `saved_auxv` is made once, at
+        // `exec`, so a later `setuid` does not move the ids the file reports.
+        next_mm.set_saved_auxv(loaded.auxv.clone());
         task.mm = next_mm;
         task.brk_base = loaded.brk;
         task.brk_pages = 0;

@@ -2350,3 +2350,15 @@ carries the per-phase history.*
   zero as a **named gap** - nothing counts device-layer bytes per task. Pin `t-proc-io` (13 claims)
   is `PASS` on both arms and **10 of 13 red** counterfactually; two claims moved while writing it
   because the fixture charged what it measured. (§6.135, item 249)
+- **`/proc/<pid>/auxv` reports the vector the program was handed.** The file was absent, and the
+  vector existed only on the initial stack: this kernel wrote it and kept nothing, so there was no
+  second door onto it. `auxv()` now records the bytes it pushes into `Loaded::auxv`, `Mm::saved_auxv`
+  holds the address space's copy (set at init, spawn and `exec`; copied at `fork`), and both
+  `/proc/<pid>/auxv` and `/proc/<pid>/task/<tid>/auxv` read it at `0400` with `st_size` 0. The file is
+  not text - a `u64` value with `0x80` in it is not valid UTF-8 - so a generated `ProcFile` renders
+  bytes now, the text helpers converting without a copy. The promise the copy buys is the measured
+  one: a `setuid` after `exec` does not move the ids the file reports, because the stack's vector did
+  not move either. Pin `t-proc-auxv` (16 claims) is `PASS` on both arms and **15 of 16 red**
+  counterfactually. Named gaps: this kernel's vector is sixteen entries where Linux's is
+  twenty-three (the loader's gap, not the file's), and a zombie answers `ENOENT` where Linux answers
+  `ESRCH`. (§6.136, item 250)

@@ -11824,3 +11824,144 @@ other half: it belongs where the answer is known, which is why a refused call st
 and a failed transfer still counts as zero bytes. And the fixture lesson is the one this file keeps
 teaching - an instrument that reads the counter it is measuring charges what it measures, and the
 reading is then true and useless.
+
+## §6.136 `/proc/<pid>/auxv` is the vector the program was handed (LANDED 2026-11-12)
+
+Linux hands a program its auxiliary vector on the initial stack and keeps a copy
+in the address space (`mm->saved_auxv`) so `/proc/<pid>/auxv` can report the same
+words later. This kernel wrote the vector onto the stack and kept nothing: the
+file did not exist, and the only record of what a program was told was the copy
+in its own memory, which nothing in the kernel could read back.
+
+Measured on a current host first (`build/scratch/auxv/`, Linux 7.2.14, uid 1000):
+
+```
+mode 0400  size 0
+read 368 bytes = 23 entries
+  type 33 value 0x7f4049bb4000     AT_SYSINFO_EHDR
+  type 16 value 0x178bfbff         AT_HWCAP
+  type 6  value 0x1000             AT_PAGESZ
+  type 17 value 0x64               AT_CLKTCK
+  type 3  value 0x556eebed9040     AT_PHDR
+  type 4  value 0x38               AT_PHENT
+  type 5  value 0xf                AT_PHNUM
+  type 7  value 0x7f4049bb6000     AT_BASE
+  type 9  value 0x556eebeda0b0     AT_ENTRY
+  type 11 value 0x3e8              AT_UID
+  type 12 value 0x3e8              AT_EUID
+  type 13 value 0x3e8              AT_GID
+  type 14 value 0x3e8              AT_EGID
+  type 23 value 0x0                AT_SECURE
+  type 25 value 0x7fffca0af9e9     AT_RANDOM
+  type 31 value 0x7fffca0b1ff4     AT_EXECFN
+  type 0  value 0x0                AT_NULL
+```
+
+and the vector the program itself reads through `getauxval` agrees with it entry
+for entry. Three more readings, each from its own probe:
+
+```
+whole read: 368 bytes (23 entries)
+pread(16, off 0):  16 bytes type=33      a 16-byte window reads one pair
+pread(16, off 16): 16 bytes type=51
+pread at end:      0 bytes
+st_size:           0                     the length is only known on the read
+/proc/1/auxv by uid 1000: EACCES(13)
+zombie's auxv:            ESRCH(3)       its mm is gone
+/proc/<pid>/task/<tid>/auxv: present, same bytes
+```
+
+So the rules are:
+
+* **The file is a read of a stored copy, not a rebuild.** The vector is made
+  once, when the program is executed, and what a process reads later is those
+  bytes - which is why a `setuid` after `exec` does not move the ids the file
+  reports. A kernel that recomputed the vector on the read would answer the
+  current ids: the same shape, a different file.
+* **The words are native-endian `(u64, u64)` pairs, terminator included**, so the
+  body is not text and a `String` cannot carry it.
+* **`0400`, `st_size` 0, both spellings.** The vector carries the ids the process
+  was executed with, so it belongs to its owner; the length is unknown until the
+  file is read; and the thread's directory answers the same bytes because there
+  is one copy per address space.
+
+### What this kernel had
+
+`src/sched/runtime/load.rs`'s `auxv()` built sixteen entries - `AT_PHDR`,
+`AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, the four ids,
+`AT_HWCAP`, `AT_CLKTCK`, the `rseq` pair, `AT_SECURE`, `AT_RANDOM`, `AT_EXECFN`,
+`AT_NULL` - and pushed them into the argument block. Nothing kept them, so there
+was no second door to open: the file was simply absent.
+
+### The fix
+
+One builder, one copy, four places that hand it over:
+
+* `auxv()` now records what it wrote, into `Loaded::auxv` - the bytes on the
+  stack and the bytes the file reports are the same bytes by construction, so the
+  two doors cannot drift.
+* `Mm::saved_auxv` is the address space's copy, set at the three places an image
+  is installed (init, the spawn path, and `exec`) and copied at the one place a
+  child inherits an address space (`fork`, beside `set_image_bounds` and
+  `set_credentials`, which are inherited for the same reason).
+* `/proc/<pid>/auxv` and `/proc/<pid>/task/<tid>/auxv` read it, `0400`.
+
+The file's plumbing needed a change of its own: a generated procfs file's body
+was an `Arc<str>`, so the node could carry text and nothing else - and `0x80` in
+a `u64` value is not valid UTF-8, so `/proc/<pid>/auxv` could not have been
+served by it at all. A `ProcFile` now renders `Arc<[u8]>`, the text helpers
+convert their `String` without a copy (so no other file moved), and the two
+nodes that were never files of bytes (`/proc/sys`'s knobs, the links) keep their
+own text alias. The host test
+`a_file_whose_body_is_not_text_is_served_byte_for_byte` pins the node's side of
+it, since no host test can reach a real vector.
+
+### The pin
+
+`user/tests/src/bin/t-proc-auxv.rs`, sixteen claims:
+
+* the body exists, is a whole number of pairs, ends in `AT_NULL`, and nothing
+  follows the terminator;
+* `AT_PAGESZ` is `sysconf(_SC_PAGESIZE)`, `AT_CLKTCK` is 100, and the four id
+  words are the process's own;
+* `AT_EXECFN` points into a readable mapping and the string there names this
+  program; `AT_RANDOM` points at readable bytes; `AT_ENTRY` lands in executable
+  code and `AT_PHDR` in readable memory (the ELF header table is in the image's
+  first read-only segment - asking for it to be executable fails on a correct
+  kernel, which is how the first draft of this claim was wrong);
+* the file is `0400` and reports size 0;
+* the thread's spelling is the process's bytes;
+* a `fork` child that has not `exec`ed reads these bytes;
+* a child executed by `/proc/self/exe` reads `/proc/self/exe` back from
+  `AT_EXECFN` - the path as it was spelled, which is Linux's `bprm->filename`,
+  not the resolved one - and that path is not the one this process was started
+  by;
+* a collected process has no vector.
+
+Host: 16/16 `PASS`. Machine: 16/16 `PASS`, `AT_EXECFN` reading
+`"/bin/t-proc-auxv"` and the four ids `0` (the payload is root).
+
+**Counterfactual**: with the fix stashed and both binaries rebuilt, 15 of 16 go
+red - the file is absent, so every claim that reads it fails. The two greens are
+the honest boundaries: "and that is not the path this process was started by" is
+trivially true when there is no path, and "a collected process has no auxv" holds
+for a kernel that never had one.
+
+### Named gaps
+
+* **This kernel's vector is sixteen entries; Linux's is twenty-three.** The file
+  reports what this kernel *actually handed each program*, which is the right
+  answer for this kernel - `AT_SYSINFO_EHDR` (there is no vDSO),
+  `AT_MINSIGSTKSZ`, `AT_HWCAP2`, `AT_PLATFORM` and `AT_FLAGS` are entries the
+  loader does not push, and adding them is a change to what a program is handed,
+  not to this file.
+* **A zombie answers `ENOENT` here where Linux answers `ESRCH`.** Linux refuses
+  because the `mm` is gone; this kernel's node reports the same "no vector" a
+  collected task does, and the two collapse into one answer. The pin asserts the
+  refusal, not the errno.
+
+### The rule
+
+A file that reports what a process was handed must read the copy, not rebuild
+it. The stack and the file are two doors onto one vector, and the only way they
+cannot disagree is for the second door to be the first one's own bytes.

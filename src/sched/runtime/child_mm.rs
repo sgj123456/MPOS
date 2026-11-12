@@ -1896,6 +1896,18 @@ pub struct Mm {
     /// (`build/scratch/statcode/inherit2.c`) - while `execve` replaces it with
     /// the new image's. A task with no user address space keeps zeros.
     pub(crate) image: Mutex<RefCell<ImageBounds>>,
+    /// The auxiliary vector this address space was handed, in the bytes the
+    /// initial stack carries: what `/proc/<pid>/auxv` reports.
+    ///
+    /// Linux keeps one copy per `mm` (`saved_auxv`), made at `exec` and copied
+    /// by `fork`, and the file is a read of it - not a rebuild. That is the
+    /// promise that makes the file useful: a process that `setuid`s after its
+    /// `exec` still reads the ids it was *executed* with, because the vector
+    /// on its stack did not move either (`docs/notes/` §6.136).
+    ///
+    /// Empty for a group that has no image of its own; the readers treat that
+    /// as "nothing to report" rather than as an empty file.
+    pub(crate) saved_auxv: Mutex<RefCell<alloc::vec::Vec<u8>>>,
     /// Whether `mlockall(MCL_FUTURE)` is in force: for this group every mapping
     /// made from now on is locked as it is made, which is Linux's
     /// `mm->def_vma_flags`' `VM_LOCKED` bit.
@@ -2015,6 +2027,7 @@ impl Mm {
             syscr: core::sync::atomic::AtomicU64::new(0),
             syscw: core::sync::atomic::AtomicU64::new(0),
             image: Mutex::new(RefCell::new(image)),
+            saved_auxv: Mutex::new(RefCell::new(alloc::vec::Vec::new())),
             lock_future: core::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -2032,6 +2045,18 @@ impl Mm {
     /// for the ten `stat` fields that report them.
     pub(crate) fn image_bounds(&self) -> ImageBounds {
         critical_section::with(|cs| *self.image.borrow(cs).borrow())
+    }
+
+    /// Put the image's auxiliary vector in place: what `exec` does with the
+    /// bytes the loader just wrote onto the new stack.
+    pub(crate) fn set_saved_auxv(&self, bytes: alloc::vec::Vec<u8>) {
+        critical_section::with(|cs| *self.saved_auxv.borrow(cs).borrow_mut() = bytes);
+    }
+
+    /// The auxiliary vector this group was handed, for `/proc/<pid>/auxv` and
+    /// for a `fork` child about to inherit its parent's copy.
+    pub(crate) fn saved_auxv(&self) -> alloc::vec::Vec<u8> {
+        critical_section::with(|cs| self.saved_auxv.borrow(cs).borrow().clone())
     }
 
     /// Put a whole VMA table in place: what `fork` hands its child, whose
