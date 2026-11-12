@@ -12874,3 +12874,45 @@ Named gaps: `0400` plus Linux's `ptrace_may_access` gate is wired through
 tracer reports its last call rather than the stop's state (Linux's `running`
 for a non-running task is its own subtlety), and the file says nothing about a
 `vDSO` call, which has no syscall number to report.
+
+## §6.144 `t-wchan`'s single-sample claim was a race, and the gate proved it (2026-11-12)
+
+The first full sweep after `/proc/<pid>/syscall` landed (`§6.143`) went
+`x86_64 pass=304 fail=1`, and the one red was `t-wchan`:
+
+```text
+FAIL:  a child blocked in a read names its wait (Some("0"), state Some('R'))
+ok:    sampled together, it is asleep with its wait named (Some((Some('S'), Some("block_until_nanos"))))
+```
+
+Two things about that pair made it a **test** defect rather than a kernel one,
+and the second is decisive:
+
+* the same kernel passed `t-wchan` 3/3 when booted alone, and the next full sweep
+  was green;
+* the claim **directly beneath** it already records the mechanism in as many
+  words - "this kernel's pipe read is a *timed* park (`block_until_nanos`), so a
+  blocked reader alternates between parked and briefly runnable" - and loops up
+  to 200 times to find a sample where the task is asleep *and* names its wait.
+
+So the failing claim was the only single sample left in that program, and it was
+asking a timed park for a promise a timed park does not make: that *any* sample
+finds it parked. Six TCG lanes make landing in the runnable moment likelier; the
+`R`/`0` pair is the park's own alternation seen at the wrong instant, not a
+`wchan` that lost its answer.
+
+**The fix** is the claim the file can keep: sample for a bounded window (200 ×
+5 ms) for a word that names the wait, without demanding the sample also catch the
+asleep state - that stronger pairing stays the next claim's, which already loops.
+The measurement that makes the change honest is the one the file already carried;
+what changed is that the last single sample now uses it too.
+
+Verified: 12/12 on the host, 12/12 three times running in the guest
+(`build/boot-wchan-fix{1,2,3}.log`), and the full sweep green
+(`build/gate-wchanfix.log`).
+
+**The rule this is an instance of** (the same one §6.78a records for
+`t-ptrace-attach`): a claim built on a *poll window* reddens under load. When the
+property is a state the kernel reports, assert the state and let the poll only
+prove it is reachable - never make "one sample happened to land on the right
+side" the claim.

@@ -147,13 +147,35 @@ fn main() {
         mine == "0",
     );
 
-    // A parked child: a non-empty word that is not `0`.
+    // A parked child names a wait - **within a bounded window**, because a
+    // single sample cannot promise it and this claim used to try.
+    //
+    // Measured, and it cost a gate run: the first full sweep after
+    // `/proc/<pid>/syscall` landed went `fail=1` here with `(Some("0"), state
+    // Some('R'))`, while `t-wchan` then passed 3/3 alone on the same kernel and
+    // the next full sweep was green. The mechanism is the one the claim *below*
+    // already records in as many words - this kernel's pipe read is a **timed**
+    // park (`block_until_nanos`), so a blocked reader alternates between parked
+    // and briefly runnable, and a sample that lands in the runnable moment
+    // reads `0` in a state of `R`. Six TCG lanes make that moment likelier.
+    //
+    // So the claim is what a timed park can promise: sampling for a bounded
+    // window finds a word that names the wait. The claim beneath it makes the
+    // stronger one (asleep *and* named, together), and it already loops - this
+    // one was the only single sample left, and it was the one that reddened.
     let (pid, mut child) = parked_child();
-    let word = wchan(pid);
-    let letter = state_letter(pid);
+    let mut named = None;
+    for _ in 0..200 {
+        let word = wchan(pid);
+        if word.as_deref().is_some_and(|w| !w.is_empty() && w != "0") {
+            named = Some((word, state_letter(pid)));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     report.check(
-        &format!("a child blocked in a read names its wait ({word:?}, state {letter:?})"),
-        word.as_deref().is_some_and(|w| !w.is_empty() && w != "0"),
+        &format!("a child blocked in a read names its wait, sampled ({named:?})"),
+        named.is_some(),
     );
     // The two files are two reads at two moments, and this kernel's pipe read
     // is a *timed* park (`block_until_nanos`), so a blocked reader alternates
