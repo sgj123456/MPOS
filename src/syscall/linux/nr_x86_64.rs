@@ -563,6 +563,14 @@ pub const FANOTIFY_MARK: u64 = 301;
 /// tables converged, so unlike `userfaultfd` there is no second number.
 pub const CLOSE_RANGE: u64 = 436;
 
+/// `name_to_handle_at(2)`/`open_by_handle_at(2)` - naming an object by a
+/// filesystem-issued handle instead of by a name. These are the old
+/// per-machine numbers (303/304 here, 264/265 on aarch64) because the pair
+/// landed before the two number tables converged; both are checked against
+/// the musl tables rather than assumed from one machine.
+pub const NAME_TO_HANDLE_AT: u64 = 303;
+pub const OPEN_BY_HANDLE_AT: u64 = 304;
+
 /// The mount API's attachment half: `open_tree(2)`, `move_mount(2)` and
 /// `mount_setattr(2)`. Same numbers on both machines - these landed after the
 /// number tables converged.

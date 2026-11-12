@@ -342,6 +342,11 @@ pub const USERFAULTFD: u64 = 282;
 /// tables converged, so unlike `userfaultfd` there is no second number.
 pub const CLOSE_RANGE: u64 = 436;
 
+/// See `nr_x86_64.rs`: the handle pair, whose numbers differ from the first
+/// machine's because the tables had not converged when the pair landed.
+pub const NAME_TO_HANDLE_AT: u64 = 264;
+pub const OPEN_BY_HANDLE_AT: u64 = 265;
+
 /// The mount API's attachment half: `open_tree(2)`, `move_mount(2)` and
 /// `mount_setattr(2)`. Same numbers on both machines - these landed after the
 /// number tables converged.

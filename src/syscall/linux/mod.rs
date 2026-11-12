@@ -283,6 +283,8 @@ pub unsafe fn dispatch(
         nr::TRUNCATE => fs::truncate(args, &cwd()),
         nr::FTRUNCATE => fs::ftruncate(args),
         nr::STATFS => fs::statfs(args, &cwd()),
+        nr::NAME_TO_HANDLE_AT => fs::handle_name_to_handle_at(args, from_user),
+        nr::OPEN_BY_HANDLE_AT => fs::handle_open_by_handle_at(args, from_user),
         nr::FSTATFS => fs::fstatfs(args),
         nr::IOCTL => fs::handle_ioctl(args, from_user),
         nr::WRITEV => fs::handle_writev(args, from_user),

@@ -2403,3 +2403,10 @@ carries the per-phase history.*
   served), and a wrapping range is accepted as it is by `readahead`. Pin `t-fadvise` (18 claims) is
   `PASS` on both arms and **5 of 18 red** counterfactually. Named gap: every recognised advice is
   accepted and does nothing, nothing being cached evictably. (§6.139, item 253)
+- `name_to_handle_at`/`open_by_handle_at` answer `EOPNOTSUPP` - the word Linux uses on a filesystem
+  without export operations - instead of `ENOSYS`, and ask their questions in Linux's order: the flag
+  word before the descriptor, the name before both output pointers, and `handle_bytes` before the
+  capability. Neither output pointer is validated, because nothing is going to be written there;
+  the capability is the discriminator the pin reads out of `/proc/self/status`, so the same program
+  says `EPERM` on an unprivileged host and `EOPNOTSUPP` in the guest. 18 claims, 17/18 red
+  counterfactually (`ENOSYS`). (§6.140, item 254)

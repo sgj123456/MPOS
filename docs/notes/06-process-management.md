@@ -12392,3 +12392,123 @@ both arms (`build/test-lane-x86_64-0/serial.log:3740`,
 order in which a door asks about them is part of its ABI - the caller who has two
 of them wrong is the only caller who can tell, and every single-fault test will
 agree with a door that asks in the wrong order.
+
+## §6.140 `name_to_handle_at` answers what a filesystem without handles answers (LANDED 2026-11-12)
+
+The pair `name_to_handle_at(2)`/`open_by_handle_at(2)` exists so a caller can
+name an object by something a rename cannot invalidate - the mechanism behind
+`tar --xattrs --acls`'s handle cache, `rsync`'s `--copy-devices` fallback, and
+every backup tool that wants to remember an inode across a tree walk. Both
+numbers were undispached here, so both doors answered `ENOSYS`.
+
+That is the wrong answer even though this kernel cannot do the thing. `ENOSYS`
+means *the call does not exist here*; a caller that hears it concludes the
+kernel predates the interface and has no fallback for the platform. What this
+kernel actually is, for both calls, is a filesystem whose filesystems have no
+export operations - and Linux has a word for exactly that, which callers
+already know how to handle: `EOPNOTSUPP`. Measured on a current host (Linux
+7.2.14, `build/scratch/nhandle/{p,q,r,t,u,v,w}.c`), on `/proc/self/stat`, whose
+filesystem is one of those:
+
+```
+plain call                                = EOPNOTSUPP(95)
+null handle / null mount_id / ptr = 1     = EOPNOTSUPP(95)   <- no write, no check
+flags 0x100 (AT_SYMLINK_NOFOLLOW)         = EINVAL(22)
+flags 0x800 (AT_NO_AUTOMOUNT)             = EINVAL(22)
+flags 0x200 / 0x400 / 0x1000              = 0 / EOPNOTSUPP / EOPNOTSUPP
+bad dirfd, relative name, flags 0         = EBADF(9)
+bad dirfd, relative name, flags 0x100     = EINVAL(22)       <- flags first
+bad dirfd, absolute name                  = EOPNOTSUPP(95)   <- name first
+null path                                 = EFAULT(14)
+missing path                              = ENOENT(2)
+missing path with a null handle            = ENOENT(2)       <- name first
+open_by_handle_at, handle_bytes 0          = EINVAL(22)
+open_by_handle_at, handle_bytes 8, no cap  = EPERM(1)
+```
+
+and, on `tmpfs`, which *does* export, the same calls answer `0` with a 12-byte
+handle, `EOVERFLOW(75)` with the needed size written back for every short
+buffer, and `EFAULT` for the three bad pointers `procfs` ignored. The contrast
+is the whole finding: **the pointer and buffer questions belong to a filesystem
+that can answer them**, and a filesystem that cannot is not allowed to borrow
+their errno.
+
+### What the door does now
+
+```
+name_to_handle_at(dirfd, path, handle, mount_id, flags):
+    flags & !(0x200 | 0x400 | 0x1000)     -> EINVAL
+    the name (dirfd, pointer, existence)  -> EBADF / EFAULT / ENOENT
+    otherwise                             -> EOPNOTSUPP
+```
+
+Neither `handle` nor `mount_id` is read or written: an answer of
+`EOPNOTSUPP` promises nothing was placed there, and validating the destination
+would be a check with no write behind it - the `EFAULT` Linux gives only where
+it is about to fill the buffer in. The `0x200` bit is `AT_HANDLE_FID`, and it
+reads the same in this call and in `AT_REMOVEDIR` in the family that removes
+things: the flag word is a vocabulary per call, not a shared mask, which is why
+it is a verdict of its own (`abi::name_to_handle_at_flags_verdict`).
+
+```
+open_by_handle_at(mount_fd, handle, flags):
+    handle_bytes == 0         -> EINVAL        (before the privilege)
+    !CAP_DAC_READ_SEARCH      -> EPERM
+    mount_fd not open         -> EBADF
+    otherwise                 -> EOPNOTSUPP
+```
+
+The capability is the honest discriminator here, and the pin uses it as one:
+it reads `CapEff` out of `/proc/self/status` and computes which refusal it
+should meet, so the same program says `EPERM` on a host that runs it
+unprivileged and `EOPNOTSUPP` in this kernel's guest, where the payload is
+root. The second is the case that cannot be measured on a development host at
+all - a user namespace holding the whole set is still refused, because the
+check is against the initial namespace - so it is decided by reasoning and
+fixed by the pin rather than observed.
+
+### Two divergences this records
+
+* **`AT_HANDLE_FID` succeeds on Linux and `EOPNOTSUPP`s here.** Linux builds a
+  fid for that flag on *any* inode, export operations or not (`procfs` measured
+  `0`), because the fid is deliberately non-decodable: it exists to be handed
+  to `fanotify`, which this kernel does not have. Building one is a feature,
+  not a field; it is a named gap.
+* **With the capability, Linux answers `ESTALE(116)`** for a handle its
+  filesystem cannot decode. This kernel answers `EOPNOTSUPP`, because the
+  decode path is unreachable here - there is no handle in existence to decode -
+  and `ESTALE` would claim a staleness this kernel never observed. The pin
+  fixes that answer so a later implementation has to change it on purpose.
+
+### The pin
+
+`user/tests/src/bin/t-handle-at.rs`, 18 claims: the served-call answer, the
+three-bit vocabulary with its two refusals, the flag-before-descriptor witness
+(`(999, relative, 0x100) = EINVAL`), the name-before-descriptor witness
+(absolute name through `999`), the null-pointer-is-not-an-error pair that makes
+the `tmpfs`/`procfs` distinction visible, `handle_bytes == 0`, the
+capability-decided answer, and a claim that neither door answers `ENOSYS`.
+
+Host 18/18 and machine 18/18. Counterfactually, with the six syscall-layer
+files stashed: **17 of 18 red**, every one of them reading `ENOSYS(38)`. The
+single green is `flag 0x200 is part of the vocabulary`, whose claim is "not
+`EINVAL`" - and `ENOSYS` is not `EINVAL`, so it holds on both kernels. That is
+the honest boundary of a vocabulary claim: it pins that the bit is *known*,
+not that the door exists.
+
+### The gate caught one thing the compiler did not
+
+The measured table at the top of this section first sat in
+`name_to_handle_at_flags_verdict`'s doc comment inside a bare fenced block, and
+`cargo test -p mpos --doc` compiles every bare fence as Rust: `0 = 0` is not an
+item, so the gate went red on a doctest while both machines were green
+(`build/gate-handleat.log`). A table that is a *measurement* is fenced `text`;
+the gate's doctest stage is the reader that notices, and only on a bare fence.
+
+### The rule
+
+`ENOSYS` and `EOPNOTSUPP` are different claims about the world, and the one a
+caller can act on is the second. A kernel that cannot do a thing but knows the
+shape of the thing owes the caller the refusal that names *what* is missing -
+here, a filesystem with no handles - rather than the refusal that says the
+kernel has never heard of the question.

@@ -11149,3 +11149,39 @@ witnesses.
 
 **Named gaps:** every recognised advice is accepted and does nothing (nothing is cached evictably,
 nothing is read lazily). Notes: `§6.139`.
+
+### Item 254 `name_to_handle_at`/`open_by_handle_at` - the refusal a filesystem without handles owes
+
+**Before:** both numbers were undispached, so both doors answered `ENOSYS(38)` - which tells a
+caller the kernel predates the interface instead of that this filesystem cannot name handles.
+
+**Linux, on a filesystem without export operations** (7.2.14, `build/scratch/nhandle/`): a served
+call is `EOPNOTSUPP(95)` for every buffer size, and the output pointers are never looked at (null
+`handle`, null `mount_id`, and `(handle = 1)` all answer `95`); the flag word is judged before the
+descriptor (`(999, relative name, 0x100) = EINVAL`, where `flags = 0` is `EBADF`); the name is
+judged before everything else (`missing path + null handle = ENOENT`). `open_by_handle_at` judges
+the handle's `handle_bytes` first (`0` is `EINVAL`), then needs `CAP_DAC_READ_SEARCH` (`EPERM`
+without it), then the mount descriptor.
+
+| call | Linux | this kernel, before | now |
+|---|---|---|---|
+| `name_to_handle_at`, valid | `95` on a non-exporting fs | `38` | `95` |
+| `name_to_handle_at`, flags `0x100`/`0x800` | `22` | `38` | `22` |
+| `name_to_handle_at`, bad dirfd, relative name | `9` (flags first: `22`) | `38` | `9` and `22` in that order |
+| `name_to_handle_at`, null name / missing name | `14` / `2` | `38` | `14` / `2` |
+| `name_to_handle_at`, null handle | `95` (no write, no check) | `38` | `95` |
+| `open_by_handle_at`, `handle_bytes = 0` | `22` | `38` | `22` |
+| `open_by_handle_at`, shaped handle | `1` without the capability | `38` | `1` / `95` by capability |
+
+**Landed:** `src/syscall/linux/nr_x86_64.rs` (`NAME_TO_HANDLE_AT = 303`, `OPEN_BY_HANDLE_AT = 304`),
+`nr_aarch64.rs` (`264`/`265`), `nr.rs`'s assertion table; `abi::name_to_handle_at_flags_verdict`
+(0x200 is `AT_HANDLE_FID` here and `AT_REMOVEDIR` elsewhere - a per-call vocabulary, not a shared
+mask); `fs::handle_name_to_handle_at` and `fs::handle_open_by_handle_at`; the dispatch arms.
+
+**Pin:** `user/tests/src/bin/t-handle-at.rs`, 18 claims, host and machine 18/18, counterfactual
+17/18 red (all `ENOSYS`).
+
+**Named gaps:** `AT_HANDLE_FID` builds a fid on Linux for any inode and is `EOPNOTSUPP` here (it
+is for `fanotify`, which this kernel does not have); with the capability Linux answers `ESTALE(116)`
+for an undecodable handle where this kernel answers `EOPNOTSUPP` (there is no handle here to be
+stale). §6.140.

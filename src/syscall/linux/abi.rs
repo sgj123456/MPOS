@@ -4284,6 +4284,36 @@ pub(crate) fn fadvise_range_verdict(offset: i64, len: i64) -> Result<(), isize> 
     }
     Ok(())
 }
+/// The flag word `name_to_handle_at(2)` accepts.
+///
+/// Measured on a current host (Linux 7.2.14, `build/scratch/nhandle/v.c`),
+/// one bit at a time through a descriptor nothing is open on - so the flag
+/// question is answered before the descriptor ever is:
+///
+/// ```text
+/// 0                  = 0
+/// AT_SYMLINK_FOLLOW  = 0      (0x400)
+/// AT_HANDLE_FID      = 0      (0x200)
+/// AT_EMPTY_PATH      = 0      (0x1000)
+/// AT_SYMLINK_NOFOLLOW= EINVAL (0x100)
+/// AT_NO_AUTOMOUNT    = EINVAL (0x800)
+/// ```
+///
+/// `0x200` is the one to read twice: it is `AT_REMOVEDIR` in the family that
+/// removes things, and `AT_HANDLE_FID` here - the flag that asks for a
+/// non-decodable fid. The two calls read the same bit through different
+/// vocabularies, which is why this is a verdict of its own rather than a use
+/// of a shared `AT_*` mask.
+pub(crate) fn name_to_handle_at_flags_verdict(flags: usize) -> Result<(), isize> {
+    const AT_HANDLE_FID: u32 = 0x200;
+    const AT_SYMLINK_FOLLOW: u32 = 0x400;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const ACCEPTED: u32 = AT_HANDLE_FID | AT_SYMLINK_FOLLOW | AT_EMPTY_PATH;
+    if flags as u32 & !ACCEPTED != 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
 
 /// `fadvise64(2)`'s `advice` is a 32-bit `int` with a closed vocabulary of six.
 ///
@@ -7641,6 +7671,27 @@ mod diskstat_tests {
         assert_eq!(fadvise_range_verdict(-1, 0), Err(err::EINVAL));
         assert_eq!(fadvise_range_verdict(0, -1), Err(err::EINVAL));
         assert_eq!(fadvise_range_verdict(-4096, 4096), Err(err::EINVAL));
+    }
+
+    #[test]
+    fn name_to_handle_at_takes_three_bits_and_refuses_the_rest() {
+        for accepted in [0, 0x200, 0x400, 0x1000, 0x600, 0x1400, 0x1600] {
+            assert_eq!(
+                name_to_handle_at_flags_verdict(accepted),
+                Ok(()),
+                "{accepted:#x}"
+            );
+        }
+        // The `int` Linux reads is the low half of the register, so the top
+        // half is not a refusal: `0x1_0000_0000` is the flag word 0.
+        assert_eq!(name_to_handle_at_flags_verdict(0x1_0000_0000), Ok(()));
+        for refused in [0x100, 0x800, 0x2000, 0xffff_ffff, 0x1_0000_0100] {
+            assert_eq!(
+                name_to_handle_at_flags_verdict(refused),
+                Err(err::EINVAL),
+                "{refused:#x}"
+            );
+        }
     }
 
     /// `sync_file_range`'s flag word is three bits wide: 1, 2 and 4 are the

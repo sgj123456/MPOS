@@ -493,6 +493,8 @@ mod tests {
         assert_eq!(CLOCK_SETTIME, 227);
         assert_eq!(UNSHARE, 272);
         assert_eq!(SETNS, 308);
+        assert_eq!(NAME_TO_HANDLE_AT, 303);
+        assert_eq!(OPEN_BY_HANDLE_AT, 304);
         assert_eq!(SECCOMP, 317);
         // The socket trio.
         assert_eq!(ACCEPT4, 288);

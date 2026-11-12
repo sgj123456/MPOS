@@ -292,7 +292,20 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-12, `fadvise64`'s order §6.139):** stage 1 `1282 tests, 0 failed`
+**Latest measured gate (2026-11-12, the handle pair's refusal §6.140):** stage 1 `1283 tests, 0 failed`
+(72.22 s - the +1 is `name_to_handle_at_takes_three_bits_and_refuses_the_rest`); x86_64
+`pass=302 fail=0 (302 built)`, `mpos-kunit 35 passed, 0 failed` (52.66 s over 2 lane(s), total
+`72.57 s`, `+0.6%`); aarch64 `pass=301 fail=0 (301 built)`, kunit 35/0 (134.95 s, total `229.93 s`,
+`+0.8%`) - `GATE EXIT=0`, both arms in one command with the lane count forced. `t-handle-at`
+`=== PASS` on both arms (`build/test-lane-x86_64-0/serial.log`, `build/test-lane-aarch64-1/serial.log`);
+counterfactually, with the six syscall-layer files stashed, 17 of its 18 claims read `ENOSYS(38)`
+(`build/boot-handleat-cf1.log`), and the one that stayed green is a "not `EINVAL`" vocabulary claim.
+The first run of this gate went red on the **doctest** stage (`build/gate-handleat.log`): a measured
+table in a doc comment was fenced without a language, so rustdoc compiled `0 = 0` as Rust - the
+fence is `text` now, and both machines were green in that same run, which is why the doctest stage
+is the one that had to say so.
+
+**Measured gate before it (2026-11-12, `fadvise64`'s order §6.139):** stage 1 `1282 tests, 0 failed`
 (71.79 s - the +1 is `fadvise_has_six_advices_and_a_signed_range_that_may_wrap`); x86_64
 `pass=301 fail=0 (301 built)`, `mpos-kunit 35 passed, 0 failed` (52.91 s over 2 lane(s), total
 `72.16 s`, `+1.5%`); aarch64 `pass=300 fail=0 (300 built)`, kunit 35/0 (138.82 s, total `232.84 s`,

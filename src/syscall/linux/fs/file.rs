@@ -8262,6 +8262,106 @@ pub fn handle_sync_file_range(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
+/// `name_to_handle_at(dirfd, path, handle, mount_id, flags)` — the path-to-handle
+/// half of the pair Linux's backup tools use to survive a rename.
+///
+/// No filesystem here can name an object by a handle: this kernel issues none
+/// and keeps no decode table, so the honest answer for a served call is
+/// `EOPNOTSUPP` — and that is exactly what Linux answers on a filesystem
+/// without export operations. Measured on a current host (Linux 7.2.14,
+/// `build/scratch/nhandle/{p,q,r,t,u,v}.c`):
+///
+/// * `procfs`, which has none, answers `EOPNOTSUPP(95)` for **every** buffer
+///   size (0, 1 and 128 bytes measured) and leaves the caller's `handle_bytes`
+///   exactly as it sent it, where `tmpfs`, which does export, answers
+///   `EOVERFLOW(75)` and writes back the size it needs. The size question is
+///   only reachable on a filesystem that can answer it, so this door never
+///   asks it — it must not invent an `EOVERFLOW` for a size it has none of;
+/// * the flag word is judged before the descriptor: `0x100` and `0x800` are
+///   `EINVAL` even through a `dirfd` nothing is open on (`999, flags=0x100`
+///   measured `22`, not `9`);
+/// * then the name: `EBADF` for a bad `dirfd`, `EFAULT` for a null or
+///   unreadable one, `ENOENT` for a name nothing answers to;
+/// * and then the refusal, **before either output pointer is looked at**: on
+///   `procfs` a null `handle`, a null `mount_id` and a pointer at `1` all
+///   answer `EOPNOTSUPP`, where on `tmpfs` the same three are `EFAULT`. A
+///   filesystem that has no handle to give never writes one, so it never
+///   validates the place the caller wanted it put - the pointer is only a
+///   question for a filesystem that can answer it. (The name still comes
+///   first: `/no/such` with a null `handle` is `ENOENT`, not `EOPNOTSUPP`.)
+///
+/// `ENOSYS` was the wrong answer here, and worse than useless: it tells a
+/// backup tool that the kernel predates the call, where `EOPNOTSUPP` tells it
+/// the truth the tool already knows how to handle — this filesystem cannot
+/// name handles, so fall back to walking paths. The two answers lead the same
+/// caller down different roads.
+pub fn handle_name_to_handle_at(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (dirfd, path_ptr, handle, mount_id, flags) =
+        (args[0] as i32, args[1], args[2], args[3], args[4]);
+    if let Err(e) = abi::name_to_handle_at_flags_verdict(flags) {
+        return e;
+    }
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let cwd = crate::sched::current_cwd();
+    let base = match base_for(dirfd, &path, &cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    if let Err(e) = crate::vfs::resolve_opt(&path, Some(base)) {
+        return err_of(e);
+    }
+    // Neither output pointer is touched: a filesystem with no handle to give
+    // does not validate where one would go (measured - a null `handle`, a null
+    // `mount_id` and `(handle = 1)` all answer `EOPNOTSUPP` on `procfs`, and
+    // all three are `EFAULT` on `tmpfs`, where the write is about to happen).
+    let _ = (handle, mount_id);
+    err::EOPNOTSUPP
+}
+
+/// `open_by_handle_at(mount_fd, handle, flags)` — the other half, and the one
+/// that cannot be served at all: a handle is a thing this kernel never issues,
+/// so there is nothing a caller could have been handed to open.
+///
+/// The order before that answer is Linux's, measured on a current host
+/// (Linux 7.2.14, `build/scratch/nhandle/{p,q,s}.c`):
+///
+/// * a handle whose `handle_bytes` is 0 is `EINVAL`, before the privilege and
+///   before the mount descriptor;
+/// * then the privilege: `CAP_DAC_READ_SEARCH` is the capability that opens by
+///   handle, and without it every shape answers `EPERM(1)` — measured for a
+///   valid tmpfs handle and for two fabricated ones, and a root inside a user
+///   namespace is refused as well, so the check is against the initial
+///   namespace rather than the caller's;
+/// * then the mount descriptor: `EBADF` for one nothing is open on.
+///
+/// With the capability, Linux's answer for a handle its filesystem cannot
+/// decode is `ESTALE(116)`; this kernel answers `EOPNOTSUPP`. That divergence
+/// is deliberate and recorded (`docs/notes/` §6.140): the decode path is
+/// unreachable here because no handle exists to decode, and `ESTALE` would
+/// claim a staleness this kernel never observed.
+pub fn handle_open_by_handle_at(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (mount_fd, handle) = (args[0] as i32, args[1]);
+    if handle == 0 || !buffer_ok(handle, 4, false, from_user) {
+        return err::EFAULT;
+    }
+    // The caller's own `handle_bytes`: Linux reads it before it asks anything
+    // else, including the capability.
+    let bytes = unsafe { (handle as *const u32).read_unaligned() };
+    if bytes == 0 {
+        return err::EINVAL;
+    }
+    if !crate::sched::current_credentials().capable(crate::cred::CAP_DAC_READ_SEARCH) {
+        return err::EPERM;
+    }
+    if let Err(e) = crate::sched::current_fds().clone_at(mount_fd) {
+        return err_of(e);
+    }
+    err::EOPNOTSUPP
+}
+
 /// `syncfs(fd)` — flush the filesystem one descriptor belongs to. Every
 /// write here already reached its storage — ramfs and ext2 write through —
 /// so the flush is empty; the call still owes the descriptor check.

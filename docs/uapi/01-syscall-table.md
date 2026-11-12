@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **256** x86_64
-syscall numbers, `nr_aarch64.rs` the same **256** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **301** x86_64
+syscall numbers, `nr_aarch64.rs` the same **301** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **256** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
+explicit arm for **293** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
 
@@ -274,6 +274,8 @@ A call absent from those is served as its phase section records.
 | `pwritev` | 296 | fs | 70 |
 | `recvmmsg` | 299 | net | 243 |
 | `prlimit64` | 302 | abi | 261 |
+| `name_to_handle_at` | 303 | fs | 254 |
+| `open_by_handle_at` | 304 | fs | 254 |
 | `syncfs` | 306 | fs | 267 |
 | `sendmmsg` | 307 | net | 269 |
 | `setns` | 308 | posix | 268 |
