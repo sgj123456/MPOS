@@ -176,6 +176,7 @@ pub fn run(
     check_target_gates()?;
     check_boot_openings()?;
     check_syscall_inventory()?;
+    check_fuzz_targets_declared()?;
 
     // Stage 1 starts here and is *joined* at the first arm's report. The two
     // share no file - the host suite writes cargo's `target/`, the sweeps
@@ -525,6 +526,33 @@ fn check_syscall_inventory() -> Result<()> {
     );
 }
 
+/// The fourth structural check, and the same species again: a file that looks
+/// like a fuzz target and compiles never. A target is a `[[bin]]` - cargo
+/// builds targets, not files - so a `fuzz_targets/foo.rs` with no block beside
+/// it is coverage that does not exist, and the converse (a `[[bin]]` whose
+/// `path` names nothing) stops the whole workspace building with a message
+/// about a path rather than a shape.
+///
+/// Cheap by construction - two directory walks and one TOML scan - so it runs
+/// beside the sweeps. The build-and-run half is [`run_fuzz_workspace`], which
+/// spawns cargo and therefore lives with the other stage-1 invocations.
+fn check_fuzz_targets_declared() -> Result<()> {
+    println!("Target gates: every fuzz target file has a `[[bin]]` block");
+    let drift = crate::gates::fuzz_targets_declared(&utils::project_root()?)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if drift.is_empty() {
+        return Ok(());
+    }
+    for item in &drift {
+        eprintln!("  {}", item.what);
+    }
+    bail!(
+        "{} fuzz target(s) declared and on disk disagree; a file no `[[bin]]` names is \
+         compiled by nothing (AGENTS.md §3 rule 2)",
+        drift.len()
+    );
+}
+
 /// The arch-independent kernel, tested on the host. `--target` is explicit
 /// because the root `.cargo/config.toml` defaults every cargo command to the
 /// bare-metal target, and the host tests are the opposite of that.
@@ -633,6 +661,25 @@ fn run_unit_tests() -> Result<String> {
     .current_dir(&root);
     text.push_str(&run_captured(&mut cmd, "the host user suite's build")?);
 
+    // The fuzz workspace: its own workspace, so no stage of this gate has ever
+    // built it, and on 2026-11-12 eight of its twenty-two targets had been
+    // broken for a month without one red lane (`docs/notes/` §1.4's lesson in
+    // its own shape, §3.29 for what running it then found).
+    //
+    // Two things are asked, because they are different claims and only the
+    // second one costs anything: every declared target **builds**, and every
+    // built target **survives its corpus**. The second is what found the ext4
+    // defect - compiling had been the whole of what anyone checked, and the
+    // first four hundred runs of a repaired target panicked.
+    //
+    // Instrumented (sancov) because the cost is the same 13 s as a plain build
+    // and an uninstrumented libFuzzer run answers `exec/s: 0` with "no
+    // interesting inputs" - a smoke test wearing a fuzz run's clothes. Corpus
+    // directories are copied into `build/` first: libFuzzer appends to whatever
+    // corpus it is given, and the repo's seeds are inputs, not scratch space.
+    text.push_str("Build and run: the fuzz workspace (host)\n");
+    text.push_str(&run_fuzz_workspace(&root)?);
+
     text.push_str("Unit tests: xtask\n");
     let mut cmd = Command::new("cargo");
     cmd.args([
@@ -646,6 +693,132 @@ fn run_unit_tests() -> Result<String> {
     text.push_str(&run_captured(&mut cmd, "xtask's unit tests")?);
 
     Ok(text)
+}
+
+/// The one fuzz-workspace invocation, in the same shape as the host suite: it
+/// is stage 1's, it is captured, and it refuses a non-zero exit.
+///
+/// `fuzz/` declares `[workspace]` of its own - the kernel's
+/// `[build] target = x86_64-unknown-none` cannot link a libFuzzer binary - so
+/// every command here passes `--target` and a `CARGO_TARGET_DIR` under
+/// `build/`, which is also what keeps its artefacts out of the kernel's.
+fn run_fuzz_workspace(root: &Path) -> Result<String> {
+    const SANCOV: &str = "-Cpasses=sancov-module \
+        -Cllvm-args=-sanitizer-coverage-level=4 \
+        -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+        -Cllvm-args=-sanitizer-coverage-pc-table \
+        -Cllvm-args=-sanitizer-coverage-trace-compares \
+        -Cdebug-assertions=on";
+
+    let fuzz = root.join("fuzz");
+    let target_dir = root.join("build").join("fuzz-target");
+    let scratch = root.join("build").join("fuzz-run");
+
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--bins", "--target", "x86_64-unknown-linux-gnu"])
+        .current_dir(&fuzz)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTFLAGS", SANCOV);
+    let mut text = run_captured(&mut cmd, "the fuzz workspace's build")?;
+
+    // Where cargo put them. The triple level is cargo's own; the `debug/`
+    // directly under `CARGO_TARGET_DIR` holds only bookkeeping.
+    let bin_dir = target_dir.join("x86_64-unknown-linux-gnu").join("debug");
+
+    // One entry per declared target, read from the manifest rather than from
+    // the directory, so a target that failed to produce a binary is a failure
+    // here instead of a name that quietly never ran.
+    let manifest = fs::read_to_string(fuzz.join("Cargo.toml")).context("fuzz/Cargo.toml")?;
+    let mut names: Vec<String> = Vec::new();
+    for line in manifest.lines() {
+        let Some(rest) = line.trim().strip_prefix("path = \"fuzz_targets/") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(".rs\"") else {
+            continue;
+        };
+        names.push(name.to_string());
+    }
+    names.sort();
+
+    // The runs happen in `build/`, so a `crash-<hash>` or a grown corpus
+    // lands there rather than in the tree the next person reviews.
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).with_context(|| format!("{}", scratch.display()))?;
+
+    let runs_dir = scratch.join("run");
+    fs::create_dir_all(&runs_dir).with_context(|| format!("{}", runs_dir.display()))?;
+
+    let mut seeded = 0usize;
+    let mut smoke = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for name in &names {
+        let binary = bin_dir.join(name);
+        if !binary.is_file() {
+            failed.push(format!("{name}: the build produced no binary"));
+            continue;
+        }
+        let seeds = fuzz.join("seeds").join(name);
+        // A seeded target gets its corpus executed; the rest get a short bare
+        // run, which reaches the empty and smallest inputs only. The two are
+        // counted apart in the log because they are different claims, and a
+        // count that mixed them would read as more coverage than there is.
+        let (args, kind) = if seeds.is_dir() {
+            let corpus = scratch.join("corpus").join(name);
+            let _ = fs::remove_dir_all(&corpus);
+            copy_dir(&seeds, &corpus)
+                .with_context(|| format!("copying {} into build/", seeds.display()))?;
+            seeded += 1;
+            (
+                vec!["-runs=0".to_string(), corpus.display().to_string()],
+                "corpus",
+            )
+        } else {
+            smoke += 1;
+            (vec!["-runs=200".to_string()], "smoke")
+        };
+        let mut cmd = Command::new(&binary);
+        cmd.args(&args).current_dir(&runs_dir);
+        if let Err(e) = run_captured(&mut cmd, &format!("fuzz target {name} ({kind})")) {
+            failed.push(format!("{name}: {e}"));
+        }
+    }
+
+    text.push_str(&format!(
+        "fuzz workspace: {} target(s) built; {seeded} corpus run(s), {smoke} smoke run(s)\n",
+        names.len()
+    ));
+    if !failed.is_empty() {
+        for f in &failed {
+            text.push_str(&format!("  {f}\n"));
+        }
+        bail!(
+            "{} of {} fuzz target(s) did not build or did not survive their input; a target \
+             that cannot run is coverage the gate does not have (AGENTS.md §3 rule 2, \
+             `docs/notes/` §3.29)",
+            failed.len(),
+            names.len()
+        );
+    }
+    Ok(text)
+}
+
+/// A small recursive copy, for the seed corpora. `std` has no one-call version
+/// and the trees are two or three files deep at most.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("{}", to.display()))?;
+    for entry in fs::read_dir(from).with_context(|| format!("{}", from.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &dest)?;
+        } else {
+            fs::copy(&path, &dest)
+                .with_context(|| format!("{} -> {}", path.display(), dest.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run `cmd` to completion, keeping its output for the caller to print when it

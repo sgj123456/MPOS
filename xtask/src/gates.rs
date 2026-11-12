@@ -603,6 +603,73 @@ mod tests {
         assert!(!said.iter().any(|w| w.contains("`read`")), "{said:?}");
         assert_eq!(drift.len(), 2, "exactly the two defects: {said:?}");
     }
+
+    /// A fuzz workspace where one target file is undeclared and one declaration
+    /// names a file that is not there.
+    fn scratch_fuzz_tree(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mpos-xtask-fuzz-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("fuzz/fuzz_targets")).unwrap();
+        fs::write(
+            dir.join("fuzz/Cargo.toml"),
+            "[workspace]\n\n\
+             [[bin]]\nname = \"built\"\npath = \"fuzz_targets/built.rs\"\n\n\
+             [[bin]]\nname = \"ghost\"\npath = \"fuzz_targets/ghost.rs\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("fuzz/fuzz_targets/built.rs"), "fn main() {}\n").unwrap();
+        // Declared and present: the pair that must not be reported.
+        // Neither declared nor present-but-shared: `support` is a module.
+        fs::write(dir.join("fuzz/fuzz_targets/support.rs"), "pub fn f() {}\n").unwrap();
+        // Present and undeclared: the defect this check exists for.
+        fs::write(dir.join("fuzz/fuzz_targets/forgotten.rs"), "fn main() {}\n").unwrap();
+        dir
+    }
+
+    /// Both directions, and neither of the two shapes that are legitimate: a
+    /// check that cannot tell a declared target from a stray file agrees with
+    /// itself and pins nothing (this file's header, and 06805ae's lesson).
+    #[test]
+    fn a_fuzz_target_is_reported_when_it_is_not_declared_and_when_it_is_missing() {
+        let dir = scratch_fuzz_tree("both");
+        let drift = fuzz_targets_declared(&dir).unwrap();
+        let said: Vec<&str> = drift.iter().map(|d| d.what.as_str()).collect();
+        assert!(
+            said.iter()
+                .any(|w| w.contains("forgotten.rs") && w.contains("no `[[bin]]")),
+            "an undeclared target file must be reported: {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|w| w.contains("ghost") && w.contains("does not exist")),
+            "a declaration naming no file must be reported: {said:?}"
+        );
+        // `support` is a module and `built` is a correct pair: neither is drift.
+        // (`built` is checked as a path, not as a word: the finding for the
+        // undeclared file ends "so it is never built", which contains it.)
+        assert!(!said.iter().any(|w| w.contains("support")), "{said:?}");
+        assert!(
+            !said.iter().any(|w| w.contains("fuzz_targets/built.rs")),
+            "{said:?}"
+        );
+        assert_eq!(drift.len(), 2, "exactly the two defects: {said:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The real tree's fuzz workspace declares every target it holds.
+    #[test]
+    fn every_fuzz_target_is_declared() {
+        let root = crate::utils::project_root().expect("the workspace root");
+        let drift = fuzz_targets_declared(&root).expect("the fuzz manifest read");
+        assert!(
+            drift.is_empty(),
+            "the fuzz workspace and its manifest disagree: {drift:#?}\n\
+             A `fuzz_targets/*.rs` with no `[[bin]]` is a file cargo never builds \
+             - it reads as coverage and is none (AGENTS.md §5's 'a new test \
+             program silently never built', in its fuzz shape)."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +767,98 @@ pub fn syscall_inventory(root: &Path) -> Result<Vec<InventoryDrift>, String> {
             section: "1.0",
             what: format!("`{row}` has a §1.0 row but no dispatch arm"),
         });
+    }
+    drift.sort_by(|a, b| a.what.cmp(&b.what));
+    Ok(drift)
+}
+
+// ---------------------------------------------------------------------------
+// The fuzz workspace's own bookkeeping
+// ---------------------------------------------------------------------------
+
+/// One way the fuzz workspace and its manifest disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuzzDrift {
+    /// What is wrong, in the words the gate prints.
+    pub what: String,
+}
+
+/// The module `fuzz/fuzz_targets/` holds that is not a fuzzing target: the
+/// harness the targets `mod support;` for the in-memory disk and the byte
+/// readers. It has no `[[bin]]` because it is not a program.
+const FUZZ_SHARED_MODULE: &str = "support";
+
+/// Every file in `fuzz/fuzz_targets/` but the shared module must be declared as
+/// a `[[bin]]`, and every declared `[[bin]]` must name a file that exists.
+///
+/// This is `AGENTS.md` §5's trap in its fuzz shape: "a new test program
+/// silently never built". A fuzz target is a `[[bin]]` — cargo builds targets,
+/// not files — so a `fuzz_targets/foo.rs` with no `[[bin]]` block is a file
+/// that looks like coverage, compiles never, and is invisible to every check
+/// that asks cargo what it built. The converse is the same defect from the
+/// other side: a `[[bin]]` whose `path` names nothing stops the whole
+/// workspace building, and the message a reader gets names the path rather
+/// than the shape.
+///
+/// Cheap by construction — two directory walks and a line scan of one TOML —
+/// so it runs beside the sweeps rather than on request. The build half (do the
+/// declared targets *compile*) cannot be this function: it spawns cargo, and
+/// lives in `selftest` with the other invocations.
+pub fn fuzz_targets_declared(root: &Path) -> Result<Vec<FuzzDrift>, String> {
+    let dir = root.join("fuzz");
+    let manifest = dir.join("Cargo.toml");
+    let toml = fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+
+    // The declared targets, from their `path = "fuzz_targets/<name>.rs"` lines
+    // rather than from `name = ...`: the path is what cargo actually builds,
+    // and a block whose two halves disagree is itself a defect this should see.
+    let mut declared: Vec<String> = Vec::new();
+    for line in toml.lines() {
+        let Some(rest) = line.trim().strip_prefix("path = \"fuzz_targets/") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(".rs\"") else {
+            continue;
+        };
+        declared.push(name.to_string());
+    }
+
+    let entries = fs::read_dir(dir.join("fuzz_targets"))
+        .map_err(|e| format!("{}: {e}", dir.join("fuzz_targets").display()))?;
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("a fuzz_targets entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem != FUZZ_SHARED_MODULE {
+            files.push(stem.to_string());
+        }
+    }
+
+    let declared_set: HashSet<&String> = declared.iter().collect();
+    let file_set: HashSet<&String> = files.iter().collect();
+
+    let mut drift = Vec::new();
+    for file in &file_set {
+        if !declared_set.contains(file) {
+            drift.push(FuzzDrift {
+                what: format!("fuzz_targets/{file}.rs has no `[[bin]]`, so it is never built"),
+            });
+        }
+    }
+    for name in &declared_set {
+        if !file_set.contains(name) {
+            drift.push(FuzzDrift {
+                what: format!(
+                    "`[[bin]] {name}` names fuzz_targets/{name}.rs, which does not exist"
+                ),
+            });
+        }
     }
     drift.sort_by(|a, b| a.what.cmp(&b.what));
     Ok(drift)
