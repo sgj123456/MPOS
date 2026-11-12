@@ -908,9 +908,28 @@ Why the frame is the blocker, per machine - both read from the code:
   needed, and the hardware saved none of them; the ABI relies on the handler preserving the
   registers it happens to use, which leaves no memory image to rewrite.
 - **aarch64**: the IRQ stubs save `x0..x18`, `x29` and `x30` - "exactly the registers a Rust callee
-  may clobber" (`arch/src/arch/aarch64/vectors.rs:16-19`) - and `x19..x28` are callee-saved, so the
-  handler restores them itself. The interrupted image on the stack is therefore not complete there
+  may clobber" (`arch/src/arch/aarch64/vectors.rs:16-19`) - and `x19..x28` are callee-saved, so
+  `irq` restores them itself. The interrupted image on the stack is therefore not complete there
   either.
+
+  **Re-read and corrected 2026-11-12**, because the sentence above was *reasoning from the call
+  rule* rather than from the stub, and the stub does not quite bear it out - the difference matters
+  to anyone doing the work. The EL0 IRQ entry (`__vec_el0_irq`) allocates `736` bytes and stores
+  `x0..x18`, `x29`, `x30` **and the 528-byte FP half** (`q0..q31`, `FPCR`, `FPSR`) - the same shape
+  the EL0 *sync* stub uses, and the sync stub already carries all thirty-one integer registers. So
+  the EL0 interrupt path is much closer to a complete image than "the callee-saved set is the
+  handler's problem" suggests: what is missing from it is exactly **`x19..x28`**, ten registers, and
+  the FP state is already there (`TRAP_FPU_OFFSET`, 176).
+
+  Two consequences for the plan, both from reading rather than from a boot:
+  * the aarch64 half is *smaller* than the x86_64 half - draw the frame with ten more `stp` pairs
+    and it is complete, where x86_64 needs a naked stub replacing an `extern "x86-interrupt"` one;
+  * `docs/notes/` previously implied `irq`'s own preservation covered it. It does not cover the
+    *interrupted program's* `x19..x28`: `irq` preserves them across its own Rust call, which
+    restores whatever the handler left, not what the program had. A frame built from this stack
+    image would restore the handler's values into the program's callee-saved registers - a subtler
+    corruption than a missing image, and the reason the ten registers have to be *stored at trap
+    time* rather than reconstructed later.
 
 **The instrument now exists, and its first version was wrong.** The reading above claims the probe
 was "staged as `t-iret`", and it was not: no such program was in the tree, so
@@ -949,6 +968,23 @@ the syscall gate already uses), aarch64 saving `x19..x28` as well - and then a d
 installs the frame on *that* image, obeying the restart and `sigcontext` rules `deliver_signal`
 already encodes. That is a change to both machines' trap entry, not a field, which is why it is
 named here instead of approximated.
+
+**The seam the delivery path reuses already exists**, which is the part that makes this landable
+rather than a rewrite of the ABI: `capture_frame`/`apply_frame` (`src/syscall/linux/proc.rs:913`,
+`:923`) turn a machine frame into the ABI's 27-word register file and back through
+`hal::capture_user_regs`/`hal::restore_user_regs`, and they are what `PTRACE_*REGS` and the
+group-stop path already go through. A trap-side delivery is therefore "capture from the trap frame
+instead of the gate frame, then run the same `build_frame`" - the frame *builder* is shared; only
+the pointer handed to it is new. What is genuinely new is the x86_64 stub, because there is no
+frame to capture until the general-purpose registers are on the stack.
+
+**A delegated attempt at the x86_64 half failed 2026-11-12**, leaving neither a report nor a changed
+line, which is worth recording as a fact about the *size* of the step rather than about the delegate:
+the stub has to save a register file, enter the handler with a valid `gs` base and kernel stack, and
+return through a path that either `iret`s to a rewritten user image or resumes a kernel context -
+and a half-applied version of that is a machine that does not boot. The instrument above is what
+came out of that round instead, and it is the thing the next attempt needs most: a reproducible
+before/after. Nothing in that attempt is in the tree.
 
 **Who this is visible to.** A program that computes without entering the kernel - a tensor loop, a
 numeric solver, a spin-wait on a shared page - holds a `SIGINT`, `SIGALRM` or `SIGUSR1` until it
