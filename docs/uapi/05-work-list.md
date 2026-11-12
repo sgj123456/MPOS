@@ -11429,3 +11429,75 @@ pinned by `an_indirect_block_past_the_volume_reads_as_a_hole` (fails without the
 `seccomp_filter` (221 lines, 11 seeds) closes the one rule-2 debt the audit found:
 `seccomp::Program::parse` validates classic BPF from user bytes and had no fuzzer.
 Full gate green on both arms.
+
+### Item 261 A handled signal reaches a program that never calls - on aarch64
+
+§2.13 was the last named gap in the signal surface, and it was a *shape* problem rather than a
+missing call: the queue, the disposition and the frame builder were all correct and pinned (§2.12);
+what did not exist was a second door onto `build_frame` for a trap that is not a syscall.
+
+**What was wrong, in one sentence.** `deliver_signal` is called from the syscall gate's return
+because that is where the kernel had *built* a user register file - and the doc said so, "the syscall
+return path is the only place that has one". That sentence was true of the code and false of the
+machines: an interrupt taken from a program lands with every register the program was using already
+on the kernel stack, if the entry stub put them there.
+
+**Per machine, measured by reading both stubs.**
+
+| | EL0 trap frame before | verdict |
+|---|---|---|
+| aarch64 | `x0..x18`, `x29`, `x30`, the 528-byte FP half - **`x19..x28` missing** | cheap: ten `stp` pairs |
+| x86_64 | `extern "x86-interrupt"` gives `RIP`/`CS`/`RFLAGS`/`RSP`/`SS`; the GPRs sit below it, unnamed | needs a naked stub |
+
+So the machine whose interrupt ABI looks more primitive was the easy half, inverting the plan §2.13
+had carried since it was written.
+
+**What landed.**
+
+- `__vec_el0_irq` (`arch/src/arch/aarch64/vectors.rs`) builds the same 816-byte
+  `context::UserFrame` the EL0 sync stub builds, and hands it over with `mov x0, sp` / `bl {irq}`.
+  Ten `stp` pairs, 80 bytes; the three `TRAP_IRQ_*` constants are gone (`TRAP_FRAME_BYTES` serves
+  both EL0 entries now). The ten registers are stored **at trap time**, which is the whole point:
+  `irq` preserving them across its own Rust call keeps what the *handler* left, not what the program
+  had.
+- `extern "C" fn irq(frame: *mut ())` calls `hal::kernel::deliver_at_trap(frame)` inside `if ticked
+  {`, **before** the preempt - a delivery rewrites the frame, and a task switched away first resumes
+  into the frame without the handler in it. The kernel's IRQ stub passes `mov x0, #0`: it interrupted
+  the kernel, so there is no program context to build on.
+- `Gate::capture_trap_regs(frame, tls, out) -> bool` is the capability question, and it is not
+  `capture_user_regs` with a different argument: that op's `result` word is a write, and at a trap
+  there is no result - every register the frame names is live. aarch64 answers the whole frame;
+  **x86_64 answers `false`**, with the reason in the code.
+- `proc::build_frame` split into the capture (the caller's) and `build_frame_at` (one policy, two
+  doors, so they cannot drift). The trap door skips `restart_verdict` - an interrupt restarts
+  nothing - and leaves the result slot holding what the interrupted code had.
+
+**The bug the gate caught.** The first version took the machine down on every aarch64 lane before a
+single test program ran: `KERNEL PANIC: there is no task 255`. The boot's own EL0 check runs a ring-3
+program with **no task behind it**, so `current()` is `SCHED_ID` - reserved slot 255 - and the
+delivery's tracer guard asked the table about that slot. The fix is `sched::in_task()`
+(`STARTED && current() != SCHED_ID`), and the trap door answers `false` when it is not true. A trap
+path cannot assume a task exists.
+
+**The measurement** (`build/gate-iret-aarch64b.log`, `build/test-lane-aarch64-4/serial.log`):
+
+| | control | armed |
+|---|---|---|
+| aarch64 before | 400 000 000 of 400 000 000 | `count exhaustion` after 400 000 000 |
+| **aarch64 after** | 400 000 000 of 400 000 000 | **`THE SIGNAL` after 12 559 965** |
+| x86_64 (gap) | 400 000 000 of 400 000 000 | `count exhaustion` after 400 000 000 |
+| Linux 7.2.14 host | 400 000 000 of 400 000 000 | `THE SIGNAL` after 7 086 584 |
+
+**The pin.** `t-iret` stopped being a reading and became a claim with an expectation per **kernel**
+(`host_run() || cfg!(target_arch = "aarch64")`): aarch64 and any host run assert "leaves at the
+signal", x86_64's guest asserts "runs to its limit, because this kernel hands a handled signal over
+only at a system call". The second half is what pins the remaining gap as *current behaviour* - the
+day the naked tick stub lands, this program reddens and names the line. It is no longer in
+`tests.toml`'s `diagnostic` group, which existed for exactly the reason it no longer applies.
+
+**Gate:** `build/gate-213.log`, `GATE_EXIT=0` - stage 1 793 host tests 0 failed; x86_64
+`pass=307 fail=0`, kunit 35/0; aarch64 `pass=306 fail=0`, kunit 35/0.
+
+**Still open.** x86_64's half: replace the tick handler's `extern "x86-interrupt"` entry with a stub
+that pushes a `Regs`-shaped block before calling a Rust fn. New assembly on the one path that
+preempts, so it is a change of its own with its own before/after (`docs/notes/` §2.13's last section).

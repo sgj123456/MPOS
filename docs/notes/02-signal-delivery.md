@@ -854,7 +854,8 @@ first. And the pick is `wants_signal` without its "prefer a thread not
 already handling it" half - one copy, one handler run is what the pin's
 third claim reads, and nothing in the sweep depends on the finer choice yet.
 
-### 2.13 A handled signal waits for a system call — **NAMED GAP**
+### 2.13 A handled signal waits for a system call — **CLOSED ON AARCH64 2026-11-12,
+STILL THE GAP ON X86_64**
 
 **The question.** A task in ring 3 that computes and never makes a system call: does a signal with a
 handler reach it? Linux says yes, at the next trap. This kernel says no: the signal is queued and
@@ -890,15 +891,16 @@ charged and the expiry scan fired - and the handler still never ran: the loop ra
 limit. The report line after it is the next syscall the task makes, and that is where the signal
 would have been handed over.
 
-**Mechanism, in the code.** `preempt_now` (`src/sched/runtime/task.rs:3741`) is the clock's hook,
-and it calls `check_itimer()`, then `deliver_pending_signal()`, then `schedule`. But
-`deliver_pending_signal` (`:3766`) only takes a **fatal** signal - `take_fatal_signal()` then
-`die_of_fatal_signal(sig)` - so a `SIGKILL` or a default-disposition `SIGTERM` ends a spinning task
-at the next tick. A signal with a *handler* needs the interrupted task's register file to build a
-frame on, and the clock's hook has no such image, so the signal goes back into the pending set,
-where `src/syscall/mod.rs:284`'s `linux::deliver_signal(regs_ptr, nr, ret)` finds it on the task's
-next syscall. `deliver_pending_signal`'s own doc says so: "the syscall return path is the only place
-that has one".
+**Mechanism, in the code — as it stood before the fix.** `preempt_now`
+(`src/sched/runtime/task.rs`) is the clock's hook, and it calls `check_itimer()`, then
+`deliver_pending_signal()`, then `schedule`. But `deliver_pending_signal` only took a **fatal**
+signal - `take_fatal_signal()` then `die_of_fatal_signal(sig)` - so a `SIGKILL` or a
+default-disposition `SIGTERM` ended a spinning task at the next tick. A signal with a *handler* needs
+the interrupted task's register file to build a frame on, and the clock's hook had no such image, so
+the signal went back into the pending set, where `src/syscall/mod.rs`'s
+`linux::deliver_signal(regs_ptr, nr, ret)` found it on the task's next syscall.
+`deliver_pending_signal`'s own doc said so, in the sentence this section existed to falsify: *"the
+syscall return path is the only place that has one"*. It is not - see **How it was closed** below.
 
 Why the frame is the blocker, per machine - both read from the code:
 
@@ -998,3 +1000,93 @@ here"), which is the workaround a program would need and should not have to writ
 not get.** Linux's delivery point is "on the way back to ring 3", and every trap has that way back;
 this kernel's is "on the way back from a syscall", which is a subset. The gap is not in the queue or
 the handler - both are correct and pinned (§2.12) - it is in *where the frame comes from*.
+
+#### How it was closed on aarch64 — 2026-11-12
+
+**The decision the whole fix turns on.** The syscall return was never the only *moment* a whole
+register file exists. It was the only moment this kernel had **built** one into the ABI's 27/34-word
+form. An interrupt taken from a program lands with every register the program was using already on
+the kernel stack - if the entry stub put them there - so the question stopped being "can a trap
+frame serve as a handler's frame" and became "which machine's trap frame already *is* one".
+
+Measured answer, from reading both stubs: aarch64's, once the EL0 IRQ entry saved the whole
+`UserFrame`, and x86_64's does not and cannot today. That inverted the work order the earlier
+paragraphs assumed - the machine whose interrupt ABI looks more primitive was the easy one.
+
+**What changed, in five pieces.**
+
+1. `__vec_el0_irq` (`arch/src/arch/aarch64/vectors.rs`) now builds the same 816-byte
+   `context::UserFrame` the EL0 **sync** stub builds: `sub sp, sp, #816`; `x0..x30` at
+   `[sp,#0]..[sp,#240]`; `SP_EL0`/`ELR_EL1`/`SPSR_EL1` at `[sp,#248]/[#264]`; the 528-byte FP half at
+   `[sp,#272]..[sp,#752]`; `orig_x0` at `[sp,#800]`; then `mov x0, sp` and `bl {irq}` - the handoff
+   the sync stub already used. The ten registers the old frame left to the handler (`x19..x28`) are
+   stored at trap time now, which is the only way to keep what the **program** had rather than what
+   the handler left. Cost: ten `stp` pairs, 80 bytes, and the three `TRAP_IRQ_*` constants are gone
+   because `TRAP_FRAME_BYTES` (816) now serves both EL0 entries.
+2. `extern "C" fn irq(frame: *mut ())` takes that address, and inside `if ticked {`, **before** the
+   preempt split: `if in_user && !frame.is_null() { crate::hal::kernel::deliver_at_trap(frame) }`.
+   Before the preempt, not after: a delivery rewrites the frame, and a task switched away first
+   would resume into the frame without the handler in it. The kernel's own IRQ stub passes `mov x0,
+   #0` - it interrupted the kernel, so there is no program context to build on.
+3. `Gate::capture_trap_regs(frame, tls, out) -> bool` (`arch/src/hal/mod.rs`) is the new capability
+   question. It is **not** `capture_user_regs` with a different argument: that op's `result` word is
+   a write, and at a trap there is no result to write - every register the frame names is live.
+   aarch64 answers the whole `UserFrame`; **x86_64 answers `false`** with the reason in the code: its
+   `extern "x86-interrupt"` frame carries five words and the GPRs sit below it at an offset Rust
+   cannot name, so building the ABI's file there would invent twenty-two words.
+4. `proc::build_frame` split into the capture (the caller's) and `build_frame_at` (one policy, two
+   doors, so they cannot drift). The trap door is `proc::deliver_at_trap`: null frame → no; not in a
+   task → no; a traced task → no (a ptrace stop is a syscall-exit shape here and a stop off a trap
+   frame is one the tracer cannot read); then the same `take_deliverable_siginfo` /
+   `current_disposition` / `default_action` ladder the syscall door uses, with `restart = None`
+   ("an interrupt restarts nothing") and the result slot left as the interrupted code had it.
+5. `src/kernel_services.rs` routes `deliver_at_trap` to `syscall::linux::deliver_at_trap`, which
+   calls `sched::check_itimer()` first - a tick is the moment a timer that came due is noticed, and
+   a signal queued by this very interrupt has to be in the set this looks at.
+
+**A bug the gate caught, and it is the interesting one.** The first version took the machine down on
+every aarch64 lane before any test program ran:
+
+```
+KERNEL PANIC: panicked at src/sched/runtime/task.rs:1937:32: there is no task 255
+```
+
+The boot's own **EL0 check** runs a ring-3 program with no task behind it, so `current()` answers
+`SCHED_ID` - reserved slot 255, no task in it - and the delivery's `has_tracer(current())` asked the
+table about that slot. The fix is a predicate that names the absence: `sched::in_task()` =
+`STARTED && current() != SCHED_ID`, and the trap door answers `false` when it is not true. A trap
+path cannot assume a task exists; the boot takes traps of its own, and the only reason this was
+found in minutes rather than by a user is that the gate boots the machine.
+
+**The measurement** (`build/test-lane-aarch64-4/serial.log`, `cargo xtask test --arch aarch64
+--groups diagnostic`, `build/gate-iret-aarch64b.log` `GATE_EXIT=0`):
+
+```
+ok:    control: with no signal, the loop reaches its limit (400000000 of 400000000 iteration(s))
+ok:    with a 30 ms CPU-time signal armed, nothing in the loop but arithmetic: it left by THE SIGNAL after 11337551 iteration(s)
+ok:    the reading: delivered at a trap = true, delivered only at a system call = false
+t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this machine)
+```
+
+Against the same program before the change: `left by count exhaustion after 400000000`. The signal
+arrived **11 337 551** iterations into a 400-million-iteration limit - the handler ran while the task
+was still in its own ring-3 code, which is Linux's shape. On the host the same binary leaves at
+7 086 584 of 400 000 000, so the ordering of magnitude matches too.
+
+`t-iret` therefore stopped being a reading and became a claim, with an expectation per *kernel*
+rather than per architecture (`host_run() || cfg!(target_arch = "aarch64")`): aarch64 and any host
+run assert "leaves at the signal", x86_64's guest asserts "runs to its limit, because this kernel
+hands a handled signal over only at a system call". That second half is what makes the x86_64 gap
+**pinned as current behaviour** - the day the naked tick stub lands, this program reddens and names
+the line to change. It is no longer in `tests.toml`'s `diagnostic` group: a reading with no claim to
+fail on was why it was there.
+
+**What remains, and why it is a different change.** On x86_64 the tick handler is
+`extern "x86-interrupt" fn timer(frame: InterruptStackFrame)` (`arch/src/arch/x86_64/idt.rs`). That
+ABI's prologue saves the general-purpose registers *below* the frame Rust is handed, at an offset it
+has no name for. Closing the gap means replacing that entry with a hand-written stub that pushes a
+`Regs`-shaped block (the same shape `syscall_entry` already uses) before calling a Rust fn - new
+assembly on the one path that preempts, which is why it is a change of its own with its own
+before/after rather than a second edit here. `Gate::capture_trap_regs` answering `false` is the
+honest placeholder: it makes the ABI layer behave exactly as it did before this round on that
+machine, instead of inventing twenty-two registers.

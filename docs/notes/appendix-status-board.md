@@ -751,7 +751,9 @@ are not restated in the phase sections above.
         into whatever they hold - i.e. into another address space's idea of a program counter. Fixed
         in the stub (three words saved after the FP block and written back before the `eret`, with
         the same "scratch registers before the register file" ordering the FP state needs, `#736`
-        frame, and `TRAP_IRQ_STATUS_OFFSET` asserted beside the other layout constants). With it in,
+        frame, and `TRAP_IRQ_STATUS_OFFSET` asserted beside the other layout constants — that frame
+        has since become the full `UserFrame` at `#816` so a trap can be delivered from it, and the
+        constant is `TRAP_FRAME_BYTES`' sibling; see §2.13). With it in,
         the sweep is `pass=27 fail=0` with preemption live, and the verdict's `/musl` helper runs.
         **What preemption then cost the verdict, and the second fix.** `M6_INIT_OK` was printed after
         the handoff, under the words "it has not run yet" - true only while nothing could preempt the

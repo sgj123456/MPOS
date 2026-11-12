@@ -41,12 +41,15 @@ One-glance status of the whole roadmap.
   not hand a `SIGSTOP`ped task back with the stop still installed (§6.88, item
   201); the named
   residues are the kernel-spawned program path's `SIG_DFL` start, the
-  alternate-stack pin's shape, and one **named gap**: a handled signal is handed
-  over on the return from a *system call*, not on the return from any trap, so a
-  task that computes in ring 3 without entering the kernel holds it until it next
-  calls something - Linux hands it over at the next tick (`iret.c`'s burn loop
-  leaves `by THE SIGNAL` on the host, this machine's runs to its iteration limit
-  with the timer reading `remaining 0 ms`: §2.13, `build/boot-iret1.log`)
+  alternate-stack pin's shape, and one gap that is **closed on aarch64 and open on
+  x86_64**: a handled signal is handed over on the return from a *system call* on
+  x86_64, so a task that computes in ring 3 without entering the kernel holds it
+  until it next calls something. On aarch64 it is handed over at the tick, because
+  the EL0 interrupt stub now builds a whole `UserFrame` and the entry delivers from
+  it before preempting: `t-iret` leaves by the signal after 12 559 965 of
+  400 000 000 iterations, where before the fix it ran to its limit (§2.13, item 261).
+  x86_64 keeps the gap because its `extern "x86-interrupt"` frame carries no GPRs -
+  `Gate::capture_trap_regs` answers `false`, and `t-iret` pins exactly that
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
@@ -987,8 +990,9 @@ One-glance status of the whole roadmap.
   only returned the right errno would miss. The 32-bit word now lives in one
   host-testable verdict, the order in the handlers' statements; the three stale
   "no per-task CPU accounting" comments now name the real gap (CPU time is
-  charged, but the expiry scan covers `ITIMER_REAL` only, and closing it needs
-  §2.13's delivery path). Pinned by `t-itimer-order` (27 claims,
+  charged, but the expiry scan covers `ITIMER_REAL` only - and that half is now
+  reachable on aarch64, where §2.13's trap-time delivery exists to hand the
+  expiry over). Pinned by `t-itimer-order` (27 claims,
   counterfactually 8 red) (§6.125, item 239)
 - [x] `/proc/uptime`'s two columns are two `%lu.%02lu` words and the idle column is a live counter,
   not a literal `0.0`: an unpadded `S.4` was read by `atof` as `S+0.4` (360 ms high) on ~9% of reads,
@@ -1339,10 +1343,10 @@ its 900 s budget with no summary has no reading yet.
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-the delivery *point* is the one open item in the signal surface - a handled
-signal waits for a system call, where Linux hands it over on the way back to ring 3 from any trap,
-so a task computing without kernel entries ignores `Ctrl-C` until its next call (§2.13, measured on
-both sides);  
+the delivery *point* is open on one machine only now - a handled signal waits for a system call on
+x86_64, where Linux hands it over on the way back to ring 3 from any trap, so a task computing
+without kernel entries ignores `Ctrl-C` until its next call; **aarch64 delivers at the trap** since
+2026-11-12 (`t-iret` measures it: 12 559 965 of 400 000 000 iterations, §2.13, item 261);  
 `memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs keep `user.*` on the memory filesystems and refuse the other namespaces by name (item 132, §3.15);  
 the datagram lines are Linux's now - 65 507 for a datagram, and `EMSGSIZE` from the  
 destination link's MTU where Linux's default would fragment it - while IP fragmentation  

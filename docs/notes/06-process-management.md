@@ -10198,13 +10198,17 @@ of 200 ms`.
 Two traps were paid for here:
 
 - **A signal with a handler is handed over at a kernel entry, and a pure burn loop has none.**
-  `deliver_pending_signal`'s own doc says it: "the syscall return path is the only place that has
+  `deliver_pending_signal`'s own doc said it: "the syscall return path is the only place that has
   [a register file]". The first machine run of the pin burned 400 chunks (over 200 ms of CPU,
   `timer_gettime` reading 0 left) and the handler never ran, so two claims were red for a reason
   that had nothing to do with the clock. The loop now makes one cheap `getpid` per chunk, which is
   what an ordinary program's loop does. Linux also hands a handled signal over on an interrupt's
-  return to ring 3, which this kernel does not: **`docs/notes/` §2.13 measures that difference and
-  names it as a gap** (`build/scratch/timerclock/iret.c` on the host, `build/boot-iret1.log` here).
+  return to ring 3, and since 2026-11-12 this kernel does too on aarch64 — the machine's interrupt
+  entry hands its trap frame to `hal::kernel::deliver_at_trap` before it preempts. On x86_64 that
+  sentence is still true and §2.13 says why: its handlers get an `InterruptStackFrame` with the
+  GPRs saved below it where Rust cannot name them, so `Gate::capture_trap_regs` answers `false`
+  there. **`docs/notes/` §2.13 measures that difference and names what remains**
+  (`build/scratch/timerclock/iret.c` on the host, `build/boot-iret1.log` here).
   §7.4h is about a different question - which thread a delivered signal went to.
 - **A test's contract moves when the kernel starts serving the field it measured.** `t-timer-create`
   carried a claim written as `a clock with no accounting behind it is EOPNOTSUPP`, which was true
