@@ -383,6 +383,26 @@ impl crate::hal::Gate for crate::hal::Current {
         // one that happens *before* a handler is entered.
         frame.rax = value as usize;
     }
+
+    unsafe fn capture_trap_regs(_frame: *mut (), _tls: usize, _out: &mut [u64]) -> bool {
+        // `false`, and it is an answer rather than a gap left open.
+        //
+        // The frame this machine's interrupt handlers are given is an
+        // `InterruptStackFrame`: `rip`, `cs`, `rflags`, `rsp`, `ss`. The
+        // general registers are saved by the compiler's `x86-interrupt`
+        // prologue *below* that, at an offset Rust has no name for and the
+        // handler cannot address - so there is nothing here to read them out
+        // of. Building the ABI's file from what this frame does carry would
+        // invent twenty-two words, and a handler entered on invented registers
+        // is worse than a signal that waits for the next syscall.
+        //
+        // Closing §2.13 on this machine means replacing the tick handler's
+        // `extern "x86-interrupt"` entry with a stub that pushes a `Regs`-shaped
+        // block - the shape `syscall_entry` already builds - so the trap frame
+        // becomes an object of the same kind as the gate frame. That is a
+        // separate change with its own measurement (`docs/notes/` §2.13).
+        false
+    }
 }
 
 extern "C" fn rust_syscall(regs: *mut Regs) -> usize {

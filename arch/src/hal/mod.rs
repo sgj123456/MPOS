@@ -968,6 +968,30 @@ pub trait Gate {
     /// # Safety
     /// As [`Gate::user_ip`], for a frame that may be null.
     unsafe fn set_result(frame: *mut (), value: isize);
+
+    /// A trap frame read out as the ABI's register file, with nothing written
+    /// into it. `false` where the machine has no such frame, or `frame` is null.
+    ///
+    /// Not [`Gate::capture_user_regs`] with a different argument, because that
+    /// op's `result` word *is* a write, and at a trap there is no result to
+    /// write: the task was interrupted mid-instruction and every register the
+    /// frame names is a value the program is still using. On aarch64 the result
+    /// slot is `x0`, which is also the call's first argument - seeding it with a
+    /// zero would hand the handler's saved context a live register overwritten
+    /// (`Gate::set_result`'s doc has the measured instance of exactly that
+    /// mistake). So this op exists to say "read this frame, change nothing".
+    ///
+    /// The frame is one the machine's own trap stub built with every register in
+    /// it; a machine whose trap entry leaves the general registers where Rust
+    /// cannot name them answers `false` rather than reconstructing them. That is
+    /// x86_64 today: `extern "x86-interrupt"` saves them below the frame the
+    /// handler is given (`docs/notes/` §2.13).
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], and `out` must be [`ABI_REG_COUNT`] words long.
+    ///
+    /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
+    unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool;
 }
 
 /// A machine this kernel can run on. `Current` names the one being built.
@@ -1700,6 +1724,16 @@ pub unsafe fn user_context(frame: *mut (), rax: usize) -> Option<UserFrame> {
 #[inline]
 pub unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]) {
     unsafe { <Current as Gate>::capture_user_regs(frame, rax, tls, out) }
+}
+
+/// A trap frame as the ABI's register file, with no slot written. See
+/// [`Gate::capture_trap_regs`].
+///
+/// # Safety
+/// As [`Gate::capture_trap_regs`].
+#[inline]
+pub unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool {
+    unsafe { <Current as Gate>::capture_trap_regs(frame, tls, out) }
 }
 
 /// Write the ABI's register file back into the gate frame. See

@@ -3028,6 +3028,22 @@ pub fn started() -> bool {
     STARTED.load(Ordering::Relaxed)
 }
 
+/// Whether a *task* is running: not the boot code before [`init`], and not the
+/// scheduler's own loop between two tasks.
+///
+/// These are two different absences and a caller cannot tell them apart by
+/// asking the table. Before `init` there is no tenant anywhere; between two
+/// tasks the table is full but `current` is [`SCHED_ID`], a reserved slot with
+/// no task in it. Either way "the running task" has no answer, and a caller on a
+/// trap path has to ask *here* rather than assume, because the boot takes traps
+/// of its own: its EL0 check runs a program with no task behind it, so a
+/// delivery that read the current context there asked the table about slot 255
+/// and took the machine down with `there is no task 255` - measured 2026-11-12,
+/// on every lane of the aarch64 sweep, which is what this guard is for.
+pub fn in_task() -> bool {
+    STARTED.load(Ordering::Relaxed) && current() != SCHED_ID
+}
+
 /// The kernel stack the running task is on, as `(base, top)` - the low and
 /// high addresses of the block the frame allocator handed out for it.
 ///
@@ -3961,10 +3977,16 @@ fn preempt_now() {
 /// the next tick, so no program can outlast a `kill` by never making a
 /// syscall. Called from interrupt context, where it must not block.
 ///
-/// Signals that cannot be finished here are left alone rather than dropped:
-/// one with a handler needs the task's register file to build a frame on, and
-/// the syscall return path is the only place that has one - so it goes back
-/// into the pending set, where the next syscall the task makes will find it.
+/// Only the *fatal* half is done here, and not because a handled one could not
+/// be: the machine's trap frame carries the whole interrupted register file, so
+/// a handler can be entered from it, and on this machine that is what happens -
+/// the machine's interrupt entry hands its frame to
+/// `hal::kernel::deliver_at_trap` before it preempts
+/// (`arch/src/arch/aarch64/vectors.rs`, `docs/notes/` §2.13). What is left for
+/// this function is the case with no frame at all to build on, which is also the
+/// case that cannot wait: a signal with no handler ends the task, and a task
+/// that never makes a syscall would otherwise never end.
+///
 /// A signal the task has blocked is not even looked at: that is what blocking
 /// means.
 pub fn deliver_pending_signal() {

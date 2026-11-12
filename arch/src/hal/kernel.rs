@@ -210,6 +210,33 @@ pub trait Kernel: Sync {
     /// Account one tick to whatever was running when the interrupt landed.
     fn charge_cpu(&self, in_user: bool);
 
+    /// Hand a signal to the task this interrupt interrupted, if one is waiting
+    /// for it and can be delivered **here**.
+    ///
+    /// This is the second door onto a handled signal, and it exists because the
+    /// first one was never the only moment a whole register file is available -
+    /// it was the only moment the kernel had *built* one. An interrupt from a
+    /// program lands with every register of that program on the kernel stack
+    /// already, saved by the stub that called this handler, so a signal that
+    /// only needed a frame to run on was waiting for a system call for no reason
+    /// (`docs/notes/` §2.13; Linux hands such a signal over at the next tick).
+    ///
+    /// `frame` is the machine's trap frame for the interrupted program, or null
+    /// for an interrupt that landed on the kernel - a trap from ring 0 has no
+    /// program context to build a handler's frame on, and the machine says so by
+    /// passing null rather than by leaving the question to the kernel.
+    ///
+    /// The kernel answers `false` and leaves the signal pending when it cannot
+    /// deliver from this frame: no handler at all (the fatal path is not this
+    /// one), a disposition this machine has no frame for, a tracer that must see
+    /// the stop at a syscall, or a stack that cannot be written. Pending is the
+    /// safe answer - the syscall exit still has the frame and will try again.
+    ///
+    /// Present only where the build declares `mpos_signal_frame`: a machine with
+    /// no way to lay out a handler's frame has nothing to deliver.
+    #[cfg(mpos_signal_frame)]
+    fn deliver_at_trap(&self, frame: *mut ()) -> bool;
+
     // -----------------------------------------------------------------------
     // The rest of what a machine asks for. None of these is on a trap path in
     // the sense the methods above are: they are the boot bringing the kernel
@@ -498,6 +525,16 @@ pub fn preempt_at(ip: usize) {
 #[inline]
 pub fn charge_cpu(in_user: bool) {
     registered().charge_cpu(in_user)
+}
+
+/// Hand a waiting signal to the task an interrupt interrupted. See
+/// [`Kernel::deliver_at_trap`].
+///
+/// Present only where the build declares `mpos_signal_frame`.
+#[cfg(mpos_signal_frame)]
+#[inline]
+pub fn deliver_at_trap(frame: *mut ()) -> bool {
+    registered().deliver_at_trap(frame)
 }
 
 /// The device-not-available trap. See [`Kernel::device_not_available`].

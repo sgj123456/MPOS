@@ -164,6 +164,18 @@ impl Kernel for Services {
         sched::charge_cpu(in_user)
     }
 
+    #[cfg(mpos_signal_frame)]
+    fn deliver_at_trap(&self, frame: *mut ()) -> bool {
+        // Through the syscall layer rather than straight to the scheduler: what
+        // a delivery *does* - which signal, which stack, which mask, how the
+        // frame is written - is that layer's policy, and it is one function
+        // shared with the syscall-exit door so the two cannot drift. The
+        // scheduler's part (the table walk that takes a pending signal, and the
+        // block mask it installs) is reached from there, which is the direction
+        // that edge already runs.
+        syscall::linux::deliver_at_trap(frame)
+    }
+
     /// The console service, which is where a `println!` on this kernel already
     /// lands - so a machine's fault report reads the same as any other line, and
     /// reaches whichever console the boot has pointed at.

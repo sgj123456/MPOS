@@ -13,10 +13,24 @@
 //! register away from writing into its neighbour; keeping the stubs out of the
 //! table is what makes that impossible rather than unlikely.
 //!
-//! What is saved. The IRQ stubs save `x0..x18`, `x29` and `x30`: exactly the
-//! registers a Rust callee may clobber, so preserving those is preserving the
-//! interrupted code's architecturally-visible state. `x19..x28` are
-//! callee-saved and the handler restores them itself.
+//! What is saved. The two IRQ stubs differ here, and the difference is the
+//! whole point of one of them. The *kernel's* IRQ stub saves `x0..x18`, `x29`
+//! and `x30`: exactly the registers a Rust callee may clobber, so preserving
+//! those preserves the interrupted kernel code's architecturally-visible state.
+//! `x19..x28` are callee-saved and `irq` restores them itself, because the
+//! interrupted code here is the kernel's own and a Rust callee does keep them.
+//!
+//! The *EL0* IRQ stub instead saves the whole `UserFrame` - all thirty-one
+//! integer registers, `SP_EL0`, `ELR_EL1`, `SPSR_EL1`, the original `x0`, and
+//! the 528-byte floating-point half - the same layout the EL0 sync stub builds.
+//! It has to: a trap from a program is the one trap a handled signal can be
+//! delivered from, and delivering one means handing the frame to the ABI layer,
+//! which needs every register the interrupted program was actually using.
+//! Preserving `x19..x28` "in the handler" is not the same thing - that keeps
+//! what the *handler* left, not what the program had - so those ten are stored
+//! at trap time like the rest. That is what makes a trap frame on this machine
+//! *be* a `UserFrame` rather than merely resemble one; the cost is ten `stp`
+//! pairs, 80 bytes.
 //!
 //! `PC` and `PSTATE` are a different matter, and the difference is *not* the
 //! call rule. The CPU does not put them on the interrupted stack: it writes them
@@ -154,21 +168,19 @@ pub const TRAP_ORIG_X0_OFFSET: usize = TRAP_FPU_OFFSET + TRAP_FPU_BYTES;
 /// interrupted call's first argument.
 pub const TRAP_FRAME_BYTES: usize = TRAP_ORIG_X0_OFFSET + 16;
 
-/// Where the floating-point state sits inside the EL0 *interrupt* frame: after
-/// the 176 bytes the kernel's own IRQ stub saves, which is the whole of the
-/// difference between the two stubs.
-pub const TRAP_IRQ_FPU_OFFSET: usize = 176;
-
-/// Where the interrupted program's resume state sits inside the EL0 interrupt
-/// frame: `SP_EL0`, `ELR_EL1`, `SPSR_EL1`, immediately after the floating-point
-/// block. The sync stub keeps the same three words inside its `UserFrame`; this
-/// stub has no `UserFrame`, and an interrupt that can preempt needs them all the
-/// same (see the stub's own comment).
-pub const TRAP_IRQ_STATUS_OFFSET: usize = TRAP_IRQ_FPU_OFFSET + TRAP_FPU_BYTES;
-
-/// The EL0 interrupt frame: the saved registers, the floating-point state, the
-/// resume state - rounded up to the 16-byte alignment `SP` must keep.
-pub const TRAP_IRQ_FRAME_BYTES: usize = TRAP_IRQ_STATUS_OFFSET + 24 + 8;
+// The EL0 *interrupt* stub has no constants of its own any more, and that is
+// the point of this note: it used to build a frame of its own shape - 176 bytes
+// of the registers a Rust callee may clobber, then the floating-point half, then
+// the three resume words - and the difference between it and the sync stub was
+// exactly the registers nobody had asked it for. `x19..x28` were missing, which
+// was sound while an interrupt could only *return* to the program it
+// interrupted, because `irq` preserves the callee-saved set across its own call:
+// what the stub restores is what the handler left, not what the program had.
+// Handing a trap frame to the ABI layer is what asks the question the old shape
+// could not answer - a signal frame has to carry the program's own registers -
+// so the EL0 IRQ stub now saves the same `UserFrame` the sync stub does, at the
+// same offsets, and the two frames are one layout. `TRAP_FRAME_BYTES` below
+// serves both, and the assert block pins that they still agree.
 
 /// Where the *kernel's* interrupt stub keeps the resume state of the context it
 /// interrupted: `ELR_EL1` then `SPSR_EL1`, after the 176 bytes it saves.
@@ -209,18 +221,6 @@ const _: () = {
     assert!(
         TRAP_FRAME_BYTES == 816 && TRAP_FRAME_BYTES % 16 == 0,
         "the EL0 sync stub's frame size moved"
-    );
-    assert!(
-        TRAP_IRQ_FPU_OFFSET == 176,
-        "the EL0 IRQ stub's floating-point offset moved"
-    );
-    assert!(
-        TRAP_IRQ_STATUS_OFFSET == 704,
-        "the EL0 IRQ stub's resume-state offset moved"
-    );
-    assert!(
-        TRAP_IRQ_FRAME_BYTES == 736 && TRAP_IRQ_FRAME_BYTES % 16 == 0,
-        "the EL0 IRQ stub's frame size moved"
     );
     assert!(
         TRAP_FPU_BYTES == 528,
@@ -359,6 +359,14 @@ __vec_irq:
     mrs x9, elr_el1
     mrs x10, spsr_el1
     stp x9, x10, [sp, #176]
+    /* A null frame, and it means something rather than being a placeholder: this
+       entry interrupted the *kernel*, so the registers in the frame above are
+       the kernel's own and there is no program context to build a handler's
+       frame on. `irq` takes the frame address because the EL0 entry opposite
+       has one - a trap from a program is the one trap a handled signal can be
+       delivered from (see the EL0 stub below) - and the kernel stub says "none"
+       in the only way the two can agree on. */
+    mov x0, #0
     bl {irq}
     /* Written back first, through the same two scratch registers, because the
        register restore below hands `x9` and `x10` back to the context that was
@@ -380,19 +388,33 @@ __vec_irq:
     add sp, sp, #192
     eret
 
-    /* An interrupt that lands on a *program*. It is the stub above plus the
-       floating-point half, and it exists because the two differ in exactly
-       that: the kernel's own code has no interest in the vector registers of
-       the task it interrupted (a call may destroy the caller-saved ones, and
-       the callee-saved ones are `irq`'s to keep), while a program's registers
-       are its own across an interrupt whatever the ABI says about calls. The
-       528 bytes are `q0..q31`, `FPCR` and `FPSR` in the same order
-       `mpos_context_switch` saves them, at the offset [`TRAP_FPU_OFFSET`]
-       names; the integer half above is the same 176 bytes the sibling stub
-       uses, so the frame's first half is identical on both entries. */
+    /* An interrupt that lands on a *program*. The frame it builds is
+       `context::UserFrame` over the floating-point half - the same 816 bytes,
+       at the same offsets, that the sync stub below builds - because this is
+       the only IRQ entry whose frame the kernel may hand to the signal
+       machinery, and that machinery reads a `UserFrame` and nothing else.
+
+       That is the whole difference from the kernel's own IRQ stub above, and
+       the reason this one is four times its size. An interrupt on the kernel
+       has no registers worth keeping: a call may destroy the caller-saved set,
+       and the callee-saved set is `irq`'s to preserve across its own call. An
+       interrupt on a *program* interrupts code that knows nothing of calls, so
+       every register is the program's. The old shape here saved x0..x18, x29
+       and x30 and left x19..x28 to `irq` - which does preserve them, across
+       its own call, so what the restore handed back was what the *handler*
+       left rather than what the program had. That was sound while an
+       interrupt could only return to the context it interrupted, and it was
+       sound precisely because of that. Delivering a signal from a trap is
+       what asks the other question: the handler's frame is built on this
+       image, so a register in it holding the handler's value is a register
+       the program loses. Ten `stp` pairs cost 80 bytes; the frame is the
+       sync stub's, [`TRAP_FRAME_BYTES`] rather than a second number.
+
+       The 528 bytes after the integer half are `q0..q31`, `FPCR` and `FPSR`,
+       in the order `mpos_context_switch` saves them, at [`TRAP_FPU_OFFSET`]. */
     .balign 16
 __vec_el0_irq:
-    sub sp, sp, #736
+    sub sp, sp, #816
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -402,72 +424,92 @@ __vec_el0_irq:
     stp x12, x13, [sp, #96]
     stp x14, x15, [sp, #112]
     stp x16, x17, [sp, #128]
-    str x18, [sp, #144]
-    stp x29, x30, [sp, #152]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
     /* The interrupted program's resume state. The CPU put it in `SP_EL0`,
-       `ELR_EL1` and `SPSR_EL1` rather than on the stack, and unlike the sync
-       stub - whose `UserFrame` has slots for all three - this one used to leave
-       them where they were. That was sound only while an IRQ always returned to
-       the context it interrupted: the moment the clock can *preempt* (see
-       [`irq`]), this task is switched out, another task's traps overwrite the
-       three registers, and the `eret` below resumes into whatever they hold -
-       measured: a level-3 translation fault at `0x221af0` in the first EL0
-       program the sweep ran. They are saved here and written back before the
-       `eret` for the same reason the sync stub does it. */
+       `ELR_EL1` and `SPSR_EL1` rather than on the stack. That was sound only
+       while an IRQ always returned to the context it interrupted: the moment
+       the clock can *preempt* (see [`irq`]), this task is switched out,
+       another task's traps overwrite the three registers, and the `eret` below
+       resumes into whatever they hold - measured: a level-3 translation fault
+       at `0x221af0` in the first EL0 program the sweep ran. */
     mrs x9, sp_el0
     mrs x10, elr_el1
     mrs x11, spsr_el1
-    str x9, [sp, #704]
-    str x10, [sp, #712]
-    str x11, [sp, #720]
-    stp q0,  q1,  [sp, #176]
-    stp q2,  q3,  [sp, #208]
-    stp q4,  q5,  [sp, #240]
-    stp q6,  q7,  [sp, #272]
-    stp q8,  q9,  [sp, #304]
-    stp q10, q11, [sp, #336]
-    stp q12, q13, [sp, #368]
-    stp q14, q15, [sp, #400]
-    stp q16, q17, [sp, #432]
-    stp q18, q19, [sp, #464]
-    stp q20, q21, [sp, #496]
-    stp q22, q23, [sp, #528]
-    stp q24, q25, [sp, #560]
-    stp q26, q27, [sp, #592]
-    stp q28, q29, [sp, #624]
-    stp q30, q31, [sp, #656]
+    stp x9, x10, [sp, #248]
+    str x11, [sp, #264]
+    stp q0,  q1,  [sp, #272]
+    stp q2,  q3,  [sp, #304]
+    stp q4,  q5,  [sp, #336]
+    stp q6,  q7,  [sp, #368]
+    stp q8,  q9,  [sp, #400]
+    stp q10, q11, [sp, #432]
+    stp q12, q13, [sp, #464]
+    stp q14, q15, [sp, #496]
+    stp q16, q17, [sp, #528]
+    stp q18, q19, [sp, #560]
+    stp q20, q21, [sp, #592]
+    stp q22, q23, [sp, #624]
+    stp q24, q25, [sp, #656]
+    stp q26, q27, [sp, #688]
+    stp q28, q29, [sp, #720]
+    stp q30, q31, [sp, #752]
     mrs x9, fpcr
     mrs x10, fpsr
-    str x9, [sp, #688]
-    str x10, [sp, #696]
+    str x9, [sp, #784]
+    str x10, [sp, #792]
+    /* The program's `x0`, before the handoff below overwrites the register
+       with the frame's address - `TRAP_ORIG_X0_OFFSET`, the same slot the
+       sync stub fills. An IRQ has no system call in flight, so nothing here
+       reads it back as a call's first argument; it is filled because the
+       slot is part of the layout, and a frame handed to the signal machinery
+       with a stale word in it is a frame that would answer the wrong question
+       if anything ever did ask. */
+    str x0, [sp, #800]
+    /* The frame's address, the handoff `__vec_el0_sync` makes for the same
+       reason: `irq` is the only code that knows whether anything is waiting
+       to be delivered, and it cannot answer from the stack pointer alone. A
+       null here is the kernel stub's call, where there is no user frame and
+       nothing to deliver to. */
+    mov x0, sp
     bl {irq}
     /* The status words first, through `x9` - the register restore below gives
        `x9` back to the program, so this is the only window they can be used
-       in (the same ordering the FP state needs, one paragraph up). */
-    ldr x9, [sp, #704]
+       in (the same ordering the FP state needs, one paragraph up). A delivery
+       inside `irq` rewrites all three, which is how the handler gets the
+       program's `pc`, `sp` and mode. */
+    ldr x9, [sp, #248]
     msr sp_el0, x9
-    ldr x9, [sp, #712]
+    ldr x9, [sp, #256]
     msr elr_el1, x9
-    ldr x9, [sp, #720]
+    ldr x9, [sp, #264]
     msr spsr_el1, x9
-    ldp q0,  q1,  [sp, #176]
-    ldp q2,  q3,  [sp, #208]
-    ldp q4,  q5,  [sp, #240]
-    ldp q6,  q7,  [sp, #272]
-    ldp q8,  q9,  [sp, #304]
-    ldp q10, q11, [sp, #336]
-    ldp q12, q13, [sp, #368]
-    ldp q14, q15, [sp, #400]
-    ldp q16, q17, [sp, #432]
-    ldp q18, q19, [sp, #464]
-    ldp q20, q21, [sp, #496]
-    ldp q22, q23, [sp, #528]
-    ldp q24, q25, [sp, #560]
-    ldp q26, q27, [sp, #592]
-    ldp q28, q29, [sp, #624]
-    ldp q30, q31, [sp, #656]
-    ldr x9, [sp, #688]
-    ldr x10, [sp, #696]
+    /* The floating-point half, through `x9`/`x10`, which has to come *before*
+       the register restore below for the reason the sync stub records: that
+       restore gives `x9` and `x10` back to the program. */
+    ldp q0,  q1,  [sp, #272]
+    ldp q2,  q3,  [sp, #304]
+    ldp q4,  q5,  [sp, #336]
+    ldp q6,  q7,  [sp, #368]
+    ldp q8,  q9,  [sp, #400]
+    ldp q10, q11, [sp, #432]
+    ldp q12, q13, [sp, #464]
+    ldp q14, q15, [sp, #496]
+    ldp q16, q17, [sp, #528]
+    ldp q18, q19, [sp, #560]
+    ldp q20, q21, [sp, #592]
+    ldp q22, q23, [sp, #624]
+    ldp q24, q25, [sp, #656]
+    ldp q26, q27, [sp, #688]
+    ldp q28, q29, [sp, #720]
+    ldp q30, q31, [sp, #752]
+    ldr x9, [sp, #784]
+    ldr x10, [sp, #792]
     msr fpcr, x9
     msr fpsr, x10
     ldp x0, x1, [sp, #0]
@@ -479,9 +521,14 @@ __vec_el0_irq:
     ldp x12, x13, [sp, #96]
     ldp x14, x15, [sp, #112]
     ldp x16, x17, [sp, #128]
-    ldr x18, [sp, #144]
-    ldp x29, x30, [sp, #152]
-    add sp, sp, #736
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #816
     eret
 
     /* A trap from EL0. Unlike the IRQ stub this one has to save *everything*,
@@ -687,7 +734,7 @@ pub fn table() -> u64 {
 /// mode field is `EL0t` (0) when the tick landed on a program, and anything else
 /// means the kernel was running on its behalf. The same attribution x86_64 gets
 /// from the interrupted frame's code segment.
-extern "C" fn irq() {
+extern "C" fn irq(frame: *mut ()) {
     let intid = gic::acknowledge();
     let mut ticked = false;
     // The interrupted state is in `SPSR_EL1` and the interrupted address in
@@ -733,6 +780,33 @@ extern "C" fn irq() {
     // task is resumed, and a controller line left un-acknowledged would block
     // every interrupt until then.
     if ticked {
+        // The second door onto a handled signal, and the one that makes a
+        // program which never calls interruptible.
+        //
+        // The frame is the one the EL0 stub above built: every register of the
+        // interrupted program, saved where the handler can read it. Handing
+        // that address over is all this machine has to do - the kernel decides
+        // whether there is a signal to deliver, whether this machine can lay
+        // out a frame for it, and leaves it pending when it cannot, so the
+        // syscall exit tries again (`hal::Kernel::deliver_at_trap`,
+        // `docs/notes/` §2.13).
+        //
+        // Gated on the tick rather than on every interrupt, and on `in_user`
+        // rather than on the frame alone: the clock is the interrupt guaranteed
+        // to keep arriving while a program computes - which is the case this
+        // exists for - and a trap from the kernel has no program context to
+        // build a frame on (its stub passes null for exactly that reason).
+        // Linux hands such a signal over at the next tick too.
+        //
+        // Before the preempt below, not after: a delivery rewrites this frame,
+        // and if the scheduler takes the task away first, what it resumes into
+        // is the frame without the handler in it.
+        #[cfg(mpos_signal_frame)]
+        {
+            if in_user && !frame.is_null() {
+                crate::hal::kernel::deliver_at_trap(frame);
+            }
+        }
         // An interrupt that landed on a program inside an armed restartable
         // sequence's span is the one thing the switch must not do; the address
         // is what lets the scheduler tell the two apart (`crate::sched::rseq`).

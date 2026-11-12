@@ -73,6 +73,25 @@ pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, nr, ret)
 }
 
+/// Hand a waiting signal to the task an interrupt interrupted. See
+/// [`proc::deliver_at_trap`].
+///
+/// The other door onto a handled signal, and the one that makes a program which
+/// never calls interruptible. Reached from the machine's interrupt entry through
+/// `hal::kernel::deliver_at_trap`, so a machine whose trap entry cannot name the
+/// program's registers never calls this at all (`hal::capture_trap_regs`).
+///
+/// The clock is checked first, and that ordering is the delivery's: a tick is
+/// the moment a timer that came due is noticed, and a signal queued *by this
+/// very interrupt* - an interval timer expiring on the clock that is running
+/// now - has to be in the set this looks at or it waits a whole slice for the
+/// next trap.
+#[cfg(mpos_signal_frame)]
+pub fn deliver_at_trap(frame: *mut ()) -> bool {
+    crate::sched::check_itimer();
+    proc::deliver_at_trap(frame)
+}
+
 /// One Linux syscall, dispatched by number across the whole table.
 ///
 /// # Safety

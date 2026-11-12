@@ -1028,6 +1028,21 @@ impl crate::hal::Gate for crate::hal::Current {
         // is entered rather than in the gate's own return sequence.
         frame.x[0] = value as u64;
     }
+
+    unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool {
+        if frame.is_null() {
+            return false;
+        }
+        // SAFETY: the caller's contract. This machine's trap entries save the
+        // whole `UserFrame` - the EL0 IRQ stub does, and that is what makes a
+        // trap frame here *be* a user frame rather than merely resemble one
+        // (`arch/src/arch/aarch64/vectors.rs`).
+        let user = unsafe { *(frame as *const context::UserFrame) };
+        // No write into `x0`, unlike `capture_user_regs` above: an interrupt
+        // names no result, and `x0` is a live register the program was using.
+        crate::hal::UserFrameOps::to_user_regs(&user, tls, out);
+        true
+    }
 }
 
 impl crate::hal::Platform for crate::hal::Current {}

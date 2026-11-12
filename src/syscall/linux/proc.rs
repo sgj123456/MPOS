@@ -59,6 +59,34 @@ fn build_frame(
     ret: isize,
     restart: Option<u64>,
 ) -> bool {
+    // The interrupted call's register file, with `ret` - its own answer - in the
+    // result slot. That is what the frame saves, or what the restart number
+    // replaces.
+    let regs = capture_frame(regs_ptr, ret as usize);
+    let interrupted_sp = unsafe { crate::hal::user_context(regs_ptr, 0) }
+        .map(|ctx| ctx.sp())
+        .unwrap_or(0);
+    build_frame_at(regs_ptr, &regs, interrupted_sp, sig, action, info, restart)
+}
+
+/// The same, for a delivery that already holds the interrupted register file.
+///
+/// Two doors lead here and they capture their frame differently, which is why
+/// the capture is the caller's: a syscall exit has a gate frame and a result to
+/// put in the result slot, and a trap has a trap frame whose every register is a
+/// live value (`hal::capture_trap_regs`). Everything after the capture - which
+/// stack, which mask, which restorer, the write, the apply - is one policy, and
+/// it is this function so that the two doors cannot drift apart.
+#[cfg(mpos_signal_frame)]
+fn build_frame_at(
+    regs_ptr: *mut (),
+    regs: &AbiRegs,
+    interrupted_sp: usize,
+    sig: u8,
+    action: &crate::sched::signal::Action,
+    info: &crate::sched::signal::SigInfo,
+    restart: Option<u64>,
+) -> bool {
     let alt = crate::sched::signal_alt_stack(crate::sched::current());
     let blocked = crate::sched::current_blocked();
     let delivery = crate::hal::SignalDelivery {
@@ -86,10 +114,7 @@ fn build_frame(
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
         fpu: interrupted_fpu(),
     };
-    // The interrupted call's register file, with `ret` - its own answer - in the
-    // result slot. That is what the frame saves, or what the restart number
-    // replaces.
-    let mut regs = capture_frame(regs_ptr, ret as usize);
+    let mut regs = *regs;
     let mut bytes = [0u8; crate::hal::SIGNAL_FRAME_BYTES];
     // `regs_ptr` goes in as well, because a machine may keep the interrupted
     // floating-point state in its own trap frame rather than in the task's
@@ -112,9 +137,6 @@ fn build_frame(
     // (beyond the slack, past `RLIMIT_STACK`) still refuses, and the default
     // action is what follows.
     if !crate::sched::write_user(at.sp, &bytes) {
-        let interrupted_sp = unsafe { crate::hal::user_context(regs_ptr, 0) }
-            .map(|ctx| ctx.sp())
-            .unwrap_or(0);
         if interrupted_sp == 0
             || !crate::sched::resolve_stack_growth(at.sp)
             || !crate::sched::write_user(at.sp, &bytes)
@@ -283,6 +305,90 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number
         // in the exit code so the parent can tell which one it was.
+        crate::sched::die_of_fatal_signal(sig);
+    }
+    true
+}
+
+/// Run a pending signal's handler on a **trap** frame, or take its default
+/// action. `false` leaves the signal pending.
+///
+/// The second door onto a handled signal, and the one Linux actually uses for a
+/// program that never calls: a trap from ring 3 arrives with every register
+/// already saved on the kernel stack by the machine's own entry stub, so the
+/// whole return context the handler needs exists at that moment. The syscall
+/// return is not the only moment one exists - it was only the only moment this
+/// kernel had *built* one (`deliver_signal`'s doc, which this falsifies;
+/// `docs/notes/` §2.13).
+///
+/// What a trap does not have is a call: no number for `SA_RESTART` to rewind,
+/// no return value for the result slot, and no second argument that is an
+/// `ioctl`'s request word. So `restart` is `None` and the ABI's result slot is
+/// left holding whatever the interrupted code had in it - which is the truth,
+/// because an interrupt names no result.
+#[cfg(mpos_signal_frame)]
+pub(super) fn deliver_at_trap(frame: *mut ()) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    // There has to be a *task* to deliver to, and this is not the same question
+    // as "is there a frame": the boot code takes traps of its own before the
+    // scheduler exists, and its EL0 check runs a program with no task behind it.
+    // Reading the current context there asked the table about a reserved slot
+    // and took the machine down - measured 2026-11-12, every lane of the
+    // aarch64 sweep, `there is no task 255` (§2.13).
+    if !crate::sched::in_task() {
+        return false;
+    }
+    // A traced task's signals are its tracer's business, and this door does not
+    // serve them: a ptrace stop is a *syscall-exit* shape here - the tracer
+    // reads and rewrites the frame the gate built and the report carries a call
+    // number - so a stop taken off a trap frame would be a stop the tracer
+    // cannot read. Leaving it pending is the safe answer and the honest one: the
+    // next syscall the task makes takes the door that has the shape for it.
+    //
+    // Measured consequence of getting this wrong would be a tracee that stops
+    // for a signal and never reports the call that is still in flight; there is
+    // no measurement yet because the branch has never run - on x86_64 this whole
+    // function is unreachable (`hal::capture_trap_regs` answers false) and on
+    // aarch64 no test in the suite runs a signal under a tracer.
+    if crate::sched::has_tracer(crate::sched::current()) {
+        return false;
+    }
+    let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
+    // SAFETY: the caller hands the machine's own trap frame for this task.
+    if !unsafe { crate::hal::capture_trap_regs(frame, crate::sched::current_tls(), &mut regs) } {
+        return false;
+    }
+    let Some((sig, info)) = crate::sched::take_deliverable_siginfo() else {
+        return false;
+    };
+    let action = crate::sched::current_disposition(sig);
+    if action.is_ignore() {
+        return false;
+    }
+    if action.is_default() {
+        match crate::sched::signal::default_action(sig) {
+            crate::sched::signal::DefaultAction::Terminate => {
+                crate::sched::die_of_fatal_signal(sig);
+            }
+            // Nothing to hand over and nothing to change: the signal is spent.
+            crate::sched::signal::DefaultAction::Ignore => return false,
+            crate::sched::signal::DefaultAction::Continue => return false,
+            // A stop from a trap is legal - the frame is the task's whole
+            // context - and the park puts it back where it was.
+            crate::sched::signal::DefaultAction::Stop => {
+                crate::sched::group_stop(&mut regs, sig);
+                apply_frame(frame, &regs);
+                return false;
+            }
+        }
+    }
+    // `interrupted_sp` comes from the captured file rather than from a second
+    // read of the frame: the two doors capture in different ways, and the file
+    // is what both of them have.
+    let interrupted_sp = unsafe { crate::hal::user_sp(frame) } as usize;
+    if !build_frame_at(frame, &regs, interrupted_sp, sig, &action, &info, None) {
         crate::sched::die_of_fatal_signal(sig);
     }
     true
