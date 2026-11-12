@@ -144,6 +144,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "seccomp_filter"
+path = "fuzz_targets/seccomp_filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "signal_sets"
 path = "fuzz_targets/signal_sets.rs"
 test = false

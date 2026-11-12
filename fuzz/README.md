@@ -92,6 +92,7 @@ not merely that it does not panic - a crash is the least informative outcome.
 | `link_wire` | `link::{parse_sll, encode_sll, parse_ethernet, encode_ethernet, Frames}` | 短的或异族的 `sockaddr_ll` 被拒，字段落在 `linux/if_packet.h` 的偏移上并等于给定字节；短于以太网头的帧被拒；以太网类型就是线上那两个字节；两个 encode 都能往返；环形缓冲不超过 `RING_FRAMES` 且留住最新的 |
 | `signal_sets` | `sched::signal` | 表外信号被丢弃；pending 集按序取空 |
 | `sched_policy` | `sched::policy::Scheduler` | 每次转移恰好移动它声称的那数量；时钟不回退 |
+| `seccomp_filter` | `seccomp::Program::{parse, run}` | 长度域的拒绝按 `parse` 自己的次序（空、非 8 的倍数、条数超限）；内容域的拒绝由字节重推（未终止、跳转越界）；`Ok` 时末条是 `RET`、每个跳转落在 `pc+1+off < count` 之内、两次 `parse` 同答、`run` 对同一输入两次同答；越界载入、除零、移位过宽都答 `RET_KILL_THREAD` 而从不 panic |
 | `date_civil` | `date::{days_from_civil, civil_from_epoch}` | 两个方向互为逆运算，包括闰年规则 |
 | `logging_cmdline` | `logging::level_from_cmdline` | 任何命令行都落在可比较的等级区间内 |
 | `inotify_record` | `vfs::inotify::{pad_name, record_len, event_matches}` | 记录声明的长度与它的字节一致，且对齐 |
