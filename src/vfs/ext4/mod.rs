@@ -4239,4 +4239,51 @@ mod tests {
         );
         assert_eq!(flagged.flags().expect("flags"), want, "and nothing changed");
     }
+
+    /// An inode's *indirect* block word is disk data too, and a number past
+    /// the volume must answer "hole" rather than reach the block cache.
+    ///
+    /// Found by running `fuzz_targets/ext4_image.rs` at `-runs=400` on
+    /// 2026-11-12: a mutated image put `1869902697` in `i_block[12]` of a
+    /// 128-block filesystem and the run died in `read_bytes`' own net
+    /// (`docs/notes/` §3.29). In a release build that net is a `debug_assert!`
+    /// and the read below it answers zeros - so nothing a boot does changes.
+    /// What changes is that the invariant the net *asserts* now holds: the
+    /// number reaching the cache has already been vetted where it was
+    /// consumed.
+    ///
+    /// The pin is the panic's absence, which is why it needs the host test
+    /// profile's `debug_assertions`: without the fix this test dies inside
+    /// `ptr_at` instead of answering, exactly as the fuzzer did.
+    #[test]
+    fn an_indirect_block_past_the_volume_reads_as_a_hole() {
+        let dev = format();
+        // A file whose only block pointer is block 12 - the single-indirect
+        // word - naming a block the volume does not have. Its data block is
+        // real, so the fixture's own bookkeeping stays consistent; what is
+        // invented is the pointer the read will follow.
+        seed_file(&dev, 11, "beyond", 14, b"data");
+        const INODE12: usize = TABLE + 10 * 128; // inode 11
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            let disk = &mut *disk;
+            put32(disk, INODE12 + 40, 0); // no direct block at all
+            put32(disk, INODE12 + 40 + 12 * 4, 5000); // i_block[12], past 128
+            // A size that reaches into the indirect range, so the read asks
+            // for logical block 12 and therefore follows that word.
+            put32(disk, INODE12 + 4, 16 * 1024);
+        });
+
+        let fs = mounted(Arc::new(dev));
+        let file = fs.inode_of(11);
+        let mut buf = [0xAAu8; 1024];
+        // The answer is a hole: zeros, and the bytes the buffer already held
+        // are gone, which is what distinguishes "read as nothing" from "did
+        // not touch the buffer".
+        let n = file
+            .read_at(12 * 1024, &mut buf)
+            .expect("a read, not a panic");
+        assert_eq!(n, 1024, "the hole still answers for the whole block");
+        assert!(buf.iter().all(|b| *b == 0), "a hole reads as zeros");
+    }
 }

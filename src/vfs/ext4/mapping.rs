@@ -10,6 +10,19 @@ impl Core {
     /// disk does not have, and the caller's answer for a hole is already the
     /// right one for that: read as zeros, never written to.
     pub(crate) fn ptr_at(&self, block: u64, i: usize) -> Option<u64> {
+        // The block being *read from* is disk data too, and every caller hands
+        // it what an inode's own `i_block[12]`/`i_block[13]` word said. That
+        // word is a 32-bit number out of an image nobody validated, so it can
+        // name a block this volume does not have - and asking the cache for it
+        // is the one read here the caller's answer ("hole") cannot express
+        // after the fact. Vetted where the number is *consumed*, which is this
+        // function: the same rule as the value below, one level up. Found by
+        // running the ext4 fuzzer at `-runs=400` in a dev profile, where the
+        // net in `read_bytes` fired on a 128-block image and a block number of
+        // 1869902697 (`docs/notes/` §3.29).
+        if !self.block_is_live(block) {
+            return None;
+        }
         let mut bytes = [0u8; 4];
         self.read_bytes(block, i * 4, &mut bytes);
         let value = le32(&bytes, 0);
@@ -148,6 +161,16 @@ impl Core {
         i: usize,
         allocated: &mut bool,
     ) -> VfsResult<u64> {
+        // The indirect block is an inode's own `i_block[12]`/`i_block[13]`
+        // word, so it is disk data as much as the slot inside it is. Asking
+        // for a slot in a block the volume does not have cannot be served:
+        // `put_ptr` would be dropped by `update_block`'s own vet, which leaves
+        // the caller holding a block number nothing records - a write that
+        // reports success and changes no pointer. `Corrupt` is what the image
+        // is (`docs/notes/` §3.29, the read path's half of the same lesson).
+        if !self.block_is_live(indirect) {
+            return Err(VfsError::Corrupt);
+        }
         match self.ptr_at(indirect, i) {
             Some(block) => Ok(block),
             None => {
