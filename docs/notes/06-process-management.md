@@ -13077,3 +13077,128 @@ That program alone was green 3/3 boots (200/200 each), and its claim is the
 *blocked* child that this kernel's timed park wakes periodically. Six TCG lanes
 make the runnable moment likelier; nothing in this change touches the scheduler.
 The second sweep was green on both arms.
+
+## §6.146 the poll-window class closed across the suite: four claims, and the last one was §6.144a's own (2026-11-12)
+
+§6.144a closed with a warning rather than a conclusion: with `t-ptrace-attach`, `t-wchan` and
+`t-rr-interval` fixed in three consecutive sweeps, "the suite's remaining *unconditional* samples of
+a parkable task are the same defect waiting to fire". This is the audit that went looking for them -
+all **321** programs in `user/tests/src/bin` (97 read `/proc`, 61 mention a state), sorted against
+the class's three signals: a single read of a `/proc` state file or of a state-sensitive call about a
+child expected blocked/sleeping/stopped, with no retry; a fixed-count loop demanding that every
+sample show one state; and a claim whose red line cannot distinguish "the kernel disagreed" from "we
+sampled at the wrong instant".
+
+**Four programs still had the shape and were changed, and none of it was a kernel bug** - each is
+green on the host, 3/3 boots in the x86_64 guest and green on the aarch64 arm after the change. The
+fourth is the sharp one: the conditional shape §6.144a prescribed - read the state letter once, in
+the same breath as the call - is *still* a poll window, because that letter comes from a different
+syscall than the call it conditions. A full aarch64 lane said so in this audit's own gate.
+
+### `t-proc-syscall`: one sample of a timed park, and a zombie after a fixed sleep
+
+The newest program (§6.143) carried the class's first signal twice. Its "a task parked in `read(2)`
+reports read and its descriptor" slept 150 ms and read `/proc/<pid>/syscall` **once**, demanding the
+answer every time - the same "any look lands on the asleep side" promise a timed park does not make
+that reddened `t-wchan` one sweep earlier. Its zombie claim slept a fixed 150 ms too and never read
+the state it was naming.
+
+**Measurement, with the fix's own instrumentation in the guest: `199 asleep of 200, 0 disagreed` in
+all three boots, and the same `199 of 200` on the host.** One sample in two hundred catches the
+runnable moment the child alternates into - which is exactly the instant a single sample could land
+on, and the old line would have failed there while the file was answering correctly.
+
+The claim is now the conditional one, the `t-rr-interval` shape: each sample reads
+`/proc/<pid>/stat`'s field 3 in the same breath as the file, an **asleep** sample that does not name
+`read` and the descriptor the child was given is the disagreement the claim exists to catch, and at
+least a quarter of the samples must have found it asleep so a child that was never parked cannot pass
+it. The zombie half now polls for the letter `Z` (200 x 5 ms) and asserts it beside the three-field
+form, so a red line says which fact moved.
+
+### `t-wchan`: "a zombie is not waiting either" was a fixed sleep, not a state
+
+§6.144 fixed the single sample *above* this claim and left it as the file's other window: spawn a
+child that exits at once, sleep 400 ms, read `wchan` once, expect `0`. It even printed the state and
+never asserted it - and a running task and a corpse both read `0`, so the line could pass without the
+zombie existing and could fail for an instant it never named.
+
+The fix is the rule the rest of the file already follows: poll for the state the claim names (400 x
+5 ms for `Z`), then read the word, and require both. Once the letter reads `Z` the answer is fixed -
+`waitpid` is what takes the entry away. Guest: `state Some('Z')` 3/3.
+
+### `t-waitid`: the named child was slept through the sibling's settle loop
+
+The class's third signal is exact here. "A zombie sibling is not the named child's event" forked the
+named child beside the sibling, then waited (up to 400 x 5 ms, a **2000 ms** bound) for the sibling
+to become a zombie, then sampled the named child's wait. The named child slept **150 ms**. On a lane
+slow enough to spend that sleep inside the settle loop, `waitid(P_PID, alive, WEXITED|WNOHANG)`
+answers with the named child's *own* exit record, `si_pid == alive`, and the line fails - the same
+red as a kernel that ignored `id` and answered the sibling's record, which is the divergence the
+claim was written for. Two findings, one message.
+
+The fix makes the sample a fact instead of a race: the sibling is forked and its death waited for
+**first**, and the named child is born after that wait, so its 150 ms only has to outlast the two
+calls the claim is about. Its state letter is read in the same breath and carried in the line (and
+is part of the verdict, `!= 'Z'`), so a future red says which of the two findings it is. Measured in
+the guest: `named child state Some('R')` in one boot and `Some('S')` in two - the state at the
+instant genuinely varies, which is why the fixture must not depend on it.
+
+### `t-rr-interval`: §6.144a's one-letter conditional was one letter short
+
+The gate that closed this audit went red on the *previous* fix, on the second machine:
+
+```text
+FAIL:  a sample that finds the blocked child asleep is answered zero (99 asleep of 200, 8 disagreed, 102 zeros overall)
+```
+
+In the same run the paired control passed - `0 zeros, 200 of 200 slices; the blocked child read 102
+zeros and 8 slices` - and the stopped (`state T`) and zombie (`state Z`) claims were green, so the
+kernel's runqueue rule was intact. What the line caught is the sampling: `state_letter` and the
+`sched_rr_get_interval` call are two syscalls, and on aarch64 the parked child alternated fast enough
+(99 of 200 samples caught it asleep) that the pair disagreed in **both** directions in one run - 8 of
+99 asleep-before samples answered a slice and 11 of 101 runnable-before samples answered zero. Two
+reads of one moving record, one letter from an earlier instant and an answer from a later one: a
+single letter *before* the call cannot say what the call saw. The kernel has no window here - both
+doors read the same `state_of` under the table lock (`src/sched/runtime/procfs.rs`) - the test does.
+
+The fix reads the letter on **both sides** of the call. A sample where both sides read `S` describes
+one state across the whole window the call sits in, and a slice answer there is the disagreement the
+claim exists for. A letter that moved across the call is counted apart (`blocked_moved`): that is the
+park alternating, not the kernel answering wrongly, and the line prints it so the two are separable.
+The non-vacuity floor stays (`>= SAMPLES / 8`). The duplicate helper the previous fix had added
+(`state_of`, character-identical to `state_letter`) is gone.
+
+Measured after the fix, x86_64 guest: `200 asleep both sides of 200, 0 disagreed, 0 letter moved` in
+all three boots. The aarch64 arm is the one that failed and is green on three runs
+(`build/gate-pa-aarch64-{1,2}.log` and the final gate's arm below). Host `PASS` - the machine-only
+claim is skipped there for §6.132's reason.
+
+### Audited, and deliberately not touched
+
+- **State reads that already loop**: `t-clone-exit`, `t-leader-outlived`, `t-exit-group`,
+  `t-stat-bounds`, `t-stat-flags`, `t-statm`, `t-status-vm`, `t-stale-pid`, `t-tid-dir` and
+  `t-proc-timers` all wait for the state letter (`Z`) with a bounded loop before judging the answer.
+- **Live-child fixtures forked immediately before the probe**, with no settle loop between the fork
+  and the call: `t-pidfd`'s `child_sleeps(150)` claims and `t-wait4`'s "WNOHANG on a running child
+  answers 0" - a microsecond gap against a documented budget, not a sample of a timed park.
+- **Claims about the caller's own state, or about a value genuinely constant for the subject**:
+  `t-cpuclock`'s sleeping process, `t-smaps`' parked child's mapping `Size`/`Rss`, `t-oom-score`'s
+  adjustment relation, `t-clock-getres`' coarse readings, `t-loadavg`, `t-procstat` - the class's
+  own exemption list.
+- **The three prior fixes**: `t-ptrace-attach`'s `!gone && state == "T"` and `t-wchan`'s sampled
+  pairing needed nothing. `t-rr-interval`'s did, one letter stronger (above).
+
+### Verification and the sweep
+
+Host (`MPOS_ON_HOST=1`, rebuilt for `x86_64-unknown-linux-musl`): `t-proc-syscall`, `t-wchan`,
+`t-waitid` and `t-rr-interval` all `PASS`. Guest, single-boot harness (`MEM=3072`,
+`.workbuddy/one-test-boot.sh`, three boots each): `build/boot-pa-procsyscall-{1,2,3}.log`,
+`build/boot-pa-wchan-{1,2,3}.log`, `build/boot-pa-waitid-{1,2,3}.log`, `build/boot-pa-rr-{1,2,3}.log`
+- 3/3 green each. The aarch64 arm (the machine that failed) ran green three times:
+  `build/gate-pa-aarch64-{1,2}.log` (`verdict pass=305 fail=0`) and the final gate's own arm.
+
+The full gate (`build/gate-pollaudit.log`) is `GATE_EXIT=0`, stage 1 `1296 tests, 0 failed`, and
+`pass=306 fail=0` on x86_64 / `pass=305 fail=0` on aarch64, with `mpos-kunit 35 passed, 0 failed` on
+each. **Four programs changed out of 321 audited; no kernel behaviour was touched and no genuine
+kernel bug was found** - the class's remaining instances were claims asking a timed park for a
+continuity, or for an instant, that it does not promise.

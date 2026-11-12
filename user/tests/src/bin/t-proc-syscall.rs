@@ -5,10 +5,13 @@
 //! to calls the program makes itself, so they hold on both machines where the
 //! numbers differ:
 //!
-//! * a task parked in `read(2)` reports `read`'s number and that call's file
-//!   descriptor as its first argument;
+//! * a sample that finds a task asleep in `read(2)` reports `read`'s number and
+//!   that call's file descriptor as its first argument - the child's state is
+//!   read in the same breath, because a *timed* park alternates between asleep
+//!   and briefly runnable (`docs/notes/` §6.144a, §6.146);
 //! * a task in ring 3 reports the word `running`;
-//! * a zombie reports Linux's three-field form `-1 0x0 0x0`.
+//! * a zombie (waited for by its state letter, not by a sleep) reports Linux's
+//!   three-field form `-1 0x0 0x0`.
 //!
 //! Measured on Linux 7.2.14 first (`build/scratch/procsyscall/p.c`).
 
@@ -30,6 +33,25 @@ fn fields(text: &str) -> Vec<&str> {
 /// Parse a `0x`-prefixed hex field.
 fn hex(field: &str) -> Option<u64> {
     u64::from_str_radix(field.strip_prefix("0x")?, 16).ok()
+}
+
+/// The state letter `/proc/<pid>/stat` reports, or `None` when the task is not
+/// there (or the file cannot be read).
+///
+/// The companion the two claims about a *child* need: this kernel's parks are
+/// **timed**, so a child blocked in a pipe read alternates between parked and
+/// briefly runnable, and a sample of it must record which moment it caught
+/// rather than assume it always caught the asleep one (`docs/notes/` §6.144).
+/// Field 3 is the first token after the parenthesised `comm`, which may itself
+/// contain spaces and parentheses, so the split starts after the last `)`.
+fn state_of(pid: i32) -> Option<char> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    text.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 fn main() {
@@ -124,13 +146,42 @@ fn main() {
     }
     r.check("a parked child exists", parked > 0);
     if parked > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let text = std::fs::read_to_string(format!("/proc/{parked}/syscall")).ok();
-        let g = fields(text.as_deref().unwrap_or(""));
+        // The claim is the **conditional** one, which is what this kernel owes
+        // (`docs/notes/` §6.144a): a sample that finds the task asleep inside
+        // `read` must name `read` and the descriptor the call was given. The
+        // single sample this used to be asked a timed park for a promise a
+        // timed park does not make - that *any* look, at any instant, lands on
+        // the asleep side - and it could not tell "the file forgot the call"
+        // from "the child had not reached the read yet" (§6.78a's lesson, one
+        // file later).
+        //
+        // So each sample reads the state letter in the same breath as the file
+        // and the two moments are counted apart: a disagreement is a sample
+        // that reports `S` *and* does not name `read`/the descriptor, which is
+        // the kernel answer this claim exists to catch. The floor keeps a claim
+        // from passing on a child that was never parked for a single sample.
+        const SAMPLES: usize = 200;
+        let mut asleep = 0usize;
+        let mut disagreed = 0usize;
+        for _ in 0..SAMPLES {
+            let state = state_of(parked);
+            let text = std::fs::read_to_string(format!("/proc/{parked}/syscall")).ok();
+            let g = fields(text.as_deref().unwrap_or(""));
+            let named = g.first().and_then(|v| v.parse::<i64>().ok()) == Some(READ_NR)
+                && g.get(1).and_then(|v| hex(v)).map(|v| v as i32) == Some(pp[0]);
+            if state == Some('S') {
+                asleep += 1;
+                if !named {
+                    disagreed += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         r.check(
-            &format!("a task parked in read(2) reports read and its descriptor (got {g:?})"),
-            g.first().and_then(|v| v.parse::<i64>().ok()) == Some(READ_NR)
-                && g.get(1).and_then(|v| hex(v)).map(|v| v as i32) == Some(pp[0]),
+            &format!(
+                "a sample that finds the task asleep in read(2) names read and its descriptor ({asleep} asleep of {SAMPLES}, {disagreed} disagreed)"
+            ),
+            asleep >= SAMPLES / 4 && disagreed == 0,
         );
         unsafe {
             libc::kill(parked, libc::SIGKILL);
@@ -147,14 +198,26 @@ fn main() {
         std::process::exit(7);
     }
     if zombie > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Wait for the **state the claim is about**, not for a fixed number of
+        // milliseconds: a zombie cannot leave the table until it is reaped, so
+        // once the letter reads `Z` the answer below is stable; before it does,
+        // a red line could not tell the kernel's answer from ours. The same
+        // poll the sibling `/proc` files use (`docs/notes/` §6.78a).
+        let mut state = None;
+        for _ in 0..200 {
+            state = state_of(zombie);
+            if state == Some('Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let text = std::fs::read_to_string(format!("/proc/{zombie}/syscall")).ok();
         // `-1` is the number no syscall has, and a task with no saved frame has
         // zeros where the two registers go - Linux's three-field form, not a
         // nine-field line of zeros and not `running`.
         r.check(
-            &format!("a zombie answers Linux's three-field form (got {text:?})"),
-            text.as_deref() == Some("-1 0x0 0x0\n"),
+            &format!("a zombie answers Linux's three-field form (state {state:?}, got {text:?})"),
+            state == Some('Z') && text.as_deref() == Some("-1 0x0 0x0\n"),
         );
         let mut status = 0;
         unsafe { libc::waitpid(zombie, &mut status, 0) };

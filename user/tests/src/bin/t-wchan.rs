@@ -228,16 +228,25 @@ fn main() {
         .spawn()
         .expect("spawn a child that exits at once");
     let dead_pid = dead.id() as i32;
-    // Let it die, then read it before reaping: `waitpid` takes the `/proc`
-    // entry away with it.
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Wait for the **state the claim names** - a zombie - rather than sleeping a
+    // fixed 400 ms and hoping: a live task and a corpse both read `0` from this
+    // file, so a sample taken before the death could not tell the kernel's
+    // answer from ours, and a child that became a zombie while still running
+    // through its exit would make the line red for a reason it never printed.
+    // Once the letter says `Z` the answer is fixed: `waitpid` takes the `/proc`
+    // entry away, and nothing else moves a corpse.
+    let mut dead_state = None;
+    for _ in 0..400 {
+        dead_state = state_letter(dead_pid);
+        if dead_state == Some('Z') {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let dead_word = wchan(dead_pid);
     report.check(
-        &format!(
-            "a zombie is not waiting either ({dead_word:?}, state {:?})",
-            state_letter(dead_pid)
-        ),
-        dead_word.as_deref() == Some("0"),
+        &format!("a zombie is not waiting either ({dead_word:?}, state {dead_state:?})"),
+        dead_state == Some('Z') && dead_word.as_deref() == Some("0"),
     );
     let _ = dead.wait();
     report.check(

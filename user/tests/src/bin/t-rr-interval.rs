@@ -220,9 +220,8 @@ fn main() {
     // Until §6.131's gate the single-sample form of this claim was written for
     // both, and a loaded aarch64 lane failed it with `state S, got 4000000 ns`.
     let mut blocked_zero = 0usize;
-    let mut blocked_slice = 0usize;
-    // Samples in which the blocked child was confirmed **asleep** when the call
-    // was made, and the ones where it was momentarily runnable instead.
+    // Samples in which the blocked child was confirmed **asleep** at the same
+    // moment as the call, and the ones where the letter moved across it.
     //
     // This split is the fix for the claim's second form (§6.144): the child is
     // parked in a pipe read that will never be satisfied, but the park is
@@ -237,21 +236,42 @@ fn main() {
     // answered a slice for a task it also called sleeping is wrong, and this
     // still catches it - it just no longer asks the park to be continuous,
     // which a timed park does not promise.
+    //
+    // §6.146 is why the state is read on **both sides** of the call. One letter
+    // read a moment *before* the call is a different instant from the one the
+    // call takes, and on a loaded aarch64 lane the pair disagreed in both
+    // directions in the same run - `99 asleep of 200` with `8 disagreed` while
+    // a spinner answered 200/200 slices: a letter from an earlier syscall and
+    // an answer from a later one are two reads of one moving record, and the
+    // park alternates fast enough there for the two to land on opposite sides.
+    // Requiring `S` on both sides means no letter moved anywhere in the window
+    // the call sits in, so the sample really does describe one state; a letter
+    // that moved is counted apart (`blocked_moved`) rather than as a
+    // disagreement, because it is the park alternating, not the kernel
+    // answering wrongly.
     let mut blocked_asleep = 0usize;
+    let mut blocked_moved = 0usize;
+    let mut blocked_slice = 0usize;
     let mut runnable_zero = 0usize;
     let mut runnable_slice = 0usize;
     for _ in 0..SAMPLES {
-        let asleep = state_letter(pid as usize) == Some('S');
-        if let (OK, nsec) = interval(pid as usize) {
-            if asleep {
+        let before = state_letter(pid as usize);
+        let answered = interval(pid as usize);
+        let after = state_letter(pid as usize);
+        if let (OK, nsec) = answered {
+            if before == Some('S') && after == Some('S') {
                 blocked_asleep += 1;
+                if nsec != 0 {
+                    // A slice answer *while the record reads asleep on both
+                    // sides of it*: this is the disagreement the claim exists
+                    // for.
+                    blocked_slice += 1;
+                }
+            } else if before != after {
+                blocked_moved += 1;
             }
             if nsec == 0 {
                 blocked_zero += 1;
-            } else if asleep {
-                // A slice answer *while the same moment reads asleep*: this is
-                // the disagreement the claim exists for.
-                blocked_slice += 1;
             }
         }
         if let (OK, nsec) = interval(spinner as usize) {
@@ -274,9 +294,9 @@ fn main() {
     if !mpos_user_tests::host_run() {
         r.check(
             &format!(
-                "a sample that finds the blocked child asleep is answered zero ({blocked_asleep} asleep of {SAMPLES}, {blocked_slice} disagreed, {blocked_zero} zeros overall)"
+                "a sample that finds the blocked child asleep on both sides is answered zero ({blocked_asleep} asleep both sides of {SAMPLES}, {blocked_slice} disagreed, {blocked_moved} letter moved)"
             ),
-            blocked_asleep >= SAMPLES / 4 && blocked_slice == 0,
+            blocked_asleep >= SAMPLES / 8 && blocked_slice == 0,
         );
     }
 
@@ -296,7 +316,7 @@ fn main() {
     unsafe { libc::kill(pid, libc::SIGSTOP) };
     let mut status = 0i32;
     unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
-    let state = state_of(pid as usize);
+    let state = state_letter(pid as usize);
     let (code, nsec) = interval(pid as usize);
     r.check(
         &format!(
@@ -335,7 +355,7 @@ fn main() {
     // kernel's `task_state` reports `Z` for as long as the slot holds the
     // record, so its answer is fixed. §6.132.
     if !mpos_user_tests::host_run() {
-        let state = state_of(zombie as usize);
+        let state = state_letter(zombie as usize);
         let (code, nsec) = interval(zombie as usize);
         r.check(
             &format!(
@@ -362,7 +382,7 @@ fn main() {
     // *everything* from passing, and it samples under one load; this asks the
     // same child again after the stop and the reap, so the control is not a
     // property of that one window.
-    let state = state_of(spinner as usize);
+    let state = state_letter(spinner as usize);
     let (code, nsec) = interval(spinner as usize);
     r.check(
         &format!(
@@ -380,16 +400,4 @@ fn main() {
     }
 
     r.finish();
-}
-
-/// The state letter this machine reports for `who` in `/proc/<who>/stat`, or
-/// `None` when there is no such file. Used only to make a red line readable:
-/// the claims above assert the *answer*, and this says what the kernel thought
-/// of the target when it gave it.
-fn state_of(who: usize) -> Option<char> {
-    let text = std::fs::read_to_string(format!("/proc/{who}/stat")).ok()?;
-    // Field 3 is the letter, and the command field (2) is parenthesised and may
-    // contain spaces, so the letter is the first character after the last ')'.
-    let after = text.rsplit_once(')')?.1;
-    after.split_whitespace().next()?.chars().next()
 }

@@ -2453,3 +2453,14 @@ carries the per-phase history.*
   higher, a larger resident set scores higher, another task readable, a gone pid `ENOENT`) that both
   machines keep. `t-oom-score` is green on the host first and in the guest, 10/13 counterfactually
   red without the file. (§6.145, item 258)
+- the **poll-window class** is closed across the user suite: a claim that samples a *parkable* task
+  now asserts the state the kernel reports and lets sampling only establish that the state is
+  reachable. The audit of all 321 programs found four still carrying the shape - `t-proc-syscall`'s
+  parked-child sample (measured `199 asleep of 200`, one look in two hundred catching the timed
+  park's runnable moment) and its fixed-sleep zombie, `t-wchan`'s zombie claim (a fixed 400 ms sleep
+  that never asserted `Z`), `t-waitid`'s named child sampled after a 2000 ms settle loop against its
+  own 150 ms sleep, and `t-rr-interval`'s one-letter conditional - a full aarch64 lane read
+  `99 asleep of 200, 8 disagreed` because the letter is a *different syscall* from the call it
+  conditions, so the fix reads the letter on **both sides** of it (`blocked_moved` counts a letter
+  that moved apart, a slice with `S` on both sides is the disagreement) and requires a floor. Host
+  PASS and 3/3 boots per changed program; no kernel behaviour touched. (§6.146, item 259)

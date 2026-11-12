@@ -294,6 +294,25 @@ fn await_event(kid: libc::pid_t, options: i32) -> Option<libc::siginfo_t> {
     None
 }
 
+/// The state letter `/proc/<pid>/stat` reports, or `None` when the task is not
+/// there (or the file cannot be read).
+///
+/// A claim about *whether* a child has an event to report depends on that child
+/// not having finished yet, and this kernel's parks are timed, so the letter is
+/// what separates "the call answered wrongly" from "the fixture outlived its
+/// sleep" in a red line (`docs/notes/` §6.78a, §6.146). Field 3 is the first
+/// token after the parenthesised `comm`, which may itself contain spaces and
+/// parentheses, so the split starts after the last `)`.
+fn state_of(pid: libc::pid_t) -> Option<char> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    text.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
 fn main() {
     println!("t-waitid");
     let mut r = Report::new();
@@ -450,17 +469,24 @@ fn main() {
     // and hands the *sibling's* record to nobody but the caller that names it.
     // A kernel that ignores its `id` answers with the sibling here - which is
     // exactly the divergence this claim was written for.
-    let alive = unsafe { libc::fork() };
-    if alive == 0 {
-        sleep_ms(150);
-        leave(0);
-    }
+    //
+    // The **order** is load-bearing and is this section's fix (`docs/notes/`
+    // §6.146). The named child used to be forked beside the sibling and sampled
+    // after the sibling's death was waited for - a wait bounded at 2000 ms
+    // against the child's own 150 ms sleep. A lane slow enough to spend the
+    // sleep inside that wait made the claim red with the *same* line whether the
+    // kernel had answered with a stranger's record or the named child had
+    // already finished: two findings, one message, which is the poll-window
+    // class §6.78a and §6.144 record. So the sibling is forked and waited for
+    // first, and the named child is born **after** that wait - its 150 ms now
+    // only has to outlast the two calls below, not the settle loop above.
     let zombie = child_that_exits(4);
     r.check(
-        "the running child and its zombie sibling were forked",
-        alive > 0 && zombie > 0,
+        "a child was forked to become the zombie sibling",
+        zombie > 0,
     );
-    if alive > 0 && zombie > 0 {
+    let mut alive: libc::pid_t = -1;
+    if zombie > 0 {
         // Wait for the sibling to be a zombie, so the only thing that can keep
         // the next answer honest is the `id`. `WNOWAIT` is load-bearing here:
         // this probe must *look* at the record without collecting it, or the
@@ -483,12 +509,25 @@ fn main() {
             tries += 1;
         }
         r.check("the sibling became a zombie", ready);
-
+        alive = unsafe { libc::fork() };
+        if alive == 0 {
+            sleep_ms(150);
+            leave(0);
+        }
+    }
+    r.check(
+        "the running child and its zombie sibling were forked",
+        zombie > 0 && alive > 0,
+    );
+    if zombie > 0 && alive > 0 {
         let mut info = poisoned();
+        let alive_state = state_of(alive);
         let answered = waitid(libc::P_PID, alive, &mut info, libc::WEXITED | libc::WNOHANG);
         r.check(
-            "a zombie sibling is not the named child's event",
-            answered == 0 && unsafe { info.si_pid() } == 0,
+            &format!(
+                "a zombie sibling is not the named child's event (named child state {alive_state:?})"
+            ),
+            answered == 0 && unsafe { info.si_pid() } == 0 && alive_state.is_some_and(|c| c != 'Z'),
         );
 
         // And the sibling is still there to be collected, by name.
@@ -518,12 +557,16 @@ fn main() {
         }
 
         // WNOHANG while the only child left is still running: 0 with the info
-        // cleared, not an error and not a blocking wait.
+        // cleared, not an error and not a blocking wait. The state letter goes
+        // in the line beside the answer for the same reason the claim above
+        // carries it: an empty or `Z` letter is a fixture that outlived its
+        // 150 ms, a live letter with an answer is the kernel saying something.
         let mut info = poisoned();
+        let alive_state = state_of(alive);
         let answered = waitid(libc::P_PID, alive, &mut info, libc::WEXITED | libc::WNOHANG);
         r.check(
-            "WNOHANG with nothing ready answers 0, not an error",
-            answered == 0,
+            &format!("WNOHANG with nothing ready answers 0, not an error (state {alive_state:?})"),
+            answered == 0 && alive_state.is_some_and(|c| c != 'Z'),
         );
         r.check("and clears si_pid to 0", unsafe { info.si_pid() } == 0);
 
