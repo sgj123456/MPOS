@@ -4478,8 +4478,8 @@ const ITIMERSPEC_SIZE: usize = 32;
 /// comment said the opposite for a while after the group table landed - the
 /// stale sentence is exactly what the pin exists to catch.
 ///
-/// A `clockid` this kernel has no clock for — the CPU-time clocks, whose
-/// accounting does not exist here — is `EINVAL`, as is an out-of-range
+/// A `clockid` this kernel has no clock for is refused with the errno Linux
+/// uses for that clock (§6.123, §6.124), as is an out-of-range
 /// `sigev_notify`, a signal number the kernel cannot queue, or a
 /// `SIGEV_THREAD_ID` naming a thread outside the caller's group: a timer
 /// aimed at another process's thread is a way to signal a process the caller
@@ -4605,14 +4605,23 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     }
 
     // The tid is validated against the caller's thread group inside the
-    // scheduler's table, where the group is known.
-    let slot = match crate::sched::timer_alloc(signo, value, notify, clock) {
-        Ok(slot) => slot,
+    // scheduler's table, where the group is known. The clock id goes with the
+    // clock: `/proc/<pid>/timers` reports `timer->it_clock`, which for the wall
+    // clocks *is* the caller's number and for a CPU clock is the kernel's own
+    // encoded form, so the table has to remember which one was asked for.
+    let id = match crate::sched::timer_alloc(
+        signo,
+        value,
+        notify,
+        clock,
+        abi::timer_clock_word(clockid as i32),
+    ) {
+        Ok(id) => id,
         Err(e) => return e,
     };
     // The id the caller holds. Linux hands out an `int`; a libc widens it into
     // its `timer_t`, so four bytes out is the whole answer.
-    unsafe { (out as *mut i32).write_unaligned(slot as i32) };
+    unsafe { (out as *mut i32).write_unaligned(id as i32) };
     0
 }
 

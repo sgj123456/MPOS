@@ -2362,3 +2362,18 @@ carries the per-phase history.*
   counterfactually. Named gaps: this kernel's vector is sixteen entries where Linux's is
   twenty-three (the loader's gap, not the file's), and a zombie answers `ENOENT` where Linux answers
   `ESRCH`. (§6.136, item 250)
+- **`/proc/<pid>/timers` lists the group's POSIX timers, and a `timer_t` is a counter now.** The file
+  did not exist, so a program could only remember what it had created; writing it exposed the worse
+  defect underneath: the handle **was the slot index**, so `delete(1); create()` handed `1` back and
+  the old handle began naming a different timer - a silent retarget no test could see, because none
+  of them deleted anything. Linux keeps a per-process counter (`0,1,2,3,4`, delete `1`, create -> `5`)
+  and lists the table descending; `timer_alloc` now returns that counter while still picking the
+  lowest slot, and `timer_arm`/`timer_state`/`timer_overrun`/`timer_remove` resolve through
+  `timer_slot`. The file is `0444`, four lines per timer (`ID:`/`signal:`/`notify:`/`ClockID:`), the
+  `signal:` value the `sigval` as 16 hex digits, the subject named in the reader's namespace
+  (`pid.N`, and `signal/tid.N` for a thread-directed timer - the word before the slash names the
+  mechanism), `ClockID` the caller's own id for a wall clock and `-6` for the process CPU clock, no
+  per-thread spelling, and a zombie keeps the file **empty** until the reap. Pin `t-proc-timers`
+  (18 claims) is `PASS` on both arms and **15 of 18 red** counterfactually. Named gaps: the
+  eight-slot table answers `EAGAIN` where Linux is bounded by `RLIMIT_SIGPENDING`, and `TIMER_ABSTIME`
+  is still refused. (§6.137, item 251)

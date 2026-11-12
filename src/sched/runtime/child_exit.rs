@@ -1609,6 +1609,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             },
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
         });
 
@@ -2234,6 +2235,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             },
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
             mm: {
                 mm.join();

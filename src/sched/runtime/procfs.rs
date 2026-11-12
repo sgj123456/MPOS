@@ -488,6 +488,15 @@ pub struct TaskSnapshot {
     /// [`crate::abi::tty_nr`] so this field and anything else that names a
     /// terminal encode it one way (§6.129).
     pub tty_nr: u32,
+    /// This thread group's POSIX timers, newest number first - what
+    /// `/proc/<pid>/timers` prints, four lines per timer.
+    ///
+    /// A snapshot carries them rather than the file reaching into the table,
+    /// because the file needs the *reader* to name a `SIGEV_THREAD_ID` target
+    /// in its own pid namespace and the table is the scheduler's: the numbers
+    /// travel as numbers and the translation happens where the reader is
+    /// known (§6.137).
+    pub timers: alloc::vec::Vec<crate::abi::TimerLine>,
     /// `/proc/<pid>/stat`'s field 8, `tpgid`: the process group the terminal
     /// would send its interrupt to, or `-1` for a task with no controlling
     /// terminal.
@@ -678,6 +687,70 @@ pub fn saved_auxv_of(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
     })
 }
 
+/// The timers of `id`'s thread group, newest number first - the order Linux
+/// lists them in (measured: ids 0..4 print `5, 4, 3, 2, 0` after the second was
+/// deleted, `build/scratch/ptimers/t.c`).
+///
+/// `None` is the file's own absence: a task that has exited has no timers to
+/// report and `/proc/<pid>/timers` is `ENOENT` there, as measured on the host.
+pub fn timer_lines(id: TaskId) -> Option<alloc::vec::Vec<crate::abi::TimerLine>> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(|entry| entry.as_ref())?;
+        // A zombie's file exists and is **empty**, not absent: measured on the
+        // host (`build/scratch/ptimers/z.c`, 7.2.14) a killed-but-unreaped child
+        // reads `0 bytes` while the same number after the reap is `ENOENT`. The
+        // timers themselves are gone by then - Linux tears them down at exit -
+        // so the list is empty rather than the record's last state.
+        if task.exited {
+            return Some(alloc::vec::Vec::new());
+        }
+        // The group's table, whichever thread is asked: Linux keeps POSIX
+        // timers on `signal_struct`, which is what §2.11 measured.
+        Some(lines_of(t.task(task.tgid)))
+    })
+}
+
+/// The four facts `/proc/<pid>/timers` prints, per live timer, newest first.
+///
+/// The notify target stays a raw task id: naming it in the reader's pid
+/// namespace is the file's business (the renderer has the reader), and nothing
+/// above this layer should translate a number it is not printing.
+pub(crate) fn lines_of(task: &Task) -> alloc::vec::Vec<crate::abi::TimerLine> {
+    let mut lines: alloc::vec::Vec<crate::abi::TimerLine> = task
+        .timers
+        .iter()
+        .flatten()
+        .map(|timer| {
+            // The subject is the *process* for the two process-directed kinds -
+            // measured, Linux prints `signal/pid.17830`, the pid of the process
+            // holding the timer - and the named thread for `SIGEV_THREAD_ID`,
+            // which prints `tid.17626`. Both are slots here; the reader's number
+            // is the renderer's to work out.
+            let (kind, subject) = match timer.notify() {
+                crate::sched::TimerNotify::None => {
+                    (crate::abi::TIMER_NOTIFY_NONE, task.tgid.0 as u64)
+                }
+                crate::sched::TimerNotify::Signal => {
+                    (crate::abi::TIMER_NOTIFY_SIGNAL, task.tgid.0 as u64)
+                }
+                crate::sched::TimerNotify::Thread(thread) => {
+                    (crate::abi::TIMER_NOTIFY_THREAD, thread.0 as u64)
+                }
+            };
+            crate::abi::TimerLine {
+                id: timer.id(),
+                signo: timer.signo(),
+                value: timer.value(),
+                kind,
+                subject,
+                clock_word: timer.clock_word(),
+            }
+        })
+        .collect();
+    lines.sort_by(|a, b| b.id.cmp(&a.id));
+    lines
+}
+
 /// The facts about `task`, in the shape `/proc` reports them.
 pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     let state = state_of(t, id, task);
@@ -803,6 +876,11 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .and_then(crate::vfs::tty::by_dev_id)
             .and_then(|tty| tty.foreground())
             .map(|group| group.0),
+        // The group's timer table, whichever thread the file names - Linux
+        // keeps POSIX timers on `signal_struct` (§2.11), and a zombie reads an
+        // empty list here while its file is absent, which `timer_lines` is what
+        // decides (§6.137).
+        timers: lines_of(task),
         // Fields 10, 11 and 12 are faults: the group's own, the group's
         // collected children, and this thread's own. Fields 12 and 13
         // (`majflt`/`cmajflt`) stay zero and are the named gap `Mm::minflt`

@@ -1659,6 +1659,9 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::terminal_foreground`] - `stat`'s field
     /// 8 as the foreground group's **slot**, or `None` for no terminal.
     pub terminal_foreground: Option<usize>,
+    /// See [`crate::sched::TaskSnapshot::timers`] - the group's POSIX timers,
+    /// four lines each in `/proc/<pid>/timers`, newest number first.
+    pub timers: alloc::vec::Vec<crate::abi::TimerLine>,
     /// See [`crate::sched::TaskSnapshot::minflt`] - `stat`'s field 10, the
     /// group's own minor faults.
     pub minflt: u64,
@@ -1812,6 +1815,84 @@ fn io_body(slot: usize, whole: bool) -> Option<alloc::string::String> {
     #[cfg(not(target_os = "none"))]
     {
         let _ = (slot, whole);
+        None
+    }
+}
+
+/// The body of `/proc/<pid>/timers`: four lines per POSIX timer, newest number
+/// first.
+///
+/// Linux writes, per timer (`kernel/time/posix-timers.c`'s `proc_timers_show`,
+/// read off a 7.2.14 host in `build/scratch/ptimers/`):
+///
+/// ```text
+/// ID: 2
+/// signal: 12/0000000000000000
+/// notify: signal/tid.17626
+/// ClockID: -6
+/// ```
+///
+/// - the `ID` is the number `timer_create` answered with, and the ids are listed
+///   **descending** (five creates then a delete printed `5, 4, 3, 2, 0`);
+/// - `signal:` is `signo/sigval` with the value in sixteen hex digits;
+/// - `notify:` is `none|signal|thread` and then the subject as `pid.<n>` for the
+///   first two and `tid.<n>` for the third, named in the **reader's** pid
+///   namespace - which is why the subject arrives as a task id and is translated
+///   here;
+/// - `ClockID:` is `timer->it_clock`, the caller's id for a wall clock and the
+///   kernel's encoded form for a CPU clock ([`crate::abi::timer_clock_word`]).
+///
+/// The file is empty (zero bytes, not a blank line) for a process with no
+/// timers, and `itimer`s do not appear in it at all - measured: `setitimer` on
+/// `ITIMER_REAL` and `ITIMER_VIRTUAL` left the three POSIX lines unchanged.
+fn timers_text(lines: &[crate::abi::TimerLine], translate: impl Fn(usize) -> usize) -> String {
+    let mut body = alloc::string::String::new();
+    for line in lines {
+        // Measured: a `SIGEV_THREAD_ID` timer reads `signal/tid.N`, not
+        // `thread/...` - the word before the slash names the *notification
+        // mechanism*, and a thread-directed timer still notifies by signal; the
+        // slash's suffix is what says the subject is a thread.
+        let (what, prefix) = match line.kind {
+            crate::abi::TIMER_NOTIFY_NONE => ("none", "pid"),
+            crate::abi::TIMER_NOTIFY_SIGNAL => ("signal", "pid"),
+            _ => ("signal", "tid"),
+        };
+        let subject = translate(line.subject as usize);
+        body.push_str(&alloc::format!(
+            "ID: {id}\nsignal: {signo}/{value}\nnotify: {what}/{prefix}.{subject}\nClockID: {clock}\n",
+            id = line.id,
+            signo = line.signo,
+            value = hex16(line.value),
+            what = what,
+            prefix = prefix,
+            subject = subject,
+            clock = line.clock_word,
+        ));
+    }
+    body
+}
+
+/// A `sigval` as Linux's `%px` writes it: sixteen lowercase hex digits, no
+/// `0x`, zero padded.
+fn hex16(value: u64) -> alloc::string::String {
+    alloc::format!("{value:016x}")
+}
+
+/// The `timers` file's body for one process, or `None` when it is not there.
+///
+/// `None` covers both shapes Linux distinguishes: a number that names nothing,
+/// and a task that has exited - measured on the host, a zombie's
+/// `/proc/<pid>/timers` is `ENOENT` (its `signal_struct` is gone with the
+/// address space), which the file has no second answer for (§6.137).
+fn timers_body(slot: usize) -> Option<alloc::string::String> {
+    #[cfg(target_os = "none")]
+    {
+        let lines = crate::sched::timer_lines(crate::sched::TaskId(slot))?;
+        Some(timers_text(&lines, reader_number))
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = slot;
         None
     }
 }
@@ -4008,6 +4089,17 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         NodeKind::File,
         owner_bytes_file(move || auxv_body(slot)),
     );
+    // The process's POSIX timers, four lines each, newest number first -
+    // `0444` because Linux's `proc_pid_timers` is `S_IRUGO`, and *not* offered
+    // per thread: measured on the host, `/proc/<pid>/task/<tid>/timers` and
+    // `/proc/thread-self/timers` are both `ENOENT` while `/proc/<pid>/timers`
+    // answers, because the timers hang off `signal_struct` rather than an
+    // `mm` or a task (§6.137).
+    node.add(
+        "timers",
+        NodeKind::File,
+        maybe_file(move || timers_body(slot)),
+    );
     node.add(
         "maps",
         NodeKind::File,
@@ -5647,6 +5739,68 @@ mod tests {
     /// counts. Both columns, every boundary of the two-digit fraction, and the
     /// trailing newline are pinned here rather than in a booted machine: the
     /// widths are a rendering fact, and this function is host-compiled.
+    #[test]
+    fn the_timers_file_is_linuxs_four_lines_with_the_subject_translated() {
+        use crate::abi::{TIMER_NOTIFY_NONE, TIMER_NOTIFY_SIGNAL, TIMER_NOTIFY_THREAD, TimerLine};
+        let lines = [
+            TimerLine {
+                id: 5,
+                signo: 0,
+                value: 0,
+                kind: TIMER_NOTIFY_NONE,
+                subject: 7,
+                clock_word: 1,
+            },
+            TimerLine {
+                id: 4,
+                signo: 34,
+                value: 0,
+                kind: TIMER_NOTIFY_SIGNAL,
+                subject: 7,
+                clock_word: -6,
+            },
+            TimerLine {
+                id: 0,
+                signo: 10,
+                value: 0xdead,
+                kind: TIMER_NOTIFY_SIGNAL,
+                subject: 7,
+                clock_word: 0,
+            },
+            TimerLine {
+                id: 9,
+                signo: 12,
+                value: 0,
+                kind: TIMER_NOTIFY_THREAD,
+                subject: 11,
+                clock_word: 1,
+            },
+        ];
+        // The reader's namespace maps slots to its own numbers: 7 is its pid 1.
+        let text = timers_text(&lines, |slot| if slot == 7 { 1 } else { 1000 + slot });
+        assert_eq!(
+            text,
+            "ID: 5\n\
+             signal: 0/0000000000000000\n\
+             notify: none/pid.1\n\
+             ClockID: 1\n\
+             ID: 4\n\
+             signal: 34/0000000000000000\n\
+             notify: signal/pid.1\n\
+             ClockID: -6\n\
+             ID: 0\n\
+             signal: 10/000000000000dead\n\
+             notify: signal/pid.1\n\
+             ClockID: 0\n\
+             ID: 9\n\
+             signal: 12/0000000000000000\n\
+             notify: signal/tid.1011\n\
+             ClockID: 1\n"
+        );
+        // A process with no timers reads an *empty* file, not a blank line.
+        assert_eq!(timers_text(&[], |slot| slot), "");
+    }
+
     #[test]
     fn uptime_is_two_zero_padded_columns_and_a_real_idle_number() {
         assert_eq!(super::uptime_line(5, 4, 304616, 14), "5.04 304616.14\n");
@@ -7384,6 +7538,7 @@ mod tests {
             // that wants a terminal sets both itself (§6.129's host test does).
             tty_nr: 0,
             terminal_foreground: None,
+            timers: alloc::vec::Vec::new(),
             minflt: 0,
             cminflt: 0,
             minflt_own: 0,

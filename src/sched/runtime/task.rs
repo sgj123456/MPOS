@@ -934,6 +934,48 @@ pub struct PosixTimer {
     /// `deadline` is a tick-counter value; a CPU-time timer's is a group CPU
     /// reading, and the two never mix.
     clock: TimerClock,
+    /// The clock id the creator spelled, kept because `/proc/<pid>/timers`
+    /// reports it and because a `ClockID` this table did not remember would
+    /// have to be guessed from `TimerClock`, which holds only "wall or CPU"
+    /// and cannot tell `CLOCK_REALTIME` from `CLOCK_TAI`.
+    clock_id: i32,
+    /// The number `timer_create` answered with - the caller's handle. Linux
+    /// hands these out from a per-process counter that only ever moves
+    /// forward, so a deleted timer's number is never given to the next one
+    /// (measured: ids 0..4, delete 1, next create answers **5**;
+    /// `build/scratch/ptimers/t.c`). That is why this is not the slot index:
+    /// reusing the lowest free slot would hand a caller a number it has
+    /// already deleted, and the handle in its hand would start naming a
+    /// different timer.
+    id: u32,
+}
+
+impl PosixTimer {
+    /// The number `timer_create` answered with.
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// The signal an expiry raises.
+    pub(crate) fn signo(&self) -> u8 {
+        self.signo
+    }
+
+    /// The `union sigval` an expiry carries.
+    pub(crate) fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Where an expiry's signal goes.
+    pub(crate) fn notify(&self) -> TimerNotify {
+        self.notify
+    }
+
+    /// The clock word `/proc/<pid>/timers` prints - the caller's id for a wall
+    /// clock, Linux's encoded form for a CPU clock (see `abi::timer_clock_word`).
+    pub(crate) fn clock_word(&self) -> i32 {
+        self.clock_id
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1522,6 +1564,12 @@ pub(crate) struct Task {
     /// thread of the group reaches and the one an expiry fires from
     /// (`docs/notes/` §2.11), while a non-leader's table is never written.
     pub(crate) timers: [Option<PosixTimer>; TIMER_SLOTS],
+    /// The next number [`timer_alloc`] hands out. Linux keeps this counter per
+    /// process (`sig->posix_timer_id`) and only moves it forward, wrapping at
+    /// `INT_MAX`; `TIMER_SLOTS` is eight, so a wrap cannot collide with a live
+    /// timer here (it would take 2^32 creates) - but the counter is still the
+    /// number's source, not the slot index (see `PosixTimer::id`).
+    pub(crate) next_timer_id: u32,
     /// What a tracer has made of this task, if anything.
     pub(crate) trace: Tracing,
 }
@@ -1787,6 +1835,7 @@ impl Task {
             tls: 0,
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
         }
     }
@@ -2571,6 +2620,7 @@ impl Table {
             tls: 0,
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
         });
         TaskId(slot)
@@ -3643,9 +3693,13 @@ pub fn itimer_snapshot(which: usize) -> Option<ItimerSnapshot> {
 /// signal a process the caller may have no right to signal.
 ///
 /// A timer is born disarmed, exactly as Linux's is: `timer_create` only makes
-/// the record, and `timer_settime` is what arms it. The new timer's slot is
-/// the lowest free one - ids are the caller's to hold, not a sequence to
-/// read meaning into.
+/// the record, and `timer_settime` is what arms it. The new timer's **slot** is
+/// the lowest free one; the **number** it answers with is the group's next
+/// counter value, never a slot that has been handed out before, because Linux
+/// never gives a deleted timer's number to the next one (measured: five
+/// creates answer 0..4, delete 1, the sixth answers **5** -
+/// `build/scratch/ptimers/t.c`). The two used to be the same number, which made
+/// a deleted timer's handle start naming whichever timer took its slot.
 ///
 /// `clock` is the clock the timer is *on*, and it is part of the record rather
 /// than of the arithmetic at each door: an expiry, a `timer_gettime` and a
@@ -3656,7 +3710,8 @@ pub fn timer_alloc(
     value: u64,
     notify: TimerNotify,
     clock: TimerClock,
-) -> Result<usize, isize> {
+    clock_id: i32,
+) -> Result<u32, isize> {
     with_table(|t| {
         if let TimerNotify::Thread(target) = notify {
             let ok = task_ok_for_timer(t, target).is_some_and(|grp| grp == t.task(t.current).tgid);
@@ -3672,6 +3727,8 @@ pub fn timer_alloc(
         let Some(slot) = slot else {
             return Err(crate::err::EAGAIN);
         };
+        let id = task.next_timer_id;
+        task.next_timer_id = task.next_timer_id.wrapping_add(1);
         task.timers[slot] = Some(PosixTimer {
             interval_ticks: 0,
             deadline: None,
@@ -3680,9 +3737,25 @@ pub fn timer_alloc(
             notify,
             overrun: 0,
             clock,
+            clock_id,
+            id,
         });
-        Ok(slot)
+        Ok(id)
     })
+}
+
+/// The slot holding the running task's timer numbered `id`, or `None` when the
+/// number names no live timer of this group.
+///
+/// The number and the slot came apart when ids stopped being reused: the table
+/// is still `TIMER_SLOTS` slots, but a number outlives the slot it was born in
+/// only until the timer is deleted, and never comes back afterwards. Eight
+/// slots make the scan free.
+fn timer_slot(t: &Table, id: usize) -> Option<usize> {
+    let task = t.task(t.task(t.current).tgid);
+    task.timers
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|timer| timer.id as usize == id))
 }
 
 /// The thread group a task belongs to, for the `SIGEV_THREAD_ID` check, or
@@ -3705,11 +3778,12 @@ fn task_ok_for_timer(t: &Table, target: TaskId) -> Option<TaskId> {
 /// reading are in hand - a caller converting a timespec into a tick-counter
 /// value would arm a CPU-time timer against machine uptime, which is the defect
 /// this signature exists to make unspellable (`§6.123`).
-pub fn timer_arm(slot: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u64, u64)> {
+pub fn timer_arm(id: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u64, u64)> {
     if value_ticks != 0 {
         POSIX_TIMERS_ARMED.store(true, Ordering::Relaxed);
     }
     with_table(|t| {
+        let slot = timer_slot(t, id)?;
         let leader = t.task(t.current).tgid;
         let task = t.task_mut(leader);
         let group_now = {
@@ -3734,8 +3808,9 @@ pub fn timer_arm(slot: usize, interval_ticks: u64, value_ticks: u64) -> Option<(
 /// Read a timer's `(interval, remaining)` in ticks, for `timer_gettime`.
 /// `None` is an id that names no timer of this task's; a disarmed timer
 /// answers zero remaining, exactly as Linux's does.
-pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
+pub fn timer_state(id: usize) -> Option<(u64, u64)> {
     with_table(|t| {
+        let slot = timer_slot(t, id)?;
         let leader = t.task(t.current).tgid;
         let timer = t.task(leader).timers.get(slot)?.as_ref()?;
         let (utime, stime, _, _) = t.task(leader).mm.cpu_all();
@@ -3749,8 +3824,9 @@ pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
 
 /// The overrun count `timer_getoverrun` reports, or `None` for an id that
 /// names no timer of this task's.
-pub fn timer_overrun(slot: usize) -> Option<u32> {
+pub fn timer_overrun(id: usize) -> Option<u32> {
     with_table(|t| {
+        let slot = timer_slot(t, id)?;
         let leader = t.task(t.current).tgid;
         Some(t.task(leader).timers.get(slot)?.as_ref()?.overrun)
     })
@@ -3759,8 +3835,12 @@ pub fn timer_overrun(slot: usize) -> Option<u32> {
 /// Free a timer's slot. The id dies with it: a later use of the same number
 /// is `EINVAL`, whether or not the slot has been handed out again, because a
 /// timer that was deleted is not a timer whatever occupies its slot now.
-pub fn timer_remove(slot: usize) -> bool {
+pub fn timer_remove(id: usize) -> bool {
     with_table(|t| {
+        let slot = match timer_slot(t, id) {
+            Some(slot) => slot,
+            None => return false,
+        };
         let leader = t.task(t.current).tgid;
         let task = t.task_mut(leader);
         match task.timers.get_mut(slot) {

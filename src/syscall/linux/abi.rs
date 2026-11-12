@@ -4272,6 +4272,33 @@ pub(crate) fn itimer_which_verdict(word: usize) -> Result<usize, isize> {
     }
 }
 
+/// The clock word `/proc/<pid>/timers` prints for a timer, given the clock id
+/// its creator spelled.
+///
+/// The wall clocks print the number the caller passed: Linux's `proc_timers_show`
+/// renders `timer->it_clock`, and for `CLOCK_REALTIME`/`MONOTONIC`/`BOOTTIME`/`TAI`
+/// that member *is* the caller's id (measured: `ClockID: 0`, `1`, `7`, `11`,
+/// `build/scratch/ptimers/t.c` on the host, 7.2.14).
+///
+/// A CPU clock is the exception, and it is not our invention: Linux encodes the
+/// clock as `(~pid << 3) | which` with `pid` zero meaning "the creating process",
+/// so `CLOCK_PROCESS_CPUTIME_ID` (which this kernel accepts since §6.123) prints
+/// **-6** — `(0xFFFFFFFF << 3) | 2` truncated to `int`. Reported as measured
+/// rather than translated back to `2`, because a caller that reads the file is
+/// reading the kernel's own record of the timer, and a tidied-up number would be
+/// a different promise from the one Linux makes.
+pub(crate) fn timer_clock_word(clock_id: i32) -> i32 {
+    /// `CLOCK_PROCESS_CPUTIME_ID`, the one CPU clock a timer can be built on here.
+    const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+    /// `(~0 << 3) | CPUCLOCK_SCHED`, `CPUCLOCK_SCHED` being 2.
+    const ENCODED_PROCESS_CPUCLOCK: i32 = -6;
+    if clock_id == CLOCK_PROCESS_CPUTIME_ID {
+        ENCODED_PROCESS_CPUCLOCK
+    } else {
+        clock_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7525,5 +7552,13 @@ mod diskstat_tests {
         // And zero is zero at every rate: this half must not scale.
         assert_eq!(rr_interval_nanos(false, 1000), 0);
         assert_eq!(rr_interval_nanos(false, 100), 0);
+    }
+
+    #[test]
+    fn a_wall_timer_prints_the_clock_it_was_built_on_and_a_cpu_one_prints_the_encoded_word() {
+        for wall in [0, 1, 7, 11] {
+            assert_eq!(timer_clock_word(wall), wall);
+        }
+        assert_eq!(timer_clock_word(2), -6);
     }
 }

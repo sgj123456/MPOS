@@ -292,7 +292,21 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-12, `/proc/<pid>/auxv` §6.136):** stage 1 `1276 tests, 0 failed`
+**Latest measured gate (2026-11-12, `/proc/<pid>/timers` §6.137):** stage 1 `1278 tests, 0 failed`
+(70.08 s — the +2 are `the_timers_file_is_linuxs_four_lines_with_the_subject_translated` and
+`a_wall_timer_prints_the_clock_it_was_built_on_and_a_cpu_one_prints_the_encoded_word`); x86_64
+`pass=300 fail=0 (300 built)`, `mpos-kunit 35 passed, 0 failed` (70.44 s over 2 lane(s), `-5.8%`
+against the previous green); aarch64 `pass=299 fail=0 (299 built)`, `mpos-kunit 35 passed, 0 failed`
+(227.88 s over 2 lane(s), `-0.5%`) — `GATE EXIT=0`, both arms in one command with the lane count
+forced (`MPOS_TEST_LANES=2`, the container being pinned to one CPU). `t-proc-timers` ran on both arms
+(`build/test-lane-x86_64-0/serial.log:4425`, `build/test-lane-aarch64-0/serial.log:4655`).
+Counterfactually **15 of 18 red** (`build/boot-timers-cf1.log`): every claim that reads the file,
+because with the nine source files stashed the node does not exist - and the three that stay green
+are honest boundaries (the `itimer` byte comparison is true of two empty strings, the reap claim is
+true of a number that never had a file, and the per-thread `ENOENT` is the same answer for the same
+reason).
+
+**Measured gate before it (2026-11-12, `/proc/<pid>/auxv` §6.136):** stage 1 `1276 tests, 0 failed`
 (74.54 s — the +1 is `a_file_whose_body_is_not_text_is_served_byte_for_byte`, the node's own
 plumbing, since no host test can reach a real vector); x86_64 `pass=299 fail=0 (299 built)`,
 `mpos-kunit 35 passed, 0 failed` (74.80 s over 2 lane(s), `+6.3%`); aarch64 `pass=298 fail=0 (298

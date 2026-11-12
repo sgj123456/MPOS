@@ -910,6 +910,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             tls: 0,
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
@@ -1129,6 +1130,7 @@ pub fn try_spawn_user(
             tls: 0,
             itimers: [None; 3],
             timers: [None; TIMER_SLOTS],
+            next_timer_id: 0,
             trace: Tracing::default(),
         });
         let id = TaskId(slot);

@@ -912,6 +912,39 @@ pub const SIGXCPU: i32 = 24;
 pub const SIGXFSZ: i32 = 25;
 pub const SIGSYS: i32 = 31;
 
+/// `/proc/<pid>/timers`'s `notify:` word for a timer whose `sigev_notify` is
+/// `SIGEV_NONE` - it only counts, and signals nobody.
+pub const TIMER_NOTIFY_NONE: u8 = 0;
+/// ... for `SIGEV_SIGNAL`, whose expiry is process-directed.
+pub const TIMER_NOTIFY_SIGNAL: u8 = 1;
+/// ... for `SIGEV_THREAD_ID`, whose expiry names one thread - `subject` is it.
+pub const TIMER_NOTIFY_THREAD: u8 = 2;
+
+/// One POSIX timer in the shape `/proc/<pid>/timers` reports it.
+///
+/// The record is plain data on purpose: the scheduler builds it from the timer
+/// table it owns, procfs renders it, and the type lives in this leaf crate so
+/// both sides - and the host tests of the rendering - name one struct rather
+/// than three copies of the same four fields.
+#[derive(Clone)]
+pub struct TimerLine {
+    /// The number `timer_create` answered with - the caller's handle.
+    pub id: u32,
+    /// The signal an expiry raises.
+    pub signo: u8,
+    /// The `union sigval` the expiry carries.
+    pub value: u64,
+    /// One of [`TIMER_NOTIFY_NONE`]/[`TIMER_NOTIFY_SIGNAL`]/[`TIMER_NOTIFY_THREAD`].
+    pub kind: u8,
+    /// The thread a `SIGEV_THREAD_ID` timer notifies, as a task id; unused by
+    /// the other two kinds.
+    pub subject: u64,
+    /// The clock word Linux prints: the creator's clock id for a wall clock,
+    /// the kernel's encoded form for a CPU clock ([`crate::timer_clock_word`]
+    /// is that mapping, and §6.137 measures it).
+    pub clock_word: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

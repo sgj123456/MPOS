@@ -11965,3 +11965,149 @@ for a kernel that never had one.
 A file that reports what a process was handed must read the copy, not rebuild
 it. The stack and the file are two doors onto one vector, and the only way they
 cannot disagree is for the second door to be the first one's own bytes.
+
+## §6.137 `/proc/<pid>/timers` is the group's table, and a timer's number is not its slot (LANDED 2026-11-12)
+
+The POSIX timer calls existed since §6.123 and §6.124, but nothing let a program
+*list* what it held: a probe that wanted to know which numbers were live had to
+remember every call it made, and a program that forgot one could not find out.
+This kernel had no `/proc/<pid>/timers` at all. Writing the file also exposed a
+second, worse defect: this kernel's `timer_t` **was the slot index**, so the
+create after a delete handed the caller the deleted number back and its old
+handle silently began naming a different timer.
+
+Everything here was measured on a host Linux first (`build/scratch/ptimers/`,
+7.2.14), with raw syscalls - no libc on Linux binds `sigevent`, `itimerspec` or
+`timer_t`, the same reason `t-timer-create` goes through `libc::syscall`.
+
+The file with no timers (`p.c`, `u.c`):
+
+```
+/proc/self/timers           0 bytes, mode 0444, st_size 0, no trailing newline
+/proc/thread-self/timers    open errno=2 (ENOENT)
+/proc/<pid>/task/<tid>/timers open errno=2 (ENOENT)
+/proc/1/timers (uid 1000)    0 bytes - readable, it is 0444
+```
+
+and with three timers on one process (`p.c`):
+
+```
+ID: 2
+signal: 12/0000000000000000
+notify: signal/tid.17626
+ClockID: -6
+ID: 1
+signal: 0/0000000000000000
+notify: none/pid.17626
+ClockID: 0
+ID: 0
+signal: 10/0000000000000000
+notify: signal/pid.17626
+ClockID: 1
+```
+
+Four lines per timer, in that order, with the case the man page does not spell
+out: upper-case `ID:`/`ClockID:` beside lower-case `signal:`/`notify:`. The
+`signal:` value is the `sigval` as sixteen lowercase hex digits, so a timer
+created with `sival_ptr = 0xdead` prints `000000000000dead`. `notify:` names the
+notification mechanism before the slash and the subject's kind after it, which is
+why a `SIGEV_THREAD_ID` timer reads **`signal/tid.N`** and not `thread/...` - the
+first guess, caught by the host run.
+
+`ClockID:` is `timer->it_clock`, and that is the caller's own id for a wall
+clock (`0`, `1`, `7`, `11` measured, one `timer_create` each) but the kernel's
+encoded word for a CPU clock: `CLOCK_PROCESS_CPUTIME_ID` prints **`-6`**, which
+is `(~0 << 3) | 2` truncated to `int`.
+
+### The number is a counter, not a slot
+
+The measurement that made this a defect rather than a new file (`t.c`):
+
+```
+create REALTIME=0  -> 0     create MONOTONIC=1 -> 1     create BOOTTIME=7 -> 2
+create TAI=11      -> 3     create PROCESS_CPUTIME=2 -> 4
+delete 1 ; create MONOTONIC -> 5          (not 1)
+/proc/self/timers prints ids: 5, 4, 3, 2, 0
+```
+
+Linux keeps a per-process counter that only moves forward, so a deleted number is
+never handed out again, and the file lists the table **descending**. This kernel
+returned the slot, so `delete(1); create()` answered `1` and the caller's old
+handle started naming a *different* timer - a silent retarget, which is the
+failure shape `AGENTS.md` §3 rules 2 and 3 exist to prevent.
+
+A fork inherits the counter's position, as it inherits the timers themselves: the
+child's next number is not the parent's next number.
+
+An `itimer` is not a POSIX timer and does not appear: `setitimer` on `ITIMER_REAL`
+and `ITIMER_VIRTUAL` left the file byte-for-byte unchanged (`p.c`).
+
+A zombie **keeps the file, empty** (`z.c`):
+
+```
+running child     /proc/<pid>/timers: 70 bytes (one timer)
+killed, unreaped  /proc/<pid>/timers: 0 bytes
+reaped            /proc/<pid>/timers: errno=2 (ENOENT)
+```
+
+because Linux holds the `signal_struct` until the task is collected and tears the
+timers down at exit - so the empty list is not the record's last state, it is the
+truth: a zombie has no timers.
+
+### The fix
+
+Four places, one idea: the number and the slot are two different things.
+
+* `PosixTimer` gained `id: u32` and `clock_id: i32`, and `Task` gained a
+  `next_timer_id: u32` counter (six construction points: init, spawn, thread
+  spawn, exec, fork, and the fresh-task literal). `timer_alloc` still picks the
+  lowest free slot but returns the counter and advances it.
+* Every door that takes a `timer_t` - `timer_arm`, `timer_state`,
+  `timer_overrun`, `timer_remove` - now resolves it through `timer_slot`, which
+  scans the eight slots for a matching `id`. A deleted number therefore names
+  nothing, and a live number names exactly one timer.
+* `crates/abi` gained `TimerLine { id, signo, value, kind, subject, clock_word }`
+  and the three `TIMER_NOTIFY_*` constants, so `sched` produces the answer and
+  `vfs` renders it; the subject travels as a **task id**, because the file is read
+  from another pid namespace and only the reader's namespace can name it.
+* `src/vfs/procfs.rs` renders it with `timers_text` (four lines each, `hex16` for
+  the `%px` word), and the node is `maybe_file` at `0444` - one node at
+  `/proc/<pid>/timers`, deliberately **not** under `task/<tid>`, because Linux
+  measured no per-thread spelling.
+
+The file reads `Some(empty)` for a zombie and `None` only when no task holds the
+number, which is what makes the two answers above.
+
+### The pin
+
+`user/tests/src/bin/t-proc-timers.rs`, 18 claims: the empty file's zero bytes;
+one timer's whole body byte for byte; the subject is this process; the `sigval`
+in the signal word; `ClockID` for all four wall clocks; `-6` for the process CPU
+clock; `none/pid.N` for a silent timer; `signal/tid.N` for a thread-directed one;
+the ids are what `timer_create` answered, listed descending; a deleted id is not
+reused; an `itimer` changes nothing; the node is `0444` with size 0; there is no
+per-thread spelling; a zombie keeps an empty file and the reap takes it away.
+
+The counterfactual stashes the nine source files and rebuilds the kernel *and*
+the UEFI loader that embeds it (`boot/src/lib.rs`'s `PACKED_KERNEL`), then boots
+the same binary: **15 of 18 claims red**, every one that reads the file, because
+the node does not exist; the two that stay green are the `itimer` byte comparison
+and the reap claim, both of which are true of a kernel that never had the file.
+Restoring and rebuilding returns 18/18.
+
+### Gate
+
+`build/gate-timers.log`, `MPOS_TEST_LANES=2 TMPDIR=$PWD/build/tmp cargo xtask
+test --all-targets`: stage 1 `1278 tests, 0 failed` (70.08 s); x86_64 `pass=300
+fail=0 (300 built)`, `mpos-kunit 35 passed, 0 failed`, `total 70.44 s` (-5.8%
+against the previous green); aarch64 `pass=299 fail=0 (299 built)`, kunit 35/0,
+`total 227.88 s` (-0.5%). `t-proc-timers` passed on both arms:
+`build/test-lane-x86_64-0/serial.log:4425` and
+`build/test-lane-aarch64-0/serial.log:4655`.
+
+### The rule
+
+A handle is a promise about *which object*, not about *where it is stored*. The
+two coincide until something is deleted, which is why an index-as-handle passes
+every test that never frees anything - and why the file that finally listed the
+table could show the retarget.

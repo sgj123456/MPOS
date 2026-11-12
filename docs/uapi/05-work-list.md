@@ -11021,3 +11021,46 @@ counterfactually; the two greens are the honest boundaries §6.136 names).
 reports what this kernel actually handed a program (`AT_SYSINFO_EHDR`, `AT_MINSIGSTKSZ`, `AT_HWCAP2`,
 `AT_PLATFORM`, `AT_FLAGS` are not pushed), which is a gap in the loader's vector, not in this file;
 and a zombie answers `ENOENT` where Linux answers `ESRCH`.
+
+### Item 251 `/proc/<pid>/timers` - and a `timer_t` that was a slot index
+
+**Before:** the file did not exist, and `timer_create` answered the slot it had picked. Deleting a
+timer freed that number for the next create, so an old handle silently named a different timer.
+
+**Now:** `/proc/<pid>/timers` exists at `0444`, one node (no `task/<tid>` spelling), four lines per
+timer, ids listed descending and never reused. `timer_t` is a per-process counter: `timer_alloc`
+still picks the lowest free slot but returns the counter, and `timer_arm`/`timer_state`/
+`timer_overrun`/`timer_remove` resolve it through `timer_slot`.
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| `/proc/<pid>/timers`, no timers | 0 bytes | `ENOENT` | 0 bytes |
+| one timer | 4 lines, `ID:`/`signal:`/`notify:`/`ClockID:` | `ENOENT` | the same 4 lines |
+| `signal:` word | the `sigval` as 16 hex digits | `ENOENT` | the same |
+| `notify:` subject | `pid.N`/`tid.N` in the reader's namespace | `ENOENT` | the same |
+| `ClockID:` wall clock | the caller's id (`0`,`1`,`7`,`11`) | `ENOENT` | the same |
+| `ClockID:` process CPU clock | `-6` (`(~0 << 3) \| 2`) | `ENOENT` | `-6` |
+| id after `delete(1); create()` | a number never used before (`0..4` then `5`) | `1` - the slot | `5` |
+| `itimer` in the list | absent | absent | absent |
+| zombie | file present, 0 bytes | `ENOENT` | present, 0 bytes |
+| `task/<tid>/timers` | `ENOENT` | `ENOENT` | `ENOENT` |
+
+**Why it is not one more formatted file.** A file that lists a table cannot be built by printing what
+the caller remembers: it has to read the table, and reading the table is what shows the handle rule.
+The retarget was invisible to every test that never deleted a timer, which is all of them until this
+one; the file and the counter had to land together, because either alone leaves the other wrong.
+
+**Measurement:** `build/scratch/ptimers/{p,t,u,z}.c` on host 7.2.14 - the four-line shape, the three
+`notify:` spellings, `ClockID` for five clocks, the `0..4` then `5` sequence, the absent per-thread
+spelling, and the zombie's empty file.
+
+**Landed:** `PosixTimer::{id,clock_id}` and `Task::next_timer_id` with the six construction points,
+`timer_slot` and the four doors that now resolve through it
+(`src/sched/runtime/task.rs`); `TimerLine`/`TIMER_NOTIFY_*` in `crates/abi`; `lines_of`/`timer_lines`
+(`src/sched/runtime/procfs.rs`); `timer_clock_word` (`src/syscall/linux/abi.rs`); the renderer and the
+node (`src/vfs/procfs.rs`); host tests for the render and the clock word, `774` host tests green; pin
+`user/tests/src/bin/t-proc-timers.rs` (18 claims, 15 red counterfactually).
+
+**Named gaps:** the eight-slot table is this kernel's own bound - Linux's is bounded by
+`RLIMIT_SIGPENDING`, so a ninth timer answers `EAGAIN` here where Linux would create one (§6.125's
+existing gap); and `TIMER_ABSTIME` is still refused (§6.124).
