@@ -230,6 +230,9 @@ pub const FCHMODAT2: u64 = 452; // 452 on x86_64
 pub const MKNODAT: u64 = 33; // 259 on x86_64
 pub const FUTIMESAT: u64 = 64032; // no arm64 number; unreachable on aarch64
 pub const READAHEAD: u64 = 213; // 187 on x86_64
+pub const SYNC_FILE_RANGE: u64 = 84; // 277 on x86_64 (asm-generic spells it 84,
+                                    // where `sync_file_range2` is the same number
+                                    // for machines with aligned 64-bit arguments)
 pub const SPLICE: u64 = 76; // 275 on x86_64
 pub const SYNCFS: u64 = 267; // 306 on x86_64
 pub const SYSLOG: u64 = 116; // 103 on x86_64

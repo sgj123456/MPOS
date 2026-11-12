@@ -631,6 +631,7 @@ pub unsafe fn dispatch(
         // contract here is a rule each and the descriptor checks.
         nr::SPLICE => fs::handle_splice(args, from_user),
         nr::READAHEAD => fs::handle_readahead(args),
+        nr::SYNC_FILE_RANGE => fs::handle_sync_file_range(args),
         nr::SYNCFS => fs::handle_syncfs(args),
         nr::SYSLOG => fs::handle_syslog(args, from_user),
         // The process half: identity, capabilities, scheduling, memory

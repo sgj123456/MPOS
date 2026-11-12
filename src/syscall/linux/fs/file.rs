@@ -8146,12 +8146,104 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 }
 
 /// `readahead(fd, offset, count)` — a promise that the range is coming.
-/// Nothing here reads lazily, so there is nothing to pull in early; the
-/// call is the descriptor's validity and the success.
+///
+/// Nothing here reads lazily, so there is nothing to pull in early. That makes
+/// the call pure admission, which is exactly why its admission had to be the
+/// measured one: it used to be "the descriptor exists, therefore 0", and that
+/// answered a write-only descriptor, a directory, a pipe and a character device
+/// all with the same 0 Linux uses for a file it will really read. Measured on a
+/// current host (Linux 7.2.14, `build/scratch/advice/{p,q,r,t,u}.c`):
+///
+/// * `readahead(write-only regular fd) = EBADF`, and it stays `EBADF` when the
+///   offset is also bad - the mode is asked first;
+/// * `readahead(dir)`, `readahead(pipe)`, `readahead(/dev/null)`,
+///   `readahead(/dev/zero)` and `readahead(socket)` are all `EINVAL`: only a
+///   regular file has a page cache to fill;
+/// * `readahead(regular, -1, 4096) = EINVAL` and `count = 2^63 = EINVAL`, while
+///   `i64::MAX` is accepted - see [`crate::syscall::linux::abi::readahead_range_verdict`];
+/// * `readahead(999, -1, 4096) = EBADF`, so the descriptor is asked before the
+///   range.
+///
+/// An `O_PATH` descriptor is `EBADF` on Linux as well, but this kernel has no
+/// `O_PATH`, so the readable test here stands in for a state it cannot reach.
 pub fn handle_readahead(args: [usize; ARG_COUNT]) -> isize {
-    match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => 0,
-        Err(e) => err_of(e),
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if file.check_readable().is_err() {
+        return err::EBADF;
+    }
+    // A pipe and a `socketpair` end report `NodeKind::File` - the filesystem's
+    // vocabulary has no word for "anonymous byte channel" (`fsync` carries the
+    // same note) - so the kind alone would let both through as regular files.
+    let inode = file.inode();
+    if inode.as_pipe().is_some() || inode.as_duplex().is_some() {
+        return err::EINVAL;
+    }
+    if file.metadata().kind != NodeKind::File {
+        return err::EINVAL;
+    }
+    if let Err(e) = abi::readahead_range_verdict(args[1] as i64, args[2] as i64) {
+        return e;
+    }
+    0
+}
+
+/// `sync_file_range(fd, offset, nbytes, flags)` — flush a byte range.
+///
+/// Every write this kernel makes reaches its medium before the call returns, so
+/// like `fsync` the flush is empty and the call is its admission. It was not
+/// dispatched at all, which meant `ENOSYS` for a call Linux has answered since
+/// 2.6.17, and a caller that gets `ENOSYS` there has no fallback: the whole
+/// point of the call is that the caller does not have to wait for the data.
+///
+/// Linux's order, measured on a current host (Linux 7.2.14,
+/// `build/scratch/advice/{p,q,r,s,u,v}.c`):
+///
+/// * a missing descriptor is `EBADF`, and `(999, flags=8)` is `EBADF` rather
+///   than `EINVAL` - the descriptor comes first;
+/// * then the flag word: `1|2|4` are the vocabulary and any other bit is
+///   `EINVAL`, which `(pipe, flags=8) = EINVAL` proves is judged *before* the
+///   descriptor's kind (the same pipe with `flags=0` answers `ESPIPE`);
+/// * then the kind: a node with nothing behind it turns the call into `ESPIPE` -
+///   a pipe, a socket, a character device and an anonymous inode all measure
+///   `ESPIPE(29)` - while a regular file, a directory and a block device answer
+///   0;
+/// * a negative `offset` or `nbytes` is `EINVAL`, and so is a range whose sum
+///   wraps an `i64` - `(2^62, 2^62)` is refused while `(0, i64::MAX)` and
+///   `(i64::MAX, 0)` are served. That is the one place this call is stricter
+///   than `readahead`, which accepts a wrapping sum.
+
+///
+/// A read-only descriptor is served, not refused: `sync_file_range` on an
+/// `O_RDONLY` file answers 0, so nothing here asks about the mode.
+pub fn handle_sync_file_range(args: [usize; ARG_COUNT]) -> isize {
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if let Err(e) = abi::sync_file_range_range_verdict(args[1] as i64, args[2] as i64) {
+        return e;
+    }
+    if let Err(e) = abi::sync_file_range_flags_verdict(args[3]) {
+        return e;
+    }
+    // `NodeKind::File` is what a pipe and a `socketpair` end report, so the
+    // kind cannot answer for them; `ESPIPE` is Linux's word for "nothing here
+    // to flush" and these are the two families whose kind lies.
+    let inode = file.inode();
+    if inode.as_pipe().is_some() || inode.as_duplex().is_some() {
+        return err::ESPIPE;
+    }
+    match file.metadata().kind {
+        NodeKind::File | NodeKind::Dir | NodeKind::BlockDev => 0,
+        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo | NodeKind::Anon { .. } => {
+            err::ESPIPE
+        }
+        // A symlink cannot be held open here without the traversal the open
+        // already did, so its descriptor is the target's kind.
+        NodeKind::Symlink => err::ESPIPE,
     }
 }
 

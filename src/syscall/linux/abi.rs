@@ -4246,6 +4246,72 @@ pub(crate) fn iov_count_verdict(count: usize) -> Result<usize, isize> {
     Ok(n as usize)
 }
 
+/// `readahead(2)`'s two range words are signed, and both must be non-negative.
+///
+/// That is the whole of the call's range law, and it is narrower than it looks:
+/// the count is **not** capped at `MAX_READAHEAD` (131072 bytes) - Linux answers
+/// 0 for a million, a gigabyte, a terabyte and `i64::MAX` alike - it is only
+/// *signedness* that is judged. A caller passing `~0UL` reaches this kernel as
+/// `usize::MAX` and reaches Linux as `-1`, and both refuse it, but for the
+/// second time by way of the sign: `2^63` written as an unsigned count is
+/// `EINVAL` while `2^63 - 1` is accepted, which is only possible if the word is
+/// read as an `i64`. Measured on a current host (Linux 7.2.14,
+/// `build/scratch/advice/{p,q,r,t}.c`): `readahead(regular, 0, i64::MAX) = 0`,
+/// `readahead(regular, 0, 2^63) = EINVAL`, `readahead(regular, -1, 0) = EINVAL`
+/// (a negative offset is refused even with nothing to read), and
+/// `readahead(regular, 0, 131073) = 0`.
+pub(crate) fn readahead_range_verdict(offset: i64, count: i64) -> Result<(), isize> {
+    if offset < 0 || count < 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
+/// `sync_file_range(2)`'s range is signed **and** must not overflow.
+///
+/// The same two words `readahead` takes, judged by a stricter law: both must be
+/// non-negative, and `offset + nbytes` must fit an `i64`. That last clause is
+/// the one place the two doors disagree, and the disagreement is measurable:
+/// `readahead(regular, 2^62, i64::MAX) = 0` while
+/// `sync_file_range(regular, 2^62, 2^62) = EINVAL` (Linux 7.2.14,
+/// `build/scratch/advice/{t,y}.c`). `sync_file_range(regular, 0, i64::MAX)` is
+/// still 0, and so is `(i64::MAX, 0)`: it is the *sum* that may not wrap, not
+/// either word.
+///
+/// A negative range is `EINVAL` here too - and that is worth stating because a
+/// first probe of this door reported otherwise. The probe passed `-1` through
+/// `syscall(2)`'s variable arguments as an `int`, so the register held
+/// `0x0000_0000_ffff_ffff` rather than `-1` and the kernel was reading a
+/// positive 4294967295: the reading said "negative offsets are accepted" and the
+/// truth was a probe that never sent one. Passing the words as `long` gives the
+/// table this function encodes (`build/scratch/advice/{w,x}.c`).
+pub(crate) fn sync_file_range_range_verdict(offset: i64, nbytes: i64) -> Result<(), isize> {
+    if offset < 0 || nbytes < 0 || offset.checked_add(nbytes).is_none() {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
+/// `sync_file_range(2)`'s `flags` word: three bits, and every other bit refused.
+///
+/// `SYNC_FILE_RANGE_WAIT_BEFORE` (1), `..._WRITE` (2) and `..._WAIT_AFTER` (4)
+/// are the vocabulary; Linux's `generic_write_sync` family ignores all three on
+/// a filesystem whose writes already reached the medium, but a word carrying
+/// bit 8 or the sign bit is `EINVAL` before the file is looked at - measured on
+/// a current host (Linux 7.2.14, `build/scratch/advice/{p,r,s}.c`):
+/// `flags = 0|1|2|4|7` all answer 0, `flags = 8|0x10|0x18|~0` all answer
+/// `EINVAL`, and `(pipe, flags=8)` answers `EINVAL` where `(pipe, flags=0)`
+/// answers `ESPIPE` - the flag word is judged before the file's own answer,
+/// which is why this is asked *before* the node's kind in `handle_sync_file_range`.
+pub(crate) fn sync_file_range_flags_verdict(word: usize) -> Result<(), isize> {
+    const VALID: u32 = 1 | 2 | 4;
+    let flags = word as u32;
+    if flags & !VALID != 0 {
+        return Err(err::EINVAL);
+    }
+    Ok(())
+}
+
 /// `setitimer`/`getitimer`'s `which` is a 32-bit `int`, not the `usize` the
 /// syscall register carries. Linux's `do_setitimer` takes it into an `int`, so
 /// a caller whose word has anything above bit 31 is really naming the low
@@ -7485,6 +7551,58 @@ mod diskstat_tests {
         assert_eq!(iov_count_verdict(usize::MAX), Err(err::EINVAL));
         assert_eq!(iov_count_verdict(0x1_0000_0000), Ok(0));
         assert_eq!(iov_count_verdict(0x1_0000_0401), Err(err::EINVAL));
+    }
+
+    /// `readahead`'s range words are signed, and only their sign is judged:
+    /// a count of a terabyte is a promise, a negative one is a refusal.
+    #[test]
+    fn readahead_judges_the_sign_of_its_range_and_nothing_else() {
+        assert_eq!(readahead_range_verdict(0, 4096), Ok(()));
+        assert_eq!(readahead_range_verdict(0, 0), Ok(()));
+        assert_eq!(readahead_range_verdict(0, 131_073), Ok(()));
+        assert_eq!(readahead_range_verdict(0, i64::MAX), Ok(()));
+        assert_eq!(readahead_range_verdict(1 << 62, i64::MAX), Ok(()));
+        // `2^63` written as an unsigned count arrives here as a negative `i64`.
+        assert_eq!(readahead_range_verdict(0, i64::MIN), Err(err::EINVAL));
+        assert_eq!(readahead_range_verdict(-1, 0), Err(err::EINVAL));
+        assert_eq!(readahead_range_verdict(-1, 4096), Err(err::EINVAL));
+    }
+
+    /// The two neighbouring doors judge their range differently, and only one
+    /// of them refuses a sum that wraps.
+    #[test]
+    fn readahead_lets_its_range_wrap_and_sync_file_range_refuses_to() {
+        // readahead: sign only.
+        assert_eq!(readahead_range_verdict(1 << 62, i64::MAX), Ok(()));
+        // sync_file_range: sign, then the sum.
+        assert_eq!(
+            sync_file_range_range_verdict(1 << 62, i64::MAX),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            sync_file_range_range_verdict(1 << 62, 1 << 62),
+            Err(err::EINVAL)
+        );
+        assert_eq!(sync_file_range_range_verdict(i64::MAX, 0), Ok(()));
+        assert_eq!(sync_file_range_range_verdict(0, i64::MAX), Ok(()));
+        assert_eq!(sync_file_range_range_verdict(0, 4096), Ok(()));
+        assert_eq!(sync_file_range_range_verdict(-1, 4096), Err(err::EINVAL));
+        assert_eq!(sync_file_range_range_verdict(0, -1), Err(err::EINVAL));
+    }
+
+    /// `sync_file_range`'s flag word is three bits wide: 1, 2 and 4 are the
+    /// vocabulary, `8` and every bit above it is `EINVAL`.
+    #[test]
+    fn sync_file_range_has_three_flag_bits_and_refuses_the_rest() {
+        for word in [0usize, 1, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(sync_file_range_flags_verdict(word), Ok(()));
+        }
+        for word in [8usize, 0x10, 0x18, 0x7fff_fff8, 0x8000_0000] {
+            assert_eq!(sync_file_range_flags_verdict(word), Err(err::EINVAL));
+        }
+        // A word wider than 32 bits is read as the `unsigned int` Linux reads.
+        assert_eq!(sync_file_range_flags_verdict(0x1_0000_0000), Ok(()));
+        assert_eq!(sync_file_range_flags_verdict(0x1_0000_0001), Ok(()));
     }
 
     /// before §6.124 the door refused all but `flags = 0`.

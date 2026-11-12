@@ -441,6 +441,7 @@ mod tests {
         assert_eq!(MKNODAT, 259);
         assert_eq!(FUTIMESAT, 261);
         assert_eq!(READAHEAD, 187);
+        assert_eq!(SYNC_FILE_RANGE, 277);
         assert_eq!(SPLICE, 275);
         assert_eq!(SYNCFS, 306);
         assert_eq!(SYSLOG, 103);

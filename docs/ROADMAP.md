@@ -2377,3 +2377,17 @@ carries the per-phase history.*
   (18 claims) is `PASS` on both arms and **15 of 18 red** counterfactually. Named gaps: the
   eight-slot table answers `EAGAIN` where Linux is bounded by `RLIMIT_SIGPENDING`, and `TIMER_ABSTIME`
   is still refused. (§6.137, item 251)
+- `readahead` and `sync_file_range` were answered by their subject rather than their range: the first
+  returned 0 for every descriptor that existed, so a write-only descriptor, a directory, a pipe and a
+  character device all got the answer Linux reserves for a file it will really read; the second had no
+  dispatch arm and fell into `_ => ENOSYS`, which has no fallback for a caller whose whole point is
+  not waiting. Both now ask four questions in the measured order, and the two orders are not the
+  same: `readahead` asks descriptor → mode (`EBADF`) → regular file (`EINVAL`) → signed range
+  (`EINVAL`), while `sync_file_range` asks descriptor → range (`EINVAL`, including a sum that wraps -
+  which `readahead` accepts) → flag word `1|2|4` (`EINVAL`) → a node with something to flush
+  (`ESPIPE`). The order witnesses are calls with two faults at once: `readahead(999, -1, 4096)` is
+  `EBADF`, and `sync_file_range(pipe, flags=8)` is `EINVAL` where the same pipe with `flags=0` is
+  `ESPIPE`. `SYNC_FILE_RANGE` is `277` on x86_64 and `84` on aarch64. Pin `t-range-advice`
+  (22 claims) is `PASS` on both arms and **19 of 22 red** counterfactually. Named gaps: no
+  `MAX_READAHEAD` window and no deferred writes, so the three flush bits have nothing to wait on.
+  (§6.138, item 252)

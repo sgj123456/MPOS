@@ -292,7 +292,23 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
-**Latest measured gate (2026-11-12, `/proc/<pid>/timers` §6.137):** stage 1 `1278 tests, 0 failed`
+**Latest measured gate (2026-11-12, `readahead`/`sync_file_range` §6.138):** stage 1
+`1281 tests, 0 failed` (70.73 s - the +3 are `readahead_judges_the_sign_of_its_range_and_nothing_else`,
+`readahead_lets_its_range_wrap_and_sync_file_range_refuses_to` and
+`sync_file_range_has_three_flag_bits_and_refuses_the_rest`); x86_64 `pass=301 fail=0 (301 built)`,
+`mpos-kunit 35 passed, 0 failed` (51.71 s over 2 lane(s), total `71.08 s`, `+0.9%` against the
+previous green); aarch64 `pass=300 fail=0 (300 built)`, kunit 35/0 (128.05 s, total `221.48 s`,
+`-2.8%`) - `GATE EXIT=0`, both arms in one command with the lane count forced
+(`MPOS_TEST_LANES=2`). `t-range-advice` `=== PASS` on both arms
+(`build/test-lane-x86_64-1/serial.log:4171`, `build/test-lane-aarch64-1/serial.log:4641`).
+Counterfactually **19 of 22 red** (`build/boot-advice-cf1.log`): the admission claims read 0 where
+the answer is `EBADF`/`EINVAL`/`ESPIPE`, and every `sync_file_range` claim reads `ENOSYS(38)`, while
+the three controls (a regular file's range is served, a huge count is still a promise, a missing
+descriptor was already `EBADF`) hold on both kernels. The two order witnesses are the claims worth
+reading: `readahead(999, -1, 4096) = EBADF` and `sync_file_range(pipe, flags=8) = EINVAL` cannot be
+satisfied by a door that asks its questions in any other order.
+
+**Measured gate before it (2026-11-12, `/proc/<pid>/timers` §6.137):** stage 1 `1278 tests, 0 failed`
 (70.08 s — the +2 are `the_timers_file_is_linuxs_four_lines_with_the_subject_translated` and
 `a_wall_timer_prints_the_clock_it_was_built_on_and_a_cpu_one_prints_the_encoded_word`); x86_64
 `pass=300 fail=0 (300 built)`, `mpos-kunit 35 passed, 0 failed` (70.44 s over 2 lane(s), `-5.8%`

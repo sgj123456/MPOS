@@ -11064,3 +11064,51 @@ node (`src/vfs/procfs.rs`); host tests for the render and the clock word, `774` 
 **Named gaps:** the eight-slot table is this kernel's own bound - Linux's is bounded by
 `RLIMIT_SIGPENDING`, so a ninth timer answers `EAGAIN` here where Linux would create one (§6.125's
 existing gap); and `TIMER_ABSTIME` is still refused (§6.124).
+
+### Item 252 `readahead` and `sync_file_range` - two admission doors, two range laws
+
+**Before:** `readahead` answered "the descriptor exists, therefore 0", so a write-only descriptor, a
+directory, a pipe and a character device all got the 0 Linux reserves for a file it will really read.
+`sync_file_range` had no dispatch arm at all and fell into `_ => ENOSYS`.
+
+**Now:** both doors ask four questions in a measured order, and `sync_file_range` is served.
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| `readahead(regular, 0, 4096)` | 0 | 0 | 0 |
+| `readahead(write-only regular fd)` | `EBADF` | 0 | `EBADF` |
+| `readahead(dir)` / `(pipe)` / `(/dev/null)` / `(socket)` | `EINVAL` | 0 | `EINVAL` |
+| `readahead(regular, -1, 4096)` | `EINVAL` | 0 | `EINVAL` |
+| `readahead(regular, 0, 2^63)` | `EINVAL` | 0 | `EINVAL` |
+| `readahead(regular, 0, i64::MAX)` | 0 | 0 | 0 |
+| `readahead(999, -1, 4096)` | `EBADF` | `EBADF` | `EBADF` |
+| `sync_file_range(regular, 0, 4096, 0\|1\|2\|4\|7)` | 0 | `ENOSYS` | 0 |
+| `sync_file_range(regular, 0, 4096, 8)` | `EINVAL` | `ENOSYS` | `EINVAL` |
+| `sync_file_range(pipe, 0, 4096, 8)` | `EINVAL` | `ENOSYS` | `EINVAL` |
+| `sync_file_range(pipe)` / `(/dev/null)` / `(socket)` | `ESPIPE` | `ENOSYS` | `ESPIPE` |
+| `sync_file_range(dir)` | 0 | `ENOSYS` | 0 |
+| `sync_file_range(999, 0, 4096, 8)` | `EBADF` | `ENOSYS` | `EBADF` |
+| `sync_file_range(regular, -1, 4096, 0)` | `EINVAL` | `ENOSYS` | `EINVAL` |
+| `sync_file_range(regular, 2^62, 2^62, 0)` | `EINVAL` | `ENOSYS` | `EINVAL` |
+| `sync_file_range(regular, 0, i64::MAX, 0)` | 0 | `ENOSYS` | 0 |
+
+**Why the two doors do not share a rule.** They order their four questions differently - `readahead`
+asks the mode before the range, `sync_file_range` asks the range and then the flag word before the
+kind - and they disagree about a wrapping sum (`readahead` accepts one, `sync_file_range` refuses
+it). A single shared "validate then serve" helper would have to guess which of the four faults a
+caller has, and the caller has two of them in exactly the tests that pin the order.
+
+**Measurement:** `build/scratch/advice/{p,q,r,s,t,u,v,w,x,y}.c` on host 7.2.14. One probe of this
+family was wrong and is worth recording: it passed the range words as `int` through `syscall(2)`'s
+variable arguments, so the register held `0x0000_0000_ffff_ffff` rather than `-1`, and it reported
+"negative offsets are accepted". The table above comes from probes that declare the words `long`.
+
+**Landed:** `readahead_range_verdict`/`sync_file_range_range_verdict`/`sync_file_range_flags_verdict`
+(`src/syscall/linux/abi.rs`); `handle_readahead` rewritten and `handle_sync_file_range` added
+(`src/syscall/linux/fs/file.rs`), both with the `as_pipe()`/`as_duplex()` guard `fsync` already
+carried; `SYNC_FILE_RANGE` = `277`/`84` in the two number tables and its `nr.rs` assertion; the
+dispatch arm. Pin: `user/tests/src/bin/t-range-advice.rs`, 22 claims, 19 of them red against the
+kernel without the change.
+
+**Named gaps:** no `MAX_READAHEAD` window (nothing is read lazily to fill one) and no deferred
+writes, so `sync_file_range`'s three flush bits have nothing to wait on. Notes: `§6.138`.

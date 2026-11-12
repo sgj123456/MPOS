@@ -427,6 +427,11 @@ pub const MKNODAT: u64 = 259;
 pub const FUTIMESAT: u64 = 261;
 /// `readahead(2)`: a promise that the range is coming.
 pub const READAHEAD: u64 = 187;
+/// `sync_file_range(2)`: flush a byte range of one descriptor. Linux numbers
+/// it 84 on the asm-generic table, where the same number also spells
+/// `sync_file_range2` for machines whose 64-bit arguments must be aligned;
+/// on a 64-bit machine the plain order `(fd, offset, nbytes, flags)` is it.
+pub const SYNC_FILE_RANGE: u64 = 277;
 /// `splice(2)`: move bytes between a pipe and anything else.
 pub const SPLICE: u64 = 275;
 /// `syncfs(2)`: flush the filesystem one descriptor belongs to.

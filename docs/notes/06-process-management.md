@@ -12111,3 +12111,172 @@ A handle is a promise about *which object*, not about *where it is stored*. The
 two coincide until something is deleted, which is why an index-as-handle passes
 every test that never frees anything - and why the file that finally listed the
 table could show the retarget.
+
+## §6.138 `readahead` and `sync_file_range` judge a range, and the two laws differ (LANDED 2026-11-12)
+
+Two neighbouring calls, both of the shape "here is a byte range, do something
+sensible with it", both answered by the wrong thing for the same reason: this
+kernel treated the *subject* as the whole question. `readahead(2)` was
+
+```rust
+match crate::sched::current_fds().clone_at(args[0] as i32) {
+    Ok(_) => 0,
+    Err(e) => err_of(e),
+}
+```
+
+which is to say every descriptor that exists is a descriptor whose range will be
+read. `sync_file_range(2)` had no dispatch arm at all, so it fell through the
+`_ => ENOSYS` and told every caller Linux had never heard of a call it has served
+since 2.6.17 - and there is no fallback for that answer, because the whole point
+of the call is that the caller does not have to wait.
+
+### What the host answers
+
+Measured on Linux 7.2.14 (`build/scratch/advice/{p,q,r,t,u,v,w,x,y}.c`), with one
+correction worth stating up front: the first probe passed the range words through
+`syscall(2)`'s variable arguments as `int`, so the register held
+`0x0000_0000_ffff_ffff` rather than `-1` and the kernel read a positive
+4294967295. That probe reported "a negative offset is accepted" and the truth was
+that it never sent one. Every reading below comes from a probe that declares its
+arguments `long`:
+
+```
+readahead(regular, 0, 4096)                 = 0
+readahead(regular, 0, 131073)               = 0        (no MAX_READAHEAD cap)
+readahead(regular, 0, i64::MAX)             = 0
+readahead(regular, 2^62, i64::MAX)          = 0        (a wrapping sum is fine)
+readahead(regular, -1, 0)                   = EINVAL
+readahead(regular, 0, 2^63)                 = EINVAL   (a signed negative count)
+readahead(write-only regular fd)            = EBADF
+readahead(regular, -1, 4096) on a write-only fd = EBADF  (mode before range)
+readahead(dir) / (pipe) / (/dev/null) / (/dev/zero) / (socket) = EINVAL
+readahead(999, -1, 4096)                    = EBADF    (descriptor before range)
+```
+
+```
+sync_file_range(regular, 0, 4096, 0|1|2|4|7)   = 0
+sync_file_range(regular, 0, 4096, 8|0x10|0x18|~0) = EINVAL
+sync_file_range(pipe, 0, 4096, 8)              = EINVAL   (flags before kind)
+sync_file_range(pipe, 0, 4096, 0)              = ESPIPE
+sync_file_range(/dev/null) / (/dev/zero) / (socket)     = ESPIPE
+sync_file_range(dir)                           = 0
+sync_file_range(regular, -1, 4096, 0)          = EINVAL
+sync_file_range(regular, 0, -1, 0)             = EINVAL
+sync_file_range(regular, 2^62, 2^62, 0)        = EINVAL   (the sum wraps)
+sync_file_range(regular, 0, i64::MAX, 0)       = 0
+sync_file_range(regular, i64::MAX, 0, 0)       = 0
+sync_file_range(999, 0, 4096, 8)               = EBADF    (descriptor first)
+```
+
+So the two doors ask four questions in a fixed order - and they ask them in an
+order that is not the same, which is the part a shape cannot get right:
+
+| door | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| `readahead` | descriptor exists (`EBADF`) | mode is readable (`EBADF`) | node is a regular file (`EINVAL`) | offset and count non-negative (`EINVAL`) |
+| `sync_file_range` | descriptor exists (`EBADF`) | range non-negative and non-wrapping (`EINVAL`) | flag word is `1\|2\|4` (`EINVAL`) | node has something to flush (`ESPIPE`) |
+
+Two contradictory witnesses pin the orders. `readahead(999, -1, 4096)` is `EBADF`
+and not `EINVAL`, so the descriptor outranks the range. `sync_file_range(pipe,
+flags=8)` is `EINVAL` while the same pipe with `flags=0` is `ESPIPE`, so the flag
+word outranks the kind - but `(999, flags=8)` is `EBADF`, so the descriptor
+outranks the flag word. A door that tested its arguments in a different order
+would answer each of those callers with the wrong errno while agreeing on every
+single-fault test.
+
+The two laws also differ in one place, and only measurement finds it: `readahead`
+accepts a range whose sum wraps (`2^62 + i64::MAX` is served) while
+`sync_file_range` refuses one (`2^62 + 2^62` is `EINVAL`), because the latter's
+`vfs_fsync_range` forms `end = offset + nbytes` and checks that it did not wrap.
+
+### The shape here
+
+`readahead`'s mode test is `File::check_readable()`, and its kind test needs the
+`as_pipe()`/`as_duplex()` pair as well as the kind, for the reason `fsync`
+already carries: a pipe end and a `socketpair` end report `NodeKind::File`,
+because the filesystem's vocabulary has no word for an anonymous byte channel.
+Reading the kind alone would let a pipe through as a regular file and answer 0
+where Linux answers `EINVAL` - the same lie, in the same two families, as the one
+`fsync` was fixed for.
+
+`sync_file_range`'s flush is empty - every write here reached its medium before
+the call returns - so like `fsync` the call is its admission. What is not empty is
+the answer for a node with nothing behind it: pipes, sockets, character devices
+and anonymous inodes are `ESPIPE`, which is Linux's word for "this medium has no
+byte ranges to wait on".
+
+The numbers are `277` on x86_64 and `84` on aarch64, both pinned in `nr.rs`'s
+assert table. The asm-generic table spells `sync_file_range2` with the same `84`:
+the C library picks the variant whose 64-bit arguments are aligned, and on a
+64-bit machine both are the plain `(fd, offset, nbytes, flags)` order.
+
+### The pin
+
+`user/tests/src/bin/t-range-advice.rs`, 22 claims. It creates its own file under
+`/tmp` (a regular file is what `readahead` will serve), opens the same file
+write-only for the mode test, and uses `/tmp` itself, `/dev/null` and a `pipe(2)`
+pair for the kinds. Two claims are order witnesses rather than answers -
+`readahead(999, -1, 4096) = EBADF` and `sync_file_range(pipe, flags=8) = EINVAL`
+- because the errno alone cannot tell an order apart; only a call with *two*
+faults can.
+
+Both arms passed: host 22/22 and the machine 22/22 (`build/boot-advice1.log`).
+
+Against the kernel without the change (the six syscall-layer files stashed and
+both the kernel and the loader rebuilt), **19 of the 22 claims fail**
+(`build/boot-advice-cf1.log`):
+
+```
+FAIL: a descriptor this call cannot read from is EBADF (got 0, want 9)
+FAIL: a directory has no page cache to fill (got 0, want 22)
+FAIL: a pipe has no page cache either (got 0, want 22)
+FAIL: and neither has a character device (got 0, want 22)
+FAIL: a negative offset is refused (got 0, want 22)
+FAIL: a count whose top bit is set is a negative count (got 0, want 22)
+FAIL: a flush of a regular range is served (got 38, want 0)
+FAIL: a flag bit outside the vocabulary is EINVAL (got 38, want 22)
+FAIL: a pipe has nothing to flush, so the same pipe is ESPIPE (got 38, want 29)
+FAIL: a descriptor this call ... (got 38, want 9)      [four more ENOSYS lines]
+```
+
+The three that hold on both kernels are the controls: a regular file's range is
+served, a huge count is still a promise, and a missing descriptor was already
+`EBADF`. That is the shape a counterfactual should have - the claims that move
+are the ones the change is about, and the ones that do not are the ones the old
+code already answered.
+
+### The gate
+
+`GATE EXIT=0`. Stage 1 `1281 tests, 0 failed` (70.73 s) - the +3 are
+`readahead_judges_the_sign_of_its_range_and_nothing_else`,
+`readahead_lets_its_range_wrap_and_sync_file_range_refuses_to` and
+`sync_file_range_has_three_flag_bits_and_refuses_the_rest`. x86_64
+`pass=301 fail=0 (301 built)` with `mpos-kunit 35 passed, 0 failed` (51.71 s over
+2 lane(s), total `71.08 s`, `+0.9%` against the previous green); aarch64
+`pass=300 fail=0 (300 built)` with kunit 35/0 (128.05 s over 2 lane(s), total
+`221.48 s`, `-2.8%`). `t-range-advice` is `=== PASS` on both arms
+(`build/test-lane-x86_64-1/serial.log:4171`, `build/test-lane-aarch64-1/serial.log:4641`).
+
+### Named gaps
+
+- **`MAX_READAHEAD`**. Linux truncates the range it will actually pull in to
+  `MAX_READAHEAD` (128 KiB) and expands a read to `readahead_expand()`. This
+  kernel reads eagerly, so there is no window to fill; the call is admission and
+  the answer is 0. What is *not* implemented is any promise about the bytes
+  arriving early - and the caller cannot tell, which is what makes this a gap in
+  the mechanism rather than in the answer.
+- **`sync_file_range`'s flush**. Every write here is synchronous, so nothing is
+  deferred and nothing is flushed. A medium that starts deferring writes has to
+  give this call a real answer, and `WAIT_BEFORE`/`WAIT_AFTER` have no meaning
+  until then. `sync_file_range2` is the same call with the aligned-argument order
+  and is not separately numbered here, because a 64-bit machine uses the plain
+  order.
+
+### The rule
+
+An admission is a promise, and a promise about a *range* is not a promise about
+its *subject*. "The descriptor exists" answers which object, never whether this
+call can do anything with that object - which is why both doors here had to be
+taught the four questions and the order between them, and why the two doors
+turned out to order them differently.
