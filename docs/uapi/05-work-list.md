@@ -11289,3 +11289,44 @@ Linux answers `EACCES` at the open.
 **Pin:** `user/tests/src/bin/t-proc-words.rs`, 19 claims, host and guest green;
 the conversion claims are relations between the two files, never constants.
 Notes: `§6.142`.
+
+### Item 257 `/proc/<pid>/syscall` - the call a task is inside
+
+**Before:** `ENOENT`. The file `strace -p` reads - and the only door for a task's
+*current* syscall that needs neither a tracer nor a stop - did not exist.
+
+**Now:** the directory and file exist for `/proc/<pid>` and `/proc/<pid>/task/<tid>`,
+`0400`, ptrace-gated, rendering the record the gate takes at dispatch entry.
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| a task in a call | `0 0x3 0x… 0x… 0x0 0x0 0x0 0x… 0x…` | `ENOENT` | the same nine fields |
+| a task in ring 3 | `running` | `ENOENT` | `running` |
+| a zombie | `-1 0x0 0x0` | `ENOENT` | the same three fields |
+| a pid that is not there | `ENOENT` | `ENOENT` | `ENOENT` |
+| mode | `0400` | - | `0400` |
+
+**Why the record is taken at the gate.** The arguments live in registers the
+handler may clobber and the frame holding `sp`/`pc` is on the task's own kernel
+stack, so `enter_syscall` runs between the entry stop and the dispatch, and
+`leave_syscall` runs when the dispatch returns - **before** signal delivery,
+because a handler runs in ring 3.
+
+**Why `sp` needed a machine question.** `hal::Gate` had `user_ip` and nothing for
+the stack pointer; `user_sp` is its symmetric one-register sibling (`Regs::
+user_rsp` on x86_64, `UserFrameOps::sp` on aarch64), not a whole `UserFrame` copy
+- this runs on every syscall.
+
+**Two lifecycle ends, both of which would have gone stale rather than missing:**
+`execve` never returns, so its record is cleared where the image is replaced
+(else a fresh program would answer with the `execve` it was born from for ever);
+`exit` gets no clear, because a dead task answers the zombie form.
+
+**Pin:** `user/tests/src/bin/t-proc-syscall.rs`, 14 claims, whose strongest are
+relations rather than numbers: the file is read by a `read(2)` of the test's own
+and reports *that* call's number and descriptor, and a child parked on a pipe's
+read end reports `read` and that pipe end. Green on the host first and in the
+guest, which print different addresses under the same claims.
+
+**Named gaps:** a task stopped by a tracer reports its last call rather than the
+stop's state; a `vDSO` call has no number to report. Notes: `§6.143`.

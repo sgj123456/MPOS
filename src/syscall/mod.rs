@@ -256,8 +256,26 @@ pub unsafe fn linux_dispatch(
     // the signal delivery's restart question - is a question about the call that
     // runs, not the one that was asked for.
     let (nr, args) = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
+    // The call this task is *inside*, for `/proc/<pid>/syscall`: recorded here
+    // because the gate's frame is this task's only until the dispatch returns,
+    // and the arguments are clobbered by every nested call. `sp`/`pc` come from
+    // the frame the same way `user_ip` already does; both are cheap reads of
+    // the machine's saved registers, not a whole `UserFrame` copy.
+    //
+    // A null frame is a call the kernel made on its own behalf: there is no
+    // user context, and it belongs to no `/proc` entry.
+    if !regs_ptr.is_null() {
+        // SAFETY: `regs_ptr` is the gate's own frame, per this function's contract.
+        let sp = unsafe { crate::hal::user_sp(regs_ptr) };
+        let pc = unsafe { crate::hal::user_ip(regs_ptr) };
+        crate::sched::enter_syscall(nr, args, sp, pc);
+    }
     // SAFETY: the caller's contract, passed through unchanged.
     let ret = unsafe { linux::dispatch(nr, args, from_user, regs_ptr) };
+    // The call has returned: nothing is in flight now. Cleared *before* the
+    // signal delivery below, because a handler runs in ring 3 - if the delivery
+    // rewrites the frame and jumps in, the task is no longer inside a call.
+    crate::sched::leave_syscall();
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
     // The call's result goes into the frame *now*, before the signal delivery
     // below, and that order is the whole reason this is not the gate's own

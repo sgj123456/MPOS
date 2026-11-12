@@ -12801,3 +12801,76 @@ refusals, the sentinel's capability rule (judged by the caller's uid, so the sam
 program expects `EACCES` unprivileged and the floor landing on the guest), and
 `ENOENT` for a pid that does not exist. Green on the host first, then in the
 guest (`build/boot-procwords2.log`).
+
+## §6.143 `/proc/<pid>/syscall`: the call a task is inside (LANDED 2026-11-12)
+
+The file `strace -p` reads, and the only door for a task's **current** syscall
+that needs neither the caller to be a tracer nor the task to be stopped:
+`PTRACE_GET_SYSCALL_INFO` needs both. It did not exist here - `ENOENT`.
+
+Measured whole on Linux 7.2.14 (`build/scratch/procsyscall/p.c`), four shapes:
+
+```text
+in a call     0 0x3 0x7ffe7e3c2360 0x1ff 0x0 0x0 0x0 0x7ffe7e3c2340 0x7ff78a911b0d
+in ring 3     running
+a zombie      -1 0x0 0x0
+gone          ENOENT
+```
+
+The number is **decimal** and the eight that follow are **hex with a `0x`
+prefix** - the six arguments, then the user stack pointer and the instruction
+pointer - single-spaced. A task in ring 3 answers the *word* `running` rather
+than an empty file, which is the distinction that makes the file usable: an
+empty answer would be indistinguishable from a failed read. A dead task answers
+**three** fields, `-1 0x0 0x0`, because there is no frame left to describe.
+
+### What it took, and why at the gate
+
+The record has to be taken at **dispatch entry**: the arguments live in registers
+that the handler is free to clobber, and the frame that holds `sp`/`pc` is on the
+task's own kernel stack, so nothing may read it later. So `enter_syscall` runs
+after the entry stop and before the dispatch, and `leave_syscall` when the
+dispatch returns - *before* signal delivery, because a handler runs in ring 3 and
+the task is then no longer inside a call.
+
+`sp` needed a new machine question. `hal::Gate` had `user_ip` (one register, and
+the reason it is separate from `user_context` is that a caller wanting one
+register should not pay for the whole frame), so this adds the symmetric
+`user_sp`: `Regs::user_rsp` on x86_64, `UserFrameOps::sp` on aarch64. Both are one
+read of a saved register, so the cost per syscall is two loads and a small store
+- which matters, because this runs on every call, not only on the ones a tracer
+looks at.
+
+Two ends of the lifecycle needed their own care, and both are the kind of thing
+that would have produced a *stale* answer rather than a missing one:
+
+* **`execve` never returns**, so the record the gate set for it has no return to
+  clear it. The clear is where the image is replaced (`exec_replace`, beside
+  `user_resume = None`), or a newly exec'd program would answer `/proc/<pid>/
+  syscall` with the `execve` it was born from for ever.
+* **`exit` needs no clear** and must not get one: a dead task answers the
+  zombie form, which is the three-field line, not `running`.
+
+### The pin
+
+`user/tests/src/bin/t-proc-syscall.rs`, 14 claims, and its strongest two are
+relations rather than numbers, which is what lets the same program pass on a host
+and a guest whose addresses and syscall tables differ:
+
+* the file is read *by* a `read(2)` of the test's own, and the record is taken at
+  entry - so the line **describes the call fetching it**: its number is `read`'s
+  and its first argument is the descriptor the test passed;
+* a **parked** task (a child blocked on a pipe read) reports `read` and that
+  pipe's read end;
+* a ring-3 spinner answers `running`, a zombie `-1 0x0 0x0`, an absent pid
+  `ENOENT`, and the file is `0400`.
+
+Green on the host first and in the guest (`build/boot-procsyscall1.log`), with
+the guest printing its own addresses (`sp 0x3fdf6908 pc 0x44edf7`) where the host
+printed `0x7ffce32cda48`/`0x44fa79` - the same claims, different numbers.
+
+Named gaps: `0400` plus Linux's `ptrace_may_access` gate is wired through
+`describes_task`, so another process's file is `EACCES`; a task stopped by a
+tracer reports its last call rather than the stop's state (Linux's `running`
+for a non-running task is its own subtlety), and the file says nothing about a
+`vDSO` call, which has no syscall number to report.

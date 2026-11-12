@@ -1575,6 +1575,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             },
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
+            syscall: None,
             nice: t.task(parent_id).nice,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
@@ -1757,6 +1758,11 @@ pub fn exec_replace(
         // the address space being thrown away, so `exec` clears it (measured: a
         // registration does not survive `exec`).
         task.user_resume = None;
+        // `execve` never returns, so the call-in-flight record the gate set for
+        // it has no return to clear it: the task is about to resume as a *new*
+        // program in ring 3, and `/proc/<pid>/syscall` must answer `running`
+        // from here on rather than naming an `execve` that already happened.
+        task.syscall = None;
         crate::sched::rseq::exec_clear(id);
         task.child_tid = 0;
         task.tls = 0;
@@ -2210,6 +2216,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             no_new_privs,
             oom_score_adj,
             oom_score_adj_min,
+            syscall: None,
             nice,
             rlimits,
             seccomp_strict,

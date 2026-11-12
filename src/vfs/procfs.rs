@@ -3904,6 +3904,70 @@ fn oom_adj_ctl(pid: usize) -> Arc<dyn Inode> {
     })
 }
 
+/// `/proc/<pid>/syscall`: the call a task is inside, or the word `running`.
+///
+/// The file `strace -p` and every "what is this process stuck in" tool reads,
+/// and the one place a tasks's *current* syscall is visible from outside it:
+/// `PTRACE_GET_SYSCALL_INFO` needs the caller to be the tracer and the tracee to
+/// be stopped, while this door needs neither.
+///
+/// Measured whole on Linux 7.2.14 (`build/scratch/procsyscall/p.c`), four shapes:
+///
+/// ```text
+/// in a call     0 0x3 0x7ffe7e3c2360 0x1ff 0x0 0x0 0x0 0x7ffe7e3c2340 0x7ff78a911b0d
+/// in ring 3     running
+/// a zombie      -1 0x0 0x0
+/// gone          ENOENT
+/// ```
+///
+/// Three details the shapes carry. The number is **decimal** and the eight that
+/// follow are **hex with a `0x` prefix** - the number, the six arguments, then
+/// the user stack pointer and the instruction pointer, single-spaced. A task in
+/// ring 3 answers the word `running`, and there is no newline-only case to
+/// confuse it with. A dead task answers three fields, not nine: `-1` in the
+/// number slot and zeros for the two registers, which is what a task with no
+/// saved frame has to say.
+///
+/// The record it renders is [`crate::sched::syscall_frame_of`], captured at
+/// dispatch entry and cleared when the dispatch returns - so a task parked
+/// *inside* a handler keeps it, which is the case the file exists for.
+///
+/// `0400`: the mode is the word's own, and Linux runs `ptrace_may_access` before
+/// it answers, which is why a process nobody may inspect is `EACCES` rather than
+/// a line (the `describes_task` gate every ptrace-shaped proc file here uses).
+#[cfg(target_os = "none")]
+fn syscall_file(pid: usize, slot: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(move || {
+            let snapshot = task(slot)?;
+            // A task that has exited answers Linux's three-field form: there is
+            // no frame left to describe, and `-1` is the number no syscall has.
+            if snapshot.state == 'Z' || snapshot.state == 'X' {
+                return Some(alloc::string::String::from("-1 0x0 0x0\n").into_bytes());
+            }
+            match crate::sched::syscall_frame_of(pid) {
+                Some(frame) => {
+                    let mut out = alloc::format!("{}", frame.nr);
+                    for arg in frame.args {
+                        out.push_str(&alloc::format!(" {arg:#x}"));
+                    }
+                    out.push_str(&alloc::format!(" {:#x} {:#x}\n", frame.sp, frame.pc));
+                    Some(out.into_bytes())
+                }
+                // In ring 3, and that is the whole answer - not an empty file
+                // and not a number.
+                None => Some(alloc::string::String::from("running\n").into_bytes()),
+            }
+        }),
+        mode: 0o400,
+        size: 0,
+        describes: Some(pid),
+        rendered: Mutex::new(RefCell::new(None)),
+    })
+}
+
 /// `/proc/<pid>/personality`: the execution-environment word `personality(2)`
 /// reports, as eight lowercase hex digits.
 ///
@@ -4344,6 +4408,9 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // owner `personality(2)` answers from.
     #[cfg(target_os = "none")]
     node.add("personality", NodeKind::File, personality_file(slot));
+    // The call this task is inside right now - `strace -p`'s question.
+    #[cfg(target_os = "none")]
+    node.add("syscall", NodeKind::File, syscall_file(leader, slot));
     // `/proc/<pid>/timens_offsets` - the clocks this process's children will
     // read, and the one door a `unshare(CLONE_NEWTIME)` has for saying by how
     // much. Named the way a real kernel names it, because the tools that write

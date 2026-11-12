@@ -804,6 +804,20 @@ pub trait Gate {
     /// `syscall::linux_dispatch` was handed.
     unsafe fn user_ip(frame: *mut ()) -> u64;
 
+    /// The user **stack pointer** of the call being dispatched: the stack the
+    /// gate will return onto.
+    ///
+    /// The sibling of [`Gate::user_ip`], and separate from
+    /// [`Gate::user_context`] for the reason that one exists: a caller that
+    /// wants one register should not pay for the whole frame. `/proc/<pid>/
+    /// syscall` reports the pair for a task parked in a call, so both have to be
+    /// readable at dispatch entry - the only moment the frame is guaranteed to
+    /// be this task's.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`].
+    unsafe fn user_sp(frame: *mut ()) -> u64;
+
     /// Send the frame back to userland at `entry` on `sp` - how `execve` makes a
     /// call that never returns.
     ///
@@ -1743,6 +1757,10 @@ pub unsafe fn syscall_entry_result_slot(frame: *mut (), nr: usize) -> usize {
 /// # Safety
 /// As [`Gate::set_result`].
 #[inline]
+pub unsafe fn user_sp(frame: *mut ()) -> u64 {
+    unsafe { <Current as Gate>::user_sp(frame) }
+}
+
 pub unsafe fn set_result(frame: *mut (), value: isize) {
     unsafe { <Current as Gate>::set_result(frame, value) }
 }

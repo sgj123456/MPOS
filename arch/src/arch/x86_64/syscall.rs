@@ -212,6 +212,14 @@ impl crate::hal::Gate for crate::hal::Current {
         regs.rcx as u64
     }
 
+    unsafe fn user_sp(frame: *mut ()) -> u64 {
+        // SAFETY: the caller's contract - the pointer is the frame
+        // `rust_syscall` was handed, and the stub parked the caller's `rsp`
+        // there before it built the rest.
+        let regs = unsafe { &*(frame as *const Regs) };
+        regs.user_rsp as u64
+    }
+
     unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
         // SAFETY: as above.
         let regs = unsafe { &mut *(frame as *mut Regs) };

@@ -925,6 +925,13 @@ impl crate::hal::Gate for crate::hal::Current {
         crate::hal::UserFrameOps::ip(frame) as u64
     }
 
+    unsafe fn user_sp(frame: *mut ()) -> u64 {
+        // SAFETY: as `user_ip` - the EL0 sync vector's frame for this task, and
+        // `UserFrameOps::sp` is the field the machine keeps the user stack in.
+        let frame = unsafe { &*(frame as *const context::UserFrame) };
+        crate::hal::UserFrameOps::sp(frame) as u64
+    }
+
     unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
         // SAFETY: as above.
         let frame = unsafe { &mut *(frame as *mut context::UserFrame) };

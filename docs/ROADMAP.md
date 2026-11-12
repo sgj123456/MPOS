@@ -2432,3 +2432,13 @@ carries the per-phase history.*
   where Linux's `proc_reg_open` asks the node's write *method* and answers `EACCES` at the open for
   root too - `ProcFile` now says it has no write method, which fixes every read-only generated file.
   Pin `t-proc-words` (19 claims), green on the host first and in the guest. (§6.142, item 256)
+- `/proc/<pid>/syscall` exists - nine fields (`nr` decimal, six arguments and the two registers in
+  `0x` hex) for a task inside a call, the word `running` for one in ring 3, and Linux's three-field
+  `-1 0x0 0x0` for a zombie. The record is taken at **dispatch entry** (the arguments are in registers
+  the handler clobbers and the frame is on the task's own kernel stack), cleared when the dispatch
+  returns - *before* signal delivery - and cleared again where `execve` replaces the image, since that
+  call never returns and would otherwise describe a fresh program for ever. `sp` needed a new
+  one-register machine question (`Gate::user_sp`) rather than a whole `UserFrame` copy, because this
+  runs on every syscall. Pin `t-proc-syscall` (14 claims): its strongest claims are that the file,
+  read *by* a `read(2)` of the test's own, describes that very call and its descriptor. (§6.143, item
+  257)

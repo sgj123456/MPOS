@@ -1,3 +1,4 @@
+use super::super::SyscallFrame;
 use super::ASLR_REGION_PAGES;
 use super::ASLR_STACK_PAGES;
 use super::FIRST_ALLOC_SLOT;
@@ -101,6 +102,45 @@ pub fn prev_syscall(slot: usize) -> u32 {
 }
 
 /// The bare number of `slot`'s last syscall, `0` for none yet.
+/// Record the call the running task has just entered.
+pub fn enter_syscall(nr: u64, args: [usize; 6], sp: u64, pc: u64) {
+    with_table(|t| {
+        let slot = t.current;
+        if let Some(task) = t.tasks.get_mut(slot.0).and_then(Option::as_mut) {
+            let mut words = [0u64; 6];
+            for (word, arg) in words.iter_mut().zip(args) {
+                *word = arg as u64;
+            }
+            task.syscall = Some(SyscallFrame {
+                nr,
+                args: words,
+                sp,
+                pc,
+            });
+        }
+    });
+}
+
+/// Forget it: the call returned (or the image it ran in was replaced).
+pub fn leave_syscall() {
+    with_table(|t| {
+        let slot = t.current;
+        if let Some(task) = t.tasks.get_mut(slot.0).and_then(Option::as_mut) {
+            task.syscall = None;
+        }
+    });
+}
+
+/// The call `pid` is inside, or `None` for a task in ring 3.
+pub fn syscall_frame_of(pid: usize) -> Option<SyscallFrame> {
+    with_table(|t| {
+        t.tasks
+            .get(pid)
+            .and_then(Option::as_ref)
+            .and_then(|task| task.syscall)
+    })
+}
+
 pub fn last_syscall(slot: usize) -> u32 {
     LAST_SYSCALL
         .get(slot)
@@ -1470,6 +1510,20 @@ pub(crate) struct Task {
     /// read as a lie the next time anything asks.
     pub(crate) oom_score_adj: i32,
     pub(crate) oom_score_adj_min: i32,
+    /// The call this task is **inside** right now, for
+    /// `/proc/<pid>/syscall`.
+    ///
+    /// `None` is the answer Linux spells `running`: the task is in ring 3, not
+    /// in a call. `Some` is set at dispatch entry and cleared when the dispatch
+    /// returns, so a task parked *inside* a handler - a `read(2)` waiting on a
+    /// pipe, a `wait4` on a child - keeps its record for as long as it waits,
+    /// which is exactly the case the file exists for (`strace -p` asks what a
+    /// process is stuck in).
+    ///
+    /// `execve` never returns, so its record is cleared where the image is
+    /// replaced rather than at a return that never happens; `exit` needs no
+    /// clear because a dead task answers the file's zombie form.
+    pub(crate) syscall: Option<SyscallFrame>,
     /// The nice value, the `-20..19` number `setpriority` records and
     /// `getpriority` reports (in the raw syscall's `20-nice` encoding). Like
     /// `oom_score_adj` it is state this kernel keeps honestly rather than
@@ -1820,6 +1874,7 @@ impl Task {
             seccomp_filters: Vec::new(),
             oom_score_adj: 0,
             oom_score_adj_min: 0,
+            syscall: None,
             nice: 0,
             brk_base: 0,
             brk_pages: 0,
@@ -2605,6 +2660,7 @@ impl Table {
             seccomp_filters: Vec::new(),
             oom_score_adj: 0,
             oom_score_adj_min: 0,
+            syscall: None,
             nice: 0,
             brk_base: 0,
             brk_pages: 0,
