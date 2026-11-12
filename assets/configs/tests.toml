@@ -129,7 +129,17 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-p9read", "t-pipecost"]
 # each machine, so running it on both is right, but a diagnostic is one thing
 # everywhere - and §15.34's rule bounds what a boot may assert by what the
 # kernel itself produces, which an interactive child's state letter is not.
-diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
+#
+# `t-iret` is the newest member and the plainest case: it measures *where* a
+# handled signal is handed over (§2.13) and prints which of the two doors the
+# machine used. On Linux it leaves a ring-3 burn loop at ~188 million of its 400
+# million iterations; on this kernel the same loop runs to exhaustion, because a
+# caught signal waits for the task's next system call. That is a named gap, not
+# a failure - which is exactly why it is a diagnostic and not a claim: a `t-`
+# assertion that reddens on one machine is a statement about the port, and this
+# is a statement about the ABI's remaining gap. When x86_64's half lands the
+# program's own output changes to Linux's shape, and that is the evidence.
+diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops", "t-iret"]
 
 # The first machine's own half. Empty, and an empty section is that machine's
 # answer rather than a missing one: every group it needs is a group the baseline

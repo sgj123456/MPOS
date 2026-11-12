@@ -912,6 +912,37 @@ Why the frame is the blocker, per machine - both read from the code:
   handler restores them itself. The interrupted image on the stack is therefore not complete there
   either.
 
+**The instrument now exists, and its first version was wrong.** The reading above claims the probe
+was "staged as `t-iret`", and it was not: no such program was in the tree, so
+`build/boot-iret1.log` could not be reproduced by anybody - a measurement whose instrument is missing
+is a sentence, not evidence. `user/tests/src/bin/t-iret.rs` is that program now, in the
+`diagnostic` group, and it reproduces both sides on demand (`build/boot-iret-gap{1,2}.log` after
+`build/boot-iret-new1.log`):
+
+```
+host (Linux 7.2.14)   control: 400000000 of 400000000
+                      armed:   left by THE SIGNAL after 188429911 iteration(s)
+guest (this kernel)   control: 400000000 of 400000000
+                      armed:   left by count exhaustion after 400000000 iteration(s)
+```
+
+Two things about writing it are worth keeping, because each is a trap this file's own subject set:
+
+* **The flag has to be read before any system call.** The first version read `GOT` *after*
+  `timer_delete`, and the guest answered "delivered at a trap" for a loop that had run to exhaustion -
+  the disarm syscall delivered the pending signal, and the instrument then reported that as an
+  interrupt. The question is whether the signal interrupted *the loop*, and the first syscall after
+  it is one of the doors the signal can come through. A reading taken after the thing it measures is
+  not a reading.
+* **Two measurements, not one.** "The loop ended by itself" and "the loop ended because of the
+  signal" are the same output from a single run, so the same burn runs twice - once armed, once as a
+  control. The host's control reaching its limit is what makes its armed run's early exit mean
+  something; without it, a loop that simply could not finish inside the budget would read as a
+  machine that delivered the signal.
+
+That the guest contradicts the host under this instrument is the *evidence the gap is real and
+reproducible*, which the note did not previously have in a form anyone could re-take.
+
 **What closing it would take.** Each machine's tick vector would need a full user-register image at
 trap time - x86_64 a naked stub that pushes a `pt_regs` before calling the handler (the same shape
 the syscall gate already uses), aarch64 saving `x19..x28` as well - and then a delivery path that

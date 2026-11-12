@@ -1,0 +1,202 @@
+//! t-iret - where a handled signal is handed over: at a trap, or at a system call.
+//!
+//! **Not a check: a reading**, and it is in the `diagnostic` group for that
+//! reason. It measures roadmap item §2.13 - the one named gap left in the
+//! signal surface - which `docs/notes/`'s appendix currently describes as
+//! *"staged as `t-iret`"* (`build/boot-iret1.log`) while the program did not
+//! exist in the tree, so the reading could not be reproduced by anybody. This is
+//! that program.
+//!
+//! The question is a single sentence: **does a handler run for a task that has
+//! not entered the kernel since the signal was posted?** Linux hands a handled
+//! signal over on the return to ring 3 from *any* trap, so a task that computes
+//! in a tight loop and makes no calls is interrupted at the next tick. This
+//! kernel's `deliver_signal` is called from the syscall gate's return path,
+//! because that is the only place with a user register file to build a frame
+//! on - so a caught signal waits for the task's next system call.
+//!
+//! The difference is not academic: it is why `Ctrl-C` does not interrupt a
+//! program that is computing rather than calling.
+//!
+//! ## The measurement, and why it is two measurements
+//!
+//! One loop is not enough to tell the two behaviours apart, because "the loop
+//! ended by itself" and "the loop ended because of the signal" are different
+//! answers that a single reading confuses. So the same burn runs twice:
+//!
+//! 1. **With a signal armed**, and a loop that makes no calls.
+//! 2. **The same loop with no signal** - the control, which says whether the
+//!    loop can even finish inside the budget on this machine.
+//!
+//! The reading is then a *contrast*: with the signal, does the loop stop early?
+//! A program whose loop simply cannot run to its limit inside the budget would
+//! look identical to one interrupted by a signal if only the first run were
+//! taken, so the control is not decoration - it is what makes the reading mean
+//! something.
+//!
+//! ## How the signal is armed without entering the loop's budget
+//!
+//! `timer_create(CLOCK_PROCESS_CPUTIME_ID, ...)` with `SIGEV_SIGNAL` - a timer
+//! on CPU time, so it fires once the process has *used* 30 ms of processor
+//! rather than after 30 ms of wall clock. That distinction matters here: a
+//! wall-clock timer on a loaded machine can fire while the task is not running
+//! at all, which would make the reading a statement about the host's scheduler
+//! instead of this kernel's delivery point. This kernel serves that clock
+//! (`docs/uapi/` §5.1, §6.123) and the resolution is the tick, so the arming
+//! deadline is approximate - which is fine, because the claim is about *which
+//! door* the signal comes through, never about when.
+//!
+//! The handler sets a `volatile` flag and nothing more: a handler that made a
+//! syscall would answer the question by asking it, because returning from the
+//! handler goes back through the same path.
+//!
+//! ## What the two machines print
+//!
+//! On Linux (measured, `build/scratch/timerclock/iret.c`, and this program on
+//! that host): `loop left by THE SIGNAL after N iteration(s)` with N far below
+//! the limit. On this kernel: `loop left by count exhaustion`, with the timer
+//! already expired - the gap, stated as a reading rather than as a failure.
+//!
+//! When §2.13's x86_64 half lands, this program's own output changes to the
+//! Linux shape, and *that* is the evidence the fix works; it stays a diagnostic
+//! until the aarch64 half lands too, because a `t-` claim that reddens on one
+//! machine is a claim about the port rather than about the ABI.
+
+use mpos_user_tests::Report;
+
+/// The loop's iteration budget. Large enough that a signal at 30 ms of CPU time
+/// arrives long before it, small enough that an uninterrupted run finishes in a
+/// few seconds even on a TCG-emulated core.
+const LIMIT: i64 = 400_000_000;
+
+/// The handler's flag. `sig_atomic_t` is the only type a handler may portably
+/// touch, and the loop reads it through `read_volatile` so the compiler cannot
+/// hoist the check out of the loop's body.
+static mut GOT: libc::c_int = 0;
+
+extern "C" fn handler(_sig: libc::c_int) {
+    // SAFETY: `GOT` is the one object this handler touches, it is only ever
+    // written here and only read by the interrupted loop, and `sig_atomic_t`
+    // access is atomic with respect to the interruption by definition.
+    unsafe { GOT = GOT.saturating_add(1) };
+}
+
+/// One burn: a loop that makes **no** system call, answering the iterations it
+/// managed and whether the handler ran.
+///
+/// `armed` is what makes this two measurements rather than one: with the flag
+/// clear the same loop runs the control.
+fn burn(armed: bool) -> (i64, bool) {
+    unsafe { GOT = 0 };
+    let mut timer: libc::timer_t = unsafe { core::mem::zeroed() };
+    if armed {
+        // A NULL `sigevent`'s default is `SIGALRM`, but the signal is named
+        // explicitly: `SIGEV_SIGNAL` plus a number is the shape this measures,
+        // and relying on the default would leave the reading describing a
+        // different call than the one written down.
+        let mut ev: libc::sigevent = unsafe { core::mem::zeroed() };
+        ev.sigev_notify = libc::SIGEV_SIGNAL;
+        ev.sigev_signo = libc::SIGUSR1;
+        let made =
+            unsafe { libc::timer_create(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ev, &mut timer) };
+        if made != 0 {
+            // The clock or the call is missing: that is itself a reading, and
+            // it is reported rather than silently turning this into a control.
+            return (-1, false);
+        }
+        let mut its: libc::itimerspec = unsafe { core::mem::zeroed() };
+        its.it_value.tv_nsec = 30 * 1_000_000;
+        unsafe { libc::timer_settime(timer, 0, &its, core::ptr::null_mut()) };
+    }
+
+    let mut x: f64 = 0.0;
+    let mut i: i64 = 0;
+    while i < LIMIT {
+        x += i as f64;
+        // The check the compiler must not hoist: `read_volatile` is the only
+        // way to tell it the flag can change without the loop doing anything.
+        let stop = unsafe { core::ptr::read_volatile(&raw const GOT) } != 0;
+        if stop {
+            break;
+        }
+        i += 1;
+    }
+    // Keep `x` observable so the arithmetic cannot be optimised away - a loop
+    // that the compiler removed would be a reading about nothing.
+    let managed = i + (x as i64 & 0);
+    // **Read the flag before any system call.** This is the instrument's whole
+    // correctness: the question is whether the signal interrupted *the loop*,
+    // and the first syscall after it is a door the signal can come through.
+    // Reading `GOT` after `timer_delete` answered `true` on a machine whose
+    // loop had in fact run to its limit - the disarm syscall had delivered the
+    // pending signal - and the reading said "delivered at a trap" about a task
+    // that had not been interrupted at all. Caught by the guest contradicting
+    // the host.
+    let got = unsafe { core::ptr::read_volatile(&raw const GOT) } != 0;
+    if armed {
+        unsafe { libc::timer_delete(timer) };
+    }
+    (managed, got)
+}
+
+fn main() {
+    let mut r = Report::new();
+
+    // The handler must be installed *before* the timer is armed, or the default
+    // action for `SIGUSR1` ends the process and the reading is about a corpse.
+    let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
+    sa.sa_sigaction = handler as usize;
+    sa.sa_flags = 0;
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut());
+    }
+
+    // 1. The control first, so the two readings are printed in the order that
+    //    makes the contrast readable: what the loop does with no signal at all.
+    let (control_done, control_got) = burn(false);
+    r.check(
+        &format!(
+            "control: with no signal, the loop reaches its limit ({control_done} of {LIMIT} iteration(s))"
+        ),
+        control_done == LIMIT && !control_got,
+    );
+
+    // 2. The measurement. Whatever it says is a reading, not a failure - the
+    //    `check` below only asserts that the *instrument* worked (the loop ran
+    //    and the flag has a definite value), never which answer the machine
+    //    gave, because that answer is the item.
+    let (armed_done, armed_got) = burn(true);
+    let left_by = if armed_got {
+        "THE SIGNAL"
+    } else {
+        "count exhaustion"
+    };
+    r.check(
+        &format!(
+            "with a 30 ms CPU-time signal armed, nothing in the loop but arithmetic: it left by {left_by} after {armed_done} iteration(s)"
+        ),
+        armed_done >= 0,
+    );
+    r.check(
+        &format!(
+            "the reading: delivered at a trap = {}, delivered only at a system call = {}",
+            armed_got,
+            !armed_got && armed_done == LIMIT
+        ),
+        // Always true: this claim exists to print the verdict in one line, and
+        // a `Report` needs a claim to print it. The *reading* is the line above.
+        armed_done != i64::MIN,
+    );
+
+    if armed_got {
+        println!(
+            "t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this machine)"
+        );
+    } else {
+        println!(
+            "t-iret: the signal waited for a system call (the §2.13 gap, named in docs/notes/)"
+        );
+    }
+    r.finish();
+}
