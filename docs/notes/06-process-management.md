@@ -12711,3 +12711,93 @@ every host test that called the function directly stayed green. That is the valu
 of the "never used" warning being a `warn` in a tree whose dead code is normally
 intentional: a hook that is *defined* somewhere no dispatch can reach is exactly
 what it is for.
+
+## §6.142 `personality` and `oom_adj`: two views, one owner each (LANDED 2026-11-12)
+
+Both of these `/proc/<pid>` files are **views** - one of `personality(2)`'s word,
+one of the modern `oom_score_adj` under the deprecated fifteen-step name - and
+both are the kind of file that is easy to serve *wrongly* by keeping a second
+copy of a fact that already has an owner. Neither existed here: a program that
+opened either got `ENOENT`.
+
+Measured on Linux 7.2.14 (`build/scratch/procsyscall/{pers,oomadj}.c`):
+
+```text
+/proc/self/personality     00000000          mode 0400, read-only
+/proc/self/oom_adj         3                 mode 0644, read/write
+/proc/self/oom_score_adj   200
+```
+
+### `personality`: eight hex digits, and the syscall's own answer
+
+The file is the execution-environment word in eight lowercase hex digits, zero
+padded, `0400` and read-only (`open(O_WRONLY)` answered `EACCES`); another
+process's file was readable in the same run, so the `0400` is the word's and not
+a ptrace gate. Setting `personality(ADDR_NO_RANDOMIZE)` moved it to
+`00040000`.
+
+This kernel has **one** persona - `PER_LINUX`, word `0` - and its `personality(2)`
+refuses every other with `EINVAL`. So the file's whole content is a constant
+today, and that is exactly the trap: a proc file formatted from a constant of its
+own would be the shape §6.101 records, a field answered from "the case that is
+usual" rather than from the fact. The two doors now answer from one function
+(`sched::personality_of`), so the day a second persona lands they cannot drift.
+The handler was rewritten to ask it too.
+
+### `oom_adj`: a conversion, not a second store
+
+`oom_adj` is the old -17..15 scale. Linux keeps one `oom_score_adj` and renders
+this file from it, and a write either way moves that one word. Measured, all in
+one run:
+
+```text
+oom_score_adj 200          -> oom_adj reads 3          (200 * 15 / 1000)
+write oom_adj 15           -> oom_score_adj 1000       (15 * 1000 / 15)
+write oom_score_adj 200    -> oom_adj reads 3 again
+write oom_adj 16 / -18     -> EINVAL
+write oom_adj abc          -> EINVAL
+write oom_adj -17          -> EACCES unprivileged
+```
+
+The last line is the interesting one: `-17` is not "one step further down", it is
+the **disable sentinel** that maps to the modern floor `-1000`. The plain
+multiplication would give `-1133`, a number the modern scale does not have, so
+the conversion is a special case at each end and a multiply in the middle. That
+is what `oom_score_adj_from_adj` / `oom_adj_from_score_adj` spell, host-tested
+against the measured round trips - including `-1000 -> -17` back.
+
+Writing it moves the *floor* too, which is Linux's rule and not a bug: a write of
+`15` takes the modern word to `1000`, and a process that has been given a
+protective value cannot then be walked back up the scale by something it runs
+later. The pin had to be written to respect that - its first version wrote `1000`
+and then tried `0`, and the refusals it got were the floor doing its job. The
+claims are now made from the value the program *inherits*, upward.
+
+### A wrong errno the guest found, and the rule behind it
+
+The pin's first version claimed `open("/proc/self/personality", O_WRONLY)` is
+`EACCES`, and the guest answered `95` (`EOPNOTSUPP`) on the write, where the
+host had answered `13` (`EACCES`) at the open - the guest had handed back a
+descriptor first. The difference is a rule this tree already
+had and this file did not use: `Inode::has_write_method`, which Linux's
+`proc_reg_open` asks instead of the permission word - a generated file with no
+writer refuses a write-open **for root too**, because the rule is the *method*
+and not the capability (item 146's rule for sysfs attributes). `ProcFile` is
+read-only by construction, so it now answers `false` there; `ProcCtl`, the
+writable half, keeps the default.
+
+That fix is broader than this item's two files - it changes every read-only
+generated file's write-open from "descriptor, then `EOPNOTSUPP` on write" to
+`EACCES` at the open - which is Linux's answer for all of them. The gate is what
+says whether anything depended on the older shape.
+
+### The pin
+
+`user/tests/src/bin/t-proc-words.rs`, 19 claims: the word's shape and its
+agreement with `personality(2)`, the `0400` and the read-only refusal, another
+process's readability, `oom_adj`'s mode, the conversion as a *relation* between
+two files in both directions, the two ends of both scales, the three `EINVAL`
+refusals, the sentinel's capability rule (judged by the caller's uid, so the same
+program expects `EACCES` unprivileged and the floor landing on the guest), and
+`ENOENT` for a pid that does not exist. Green on the host first, then in the
+guest (`build/boot-procwords2.log`).

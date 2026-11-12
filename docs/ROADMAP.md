@@ -2422,3 +2422,13 @@ carries the per-phase history.*
   Pin `t-fdinfo` (24 claims) is green on the host first; the host unit tests compare whole measured
   lines, which is what caught a `flags:` rendered with `{:o}` instead of Linux's literal-`0` prefix.
   (§6.141, item 255)
+- `/proc/<pid>/personality` and `/proc/<pid>/oom_adj` are served as **views**, each with one owner:
+  the first from `sched::personality_of`, the same function `personality(2)` now asks, so the two
+  doors cannot drift when a second persona lands; the second has no store at all - it converts to and
+  from the one `oom_score_adj` word, both directions measured, with `-17` mapping to the modern
+  *floor* `-1000` rather than through the multiplication (which would give `-1133`, a number the
+  scale does not have). The guest found a real divergence on the way: this kernel handed back a
+  descriptor for a write-open of a generated read-only file and answered `EOPNOTSUPP` on the write,
+  where Linux's `proc_reg_open` asks the node's write *method* and answers `EACCES` at the open for
+  root too - `ProcFile` now says it has no write method, which fixes every read-only generated file.
+  Pin `t-proc-words` (19 claims), green on the host first and in the guest. (§6.142, item 256)

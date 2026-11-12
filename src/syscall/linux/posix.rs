@@ -1367,9 +1367,14 @@ pub fn handle_munlockall(_args: [usize; ARG_COUNT]) -> isize {
 /// previous one; anything else is the man page's EINVAL, the refusal for
 /// a persona this kernel does not have.
 pub fn handle_personality(args: [usize; ARG_COUNT]) -> isize {
+    // The word in force comes from its one owner, which
+    // `/proc/<pid>/personality` reads too: two doors over one fact answer from
+    // one place or they drift.
+    let in_force = crate::sched::personality_of(crate::sched::current_pid_number() as usize)
+        .unwrap_or(0) as isize;
     match args[0] {
-        0xffff_ffff => 0, // the query: the persona in force is the default
-        0 => 0,           // the default itself: already in force
+        0xffff_ffff => in_force, // the query
+        0 if in_force == 0 => 0, // the default itself: already in force
         _ => err::EINVAL,
     }
 }

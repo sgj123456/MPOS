@@ -684,6 +684,22 @@ pub fn set_current_umask(mask: u32) {
 /// `/proc/<pid>/oom_score_adj` reads the pair. `None` when no such task exists
 /// - which is what makes the file go away with the process it described.
 #[cfg(target_os = "none")]
+/// The execution-environment word `personality(2)` reports for `pid`.
+///
+/// **One owner.** This kernel has exactly one persona - `PER_LINUX`, word `0` -
+/// and refuses every other with `EINVAL`, so the function is a constant; it
+/// exists as a function rather than a constant a caller may copy so that
+/// `/proc/<pid>/personality` and the `personality(2)` handler answer from the
+/// same place. Two copies of `0` would drift the day a second persona lands,
+/// and the proc file would be the one nobody remembered to move
+/// (`docs/notes/` §6.101's rule: a field readable in the common case must be
+/// answered from the kernel, not from the case that happens to be usual).
+///
+/// `None` only for a task slot that names nobody.
+pub fn personality_of(pid: usize) -> Option<u32> {
+    with_table(|t| t.tasks.get(pid).and_then(Option::as_ref).map(|_| 0))
+}
+
 pub fn oom_score_adj_of(pid: usize) -> Option<(i32, i32)> {
     with_table(|t| {
         t.tasks

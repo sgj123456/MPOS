@@ -135,6 +135,22 @@ impl Inode for ProcFile {
         self.describes
     }
 
+    /// A generated **read-only** file has no writer, and Linux's open asks the
+    /// *method* rather than the permission: `proc_reg_open` refuses
+    /// `FMODE_WRITE` when the inode is not writable, so root's
+    /// `open("/proc/self/personality", O_WRONLY)` is `EACCES` - not a descriptor
+    /// whose first `write` then fails.
+    ///
+    /// Measured: the host answered `EACCES(13)` where this kernel used to hand
+    /// back a descriptor and answer `EOPNOTSUPP(95)` on the write
+    /// (`t-proc-words`, which had to be fixed rather than taught to accept the
+    /// wrong errno). The writable generated files are [`ProcCtl`], which keeps
+    /// the default `true`. This is `nothing-writable`'s rule (item 146) applied
+    /// to the whole generated half of the tree.
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
     /// procfs reports a word and keeps none, and Linux answers access by that
     /// word: `0400` `maps`/`environ` is the owner's, `0444` `status` is
     /// everyone's, `0500` `fd` is search-only (`Inode::mode_polices_access`).
@@ -3751,11 +3767,51 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     node
 }
 
+/// The range Linux's **deprecated** `oom_adj` takes: -17 through 15, the old
+/// fifteen-step scale `oom_score_adj` replaced.
+///
+/// The two ends are asymmetric on purpose and the asymmetry is the whole
+/// compatibility story: `15` is "kill me first" and maps to `oom_score_adj`
+/// `1000`, while `-17` is the *special* "never kill me" that maps to the floor
+/// `-1000` rather than through the same multiplication (`-17 * 1000 / 15` would
+/// be `-1133`, outside the modern scale). Measured on Linux 7.2.14
+/// (`build/scratch/procsyscall/oomadj.c`): `oom_adj` read `3` where
+/// `oom_score_adj` read `200` (`200 * 15 / 1000`), a write of `15` moved the
+/// modern word to `1000`, and a write of `-17` from an unprivileged process was
+/// `EACCES` - the floor's own `CAP_SYS_RESOURCE` rule, which the modern file
+/// applies too.
+const OOM_ADJ_MIN: i32 = -17;
+const OOM_ADJ_MAX: i32 = 15;
+
+/// The `oom_score_adj` an `oom_adj` value means.
+///
+/// The scale change is a multiply-and-divide in the middle and a special case
+/// at each end: `-17` is the disable sentinel (`OOM_SCORE_ADJ_MIN`) and every
+/// other value is `adj * 1000 / 15` in integer arithmetic, which is why `15`
+/// lands exactly on `1000` and `3` on `200`. Linux's own conversion is the same
+/// two lines, and the round trip is exact only at the ends - `200` reads back as
+/// `3`, not as whatever `200` came from.
+fn oom_score_adj_from_adj(adj: i32) -> i32 {
+    if adj == OOM_ADJ_MIN {
+        OOM_SCORE_ADJ_MIN
+    } else {
+        adj * OOM_SCORE_ADJ_MAX / OOM_ADJ_MAX
+    }
+}
+
+/// The `oom_adj` an `oom_score_adj` value reads back as: the inverse
+/// conversion, with `-1000` reading as the `-17` sentinel it stands for.
+fn oom_adj_from_score_adj(score: i32) -> i32 {
+    if score == OOM_SCORE_ADJ_MIN {
+        OOM_ADJ_MIN
+    } else {
+        score * OOM_ADJ_MAX / OOM_SCORE_ADJ_MAX
+    }
+}
+
 /// The range Linux lets `oom_score_adj` take - `OOM_SCORE_ADJ_MIN` and
 /// `OOM_SCORE_ADJ_MAX`, the two ends of the scale the OOM killer scores on.
-#[cfg(target_os = "none")]
 const OOM_SCORE_ADJ_MIN: i32 = -1000;
-#[cfg(target_os = "none")]
 const OOM_SCORE_ADJ_MAX: i32 = 1000;
 
 /// `/proc/<pid>/oom_score_adj`: the score adjustment itself, with the floor
@@ -3796,6 +3852,88 @@ fn oom_score_adj_ctl(pid: usize) -> Arc<dyn Inode> {
             }
             Ok(())
         }),
+    })
+}
+
+/// `/proc/<pid>/oom_adj`: the **deprecated** fifteen-step scale, a view of the
+/// modern word and a write that converts.
+///
+/// It is not a second store. Linux keeps one `oom_score_adj` and renders this
+/// file from it, and a process that writes this one moves that one - measured
+/// on Linux 7.2.14 (`build/scratch/procsyscall/oomadj.c`): `oom_score_adj` 200
+/// reads here as `3` (`200 * 15 / 1000`), a write of `15` moved the modern word
+/// to `1000`, and `write 200` to the modern file made this one read `3` again.
+/// Keeping two stores would let them disagree the moment either is written, so
+/// this file has no state of its own and [`oom_score_adj_from_adj`] /
+/// [`oom_adj_from_score_adj`] are the whole of it.
+///
+/// Three refusals, each measured in the same run: a value outside `-17..=15` is
+/// `EINVAL` (`16`, `-18` and `abc` all answered it), and a write that would take
+/// the process below the floor it already has is `EACCES` for a caller without
+/// the capability - which is `-17` from an unprivileged process, because the
+/// sentinel is the floor. That authority rule is the modern file's, reused
+/// rather than restated: it is one `oom_score_adj` either way.
+#[cfg(target_os = "none")]
+fn oom_adj_ctl(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        read: Box::new(move || {
+            crate::sched::oom_score_adj_of(pid)
+                .map(|(score, _)| alloc::format!("{}\n", oom_adj_from_score_adj(score)))
+        }),
+        write: Box::new(move |text: &str| {
+            let Ok(adj) = text.parse::<i32>() else {
+                return Err(VfsError::Invalid);
+            };
+            if !(OOM_ADJ_MIN..=OOM_ADJ_MAX).contains(&adj) {
+                return Err(VfsError::Invalid);
+            }
+            let score = oom_score_adj_from_adj(adj);
+            let Some((_, floor)) = crate::sched::oom_score_adj_of(pid) else {
+                return Err(VfsError::NoEntry);
+            };
+            if score < floor && crate::sched::current_owner().0 != 0 {
+                return Err(VfsError::Access);
+            }
+            if !crate::sched::set_oom_score_adj(pid, score) {
+                return Err(VfsError::NoEntry);
+            }
+            Ok(())
+        }),
+    })
+}
+
+/// `/proc/<pid>/personality`: the execution-environment word `personality(2)`
+/// reports, as eight lowercase hex digits.
+///
+/// Measured on Linux 7.2.14 (`build/scratch/procsyscall/pers.c`): `00000000`
+/// for the default persona, `00040000` once `personality(ADDR_NO_RANDOMIZE)`
+/// was set - eight digits, zero-padded, lowercase - at `0400`, and read-only
+/// (`open(O_WRONLY)` answered `EACCES`). The same run read another process's
+/// file and got its word, so this is not the owner-only `0400` of a *ptrace*
+/// file; the mode is the word's own.
+///
+/// **One owner for the word.** It is [`crate::sched::personality_of`], which is
+/// the same function `personality(2)`'s handler answers from, so the two doors
+/// cannot disagree about the persona in force - and both say the same thing
+/// today because this kernel has exactly one (`PER_LINUX`, word `0`) and
+/// refuses any other. A proc file answered from a constant of its own would be
+/// the shape `docs/notes/` §6.101 records: a field formatted from a default
+/// that happens to match today's usual case.
+#[cfg(target_os = "none")]
+fn personality_file(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(move || {
+            crate::sched::personality_of(pid)
+                .map(|word| alloc::format!("{word:08x}\n").into_bytes())
+        }),
+        mode: 0o400,
+        size: 0,
+        describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
     })
 }
 
@@ -4197,6 +4335,15 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // procfs invents no file to answer it.
     #[cfg(target_os = "none")]
     node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(leader));
+    // The **deprecated** fifteen-step scale, a view of the word above and a
+    // write that converts into it - Linux keeps one adjustment and two names,
+    // which is why this file has no store of its own.
+    #[cfg(target_os = "none")]
+    node.add("oom_adj", NodeKind::File, oom_adj_ctl(leader));
+    // The execution-environment word, `0400` and read-only, asked of the same
+    // owner `personality(2)` answers from.
+    #[cfg(target_os = "none")]
+    node.add("personality", NodeKind::File, personality_file(slot));
     // `/proc/<pid>/timens_offsets` - the clocks this process's children will
     // read, and the one door a `unshare(CLONE_NEWTIME)` has for saying by how
     // much. Named the way a real kernel names it, because the tools that write
@@ -5749,6 +5896,34 @@ impl FileSystem for ProcFs {
 
 #[cfg(test)]
 mod tests {
+    use super::{oom_adj_from_score_adj, oom_score_adj_from_adj};
+
+    /// The two `oom_adj` conversions, against Linux 7.2.14's measured round
+    /// trips (`build/scratch/procsyscall/oomadj.c`).
+    ///
+    /// Three facts, each a line of the measurement: `oom_score_adj` 200 reads
+    /// back as `oom_adj` 3 (`200 * 15 / 1000`); a write of `15` lands on `1000`
+    /// exactly (`15 * 1000 / 15`); and `-17` is the **sentinel**, mapping to the
+    /// floor `-1000` rather than through the multiplication - which would give
+    /// `-1133`, a number the modern scale does not have. A renderer that treated
+    /// the ends like the middle would print `-17` only for `-1000` by accident
+    /// and a nonsense `oom_adj` for every other floor value.
+    #[test]
+    fn the_oom_adj_conversions_are_linuxs_measured_round_trips() {
+        assert_eq!(oom_adj_from_score_adj(200), 3);
+        assert_eq!(oom_score_adj_from_adj(15), 1000);
+        // The sentinel pair, both directions.
+        assert_eq!(oom_score_adj_from_adj(-17), -1000);
+        assert_eq!(oom_adj_from_score_adj(-1000), -17);
+        // The rest of the scale is the plain multiply, truncating as C does.
+        assert_eq!(oom_score_adj_from_adj(-1), -66);
+        assert_eq!(oom_adj_from_score_adj(-66), -0);
+        assert_eq!(oom_score_adj_from_adj(0), 0);
+        // A value the modern file can hold but the old scale cannot represent
+        // exactly reads back to the nearest step, never as a sentinel.
+        assert_eq!(oom_adj_from_score_adj(999), 14);
+    }
+
     /// A generated file read in chunks stays one snapshot.
     ///
     /// The file is not a constant: `/proc/<pid>/maps` grows when the process

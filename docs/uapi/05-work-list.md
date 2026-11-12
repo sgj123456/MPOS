@@ -11247,3 +11247,45 @@ pseudo-filesystems, different for a device-backed mount), an anonymous epoll
 target falls back to the root filesystem's device where Linux prints the pseudo
 filesystem's own, and `eventfd-id` names the inode rather than a separate
 per-boot counter. §6.141.
+
+### Item 256 `personality` and `oom_adj` - two views of words that already had owners
+
+**Before:** both files were missing (`ENOENT`). Neither is state this kernel
+lacks; both are *renderings* of facts answered elsewhere, which is what made them
+worth doing as views rather than as stores.
+
+**Now:** `/proc/<pid>/personality` (8 lowercase hex digits, `0400`, read-only)
+and `/proc/<pid>/oom_adj` (`0644`, the deprecated -17..15 scale over the modern
+word).
+
+| | Linux 7.2.14 | this kernel before | now |
+|---|---|---|---|
+| `personality` word | `00000000` (one persona) | `ENOENT` | `personality(2)`'s own answer |
+| `personality` write-open | `EACCES` (no write method, root too) | - | `EACCES` |
+| `oom_adj` from `oom_score_adj` 200 | `3` | `ENOENT` | `3` (`score * 15 / 1000`) |
+| write `oom_adj` 15 | `oom_score_adj` 1000 | - | the same |
+| write `oom_adj` 16 / -18 / `abc` | `EINVAL` | - | `EINVAL` |
+| write `oom_adj` -17 unprivileged | `EACCES` | - | `EACCES` |
+| write `oom_adj` -17 as root | lands on `-1000`, not `-1133` | - | the same |
+
+**Why one owner each.** `personality` answers from `sched::personality_of`, the
+same function the `personality(2)` handler now asks - a proc file formatted from
+its own constant is the field-from-the-usual-case trap. `oom_adj` has **no store
+at all**: it converts to and from the one `oom_score_adj` word, which is why
+writing either file moves the other (measured both ways).
+
+**Why the two ends are special.** `-17` is the disable sentinel and maps to the
+modern *floor* `-1000`; the plain multiplication would give `-1133`, which the
+modern scale does not have. `15` is the other end and lands exactly on `1000`.
+
+**Landed:** `sched::personality_of` (one owner, host stub included) and
+`handle_personality` rewritten to ask it; `oom_adj_ctl`/`personality_file` in
+`src/vfs/procfs.rs` with the two conversions; and `ProcFile::has_write_method`
+answering `false`, which is item 146's rule (a generated file with no writer
+refuses a write-open for root too) applied to the whole generated half of the
+tree - the guest caught the old shape answering `EOPNOTSUPP` on the write where
+Linux answers `EACCES` at the open.
+
+**Pin:** `user/tests/src/bin/t-proc-words.rs`, 19 claims, host and guest green;
+the conversion claims are relations between the two files, never constants.
+Notes: `§6.142`.

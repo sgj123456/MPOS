@@ -98,10 +98,10 @@ pub use runtime::{
     note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner, note_run_begin,
     note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of, out_of_memory,
     own_pid_number, page_present_in, parent_group_of, parent_of, park_site, parks_of, pause,
-    pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation,
-    pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive,
-    poll_any_child_event, poll_child_event, populate_user_page_at, preempt, preempt_at,
-    prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
+    personality_of, pgid_of, pid_chain_of, pid_number_of, pid_numbers_of, pidfd_fd_table,
+    pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names,
+    pidfd_task_alive, poll_any_child_event, poll_child_event, populate_user_page_at, preempt,
+    preempt_at, prev_syscall, process_members, protect_user, protect_user_range, raise_sigpipe,
     range_is_mapped, read_user, read_user_of, record_eager_range, register_membarrier,
     release_controlling_tty, release_pid, release_user_frames, reset_disposition, resident_pages,
     resolve_anon_fault, resolve_cow_fault, resolve_pid, resolve_script, resolve_stack_growth,
@@ -493,6 +493,15 @@ pub fn membarrier_registrations() -> usize {
 #[cfg(not(target_os = "none"))]
 pub fn descriptor_numbers(_pid: usize) -> alloc::vec::Vec<usize> {
     alloc::vec::Vec::new()
+}
+
+/// The host build's persona: the one this kernel has, on a harness that has
+/// neither a task table nor anything to emulate. `Some(0)` for any number is
+/// the same answer the machine gives for a slot that names a task - and the
+/// host's "any number" only ever comes from a test.
+#[cfg(not(target_os = "none"))]
+pub fn personality_of(_pid: usize) -> Option<u32> {
+    Some(0)
 }
 
 /// And for the direction `/proc/<pid>/fd/<N>`'s own mode is derived from: no
