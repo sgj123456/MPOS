@@ -64,7 +64,7 @@ pub struct SyscallFrame {
 pub mod kunit;
 
 pub use fs::FsStruct;
-pub use policy::{ARGS_BYTES_MAX, ARGV_MAX, Priority, TaskId};
+pub use policy::{ARGS_BYTES_MAX, ARGV_MAX, Priority, TaskId, TaskMemory};
 /// How many tasks are alive forever, which is what [`kunit`]'s wait-for-the-other
 /// tasks helper compares against.
 ///
@@ -83,10 +83,10 @@ pub use runtime::{
     ITIMER_VIRTUAL, Identity, ItimerSnapshot, ItimerState, MAX_TASKS, MapFacts, Named, Redirect,
     SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID, STACK_ORDER, Sent, SpawnError, Stop, TIMER_ABSTIME,
     TaskSnapshot, TimerClock, TimerNotify, WaitEnd, WaitEvent, WaitFor, WaitPark,
-    acquire_controlling_tty, adopt_pid, arm_diskstat_boot_namespace, become_session_leader,
-    block_until, block_until_child_event, block_until_code, block_until_interruptible,
-    block_until_interruptible_rolling_back, block_until_nanos, block_until_uninterruptible,
-    block_until_uninterruptible_armed, block_until_uninterruptible_at,
+    acquire_controlling_tty, address_space_of, adopt_pid, arm_diskstat_boot_namespace,
+    become_session_leader, block_until, block_until_child_event, block_until_code,
+    block_until_interruptible, block_until_interruptible_rolling_back, block_until_nanos,
+    block_until_uninterruptible, block_until_uninterruptible_armed, block_until_uninterruptible_at,
     block_until_uninterruptible_until, blocked_count, brk, charge_cpu, charge_io, check_itimer,
     child_event, child_event_pending, child_visible_to, claim_anon_gaps, clone,
     continued_report_pending, controlling_tty_of_current, credentials_of, current, current_blocked,
@@ -102,24 +102,24 @@ pub use runtime::{
     current_user_ns, current_uts, deliver_pending_signal, descriptor_access, descriptor_file_of,
     descriptor_flags_of, descriptor_inode_of, descriptor_numbers, descriptors_of,
     destructive_advice_refused, detach_traced, die_of_fatal_signal, discard_exit_code,
-    enter_syscall, exec_replace, exit, exit_code, exit_group, fill_owner, fork, frames_range_free,
-    get_mmap_cursor, group_members, has_children, has_deliverable_signal, has_live_child,
-    has_matching_children, has_seccomp_filter, has_tracer, identity_of, in_task, init, insert_vma,
-    io_of, io_of_group, is_child, is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap,
-    kernel_lazy_accessible, last_syscall, leave_syscall, lock_current, lock_future,
-    locked_advice_refused, locked_pages, locked_within, madvise_dontneed, map_anon, map_facts,
-    map_frames, mapped_pages, mapping_name_at, mapping_span_at, maxrss_of, may_inspect,
-    may_mint_pid_ns, may_signal, membarrier_registrations, minflt_of, move_eager_ranges,
-    move_user_page, munmap_user, name_user_range, named_process, named_thread, nice_of,
-    note_blk_counts, note_blk_mailbox, note_blk_wait, note_claim_registration, note_claim_wake,
-    note_claim_wake_result, note_ext4_scratch, note_fill_begin, note_fill_end, note_fill_owner,
-    note_run_begin, note_run_end, note_run_owner, note_syscall, ns_of, oom_score_adj_of,
-    out_of_memory, own_pid_number, page_present_in, parent_group_of, parent_of, park_site,
-    parks_of, pause, personality_of, pgid_of, pid_chain_of, pid_number_of, pid_numbers_of,
-    pidfd_fd_table, pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member,
-    pidfd_still_names, pidfd_task_alive, poll_any_child_event, poll_child_event,
-    populate_user_page_at, preempt, preempt_at, prev_syscall, process_members, protect_user,
-    protect_user_range, raise_sigpipe, range_is_mapped, read_user, read_user_of,
+    enter_syscall, environment_of, exec_replace, exit, exit_code, exit_group, fill_owner, fork,
+    frames_range_free, get_mmap_cursor, group_members, has_children, has_deliverable_signal,
+    has_live_child, has_matching_children, has_seccomp_filter, has_tracer, identity_of, in_task,
+    init, insert_vma, io_of, io_of_group, is_child, is_exited, is_running, is_stopped,
+    itimer_snapshot, itimer_swap, kernel_lazy_accessible, last_syscall, leave_syscall,
+    lock_current, lock_future, locked_advice_refused, locked_pages, locked_within,
+    madvise_dontneed, map_anon, map_facts, map_frames, mapped_pages, mapping_name_at,
+    mapping_span_at, maxrss_of, may_inspect, may_mint_pid_ns, may_signal, membarrier_registrations,
+    minflt_of, move_eager_ranges, move_user_page, munmap_user, name_user_range, named_process,
+    named_thread, nice_of, note_blk_counts, note_blk_mailbox, note_blk_wait,
+    note_claim_registration, note_claim_wake, note_claim_wake_result, note_ext4_scratch,
+    note_fill_begin, note_fill_end, note_fill_owner, note_run_begin, note_run_end, note_run_owner,
+    note_syscall, ns_of, oom_score_adj_of, out_of_memory, own_pid_number, page_present_in,
+    parent_group_of, parent_of, park_site, parks_of, pause, personality_of, pgid_of, pid_chain_of,
+    pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation, pidfd_group_alive,
+    pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive, poll_any_child_event,
+    poll_child_event, populate_user_page_at, preempt, preempt_at, prev_syscall, process_members,
+    protect_user, protect_user_range, raise_sigpipe, range_is_mapped, read_user, read_user_of,
     record_eager_range, register_membarrier, release_controlling_tty, release_pid,
     release_user_frames, reset_disposition, resident_pages, resolve_anon_fault, resolve_cow_fault,
     resolve_pid, resolve_script, resolve_stack_growth, resume_traced, retired_status, rlimits_of,
@@ -669,12 +669,25 @@ pub fn io_of_group(_id: TaskId) -> Option<(u64, u64, u64, u64)> {
     None
 }
 
-/// The host build has no image on a stack, so it has no auxiliary vector to
-/// report: `None` is the honest answer for a host test, not a claim that a
-/// process was executed without one.
+/// The host build has no process table, so no number names a task: `NoTask` is
+/// the honest answer for a host test, not a claim that a process was executed
+/// without a vector.
 #[cfg(not(target_os = "none"))]
-pub fn saved_auxv_of(_id: TaskId) -> Option<alloc::vec::Vec<u8>> {
-    None
+pub fn saved_auxv_of(_id: TaskId) -> TaskMemory {
+    TaskMemory::NoTask
+}
+
+/// The host build keeps no environment block for a task, for the same reason.
+#[cfg(not(target_os = "none"))]
+pub fn environment_of(_id: TaskId) -> TaskMemory {
+    TaskMemory::NoTask
+}
+
+/// The host build has no address space for a number to name, so a memory-derived
+/// file's open refuses in the shape a task that never existed gets.
+#[cfg(not(target_os = "none"))]
+pub fn address_space_of(_id: TaskId) -> TaskMemory {
+    TaskMemory::NoTask
 }
 
 /// The host build keeps no resident-set record; the machine build reads the

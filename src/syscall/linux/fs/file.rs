@@ -395,6 +395,18 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                         return err::EPERM;
                     }
                 }
+                // The node's own last word, once the shape, the word and the
+                // flags have answered: Linux's `proc_reg_open` calls the file's
+                // own `open`, and `/proc/<pid>/auxv` and `/proc/<pid>/environ`
+                // grab the task's address space there (`mm_access`). That is
+                // where a zombie's `ESRCH` comes from - and why the refusal is
+                // here and not in `open_replacement`, which runs before the
+                // permission word and would answer a stranger `ESRCH` where
+                // Linux answers `EACCES` (`build/scratch/zombiemm/s.c`).
+                if let Err(e) = file.inode().open_check() {
+                    let _ = crate::sched::current_fds().close(fd);
+                    return err_of(e);
+                }
             }
             // Where this description lives, recorded for the `st_dev` both
             // doors report. The label is the path it was opened by, and the

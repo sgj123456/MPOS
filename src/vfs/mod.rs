@@ -625,6 +625,27 @@ pub trait Inode: Send + Sync + core::any::Any {
         Ok(None)
     }
 
+    /// The node's own last word on an open that has already passed the shape,
+    /// the permission word and the flag refusals - Linux's `proc_reg_open`
+    /// calling the file's own `proc_open`.
+    ///
+    /// The *place* is the point, and it is measured. `/proc/<pid>/auxv` and
+    /// `/proc/<pid>/environ` grab the task's address space in their `open`
+    /// (`mm_access`), which is why a zombie's is `ESRCH` - and a stranger's is
+    /// `EACCES` first, from the `0400` word: a root-owned zombie opened by
+    /// uid 65534 answers `EACCES`, its owner `ESRCH`
+    /// (`build/scratch/zombiemm/s.c`, Linux 7.2.14, under `sudo`). A refusal
+    /// riding [`Self::open_replacement`] would run before the permission
+    /// check and answer `ESRCH` where Linux answers `EACCES`.
+    ///
+    /// A node that has something to do here does it, rather than merely
+    /// checking: the file's own open may *capture* the body it will serve, as
+    /// Linux's open holds the address space it grabbed
+    /// (`crate::vfs::procfs::ProcFile`).
+    fn open_check(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
     /// The socketpair end this node is, if it is one.
     ///
     /// A descriptor that carries a connected stream has one operation a file

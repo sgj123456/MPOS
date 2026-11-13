@@ -677,25 +677,79 @@ pub fn task_wait(id: TaskId) -> Option<crate::sched::wchan::Wait> {
 ///
 /// The answer is the group's copy (Linux's `mm->saved_auxv`), so every thread
 /// reads the same words, and a `fork` child that has not `exec`ed reads its
-/// parent's. `None` when the number no longer names a live task, so the file
-/// can answer with a refusal rather than an empty vector.
-///
-/// A zombie answers `None` as well, and that is a divergence with a name: Linux
-/// refuses a dead process's `auxv` with `ESRCH` because its `mm` is gone
-/// (`build/scratch/auxv/q.c`), while this kernel's node reports the same
-/// "nothing to say" a collected task does (`docs/notes/` §6.136).
+/// parent's. A zombie answers [`crate::sched::TaskMemory::NoMemory`] rather than the
+/// "nothing to say" a collected task gives, because that is Linux's own split:
+/// its `mm` is gone, so its memory files refuse with `ESRCH` while the files
+/// that only name the process (`statm`, `status`) still answer
+/// (`docs/notes/` §6.136).
 #[cfg(target_os = "none")]
-pub fn saved_auxv_of(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
+pub fn saved_auxv_of(id: TaskId) -> crate::sched::TaskMemory {
     with_table(|t| {
-        let task = t.tasks.get(id.0).and_then(|entry| entry.as_ref())?;
+        let Some(task) = t.tasks.get(id.0).and_then(|entry| entry.as_ref()) else {
+            return crate::sched::TaskMemory::NoTask;
+        };
         if task.exited {
-            return None;
+            return crate::sched::TaskMemory::NoMemory;
         }
         let bytes = task.mm.saved_auxv();
         if bytes.is_empty() {
-            return None;
+            // The vector is recorded when an image is executed, so an empty one
+            // means this task was never executed from an image - the same
+            // "nothing to report" a number naming no task gives.
+            return crate::sched::TaskMemory::NoTask;
         }
-        Some(bytes)
+        crate::sched::TaskMemory::Bytes(bytes)
+    })
+}
+
+/// Whether this task still has an address space to report from: the question a
+/// memory-derived file asks at its own `open`.
+///
+/// [`saved_auxv_of`] and [`environment_of`] answer the same three ways, and this
+/// is the same question without a body - a file whose text this side renders
+/// itself (`/proc/<pid>/smaps_rollup`) still refuses `ESRCH` for a dead task's
+/// address space and `ENOENT` for a number that names nothing, because that is
+/// what Linux's own `open` does (`build/scratch/zombiemm/t.c`: a zombie's
+/// `smaps_rollup` open is `ESRCH(3)`; its `numa_maps` opens and reads nothing).
+/// `Bytes` with an empty vector means "there is a space, this door wanted no
+/// body from it".
+#[cfg(target_os = "none")]
+pub fn address_space_of(id: TaskId) -> crate::sched::TaskMemory {
+    with_table(|t| {
+        let Some(task) = t.tasks.get(id.0).and_then(|entry| entry.as_ref()) else {
+            return crate::sched::TaskMemory::NoTask;
+        };
+        if task.exited {
+            return crate::sched::TaskMemory::NoMemory;
+        }
+        crate::sched::TaskMemory::Bytes(alloc::vec::Vec::new())
+    })
+}
+
+/// The environment block this task was entered with, in the bytes
+/// `/proc/<pid>/environ` reports: the `KEY=VALUE` words, NUL separated with a
+/// NUL after the last.
+///
+/// Same three answers as [`saved_auxv_of`], and for the same reason: the block
+/// lives in the address space, so a zombie refuses with `ESRCH` rather than
+/// handing out the words it was started with - the divergence item 268 closed
+/// (`build/scratch/zombiemm/z.c`, and the guest probe that showed this kernel
+/// serving a zombie's 14 bytes where Linux refused).
+#[cfg(target_os = "none")]
+pub fn environment_of(id: TaskId) -> crate::sched::TaskMemory {
+    with_table(|t| {
+        let Some(task) = t.tasks.get(id.0).and_then(|entry| entry.as_ref()) else {
+            return crate::sched::TaskMemory::NoTask;
+        };
+        if task.exited {
+            return crate::sched::TaskMemory::NoMemory;
+        }
+        let mut out = alloc::vec::Vec::new();
+        for var in task.env.iter() {
+            out.extend_from_slice(var.as_bytes());
+            out.push(0);
+        }
+        crate::sched::TaskMemory::Bytes(out)
     })
 }
 
@@ -1002,6 +1056,13 @@ pub struct MapFacts {
     /// `[start, end)` of the program break, or `None` for a process that never
     /// asked for a heap.
     pub heap: Option<(usize, usize)>,
+    /// Whether the task has exited and is still collectable. Its address space
+    /// is already released by `exit_mm`, so the three files that describe it
+    /// (`maps`, `smaps`, `numa_maps`) read **nothing** rather than describing a
+    /// memory the process no longer has - measured: Linux reads 0 bytes from a
+    /// zombie's `maps`, `smaps` and `cmdline` while their opens succeed
+    /// (`build/scratch/zombiemm/z.c`).
+    pub exited: bool,
 }
 
 /// Record a range whose pages were mapped eagerly, for `/proc/<pid>/maps`.
@@ -1048,6 +1109,7 @@ pub fn map_facts(pid: usize) -> Option<MapFacts> {
             vmas: task.mm.vma_snapshot(),
             eager: task.mm.eager_ranges(),
             heap,
+            exited: task.exited,
         })
     })
 }

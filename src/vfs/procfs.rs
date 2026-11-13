@@ -48,6 +48,20 @@ use crate::mm::vm::MapFlags;
 /// the difference (`docs/notes/` §6.136).
 type Generator = Box<dyn Fn() -> Option<alloc::vec::Vec<u8>> + Send + Sync>;
 
+/// What a generated file's own **open** answers, for the files Linux's
+/// `proc_reg_open` gives a `proc_open` that does real work: `/proc/<pid>/auxv`
+/// and `/proc/<pid>/environ` grab the task's address space there (`mm_access`),
+/// which is where the two refusals come from - `ESRCH` for a task whose memory
+/// is gone and `ENOENT` for a number that names nothing
+/// (`build/scratch/zombiemm/z.c`, and `s.c` for the stranger whose `EACCES` the
+/// permission word answers first).
+///
+/// The body is captured here too, not only checked: Linux's open holds the
+/// address space it grabbed, so the descriptor keeps serving after the task
+/// dies (`build/scratch/zombiemm/q.c`: 16 bytes while live, 352 more after the
+/// child was killed and reaped).
+type Capture = Box<dyn Fn() -> VfsResult<alloc::sync::Arc<[u8]>> + Send + Sync>;
+
 /// The generator of a node whose body is text and always was: `/proc/sys`'s
 /// knobs and the links, neither of which has a binary member.
 type TextGenerator = Box<dyn Fn() -> Option<String> + Send + Sync>;
@@ -98,6 +112,10 @@ struct ProcFile {
     /// The owner this node inherits from the process it describes.
     owner: Inherited,
     generate: Generator,
+    /// The body captured by this file's own `open`, when the file is one whose
+    /// open is a real step rather than a formality ([`Capture`]). `None` for
+    /// every ordinary generated file, whose body is rendered on each read.
+    capture: Option<Capture>,
     /// The permission bits Linux gives *this* file, when they are not the
     /// read-only default every generated file here carries. Zero means that
     /// default, which is what every file but `/proc/<pid>/environ` reports.
@@ -133,6 +151,27 @@ impl Inode for ProcFile {
     /// answers for them; every other generated file is its own word's business.
     fn describes_task(&self) -> Option<usize> {
         self.describes
+    }
+
+    /// The file's own `open`, for the two nodes whose open is a real step:
+    /// `/proc/<pid>/auxv` and `/proc/<pid>/environ` grab a task's address space
+    /// here, which is where Linux's `ESRCH` for a dead task comes from, and the
+    /// bytes they grabbed are what the descriptor goes on serving ([`Capture`],
+    /// [`memory_file`]).
+    ///
+    /// Asked by the open handler *after* the shape, the permission word and the
+    /// flags have answered, because that is Linux's order: `open("/proc/<root>
+    /// zombie>/auxv")` as a stranger is `EACCES`, not `ESRCH` (measured,
+    /// `build/scratch/zombiemm/s.c`).
+    fn open_check(&self) -> VfsResult<()> {
+        let Some(capture) = &self.capture else {
+            return Ok(());
+        };
+        let bytes = capture()?;
+        critical_section::with(|cs| {
+            *self.rendered.borrow(cs).borrow_mut() = Some(bytes);
+        });
+        Ok(())
     }
 
     /// A generated **read-only** file has no writer, and Linux's open asks the
@@ -209,7 +248,12 @@ impl Inode for ProcFile {
         // (or a re-read from the beginning) sees the process as it is now. Any
         // other offset continues whichever snapshot this instance already
         // produced - the one thing a chunked reader must be able to rely on.
-        let mut content = if offset == 0 {
+        //
+        // A file whose body its *open* captured is the exception: that body is
+        // the descriptor's for its whole life (Linux's open holds the address
+        // space it grabbed), and re-asking would hand a read that arrived after
+        // the task died something the open never promised.
+        let mut content = if offset == 0 && self.capture.is_none() {
             None
         } else {
             critical_section::with(|cs| self.rendered.borrow(cs).borrow().clone())
@@ -766,6 +810,7 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
         ino: next_ino(),
         owner: Inherited::new(),
         generate: Box::new(move || Some(generate().into_bytes())),
+        capture: None,
         mode: 0,
         size: 0,
         describes: None,
@@ -861,6 +906,7 @@ fn task_file(
         ino: next_ino(),
         owner: Inherited::new(),
         generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
+        capture: None,
         mode: 0,
         size: 0,
         describes: Some(slot),
@@ -873,28 +919,8 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
         ino: next_ino(),
         owner: Inherited::new(),
         generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
+        capture: None,
         mode: 0,
-        size: 0,
-        describes: None,
-        rendered: Mutex::new(RefCell::new(None)),
-    })
-}
-
-/// The one read-only file whose own permission word is narrower than the
-/// tree's: `/proc/<pid>/environ`, which Linux makes `0400` because a process's
-/// environment can carry secrets and the file belongs to its owner.
-///
-/// A [`maybe_file`] whose word is said out loud rather than a knob on every
-/// node: the generator answers nothing for a process that has gone, exactly as
-/// its siblings' do, so this file's *shape* is ordinary and only the bits it
-/// reports are its own. Measured on a current host, beside
-/// `/proc/<pid>/cmdline`'s `0444`.
-fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
-    Arc::new(ProcFile {
-        ino: next_ino(),
-        owner: Inherited::new(),
-        generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
-        mode: 0o400,
         size: 0,
         describes: None,
         rendered: Mutex::new(RefCell::new(None)),
@@ -907,13 +933,15 @@ fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Ar
 /// `/proc/<pid>/io` is the second one: it reports another process's activity -
 /// which files it touched and how much - so it belongs to its owner exactly as
 /// `environ` does. Measured on a current host (`build/scratch/pidio/perm.c`,
-/// Linux 7.2.14): `/proc/1/io` read by uid 1000 answers `EACCES`. `env_file`
-/// above is the first; the two differ only in the generator they carry.
+/// Linux 7.2.14): `/proc/1/io` read by uid 1000 answers `EACCES`. `environ` is
+/// the first, and it now carries a [`Capture`] of its own; the two differ only
+/// in the generator they carry.
 fn owner_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
         generate: Box::new(move || generate().map(alloc::string::String::into_bytes)),
+        capture: None,
         mode: 0o400,
         size: 0,
         describes: None,
@@ -921,24 +949,87 @@ fn owner_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
     })
 }
 
-/// [`owner_file`] for a body that is not text: the generator answers bytes and
-/// this node hands them over as they are.
+/// A generated file whose body is a task's **memory**: its own `open` captures
+/// the answer, and the two refusals are the open's.
 ///
-/// `/proc/<pid>/auxv` is the one file of that shape. Linux's own is `0400` -
-/// the vector carries the ids the process was executed with, which is
-/// privilege information - and its `st_size` is `0` because the length is only
-/// known when the file is read (`build/scratch/auxv/p.c`, Linux 7.2.14). The
-/// bytes are the `(u64, u64)` pairs the initial stack carries, terminator
-/// included, which is why a `String` cannot be the generator's return type
-/// ([`Generator`]).
-fn owner_bytes_file(
-    generate: impl Fn() -> Option<alloc::vec::Vec<u8>> + Send + Sync + 'static,
+/// `/proc/<pid>/auxv` and `/proc/<pid>/environ` are the files of this shape,
+/// and Linux gives both a `proc_open` that does real work: it calls
+/// `mm_access`, which is why a zombie's `auxv` and `environ` refuse with
+/// `ESRCH` while `statm` and `status` - which only name the process - still
+/// answer (`build/scratch/zombiemm/z.c`, Linux 7.2.14; a reaped number is
+/// `ENOENT` for both). The permission word answers first: a stranger's open of
+/// a root-owned zombie is `EACCES`, not `ESRCH` (`.../s.c`, measured under
+/// `sudo`), which is why this node is asked *after* the word rather than in
+/// `open_replacement`, the door that runs before it.
+///
+/// The captured body is the descriptor's for its whole life, as Linux's open
+/// holds the address space it grabbed (`.../q.c`: 16 bytes read while live,
+/// 352 more after the child was killed and reaped). A second open re-captures,
+/// which is the same bytes: an executed image's vector and an environment
+/// block do not change between two opens of a live task.
+///
+/// `0400` is the word, because the vector carries the ids the process was
+/// executed with and the environment can carry secrets.
+fn memory_file(
+    capture: impl Fn() -> crate::sched::TaskMemory + Send + Sync + 'static,
 ) -> Arc<dyn Inode> {
+    let capture = Arc::new(capture);
+    let render = Arc::clone(&capture);
     Arc::new(ProcFile {
         ino: next_ino(),
         owner: Inherited::new(),
-        generate: Box::new(generate),
+        generate: Box::new(move || match render() {
+            crate::sched::TaskMemory::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }),
+        capture: Some(Box::new(move || match capture() {
+            crate::sched::TaskMemory::Bytes(bytes) => Ok(Arc::from(bytes)),
+            crate::sched::TaskMemory::NoMemory => Err(VfsError::NoProcess),
+            crate::sched::TaskMemory::NoTask => Err(VfsError::NoEntry),
+        })),
         mode: 0o400,
+        size: 0,
+        describes: None,
+        rendered: Mutex::new(RefCell::new(None)),
+    })
+}
+
+/// [`memory_file`] for a body this side renders: the file's `open` asks the
+/// address space the same way, and the bytes it renders are the descriptor's -
+/// but the text is procfs's own to write.
+///
+/// `/proc/<pid>/smaps_rollup` is the one node of that shape, and the gate is the
+/// measured half: Linux refuses its open with `ESRCH` for a task whose address
+/// space is gone and with `ENOENT` for a number that names nothing
+/// (`build/scratch/zombiemm/t.c`, Linux 7.2.14), while its neighbour `numa_maps`
+/// opens and reads nothing. The rollup is a *sum* of the mappings, so a zombie's
+/// header (`Rss: 0 kB`, and so on) would tell a reader the process still exists
+/// with no memory instead of that it has died.
+fn memory_text_file(
+    pid: usize,
+    generate: impl Fn() -> Option<alloc::string::String> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    let render = Arc::new(generate);
+    let text = Arc::clone(&render);
+    let gate = Arc::new(move || -> VfsResult<alloc::sync::Arc<[u8]>> {
+        match crate::sched::address_space_of(crate::sched::TaskId(pid)) {
+            crate::sched::TaskMemory::Bytes(_) => text()
+                .map(|body| alloc::sync::Arc::from(body.into_bytes()))
+                .ok_or(VfsError::NoEntry),
+            crate::sched::TaskMemory::NoMemory => Err(VfsError::NoProcess),
+            crate::sched::TaskMemory::NoTask => Err(VfsError::NoEntry),
+        }
+    });
+    let read_gate = Arc::clone(&gate);
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        generate: Box::new(move || match read_gate() {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(_) => None,
+        }),
+        capture: Some(Box::new(move || gate())),
+        mode: 0,
         size: 0,
         describes: None,
         rendered: Mutex::new(RefCell::new(None)),
@@ -962,6 +1053,7 @@ fn file_of_size(
         ino: next_ino(),
         owner: Inherited::new(),
         generate: Box::new(move || Some(generate().into_bytes())),
+        capture: None,
         mode: 0,
         size,
         describes: None,
@@ -1922,14 +2014,16 @@ fn timers_body(slot: usize) -> Option<alloc::string::String> {
 /// Not reformatted and not rebuilt: the file is a read of the copy the address
 /// space keeps (Linux's `mm->saved_auxv`), which is the only way a reader can
 /// trust it. A process that changed its ids after `exec` still reads the ids
-/// it was executed with, because that is what its stack says
-/// (`docs/notes/` §6.136).
+/// the vector a task's memory file reports, in the three cases Linux's own
+/// opening of the file distinguishes ([`crate::sched::TaskMemory`]).
 ///
-/// `None` for a task this kernel has no vector for: one that has exited (its
-/// address space is gone, which Linux refuses with `ESRCH`) and one whose
-/// number names nothing (which every sibling reports as `ENOENT`). The two
-/// collapse into this one answer, a divergence with a name.
-fn auxv_body(tid: usize) -> Option<alloc::vec::Vec<u8>> {
+/// It is a function of the open, not of the read: `/proc/<pid>/auxv` grabs the
+/// address space when it is opened (`mm_access`), so a zombie's is `ESRCH` and a
+/// reaped number's is `ENOENT` rather than a read that fails. Measured on a
+/// current host (`build/scratch/zombiemm/z.c`, Linux 7.2.14): open of a live
+/// child's `auxv` succeeds and reads 368 bytes; the same child as a zombie is
+/// `-1 errno=3`; after the parent reaps, `-1 errno=2`.
+fn auxv_memory(tid: usize) -> crate::sched::TaskMemory {
     #[cfg(target_os = "none")]
     {
         crate::sched::saved_auxv_of(crate::sched::TaskId(tid))
@@ -1937,7 +2031,37 @@ fn auxv_body(tid: usize) -> Option<alloc::vec::Vec<u8>> {
     #[cfg(not(target_os = "none"))]
     {
         let _ = tid;
-        None
+        crate::sched::TaskMemory::NoTask
+    }
+}
+
+/// the environment block a task's memory file reports, in the same three cases.
+///
+/// Same door, same rule: the block lives in the address space the zombie no
+/// longer has. This kernel used to hand a zombie's 14 bytes out - the guest
+/// probe in `docs/notes/` §6.136's row shows it - which is the over-serving
+/// item 268 closed.
+///
+/// The file is not decoration, and the boot that lacked it says so. OpenRC's
+/// `init.sh` decides whether `/proc` still needs mounting by reading *this*
+/// file twice under two different values of a variable it sets on the command
+/// line - `VAR=a md5sum /proc/self/environ` against `VAR=b md5sum ...` - and
+/// treating two *different* digests as proof that a live procfs is already
+/// there (identical digests mean the path is stale cruft in the root
+/// filesystem, which is the case the test exists to catch). With the name
+/// absent, `[ -e /proc/self/environ ]` fails, so the check never runs, OpenRC
+/// concludes "not mounted" and mounts over the procfs our disk `/init` had
+/// already mounted: `mount: mounting proc on /proc failed: Resource busy`,
+/// with the `/proc` service reporting `[ !! ]` on the Alpine boot.
+fn environ_memory(pid: usize) -> crate::sched::TaskMemory {
+    #[cfg(target_os = "none")]
+    {
+        crate::sched::environment_of(crate::sched::TaskId(pid))
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = pid;
+        crate::sched::TaskMemory::NoTask
     }
 }
 
@@ -3001,6 +3125,15 @@ fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
     use crate::mm::vma::{Vma, VmaKind};
 
     let facts = crate::sched::map_facts(pid)?;
+    // A zombie's address space is gone, and every file that describes it reads
+    // nothing rather than describing a memory the process no longer has:
+    // measured, Linux's `maps` and `smaps` open a zombie successfully and read
+    // 0 bytes (`build/scratch/zombiemm/z.c`, Linux 7.2.14 - 512 while the child
+    // lived, 0 once it exited), and `cmdline` the same. `maps` is not `ENOENT`
+    // there: the process still exists, it is the memory that does not.
+    if facts.exited {
+        return Some(Vec::new());
+    }
 
     // `[heap]` is a reporting convention rather than a mapping's own name, so
     // it is applied here, by range: Linux prints it for the break's VMA, and
@@ -3171,37 +3304,17 @@ fn smaps_rollup_of(_pid: usize) -> Option<String> {
 /// name in brackets rather than print a blank command.
 fn cmdline_of(pid: usize) -> Option<String> {
     let task = task(pid)?;
+    // A dead task's command line is empty rather than stale: Linux reads 0
+    // bytes from a zombie's `cmdline` while the open succeeds
+    // (`build/scratch/zombiemm/z.c`, Linux 7.2.14, 21 bytes while the child
+    // lived and 0 once it exited), because the words it pointed at lived in
+    // the address space `exit_mm` released.
+    if task.state == 'Z' || task.state == 'X' {
+        return Some(String::new());
+    }
     let mut out = String::new();
     for arg in task.argv.iter() {
         out.push_str(arg);
-        out.push('\0');
-    }
-    Some(out)
-}
-
-/// `/proc/<pid>/environ`: the environment, NUL-separated, with a NUL after the
-/// last `KEY=VALUE`.
-///
-/// Empty - not absent - for a process that was entered without one, which is
-/// what Linux reports for a kernel thread and what a reader must be able to
-/// tell from a missing file.
-///
-/// The file is not decoration, and the boot that lacked it says so. OpenRC's
-/// `init.sh` decides whether `/proc` still needs mounting by reading *this*
-/// file twice under two different values of a variable it sets on the command
-/// line - `VAR=a md5sum /proc/self/environ` against `VAR=b md5sum ...` - and
-/// treating two *different* digests as proof that a live procfs is already
-/// there (identical digests mean the path is stale cruft in the root
-/// filesystem, which is the case the test exists to catch). With the name
-/// absent, `[ -e /proc/self/environ ]` fails, so the check never runs, OpenRC
-/// concludes "not mounted" and mounts over the procfs our disk `/init` had
-/// already mounted: `mount: mounting proc on /proc failed: Resource busy`,
-/// with the `/proc` service reporting `[ !! ]` on the Alpine boot.
-fn environ_of(pid: usize) -> Option<String> {
-    let task = task(pid)?;
-    let mut out = String::new();
-    for var in task.env.iter() {
-        out.push_str(var);
         out.push('\0');
     }
     Some(out)
@@ -3834,7 +3947,11 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // Same file as the process's, under the thread's own name - a thread
     // shares its process's environment, and Linux answers it here too, with
     // the same `0400`.
-    node.add("environ", NodeKind::File, env_file(move || environ_of(tid)));
+    node.add(
+        "environ",
+        NodeKind::File,
+        memory_file(move || environ_memory(tid)),
+    );
     node.add("status", NodeKind::File, maybe_file(move || status_of(tid)));
     // The wait *this thread* is in, by the thread's own name - the one file
     // whose answer is per-thread rather than per-group. Measured
@@ -3859,7 +3976,7 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     node.add(
         "auxv",
         NodeKind::File,
-        owner_bytes_file(move || auxv_body(tid)),
+        memory_file(move || auxv_memory(tid)),
     );
     node.add(
         "children",
@@ -4164,6 +4281,7 @@ fn syscall_file(pid: usize, slot: usize) -> Arc<dyn Inode> {
                 None => Some(alloc::string::String::from("running\n").into_bytes()),
             }
         }),
+        capture: None,
         mode: 0o400,
         size: 0,
         describes: Some(pid),
@@ -4197,6 +4315,7 @@ fn personality_file(pid: usize) -> Arc<dyn Inode> {
             crate::sched::personality_of(pid)
                 .map(|word| alloc::format!("{word:08x}\n").into_bytes())
         }),
+        capture: None,
         mode: 0o400,
         size: 0,
         describes: None,
@@ -4493,11 +4612,12 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // What the program was handed when it was executed, in the bytes its
     // initial stack carries - the same copy a `fork` child inherits and an
     // `exec` replaces. `0400`, like Linux's, and `st_size` 0 because the
-    // length is only known when the file is read ([`owner_bytes_file`]).
+    // length is only known when the file is read ([`memory_file`], whose `0400`
+    // is the same word Linux gives the file).
     node.add(
         "auxv",
         NodeKind::File,
-        owner_bytes_file(move || auxv_body(slot)),
+        memory_file(move || auxv_memory(slot)),
     );
     // The process's POSIX timers, four lines each, newest number first -
     // `0444` because Linux's `proc_pid_timers` is `S_IRUGO`, and *not* offered
@@ -4535,7 +4655,7 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     node.add(
         "smaps_rollup",
         NodeKind::File,
-        maybe_file(move || smaps_rollup_of(slot)),
+        memory_text_file(slot, move || smaps_rollup_of(slot)),
     );
     // The mount table, in both spellings, under *every* process rather than
     // once at the top of `/proc`.
@@ -4574,7 +4694,7 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     node.add(
         "environ",
         NodeKind::File,
-        env_file(move || environ_of(slot)),
+        memory_file(move || environ_memory(slot)),
     );
     node.add(
         "status",
@@ -6291,9 +6411,9 @@ mod tests {
     #[test]
     fn a_file_whose_body_is_not_text_is_served_byte_for_byte() {
         let body = alloc::vec![0x80u8, 0x00, 0xff, 0xfe, 0x7f, 0x00, 0x00, 0x00];
-        let node = owner_bytes_file({
+        let node = memory_file({
             let body = body.clone();
-            move || Some(body.clone())
+            move || crate::sched::TaskMemory::Bytes(body.clone())
         });
         assert_eq!(node.mode(), 0o400);
         assert_eq!(node.metadata().size, 0);
@@ -7216,11 +7336,61 @@ mod tests {
         // `0400`, which is the one node whose word is its own.
         assert_eq!(file(|| String::new()).mode(), PROC_RO_FILE_MODE);
         assert_eq!(maybe_file(|| None).mode(), PROC_RO_FILE_MODE);
-        assert_eq!(env_file(|| None).mode(), 0o400);
+        assert_eq!(
+            memory_file(|| crate::sched::TaskMemory::NoTask).mode(),
+            0o400
+        );
         // `/proc/<pid>/io` is the other 0400 file, and for the same reason: it
         // reports another process's activity. Measured (`build/scratch/pidio/perm.c`):
         // `/proc/1/io` read by uid 1000 is `EACCES`.
         assert_eq!(owner_file(|| None).mode(), 0o400);
+    }
+
+    /// The memory files' own `open` is where Linux's two refusals come from, and
+    /// where the body the descriptor will serve is captured. Both halves are
+    /// pure, so they are pinned here; the measurement behind them is on a current
+    /// host (`build/scratch/zombiemm/{z,q,s}.c`, Linux 7.2.14) and on the guest
+    /// (`build/scratch/oneshot-procdead-cf{2,3}.log`).
+    #[test]
+    fn a_memory_files_open_carries_the_two_refusals_and_the_body() {
+        use crate::sched::TaskMemory;
+        use crate::vfs::VfsError;
+
+        // A task that exists with no address space, and a number that names
+        // nothing: two refusals, two errnos (`NoProcess` is ESRCH, `NoEntry` is
+        // ENOENT). The split is the whole point - Linux answers `ESRCH` for a
+        // zombie's auxv and `ENOENT` for a number it has already collected.
+        let zombie = memory_file(|| TaskMemory::NoMemory);
+        assert_eq!(zombie.open_check().err(), Some(VfsError::NoProcess));
+        let collected = memory_file(|| TaskMemory::NoTask);
+        assert_eq!(collected.open_check().err(), Some(VfsError::NoEntry));
+
+        // The bytes the open captured belong to the descriptor: a read from zero
+        // must not ask again, so the node's second answer - the task has died -
+        // cannot take them away. Counterfactually, a node that renders on the
+        // read answers the death instead: the guest held 0 of 288 bytes.
+        let questions = core::sync::atomic::AtomicUsize::new(0);
+        let captured = memory_file(move || {
+            if questions.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
+                TaskMemory::Bytes(alloc::vec::Vec::from(&b"auxv bytes"[..]))
+            } else {
+                TaskMemory::NoMemory
+            }
+        });
+        assert_eq!(captured.open_check(), Ok(()));
+        let mut buf = [0u8; 32];
+        let n = captured
+            .read_at(0, &mut buf)
+            .expect("the captured body reads");
+        assert_eq!(&buf[..n], b"auxv bytes");
+        assert_eq!(
+            captured.read_at(n as u64, &mut buf).expect("the end of it"),
+            0,
+            "and the body ends where the capture said it does"
+        );
+        // A second open asks again, and this time the task is gone: refused, as
+        // Linux's own `open` would be.
+        assert_eq!(captured.open_check().err(), Some(VfsError::NoProcess));
     }
 
     /// The seven lines are the file's whole contract, so they are pinned here byte

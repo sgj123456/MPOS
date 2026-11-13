@@ -42,6 +42,30 @@ const _: () = assert!(BANDS > 0, "a scheduler with no bands cannot queue anythin
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(pub usize);
 
+/// What a file that reports a task's **memory** can answer, in Linux's three
+/// cases.
+///
+/// The two refusals are different errnos and Linux reaches them at different
+/// moments, which is why they are one answer here and not two `None`s: a number
+/// that names nothing is `ENOENT` from path resolution, while a task that
+/// exists but whose address space is gone - a zombie, whose `mm` `exit_mm`
+/// released - is `ESRCH` from `mm_access` at the **open** (`build/scratch/zombiemm/z.c`,
+/// Linux 7.2.14: `open("/proc/<zombie>/auxv")` = -1 `errno=3`, the same for
+/// `environ`; after the parent reaps, both are -1 `errno=2`).
+///
+/// It lives here, beside [`TaskId`], because it is a fact about a number and a
+/// state rather than about the task table: the host build has no table and
+/// still has to answer the two refusals for a test.
+#[derive(Debug)]
+pub enum TaskMemory {
+    /// The bytes the file reports.
+    Bytes(alloc::vec::Vec<u8>),
+    /// `ESRCH`: the task exists but has no address space left to report.
+    NoMemory,
+    /// `ENOENT`: no task answers to the number.
+    NoTask,
+}
+
 /// Which ready queue a task sits in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Priority(u8);
