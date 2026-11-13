@@ -571,14 +571,32 @@ pub(crate) fn check_console_rx(_info: &BootInfo) -> Result<(), String> {
     let mut typed = [0u8; 2];
     typed.copy_from_slice(b"Z\n");
     let tty = vfs::tty::global();
+    // Bytes the machine itself has already put in the receive FIFO are not the
+    // injected one. `console_inject_input` uses the UART's loopback, and the
+    // console's own pump writes through the same `DR`, so an in-flight output
+    // byte lands in the FIFO beside ours. Measured 2026-11-14 (the aarch64
+    // gate's lane 3): `the poll after injecting 0x5a gave Some(109)` - the `m`
+    // of an in-flight `mpos-kunit:` line. The `IMSC` mask inside
+    // `inject_via_loopback` closes the *interrupt* window, not the pump's
+    // task-context write, so this check drains what is already queued and then
+    // polls for its own byte through at most `FOREIGN_MAX` of somebody else's.
+    const FOREIGN_MAX: usize = 8;
+    while hal::console_poll_input().is_some() {}
     for &byte in &typed {
         hal::console_inject_input(byte);
-        match hal::console_poll_input() {
-            Some(got) if got == byte => tty.receive_byte(got),
-            other => {
-                return Err(alloc::format!(
-                    "the poll after injecting {byte:#04x} gave {other:?}"
-                ));
+        let mut foreign = 0usize;
+        loop {
+            match hal::console_poll_input() {
+                Some(got) if got == byte => {
+                    tty.receive_byte(got);
+                    break;
+                }
+                Some(_) if foreign < FOREIGN_MAX => foreign += 1,
+                other => {
+                    return Err(alloc::format!(
+                        "the poll after injecting {byte:#04x} gave {other:?} after {foreign} foreign byte(s)"
+                    ));
+                }
             }
         }
     }

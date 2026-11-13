@@ -651,3 +651,24 @@ its format modifier at the uapi's offset, 72 rather than 68 (§15.13).** Both ar
 the measurements, counterfactuals and gates are in those two sections and are not repeated here.
 
 **What the 3D/virtgpu landing has *not* measured.** The family is served now, 2D and 3D both: all eleven requests are dispatched, `RESOURCE_CREATE` makes a real device resource across the new mailbox to the render task, the GL card negotiates `VIRGL` and the driver says so in its own words — `virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2 mask=0x6`, every number the deleted `user/staging/virtgpu-probe/` measured on Linux — and `t-virtgpu` pins the lot, its 3D branch included, on the GL machine (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and landed — the GPU driver is this kernel's rather than the crate's, and a submission reaches the device through the render task's mailbox, which the resource path already uses. What blocked `is_software()` was not the 3D queue but the card's identity, and that is built now: measured against a working card's own sysfs reads, the node's `device` link had to lead to the display-class PCI function — carrying `vendor`, `device`, `subsystem_vendor`, `subsystem_device`, `uevent` and the `subsystem` link libdrm resolves first — rather than to a `virtual` directory with no attributes at all. **The renderer itself is still unverified**: the GL-card run that would answer "eglinfo reports a non-software device" has not happened, because the console defect §7.4's update names killed every attempt at it. That is the first thing on this entry, and it is a measurement rather than a build.
+
+### 15.102 The console receive check drains before it injects — LANDED 2026-11-14
+
+The aarch64 boot's `arch.console_receive` case (the only aarch64 boot case that touches the receive
+path) failed one gate lane with `the poll after injecting 0x5a gave Some(109)`: **109 is the `m` of an
+in-flight `mpos-kunit:` line**, i.e. a byte the machine had itself put into the UART's receive FIFO.
+The mechanism is the loopback trick and the console's own pump sharing one `DR`: `inject_via_loopback`
+(`arch/src/arch/aarch64/pl011.rs:246`) masks the transmit interrupt for the window `LBE` is on, which
+closes the *interrupt* window (measured 2026-10-27, where that mask was added), but a pump running in
+task context writes through `tx_put` regardless, and with `LBE` set that byte lands in the FIFO beside
+the injected one.
+
+The fix is in `src/board/suites.rs`'s `check_console_rx`: drain whatever is already queued before
+injecting, then poll for the injected byte through at most `FOREIGN_MAX = 8` foreign ones, and report
+how many were stepped over when the byte never arrives. That keeps the case's claim ("the capability
+forward hands the injected byte to the tty") while no longer asserting a thing the boot's own logging
+can falsify — the failure is a real, if intermittent, confound of the measurement, not a console
+defect: the same lane log shows the tty read and the `=== SUMMARY` line after it.
+
+Recorded because the earlier note in `pl011.rs` says the window is *closed*, and it is — for the
+interrupt. Two writers, one register, and only one of them was masked is the shape to look for.
