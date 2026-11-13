@@ -12,12 +12,19 @@
 use libfuzzer_sys::fuzz_target;
 use mpos::mm::elf;
 
+/// The bytes the parser is given, as a `Source`: this target's input is the
+/// whole file, which is exactly the in-memory shape the kernel's own spawn
+/// paths and its host tests parse. The loader's *streaming* source reads a
+/// filesystem, so it is not a fuzzer's input - but it is bounded on the same
+/// invariants, which is what the assertions below are about.
+
 /// First address past the lower half, mirrored from the private constant in
 /// `mm/elf.rs`: bit 47 is what separates a user address from a kernel one.
 const USER_LIMIT: usize = 1 << 47;
 
 fuzz_target!(|data: &[u8]| {
-    let Some(image) = elf::parse(data) else {
+    let source = elf::Bytes(data);
+    let Some(image) = elf::parse(&source) else {
         return;
     };
 
@@ -32,11 +39,25 @@ fuzz_target!(|data: &[u8]| {
             "segment at {:#x} is in the kernel half",
             segment.vaddr
         );
+        // The file range a segment names must be inside the file the parser
+        // was given: `read_at` would otherwise answer short where the loader
+        // trusts a full page.
         assert!(
-            segment.memsz >= segment.data.len(),
+            segment
+                .offset
+                .checked_add(segment.filesz)
+                .is_some_and(|end| end <= data.len()),
+            "segment at {:#x} names file bytes past the end ({} + {} > {})",
+            segment.vaddr,
+            segment.offset,
+            segment.filesz,
+            data.len()
+        );
+        assert!(
+            segment.memsz >= segment.filesz,
             "segment at {:#x} maps {} bytes of file into {} of memory",
             segment.vaddr,
-            segment.data.len(),
+            segment.filesz,
             segment.memsz
         );
         assert!(
