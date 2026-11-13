@@ -1770,6 +1770,35 @@ pub fn exec_replace(
     let user_rsp =
         initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
+    // --- Build the new address space before the old one is touched ---
+    //
+    // The image is read here, page by page, and a page of a file on a block
+    // device parks the task while the device answers (`docs/notes/`, §10.5).
+    // Building the space *inside* the table lock therefore parked a task that
+    // held the lock every other task needs to be scheduled: measured on the
+    // disk image (`cargo xtask run --mode terminal`, 2026-11-14), the boot
+    // stopped dead in `/sbin/openrc` where the initramfs root had read only
+    // ramfs all along, and the same image with the image read whole reached
+    // `mpos login:`. Nothing below the lock reads a file.
+    //
+    // The order is the other half of the fix, and it is Linux's: an `execve`
+    // that cannot load leaves the caller running the image it had. Building
+    // first means every refusal above returns with the old space, the old
+    // page tables and the old frames untouched, so the error is `ENOEXEC` to a
+    // process that is still itself rather than a process whose address space
+    // has already been torn down.
+    let mut space = AddressSpace::new();
+    let mut loaded = load_user(
+        &mut space,
+        &image,
+        interp.as_ref(),
+        &layout,
+        exe,
+        interp_name,
+        user_rsp,
+    )?;
+    write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
+
     with_table(|t| {
         let id = t.current;
         // Linux's `de_thread`: an `exec` from any thread ends the group's other
@@ -1861,20 +1890,6 @@ pub fn exec_replace(
         {
             task.fpu_live = true;
         }
-
-        // --- Build new address space ---
-        let mut space = AddressSpace::new();
-        let mut loaded = load_user(
-            &mut space,
-            &image,
-            interp.as_ref(),
-            &layout,
-            exe,
-            interp_name,
-            user_rsp,
-        )?;
-
-        write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
 
         // --- Reset process state ---
         //
