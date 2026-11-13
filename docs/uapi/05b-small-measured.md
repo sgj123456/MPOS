@@ -1578,8 +1578,23 @@ Section numbers are unchanged from the original `UAPI.md`.
   `handle_sendfile`/`handle_copy_file_range`/`handle_splice` (the last only when its output is
   not a pipe). Pin: `t-inotify` grows **21 claims** (46 → 67) beside the host unit test
   `write_quiet_moves_bytes_without_reporting_modify`; item 61 carries the gates and the
-  counterfactual. The module's other two departures — `IN_UNMOUNT`, and a watched directory's
-  `IN_MOVE_SELF` — are unchanged.
+  counterfactual. The module's departures — `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`,
+  and a watched *regular file* not surviving a rename — are unchanged (item 267 closed the
+  replaced-name bookkeeping below).
+
+- **A rename that replaces a name is one move, and it retires the replaced inode's watch
+  (item 267).** The watched directory was told `IN_MOVED_FROM` + `IN_MOVED_TO` on one cookie and
+  **nothing else** — measured on a current host first (`.workbuddy/probe_inotify_rename.c`, Linux
+  7.2.14), where `vfs_rename` does not report the unlink it performs — while the victim's own watch
+  heard `IN_DELETE_SELF` then retired with `IN_IGNORED`, after which `inotify_rm_watch` of it is
+  `EINVAL`. This kernel's copy-based rename unlinked the victim through `dir.unlink` and reported
+  nothing, so that watch stayed in the registry for ever keyed on an inode no name reached; the fix
+  is the missing `notify_deleted` for the inode `renameat2` already looks up. Pin: `t-inotify` 8 new
+  claims (67 → 75) on both machines, the leak detector being `rm_watch` of the retired wd answering
+  `EINVAL` where a leaked watch answers 0; the counterfactual reddens exactly those two claims.
+  Item 267 carries the gates. What is still structural: a watched regular file does not survive a
+  rename here — the copy is a fresh inode, so its watch is retired where Linux hands it
+  `IN_MOVE_SELF` and keeps it — and `IN_UNMOUNT` and a directory's `IN_MOVE_SELF` stay named.
 
 - **A datagram socket's `SO_RCVBUF` sizes its receive queue — served (item 58's boundary).**
   The number was Linux's and nothing read it: the receive ring was a fixed 16 KiB, so a

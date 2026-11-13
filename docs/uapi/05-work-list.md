@@ -11932,3 +11932,63 @@ paths when the feature is off - one relaxed store each, cost unmeasured
 (`EXT4_FILL_BUSY`, the block-layer submit/retire pair, the wake/claim hits).
 Gating them would touch eight sites and remove the instrument's own inputs;
 recorded as a residual rather than approximated.
+
+**Item 267**, landed 2026-11-13.
+
+### Item 267 a rename that replaces a name retires the replaced inode's watch
+
+The inotify module's header carried one sentence nothing had measured: *"a rename
+that replaces a name really does unlink the old inode here, so the replaced name
+truthfully reports `IN_DELETE` before `IN_CREATE`."* Measured on a current host
+first (`.workbuddy/probe_inotify_rename.c`, Linux 7.2.14, plain user, scratch dir):
+
+| what is watched | Linux reports |
+|---|---|
+| the directory holding both names | `IN_MOVED_FROM`(`source`) + `IN_MOVED_TO`(`victim`), **one cookie**, and **no `IN_DELETE`** for the name that went |
+| the victim file itself | `IN_DELETE_SELF`, then `IN_IGNORED` - the watch is retired |
+| `inotify_rm_watch` of that wd after | `-1`, `EINVAL` (22) |
+| a write to the new name (the source's inode) | nothing on the victim's queue: it died with its inode |
+
+The sentence was wrong in both directions: there is no `IN_DELETE` for a replaced
+name (a replace is one move, and `vfs_rename` does not report the unlink it
+performs internally), and the *victim's own watch* was never told anything at all.
+This kernel's rename copies the body into a fresh inode, so `renameat2`'s
+`claim_name!` unlinks the victim through `dir.unlink(&name)` on the way - and that
+unlink reported nothing. The watch therefore stayed in the registry for ever, keyed
+on an inode no name reached: a watcher of a file that an install replaced was still
+waiting for news of a node that no longer existed, and its slot was never freed.
+
+**The fix is the missing report and only that.** `renameat2` already looks the
+target name up (`let existing = dir.lookup(&name).ok()`); on the way out, beside
+`notify_deleted(&old_inode)` for the travelling name, it now says the same for
+`existing`. The watched directory still hears exactly the moved pair - no
+`IN_DELETE` was added, which is the half a convenient fix would have got wrong.
+`emit_move`'s doc now says which inode a copy-based rename's `IN_MOVE_SELF` reaches
+(the fresh copy's, so a regular file's watchers hear no `IN_MOVE_SELF` at all) and
+the module header's sentence is rewritten to the measured one.
+
+**Pins.** `t-inotify` grows **8 claims** (67 → 75): the moved pair on one nonzero
+cookie, **the directory told nothing of the replaced name going** (the guard
+against over-reporting), the victim's `DELETE_SELF` → `IGNORED` order, and the leak
+detector - `inotify_rm_watch` of the retired wd answers `EINVAL` where a leaked
+watch answers 0. All green on the host first (`MPOS_ON_HOST=1`, Linux 7.2.14) and
+on both machines. **Counterfactual**: the victim's `notify_deleted` removed and
+nothing else touched - the guest run ends `FAILED` with exactly **two** reds by
+name, `the victim's watch hears DELETE_SELF then retires with IGNORED` and
+`the retired victim wd is gone, so rm_watch answers EINVAL`, while the other 73
+stay green.
+
+**Gate** (`build/gate-inotifyrename.log`, `GATE_EXIT=0`): stage 1
+`1314 tests, 0 failed`; x86_64 `pass=309 fail=0 (309 built)`,
+`mpos-kunit 35 passed, 0 failed`; aarch64 `pass=308 fail=0 (308 built)`,
+`mpos-kunit 35 passed, 0 failed`, 16 of 324 left out by `tests.toml`; lint
+162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting both workspaces,
+fuzz 23 targets built; `t-inotify` green on both arms (41 ms / 214 ms).
+
+**What this does not do.** A watched *regular file* still does not survive a
+rename here: the body lands in a fresh inode, so the old watch is retired with
+`IN_DELETE_SELF`+`IN_IGNORED` where Linux hands it `IN_MOVE_SELF` and keeps it
+live on the same inode. That is the copy-based rename's shape, not this item's
+bookkeeping, and it is recorded as a departure rather than approximated.
+`IN_UNMOUNT` and a watched directory's `IN_MOVE_SELF` (which waits on directory
+rename) remain the module's two other named departures.

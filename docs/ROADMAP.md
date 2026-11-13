@@ -1919,7 +1919,8 @@ through, each saying the one event itself from the syscall layer's `notice_modif
 `notice_access` (`handle_writev`, its body moved to `writev_inner`, plus `handle_sendfile`,  
 `handle_copy_file_range`, `handle_splice` when the output is not a pipe). Pinned by `t-inotify`'s 21  
 new claims (46 → 67, byte-identical on both machines) beside the host unit test. The module's other  
-two departures (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`) stay named in `docs/uapi/` §5.2.
+departures (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - since item 267 - a watched  
+regular file not surviving a rename) stay named in `docs/uapi/` §5.2.
 
 **`numa_maps` and `smaps_rollup`: the two other spellings of `smaps`' accounting** (`docs/uapi/`  
 §5.1 item 62, landed 2026-10-19): `/proc/<pid>` had `maps` and, since item 54, `smaps` — and  
@@ -2584,3 +2585,19 @@ carries the per-phase history.*
   and recorded**: `boot/build.rs` watches the kernel's mtime, so toggling a feature and rebuilding
   the loader can silently keep the *previous* kernel (the first counterfactual here measured the
   loud build twice, §7.9v) - rebuild the payload from scratch and check the wire. (§7.9v, item 266)
+
+**A rename that replaces a name retires the replaced inode's watch, and a directory is told one move
+and nothing else** (`docs/uapi/` §5.2, item 267, landed 2026-11-13): the inotify module's header had
+carried a sentence nothing had measured - "a rename that replaces a name really does unlink the old
+inode here, so the replaced name truthfully reports `IN_DELETE` before `IN_CREATE`". Measured on a
+current host first (`.workbuddy/probe_inotify_rename.c`, Linux 7.2.14): `rename(source, victim)` over
+an existing name tells the watched directory `IN_MOVED_FROM` + `IN_MOVED_TO` on one cookie and
+**nothing else**, while the victim's own watch hears `IN_DELETE_SELF` then retires with `IN_IGNORED`
+(`inotify_rm_watch` of it is `EINVAL`). This kernel's copy-based rename unlinks the victim through
+`dir.unlink` and reported nothing, so the watch stayed in the registry for ever keyed on an inode no
+name reached - a watcher of a file an install replaced was never told its file had died. The fix is
+the missing report: `renameat2` says `notify_deleted` for the `existing` inode it already looked up.
+Pin: `t-inotify` 8 new claims (67 → 75) on both machines, whose leak detector is `rm_watch` of the
+retired wd answering `EINVAL`; the counterfactual reddens exactly that pair and nothing else. Named
+departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - structural, not bookkeeping
+- a watched regular file not surviving a rename (the copy is a fresh inode). (§15.101, item 267)
