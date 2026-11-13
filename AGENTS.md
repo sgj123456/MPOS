@@ -47,18 +47,26 @@ and `musl` toolchain pieces) are listed in full in `xtask/README.md` — check t
 | `cargo xtask run` [`--mode terminal\|gui\|mirror`] [`--arch x86_64\|aarch64`] | boot in QEMU, rebuilding stale bits. `--mode` picks the window backend and the guest's `console=` list together; `--arch` picks the image — each machine boots its own installed Alpine root (pid 1 is the disk's `/init`) | when needed |
 | `cargo xtask test` [`--arch x86_64\|aarch64`] [`--all-targets`] | **the gate**: host unit tests once, then the *same* sweep on every machine it names. **Both machines are the default** (`--all-targets` spells it out); `--arch` narrows the run to one, `--no-all-targets` is the old single-machine default on purpose. Each arm runs the same lanes, the same live dashboard (`tui::Panel`) and the same report — the payload's *channel* is the only difference (the first machine's boot archive is its root; the second stages onto a disk its lanes lay). Neither arm can silently run the other machine | no |
 | `cargo xtask depgraph` | measure the module graph against the Phase-11 ratchet; fails when an edge appears or a count grows | no |
+| `cargo xtask clippy` | measure `cargo clippy`'s diagnostics for **every** crate — both kernel targets, the host `--lib` half, the user suite, xtask and the loader — against the per-lint counts recorded in `xtask/src/clippy.rs`. Fails on an error-level diagnostic, a count that grew, or a lint the arm has never carried; a count that *fell* prints the line telling you to lower the constant | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own tests | no |
 | `cargo xtask clean` | remove `build/` and `target/` | when needed |
 
 ```bash
-cargo fmt --check
-cargo clippy --target x86_64-unknown-none            # kernel, bare metal
-cargo clippy --target x86_64-unknown-linux-gnu       # kernel, host
-cargo clippy -p mpos-xtask --target x86_64-unknown-linux-gnu
-cargo clippy --target aarch64-unknown-none           # everything under arch/src/arch/aarch64/ is
-(cd boot && cargo clippy --target aarch64-unknown-uefi)   # #[cfg]-ed out of every x86 target above
+cargo fmt --check                                    # BOTH workspaces - fuzz/ is its own, and
+cargo fmt --manifest-path fuzz/Cargo.toml --all --check   # `cargo fmt --check` at the root never
+                                                     # saw it (`docs/notes/` §1.5)
+cargo xtask clippy                                   # every arm, ratcheted; the gate runs this
 ```
+
+**Clippy and rustfmt are gate steps, so you do not run them by hand — but the arms are worth knowing
+when you are reading a failure.** Their per-lint baselines live in `xtask/src/clippy.rs` and the
+counts are *recorded, not repaired*: a change that adds one diagnostic anywhere fails the gate with
+the arm, the lint and the old count named, and the honest fixes are (a) fix it, (b) allow it at the
+site with the reason on the same line, or (c) lower the baseline constant in that same commit, with
+the measurement. What you must **not** do is raise a constant to make a red go away: the number is a
+ceiling, and its whole value is that lifting it takes a justified commit. `docs/notes/` §1.6 has the
+measurement table and the four defects the first recording found.
 
 **Two build traps.** (1) **`--target` is mandatory for host work**: `.cargo/config.toml` pins
 `[build] target = "x86_64-unknown-none"`, so a bare `cargo test` builds for bare metal and cannot

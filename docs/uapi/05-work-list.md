@@ -11562,3 +11562,110 @@ back to the pending set: a ptrace stop in this kernel is a syscall-exit shape, a
 and rewrites the gate's frame with a call number in it. That branch has never executed on either
 machine, and giving a trap-side stop a report shape of its own is the next named gap on this
 surface, not a defect in this one.
+
+---
+
+**Item 263**, landed 2026-11-13.
+
+### Item 263 `cargo clippy` and `cargo fmt --check` had no stage in the gate, and the first was red
+
+`AGENTS.md` §2 lists five commands a change runs. Two of them - `cargo fmt --check` and `cargo
+clippy` - were run by **nothing**: `grep -rn 'clippy\|rustfmt' xtask/src/` answered nothing, and no
+command in `xtask/src/main.rs` invoked either. Both conventions had been in that document since it
+was written, and both were being violated while it said otherwise. This is §1.4's finding for the
+third time (§1.5 recorded the other two: the `fuzz/` workspace no stage built, and the same
+workspace's absence from `fmt --check`'s subject).
+
+**The lint was red, and the defect was real.** `cargo clippy --target x86_64-unknown-none` exited
+**101**:
+
+```
+error: this loop never actually loops
+   --> src/net/socket.rs:500:5
+    = note: `#[deny(clippy::never_loop)]` on by default
+```
+
+`fn wait_channel` was written as `while !ready() { … } 0` by `48917cf`, and `d3d22d4` (*"a socket's
+timeout bounds its wait"*) wrapped it in `loop { while !ready() { … } return 0; }`. That wrapper's
+body returns on its first pass, so the `loop` retried nothing; the deadline was entirely inside the
+inner `while`. The function *reads* as a retry loop and no retry exists - the shape `AGENTS.md` §3
+rule 4 exists to refuse ("refuse rather than approximate"). Removing the wrapper restored the shape
+the fix meant, and changed no runtime behaviour, which is why no test could have found it.
+
+**Why a ratchet.** Measured with `--message-format=json`, level ∈ {warning, error}, after the four
+fixes below:
+
+| arm | diagnostics | lints | errors |
+|---|---|---|---|
+| `mpos` (`x86_64-unknown-none`, release) | 162 | 39 | 0 |
+| `mpos` (`aarch64-unknown-none`, release) | 168 | 39 | 0 |
+| `mpos --lib` (`x86_64-unknown-linux-gnu`) | 389 | 26 | 0 |
+| `mpos-user-tests` (`x86_64-unknown-linux-musl`, release) | 273 | 44 | 0 |
+| `mpos-xtask` (`x86_64-unknown-linux-gnu`) | 3 | 2 | 0 |
+| `mpos-boot` (`aarch64-unknown-uefi`) | 1 | 1 | 0 |
+
+`cargo clippy --fix --allow-dirty --allow-staged` is not a route to a green baseline here: **9080
+ms**, and the tree came out **byte for byte identical**. So the gate holds the counts instead. Six
+arms rather than one, because a lint is reachable on one target and not another: `dead_code` is 21 on
+x86_64 and 30 on aarch64, `missing_safety_doc` is 5 and 1, and the host `--lib` half answers 252
+`dead_code` in `src/syscall/linux/abi.rs` alone (every `AT_*`/`O_*` constant whose caller is behind
+`target_os = "none"`). The host arm must be `--lib`: a bare host `cargo clippy` also builds
+`src/main.rs` and `src/board/`, which are machine-only, and dies `E0432: unresolved import
+mpos::boot::handoff` after 395 warning lines.
+
+**Three failures, and one non-failure.** An `error`-level diagnostic fails on sight (it is a denial,
+not a count). A count that grew fails. A lint the arm has never carried fails - that is what makes
+this a ratchet rather than a baseline. A count that **fell** passes and prints
+`… fell from N to M - lower the constant`, because a ratchet left high can no longer catch a
+regression back up to it; lowering it is a commit with a measurement in it.
+
+**The four fixes, each a false claim rather than a style preference.**
+
+- `clippy::mut_from_ref`, `user/tests/src/bin/t-io-uring.rs:232` - the tree's only **error**. A
+  hand-built io_uring `fn push(&self) -> &mut Sqe` handed a caller a mutable borrow of memory it held
+  only shared; the test binds its ring immutably and then mutates through it. Fixed by the honest
+  `&mut self` chain (`push`, `one`, and the two `let ring`/`let tiny` bindings).
+- `clippy::erasing_op`, `user/tests/src/bin/t-iret.rs:135` - `let managed = i + (x as i64 & 0)`, an
+  anti-optimisation `& 0` folds away entirely, i.e. a barrier that had never been one. Now
+  `core::hint::black_box(x)`.
+- `clippy::absurd_extreme_comparisons`, `user/tests/src/bin/t-diskstats.rs:158` - `after.field(3) >=
+  0` where the field is a `u64`: the vacuous half of a claim, removed; the half that can fail stays.
+- `clippy::never_loop`, `src/net/socket.rs:500` - above.
+
+**Parsing without `serde_json`.** `xtask/Cargo.toml` depends on `anyhow`, `clap`, `libc`, `ratatui`.
+A line is a diagnostic iff it holds `"reason":"compiler-message"`; the level is read after the
+**last** `"level":"` (children and nested diagnostics repeat the key earlier) and the lint after the
+**first** `"code":{"code":"` (the outermost diagnostic is written first). Validated against a real
+`serde_json` parse over all six captured arms - **996 diagnostics, zero mismatches, zero false
+positives**, never more than one code token per line.
+
+**Cost.** Warm, on a tree the gate has just built: 124-155 ms (x86_64 / aarch64 kernel), 83-135 ms
+(host `--lib`), 121-122 ms (xtask), 110 ms (boot), 139-214 ms (user suite). Cold, `CARGO_TARGET_DIR`
+under `build/`: 8401 / 8470 / 7059 / 6322 / 3440 / 6139 ms. So the step sits in **stage 1** with the
+other cargo invocations rather than in the cheap checks ahead of the sweeps.
+
+**`cargo fmt --check` landed in the same step**, over **both** workspaces - the root one and
+`fuzz/Cargo.toml` by `--manifest-path` - because 1.5-1.8 s buys the end of §1.5's finding. The root
+workspace's `members` list does not include `fuzz/` (`Cargo.toml:8`), so "the tree is fmt-clean" was
+a claim about a tree missing twelve percent of its source files.
+
+**Pins.** Ten unit tests in `xtask/src/clippy.rs` cover the scanner and the verdict logic (a child
+note is not a second diagnostic; an uncoded warning counts under `(uncoded)`; every arm's baseline is
+sorted and unique; every arm names a target and no two arms share arguments; a grown count and a
+never-seen lint are both violations; a falling count is an improvement). The end-to-end pins were
+three deliberate breaks, each reverted in the same session:
+
+| break | what it printed |
+|---|---|
+| `mpos-xtask`'s `too_many_arguments` lowered from 2 to 1 | `is at 2, up from the recorded 1`, exit 1 |
+| a `needless_bool` probe appended to `src/vfs/fdinfo.rs` | `` `clippy::needless_bool` is at 1, and the tree has never had that lint `` on three arms, exit 1 |
+| a blank line added to `fuzz/fuzz_targets/ext4_image.rs` | `cargo fmt --check` on that workspace exits 1 with a diff naming the file |
+| the same constant raised to 5 instead | `fell from 5 to 2 - lower the constant`, and it **passes** |
+
+**Gate:** `build/gate-clippy.log`, `GATE_EXIT=0` - stage 1 **1310 tests, 0 failed** (161 xtask, ten
+of them new), x86_64 `pass=307 fail=0`, aarch64 `pass=306 fail=0`, kunit 35/0, fuzz 23 targets,
+lint 162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting clean in both workspaces.
+
+**What this does not do.** It does not remove the 162/168/273 diagnostics. They are recorded, not
+repaired, and the ratchet's whole purpose is that removing one is now a visible improvement with a
+line of output rather than an unmeasured wish. A round that *lowers* a constant is the follow-up.

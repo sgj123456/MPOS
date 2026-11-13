@@ -2498,3 +2498,23 @@ carries the per-phase history.*
   bare `-runs=N` exercises the shortest inputs and nothing else. A new `seccomp_filter` target closes
   the one rule-2 debt the audit found. The same week's sibling finding: `cargo fmt --check` never saw
   `fuzz/` either, and eleven diffs across five files were sitting in it. (§3.29, §1.5, item 260)
+- **`cargo clippy` and `cargo fmt --check` are in the gate now**, and neither had ever been run by
+  any stage of it: `grep -rn 'clippy\|rustfmt' xtask/src/` answered nothing, while `AGENTS.md` §2 had
+  listed both as commands a change runs since that document was written. The first was *red* -
+  `cargo clippy --target x86_64-unknown-none` exited 101 on `clippy::never_loop` in
+  `src/net/socket.rs`, in a `loop` whose body always returned, wrapped around a wait by the commit
+  that meant to bound it. Nothing about the runtime was wrong (the timeout lived in the inner
+  `while`), which is exactly why no test could see it and why the lint was the only instrument that
+  did. A clean baseline was not reachable honestly: 162 diagnostics on x86_64, 168 on aarch64, 389 on
+  the host `--lib` half (336 of them `dead_code`, because a machine-only caller does not exist
+  there), 273 in the user suite, 3 in xtask, 1 in the loader - and `cargo clippy --fix` ran for
+  9080 ms and left the tree byte-for-byte identical. So the gate holds a **ratchet**: six arms, each
+  with its per-lint counts recorded in `xtask/src/clippy.rs`, failing on an `error`-level diagnostic,
+  on a count that grew, and on a lint that arm has never carried - while a count that *fell* prints
+  the line telling its finder to lower the constant, because a ratchet left high cannot catch a
+  regression back up to it. `cargo fmt --check` joins it for both workspaces, `fuzz/` included, which
+  is §1.5's lesson arriving with an instrument rather than a note. Measured warm at 110-214 ms per
+  arm (cold 3.4-8.5 s), so it sits in stage 1 with the other cargo invocations; the four fixes it
+  drove were each a claim that was false rather than a style preference - `mut_from_ref` in
+  `t-io-uring`'s hand-built ring, `erasing_op` in an anti-optimisation that `& 0` had folded away,
+  `absurd_extreme_comparisons` on a `u64`, and the socket wait above. (§1.6, item 263)
