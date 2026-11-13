@@ -680,6 +680,21 @@ fn run_unit_tests() -> Result<String> {
     text.push_str("Build and run: the fuzz workspace (host)\n");
     text.push_str(&run_fuzz_workspace(&root)?);
 
+    // The lints, ratcheted: every crate in the tree, measured against the
+    // counts recorded in `xtask/src/clippy.rs`, and `cargo fmt --check` over
+    // both workspaces. This is the step `AGENTS.md` §2 has always named and
+    // nothing ever ran - `grep -rn clippy xtask/src/*.rs` answered nothing
+    // until 2026-11-13, and the command was red on `src/net/socket.rs` when
+    // anyone thought to ask.
+    //
+    // In stage 1 rather than in the cheap checks above because it spawns
+    // cargo six times: a check that costs 8 s cold per machine arm is not one
+    // that belongs ahead of the sweeps, and the artefacts it reads are the
+    // ones the sweeps are building anyway. Warm, on a tree the gate has just
+    // built, it is under a second per arm (measured 2026-11-13: 124-155 ms).
+    text.push_str(&crate::clippy::gate(&root)?);
+    text.push_str(&crate::clippy::check_formatting(&root)?);
+
     text.push_str("Unit tests: xtask\n");
     let mut cmd = Command::new("cargo");
     cmd.args([

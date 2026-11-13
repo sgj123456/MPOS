@@ -6,6 +6,7 @@
 //! that user afterwards.
 
 mod arch;
+mod clippy;
 mod config;
 mod depgraph;
 mod disk;
@@ -132,6 +133,10 @@ enum Commands {
     /// Measure the kernel's module graph and check it against the ratchet
     /// (NOTES.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
+    /// Measure `cargo clippy`'s diagnostics for every crate in the tree and
+    /// hold them to the recorded counts, so the next lint cannot arrive
+    /// unnoticed (and the count can only fall)
+    Clippy,
     /// Remove the build and target directories
     Clean,
 }
@@ -148,6 +153,7 @@ impl Commands {
             Commands::Test => "test",
             Commands::TestHost => "test-host",
             Commands::Depgraph => "depgraph",
+            Commands::Clippy => "clippy",
             Commands::Clean => "clean",
         }
     }
@@ -272,7 +278,8 @@ fn main() -> Result<()> {
         | Commands::Disk
         | Commands::Test
         | Commands::TestHost
-        | Commands::Depgraph => false,
+        | Commands::Depgraph
+        | Commands::Clippy => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         // Root only where the pipeline needs to *exec* the tree it just laid:
         // the first machine's applet farm is `chroot <staging> /bin/busybox
@@ -470,6 +477,7 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
         Commands::Test => selftest::run(build_dir, profile, &targets, tests),
         Commands::TestHost => hosttest::run(build_dir),
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
+        Commands::Clippy => clippy::run(&utils::project_root()?),
         Commands::Clean => utils::clean(build_dir),
     }
 }
