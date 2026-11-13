@@ -2744,7 +2744,7 @@ the commit bodies), and each moved its pin in the same commit.
     body moved into `readv_inner` so the wrapper can report once for `readv`/`preadv`/
     `preadv2` together), and by the three copy doors (`handle_sendfile`,
     `handle_copy_file_range`, and `handle_splice` when its input is not a pipe). It sits there
-    and not in `File::read` because `read_file`/`read_file_opt` — the loader's way in — reach
+    and not in `File::read` because `read_file`/`read_file_opt` — a script's and an interpreter's way in — reach
     `File::read` and Linux's `kernel_read` does not report. The inotify module's header drops
     the stale `IN_ACCESS` sentence and keeps the three divergences that remain.
 
@@ -12235,3 +12235,46 @@ zero-page mapping operation, named rather than faked); the `EACCES` that Linux's
 `MAP_SHARED|PROT_WRITE` of a read-only file answers was already this kernel's answer and is
 not re-pinned here; and a mapping's *later* pages are still not re-checked against this
 question (the refusal is at the call, which is where Linux asks it). (§5.6, item 271)
+
+---
+
+**Item 272**, landed 2026-11-14. `execve` loads the image in bounded pieces instead of reading the
+whole program into one allocation, and a failed image read is `ENOMEM`, not the disk's `ENOSPC`.
+
+The report: the guest's `chromium` answered `/usr/bin/chromium: exec: line 36:
+/usr/lib/chromium/chromium: No space left on device`, and the user asked whether the disk was too
+small. Measured off the image itself: the binary is **296242984 bytes**, and the root filesystem of
+that image had **140528 free 4 KiB blocks (549 MB)** - the disk was not the limit. The memory was:
+`MAX_ORDER = 14` caps one buddy block at 64 MiB, `handle_execve` read the whole file into one
+`Vec<u8>`, and `read_file_opt`'s allocation failure was mapped to `VfsError::NoSpace` → `ENOSPC`.
+Linux's own loader answers `ENOMEM` when it cannot build an image, and it never holds a 296 MB
+program: it reads `BINPRM_BUF_SIZE` (256) bytes to decide whether the file is a script, then maps the
+segments the ELF headers name, reading each page when it is wanted.
+
+| before | now |
+|---|---|
+| one `Vec<u8>` of the whole file | `mm::elf::Source` + `Segment { offset, filesz }`; `parse` holds only headers and the two small relocation tables (bounded: 1 MiB / 64 KiB / 4 MiB / 4 KiB) |
+| `map_image` copied `segment.data` | `map_image` reads each page through the source (`read_at`), refusing the image on a short read |
+| `handle_execve` read the file | reads a 256-byte prefix; `InodeSource` hands the loader the file page by page |
+| script path read the whole file | a script's *prefix* goes to `resolve_script`; the interpreter's image is read where the resolver reads it |
+| allocation failure → `ENOSPC` | `VfsError::NoMemory` → `ENOMEM`; `NoSpace` stays the filesystem's number |
+
+Pins (`user/tests/src/bin/t-exec-big.rs`, 5 claims): a `/bin/sh` copy padded to **96 MiB** loads and
+answers its own exit code; a 96 MiB non-program answers `ENOEXEC`; a 96 MiB script runs; a program of
+ordinary size is the control; and the non-program's answer is asserted **not** to be `ENOSPC`.
+`MPOS_ON_HOST=1` PASS on Linux 7.2.14, guest one-shot `5/5 ok:`, `=== t-exec-big exit=0`.
+Counterfactual (whole-file read restored): the three size claims red with `ENOMEM` (12) - and with the
+errno lie restored too, with `ENOSPC` (28), which is the report.
+
+**Gate.** `build/gate-execstream3.log`, `GATE_EXIT=0`: stage 1 1320 tests 0 failed; x86_64
+`pass=314 fail=0`, aarch64 `pass=313 fail=0`, both arms' kernel suites 35/0; `t-exec-big` green in
+both arms (142 ms / 642 ms). Two earlier sweeps were red - the fuzz workspace's `elf_parse` target
+still read `segment.data` (fixed in this change: it parses through `elf::Bytes(data)`), and aarch64's
+boot case `arch.console_receive` counted a console byte as its injected one (fixed by draining
+before injecting, §15.102).
+
+**What this does not do.** The *interpreter* is still read whole (`interpreter_bytes` →
+`read_file_opt`): `ld-musl` is small and a huge loader is nobody's program, but it is a named limit.
+A file whose program-header or dynamic table exceeds the parse's caps is refused rather than
+streamed. Bytes past the last `PT_LOAD` are ignored - Linux's behaviour, and what makes the padded
+copy of a real program run. (§6.154)

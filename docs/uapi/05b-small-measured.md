@@ -1700,3 +1700,18 @@ the node says its bytes are storage - `RamFile`, `Ext4Ino` (a regular file's ino
 `true` would accept a mapping its faults cannot serve - and that failure is a kill, not an
 errno. Pin `t-mmap-refuse` (14 claims, host + both arms); the counterfactual reproduces the
 report (`exit=139`). `/dev/zero` remains a named divergence. (§5.6, item 271)
+
+**`execve` reads a window, not the file (item 272, §6.154).** The guest's `chromium` answered
+`/usr/bin/chromium: exec: line 36: /usr/lib/chromium/chromium: No space left on device` for a
+294 MiB binary on a filesystem with **549 MB free** - the number was the memory allocator's, not the
+disk's. Linux reads `BINPRM_BUF_SIZE` (256) bytes to decide what the file is and lets the loader map
+the segments its headers name, reading each page when it is wanted; this kernel read the whole file
+into one `Vec` (a 294 MB request against a 64 MiB largest block, `MAX_ORDER = 14`) and reported the
+allocation failure as the disk's `ENOSPC`. Now: `mm::elf` parses from a `Source` (header, program
+header table and the two small relocation tables, each bounded), `map_image` reads each page through
+the source, `vfs::InodeSource` hands the loader the file itself, `handle_execve` reads the 256-byte
+window and a script's prefix goes to the resolver, and an allocation the machine cannot serve is
+`ENOMEM` (`VfsError::NoMemory`). Pin `t-exec-big` (5 claims: a 96 MiB padded `/bin/sh` copy loads and
+answers its own exit code, a 96 MiB non-program is `ENOEXEC`, a 96 MiB script runs, a 96 MiB file's
+refusal is not `ENOSPC`); host PASS, guest 5/5. Counterfactual: the whole-file read restored reddens
+those three with `ENOMEM` 12, and with the errno lie restored, `ENOSPC` 28 - the report.

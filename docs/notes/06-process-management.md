@@ -13949,3 +13949,82 @@ relation settles - never a single pair of readings.
 slice, and `4 ticks against 4..5, 0 waits` / `3 ticks against 4..5, 0 waits` for the
 thread-vs-group pair - the budget was not used, which is the expected shape: the lag is
 a window of a tick, and a single re-read closes it.
+
+## §6.154 `execve` loads the image in pieces: a 296 MB program on a 64 MiB ceiling (item 272, LANDED 2026-11-14)
+
+The report came from the guest, not from a probe: `chromium` answered
+
+```text
+/usr/bin/chromium: exec: line 36: /usr/lib/chromium/chromium: No space left on device
+```
+
+and the user asked whether the disk was too small. It was not. `/usr/lib/chromium/chromium` is
+**296242984 bytes**, the launcher at line 36 is `exec "$PROGDIR/chromium" …`, and the root
+filesystem of the same image had **140528 free 4 KiB blocks (549 MB)** - `dumpe2fs -h` on
+`build/scratch/root-part2.ext4`, extracted from GPT partition 2 of `build/mpos-uefi-x86_64.img`
+(`start_lba 264192`, 3928064 sectors). The number in the message belonged to the **memory**
+allocator, not to the disk:
+
+- `src/mm/pframe.rs`'s `MAX_ORDER = 14` caps one buddy block at `2^14 × 4096` = **64 MiB**, and
+  `src/mm/heap.rs`'s `alloc_large` refuses `order > MAX_ORDER` with a null pointer. Free RAM cannot
+  help: the request is above the ceiling, not above the free count.
+- `handle_execve` read the **whole file into one `Vec<u8>`** (`vfs::read_file_opt`), so the 296 MB
+  image asked for a 296 MB contiguous allocation and could never get one.
+- `read_file_opt` mapped the allocation failure to `VfsError::NoSpace`, and `errno_of` maps that to
+  `ENOSPC` - the *disk's* number. Linux's own loader answers `ENOMEM` here; a caller told "no space
+  left on device" frees disk space it was never short of. `read_file_opt`'s doc comment already said
+  "the execve that reached for it answers ENOMEM", which was the sentence the code disagreed with.
+
+**The fix is the shape Linux's loader has: read the window a decision needs, then let the loader read
+the image as an image.** Measured on Linux 7.2.14 first: `execve` reads `BINPRM_BUF_SIZE` (256) bytes
+to decide what the file is; a program's ELF headers name the file ranges each segment needs, and the
+pages behind them are read when a page is wanted; appended bytes past the last segment are ignored,
+so a padded copy of a real program still runs.
+
+- `mm::elf` grew a `Source` (`len`, `read_at`, page-sized reads) and `parse` now reads the ELF64
+  header, the program header table and the two small tables a relocation pass needs - each bounded
+  (`META_MAX` 1 MiB, `DYNAMIC_MAX` 64 KiB, `RELA_MAX` 4 MiB, `INTERP_MAX` 4096) - instead of borrowing
+  one slice of the whole file. `Segment` carries `offset`/`filesz`; the image borrows the source.
+- `sched::runtime::load`'s `map_image` fills each page by `source.read_at(segment.offset + …)`, and
+  refuses the image if a page the headers promised cannot be read (`load_user` now answers
+  `Result<Loaded, SpawnError>`).
+- `vfs::InodeSource` is the file *as* a source: a page read is `Inode::read_at`, so a program costs its
+  own pages and nothing more.
+- `handle_execve` reads a 256-byte prefix (`binfmt::BINPRM_BUF_SIZE`), tests `"#!"` on it, hands a
+  script's prefix to `resolve_script` (a shebang is read from the first bytes; the interpreter's own
+  image is read by the resolver) and everything else to the loader through `InodeSource`.
+- the errno lie: `VfsError::NoMemory` → `ENOMEM` for "the machine could not build the buffer",
+  `NoSpace` kept for "the filesystem has no blocks", and `read_file`/`read_file_opt` (still the
+  interpreter's and a script's way in) answer `NoMemory`.
+
+**Measured, host first and then both machines** (`user/tests/src/bin/t-exec-big.rs`, 5 claims): a
+`/bin/sh` copy **padded to 96 MiB** loads and answers its own exit code; a 96 MiB file that is no
+program answers `ENOEXEC`; a 96 MiB **script** runs; and a file of ordinary size is the control.
+`MPOS_ON_HOST=1` → PASS on Linux 7.2.14; guest one-shot → **5/5 `ok:`, `=== t-exec-big exit=0`**
+(`build/scratch/oneshot-execbig3.log`). Two details the pin taught, both recorded in the file: a
+busybox copy takes its applet from `argv[0]`, so a padded copy must be exec'd as `sh -c …`; and a
+"the child exited 8" and "execve answered ENOEXEC" are the same integer, so the errno crosses a
+`CLOEXEC` pipe rather than the exit status.
+
+**Counterfactual** (the whole-file read restored, everything else kept): the three size claims red -
+padded ELF, non-program and script all answered `Err(12)` (`ENOMEM`), the errno the fixed code
+chooses; with the errno lie restored as well, the same three answer `Err(28)` (`ENOSPC`), which is the
+user's screenshot. The disk-was-not-full claim stays green in both, which is why it is written as
+"not `ENOSPC`" rather than "the exec ran".
+
+**Gate.** `build/gate-execstream3.log`, `GATE_EXIT=0`: stage 1 `1320 tests, 0 failed`; x86_64
+`pass=314 fail=0` (kunit 35/0), aarch64 `pass=313 fail=0` (kunit 35/0); `t-exec-big` green in both
+arms (142 ms / 642 ms). Two sweeps were red before it, and neither was this change's own reading: the
+first failed to **build the fuzz workspace** - `fuzz/fuzz_targets/elf_parse.rs` still called
+`elf::parse(bytes)` and read `segment.data`, the copy this round removed; it now parses through
+`elf::Bytes(data)` and asserts `segment.offset + segment.filesz` lies inside the file. The second was
+aarch64's boot case `arch.console_receive`, which polled the `m` of an in-flight `mpos-kunit:` line
+instead of its injected `0x5a` (`Some(109)`), because the UART's loopback injection shares the
+receiver with the console's own pump - fixed by draining the FIFO before injecting and polling
+through at most eight foreign bytes (`docs/notes/` §15.102).
+
+**What this does not do, named.** The *interpreter* is still read whole (`read_file_opt` →
+`interpreter_bytes`): `ld-musl` is small, and a 296 MB loader is a program nobody has. A parse holds
+up to `META_MAX` of a file's own metadata; a file whose program header table or dynamic table is
+larger than that is refused, not read. And the padding case is Linux's shape rather than a licence:
+bytes past the last `PT_LOAD` are ignored by both loaders.

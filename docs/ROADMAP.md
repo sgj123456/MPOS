@@ -2680,3 +2680,16 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   exactly (`t-mmap-refuse[10]: segfault … === t-mmap-refuse exit=139`). Gate
   `build/gate-mmaprefuse.log` `GATE_EXIT=0`, stage 1 1320, x86_64 313, aarch64 312, kunit 35/0.
   Named leftover: `/dev/zero` still answers `ENODEV` where Linux maps it. (§5.6, item 271)
+
+- `execve` loads an image in bounded pieces (item 272, §6.154). The guest's `chromium` failed with
+  `exec: line 36: /usr/lib/chromium/chromium: No space left on device` for a **294 MiB** binary on a
+  root filesystem with **549 MB free**: the number was the frame allocator's (`MAX_ORDER = 14` caps
+  one block at 64 MiB), the whole-file `read_file_opt` asked for 294 MB at once, and the failure was
+  reported with the *disk's* errno. Now `mm::elf::parse` takes a `Source` and holds only headers plus
+  the two small relocation tables (each capped); `map_image` reads each page through the source;
+  `vfs::InodeSource` is the file as a source; `handle_execve` reads `BINPRM_BUF_SIZE` (256) bytes to
+  decide what the file is, hands a script's prefix to the resolver, and an allocation the machine
+  cannot serve is `ENOMEM` (`VfsError::NoMemory`). Pin `t-exec-big` (a 96 MiB padded `/bin/sh` copy
+  runs, a 96 MiB non-program is `ENOEXEC`, a 96 MiB script runs); counterfactual reddens the three
+  size claims with `ENOMEM` 12 - and with the errno lie back, `ENOSPC` 28, the report verbatim.
+  Named: the *interpreter* is still read whole (`ld-musl` is small). (§6.154, item 272)
