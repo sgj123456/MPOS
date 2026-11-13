@@ -292,11 +292,21 @@ fn main() {
     // host's own answer here is not stable enough to pin (its two reads of one
     // moving record landed anywhere from 0 to 200 zeros across runs).
     if !mpos_user_tests::host_run() {
+        // The bound on disagreements is a **measurement**, not a convenience
+        // (§6.151). Two reads of a moving record cannot see the middle: the
+        // park is bounded so the task is briefly runnable between re-parks,
+        // and a sample whose letters agree on both sides can still have caught
+        // that moment. Measured on the aarch64 guest: 0 of 156 clean samples in
+        // the green runs, **1 of 156** on a loaded four-lane sweep
+        // (2026-11-13), and the one-sided form this replaced saw 8 of 99
+        // (§6.144). What the claim still separates is the wrong answer: a
+        // kernel that answers every parked sample a slice scores 100%, so a
+        // 12.5% bound catches it with room for the park's own motion.
         r.check(
             &format!(
                 "a sample that finds the blocked child asleep on both sides is answered zero ({blocked_asleep} asleep both sides of {SAMPLES}, {blocked_slice} disagreed, {blocked_moved} letter moved)"
             ),
-            blocked_asleep >= SAMPLES / 8 && blocked_slice == 0,
+            blocked_asleep >= SAMPLES / 8 && blocked_slice * 8 <= blocked_asleep,
         );
     }
 
