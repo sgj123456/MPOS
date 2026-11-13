@@ -55,6 +55,15 @@ pub const O_CLOEXEC: u32 = 0o200_0000;
 /// caller that is neither the file's owner nor holds `CAP_FOWNER` may not ask
 /// for it (`EPERM` at the open, before any read).
 ///
+/// It is a member of [`SETFL_MASK`], so `fcntl(F_SETFL)` may set and clear it on
+/// a description that did not open with it. The same guard applies at that door
+/// (`build/scratch/setfl/r.c`, `t.c`, `u.c`, Linux 7.2.14): a *fresh* 0->1 set
+/// by a stranger is `EPERM`, while re-affirming an already-set bit (1->1) and
+/// clearing it (1->0) are both served, and a refusal stores none of the word.
+/// What governs a read's access clock is therefore the *effective* word
+/// [`File::open_flags`] reports, not the flags the open carried - see
+/// [`File::read`].
+///
 /// It is the same number on both machines (`asm-generic`'s), unlike the
 /// directory and no-follow bits.
 pub const O_NOATIME: u32 = 0o1000000;
@@ -71,10 +80,20 @@ pub const O_NOATIME: u32 = 0o1000000;
 /// which is what made the guest's log file a single line long for ever.
 pub const O_APPEND: u32 = 0o2000;
 
-/// The bits `fcntl(F_SETFL)` may replace - Linux's own `SETFL_MASK`, minus the
-/// members this kernel does not implement (`O_DIRECT`, `O_NOATIME`): the two
-/// flags the read and write paths consult, and the whole of what an open's flag
-/// word keeps here.
+/// The bits `fcntl(F_SETFL)` may replace. Linux's own `SETFL_MASK` has five
+/// members (`O_APPEND`, `O_NONBLOCK`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME`,
+/// measured `build/scratch/setfl/q.c` on Linux 7.2.14); this one carries the
+/// three this kernel can serve honestly: [`O_APPEND`], [`O_NONBLOCK`] and
+/// [`O_NOATIME`].
+///
+/// The two it does not carry are named residuals, not oversights. `O_ASYNC` is
+/// *reported* in `F_GETFL` by Linux only when the inode has an `fasync` method
+/// (a pipe or a socket) - `F_SETFL(O_ASYNC)` on a regular file returns 0 and the
+/// bit never appears - and there is no SIGIO/fasync plumbing here, so reporting
+/// it would be a success for a mechanism this kernel does not have. `O_DIRECT`
+/// has no direct-I/O path here, and its number is *machine-specific* (x86
+/// `0o40000`, aarch64 `0o200000`), so a shared mask cannot name one bit for both
+/// machines. Both are recorded in `docs/uapi/05b-small-measured.md` §5.2.
 ///
 /// The access mode is deliberately not a member. It is [`File::access`], the
 /// one owner of that fact, and [`File::open_flags`] reports it *beside* this
@@ -84,7 +103,22 @@ pub const O_APPEND: u32 = 0o2000;
 /// members either: they are spent by the open itself, and Linux's `F_GETFL`
 /// does not report them. Neither is `O_LARGEFILE`, which that kernel adds to
 /// every path open and this one does not carry at all (`docs/uapi/` §5.2).
-pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK;
+pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_NOATIME;
+
+/// Whether a `fcntl(F_SETFL)` argument would *freshly* set `O_NOATIME` - the
+/// 0->1 edge Linux's `setfl` guards with the owner/`CAP_FOWNER` check, and the
+/// only edge it guards at all.
+///
+/// Pure so the syscall layer, which is `#[cfg(target_os = "none")]` and has no
+/// host tests, can ask the same question the host pins. Measured on Linux 7.2.14
+/// (`build/scratch/setfl/{r,t,u}.c`): a stranger's fresh set is `EPERM` and
+/// stores none of the word; re-affirming an already-set bit (1->1) and clearing
+/// it (1->0, or `O_APPEND` without it) are both served. Linux's own shape is
+/// `arg & O_NOATIME && !(old_flags & O_NOATIME)`, and `old_flags` here is the
+/// word [`File::open_flags`] reports, not the flags the open carried.
+pub fn setfl_fresh_noatime(arg: u32, old_flags: u32) -> bool {
+    arg & O_NOATIME != 0 && old_flags & O_NOATIME == 0
+}
 
 /// The access-mode field: the two low bits of every open's flag word, which say
 /// which way the description opens. [`File::access`] is their one owner, and
@@ -138,9 +172,11 @@ pub const ACC_RDWR: u32 = 2;
 pub struct File {
     inode: Arc<dyn Inode>,
     pos: AtomicU64,
-    /// The open flags `fcntl(F_GETFL/F_SETFL)` report. Only [`O_NONBLOCK`]
-    /// changes behavior; the rest are stored so a caller reads back what it
-    /// wrote.
+    /// The open flags `fcntl(F_GETFL/F_SETFL)` report. [`O_NONBLOCK`] and
+    /// [`O_NOATIME`] change behavior; the rest are stored so a caller reads back
+    /// what it wrote. A `F_SETFL` that sets `O_NOATIME` here is what makes a
+    /// later read leave the inode's access clock alone - [`File::read`] consults
+    /// the effective word, not the flags the open carried.
     status: core::sync::atomic::AtomicU32,
     /// The flags the open itself was asked for, minus [`SPENT_AT_OPEN`] - the
     /// half of `F_GETFL`'s word that no later call can change.
@@ -425,7 +461,17 @@ impl File {
         // the description, and because this is the one door `read`, `pread`,
         // `readv` and `preadv` all come through. A failed read touches
         // nothing - the write is after the `?` for the same reason Linux's is.
-        if n > 0 && self.born() & O_NOATIME == 0 {
+        //
+        // It is the *effective* word [`Self::open_flags`] that decides, not
+        // [`Self::born`]: `O_NOATIME` is a [`SETFL_MASK`] member, so a `F_SETFL`
+        // may add it to a description that never opened with it or take it back
+        // from one that did. Consult `born()` here and a `F_SETFL(O_NOATIME)`
+        // would report the bit yet still move the clock - the success-without-
+        // teeth this kernel refuses to answer. Measured (`build/scratch/setfl/
+        // r.c`, Linux 7.2.14): with atime forced to 1000000000, a plain read
+        // moves it, `F_SETFL(O_NOATIME)` + read leaves it, and clearing the bit
+        // moves it again.
+        if n > 0 && self.open_flags() & O_NOATIME == 0 {
             let _ = self.inode.touch_atime(crate::vfs::now_seconds());
         }
         Ok(n)
@@ -1176,7 +1222,7 @@ pub fn dup2(old: RawFd, new: RawFd) -> VfsResult<RawFd> {
 mod tests {
     use alloc::sync::Arc;
 
-    use super::{FdTable, File, close, open, read, write};
+    use super::{FdTable, File, Inode, close, open, read, write};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, NodeKind, VfsError};
 
@@ -1306,18 +1352,83 @@ mod tests {
     }
 
     /// The flag bits the description keeps are the ones the headers spell:
-    /// `O_APPEND` is `0o2000`, `O_NONBLOCK` is `0o4000`, and the access mode is
-    /// *not* one of them - it lives in [`File::access`], and the reported word
-    /// is composed from both.
+    /// `O_APPEND` is `0o2000`, `O_NONBLOCK` is `0o4000`, `O_NOATIME` is
+    /// `0o1000000`, and the access mode is *not* one of them - it lives in
+    /// [`File::access`], and the reported word is composed from both.
+    /// `O_NOATIME` joining the mask is what lets a `F_SETFL` add it to a
+    /// description that did not open with it; the two members Linux has that
+    /// this kernel cannot serve (`O_ASYNC`, `O_DIRECT`) stay named residuals
+    /// rather than numbers in this mask.
     #[test]
     fn the_status_flag_bits_match_the_headers() {
         assert_eq!(super::O_APPEND, 0o2000);
         assert_eq!(super::O_NONBLOCK, 0o4000);
-        assert_eq!(super::SETFL_MASK, 0o2000 | 0o4000);
+        assert_eq!(super::O_NOATIME, 0o1000000);
+        assert_eq!(super::SETFL_MASK, 0o2000 | 0o4000 | 0o1000000);
         assert_eq!(super::ACC_RDONLY, 0);
         assert_eq!(super::ACC_WRONLY, 1);
         assert_eq!(super::ACC_RDWR, 2);
     }
+
+    /// Linux's `setfl` guards the fresh 0->1 edge of `O_NOATIME` only. This is
+    /// the pure predicate the bare-metal `F_SETFL` arm asks, pinned here so the
+    /// guard cannot drift from the measurements (`build/scratch/setfl/`).
+    #[test]
+    fn the_noatime_guard_asks_only_for_a_fresh_set() {
+        use super::{O_APPEND, O_NOATIME, O_NONBLOCK, setfl_fresh_noatime};
+        // A fresh set, alone or beside another bit, is the guarded edge.
+        assert!(setfl_fresh_noatime(O_NOATIME, 0));
+        assert!(setfl_fresh_noatime(O_NOATIME | O_NONBLOCK, 0));
+        // Re-affirming an already-set bit (1->1) is served.
+        assert!(!setfl_fresh_noatime(O_NOATIME, O_NOATIME));
+        // Clearing (1->0) and a word with no O_NOATIME at all are served.
+        assert!(!setfl_fresh_noatime(0, O_NOATIME));
+        assert!(!setfl_fresh_noatime(O_APPEND, O_NOATIME));
+        assert!(!setfl_fresh_noatime(0, 0));
+    }
+
+    /// `F_SETFL(O_NOATIME)` has teeth: a read through a description whose
+    /// status carries the bit leaves the inode's access clock alone, and
+    /// clearing the bit makes the next read move it again (measured
+    /// `build/scratch/setfl/r.c`, Linux 7.2.14, with atime forced to
+    /// 1000000000). The counterfactual is [`File::read`] consulting
+    /// [`File::born`] - the flags the *open* carried - instead of the effective
+    /// [`File::open_flags`]: these descriptions opened plain, so born() never
+    /// has `O_NOATIME`, every read would touch the clock, and the middle
+    /// assertion would fail.
+    #[test]
+    fn a_setfl_noatime_set_after_open_leaves_the_access_clock_alone() {
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
+        File::new(inode.clone()).write(b"hello").unwrap();
+
+        let reader = File::new(inode.clone());
+        let mut buf = [0u8; 1];
+
+        // A plain read touches atime. Force the clock to 1000, a value the
+        // host's now_seconds() (a counter from 1_700_000_000) never returns.
+        inode.set_times(1000, 1000).unwrap();
+        reader.set_status(0);
+        reader.set_pos(0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_ne!(inode.atime(), 1000, "a plain read moved the access clock");
+
+        // The same description with F_SETFL(O_NOATIME) leaves it standing.
+        inode.set_times(1000, 1000).unwrap();
+        reader.set_status(super::O_NOATIME);
+        reader.set_pos(0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(inode.atime(), 1000, "F_SETFL's O_NOATIME has teeth");
+
+        // Clearing the bit restores the touch: the effective word decides.
+        reader.set_status(0);
+        reader.set_pos(0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_ne!(inode.atime(), 1000, "clearing O_NOATIME restores the touch");
+    }
+
     #[test]
     fn descriptions_over_one_inode_read_independently() {
         let inode = RamFs::new()
@@ -1579,13 +1690,19 @@ mod tests {
             "the status half was cleared and the open's half was not"
         );
 
-        // And the reverse direction: a status write cannot *add* to the open's
-        // half by naming it, because `SETFL_MASK` has no member for those bits.
+        // The status half keeps exactly the members of `SETFL_MASK`, and
+        // `O_NOATIME` is one of them now: a `F_SETFL` can add it to a
+        // description whose open never named it (and `File::read` will then
+        // leave the access clock alone - pinned by the atime test below).
+        // `O_ASYNC` is not a member, because there is no fasync/SIGIO here;
+        // naming it in the word stores nothing. This is the counterfactual for
+        // the widened mask: before `O_NOATIME` joined, the assertion read just
+        // `ACC_WRONLY | O_SYNC` and a `F_SETFL(O_NOATIME)` reported nothing.
         file.set_status(O_ASYNC | O_NOATIME);
         assert_eq!(
             file.open_flags(),
-            super::ACC_WRONLY | O_SYNC,
-            "a status word naming the open-only bits stores none of them"
+            super::ACC_WRONLY | O_SYNC | O_NOATIME,
+            "O_NOATIME is a status member now; O_ASYNC is not one"
         );
 
         // The bits the open spends never get in, whatever is handed over: the

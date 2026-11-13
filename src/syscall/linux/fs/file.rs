@@ -461,11 +461,13 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
             }
             // The half of the open's flag word that outlives the open and is
-            // the caller's to change later: `O_APPEND` and `O_NONBLOCK`.
-            // Storing it here is what makes `O_APPEND` bite at all - a
-            // description that never learned it writes at its cursor, which
-            // for a fresh open is the start of the file, so a log writer
-            // overwrites the beginning of its own log instead of appending.
+            // the caller's to change later: `O_APPEND`, `O_NONBLOCK` and
+            // `O_NOATIME` (the members of `SETFL_MASK`). Storing it here is
+            // what makes `O_APPEND` bite at all - a description that never
+            // learned it writes at its cursor, which for a fresh open is the
+            // start of the file, so a log writer overwrites the beginning of
+            // its own log instead of appending - and what lets a later
+            // `F_SETFL` clear an `O_NOATIME` the open carried, as Linux does.
             // `set_status` keeps only those bits, and the access mode is
             // already recorded in the field `F_GETFL` composes its word from.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
@@ -479,8 +481,9 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // disagreement on Linux's answer for every one of them
                 // (`docs/uapi/` §5.2 carried it as a gap; item 49 closes it).
                 file.set_born(flags as u32);
-                // What landed is the masked word, and the bit with teeth is
-                // `O_NONBLOCK`: it has to reach the node that does the blocking.
+                // What landed is the masked word. `O_NONBLOCK` has to reach the
+                // node that does the blocking; `O_NOATIME` has no node to sync
+                // with - [`File::read`] reads the effective word itself.
                 sync_nonblocking(&file, file.status());
             }
             // `O_TRUNC` empties an existing file as part of the open, which is
@@ -3806,6 +3809,24 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         },
         F_SETFL => match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
+                // Linux's `setfl` guards the one edge that can *add* O_NOATIME:
+                // a fresh 0->1 set by a caller that is neither the file's owner
+                // nor holds CAP_FOWNER is EPERM, and the refusal stores none of
+                // the word (a combined `O_NOATIME|O_NONBLOCK` leaves neither
+                // bit). Re-affirming an already-set bit (1->1) and clearing it
+                // (1->0) are both served. Measured on Linux 7.2.14
+                // (`build/scratch/setfl/{r,t,u}.c`); the open's own guard above
+                // asks the same ownership question before any read. The edge is
+                // a pure host-tested function so this bare-metal door cannot
+                // drift from what the pin checks.
+                if crate::vfs::file::setfl_fresh_noatime(arg as u32, file.open_flags()) {
+                    let inode = file.inode();
+                    if inode.owner().0 != crate::sched::current_fs_owner().0
+                        && !crate::sched::current_credentials().capable(crate::cred::CAP_FOWNER)
+                    {
+                        return err::EPERM;
+                    }
+                }
                 // Only the bits Linux lets a caller change are replaced - the
                 // access mode is not one of them, which is why a caller that
                 // asks for `O_NONBLOCK` alone does not lose it (`File::set_status`
