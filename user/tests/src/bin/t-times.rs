@@ -534,17 +534,34 @@ fn main() {
                             // one's past. So the group is read on both sides of the
                             // thread's file and the relation is stated against the
                             // larger of the two - the same bracketing §6.97's rule
-                            // asks for, applied to §6.96's fields. Measured twice
-                            // on the aarch64 arm: `6 ticks against 5` with the
-                            // stale reading, then `7 ticks against 6` with only the
-                            // later one.
+                            // asks for, applied to §6.96's fields.
+                            //
+                            // That bracket is still not enough on its own: the two
+                            // halves of one tick are charged in one block
+                            // (`sched::charge_cpu`), but the two *snapshots* can be
+                            // taken on either side of a charge, and on the aarch64
+                            // arm the thread's file read one tick ahead of the
+                            // group's in **16 of 400** samples (worst gap 1;
+                            // `docs/notes/` §6.153), which reddened a gate lane as
+                            // `6 ticks against 4..5`. So the group's number is
+                            // re-read until it covers the thread's, with a budget -
+                            // a group that never catches up is the bug this claim
+                            // is for, one that catches up within a tick is the pair
+                            // of snapshots.
                             let group_before = utime;
-                            let group_after = stat_cpu("/proc/self/stat")
+                            let mut group_after = stat_cpu("/proc/self/stat")
                                 .map_or(group_before, |(utime_now, _s, _c, _cs)| utime_now);
+                            let mut waited = 0;
+                            while group_after < thread_utime && waited < 20 {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                group_after = stat_cpu("/proc/self/stat")
+                                    .map_or(group_after, |(utime_now, _s, _c, _cs)| utime_now);
+                                waited += 1;
+                            }
                             let group_high = group_before.max(group_after);
                             r.check(
                                 &format!(
-                                    "and never more than its group's at either end of the read ({thread_utime} ticks against {group_before}..{group_after})"
+                                    "and never more than its group's at either end of the read ({thread_utime} ticks against {group_before}..{group_after}, {waited} waits)"
                                 ),
                                 thread_utime <= group_high,
                             );
