@@ -7617,6 +7617,83 @@ remains the pin that the wake *works*, and it would go red if the new door were
 wired wrong — the lane's absence is a limitation of the instrument, recorded
 here rather than hidden behind a green run.
 
+### §7.9v The heartbeat is a build switch: a boot's console belongs to whoever is using it
+
+The hang instrument §7.9 built prints one table of every task slot, every five
+seconds, in **every** build. That is right for a boot being read and wrong for a
+boot being used: five seconds of quiet is not enough time to type a command, and
+each beat is ten lines on this machine (a header, three counter lines, one line
+per live slot - six of them, `slot 0`, `1`, `2`, `3`, `4` and the scheduler's
+`255`). Measured on one lane's sweep log before this change (the path is
+`build/test-lane-x86_64-2/serial.log`, and the next gate run overwrote it): 5
+beats, **105 lines**, in a 2920-line log - the largest single recurring voice on
+a wire whose other recurring entries were `mpos: ioctl` (8) and `mpos: syscall`
+(4). After the change the same path holds 0, as do all eight lane logs of
+`build/gate-heartbeat.log`.
+
+| boot, same 12 s idle `/init` | instrument lines |
+|---|---|
+| `--features heartbeat` (`build/probe/oneshot/serial-heartbeat.log`) | **20** (two beats, ten lines each) |
+| the same kernel built without it (`.../serial-quiet3.log`) | **0** |
+
+Both boots are 93 and 73 serial lines, so the difference is exactly the
+instrument's own output and nothing else moved.
+
+**Why a switch and not a smarter condition inside it.** The stall this was
+written for (§7.9's udev livelock) had an `age` that never left **0-3 ms**: the
+machine was switching constantly, into the same spin. "Print only when nothing
+is progressing" is therefore precisely the state the instrument could not have
+detected, and §7.9d/§7.9f's readings - including "no heartbeat at all means the
+timer stopped" - lean on the table arriving unconditionally *while it is built
+in*. So the honest quieting is to not build it in: `Cargo.toml`'s `heartbeat`
+feature, off in every ordinary build, beside `selftest` and argued the same way
+(a build switch, not a run-time word: §15.19/§15.24's rule that whether a kernel
+carries an instrument is the build's to say).
+
+`heartbeat()` now opens with `if !cfg!(feature = "heartbeat") { return; }` -
+measured with rustc (`build/scratch/cfgstr.rs`) that the optimiser drops the
+format string from both a debug and an `-O` binary in this shape, which is what
+makes a byte scan of the artifact a fair reading. The two real artifacts of both
+machines carry none of it:
+
+| artifact | `mpos: heartbeat` occurrences |
+|---|---|
+| `target/x86_64-unknown-none/release/mpos` | 0 |
+| `target/aarch64-unknown-none/release/mpos` | 0 |
+| the same kernel with `--features heartbeat` (`build/scratch/mpos-heartbeat.elf`) | 1 (the positive control) |
+
+**The gate now says so, per arm** (`xtask/src/gates.rs`'s
+`hang_instrument_offset`, called from `selftest.rs`'s `check_hang_instrument`
+right after the test kernel is built): the image the sweep is about to boot must
+not contain the marker, and `cargo check -p mpos --features heartbeat` must
+still compile - the second half because no xtask command passes the feature, so
+nothing else in this repository builds that shape and its body would otherwise
+rot silently. It costs ~5 s per arm.
+
+**The trap this ran into, which sharpens AGENTS.md §5's.** The first
+counterfactual here was wrong: the feature-off boot still printed two beats
+while the artifact on disk was silent. `boot/build.rs` watches the kernel *file*
+(`cargo:rerun-if-changed`), and cargo compares its mtime against the build
+script's last run - but toggling a feature makes cargo re-*link* an artifact
+whose mtime can be older than that run, so the script never re-ran and the
+loader kept the previous kernel. Decompressing the payload in the loader's
+`OUT_DIR` is what showed it: raw 4543400 bytes with the marker, against the
+4534968-byte silent kernel on disk. The fix is blunt and is now the documented
+recipe: after building either shape by hand, remove
+`target/<arch>-unknown-uefi/release/build/mpos-boot` (or `touch` the kernel)
+before rebuilding the loader, and **check the wire, not the file**. `cargo
+xtask run`/`test` are not affected: they build both halves through one command,
+so the mtimes stay in order.
+
+**Residual, named.** The counters the instrument prints are still bumped in hot
+paths when it is off - `EXT4_FILL_BUSY`/`EXT4_RUN_BUSY`, `BLK_BUSY`/
+`BLK_WAITER`/`BLK_SUBMITS`/`BLK_RETIRES`, `WAKE_CALLS`, the claim and fill/run
+counters: one relaxed store each, on paths as hot as every block submission.
+Gating those would touch eight sites and remove the instrument's own inputs, and
+the cost has not been measured; the instrument is off by default, so the
+question is a performance one for a later round rather than a correctness one
+here.
+
 ### 7.4a Where the wlroots scan-out wall actually is — **MEASUREMENT**
 
 Item 178 recorded the DRM backend starting and every commit failing at `fb.c:147` with

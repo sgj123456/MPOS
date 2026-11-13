@@ -2567,3 +2567,20 @@ carries the per-phase history.*
   `build/gate-setfl.log` `GATE_EXIT=0`: stage 1 1313 tests, x86_64 `pass=309`, aarch64 `pass=308`,
   kunit 35/0 each, lint 162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting and fuzz clean,
   `t-setfl` green in both arms. (§6.148, item 265)
+
+- **`item 266`** (2026-11-13): **the boot-hang instrument is a build switch, so an ordinary console
+  belongs to whoever is using it.** `src/sched/runtime/task.rs`'s `heartbeat` printed a table of
+  every task slot every five seconds in *every* build - ten lines a beat on this machine, 105 lines
+  in one lane's 2920-line log - which is a console nobody can type on: five seconds of quiet is not
+  enough to type a command. It is now `Cargo.toml`'s `heartbeat` feature, off by default, beside
+  `selftest` and argued the same way; the guard is a `cfg!` early return (measured with rustc: the
+  format string is dropped from both debug and `-O` binaries, so a byte scan of the artifact reads
+  the build rather than an optimiser's mood). Measured on one image with a 12 s idle `/init`: 20
+  instrument lines with the feature, 0 without, and nothing else in the wire moved (93 vs 73 serial
+  lines). The gate now checks it **per arm** - the kernel image must carry no `mpos: heartbeat`, and
+  `cargo check --features heartbeat` must still compile, since no xtask command passes the feature
+  and its body would otherwise rot - for ~5 s a boot. **Named residual**: the counters it prints are
+  still bumped in hot paths when it is off (one relaxed store each, cost unmeasured). **Trap found
+  and recorded**: `boot/build.rs` watches the kernel's mtime, so toggling a feature and rebuilding
+  the loader can silently keep the *previous* kernel (the first counterfactual here measured the
+  loud build twice, §7.9v) - rebuild the payload from scratch and check the wire. (§7.9v, item 266)

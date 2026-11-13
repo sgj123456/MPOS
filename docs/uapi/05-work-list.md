@@ -11867,3 +11867,68 @@ logs).
 aarch64 `0o200000`) stay out of the mask and stay named in
 `docs/uapi/05b-small-measured.md` §5.2. Nothing here claims a description can be
 made direct.
+
+---
+
+**Item 266**, landed 2026-11-13.
+
+### Item 266 the boot-hang instrument is a build switch, so a console belongs to its user
+
+`src/sched/runtime/task.rs`'s `heartbeat` printed a table of every task slot
+every five seconds in **every** build (`const HEARTBEAT_NS: u64 =
+5_000_000_000`), and it fired from `check_itimer`, which the syscall gate, the
+preempt path and the idle loop all call. Ten lines a beat on a small machine and
+one line per slot on a large one: five seconds of quiet is not enough to type a
+command, so an interactive image could not be typed on and a lane's log was
+mostly instrument (`build/test-lane-x86_64-2/serial.log`: 5 beats, 105 lines in
+2920). This is not an ABI promise - no syscall changes - but it is the same
+class of debt as items 232/264: a reading that was served as if it were free.
+
+**Why a switch rather than a condition.** The stall the instrument was written
+for (`f4b05e7`, the udev `settle` livelock, `docs/notes/07-device-drivers.md`
+§7 R.9) had an `age` that never left 0-3 ms: the machine was switching
+constantly, so "print only when nothing is progressing" could not have fired,
+and "no heartbeat means nothing is running" is only a reading while the table is
+unconditional. So the honest quieting is a *build* decision: `Cargo.toml`'s
+`heartbeat` feature, off by default, beside `selftest`; a build that carries the
+instrument is a build being used to read a stall.
+
+**Served shape.** `fn heartbeat()` opens with `if !cfg!(feature = "heartbeat") {
+return; }` - a `ret` in an ordinary build (the guard is a compile-time
+constant). An early return rather than `#[cfg]`d bodies keeps every static it
+reads a reader, which is what stops a quiet build's dead-code report naming
+`LAST_BEAT_NS`. Measured with rustc (`build/scratch/cfgstr.rs`): the format
+string is still dropped from both a debug and an `-O` binary in this shape, so
+the artifact is a reading of the build and not of the optimiser's mood.
+
+**Measured end to end** (one image, one hand-written `/init` that sleeps 12 s and
+powers off, `build/probe/oneshot/serial-{heartbeat,quiet3}.log`): 2 beats = 20
+instrument lines with the feature, **0** without, and nothing else in the wire
+moved (93 vs 73 serial lines).
+
+**Pins.** `xtask/src/gates.rs`'s `hang_instrument_offset` scans a kernel image
+for `mpos: heartbeat` (a log cannot claim an absence, so the gate reads the
+artifact); `xtask/src/selftest.rs`'s `check_hang_instrument` runs it **per arm**
+on the kernel the sweep is about to boot, and then compiles
+`cargo check -p mpos --features heartbeat` so the instrument's body cannot rot -
+no xtask command passes the feature, so nothing else in this repository builds
+that shape. Host unit test `the_instrument_scan_tells_a_silenced_image_from_a_loud_one`
+carries a positive control (loud image → `Some(6)`). Full gate
+`build/gate-heartbeat.log` `GATE_EXIT=0`: stage 1 1314 tests 0 failed, lint
+162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting both workspaces,
+fuzz 23 targets, x86_64 `pass=309 fail=0`, aarch64 `pass=308 fail=0`,
+`mpos-kunit 35 passed, 0 failed` each, and all eight lane serial logs carry **0**
+`mpos: heartbeat` lines.
+
+**Trap found.** `boot/build.rs` watches the kernel *file's* mtime, so toggling a
+feature and rebuilding the loader can silently keep the previous kernel (this
+round's first "silent" boot printed 2 beats; the payload decompressed to the
+loud 4543400-byte kernel while 4534968 bytes sat on the path). Rebuild the
+payload from scratch - `rm -rf target/<arch>-unknown-uefi/release/build/mpos-boot`
+- and believe the wire, not the file (`docs/notes/` §7.9v, `AGENTS.md` §5).
+
+**What this does not do.** The counters the table prints are still bumped in hot
+paths when the feature is off - one relaxed store each, cost unmeasured
+(`EXT4_FILL_BUSY`, the block-layer submit/retire pair, the wake/claim hits).
+Gating them would touch eight sites and remove the instrument's own inputs;
+recorded as a residual rather than approximated.
