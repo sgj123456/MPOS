@@ -2663,3 +2663,20 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   claims instead - §6.151's bound and §6.153's one-tick lag - and both were re-derived from
   their own readings before this one). Named leftovers: the descriptor holds no `mm`,
   `stack` has no node, no swap or huge-page bits exist. (§6.152, item 270)
+
+- **`mmap` of a node with no pages is refused at the call, with Linux's `ENODEV` (item 271,
+  §5.6).** A user's `mkfontscale` died in the guest with `SIGSEGV` inside a mapping
+  `/proc/<pid>/maps` described as `object(private)`: `mmap` of a **directory** (its walk maps
+  every entry that opens) had been accepted, the fault path asked the directory for bytes,
+  `read_at` answered `EISDIR`, and the frame was refused - so the program was killed on the
+  first touch of a mapping the call had said was fine. Linux measured first: directory, FIFO,
+  socket, `/dev/null` and every `procfs`/`sysfs` file are `-1 ENODEV`, a regular file maps; and
+  `len 0`/`offset 1` are `EINVAL`, `fd -1` is `EBADF`, all before the node question. The fix is
+  a defaulted `Inode::mappable()` - Linux's `f_op->mmap`, the default **false** so a node that
+  cannot serve pages is refused rather than accepted - answered `true` by `RamFile`,
+  `Ext4Ino` (a regular file's inode, never a directory's) and `P9Inode`, with the
+  `frame_backed` arm still first so memfd/framebuffer/dma-buf are untouched. `t-mmap-refuse`
+  (14 claims) green on the host and both arms; the counterfactual reproduces the user's report
+  exactly (`t-mmap-refuse[10]: segfault … === t-mmap-refuse exit=139`). Gate
+  `build/gate-mmaprefuse.log` `GATE_EXIT=0`, stage 1 1320, x86_64 313, aarch64 312, kunit 35/0.
+  Named leftover: `/dev/zero` still answers `ENODEV` where Linux maps it. (§5.6, item 271)

@@ -1679,3 +1679,24 @@ Section numbers are unchanged from the original `UAPI.md`.
   measured nothing - a grandchild that read before the poke, and a `describes_task` a stranger
   could not see - were reworked until they did. Named leftovers: the descriptor does not hold the
   `mm`, `stack` has no node, no swap or huge-page bits exist here. `docs/notes/` §6.152.
+
+### A node with no pages is refused at the `mmap` call, not at its first fault (item 271)
+
+Reported from the guest: `mkfontscale` died of `SIGSEGV` inside a mapping of `/root/.local`,
+and `/root/.local` is a **directory**. The guest's own `strace` shows the call - `open` (`4`),
+`fstat` (`S_IFDIR|0700`), `mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 4, 0)` - and this kernel
+answered it with a mapping. The first touch asked the directory for its bytes, `read_at`
+answered `EISDIR`, and the fault killed the task.
+
+Measured on Linux 7.2.14 (`build/scratch/mmapdir/{p,q,r}.c`): `mmap` of a directory, a FIFO, a
+socket, `/dev/null` and every `procfs`/`sysfs` file is `-1 ENODEV`; a regular file maps and
+reads back; `/dev/zero` maps. `len 0` and an unaligned offset are `EINVAL`, `fd = -1` is
+`EBADF`, all before the node is asked - and `PROT_NONE`/`MAP_SHARED` are still `ENODEV`.
+
+Served now by a defaulted `Inode::mappable()` (Linux's `f_op->mmap`), answered `false` unless
+the node says its bytes are storage - `RamFile`, `Ext4Ino` (a regular file's inode) and
+`P9Inode` do - with the door answering `err::ENODEV` before either copy arm. Defaulting to
+`false` is deliberate: a node that forgets is refused with Linux's number, where a default of
+`true` would accept a mapping its faults cannot serve - and that failure is a kill, not an
+errno. Pin `t-mmap-refuse` (14 claims, host + both arms); the counterfactual reproduces the
+report (`exit=139`). `/dev/zero` remains a named divergence. (§5.6, item 271)

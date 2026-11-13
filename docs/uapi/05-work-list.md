@@ -12175,3 +12175,63 @@ before this one.
 the open answers `ESRCH`/`ENOENT`, where Linux keeps serving - the same gap `pagemap`
 carries); `stack` still has no node (it needs an unwinder); no swap or huge-page bits exist
 to report. (§6.152, item 270)
+
+**Item 271**, landed 2026-11-13. `mmap` of a node that has no pages to fill a mapping from is
+refused **at the call** with Linux's `ENODEV`, instead of being accepted and killing the
+program on the first touch of the page.
+
+**What it was.** A user reported `mkfontscale` dying in the guest. The kernel's fault report
+named the shape (`PFDIAG … the page is inside a mapping, so nothing brought it in`,
+`fault_in=vma[/root/.local] … kind=object(private)`), and the guest's own `strace`, read off
+the image's root partition, showed the call that should have been refused:
+
+| what `mkfontscale` did | what this kernel answered |
+|---|---|
+| `open("./.local", O_RDONLY)` → `4`; `fstat` → `S_IFDIR\|0700` | the open, honestly - it is a directory |
+| `mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 4, 0)` | **a mapping** (`0x7e2f2ccc1000`) |
+| the first read of that page | the fault path asked the directory for its bytes, `read_at` answered `EISDIR`, the frame was refused, and the task died of `SIGSEGV` |
+
+The program had already been told the call succeeded. An errno at the call is freetype's own
+"this is not a font" path; a `SIGSEGV` inside a mapping it believed in is not.
+
+**Measured on Linux 7.2.14 first** (`build/scratch/mmapdir/{p,q,r}.c`): `mmap(NULL, 4096,
+PROT_READ, MAP_PRIVATE, fd, 0)` is `-1 ENODEV` for a directory, a FIFO, a socket, `/dev/null`
+and every `procfs`/`sysfs` file, and maps for a regular file (`/etc/hostname`, first byte
+`97`) and `/dev/zero` (which has an mmap operation of its own). The order is measured too:
+`len 0` and `offset 1` are `EINVAL`, `fd = -1` is `EBADF`, all **before** the node question;
+`PROT_NONE` and `MAP_SHARED` are still `ENODEV`.
+
+| now | before |
+|---|---|
+| a new defaulted `Inode::mappable()` - Linux's `f_op->mmap` question - answers `false` unless a node says its bytes are storage | the door had no question, so every non-frame-backed node reached a copy arm |
+| `RamFile`, `Ext4Ino` (a regular file's inode, never a directory's) and `P9Inode` answer `true`; `frame_backed()` is still asked first, so memfd/framebuffer/dma-buf are unchanged | a directory was mapped as `FilePages`, whose faults could never be served |
+| the door answers `err::ENODEV` before both copy arms | the `SIGSEGV` arrived at the first touch, from the fault path |
+
+The default points at the refusal on purpose: a node that forgets to answer is refused with
+Linux's number, where a default of `true` would let a new node accept a mapping its faults
+cannot serve - the failure being a kill rather than an errno.
+
+**Pin.** `t-mmap-refuse` (new, both machines, 14 claims), written against Linux first:
+`MPOS_ON_HOST=1` **14/14 `PASS`** and the guest **14/14 `PASS`** - the control (a regular
+file's bytes map and its first byte is the file's), a directory `ENODEV` private **and**
+shared, the `len 0`/`offset 1`/`fd -1` ordering, a `procfs` file `ENODEV`, `/dev/null`
+`ENODEV`, a pipe end `ENODEV`, and a memfd still mapping and aliasing. Host unit tests
+`a_file_is_mappable_and_a_directory_is_not` (`ramfs`) and `a_generated_file_is_not_mappable`
+(`procfs`).
+
+**Counterfactual.** The door's arm deleted, kernel and loader rebuilt: the guest reproduces
+the user's bug and never reaches a claim about a directory - `t-mmap-refuse[10]: segfault at
+0x7ef275045000 … task 5 died of SIGSEGV it could not be handed … === t-mmap-refuse exit=139`.
+Restored (`diff -q` identical) the run is the green one above.
+
+**Gate.** `build/gate-mmaprefuse.log`, `GATE_EXIT=0`: stage 1 1320 host tests 0 failed;
+x86_64 `pass=313 fail=0`; aarch64 `pass=312 fail=0` (16 of 328 left out by `tests.toml`);
+`mpos-kunit 35 passed, 0 failed` both; lint ratcheted 162/168/389/273/3/1; both workspaces
+rustfmt's shape; the fuzz workspace 23 targets; `t-mmap-refuse` green in both arms (0 ms
+x86_64, 191 ms aarch64).
+
+**What this does not do.** `/dev/zero` still answers `ENODEV` where Linux maps it (it needs a
+zero-page mapping operation, named rather than faked); the `EACCES` that Linux's
+`MAP_SHARED|PROT_WRITE` of a read-only file answers was already this kernel's answer and is
+not re-pinned here; and a mapping's *later* pages are still not re-checked against this
+question (the refusal is at the call, which is where Linux asks it). (§5.6, item 271)

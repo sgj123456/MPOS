@@ -218,3 +218,89 @@ the guard is in `resolve_stack_growth` and is measured by the pin only indirectl
 (the pin seals heap mappings, not the stack).
 
 Full record: [`docs/uapi/`](../uapi/05-work-list.md) §5.1 item 118.
+
+### 5.6 `mmap` of a node with no pages is `ENODEV` — **DONE** (2026-11-13)
+
+A user reported `mkfontscale` dying in the guest. The kernel's own fault report
+named the whole story in three lines:
+
+```
+PFDIAG page=0x7e2fced3a000 NOT MAPPED task=11 rip=0x7e2fcf1ae141 mapped=none …
+PFDIAG vma=0x9 (r--) kind=object(private) - the page is inside a mapping, so nothing brought it in
+PFDIAG fault_in=vma[/root/.local] 0x7e2fced3a000..0x7e2fced3b000 r--u kind=object(private)
+```
+
+`mkfontscale` walks the entries of the directory it is asked to scan and maps the
+ones that open. `./.local` is a **directory**; the guest's own `strace`, read off
+the image's `/root` partition, shows the call that should have refused and did
+not:
+
+```
+open("./.local", O_RDONLY|O_LARGEFILE) = 4
+fstat(4, {st_mode=S_IFDIR|0700, st_size=4096, ...}) = 0
+mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 4, 0) = 0x7e2f2ccc1000
+close(4) = 0
++++ killed by SIGSEGV (core dumped) +++
+```
+
+The mapping was accepted as a private file mapping, `FilePages::frame_at` asked
+the directory for its bytes, `read_at` answered `EISDIR`, the frame was refused,
+and the first touch of the page killed the task. The program had already been
+told the call succeeded - **nearly-right is worse than absent**, in its exact
+form: an errno at the call would have been freetype's own "not a font" path;
+instead the process died inside a mapping it believed in.
+
+**Measured on Linux 7.2.14 first** (`build/scratch/mmapdir/{p,q,r}.c`):
+
+| node | `mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0)` |
+|---|---|
+| `/root`, `/tmp` (mode `040750`/`041777`) | `-1 ENODEV` |
+| a FIFO (mode `010600`), a socket (mode `140777`) | `-1 ENODEV` |
+| `/dev/null` (mode `020666`) | `-1 ENODEV` |
+| `/proc/self/stat`, `/proc/self/maps`, `/sys/kernel/notes` | `-1 ENODEV` |
+| `/etc/hostname` (mode `100644`) | maps; first byte `97` |
+| `/dev/zero` | maps - it has its own mmap operation |
+
+Order of the refusals, same probes: `len 0` → `EINVAL`; `offset 1` → `EINVAL`;
+`fd = -1` → `EBADF`; `PROT_NONE` → `ENODEV`; `MAP_SHARED` → `ENODEV`;
+`MAP_FIXED` → `ENODEV`; a regular file with `offset 1` → `EINVAL`;
+`MAP_SHARED|PROT_WRITE` of a read-only file → `EACCES`. So the node question is
+asked **after** the length/offset/descriptor checks and **before** anything is
+mapped.
+
+**What the fix is.** A defaulted `Inode::mappable()` - Linux's `f_op->mmap`
+question, phrased for this kernel: *are this node's bytes storage a mapping can
+be filled from?* The default is **`false`**, and that direction is the point: a
+node that forgets to answer is refused with the number Linux gives a node with no
+mapping operation, where a default of `true` would let it accept a mapping its
+faults cannot serve - the failure being a `SIGSEGV` on first touch rather than an
+errno, which is the bug. Three nodes say yes because their bytes are storage:
+`RamFile`, `Ext4Ino` (a regular file's blocks, and not a directory's - it answers
+from the inode record's own kind) and `P9Inode` (the share's regular files). The
+`frame_backed` arm is asked first and unchanged, so a memfd, a framebuffer and a
+dma-buf still map; the door answers `err::ENODEV` for everything else in one arm,
+placed before both copy arms (`src/syscall/linux/proc.rs`).
+
+**Pinned** by `t-mmap-refuse` (new, both machines, 14 claims), written against
+Linux first: `MPOS_ON_HOST=1` **14/14 ok, `PASS`, exit 0**. Guest: **14/14 ok,
+`PASS`, `exit=0`** - the control (a regular file's bytes map and its first byte
+is the file's), a directory `ENODEV` privates **and** shared, the `len 0` /
+`offset 1` / `fd -1` ordering, a `procfs` file `ENODEV`, `/dev/null` `ENODEV`, a
+pipe end `ENODEV`, and a memfd's pages still mapping and aliasing.
+
+**Counterfactual** - the door's arm deleted, kernel and loader rebuilt: the guest
+dies at the *control's next step*, which is the user's own report reproduced -
+`t-mmap-refuse[10]: segfault at 0x7ef275045000 … task 5 died of SIGSEGV it could
+not be handed … === t-mmap-refuse exit=139`, and it never reaches a claim about
+the directory. With the arm restored (`diff -q` identical) the run is the green
+one above.
+
+**Gate** — `cargo xtask test`, `build/gate-mmaprefuse.log`, `GATE_EXIT=0`: stage 1 **1320**
+host tests, 0 failed (51.24 s); x86_64 `verdict pass=313 fail=0`; aarch64 `pass=312 fail=0`
+(312 built, 16 of 328 left out by `tests.toml`); `mpos-kunit 35 passed, 0 failed` both;
+`Boot instrument: the <arch> kernel carries no hang-heartbeat table`; lint ratcheted at
+162/168/389/273/3/1, both workspaces rustfmt's shape, the fuzz workspace 23 targets built;
+`t-mmap-refuse` green in both arms (0 ms x86_64 - the whole run is refusals - 191 ms
+aarch64).
+
+Full record: [`docs/uapi/`](../uapi/05-work-list.md) §5.1 item 271.
