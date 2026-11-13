@@ -78,10 +78,14 @@
 //!
 //! (`0x8000` in each line is `O_LARGEFILE`, which that kernel adds to every
 //! path open and which this one does not carry at all - the one member of
-//! Linux's word that stays missing, named in `docs/uapi/` §5.2, together with
-//! what this kernel's `SETFL_MASK` is narrower by: `O_ASYNC`, `O_DIRECT` and
-//! `O_NOATIME` are reported when an open asked for them but cannot be set
-//! through `F_SETFL`, which Linux's `SETFL_MASK` does allow.)
+//! Linux's word that stays missing, named in `docs/uapi/` §5.2. Linux's
+//! `SETFL_MASK` has five members and this kernel's has three: `O_NOATIME` is a
+//! member since `docs/uapi/` §5.1 item 265, so `F_SETFL` may set and clear it
+//! (`t-setfl` is that pin). `O_ASYNC` and `O_DIRECT` are still narrower - both
+//! are *reported* when an open asked for them but cannot be set through
+//! `F_SETFL`, and both are named residuals rather than oversights: `O_ASYNC`
+//! needs `fasync`/SIGIO plumbing this kernel has none of, and `O_DIRECT` has no
+//! direct-I/O path and a machine-specific number.)
 //!
 //! Every descriptor these claims are made about is one this program *made* -
 //! a file it opens, a pipe it mints, a socketpair it makes - so the section
@@ -327,7 +331,7 @@ fn main() {
         }),
     );
     r.check(
-        "F_GETFL reports O_NOATIME, which no status write could restore",
+        "F_GETFL reports O_NOATIME from the open's own word",
         openat(
             CWD,
             FILE,
