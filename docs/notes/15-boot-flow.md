@@ -664,11 +664,23 @@ task context writes through `tx_put` regardless, and with `LBE` set that byte la
 the injected one.
 
 The fix is in `src/board/suites.rs`'s `check_console_rx`: drain whatever is already queued before
-injecting, then poll for the injected byte through at most `FOREIGN_MAX = 8` foreign ones, and report
-how many were stepped over when the byte never arrives. That keeps the case's claim ("the capability
-forward hands the injected byte to the tty") while no longer asserting a thing the boot's own logging
-can falsify — the failure is a real, if intermittent, confound of the measurement, not a console
-defect: the same lane log shows the tty read and the `=== SUMMARY` line after it.
+injecting, then poll for the injected byte, stepping over whatever else the machine put there, and
+report how many were stepped over when the byte never arrives. That keeps the case's claim ("the
+capability forward hands the injected byte to the tty") while no longer asserting a thing the boot's
+own logging can falsify — the failure is a real, if intermittent, confound of the measurement, not a
+console defect: the same lane log shows the tty read and the `=== SUMMARY` line after it.
+
+**The first version of that bound was `FOREIGN_MAX = 8`, and it lasted one gate.** The next
+`build/gate-execorder.log` (2026-11-14, same lane) answered `the poll after injecting 0x0a gave
+Some(13) after 8 foreign byte(s)` — eight was a guess about how much the console had queued, and a
+lane printing a sweep has no bound at all. The bound that survives is on the **wait** (`POLL_MAX =
+100_000` spins of "nothing yet"), not on somebody else's bytes: how many foreign bytes a busy console
+puts in the FIFO is a property of the load, while "the injected byte arrives through the real receive
+path" is the property this case exists to check. The check also drains again at the end — a byte
+nobody took was read as the *next* suite's input, and `ipc.tty` failed in that same gate with a
+leading `Z` in a line it had fed itself (`[90, 104, 101, 108, 108, 111, 10]` against `b"hello\n"`,
+its own `hellx\x7fo\n` sequence intact behind it). One leftover, two red cases: the second failure
+was downstream, which is why the drain at the end matters as much as the discard in the middle.
 
 Recorded because the earlier note in `pl011.rs` says the window is *closed*, and it is — for the
 interrupt. Two writers, one register, and only one of them was masked is the shape to look for.

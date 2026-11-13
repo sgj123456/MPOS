@@ -579,27 +579,45 @@ pub(crate) fn check_console_rx(_info: &BootInfo) -> Result<(), String> {
     // of an in-flight `mpos-kunit:` line. The `IMSC` mask inside
     // `inject_via_loopback` closes the *interrupt* window, not the pump's
     // task-context write, so this check drains what is already queued and then
-    // polls for its own byte through at most `FOREIGN_MAX` of somebody else's.
-    const FOREIGN_MAX: usize = 8;
+    // polls for its own byte, discarding whatever else the machine put there.
+    //
+    // The bound is on the *wait*, not on somebody else's bytes: the first
+    // version allowed eight foreign bytes and then failed, which a loaded
+    // aarch64 lane exceeded (2026-11-14, gate `build/gate-execorder.log`):
+    // `the poll after injecting 0x0a gave Some(13) after 8 foreign byte(s)`.
+    // Eight was a guess about the console's own traffic; the console's own
+    // traffic has no bound, and the property under test is only that the
+    // injected byte arrives through the real receive path at all. Foreign
+    // bytes are dropped (not handed to the tty, whose line the read at the end
+    // compares exactly) and a bounded spin decides "never arrived".
+    const POLL_MAX: usize = 100_000;
     while hal::console_poll_input().is_some() {}
     for &byte in &typed {
         hal::console_inject_input(byte);
         let mut foreign = 0usize;
+        let mut spins = 0usize;
         loop {
             match hal::console_poll_input() {
                 Some(got) if got == byte => {
                     tty.receive_byte(got);
                     break;
                 }
-                Some(_) if foreign < FOREIGN_MAX => foreign += 1,
-                other => {
+                Some(_) => foreign += 1,
+                None if spins < POLL_MAX => {
+                    spins += 1;
+                    core::hint::spin_loop();
+                }
+                None => {
                     return Err(alloc::format!(
-                        "the poll after injecting {byte:#04x} gave {other:?} after {foreign} foreign byte(s)"
+                        "the poll after injecting {byte:#04x} never found it, through {foreign} foreign byte(s)"
                     ));
                 }
             }
         }
     }
+    // Leave the FIFO as it was found: a byte nobody drained would be read as
+    // the next suite's input.
+    while hal::console_poll_input().is_some() {}
 
     // Read it back through the tty the way a shell would read `fd 0`. A canonical
     // tty returns a whole line once the newline has landed.
