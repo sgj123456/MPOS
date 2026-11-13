@@ -280,6 +280,280 @@ impl Inode for ProcFile {
     // their own.
 }
 
+/// `/proc/<pid>/pagemap`: one 64-bit word per page of the task's address space,
+/// saying what the page tables have behind that page.
+///
+/// The shape is Linux's, measured before it was written down
+/// (`build/scratch/pmap/{p,q,s}.c`, Linux 7.2.14, item 269): `0400` and
+/// `st_size` **0**; the offset is a byte offset into a file of 8-byte words, so
+/// a read that is not a whole number of words - or that starts anywhere but a
+/// word boundary - is `EINVAL(22)`, while a read past the top of the address
+/// space is a plain end-of-file (`0` bytes, no error). The bits a word carries:
+/// `1 << 63` present, `1 << 56` exclusively mapped, `1 << 61` a file page or a
+/// shared anonymous page, `1 << 55` soft-dirty, bits 0..54 the physical frame
+/// number.
+///
+/// Three of those are *derived* facts here rather than counters, and each is
+/// the honest version of what this kernel can answer:
+///
+/// - the **frame number is always 0**, which is exactly what Linux shows an
+///   unprivileged reader (`CAP_SYS_ADMIN`'s frame numbers are not served, and
+///   naming the frame a page of another process sits in is a capability, not a
+///   reading);
+/// - **soft-dirty is always set inside a VMA**, because nothing in this kernel
+///   has ever cleared a reference - which is Linux's state before the first
+///   `/proc/<pid>/clear_refs` write; the cleared state is a named gap, not a
+///   silently zeroed bit (`build/scratch/pmap/p.c`, where an untouched page of
+///   a touched mapping reads `0x0080_0000_0000_0000`, soft-dirty alone);
+/// - **exclusive** is a model: there is no page mapcount here, a private page
+///   is this address space's own copy (the kernel copies rather than sharing),
+///   and a `MAP_SHARED` mapping is the only thing two processes share - so
+///   "present and not shared" is what "exclusively mapped" can honestly mean.
+///
+/// And one gap is deliberate: an address outside every VMA reads **all zero**
+/// (measured at `vaddr 0`, where Linux answers `0x0`), not "soft-dirty" - the
+/// two answers come from different questions and Linux's own host agrees.
+///
+/// The permission order is Linux's too, and it is why this node leans on
+/// [`Inode::describes_task`] rather than checking at the open: a stranger
+/// opening a dead task's pagemap is `EACCES`, not `ESRCH` (`build/scratch/pmap/s.c`),
+/// so the ptrace gate must answer before the address space is even asked about.
+#[cfg(target_os = "none")]
+struct PageMap {
+    ino: Ino,
+    /// The owner this node inherits from the process it describes.
+    owner: Inherited,
+    /// The task whose address space the words describe.
+    pid: usize,
+}
+
+/// The `/proc/<pid>/pagemap` node for one task, under the thread's name and the
+/// process's, the way Linux binds it: the words are the group's `mm`, so both
+/// names read one address space.
+#[cfg(target_os = "none")]
+fn pagemap_file(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(PageMap {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        pid,
+    })
+}
+
+/// Linux's pagemap bits, from the mapping `fs/proc/task_mmu.c` documents and
+/// measured on the pages themselves: present, exclusively mapped, a file page
+/// or a shared anonymous page, and soft-dirty.
+// The four bit constants and the two pure helpers around them are read by the
+// machine's `read_at`, and by the host unit tests that pin the arithmetic. The
+// host build itself has no caller, so it would report them dead - the shape
+// `src/vfs/pipe.rs`'s machine-only fields already use.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const PAGEMAP_SOFT_DIRTY: u64 = 1 << 55;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const PAGEMAP_EXCLUSIVE: u64 = 1 << 56;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const PAGEMAP_FILE_OR_SHARED_ANON: u64 = 1 << 61;
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const PAGEMAP_PRESENT: u64 = 1 << 63;
+
+/// Which pages one read of `/proc/<pid>/pagemap` covers: the index of the first
+/// page, and how many whole words it may answer.
+///
+/// Linux's own file is a byte stream of 8-byte words with no length: the offset
+/// is a *byte* offset even though the caller thinks in page indices, so a read
+/// that is not word-aligned is `EINVAL(22)` rather than a short read (measured:
+/// `pread(fd, &u64, 8, page * 8 + 1)` is `-1 EINVAL`, and `pread(fd, buf, 4, …)`
+/// is too). Past the top of the address space there is no word to answer, and
+/// the emptiness is an end-of-file - the measured `0` bytes at `1 << 40` and
+/// `(1 << 46) * 8` - not an error. A read that starts inside the space and runs
+/// past its top answers the words it has.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn pagemap_span(offset: usize, len: usize, limit: usize) -> VfsResult<(usize, usize)> {
+    if offset % 8 != 0 || len % 8 != 0 {
+        return Err(VfsError::Invalid);
+    }
+    let first = offset / 8;
+    let top = limit / crate::mm::pframe::PAGE_SIZE;
+    if first >= top {
+        return Ok((first, 0));
+    }
+    Ok((first, (len / 8).min(top - first)))
+}
+
+/// The word `/proc/<pid>/pagemap` reports for one page, given the four facts
+/// this kernel can establish about it.
+///
+/// `inside` is "some VMA maps this address", and it is load-bearing: a page
+/// outside every mapping reads `0`, while a page inside one that has no frame
+/// reads soft-dirty alone (both measured, `build/scratch/pmap/p.c`). The other
+/// three are only meaningful for a page that has a frame.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn pagemap_entry(present: bool, inside: bool, file: bool, shared: bool) -> u64 {
+    if !inside {
+        return 0;
+    }
+    let mut word = PAGEMAP_SOFT_DIRTY;
+    if present {
+        word |= PAGEMAP_PRESENT;
+        if !shared {
+            // A private page is this address space's own copy: no mapcount,
+            // but the kernel copies rather than shares, so "not shared" is
+            // what "exclusively mapped" honestly is here.
+            word |= PAGEMAP_EXCLUSIVE;
+        }
+        if file {
+            word |= PAGEMAP_FILE_OR_SHARED_ANON;
+        }
+    }
+    word
+}
+
+/// The whole answer for one address: which VMA describes it, whether it has a
+/// frame, and therefore which word it reads.
+///
+/// The VMA table is the same one `maps`/`smaps` read ([`crate::sched::map_facts`]),
+/// so the classification is a linear scan over the describing ranges - the
+/// structure this kernel keeps - and the frame question is one page-table walk
+/// per page ([`crate::sched::page_present`], which re-enters the table so a
+/// walk over 262144 pages does not hold interrupts off).
+#[cfg(target_os = "none")]
+fn pagemap_word(facts: &crate::sched::MapFacts, pid: usize, vaddr: usize) -> u64 {
+    use crate::mm::vma::VmaKind;
+    let mut inside = false;
+    let mut file = false;
+    let mut shared = false;
+    for vma in facts.vmas.iter() {
+        if vaddr >= vma.start && vaddr < vma.end {
+            inside = true;
+            if let VmaKind::Frames {
+                shared: is_shared, ..
+            } = &vma.kind
+            {
+                file = true;
+                shared = *is_shared;
+            }
+            break;
+        }
+    }
+    if !inside {
+        // The eager ranges are a file's bytes read into this process's own
+        // frames, so they are file pages - except the stack, which is the
+        // process's own memory and reads as anonymous (`MappedRange` has no
+        // `[stack]` bit; the name is the shipped way `vm_book` tells them
+        // apart, `src/mm/vma.rs`).
+        for range in &facts.eager {
+            if vaddr >= range.start && vaddr < range.end {
+                inside = true;
+                file = range.name.as_deref() != Some("[stack]");
+                break;
+            }
+        }
+    }
+    if !inside {
+        inside = facts
+            .heap
+            .is_some_and(|(start, end)| vaddr >= start && vaddr < end);
+    }
+    if !inside {
+        return 0;
+    }
+    let present = crate::sched::page_present(pid, vaddr);
+    pagemap_entry(present, inside, file, shared)
+}
+
+#[cfg(target_os = "none")]
+impl Inode for PageMap {
+    /// The words describe a task's address space, so the ptrace gate answers
+    /// for this node exactly as it does for `maps`: a stranger who may not
+    /// inspect the task is `EACCES` (`build/scratch/pmap/s.c`).
+    fn describes_task(&self) -> Option<usize> {
+        Some(self.pid)
+    }
+
+    /// Linux's `pagemap_open` -> `proc_mem_open` -> `mm_access`: the address
+    /// space is taken at the open, and a task that no longer has one is
+    /// `ESRCH(3)` while a number that names nothing is `ENOENT(2)` (both
+    /// measured, `build/scratch/pmap/p.c` and `s.c`).
+    ///
+    /// The permission word has already answered by the time this runs, which is
+    /// Linux's order: the stranger's refusal is `EACCES`, even for a zombie
+    /// (`build/scratch/pmap/s.c`).
+    fn open_check(&self) -> VfsResult<()> {
+        match crate::sched::address_space_of(crate::sched::TaskId(self.pid)) {
+            crate::sched::TaskMemory::Bytes(_) => Ok(()),
+            crate::sched::TaskMemory::NoMemory => Err(VfsError::NoProcess),
+            crate::sched::TaskMemory::NoTask => Err(VfsError::NoEntry),
+        }
+    }
+
+    /// A read-only file has no writer, and Linux answers access by the method
+    /// rather than by the permission (item 146's rule): `open(…, O_WRONLY)` on
+    /// it is `EACCES`, not a descriptor whose write then fails.
+    fn has_write_method(&self) -> bool {
+        false
+    }
+
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        self.owner.set(crate::cred::task_dump_owner(ids, dumpable));
+    }
+
+    /// The timestamps are accepted and dropped, as on every generated node here
+    /// (Linux answers `0` for the three `utimensat(2)` shapes, item 138).
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn refuses_mode_change(&self) -> bool {
+        true
+    }
+
+    fn metadata(&self) -> Metadata {
+        // `st_size` 0, which is Linux's: the number of words is the address
+        // space's business and the file is a stream of them (measured,
+        // `build/scratch/pmap/p.c`).
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: 0,
+        }
+    }
+
+    /// `0400`, Linux's word for the file, and the reason a stranger cannot read
+    /// it even without the ptrace question.
+    fn mode(&self) -> u32 {
+        0o400
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let (first, count) = pagemap_span(offset as usize, buf.len(), crate::mm::elf::USER_LIMIT)?;
+        if count == 0 {
+            // Past the top of the address space: end of file, not a refusal.
+            return Ok(0);
+        }
+        let Some(facts) = crate::sched::map_facts(self.pid) else {
+            // The task died between the open and this read. Linux's open holds
+            // the `mm`, so its descriptor keeps serving; this one holds none,
+            // and answering a stale body would be worse than saying so
+            // (`docs/notes/` §6.150's named gap).
+            return Err(VfsError::NoEntry);
+        };
+        let mut written = 0;
+        for index in first..first + count {
+            let word = pagemap_word(&facts, self.pid, index * crate::mm::pframe::PAGE_SIZE);
+            buf[written..written + 8].copy_from_slice(&word.to_le_bytes());
+            written += 8;
+        }
+        Ok(written)
+    }
+}
+
 /// A generated file whose contents can be replaced by writing them.
 ///
 /// This is what makes `/proc/sys/kernel/hostname` a sysctl rather than a
@@ -3978,6 +4252,13 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         memory_file(move || auxv_memory(tid)),
     );
+    // The address space's own words, under the thread's name too: Linux binds
+    // this file in a task directory as well as a process one, and both read the
+    // group's `mm` (measured: `/proc/self/task/<tid>/pagemap` exists, `0400`,
+    // `st_size` 0 - the same node, `build/scratch/pmap/p.c` for the file's
+    // own shape).
+    #[cfg(target_os = "none")]
+    node.add("pagemap", NodeKind::File, pagemap_file(tid));
     node.add(
         "children",
         NodeKind::File,
@@ -4619,6 +4900,11 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         NodeKind::File,
         memory_file(move || auxv_memory(slot)),
     );
+    // One 64-bit word per page of the address space, `0400`, `st_size` 0 - the
+    // shape measured on the host (`build/scratch/pmap/{p,q,s}.c`). It is the
+    // group's `mm`, so this node and the thread's are two names for one answer.
+    #[cfg(target_os = "none")]
+    node.add("pagemap", NodeKind::File, pagemap_file(slot));
     // The process's POSIX timers, four lines each, newest number first -
     // `0444` because Linux's `proc_pid_timers` is `S_IRUGO`, and *not* offered
     // per thread: measured on the host, `/proc/<pid>/task/<tid>/timers` and
@@ -8427,5 +8713,111 @@ mod tests {
         // file, and asking for a slot nobody holds answers nothing.
         assert_eq!(child_slots(&table, 44), alloc::vec![]);
         assert_eq!(child_slots(&table, 99), alloc::vec![]);
+    }
+
+    /// `/proc/<pid>/pagemap` answers 8-byte words or refuses the read, and the
+    /// offset is a **byte** offset even though a caller thinks in page indices.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/pmap/q.c`): a `pread` of 8 bytes
+    /// at `page * 8` answers a word; the same read at `page * 8 + 1` is
+    /// `EINVAL(22)`; a 4-byte buffer is `EINVAL(22)` too. Past the top of the
+    /// address space (`limit / PAGE_SIZE` words) there is nothing to answer, and
+    /// that emptiness is an end-of-file - the measured `0` bytes at `1 << 40` -
+    /// while a read that starts inside the space and runs past its top answers
+    /// the words it has.
+    #[test]
+    fn a_pagemap_read_is_whole_words_or_refused() {
+        use super::pagemap_span;
+        use crate::vfs::VfsError;
+        let limit = 4 * crate::mm::pframe::PAGE_SIZE;
+        assert_eq!(pagemap_span(0, 8, limit), Ok((0, 1)), "one word, one page");
+        assert_eq!(
+            pagemap_span(8, 16, limit),
+            Ok((1, 2)),
+            "the offset counts bytes, the answer counts pages"
+        );
+        assert_eq!(
+            pagemap_span(1, 8, limit),
+            Err(VfsError::Invalid),
+            "an unaligned offset is not a short read"
+        );
+        assert_eq!(pagemap_span(0, 4, limit), Err(VfsError::Invalid));
+        assert_eq!(
+            pagemap_span(4 * 8, 8, limit),
+            Ok((4, 0)),
+            "at the top of the address space: end of file, not an error"
+        );
+        assert_eq!(pagemap_span(6 * 8, 8, limit), Ok((6, 0)));
+        assert_eq!(
+            pagemap_span(3 * 8, 3 * 8, limit),
+            Ok((3, 1)),
+            "a read that starts inside the space answers the words that are there"
+        );
+        assert_eq!(pagemap_span(0, 0, limit), Ok((0, 0)));
+    }
+
+    /// What the word means, against the values measured on Linux 7.2.14's own
+    /// pages (`build/scratch/pmap/p.c`, an unprivileged reader, so the frame
+    /// number is zeroed by the kernel on both sides):
+    ///
+    /// - a touched private anonymous page reads `0x8180_0000_0000_0000`
+    ///   (present, exclusive, soft-dirty);
+    /// - an untouched page of that same mapping reads `0x0080_0000_0000_0000`
+    ///   (inside a VMA, soft-dirty alone);
+    /// - a touched private **file** page reads `0xa180_0000_0000_0000` (also
+    ///   file-page);
+    /// - a touched `MAP_SHARED|MAP_ANONYMOUS` page reads file-page **without**
+    ///   exclusive, because two processes own it;
+    /// - an address outside every VMA reads `0` - measured at `vaddr 0`, where
+    ///   Linux answers all-zero, soft-dirty included.
+    ///
+    /// A word built the other way round (soft-dirty only when a frame exists,
+    /// or exclusive whenever present) passes one of these and fails its
+    /// neighbour, which is what makes the table a pin and not a courtesy.
+    #[test]
+    fn a_pagemap_word_names_the_facts_it_can_answer() {
+        use super::{
+            PAGEMAP_EXCLUSIVE, PAGEMAP_FILE_OR_SHARED_ANON, PAGEMAP_PRESENT, PAGEMAP_SOFT_DIRTY,
+            pagemap_entry,
+        };
+        assert_eq!(
+            pagemap_entry(false, false, false, false),
+            0,
+            "outside every VMA the page belongs to nobody"
+        );
+        assert_eq!(
+            pagemap_entry(false, true, false, false),
+            PAGEMAP_SOFT_DIRTY,
+            "inside a VMA with no frame: soft-dirty alone"
+        );
+        assert_eq!(
+            pagemap_entry(true, true, false, false),
+            PAGEMAP_PRESENT | PAGEMAP_EXCLUSIVE | PAGEMAP_SOFT_DIRTY,
+            "a touched private anonymous page, the host's 0x8180_…"
+        );
+        assert_eq!(
+            pagemap_entry(true, true, true, false),
+            PAGEMAP_PRESENT | PAGEMAP_EXCLUSIVE | PAGEMAP_FILE_OR_SHARED_ANON | PAGEMAP_SOFT_DIRTY,
+            "a touched private file page, the host's 0xa180_…"
+        );
+        assert_eq!(
+            pagemap_entry(true, true, true, true),
+            PAGEMAP_PRESENT | PAGEMAP_FILE_OR_SHARED_ANON | PAGEMAP_SOFT_DIRTY,
+            "a shared page is a file-like page and is not exclusively mapped"
+        );
+        assert_eq!(
+            pagemap_entry(true, true, false, true),
+            PAGEMAP_PRESENT | PAGEMAP_SOFT_DIRTY,
+            "sharing removes exclusive, nothing else"
+        );
+        assert_eq!(
+            PAGEMAP_PRESENT | PAGEMAP_EXCLUSIVE | PAGEMAP_SOFT_DIRTY,
+            0x8180_0000_0000_0000,
+            "the measured value itself, not only the names"
+        );
+        assert_eq!(
+            PAGEMAP_PRESENT | PAGEMAP_EXCLUSIVE | PAGEMAP_FILE_OR_SHARED_ANON | PAGEMAP_SOFT_DIRTY,
+            0xa180_0000_0000_0000
+        );
     }
 }

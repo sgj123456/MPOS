@@ -123,6 +123,24 @@ pub fn resident_pages(pid: usize, start: usize, end: usize) -> usize {
     count
 }
 
+/// Whether one page of the task `pid` names has a frame behind it - the
+/// `present` bit `/proc/<pid>/pagemap` reports for that page.
+///
+/// The same page-table question [`resident_pages`] asks of a whole range, asked
+/// of one page and answered as a bit: the resident set here *is* the tables
+/// (`Mm.frames` holds the frames, not the addresses they are mapped at), so a
+/// page is present exactly when `phys_for_virt` names a frame for it. The
+/// address is rounded down to its page because the caller writes page indices
+/// and the walk keys off the page the range's first byte falls in.
+///
+/// The critical section is entered for this one page and released again, which
+/// is why the caller may loop over a range: a reader of `pagemap` walks up to
+/// 262144 entries, and holding the table across that is the work AGENTS.md §3's
+/// fifth rule forbids (`resident_pages` above re-enters for the same reason).
+pub fn page_present(pid: usize, virt: usize) -> bool {
+    user_frame_at_task(pid, virt & !(PAGE_SIZE - 1)).is_some()
+}
+
 /// [`user_frame_at`] for a task named by its id rather than by being current,
 /// with the group's space resolved the same way: a thread owns no address space
 /// of its own, so asking the thread's own slot would answer "nothing is mapped"
