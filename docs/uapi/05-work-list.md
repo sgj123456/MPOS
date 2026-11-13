@@ -12052,10 +12052,10 @@ refusal).
 passed, 0 failed` on both, lint ratcheted, formatting clean in both workspaces, fuzz 23 targets,
 `t-proc-dead` green in both arms.
 
-**What this does not do.** `mem` and `stack` have no node in this kernel at all (the
-path is `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist.
-`pagemap` was in this list when item 268 landed; **item 269** built the node and its own section
-(`docs/notes/` §6.150) carries the shape. A task in the
+**What this does not do.** `mem` and `stack` had no node in this kernel when item 268
+landed (the path was `ENOENT`), so Linux's `ESRCH` on their open was moot until those
+files exist. **Item 269** built `pagemap` (`docs/notes/` §6.150) and **item 270** built
+`mem` (`docs/notes/` §6.152); `stack` still has none. A task in the
 `X`/exiting state shares the zombie's `task.exited` predicate - the shape matches, but only the
 zombie's answers were measured. And the empty answers of `maps`/`smaps`/`numa_maps`/`cmdline` ride
 two renderer branches (`cmdline_of` and `mapping_lines`); a future door that formatted the mapping
@@ -12112,7 +12112,66 @@ rebuilt and a boot:
 23 targets, `t-pagemap` green in both arms (20 ms / 208 ms). The gate's first run failed on
 aarch64 in `t-rr-interval`'s sampling window - the claim's bound is §6.151's measurement.
 
-**What this does not do.** `mem` and `stack` still have no node. Bit 62 (swapped) is always 0
+**What this does not do.** `mem` had no node when item 269 landed - **item 270** built it
+(`docs/notes/` §6.152) - and `stack` still has none. Bit 62 (swapped) is always 0
 because there is no swap. A pagemap descriptor does not pin the address space, so a read after the
 target dies is `ENOENT` where Linux's open-held `mm` keeps serving. The huge-page bit and the
 `clear_refs` transitions are not served.
+
+**Item 270**, landed 2026-11-13. `/proc/<pid>/mem` exists and serves **both** halves of the
+address space: a read copies the target's bytes, a write pokes them - with Linux's two
+additions that a plain physical copy cannot have.
+
+### What was measured first (Linux 7.2.14, `build/scratch/pmem/{m,n,o,p}.c`)
+
+| question | measured answer |
+|---|---|
+| open `O_RDONLY`, `O_RDWR`, `O_WRONLY` | all answer a descriptor; `fstat` is `0600`, `st_size 0` |
+| offset | the **virtual address**, byte granular: 16 at `base+1` answers 16 |
+| a page in no mapping | `EIO(5)` (at `base+64P`, `vaddr 0`, `0x7fff_fff000`, `1<<47`); offset `-8` is `EINVAL(22)` from the fd layer |
+| read across a hole | the bytes before it: `rc=8` of 16 |
+| write across a hole | the bytes it took: `rc=4` of 8, and they read back |
+| a transfer whose first page is unservable | `EIO`, not a short 0 |
+| write into a `PROT_READ` page | served, and the target reads it back |
+| read/write of a `PROT_NONE` page | both served (`FOLL_FORCE`) |
+| read of an untouched anon page | zeros; the target's `statm` resident column does not move |
+| write through `O_RDONLY` / read through `O_WRONLY` | `EBADF(9)` |
+| stranger on a root task | `EACCES(13)`, live **and** zombie; the owner on its own zombie `ESRCH(3)`; reaped `ENOENT(2)` |
+
+### What serves it now
+
+`#[cfg(target_os = "none")] struct ProcessMem` in `src/vfs/procfs.rs`: `0o600`, `st_size` 0,
+`has_write_method`, `describes_task` = the pid, and an `open_check` over
+`crate::sched::address_space_of` (`ESRCH` for a task with no space, `ENOENT` for a number
+that names none). Both directions share `mem_start` (address → `MapFacts` → `space_root_of`)
+and `address_facts`, the classification `pagemap` also asks, so the two nodes cannot drift.
+A page in no mapping ends the transfer; a transfer that served nothing is
+`VfsError::Unmapped` (`EIO`).
+
+The two things a write needs: `populate_in` gained a `force` fifth parameter (a `PROT_READ`
+or `PROT_NONE` page is made present for a caller the ptrace question has already passed),
+and `break_cow_at` splits a page a fork shares with the tracee's own `Mm` books before the
+store - `write_user_forced_of` does not do that on its own, because `strace` only reads.
+
+### Pins and counterfactuals
+
+`user/tests/src/bin/t-proc-mem.rs`, 17 claims: the whole measured table above, plus the
+refusal ladder. `MPOS_ON_HOST=1` runs 15 and skips two with a `note:` (both need to drop
+ids or capabilities a non-root host cannot). Counterfactuals redden exactly what they
+remove: ignoring `force` aborts the guest at `write into a read-only page: 5`; removing
+`break_cow_at` reddens the shared-page claim; `open_check` answering `Ok(())` reddens the
+zombie `ESRCH`; removing `describes_task` reddens the dropped-`CAP_SYS_PTRACE` claim (the
+stranger claims cannot see it, because a task that is not dumpable reads as root's node).
+
+**Gate.** `build/gate-procmem2.log`, exit 0: stage 1 `1318 tests, 0 failed`, x86_64
+`pass=312 fail=0`, aarch64 `pass=311 fail=0`, `mpos-kunit 35 passed, 0 failed` on both, lint
+ratcheted (162/168/389/273/3/1), formatting clean in both workspaces, fuzz 23 targets,
+`t-proc-mem` green in both arms. The round's first sweep (`build/gate-procmem.log`) reddened
+two sampling claims instead - `t-rr-interval`'s bound and `t-times`' thread-vs-group
+relation - and both were re-derived from their own measurements (notes §6.151, §6.153)
+before this one.
+
+**What this does not do.** The descriptor does not hold the `mm` (a target that dies after
+the open answers `ESRCH`/`ENOENT`, where Linux keeps serving - the same gap `pagemap`
+carries); `stack` still has no node (it needs an unwinder); no swap or huge-page bits exist
+to report. (§6.152, item 270)

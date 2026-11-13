@@ -1642,8 +1642,8 @@ Section numbers are unchanged from the original `UAPI.md`.
   claims they remove (`.../cf2.log` 3, `.../cf3.log` 3, `.../cf4.log` 1), and a host unit test pins
   the two refusals and the capture. Named leftovers at the time: `pagemap`/`mem`/`stack` had no node here
   (`ENOENT` for the path, so Linux's `ESRCH` was moot) - `pagemap` was built by **item 269**
-  (`docs/notes/` §6.150), `mem`/`stack` still have none - and the `X`-state task shares only the
-  zombie's measured answers. `docs/notes/` §6.149.
+  (`docs/notes/` §6.150), `mem` by **item 270** (§6.152), `stack` still has none - and the
+  `X`-state task shares only the zombie's measured answers. `docs/notes/` §6.149.
 
 - **`/proc/<pid>/pagemap` answers the page tables as words (item 269), with three bits named as
   models.** No node existed at all (`ENOENT` for the path). Measured on a current host first
@@ -1664,3 +1664,18 @@ Section numbers are unchanged from the original `UAPI.md`.
   is `0xa180_…` on the host and `0xa080_…` here). Pin `t-pagemap` (17 claims) is green on both
   machines and under `MPOS_ON_HOST=1`; two host unit tests pin the arithmetic; counterfactuals
   redden exactly 3 and exactly 1 claim. `docs/notes/` §6.150.
+
+- **`/proc/<pid>/mem` serves the address space as a byte stream, both directions (item 270).**
+  Linux measured first (`build/scratch/pmem/{m,n,o,p}.c`, 7.2.14): `0600` and `st_size 0`; the
+  offset is the virtual address, byte granular; `EIO(5)` in no mapping and `EINVAL(22)` for a
+  negative offset; short transfers that stop at the first unservable page; `FOLL_FORCE` serving
+  writes into `PROT_READ` and both halves of a `PROT_NONE` page; `EBADF` for the wrong direction;
+  and item 268/269's refusal ladder (`EACCES` first, then `ESRCH`/`ENOENT`). What a plain copy
+  cannot do is the interesting part: the pager gained a `force` parameter, and a write **breaks
+  the copy-on-write page first** with the tracee's own `Mm` books (`break_cow_at`), because a
+  debugger poking a page a forked tracee shares must not write the frame the fork also maps.
+  Pin `t-proc-mem` (17 claims; two guest-only, skipped with a `note:` on the host) is green on
+  both machines; four counterfactuals redden exactly their claims, and the two claims that first
+  measured nothing - a grandchild that read before the poke, and a `describes_task` a stranger
+  could not see - were reworked until they did. Named leftovers: the descriptor does not hold the
+  `mm`, `stack` has no node, no swap or huge-page bits exist here. `docs/notes/` §6.152.

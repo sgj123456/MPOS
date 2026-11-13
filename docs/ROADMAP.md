@@ -2623,7 +2623,8 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   and under `MPOS_ON_HOST=1`; three counterfactuals redden exactly the claims they remove, and a
   host unit test pins the two refusals and the capture. Named leftovers at
   the time: `pagemap`/`mem`/`stack` had no node here (the path itself was `ENOENT`, so Linux's
-  `ESRCH` was moot) - **item 269** built `pagemap` (§6.150), `mem`/`stack` still have none - and
+  `ESRCH` was moot) - **item 269** built `pagemap` (§6.150) and **item 270** built `mem`
+  (§6.152), `stack` still has none - and
   the `X` state shares the zombie's predicate without its own measurement. (§6.149, item 268)
 - **`/proc/<pid>/pagemap` (item 269).** The file had no node at all while §6.149 and the
   "Remaining ABI support" list both recorded it as a gap. Linux's shape measured first
@@ -2642,3 +2643,23 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   a timed park's wake (§6.151: 1 of 156 loaded-lane disagreements), fixed into a measured bound in
   the same round. Gate `build/gate-pagemap2.log` exit 0: stage 1 1317, x86_64 311, aarch64 310,
   kunit 35/0 both, lint/format/fuzz clean. (§6.150, item 269)
+- **`/proc/<pid>/mem` (item 270).** The last memory file with no node. Linux measured first
+  (`build/scratch/pmem/{m,n,o,p}.c`, 7.2.14): `0600`/`st_size 0`, the offset is the virtual
+  address byte granular, `EIO(5)` in no mapping with `EINVAL(22)` for a negative offset, short
+  transfers that stop at the first page they cannot serve, `FOLL_FORCE` serving a write into a
+  `PROT_READ` or `PROT_NONE` page, `EBADF` for the wrong direction, and the item-268/269 ladder
+  of `EACCES` before `ESRCH`/`ENOENT`. A plain physical copy is not enough for either half: the
+  pager gained a `force` parameter that skips the *target's* permission bits (the ptrace
+  question has already been answered), the cross-task reads go through a permissive walk so a
+  `PROT_NONE` page can be read, and a write **splits the copy-on-write page first** with the
+  tracee's own `Mm` books - a debugger poking a shared page must not write the frame the fork
+  also maps. The node is `ProcessMem` in `src/vfs/procfs.rs`, sharing `address_facts` with
+  `pagemap` so the two classifications cannot drift. Pin `t-proc-mem` (17 claims; the stranger
+  and the dropped-uid pair are guest-only) green both arms, four counterfactuals each reddening
+  exactly its claims, and two claims rewritten because the first versions measured nothing (a
+  grandchild that looked before the poke; a `describes_task` a stranger could never reach).
+  Gate `build/gate-procmem2.log` exit 0: stage 1 host tests 0 failed, both arms `fail=0`,
+  `mpos-kunit 35/0`, lint/fmt/fuzz clean (the round's first sweep reddened two sampling
+  claims instead - §6.151's bound and §6.153's one-tick lag - and both were re-derived from
+  their own readings before this one). Named leftovers: the descriptor holds no `mm`,
+  `stack` has no node, no swap or huge-page bits exist. (§6.152, item 270)

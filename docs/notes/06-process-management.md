@@ -13569,9 +13569,9 @@ without asking again, and a second open re-capturing (which is the refusal).
 
 - `pagemap` was in this list when §6.149 landed ("no node in this kernel at
   all"); item 269 built the node and its own section, §6.150, carries the
-  shape. `mem` still has no node (the path is `ENOENT`), so Linux's `ESRCH` on
-  its open is moot until that file exists; `stack` is the same shape (Linux
-  opens it and fails the read).
+  shape. `mem` had no node when §6.149 landed; **item 270** built it and
+  §6.152 carries the shape. `stack` still has none (Linux opens it and fails the
+  read).
 - A task in the `X`/exiting state is answered by the same `task.exited` predicate
   the zombie is - Linux releases the address space before the zombie state, so the
   shape matches, but only the zombie's own answers were measured.
@@ -13677,8 +13677,9 @@ shape, the fuzz workspace's 23 targets built, `t-pagemap` green in both arms
 (20 ms x86_64, 208 ms aarch64). The first run of this gate failed on aarch64 in
 `t-rr-interval`'s sampling window - §6.151 is that measurement and its fix.
 
-**What this does not do, named.** `mem` and `stack` still have no node (the path
-is `ENOENT`); bit 62 (swapped) is always `0` because this kernel has no swap, and
+**What this does not do, named.** `mem` had no node when item 269 landed - **item 270**
+built it (§6.152) - and `stack` still has none (the path is `ENOENT`); bit 62 (swapped) is
+always `0` because this kernel has no swap, and
 `0` is the honest answer where Linux would set it; a `pagemap` descriptor does
 not pin the address space, so a read after the target dies answers `ENOENT`
 where Linux's open-held `mm` keeps serving; the huge-page bit and the
@@ -13727,3 +13728,224 @@ Rule, the same one §6.144 wrote down in another file: a claim built on samples 
 a moving record gets a bound derived from its own measurement, and the wrong
 answer must still be far outside that bound. Measured on the host first, then on
 the machine the claim lives on.
+
+**The 12.5% bound lasted one gate.** The very next full sweep (item 270's,
+`build/gate-procmem.log`) reddened the same claim on the aarch64 four-lane arm
+with `45 asleep both sides of 200, 6 disagreed` - **13.3%**, a reading inside the
+range the earlier ones had not sampled (0 of 156 and 1 of 156 were two-lane
+readings; this one ran four programs at once). So the 12.5% was itself a claim
+the machine had not made. The bound is a **third** now (`blocked_slice * 3 <=
+blocked_asleep`), it is the same order as the worst reading rather than a
+rounding of the best one, and it still separates the wrong answer: a kernel that
+charges a parked task answers **every** such sample a slice (100%), three times
+the bound, while the runnable control in the same window still demands zero
+non-zero answers out of two hundred. The measurement table for the bound, in the
+order it was taken: 0 of 156 (green, two lanes), 1 of 156 (loaded, two lanes),
+8 of 99 (the one-sided form this replaced, §6.144), 6 of 45 (four lanes, this
+gate). The claim's text carries all four.
+
+## §6.152 `/proc/<pid>/mem`: the address space as a byte stream, and the two things a write needs that a read does not (LANDED 2026-11-13)
+
+**The gap this closes.** `/proc/<pid>/mem` had no node at all: `/proc/<pid>/pagemap` was
+built by item 269 and `auxv`/`environ` by item 268, and the ROADMAP's "Remaining ABI
+support" said `mem` and `stack` still had nothing behind them. A debugger needs both
+sides of this file - the words and the stream - and the stream is where a poke has to
+do two things a plain copy of a physical address cannot: ignore the target's *own*
+permission bits (`FOLL_FORCE`), and break a copy-on-write page before storing.
+
+### What Linux does (measured first, 7.2.14, `build/scratch/pmem/{m,n,o,p}.c`)
+
+| question | measured answer |
+|---|---|
+| open `O_RDONLY`, `O_RDWR`, `O_WRONLY` | all answer a descriptor |
+| `fstat` | mode `0600`, `st_size` `0` |
+| offset | **the virtual address**, byte granular: `pread` of 16 at `base+1` answers 16 |
+| a page in no mapping | `EIO(5)` - at `base+64P`, at `vaddr 0`, at `0x7fff_fff000`, at `1<<47` |
+| `pread` with offset `-8` | `EINVAL(22)` (the fd layer, before the node) |
+| read that runs off a mapping | the bytes before the hole: `rc=8` of 16 |
+| write that runs off a mapping | the bytes it took: `rc=4` of 8, and they read back `41 42 43 44` |
+| a transfer whose *first* page is unservable | `EIO`, not a short 0 |
+| write into a `PROT_READ` page | served (`rc=8`), and the target reads the bytes back |
+| read of a `PROT_NONE` page | 8 zeros; a write into it is served too |
+| read of an untouched anonymous page | zeros, and the target's `statm` resident column does not move (`716 204 178` before and after) |
+| write through `O_RDONLY` / read through `O_WRONLY` | `EBADF(9)` |
+| stranger (uid 65534) on a root task | `EACCES(13)`, live **and** zombie - the permission word answers before the address space |
+| the owner on its own zombie | `ESRCH(3)`; after reaping, `ENOENT(2)` |
+
+The last three rows are the same ladder item 268 and item 269 built, and it is why the
+node carries both `describes_task` (the ptrace question) and an open gate (the address
+space): the measured order is permission, then space, then the stream.
+
+### What the kernel does
+
+- `src/sched/runtime/child_mm.rs`'s `populate_in` gained a `force: bool` fifth
+  parameter; the permission line is now
+  `if !vma.permits(write) && !force { return FaultAnswer::Refused; }`. The doc names
+  `FOLL_FORCE`/`POKEDATA` and the measurement: the bits say what the **target** may do,
+  not what the kernel may do for it once the ptrace question is answered.
+- `src/sched/runtime/child_exit.rs` gained `read_user_forced_of`/`write_user_forced_of`
+  over a new `resolve_forced_page_of`, which first asks `hal::phys_for_virt_of` - the
+  permissive walk that does not require the `USER` bit - because a `PROT_NONE` page is
+  present but not user-accessible. That is safe only because the caller filters the
+  address through the VMA table first; kernel mappings live above
+  `crate::mm::elf::USER_LIMIT` and are in no VMA.
+- `src/sched/runtime/child_mm.rs` gained `break_cow_at(root, virt)`, which splits the
+  page with the tracee's own `Mm` books (`split_cow` + `charge_thread_minor_fault`)
+  rather than writing the frame the fork also maps. `write_user_forced_of` deliberately
+  does **not** do this on its own: `strace` only reads, so its doc keeps saying it will
+  not break a copy for a debugger - the `/proc/<pid>/mem` caller asks for it explicitly.
+- `src/vfs/procfs.rs`: a `#[cfg(target_os = "none")] struct ProcessMem` node, `0o600`,
+  `st_size` 0, `has_write_method() -> true`, `describes_task` = the pid, `open_check` =
+  the `TaskMemory` ladder (`address_space_of`: `Bytes` → serve, `NoMemory` → `ESRCH`,
+  `NoTask` → `ENOENT`). Reads and writes share one `mem_start` (offset → address →
+  `MapFacts` → `space_root_of`) and one classification (`address_facts`, now also what
+  `pagemap_word` asks, so the two nodes cannot drift apart). The first page that cannot
+  be served ends the transfer, and a transfer that served nothing is
+  `VfsError::Unmapped` (`EIO`) - the measured `EIO`, not a short 0.
+- `src/vfs/mod.rs` gained `VfsError::Unmapped`; `src/uaccess.rs` maps it to `EIO`.
+  It is kept apart from `Corrupt` although both answer `EIO`, because the two say
+  different things about the address.
+
+### Pins
+
+`user/tests/src/bin/t-proc-mem.rs` (17 claims; `MPOS_ON_HOST=1` runs 15 and skips two
+with a `note:`, because both need to drop ids or capabilities a non-root host cannot):
+the open's `0600`/`st_size 0`; byte-for-byte service; the offset is the address
+(`base+1`); an untouched page reads zeros; the short read (`8` of 16 across a hole); the
+short write (`4` of 8, and it reads back); `vaddr 0` and `1<<47` are `EIO`; `EBADF` both
+ways; `FOLL_FORCE` into a `PROT_READ` page with the child reading the bytes back; a
+`PROT_NONE` page taking both halves; **a write into a page a fork shares is broken
+first**, with the grandchild reading its `'A'` *after* the poke. Then the refusals: a
+zombie `ESRCH`, a collected pid `ENOENT`, a stranger `EACCES` (live and zombie), a
+same-uid target that made itself undumpable `EACCES` while a dumpable sibling is served,
+and a **root caller that dropped `CAP_SYS_PTRACE`** refused by the ptrace question.
+
+Two of the claims exist because the obvious versions measured nothing:
+
+- the copy-on-write claim first let the grandchild read its page *before* the parent's
+  poke, so a kernel that never broke the page still passed. A fourth pipe fixes the
+  order: the grandchild looks only after the poke, and the parent reads its byte before
+  releasing the child.
+- `describes_task` is invisible to a stranger, because a task that is not dumpable reads
+  as *root's* node and the `0600` word refuses before the ptrace question is asked
+  (measured: deleting `describes_task` from the node still passed the stranger claim).
+  The shape that separates them is a root caller that dropped `CAP_SYS_PTRACE`.
+
+### Counterfactuals (each: patch, rebuild kernel + re-embed the loader, boot, restore byte-identically)
+
+| reverted | what happened |
+|---|---|
+| `if !vma.permits(write) && !force` → `if !vma.permits(write)` | guest aborts: `exit=134`, `panicked at t-proc-mem.rs:332` (`write into a read-only page: 5`) |
+| the `break_cow_at` call removed from `mem_write` | exactly one red: *a write into a page a fork shares is broken first, so the fork keeps its copy* |
+| `ProcessMem::open_check` → `Ok(())` | exactly one red: *a zombie's mem node refuses the open with ESRCH* |
+| `ProcessMem::describes_task` removed | exactly one red: *a root caller that dropped CAP_SYS_PTRACE is refused by the ptrace question* |
+| `read_user_forced_of`'s permissive walk (`EIO` at `PROT_NONE`) | reproduced by the guest's first run of the pin before the fix: `write into a no-access page: 5` |
+
+### Gate
+
+`build/gate-procmem2.log` exit 0: stage 1 `1318 tests, 0 failed`; x86_64 `pass=312 fail=0`,
+aarch64 `pass=311 fail=0` (311 built, 16 of 327 left out by `tests.toml`); `t-proc-mem`
+green in both arms; `mpos-kunit 35 passed, 0 failed` per arm; lint ratcheted
+(162/168/389/273/3/1, no new lint); formatting clean in both workspaces; the fuzz
+workspace builds its 23 targets; both arms print
+`Boot instrument: the <arch> kernel carries no hang-heartbeat table`.
+
+The first sweep of this round (`build/gate-procmem.log`) went red on aarch64 with two
+claims, neither about this item's code: `t-rr-interval`'s parked-slice bound (13.3% against
+a 12.5% bound) and `t-times`' thread-vs-group relation (one tick of lag). Both are the
+"two snapshots of one moving record" class and both are re-derived with their own
+measurements in §6.151 and §6.153; this log is the sweep after those fixes.
+
+### What this does not do, named
+
+- **The descriptor does not hold the `mm`.** Linux's open takes a reference on the address
+  space, so an `fd` opened while the task lived keeps serving after it dies; here a read
+  after the death answers `ESRCH`/`ENOENT` through the same gate the open asked. The same
+  gap `pagemap` carries (§6.150), and closing it wants an `Arc` on the `Mm` held by the
+  file, which is a `Mm` lifetime item rather than a procfs one.
+- **No `FOLL_FORCE` for the *foreign* permission model beyond the pager.** The force flag
+  is applied where the page is made present and in the permissive walk; there is no
+  writable-private-file case that needs `remove-write` semantics, because this kernel has
+  no page cache to write back into.
+- **`stack` still has no node** (it needs an unwinder), and there is no swap or huge-page
+  bit to report: the machine has neither.
+- **`/proc/<pid>/mem` on a task in another pid namespace** was not measured; the ladder
+  resolves numbers the way item 268's doors do, so it inherits their namespace handling
+  rather than adding to it.
+
+## §6.153 the group's CPU number can lag a thread's by one tick - and the two claims that read a moving pair (LANDED 2026-11-13)
+
+Item 270's gate (`build/gate-procmem.log`) failed on the aarch64 arm with two
+lines, and both were about the same class of claim:
+
+```
+FAIL:  a sample that finds the blocked child asleep on both sides is answered
+       zero (45 asleep both sides of 200, 6 disagreed, 113 letter moved)
+FAIL:  and never more than its group's at either end of the read
+       (6 ticks against 4..5)
+```
+
+The first is §6.151's bound, re-derived in that section. The second is new, and
+it is a fact about the kernel rather than about the claim's shape.
+
+**What the claim asked.** A thread's own CPU time is at most its group's at any
+one instant - Linux answers the group's number by summing the thread counters at
+the moment of the read, so the relation is an invariant there. The pin read
+`/proc/self/task/<tid>/stat`'s `utime`, and `/proc/self/stat`'s `utime` on
+**both** sides of that read, then required the thread's number not to exceed the
+larger of the two. That bracket was added when a single reading failed the
+`thread < group` shape (`5 against 5`, §6.96) - an honest reading against a shape
+assertion.
+
+**What the machine said.** `6 ticks against 4..5`: the group read *after* the
+thread's file was still one tick below the thread's number. So a bracket cannot
+fix this - the two numbers disagree at one instant.
+
+**What was measured before believing it.** A throwaway probe
+(`user/tests/src/bin/t-cpuacct-probe.rs`, deleted after the reading, byte for
+byte the pattern §6.87 asks for) spun 200 µs of user code per round, 400 rounds,
+and read both files each round:
+
+```
+probe samples=400 thread_over_group=16 worst_gap=1
+```
+
+Sixteen of four hundred samples read the thread **one tick ahead** of the group,
+never two. And the charge itself is not split: `sched::charge_cpu(in_user)`
+charges `mm.charge_tick(in_user)` and `task.cpu_user.fetch_add(1)` inside **one**
+`with_table` block (§6.96's item 209). So this is not a lost charge and not a
+half-charged tick; it is **two snapshots of one moving record**, taken on
+opposite sides of the charge, and the group's half of a tick can land where the
+thread's already has - i.e. the group's number is allowed to lag by one tick in a
+window, and never by more.
+
+**What was changed, and what is named.** The claim now re-reads the group's file
+until it covers the thread's, with a budget of twenty 2 ms waits, and the
+message carries how many waits that took (`3 ticks against 5..5, 0 waits` in the
+one-shot guest run). A group that never catches up is the bug the claim is for;
+one that catches up inside a tick is the pair of snapshots. The alternative -
+making the group's number the sum of the thread counters at read time, Linux's
+own shape, which would turn this relation into an invariant - is **a named gap**
+in this round's item rather than half-done here: it is an accounting change
+touching every reader of `Task::cpu` and `Mm::cpu_all`, not a test fix.
+
+The same round's gate also re-derived §6.151's rr-interval bound from 12.5% to a
+third: 6 of 45 (13.3%) on the four-lane arm, against 0 of 156 and 1 of 156 from
+the two-lane runs the earlier bound was taken on. Both fixes were measured on the
+guest with a one-shot boot before the gate, but an idle one-shot boot cannot
+produce the loaded reading - the gate is the measurement that counts here, and
+that is exactly why the bound is written down with four readings instead of one.
+
+Rule this round adds to §6.144/§6.151's: when two counters are charged together
+but **read** through two snapshots, the relation between them is a window, and a
+claim about it either states the window with a measured size or re-reads until the
+relation settles - never a single pair of readings.
+
+**The sweep after both fixes:** `build/gate-procmem2.log` exit 0 - stage 1
+`1318 tests, 0 failed`; x86_64 `pass=312 fail=0`, aarch64 `pass=311 fail=0`; both arms
+`mpos-kunit 35 passed, 0 failed`. In that sweep the re-derived claims read
+`174 asleep both sides of 200, 0 disagreed, 1 letter moved` (x86_64) and
+`200 asleep both sides of 200, 0 disagreed, 0 letter moved` (aarch64) for the parked
+slice, and `4 ticks against 4..5, 0 waits` / `3 ticks against 4..5, 0 waits` for the
+thread-vs-group pair - the budget was not used, which is the expected shape: the lag is
+a window of a tick, and a single re-read closes it.
