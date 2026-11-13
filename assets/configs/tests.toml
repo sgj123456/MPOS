@@ -132,9 +132,9 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-p9read", "t-pipecost"]
 #
 # `t-iret` used to be the fourth member and has left: it measured *where* a
 # handled signal is handed over (§2.13), and a reading is what it was - it had
-# no claim to fail on. It is a claim now, because the answer is no longer "a gap
-# nobody has closed": aarch64 delivers at a trap and x86_64 does not, and the
-# program asserts *that*, per kernel. It sits ungrouped so both arms run it.
+# no claim to fail on. It is a claim now, and since 2026-11-13 the claim is the
+# same on both machines: both deliver at the trap, so `t-iret` asserts Linux's
+# answer unconditionally. It sits ungrouped so both arms run it.
 diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 
 # The first machine's own half. Empty, and an empty section is that machine's

@@ -1,27 +1,29 @@
 //! t-iret - where a handled signal is handed over: at a trap, or at a system call.
 //!
-//! **A claim, with an expectation per kernel rather than per architecture.**
+//! **A claim, and now the same claim on every kernel this runs on.**
 //! The question is a single sentence: *does a handler run for a task that has
 //! not entered the kernel since the signal was posted?* Linux hands a handled
 //! signal over on the return to ring 3 from **any** trap, so a task that
 //! computes in a tight loop and makes no calls is interrupted at the next tick.
 //!
-//! This kernel does that on aarch64 since 2026-11-12 (`docs/notes/` §2.13): the
-//! EL0 interrupt stub builds a whole `UserFrame` and the entry hands it to
-//! `hal::kernel::deliver_at_trap` before it preempts. It does **not** on
-//! x86_64, where the interrupt entry is an `extern "x86-interrupt"` fn whose
-//! frame carries `RIP`/`CS`/`RFLAGS`/`RSP`/`SS` only - the general-purpose
-//! registers are saved below it, where Rust has no name for them - so
-//! `Gate::capture_trap_regs` answers `false` and the signal goes back to the
-//! pending set for the next syscall to find.
+//! aarch64 has done that since 2026-11-12 (`docs/notes/` §2.13): the EL0
+//! interrupt stub builds a whole `UserFrame` and the entry hands it to
+//! `hal::kernel::deliver_at_trap` before it preempts. x86_64 followed on
+//! 2026-11-13 by a different route, because its `extern "x86-interrupt"` frame
+//! carries `RIP`/`CS`/`RFLAGS`/`RSP`/`SS` and saves the general registers below
+//! it where Rust has no name for them: the PIT entry became a hand-written stub
+//! pushing a `TrapRegs` block, which is the same object shape the syscall gate
+//! builds, so one `Gate::capture_trap_regs` now serves both doors.
 //!
-//! So the expectation is not `cfg!(target_arch)`: a *host* run is Linux on
-//! either architecture and does hand over at a trap, while the x86_64 *guest*
-//! does not. `expect_trap` below asks which kernel is running instead, which is
-//! the thing the reading is about.
+//! Which means the expectation is no longer per kernel - there is one answer
+//! left, and the program asserts it unconditionally. It asserted the *gap* on
+//! x86_64 until this landed, which is how the change was known to be finished:
+//! that arm reddened the moment the stub started delivering, and named its own
+//! line. A claim that quietly accepted either answer would have pinned nothing
+//! on either machine.
 //!
-//! The difference is not academic: it is why `Ctrl-C` does not interrupt a
-//! program that is computing rather than calling.
+//! The difference was never academic: it is why `Ctrl-C` did not interrupt a
+//! program that was computing rather than calling.
 //!
 //! ## The measurement, and why it is two measurements
 //!
@@ -61,12 +63,13 @@
 //! host): `loop left by THE SIGNAL after N iteration(s)` with N far below the
 //! limit. This kernel on aarch64: the same shape - measured 11 337 551 of
 //! 400 000 000 (`build/test-lane-aarch64-4/serial.log`, 2026-11-12). This kernel
-//! on x86_64: `loop left by count exhaustion`, with the timer already expired.
+//! on x86_64 after the stub: the same shape again - measured 18 913 221 of
+//! 400 000 000 (`build/boot-iret-x86.log`, 2026-11-13), with the pre-stub
+//! reading `count exhaustion` and the timer already expired.
 //!
-//! The x86_64 arm asserts *that* - the gap, stated as the current measured
-//! behaviour rather than left unpinned - so the day the naked tick stub lands
-//! this program reddens and says which line to change. A claim that quietly
-//! accepted either answer would pin nothing on either machine.
+//! Three kernels, one answer. The claim below is therefore unconditional, and
+//! the only thing it can now say is whether *this* kernel's door is the trap
+//! door - which is the whole question.
 
 use mpos_user_tests::Report;
 
@@ -158,12 +161,6 @@ fn main() {
         libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut());
     }
 
-    // Which door this machine has, asked of the *kernel* rather than of the
-    // architecture: a host run is Linux, which delivers at a trap on both
-    // machines; the x86_64 guest cannot yet (`Gate::capture_trap_regs` is
-    // `false` there, `docs/notes/` §2.13).
-    let expect_trap = mpos_user_tests::host_run() || cfg!(target_arch = "aarch64");
-
     // 1. The control first, so the two readings are printed in the order that
     //    makes the contrast readable: what the loop does with no signal at all.
     //    This claim holds on every kernel - the loop must be able to finish.
@@ -182,30 +179,18 @@ fn main() {
     } else {
         "count exhaustion"
     };
-    if expect_trap {
-        r.check(
-            &format!(
-                "with a 30 ms CPU-time signal armed, the loop leaves at the signal: {left_by} after {armed_done} of {LIMIT} iteration(s)"
-            ),
-            armed_got && armed_done < LIMIT,
-        );
-    } else {
-        r.check(
-            &format!(
-                "with a 30 ms CPU-time signal armed, the loop runs to its limit ({armed_done} of {LIMIT}) because this kernel hands a handled signal over only at a system call (§2.13)"
-            ),
-            !armed_got && armed_done == LIMIT,
-        );
-    }
-
-    if armed_got {
-        println!(
-            "t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this kernel)"
-        );
-    } else {
-        println!(
-            "t-iret: the signal waited for a system call (the §2.13 gap remaining on this kernel)"
-        );
-    }
+    // One claim, one expected answer: Linux's. The loop must leave early *and*
+    // it must have left because the handler ran - `armed_got` alone would pass
+    // for a loop that broke on something else, and `armed_done < LIMIT` alone
+    // would pass for a compiler that elided the loop.
+    r.check(
+        &format!(
+            "with a 30 ms CPU-time signal armed, the loop leaves at the signal: {left_by} after {armed_done} of {LIMIT} iteration(s)"
+        ),
+        armed_got && armed_done < LIMIT,
+    );
+    println!(
+        "t-iret: the signal was handed over at a trap (Linux's shape, §2.13 closed on this kernel)"
+    );
     r.finish();
 }
