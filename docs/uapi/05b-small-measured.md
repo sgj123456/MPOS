@@ -671,15 +671,21 @@ Section numbers are unchanged from the original `UAPI.md`.
   `O_CLOEXEC` are **not** reported, the first pair being spent by the open and the last being a
   *descriptor* flag (`F_GETFD`'s word). Two members of Linux's word stay deliberately missing here:
   `O_LARGEFILE`, which this kernel neither defines nor invents (`t-open-flags` pins that it is
-  ignored on both machines), and the three bits `SETFL_MASK` is narrower by - `O_ASYNC`,
-  `O_DIRECT` and `O_NOATIME` are **reported** when an open asked for them but cannot be *set*
-  through `F_SETFL`, where Linux's mask allows all three. (`O_NOATIME` itself is served now -
-  the open consults it and the read path honours it, item 108 - it is only `F_SETFL` that cannot
-  set it here.) A caller that compares the whole word
+  ignored on both machines), and two of the five bits Linux's `SETFL_MASK` carries - `O_ASYNC` and
+  `O_DIRECT` are **reported** when an open asked for them but cannot be *set* through `F_SETFL`.
+  Both are named residuals rather than oversights: `O_ASYNC` needs `fasync`/SIGIO plumbing this
+  kernel has none of (Linux itself reports it from `F_GETFL` only for an inode with an `fasync`
+  method, so `F_SETFL(O_ASYNC)` on a regular file returns 0 and the bit never appears there either),
+  and `O_DIRECT` has no direct-I/O path here and a machine-specific number (x86 `0o40000`, aarch64
+  `0o200000`), so one shared mask cannot name it for both machines. **`O_NOATIME` left this list
+  2026-11-13** (item 265): it is a member of `SETFL_MASK` now, so `F_SETFL` sets and clears it with
+  Linux's owner/`CAP_FOWNER` guard on the fresh 0->1 edge only, and the read path honours the
+  effective word - `t-setfl` is the pin, `docs/notes/` §6.148 the measurement. A caller that
+  compares the whole word
   against what it opened with now agrees on everything it can ask for, which is what `rustix::fs`'s
   `Dir` and any reopened `/proc/self/fd` entry read it for. Owner: `src/vfs/file.rs`'s
-  `File::born`/`set_born` and `open_flags`, set at the one open path. `docs/notes/` §15.16,
-  §15.67.
+  `File::born`/`set_born` and `open_flags`, set at the one open path; `SETFL_MASK` and
+  `setfl_fresh_noatime` for the changeable half. `docs/notes/` §15.16, §15.67, §6.148.
 - **`__WCLONE` narrows the wait to the kind of child `clone`'s low byte named, and
   the byte survives on the task. Landed 2026-10-18** (`docs/uapi/` §5.1 item 50).
   The bit is not a hint: Linux reads `clone`'s low byte at the *other* end and

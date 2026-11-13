@@ -11789,3 +11789,81 @@ on each; `t-rsssplit` ran in both arms (`build/test-costs-*.tsv`, 21/321 ms;
 **What this does not do.** The per-page CoW move (above) needs a page cache.
 `VmPTE`, `VmSwap`, `VmLck`/`VmPin` accounting and `statm.dirty` stay honest
 zeros, as items 222/232 record.
+
+---
+
+**Item 265**, landed 2026-11-13.
+
+### Item 265 `F_SETFL` can set and clear `O_NOATIME`, with Linux's guard
+
+`docs/uapi/05b-small-measured.md` §5.2's F_GETFL bullet said what this kernel's
+`SETFL_MASK` is narrower by: "`O_ASYNC`, `O_DIRECT` and `O_NOATIME` are
+**reported** when an open asked for them but cannot be *set* through `F_SETFL`,
+where Linux's mask allows all three." One of the three was an open door: the
+`O_NOATIME` guard at the open and the atime check in `File::read` both already
+existed; only the `F_SETFL` door was missing.
+
+**Measured on Linux 7.2.14** (`build/scratch/setfl/{p,q,r,s,t,u}.c`, `gcc -O1`,
+uid 1000 plus a `sudo -n` setuid child for the authority half):
+
+| call | result |
+|---|---|
+| plain file `F_GETFL` | `0x8002` |
+| `F_SETFL(O_NOATIME)` | `0`, `F_GETFL` = `0x48002` |
+| `F_SETFL(0)` | `0`, `F_GETFL` = `0x8002` |
+| open `O_NOATIME`, then `F_SETFL(0)` | `0`, `F_GETFL` = `0x8002` (cleared) |
+| `F_SETFL(O_DIRECT)` | `0`, `F_GETFL` = `0xc002` |
+| `F_SETFL(O_ASYNC)`, regular file | `0`, `F_GETFL` unchanged (`0x8002`) |
+| `F_SETFL(O_ASYNC)`, pipe/socket | `0`, `F_GETFL` gains `0x2000` |
+| atime forced to `1000000000`, plain read | atime moves |
+| ... `F_SETFL(O_NOATIME)`, read | atime stays `1000000000` |
+| ... clear the bit, read | atime moves again |
+| stranger's **fresh** set | `EPERM`, stores none of the word |
+| stranger re-affirms (1->1) / clears (1->0) | `0` |
+
+The guard is on the **edge**, not the bit: Linux's
+`if ((arg & O_NOATIME) && !(filp->f_flags & O_NOATIME) && !inode_owner_or_capable(...))`.
+`F_SETFL(O_NOATIME|O_NONBLOCK)` by a stranger is `EPERM` and stores neither
+bit - the refusal covers the whole call. And `O_ASYNC` is not a `SETFL_MASK`
+member `F_GETFL` reports for a regular file at all: it is `FASYNC`, set by
+`fasync_helper` where the inode has a method, which is why a pipe and a socket
+show it and a regular file does not.
+
+**What landed.** `SETFL_MASK = O_APPEND | O_NONBLOCK | O_NOATIME`
+(`src/vfs/file.rs:106`). The `born`/`status` split needed no new field: the open
+writes both halves, so widening the mask moves an open's `O_NOATIME` from the
+immutable half to the changeable one - reported once, from `status`, and now
+clearable by a later `F_SETFL`, as Linux's is. `File::read` asks
+`open_flags()` (the effective word) rather than `born()` for the atime decision;
+with the widened mask `born()` is always 0 there, so the flag would have been
+reported without teeth. The authority check is the pure, host-tested
+`setfl_fresh_noatime(arg, old_flags)` (`src/vfs/file.rs:119`), asked by the
+`F_SETFL` arm before `set_status` so a refusal stores nothing.
+
+**Pins.** `user/tests/src/bin/t-setfl.rs` (new, 9 claims): the word's set and
+clear in both directions, the atime teeth with the clock forced to
+`1000000000`, the two-bit word, the narrow `O_ASYNC` claim (reported from the
+open's word, not a status bit), and the stranger's `EPERM` - guest-only, since a
+host run is uid 1000 and cannot drop, printing the same `note:` `t-atime` does.
+Green on real Linux (`MPOS_ON_HOST=1`) and in the guest
+(`build/scratch/oneshot-setfl.log`, 9/9). Host unit tests:
+`the_noatime_guard_asks_only_for_a_fresh_set`,
+`a_setfl_noatime_set_after_open_leaves_the_access_clock_alone` (red when `read`
+asks `born()`), and `the_reported_word_holds_what_the_open_asked_for` rewritten
+for the widened mask. `t-fcntl`'s header and one claim label were corrected;
+its other `F_SETFL` claims pass no `O_NOATIME` so the guard never fires there.
+**Guest counterfactual** (`build/scratch/oneshot-setfl-cf.log`): with the old
+mask and `read` back on `born()`, four claims redden while the stranger's
+`EPERM` stays green - the pin measures the door, not the flag. Full gate
+`build/gate-setfl.log` `GATE_EXIT=0`: stage 1 1313 tests, 0 failed, lint
+162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting clean in both
+workspaces, fuzz 23 targets, x86_64 `pass=309 fail=0`, aarch64 `pass=308 fail=0`,
+`mpos-kunit 35 passed, 0 failed` on each; `t-setfl` ran in both arms
+(`build/test-costs-*.tsv`, 20/239 ms; `=== PASS t-setfl` in both lane serial
+logs).
+
+**What this does not do.** `O_ASYNC` (needs `fasync`/SIGIO delivery) and
+`O_DIRECT` (no direct-I/O path, and a machine-specific number - x86 `0o40000`,
+aarch64 `0o200000`) stay out of the mask and stay named in
+`docs/uapi/05b-small-measured.md` §5.2. Nothing here claims a description can be
+made direct.

@@ -2041,11 +2041,13 @@ answers `filp->f_flags`, so a caller that compares the word against what it open
 mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  
 this kernel answered the mode plus `O_APPEND` and `O_NONBLOCK` and nothing else. The open now records  
 the word it was asked for (`File::born`), minus exactly what the open *spends* (the creation flags  
-and `O_CLOEXEC`, which is a descriptor flag), and `F_SETFL` still reaches only its own two bits — the  
+and `O_CLOEXEC`, which is a descriptor flag), and `F_SETFL` still reaches only its own bits — the  
 split Linux's mask makes rather than a rule of this kernel. Two members of Linux's word stay  
 deliberately missing and named in `docs/uapi/` §5.2: `O_LARGEFILE`, which this kernel neither defines  
-nor invents, and the three bits its `SETFL_MASK` is narrower by (`O_ASYNC`, `O_DIRECT`, `O_NOATIME`  
-are reported when an open asked for them but cannot be set afterwards).
+nor invents, and two of the five bits Linux's `SETFL_MASK` carries (`O_ASYNC` and `O_DIRECT` are  
+reported when an open asked for them but cannot be set afterwards — `O_ASYNC` for want of  
+`fasync`/SIGIO plumbing, `O_DIRECT` for want of a direct-I/O path and because its number is  
+machine-specific). The third, `O_NOATIME`, became settable 2026-11-13 (§6.148, item 265).
 
 **The device tree removes a directory it made** (`docs/uapi/` §5.1 item 48, landed 2026-10-18): the  
 `mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` a boot printed once per boot was udev's  
@@ -2541,3 +2543,27 @@ carries the per-phase history.*
   `the_rss_lines_and_statm_shared_are_read_from_the_split` (counterfactually red against the old
   whole/0/0 renderer). Gate `build/gate-rsssplit-final.log` `GATE_EXIT=0`: stage 1 1311 tests, x86_64
   `pass=308`, aarch64 `pass=307`, kunit 35/0, lint/formatting clean, fuzz 23. (§6.147, item 264)
+
+- **`F_SETFL` can set `O_NOATIME`, and the flag has teeth** (`docs/notes/` §6.148, item 265).
+  `docs/uapi/05b-small-measured.md` §5.2 had carried one sentence for months: `SETFL_MASK` here is
+  narrower than Linux's by `O_ASYNC`, `O_DIRECT` and `O_NOATIME`, all three *reported* when an open
+  asked for them but none *settable*. Measured on Linux 7.2.14 (`build/scratch/setfl/{p,q,r,s,t,u}.c`):
+  `F_SETFL(O_NOATIME)` sets and clears the bit in both directions (an open's own bit included),
+  the bit is obeyed (atime forced to `1000000000` stays put through a read, moves again once the bit
+  is cleared), and a **fresh** 0->1 set by a caller that is neither owner nor `CAP_FOWNER` is `EPERM`
+  with no partial store - while re-affirming (1->1) and clearing (1->0) are served. `SETFL_MASK` gains
+  `O_NOATIME`; the `born`/`status` split needs no new field because the open writes both halves, so
+  the bit moves from the immutable half to the changeable one and a later `F_SETFL` can clear it, as
+  Linux's can. The teeth are one line: `File::read` asked `born()` (always 0 after the widening) and
+  asks the effective `open_flags()` now. The guard is a pure host-tested predicate
+  (`setfl_fresh_noatime`) because the `F_SETFL` arm is bare-metal only, and it refuses **before**
+  `set_status` so a refusal stores nothing. **Named residuals**: `O_ASYNC` needs `fasync`/SIGIO
+  plumbing this kernel has none of (Linux itself reports it only for an inode with a method - a
+  regular file's `F_SETFL(O_ASYNC)` returns 0 and the bit never appears), and `O_DIRECT` has no
+  direct-I/O path here and a machine-specific number (x86 `0o40000`, aarch64 `0o200000`). Pins:
+  `t-setfl` (9 claims - green on real Linux and in the guest, including the guest-only stranger
+  `EPERM`), three host unit tests, and a guest counterfactual that reddens four claims with the old
+  mask and keeps the `EPERM` one green (`build/scratch/oneshot-setfl-cf.log`). Gate
+  `build/gate-setfl.log` `GATE_EXIT=0`: stage 1 1313 tests, x86_64 `pass=309`, aarch64 `pass=308`,
+  kunit 35/0 each, lint 162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting and fuzz clean,
+  `t-setfl` green in both arms. (§6.148, item 265)

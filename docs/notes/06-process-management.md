@@ -13352,3 +13352,112 @@ A shared file mapping whose inode is a dma-buf or framebuffer is counted as
 `RssFile` (its object is not shmem), which is Linux's answer for a page cache
 backed by a device file, but this kernel serves it from a private copy rather
 than a shared page - the same model boundary, not a new gap.
+
+## §6.148 `F_SETFL` can set `O_NOATIME`, and the flag has teeth (LANDED 2026-11-13)
+
+`docs/uapi/05b-small-measured.md` §5.2 carried one sentence for months: "the
+three bits `SETFL_MASK` is narrower by - `O_ASYNC`, `O_DIRECT` and `O_NOATIME`
+are **reported** when an open asked for them but cannot be *set* through
+`F_SETFL`, where Linux's mask allows all three." It is a small, machine-
+independent, host-measurable divergence with a working `O_NOATIME` implementation
+already behind it - the open's guard and the read's atime check both existed. What
+was missing was the *door*.
+
+### What Linux actually does (measured, Linux 7.2.14, uid 1000)
+
+`build/scratch/setfl/{p,q,r,s,t,u}.c`, `gcc -O1`:
+
+| call | result |
+|---|---|
+| plain file `F_GETFL` | `0x8002` (no `O_NOATIME`) |
+| `F_SETFL(O_NOATIME)` | `0`, `F_GETFL` = `0x48002` |
+| `F_SETFL(0)` after that | `0`, `F_GETFL` = `0x8002` |
+| open with `O_NOATIME`, then `F_SETFL(0)` | `0`, `F_GETFL` = `0x8002` - **cleared** |
+| `F_SETFL(O_DIRECT)` | `0`, `F_GETFL` = `0xc002` |
+| `F_SETFL(O_ASYNC)` on a regular file | `0`, but `F_GETFL` stays `0x8002` |
+| `F_SETFL(O_ASYNC)` on a pipe or socket | `0`, `F_GETFL` gains `0x2000` |
+| atime forced to `1000000000`, plain read | atime moves to the read's moment |
+| ... `F_SETFL(O_NOATIME)` then read | atime **stays** `1000000000` |
+| ... clear the bit, read again | atime moves again |
+
+Two things this settles that a man page does not. **`O_ASYNC` is not one of the
+bits `F_GETFL` reports for a regular file** - it is `filp->f_flags`' `FASYNC`
+half, set by `fasync_helper` when the inode has an `fasync` method, and Linux
+itself reports it only where one exists (pipe, socket). **A fresh 0->1
+`O_NOATIME` set is guarded** and the guard is on the *edge*, not on the bit: with
+`sudo -n` (root opens the file, the child `setuid(1000)`), a stranger's fresh set
+is `EPERM` while re-affirming an already-set bit (1->1) and clearing it (1->0)
+both answer 0. `F_SETFL(O_NOATIME|O_NONBLOCK)` by a stranger is `EPERM` **and
+stores neither bit** - the refusal covers the whole call. Linux's own shape is
+`if ((arg & O_NOATIME) && !(filp->f_flags & O_NOATIME) && !inode_owner_or_capable(...)) return -EPERM`.
+
+### What landed
+
+`SETFL_MASK` is `O_APPEND | O_NONBLOCK | O_NOATIME` now (`src/vfs/file.rs:106`).
+The two Linux members it still lacks are **named residuals with reasons**, not
+oversights: `O_ASYNC` needs `fasync`/SIGIO plumbing this kernel has none of (and
+would be a "success" for a mechanism that does not exist), and `O_DIRECT` has no
+direct-I/O path here *and* a machine-specific number (x86 `0o40000`, aarch64
+`0o200000`), so one shared mask cannot name it for both machines.
+
+The `born`/`status` split needed no new field, and the reason is worth writing
+down because it looked like a knot for a while. `open_flags() = access | (status &
+SETFL_MASK) | born()`, and `born() = born.load() & !SETFL_MASK`. Widening the mask
+means an open's `O_NOATIME` moves from the *born* half to the *status* half - but
+the open calls **both** `set_status(flags)` and `set_born(flags)`, so the bit is
+reported exactly once, from status, and a later `F_SETFL` can now clear it. That
+is how `O_APPEND` has always behaved. The behaviour change toward Linux is
+deliberate: the old kernel kept an open's `O_NOATIME` in the immutable half for
+ever, so `F_SETFL(0)` could not take it back, and Linux's can.
+
+The teeth are one line (`src/vfs/file.rs:474`): `read` asked
+`self.born() & O_NOATIME`, which after the widening is *always* 0 - so a
+`F_SETFL(O_NOATIME)` would have reported the bit and still moved the clock. It
+asks `self.open_flags()` now, the effective word, which is what Linux's
+`file_accessed` reads.
+
+The guard is a pure host-testable function, `setfl_fresh_noatime(arg, old_flags)`
+(`src/vfs/file.rs:119`), because the syscall layer that calls it is
+`#[cfg(target_os = "none")]` and has no host tests. The `F_SETFL` arm asks it
+first and returns `EPERM` **before** `set_status`, so a refusal stores nothing -
+the ordering is the measurement, not a convenience.
+
+### Pins and counterfactuals
+
+- `user/tests/src/bin/t-setfl.rs` (new, 9 claims): the word's set/clear in both
+  directions (including clearing a bit the open carried), the atime teeth with
+  the clock forced to `1000000000`, the two-bit word, the narrow `O_ASYNC` claim,
+  and the stranger's `EPERM` - that last one guest-only, printing the same
+  `note:` `t-atime` does when a host run cannot drop below uid 1000. Green on
+  real Linux (`MPOS_ON_HOST=1`, 8/8 + the note) and in the guest (9/9,
+  `build/scratch/oneshot-setfl.log`), and in **both** gate arms
+  (`=== PASS t-setfl` in `build/test-lane-x86_64-3/serial.log` and
+  `build/test-lane-aarch64-2/serial.log` - the aarch64 arm shows all nine
+  claims, the stranger's `EPERM` included; `build/test-costs-*.tsv` 20/239 ms).
+- **Guest counterfactual** (`build/scratch/oneshot-setfl-cf.log`): with
+  `SETFL_MASK` narrowed back and `read` reverted to `born()`, four claims redden -
+  `F_SETFL sets O_NOATIME`, `and clears one an open had asked for`, `the set bit
+  leaves the access clock alone`, `O_NOATIME|O_NONBLOCK sets both` - and the
+  stranger's `EPERM` still passes, because the guard was already there at the
+  open. That split is the point: the pin measures the door, not the flag.
+- Host unit tests: `the_noatime_guard_asks_only_for_a_fresh_set` (the five edges
+  of the predicate), `a_setfl_noatime_set_after_open_leaves_the_access_clock_alone`
+  (three reads over one inode, clock forced to 1000 - counterfactually **red**
+  when `read` asks `born()`), and `the_reported_word_holds_what_the_open_asked_for`
+  rewritten to assert `ACC_WRONLY | O_SYNC | O_NOATIME` for a
+  `set_status(O_ASYNC | O_NOATIME)` - the counterfactual for the widened mask.
+- `t-fcntl`'s header and one claim label were rewritten (`O_NOATIME` is settable
+  now; its assertion was about the open's word and still holds). Its other six
+  `F_SETFL` claims pass no `O_NOATIME`, so the guard never fires.
+- Full gate `build/gate-setfl.log`, `GATE_EXIT=0`: stage 1 **1313 tests, 0
+  failed**; lint 162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1 (the six-arm
+  ratchet - the widened mask added no diagnostic); formatting clean in both
+  workspaces; fuzz 23 targets; x86_64 `pass=309 fail=0`, aarch64 `pass=308
+  fail=0`, `mpos-kunit 35 passed, 0 failed` on each.
+
+### What is still not covered
+
+`O_ASYNC` (needs `fasync`/SIGIO delivery - Linux's own reporting of it depends on
+the inode having a method) and `O_DIRECT` (no direct-I/O path, machine-specific
+number). Both stay in `docs/uapi/05b-small-measured.md` §5.2. `F_SETFL` still
+cannot make a description *direct*, and nothing here claims it can.
