@@ -373,7 +373,12 @@ pub(crate) struct Loaded {
 /// position-independent program's is the address its layout drew. A fixed one
 /// keeps zero, because the addresses in its own instructions are the ones it
 /// expects to run at.
-fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &mut Vec<usize>) {
+fn map_image(
+    space: &mut AddressSpace,
+    image: &Image<'_>,
+    base: usize,
+    frames: &mut Vec<usize>,
+) -> bool {
     for segment in &image.segments {
         let vaddr = base + segment.vaddr;
         let first = pframe::align_down(vaddr, PAGE_SIZE);
@@ -390,12 +395,20 @@ fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &
             dest.fill(0);
             // The slice of the file this page carries; everything beyond it up
             // to `memsz` stays zero, which is what .bss is.
-            let file_end = vaddr + segment.data.len();
+            let file_end = vaddr + segment.filesz;
             let from = page.max(vaddr);
             let to = (page + PAGE_SIZE).min(file_end);
             if from < to {
-                dest[from - page..to - page]
-                    .copy_from_slice(&segment.data[from - vaddr..to - vaddr]);
+                // The bytes come out of the image's source, one page at a
+                // time. `read_at` answering short is a file that cannot answer
+                // for the range its own header named; the caller refuses the
+                // image rather than placing a page of somebody else's bytes.
+                let at = segment.offset + (from - vaddr);
+                let want = to - from;
+                let got = image.source.read_at(at, &mut dest[from - page..to - page]);
+                if got != Some(want) {
+                    return false;
+                }
             }
             let mut flags = MapFlags::READ | MapFlags::USER;
             flags.insert(segment.flags & (MapFlags::WRITE | MapFlags::EXEC));
@@ -407,6 +420,7 @@ fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &
             });
         }
     }
+    true
 }
 
 /// Apply `image`'s R_X86_64_RELATIVE relocations for a load address of `base`.
@@ -501,20 +515,24 @@ pub(crate) fn load_user(
     // the same argument block. Passed in rather than computed here because the
     // caller is the one that filled that block, and the two must be one number.
     user_rsp: usize,
-) -> Loaded {
+) -> Result<Loaded, SpawnError> {
     let mut frames = Vec::new();
     let mut ranges = Vec::new();
 
     let base = match interp {
         Some(interp) => {
-            map_image(space, interp, layout.interp_bias, &mut frames);
+            if !map_image(space, interp, layout.interp_bias, &mut frames) {
+                return Err(SpawnError::NotExecutable);
+            }
             segment_ranges(interp, layout.interp_bias, interp_name, &mut ranges);
             layout.interp_bias
         }
         None => 0,
     };
 
-    map_image(space, image, layout.bias, &mut frames);
+    if !map_image(space, image, layout.bias, &mut frames) {
+        return Err(SpawnError::NotExecutable);
+    }
     segment_ranges(image, layout.bias, Some(program_name), &mut ranges);
     if interp.is_none() {
         apply_rela(space, image, layout.bias);
@@ -599,10 +617,10 @@ pub(crate) fn load_user(
         let start = layout.bias + segment.vaddr;
         if segment.flags.contains(MapFlags::EXEC) {
             start_code = start_code.min(start);
-            end_code = end_code.max(start + segment.data.len());
+            end_code = end_code.max(start + segment.filesz);
         }
         start_data = start_data.max(start);
-        end_data = end_data.max(start + segment.data.len());
+        end_data = end_data.max(start + segment.filesz);
         memsz_end = memsz_end.max(start + segment.memsz);
     }
     let mut bounds = ImageBounds {
@@ -615,7 +633,7 @@ pub(crate) fn load_user(
         ..ImageBounds::default()
     };
 
-    Loaded {
+    Ok(Loaded {
         entry,
         at_entry: layout.bias + image.entry,
         at_phdr: layout.bias + image.phdr_addr,
@@ -632,7 +650,7 @@ pub(crate) fn load_user(
         ranges: merge_ranges(ranges),
         frames,
         bounds,
-    }
+    })
 }
 
 /// Record what one image's segments occupy, at the load address they were
@@ -739,7 +757,8 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         STARTED.load(Ordering::Relaxed),
         "spawn_init() was called before sched::init()"
     );
-    let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
+    let source = crate::mm::elf::Bytes(bytes);
+    let image = elf::parse(&source).ok_or(SpawnError::NotExecutable)?;
     // Whether init has an interpreter depends on which init it is. The kernel
     // used to start its own program, statically linked, when the initramfs was
     // the root and no filesystem was up to read a loader from. The machine now
@@ -784,7 +803,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             "",
             interp_name,
             user_rsp,
-        );
+        )?;
         write_arg_block(space.root(), user_rsp, argv, env, "", &mut loaded);
 
         let root = space.root();
@@ -944,7 +963,8 @@ pub fn try_spawn_user(
         STARTED.load(Ordering::Relaxed),
         "spawn_user() was called before sched::init()"
     );
-    let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
+    let source = crate::mm::elf::Bytes(bytes);
+    let image = elf::parse(&source).ok_or(SpawnError::NotExecutable)?;
     // The interpreter, found the same way `execve` finds it. This used to pass
     // none, on the assumption that only `execve` starts dynamic programs -
     // which held only while every program the kernel started itself was static.
@@ -987,7 +1007,7 @@ pub fn try_spawn_user(
             exe,
             interp_name,
             user_rsp,
-        );
+        )?;
         // Read before the space moves into the task: a thread switches to
         // this root, and the group is what remembers it.
         let root = space.root();

@@ -15,7 +15,6 @@
 //! the kernel does no part of *that* relocation itself.
 
 use alloc::vec::Vec;
-use elf::ElfBytes;
 use elf::abi::{
     DT_RELA, DT_RELAENT, DT_RELASZ, EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_DYNAMIC,
     PT_INTERP, PT_LOAD, R_AARCH64_RELATIVE, R_X86_64_RELATIVE,
@@ -33,7 +32,7 @@ pub struct Image<'a> {
     /// Where control is transferred to, in the lower half.
     pub entry: usize,
     /// The loadable segments, in file order.
-    pub segments: Vec<Segment<'a>>,
+    pub segments: Vec<Segment>,
     /// Virtual address of the program header table (for AT_PHDR auxv).
     pub phdr_addr: usize,
     /// Number of program headers (for AT_PHNUM auxv).
@@ -71,16 +70,103 @@ pub struct Image<'a> {
     /// this module has never heard of one. It reports it so that the caller,
     /// which does have a filesystem, can load what the image points at.
     pub interp: Option<Vec<u8>>,
+    /// Where the segment bytes live. The image describes the program; this is
+    /// how the loader gets the bytes for a page without holding the file.
+    pub source: &'a dyn Source,
 }
 
-/// One `PT_LOAD` segment: file bytes to place at `vaddr`, zero-filled out to
-/// `memsz`, with the permissions the program header asked for.
-pub struct Segment<'a> {
+/// Where an image's bytes come from.
+///
+/// An `exec` must not read a program into one allocation: the kernel heap's
+/// largest block is 64 MiB (`mm::pframe::MAX_ORDER`), so a 296 MB binary - a
+/// browser - could never be loaded that way, and the failure surfaced as
+/// `ENOSPC` from a `Vec::try_reserve_exact` (`docs/notes/` §"the image is read
+/// in pieces"). A *file* is a source: the loader asks for the one page it is
+/// about to place, so the allocation is the page, not the program.
+///
+/// `&[u8]` is a source too, which is how every host test and the kernel's own
+/// in-memory spawns parse without a filesystem behind them.
+pub trait Source {
+    /// Bytes the source can answer for.
+    fn len(&self) -> usize;
+    /// Read `buf.len()` bytes at `offset`. `Some(n)` is a short read only at
+    /// end of file; `None` is a source that cannot answer at all.
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize>;
+
+    /// Nothing to read. A default rather than a required answer: it is asked
+    /// once, to refuse a file too short to hold a header, and every source says
+    /// the same thing.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Source for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let available = self.len().checked_sub(offset)?;
+        let count = available.min(buf.len());
+        buf[..count].copy_from_slice(&self[offset..offset + count]);
+        Some(count)
+    }
+}
+
+impl Source for &[u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let available = self.len().checked_sub(offset)?;
+        let count = available.min(buf.len());
+        buf[..count].copy_from_slice(&self[offset..offset + count]);
+        Some(count)
+    }
+}
+
+/// A borrowed slice as a [`Source`]: the in-memory images the kernel's own
+/// spawns and every host test parse.
+pub struct Bytes<'a>(pub &'a [u8]);
+
+impl Source for Bytes<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        self.0.read_at(offset, buf)
+    }
+}
+
+impl Source for Vec<u8> {
+    fn len(&self) -> usize {
+        <[u8]>::len(self.as_slice())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        self.as_slice().read_at(offset, buf)
+    }
+}
+
+/// One `PT_LOAD` segment: `filesz` file bytes from `offset` placed at `vaddr`,
+/// zero-filled out to `memsz`, with the permissions the program header asked
+/// for.
+///
+/// The bytes are *not* held here. They are in the [`Image`]'s source at
+/// `offset`, and the loader reads the one page it is placing. Holding them was
+/// the whole-file allocation a large program cannot survive.
+pub struct Segment {
     pub vaddr: usize,
-    /// The bytes that come from the file, `p_filesz` of them.
-    pub data: &'a [u8],
+    /// File offset of the segment's first byte (`p_offset`).
+    pub offset: usize,
+    /// File bytes the segment carries (`p_filesz`) - the part of the segment
+    /// that is not .bss.
+    pub filesz: usize,
     /// How far the segment runs in memory (`p_memsz`), never shorter than
-    /// [`Segment::data`]; the tail is what .bss is.
+    /// [`Segment::filesz`]; the tail is what .bss is.
     pub memsz: usize,
     pub flags: MapFlags,
 }
@@ -145,65 +231,141 @@ pub const MMAP_BASE: usize = 0xff00_0000_0000;
 /// this loader does not understand.
 const RELA64_RECORD: usize = 24;
 
-/// Parse `bytes` as an executable image, or `None` if it is not one this
-/// kernel is willing to load.
-pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
-    // The crate verifies the magic, the ELF version, the endianness (a
-    // big-endian file fails the ident parse against `LittleEndian`) and that
-    // every table it hands out lies inside `bytes`. ELF32 is refused here:
-    // the loader's placement and relocation math assume the 64-bit shapes.
-    let file = ElfBytes::<LittleEndian>::minimal_parse(bytes).ok()?;
-    if file.ehdr.class != Class::ELF64 {
+/// An ELF64 program header is a fixed 56-byte record.
+const PHDR64_SIZE: usize = 56;
+
+/// The largest piece of a file a parse pulls into memory at once: the header
+/// and its program header table, the interpreter path, the dynamic entries, and
+/// the RELA table. The program's own bytes are never among them - the loader
+/// reads those one page at a time through [`Source`], which is what lets a 296
+/// MB binary load on a heap whose largest block is 64 MiB.
+const META_MAX: usize = 1 << 20;
+const INTERP_MAX: usize = 4096;
+const DYNAMIC_MAX: usize = 64 << 10;
+const RELA_MAX: usize = 4 << 20;
+
+/// Read exactly `buf.len()` bytes, or nothing. A short read is a file that ends
+/// where its own header said it did not.
+fn read_exact(source: &dyn Source, offset: usize, buf: &mut [u8]) -> Option<()> {
+    match source.read_at(offset, buf) {
+        Some(count) if count == buf.len() => Some(()),
+        _ => None,
+    }
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+    bytes
+        .get(at..at + 2)
+        .map(|f| u16::from_le_bytes([f[0], f[1]]))
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes
+        .get(at..at + 4)
+        .map(|f| u32::from_le_bytes([f[0], f[1], f[2], f[3]]))
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+    bytes
+        .get(at..at + 8)
+        .map(|f| u64::from_le_bytes(f.try_into().expect("eight bytes")))
+}
+
+/// Pull one bounded file range into memory, or `None` when the file cannot
+/// answer for it inside `cap`.
+fn read_range(source: &dyn Source, offset: u64, len: u64, cap: usize) -> Option<Vec<u8>> {
+    let (offset, len) = (usize::try_from(offset).ok()?, usize::try_from(len).ok()?);
+    if len > cap || offset.checked_add(len)? > source.len() {
         return None;
     }
-    // Which machine the file is built for decides which relative-relocation kind
-    // this loader will apply: `R_X86_64_RELATIVE` (8) and `R_AARCH64_RELATIVE`
-    // (1027) mean the same thing - store `base + addend` at the offset - but are
-    // numbered per psABI. The `elf` crate's own ident check would already have
-    // rejected a file that does not parse, but it says nothing about the machine,
-    // so an unvalidated loader would accept an image for a foreign ISA, read none
-    // of its relocations (the kind would not match the hardcoded constant), and
-    // place a broken program that faults on its first `.got` access. Refuse a
-    // machine we do not know here; whether *this* kernel should exec a file built
-    // for the other known machine is the caller's `machine` check, not the
-    // parser's - the parser is bytes-in, image-out, and host-testable for both.
-    let machine = file.ehdr.e_machine;
+    let mut bytes = alloc::vec![0u8; len];
+    read_exact(source, offset, &mut bytes)?;
+    Some(bytes)
+}
+
+/// Parse `source` as an executable image, or `None` if it is not one this
+/// kernel is willing to load.
+///
+/// The header, the program header table and the two small tables a relocation
+/// pass needs are the only bytes this function holds. Everything the crate
+/// used to give us by parsing the *whole* file is read here, in bounded pieces
+/// - the shape Linux's loader has, and the one a large program requires.
+pub fn parse(source: &dyn Source) -> Option<Image<'_>> {
+    let mut header = [0u8; 64];
+    if source.len() < header.len() {
+        return None;
+    }
+    read_exact(source, 0, &mut header)?;
+    if header[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    // ELFCLASS64, little endian, and the version this module understands.
+    if header[4] != 2 || header[5] != 1 || header[6] != 1 {
+        return None;
+    }
+    let e_type = u16_at(&header, 16)?;
+    let machine = u16_at(&header, 18)?;
+    // Which machine the file is built for decides which relative-relocation
+    // kind this loader applies: `R_X86_64_RELATIVE` (8) and
+    // `R_AARCH64_RELATIVE` (1027) mean the same thing but are numbered per
+    // psABI. An unvalidated loader would accept an image for a foreign ISA and
+    // read none of its relocations, placing a program that faults on its first
+    // `.got` access. The parser accepts both because it is bytes-in,
+    // image-out and host-testable for both; which machine the kernel may run is
+    // the caller's check.
     let relative = match machine {
         EM_X86_64 => R_X86_64_RELATIVE,
         EM_AARCH64 => R_AARCH64_RELATIVE,
         _ => return None,
     };
-    // Accept ET_EXEC (fixed-address) and ET_DYN (position independent). Both
-    // are statically parseable: the segments say what each piece is, and the
-    // only difference is whether the addresses in them are destinations or
-    // offsets. `pie` records which, and the loader is the code that has to act
-    // on it - an ET_EXEC mapped somewhere else would jump to where it *was*.
-    if file.ehdr.e_type != ET_EXEC && file.ehdr.e_type != ET_DYN {
+    // Accept ET_EXEC (fixed-address) and ET_DYN (position independent).
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return None;
     }
-    let entry = file.ehdr.e_entry;
-    let phoff = file.ehdr.e_phoff;
+    let entry = u64_at(&header, 24)?;
+    let phoff = u64_at(&header, 32)?;
+    let phentsize = u16_at(&header, 54)? as usize;
+    let phnum = u16_at(&header, 56)? as usize;
+    // Program headers are a fixed 56-byte record in ELF64; anything else is a
+    // table this loader does not know how to walk.
+    if phentsize != PHDR64_SIZE {
+        return None;
+    }
+    let table_len = phnum.checked_mul(PHDR64_SIZE)?;
+    let table_end = usize::try_from(phoff).ok()?.checked_add(table_len)?;
+    if table_end > source.len() || table_len > META_MAX {
+        return None;
+    }
+    let mut table = alloc::vec![0u8; table_len];
+    read_exact(source, usize::try_from(phoff).ok()?, &mut table)?;
 
     let mut segments = Vec::new();
-    let mut dyn_data: Option<&[u8]> = None;
-    let mut interp_data: Option<&[u8]> = None;
-    for phdr in file.segments()?.iter() {
-        if phdr.p_type == PT_DYNAMIC {
+    let mut dyn_range: Option<(u64, u64)> = None;
+    let mut interp_range: Option<(u64, u64)> = None;
+    for index in 0..phnum {
+        let phdr = &table[index * PHDR64_SIZE..(index + 1) * PHDR64_SIZE];
+        let p_type = u32_at(phdr, 0)?;
+        let p_flags = u32_at(phdr, 4)?;
+        let p_offset = u64_at(phdr, 8)?;
+        let p_vaddr = u64_at(phdr, 16)?;
+        let p_filesz = u64_at(phdr, 32)?;
+        let p_memsz = u64_at(phdr, 40)?;
+        if p_type == PT_DYNAMIC {
             // The dynamic entries the relocation pass reads below come from
             // the PT_DYNAMIC segment, the loader's authoritative source.
-            dyn_data = file.segment_data(&phdr).ok();
+            dyn_range = Some((p_offset, p_filesz));
         }
-        if phdr.p_type == PT_INTERP {
+        if p_type == PT_INTERP {
             // A NUL-terminated path to the interpreter. More than one such
             // segment is malformed, and the first is as good an answer as any.
-            interp_data = interp_data.or_else(|| file.segment_data(&phdr).ok());
+            interp_range = interp_range.or(Some((p_offset, p_filesz)));
         }
-        if phdr.p_type != PT_LOAD {
+        if p_type != PT_LOAD {
             continue;
         }
-        let vaddr = phdr.p_vaddr as usize;
-        let filesz = phdr.p_filesz as usize;
-        let memsz = phdr.p_memsz as usize;
+        let vaddr = usize::try_from(p_vaddr).ok()?;
+        let filesz = usize::try_from(p_filesz).ok()?;
+        let memsz = usize::try_from(p_memsz).ok()?;
         // The file image cannot be longer than the memory image: bytes past
         // `memsz` would have nowhere to live, and a header claiming so is
         // broken rather than merely unusual.
@@ -215,50 +377,71 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
         if vaddr.checked_add(memsz)? > USER_LIMIT {
             return None;
         }
-        // Zero-copy: the slice borrows straight out of `bytes`, with the
-        // crate having checked that the file range is inside it.
-        let data = file.segment_data(&phdr).ok()?;
-        // READ needs no bit: a present page is readable, as on the wire.
-        let mut flags = MapFlags::READ;
-        if phdr.p_flags & PF_W != 0 {
-            flags |= MapFlags::WRITE;
+        // The file range has to be inside the file. A segment claiming bytes
+        // past its end is a file that cannot be loaded, not a short read to
+        // paper over later.
+        let offset = usize::try_from(p_offset).ok()?;
+        if offset.checked_add(filesz)? > source.len() {
+            return None;
         }
-        if phdr.p_flags & PF_X != 0 {
-            flags |= MapFlags::EXEC;
+        // READ needs no bit: a present page is readable, as on the wire.
+        let mut segment_flags = MapFlags::READ;
+        if p_flags & PF_W != 0 {
+            segment_flags |= MapFlags::WRITE;
+        }
+        if p_flags & PF_X != 0 {
+            segment_flags |= MapFlags::EXEC;
         }
         if memsz > 0 {
             segments.push(Segment {
                 vaddr,
-                data,
+                offset,
+                filesz,
                 memsz,
-                flags,
+                flags: segment_flags,
             });
         }
     }
 
-    if entry as usize >= USER_LIMIT {
+    if usize::try_from(entry).ok()? >= USER_LIMIT {
         return None;
     }
 
     // For static-pie ET_DYN binaries the dynamic section lists RELA entries
     // that the runtime linker would process. We only handle the one
     // relative-relocation kind this machine's psABI names (write `base+addend`
-    // at `offset`), chosen by the `e_machine` gate above.
-    let rela = extract_rela(bytes, &file, dyn_data, relative);
+    // at `offset`). A table the file names but cannot answer for refuses the
+    // whole image: placing it without its relocations is a program that runs
+    // and then writes into the layout it was linked for.
+    let rela = match dyn_range {
+        Some((offset, len)) => match read_range(source, offset, len, DYNAMIC_MAX) {
+            Some(dyn_data) => extract_rela(source, &segments, &dyn_data, relative)?,
+            // A dynamic segment larger than the cap is a file whose own
+            // metadata is unreasonable; refuse rather than silently drop the
+            // relocations it names.
+            None if len > DYNAMIC_MAX as u64 => return None,
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
 
-    // Compute the virtual address of the program header table.  For both
+    // Compute the virtual address of the program header table. For both
     // ET_EXEC and ET_DYN the table lives inside the first PT_LOAD segment
     // (file offset 0), so the virtual address is base + e_phoff.
-    let phdr_addr = segments.first().map_or(0, |s| s.vaddr + phoff as usize);
+    let phdr_addr = segments.first().map_or(0, |segment| {
+        segment.vaddr + usize::try_from(phoff).unwrap_or(0)
+    });
     // The path loses its terminator here and keeps nothing else: the caller
     // hands it to the filesystem, which wants the name, not the padding.
-    let interp = interp_data.and_then(|bytes| {
-        let end = bytes
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(bytes.len());
-        (!bytes[..end].is_empty()).then(|| Vec::from(&bytes[..end]))
-    });
+    let interp = interp_range
+        .and_then(|(offset, len)| read_range(source, offset, len, INTERP_MAX))
+        .and_then(|bytes| {
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len());
+            (!bytes[..end].is_empty()).then(|| Vec::from(&bytes[..end]))
+        });
 
     // Every relocation *the kernel* will apply has to land inside something this
     // image actually mapped. `DT_RELA` is the one table read without checking it
@@ -267,22 +450,17 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     // program rather than into it.
     //
     // Asked of `interp` rather than of `PT_INTERP` itself, because that is the
-    // question the loader asks: `load_user` runs its relocation pass when there
-    // is no interpreter image to hand the job to, and an empty `PT_INTERP`
-    // yields no interpreter rather than a zero-length one. Checking the raw
-    // segment would skip the check on exactly the file the loader still
-    // relocates itself.
-    //
-    // Measured against `memsz`, not `filesz`: a `R_X86_64_RELATIVE` most often
-    // lands in `.got` or `.data.rel.ro`, and the tail of the last segment is
-    // `.bss`, which has no file bytes at all to be inside.
+    // question the loader asks: the relocation pass runs when there is no
+    // interpreter image to hand the job to. Measured against `memsz`, not
+    // `filesz`: a `R_*_RELATIVE` most often lands in `.got` or `.data.rel.ro`,
+    // and the tail of the last segment is `.bss`, which has no file bytes.
     if interp.is_none()
         && rela.iter().any(|&(offset, _)| {
-            !segments.iter().any(|s| {
-                s.vaddr <= offset
+            !segments.iter().any(|segment| {
+                segment.vaddr <= offset
                     && offset
                         .checked_add(core::mem::size_of::<u64>())
-                        .is_some_and(|end| end <= s.vaddr + s.memsz)
+                        .is_some_and(|end| end <= segment.vaddr + segment.memsz)
             })
         })
     {
@@ -290,31 +468,32 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     }
 
     Some(Image {
-        entry: entry as usize,
+        entry: usize::try_from(entry).ok()?,
         segments,
         phdr_addr,
         // Only a position-independent image may be placed elsewhere: the
         // addresses an `ET_EXEC` names are the ones its own code refers to.
-        pie: file.ehdr.e_type == ET_DYN,
+        pie: e_type == ET_DYN,
         machine,
-        phnum: file.ehdr.e_phnum as usize,
-        phent: file.ehdr.e_phentsize as usize,
+        phnum,
+        phent: phentsize,
         rela,
         interp,
+        source,
     })
 }
 
-/// Convert a virtual address to a file offset by finding the PT_LOAD segment
-/// that contains it.  Returns `None` if no segment covers `vaddr`.
-fn vaddr_to_offset(file: &ElfBytes<'_, LittleEndian>, vaddr: usize) -> Option<usize> {
-    for phdr in file.segments()?.iter() {
-        if phdr.p_type != PT_LOAD {
-            continue;
-        }
-        let base = phdr.p_vaddr as usize;
-        let memsz = phdr.p_memsz as usize;
-        if vaddr >= base && vaddr < base + memsz {
-            return Some(phdr.p_offset as usize + (vaddr - base));
+/// Convert a virtual address to a file offset by finding the `PT_LOAD` segment
+/// that contains it. `None` if the address is in no segment, or in one's
+/// zero-filled tail (which has no file bytes behind it).
+fn vaddr_to_offset(segments: &[Segment], vaddr: usize) -> Option<usize> {
+    for segment in segments {
+        if vaddr >= segment.vaddr && vaddr < segment.vaddr + segment.memsz {
+            let within = vaddr - segment.vaddr;
+            if within >= segment.filesz {
+                return None;
+            }
+            return Some(segment.offset + within);
         }
     }
     None
@@ -323,17 +502,15 @@ fn vaddr_to_offset(file: &ElfBytes<'_, LittleEndian>, vaddr: usize) -> Option<us
 /// Read the DYNAMIC section and extract this machine's relative relocations.
 ///
 /// `relative` is the `R_*_RELATIVE` number for the file's `e_machine`, chosen in
-/// `parse` - the one kind that needs nothing but a base address to apply.
+/// `parse`. `None` is a table the file names but cannot answer for - the caller
+/// refuses the image, because an image placed without its relocations runs and
+/// then writes into the layout it was linked for.
 fn extract_rela(
-    bytes: &[u8],
-    file: &ElfBytes<'_, LittleEndian>,
-    dyn_data: Option<&[u8]>,
+    source: &dyn Source,
+    segments: &[Segment],
+    dyn_data: &[u8],
     relative: u32,
-) -> Vec<(usize, i64)> {
-    let Some(dyn_data) = dyn_data else {
-        return Vec::new();
-    };
-
+) -> Option<Vec<(usize, i64)>> {
     // The crate parses each `(d_tag, d_val)` record; the table ends at the
     // first DT_NULL the iterator stops on.
     let mut rela_vaddr: Option<u64> = None;
@@ -349,36 +526,32 @@ fn extract_rela(
     }
 
     let (Some(rela_vaddr), Some(rela_size)) = (rela_vaddr, rela_size) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     if rela_size == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     if let Some(ent) = rela_ent
         && ent as usize != RELA64_RECORD
     {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
-    // Relocate the RELA table's virtual address into the file view.
-    let Some(file_offset) = vaddr_to_offset(file, rela_vaddr as usize) else {
-        return Vec::new();
+    // Relocate the RELA table's virtual address into the file view, then pull
+    // that one range: it is the last thing a parse holds, and it is bounded.
+    let Some(file_offset) = vaddr_to_offset(segments, rela_vaddr as usize) else {
+        return Some(Vec::new());
     };
-    let Some(end) = file_offset.checked_add(rela_size as usize) else {
-        return Vec::new();
-    };
-    let Some(rela_bytes) = bytes.get(file_offset..end) else {
-        return Vec::new();
-    };
+    let rela_bytes = read_range(source, file_offset as u64, rela_size, RELA_MAX)?;
 
-    // The records themselves are parsed by the crate: iterate them as
-    // `Rela`s and keep the one kind the loader applies.
-    let table = ParsingTable::<LittleEndian, Rela>::new(LittleEndian, Class::ELF64, rela_bytes);
-    table
-        .iter()
-        .filter(|rela| rela.r_type == relative)
-        .map(|rela| (rela.r_offset as usize, rela.r_addend))
-        .collect()
+    let table = ParsingTable::<LittleEndian, Rela>::new(LittleEndian, Class::ELF64, &rela_bytes);
+    Some(
+        table
+            .iter()
+            .filter(|rela| rela.r_type == relative)
+            .map(|rela| (rela.r_offset as usize, rela.r_addend))
+            .collect(),
+    )
 }
 
 #[cfg(all(test, not(target_os = "none")))]
@@ -443,7 +616,12 @@ mod tests {
         assert_eq!(image.segments.len(), 1);
         let segment = &image.segments[0];
         assert_eq!(segment.vaddr, 0x400_000);
-        assert_eq!(segment.data, b"program bytes");
+        let mut carried = alloc::vec![0u8; segment.filesz];
+        image
+            .source
+            .read_at(segment.offset, &mut carried)
+            .expect("the image's source answers for its own bytes");
+        assert_eq!(carried, b"program bytes");
         assert_eq!(segment.memsz, 0x120);
         assert_eq!(segment.flags, MapFlags::READ | MapFlags::WRITE);
     }
@@ -497,7 +675,7 @@ mod tests {
         assert!(parse(&oversized).is_none(), "filesz past memsz");
 
         // Cut off partway through the program header table.
-        assert!(parse(&good[..40]).is_none(), "truncated header");
+        assert!(parse(&good[..40].to_vec()).is_none(), "truncated header");
     }
 
     #[test]

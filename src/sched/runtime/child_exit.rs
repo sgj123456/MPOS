@@ -1746,12 +1746,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
 /// This does **not** modify the register frame itself — the caller (syscall
 /// dispatch) does that.
 pub fn exec_replace(
-    bytes: &[u8],
+    source: &dyn crate::mm::elf::Source,
     argv: &[String],
     env: &[String],
     exe: &str,
 ) -> Result<(usize, usize), SpawnError> {
-    let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
+    let image = elf::parse(source).ok_or(SpawnError::NotExecutable)?;
     // A dynamically linked program names the interpreter that has to run
     // before it does. That is a path into the filesystem, and this is the only
     // place with both the path and the authority to follow it - which is why
@@ -1872,7 +1872,7 @@ pub fn exec_replace(
             exe,
             interp_name,
             user_rsp,
-        );
+        )?;
 
         write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
 

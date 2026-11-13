@@ -2011,29 +2011,55 @@ pub(super) fn handle_execve(
     // plain open's event; the news lands before a byte of the image is read,
     // which is where Linux's `fsnotify_open_exec` sits too.
     crate::vfs::fanotify::notice_open_exec(&inode);
-    let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
-        Ok(bytes) => bytes,
+    // Only the start of the file is read here, because only the start decides
+    // what the file is: a `#!` line makes it a script, anything else is handed
+    // to the loader as bytes it reads itself. The rest of the image is read by
+    // `exec_replace` page by page (item 272) - a program can be larger than the
+    // largest allocation this kernel can serve, and reading it whole to find out
+    // it was a program is how the chromium launcher answered "No space left on
+    // device" for a 296 MB binary on a machine with 549 MB free.
+    let mut prefix = [0u8; crate::binfmt::BINPRM_BUF_SIZE];
+    let read = match inode.read_at(0, &mut prefix) {
+        Ok(read) => read,
         Err(e) => return err_of(e),
     };
+    let prefix = &prefix[..read];
     // A `#!` file is a script rather than a program, and Linux does not honour
     // the set-uid bits on one: the bits that count belong to the interpreter,
     // and a kernel that honoured the script's would let anyone who can write
     // into a set-uid-owned script choose what runs with that authority.
-    let is_script = bytes.starts_with(b"#!");
+    let is_script = prefix.starts_with(b"#!");
 
     // A script is run by its interpreter, and the kernel is where that is
     // discovered: the file's first two bytes say so. The chain is followed
     // exactly as the kernel's own spawns follow it - one resolver, so the two
     // paths can never disagree about what a script is.
-    let (bytes, argv) = match crate::sched::resolve_script(bytes, argv, Some(cwd.clone()), &path) {
-        Ok(r) => r,
-        Err(crate::sched::SpawnError::NoSlot) => return err::EAGAIN,
-        Err(crate::sched::SpawnError::Loop) => return err::ELOOP,
-        // Linux reports a missing interpreter as "the file was not found",
-        // not as a malformed executable: the script itself was fine, and it
-        // is the path it names that could not be followed.
-        Err(crate::sched::SpawnError::NoInterpreter) => return err::ENOENT,
-        Err(_) => return err::ENOEXEC,
+    //
+    // The resolver is handed the prefix, not the file: a shebang line is read
+    // from the first bytes, and the interpreter's own image is read where the
+    // resolver reads it. A script larger than this kernel can hold is therefore
+    // a script that runs.
+    let (source, argv): (
+        alloc::boxed::Box<dyn crate::mm::elf::Source>,
+        alloc::vec::Vec<String>,
+    ) = if is_script {
+        let (bytes, argv) =
+            match crate::sched::resolve_script(prefix.to_vec(), argv, Some(cwd.clone()), &path) {
+                Ok(r) => r,
+                Err(crate::sched::SpawnError::NoSlot) => return err::EAGAIN,
+                Err(crate::sched::SpawnError::Loop) => return err::ELOOP,
+                // Linux reports a missing interpreter as "the file was not
+                // found", not as a malformed executable: the script itself was
+                // fine, and it is the path it names that could not be followed.
+                Err(crate::sched::SpawnError::NoInterpreter) => return err::ENOENT,
+                Err(_) => return err::ENOEXEC,
+            };
+        (alloc::boxed::Box::new(bytes), argv)
+    } else {
+        (
+            alloc::boxed::Box::new(crate::vfs::InodeSource::new(inode.clone())),
+            argv,
+        )
     };
 
     // A set-uid or set-group-id file promises that the program runs with the
@@ -2055,7 +2081,7 @@ pub(super) fn handle_execve(
     if let Some(ref id) = switched {
         crate::sched::set_current_identity(id.clone());
     }
-    let outcome = crate::sched::exec_replace(&bytes, &argv, &envp, &path);
+    let outcome = crate::sched::exec_replace(&*source, &argv, &envp, &path);
     if outcome.is_err() && switched.is_some() {
         crate::sched::set_current_identity(before);
     }

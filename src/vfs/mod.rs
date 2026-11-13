@@ -336,6 +336,13 @@ pub enum VfsError {
     NoRoot,
     /// EINVAL: the path is unusable, e.g. relative with no cwd yet.
     Invalid,
+    /// ENOMEM: the machine could not build the buffer this needed - a `Vec`
+    /// whose capacity the frame allocator refused. It is the number Linux's
+    /// own loader answers when it cannot allocate an image, and it was once
+    /// reported as `NoSpace`, which told a caller to free disk space that was
+    /// never the problem (a 296 MB binary against a 64 MiB allocation ceiling,
+    /// item 272).
+    NoMemory,
     /// ENOSPC: the filesystem has no free blocks or inodes left.
     NoSpace,
     /// EFBIG: a write would push the file past the filesystem's size limit.
@@ -1617,9 +1624,14 @@ pub fn read_dir(path: &str) -> VfsResult<Vec<(String, NodeKind)>> {
     resolve(path)?.read_dir()
 }
 
-/// Read a whole file into memory, sized by its metadata. The loader's way in:
-/// spawn hands the bytes to the ELF parser, which wants one contiguous slice.
-/// A directory names no bytes, so it is refused.
+/// Read a whole file into memory, sized by its metadata. What a program's
+/// *interpreter* comes back through, and what a script's bytes come back
+/// through: both are small, and both are handed over as one slice.
+///
+/// The image being exec'd is **not** read this way any more (item 272): it goes
+/// to the loader through [`InodeSource`], page by page, because a program can
+/// be larger than any single allocation this kernel can serve. A directory
+/// names no bytes, so it is refused.
 pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
     let inode = resolve(path)?;
     if inode.metadata().kind != NodeKind::File {
@@ -1630,7 +1642,7 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
-        .map_err(|_| VfsError::NoSpace)?;
+        .map_err(|_| VfsError::NoMemory)?;
     let mut chunk = [0u8; 4096];
     loop {
         let n = file.read(&mut chunk)?;
@@ -1708,9 +1720,10 @@ pub fn read_dir_opt(
 /// [`read_file`](fn.read_file.html) with a caller-supplied start.
 ///
 /// The capacity is reserved with the fallible form: a file bigger than the
-/// kernel's largest contiguous allocation — a 40 MB compiler, say — comes
-/// back as `NoSpace` rather than dying in the allocator, and the execve
-/// that reached for it answers ENOMEM instead of taking the machine down.
+/// kernel's largest contiguous allocation comes back as `NoMemory` rather than
+/// dying in the allocator, and the caller answers `ENOMEM` — the number Linux
+/// answers when it cannot build an image. It was `NoSpace` once, which told a
+/// caller to free disk space that was never the problem (item 272).
 pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec<u8>> {
     let inode = resolve_opt(path, start)?;
     if inode.metadata().kind != NodeKind::File {
@@ -1721,7 +1734,7 @@ pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
-        .map_err(|_| VfsError::NoSpace)?;
+        .map_err(|_| VfsError::NoMemory)?;
     let mut chunk = [0u8; 4096];
     loop {
         let n = file.read(&mut chunk)?;
@@ -1729,6 +1742,37 @@ pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec
             return Ok(bytes);
         }
         bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// A file handed to the loader as the file it is, rather than as bytes read
+/// into memory first.
+///
+/// This is what makes an executable larger than the kernel's largest
+/// contiguous allocation loadable: [`crate::sched::exec_replace`] reads the
+/// image's headers and then each page of each segment through this source, so a
+/// 296 MB program costs its own pages and nothing more (item 272). A short read
+/// is the file ending early; `None` is an error the caller must refuse the
+/// image for rather than serving a page of whatever was there.
+pub struct InodeSource {
+    inode: Arc<dyn Inode>,
+    len: usize,
+}
+
+impl InodeSource {
+    pub fn new(inode: Arc<dyn Inode>) -> Self {
+        let len = inode.metadata().size as usize;
+        Self { inode, len }
+    }
+}
+
+impl crate::mm::elf::Source for InodeSource {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        self.inode.read_at(offset as u64, buf).ok()
     }
 }
 

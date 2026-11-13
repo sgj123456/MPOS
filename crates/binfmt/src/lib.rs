@@ -24,6 +24,12 @@ use alloc::string::String;
 /// to be scanned to its end.
 pub const SHEBANG_LINE_MAX: usize = 256;
 
+/// How much of a file `execve` reads before deciding what it is: Linux's
+/// `BINPRM_BUF_SIZE`, the window in which a `#!` line has to fit and the only
+/// bytes a decision about the file is allowed to need. Everything past it is
+/// the loader's to read, and `execve` does not read it at all (item 272).
+pub const BINPRM_BUF_SIZE: usize = SHEBANG_LINE_MAX;
+
 /// How many `#!` hops to follow before calling it a loop. Linux caps the chain
 /// the same way and for the same reason: an interpreter may itself be a script,
 /// but not forever.
