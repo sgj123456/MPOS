@@ -992,6 +992,39 @@ pub trait Gate {
     ///
     /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
     unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool;
+
+    /// Write a register file back into a trap frame, with nothing read out of
+    /// it. The twin of [`Gate::capture_trap_regs`], and needed for the same
+    /// reason: a delivery rewrites the interrupted program's whole register
+    /// file so that the trap returns into the handler, and `restore_user_regs`
+    /// writes the *gate's* frame - a different object on a machine whose trap
+    /// entry pushes its own block (x86_64). A machine whose trap frame is its
+    /// user frame (aarch64) has nothing to distinguish and answers with the
+    /// same write.
+    ///
+    /// There is no floating-point half and no thread-local handoff: a handler
+    /// runs on the same thread with the same base, and the image the machine's
+    /// frame builder needs is read from the task's record, not written here.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], and `regs` must be [`ABI_REG_COUNT`] words long.
+    ///
+    /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
+    unsafe fn restore_trap_regs(frame: *mut (), regs: &[u64]);
+
+    /// The stack pointer a trap frame says the interrupted program had.
+    ///
+    /// Its own op rather than [`Gate::user_sp`] because that one reads the
+    /// *gate's* frame, and the two are different objects wherever the trap entry
+    /// pushes its own block. Reading a trap frame through the gate's accessor is
+    /// the mistake this whole seam exists to avoid: the fields line up on
+    /// neither machine - x86_64's trap block has no `user_rsp` word at all, so
+    /// the read would land in a register and answer a number that is not a
+    /// stack.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`]; `frame` must be a non-null trap frame.
+    unsafe fn trap_sp(frame: *mut ()) -> u64;
 }
 
 /// A machine this kernel can run on. `Current` names the one being built.
@@ -1734,6 +1767,25 @@ pub unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mu
 #[inline]
 pub unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool {
     unsafe { <Current as Gate>::capture_trap_regs(frame, tls, out) }
+}
+
+/// Write a register file back into a trap frame. See [`Gate::restore_trap_regs`].
+///
+/// # Safety
+/// As [`capture_trap_regs`].
+#[inline]
+pub unsafe fn restore_trap_regs(frame: *mut (), regs: &[u64]) {
+    unsafe { <Current as Gate>::restore_trap_regs(frame, regs) }
+}
+
+/// The interrupted program's stack pointer, from a trap frame. See
+/// [`Gate::trap_sp`].
+///
+/// # Safety
+/// As [`capture_trap_regs`].
+#[inline]
+pub unsafe fn trap_sp(frame: *mut ()) -> u64 {
+    unsafe { <Current as Gate>::trap_sp(frame) }
 }
 
 /// Write the ABI's register file back into the gate frame. See

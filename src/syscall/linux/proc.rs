@@ -66,7 +66,16 @@ fn build_frame(
     let interrupted_sp = unsafe { crate::hal::user_context(regs_ptr, 0) }
         .map(|ctx| ctx.sp())
         .unwrap_or(0);
-    build_frame_at(regs_ptr, &regs, interrupted_sp, sig, action, info, restart)
+    build_frame_at(
+        regs_ptr,
+        &regs,
+        interrupted_sp,
+        sig,
+        action,
+        info,
+        restart,
+        false,
+    )
 }
 
 /// The same, for a delivery that already holds the interrupted register file.
@@ -86,6 +95,7 @@ fn build_frame_at(
     action: &crate::sched::signal::Action,
     info: &crate::sched::signal::SigInfo,
     restart: Option<u64>,
+    at_trap: bool,
 ) -> bool {
     let alt = crate::sched::signal_alt_stack(crate::sched::current());
     let blocked = crate::sched::current_blocked();
@@ -144,10 +154,20 @@ fn build_frame_at(
             return false;
         }
     }
-    // `regs` now describes the handler's first instruction, and `apply_frame` is
-    // what puts it into the gate frame - the return address, the stack, and the
-    // three argument registers, which only the machine knows where to put.
-    apply_frame(regs_ptr, &regs);
+    // `regs` now describes the handler's first instruction, and one of the two
+    // writers puts it back - the return address, the stack, and the three
+    // argument registers, which only the machine knows where to put.
+    //
+    // Which writer is not a detail: `apply_frame` writes the *gate's* frame,
+    // and a trap frame is a different object on a machine whose interrupt entry
+    // pushes its own block (x86_64). Writing a trap frame with the gate's
+    // writer would put every register in the wrong slot - so the door says
+    // which object it holds, and the machine answers for its own shape.
+    if at_trap {
+        unsafe { crate::hal::restore_trap_regs(regs_ptr, &regs) };
+    } else {
+        apply_frame(regs_ptr, &regs);
+    }
     crate::sched::set_current_blocked(action.handler_mask(sig, blocked));
     if action.flags & crate::sched::signal::SA_RESETHAND != 0 {
         crate::sched::reset_disposition(sig);
@@ -387,8 +407,20 @@ pub(super) fn deliver_at_trap(frame: *mut ()) -> bool {
     // `interrupted_sp` comes from the captured file rather than from a second
     // read of the frame: the two doors capture in different ways, and the file
     // is what both of them have.
-    let interrupted_sp = unsafe { crate::hal::user_sp(frame) } as usize;
-    if !build_frame_at(frame, &regs, interrupted_sp, sig, &action, &info, None) {
+    // The interrupted *program's* stack pointer, which is a trap-frame read and
+    // not `hal::user_sp` - that one reads the gate's frame, and on a machine
+    // whose trap entry pushes its own block the two objects do not line up.
+    let interrupted_sp = unsafe { crate::hal::trap_sp(frame) } as usize;
+    if !build_frame_at(
+        frame,
+        &regs,
+        interrupted_sp,
+        sig,
+        &action,
+        &info,
+        None,
+        true,
+    ) {
         crate::sched::die_of_fatal_signal(sig);
     }
     true

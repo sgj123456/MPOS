@@ -384,24 +384,101 @@ impl crate::hal::Gate for crate::hal::Current {
         frame.rax = value as usize;
     }
 
-    unsafe fn capture_trap_regs(_frame: *mut (), _tls: usize, _out: &mut [u64]) -> bool {
-        // `false`, and it is an answer rather than a gap left open.
-        //
-        // The frame this machine's interrupt handlers are given is an
-        // `InterruptStackFrame`: `rip`, `cs`, `rflags`, `rsp`, `ss`. The
-        // general registers are saved by the compiler's `x86-interrupt`
-        // prologue *below* that, at an offset Rust has no name for and the
-        // handler cannot address - so there is nothing here to read them out
-        // of. Building the ABI's file from what this frame does carry would
-        // invent twenty-two words, and a handler entered on invented registers
-        // is worse than a signal that waits for the next syscall.
-        //
-        // Closing §2.13 on this machine means replacing the tick handler's
-        // `extern "x86-interrupt"` entry with a stub that pushes a `Regs`-shaped
-        // block - the shape `syscall_entry` already builds - so the trap frame
-        // becomes an object of the same kind as the gate frame. That is a
-        // separate change with its own measurement (`docs/notes/` §2.13).
-        false
+    unsafe fn capture_trap_regs(frame: *mut (), tls: usize, out: &mut [u64]) -> bool {
+        use super::context::uregs::*;
+        if frame.is_null() {
+            // A tick that interrupted the kernel: there is no program register
+            // file to report, and the caller has already refused on the same
+            // condition. Answering `false` here is the same answer, not a
+            // second one.
+            return false;
+        }
+        // SAFETY: the caller's contract - the pointer is the block
+        // `timer_stub` built on the interrupted task's own kernel stack.
+        let trap = unsafe { &*(frame as *const super::idt::TrapRegs) };
+        debug_assert_eq!(out.len(), COUNT, "the ABI's register file is 27 words");
+        let (code, data) = super::gdt::user_selectors();
+        out[R15] = trap.r15 as u64;
+        out[R14] = trap.r14 as u64;
+        out[R13] = trap.r13 as u64;
+        out[R12] = trap.r12 as u64;
+        out[RBP] = trap.rbp as u64;
+        out[RBX] = trap.rbx as u64;
+        // A trap clobbers neither `rcx` nor `r11`, so unlike the gate's
+        // capture these two are simply the program's own registers - there is
+        // no second spelling of them to reconcile.
+        out[R11] = trap.r11 as u64;
+        out[R10] = trap.r10 as u64;
+        out[R9] = trap.r9 as u64;
+        out[R8] = trap.r8 as u64;
+        out[RAX] = trap.rax as u64;
+        out[RCX] = trap.rcx as u64;
+        out[RDX] = trap.rdx as u64;
+        out[RSI] = trap.rsi as u64;
+        out[RDI] = trap.rdi as u64;
+        // An interrupt names no result. The ABI's `orig_rax` is the call number
+        // a syscall entry has and a trap does not: the program is not inside a
+        // call, so `rax` is all there is and both slots report it. Linux's own
+        // `do_signal` reads `orig_ax` only on the syscall path, so nothing a
+        // handler can observe distinguishes this from the register it names.
+        out[ORIG_RAX] = trap.rax as u64;
+        out[RIP] = trap.rip as u64;
+        out[CS] = trap.cs as u64;
+        out[EFLAGS] = trap.rflags as u64;
+        out[RSP] = trap.rsp as u64;
+        out[SS] = trap.ss as u64;
+        out[FS_BASE] = tls as u64;
+        let _ = (code, data);
+        true
+    }
+
+    unsafe fn restore_trap_regs(frame: *mut (), regs: &[u64]) {
+        use super::context::uregs::*;
+        if frame.is_null() {
+            return;
+        }
+        debug_assert_eq!(regs.len(), COUNT, "the ABI's register file is 27 words");
+        // SAFETY: the caller's contract - the block `timer_stub` built, live
+        // until the `call` into Rust returns.
+        let trap = unsafe { &mut *(frame as *mut super::idt::TrapRegs) };
+        trap.r15 = regs[R15] as usize;
+        trap.r14 = regs[R14] as usize;
+        trap.r13 = regs[R13] as usize;
+        trap.r12 = regs[R12] as usize;
+        trap.rbp = regs[RBP] as usize;
+        trap.rbx = regs[RBX] as usize;
+        trap.r11 = regs[R11] as usize;
+        trap.r10 = regs[R10] as usize;
+        trap.r9 = regs[R9] as usize;
+        trap.r8 = regs[R8] as usize;
+        trap.rax = regs[RAX] as usize;
+        trap.rcx = regs[RCX] as usize;
+        trap.rdx = regs[RDX] as usize;
+        trap.rsi = regs[RSI] as usize;
+        trap.rdi = regs[RDI] as usize;
+        // The CPU's own frame, which `iretq` replays: a handler entered this
+        // way resumes with the program's `rip` replaced by the handler's, its
+        // `rsp` by the frame the handler was given, and the flags it had.
+        // `cs`/`ss` are *not* written - a signal runs in the ring it
+        // interrupted, and writing them from a register file would let a
+        // handler's return change rings.
+        trap.rip = regs[RIP] as usize;
+        trap.rflags = regs[EFLAGS] as usize;
+        trap.rsp = regs[RSP] as usize;
+        // `ORIG_RAX` and `FS_BASE` are deliberately not written back: an
+        // interrupt names no call and the thread-local base is a CPU register,
+        // not a frame word - the gate reinstalls it from the task on every
+        // switch. `CS`/`SS` likewise stay as the CPU pushed them.
+    }
+
+    unsafe fn trap_sp(frame: *mut ()) -> u64 {
+        // The `rsp` the CPU pushed when it entered ring 0 - the interrupted
+        // program's own stack pointer, in the low half of its frame. Reading
+        // `user_sp` here instead would take the gate's field at that offset,
+        // which is a general register in this block: a number that is not a
+        // stack, handed to the frame builder as the stack's floor.
+        let trap = unsafe { &*(frame as *const super::idt::TrapRegs) };
+        trap.rsp as u64
     }
 }
 

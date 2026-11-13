@@ -1043,6 +1043,26 @@ impl crate::hal::Gate for crate::hal::Current {
         crate::hal::UserFrameOps::to_user_regs(&user, tls, out);
         true
     }
+
+    unsafe fn restore_trap_regs(frame: *mut (), regs: &[u64]) {
+        if frame.is_null() {
+            return;
+        }
+        // This machine's trap frame *is* its user frame: the EL0 stubs save the
+        // trapped registers straight into the `UserFrame` the EL0 sync entry
+        // would have used, so the write a gate frame takes is the write a trap
+        // frame takes. Nothing is translated and nothing is skipped - which is
+        // the whole reason the two doors here share one `build_frame_at`.
+        let user: context::UserFrame = crate::hal::UserFrameOps::from_user_regs(regs);
+        unsafe { *(frame as *mut context::UserFrame) = user };
+    }
+
+    unsafe fn trap_sp(frame: *mut ()) -> u64 {
+        // This machine keeps the interrupted `sp` in the same word of the same
+        // object its gate frame uses - the trap frame *is* the user frame - so
+        // the answer is the gate's answer, read from the frame it was given.
+        unsafe { <Self as crate::hal::Gate>::user_sp(frame) }
+    }
 }
 
 impl crate::hal::Platform for crate::hal::Current {}

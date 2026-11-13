@@ -1,11 +1,22 @@
 //! Interrupt Descriptor Table and dispatch.
 //!
-//! Handlers use the `x86-interrupt` ABI (nightly-only), which lets the compiler
-//! emit the register save/restore and `iretq` itself. That composes with
-//! preemption: the clock handler can switch tasks without ever returning,
+//! Every handler but the clock uses the `x86-interrupt` ABI (nightly-only), which
+//! lets the compiler emit the register save/restore and `iretq` itself. That
+//! composes with preemption: a handler can switch tasks without ever returning,
 //! because the trap frame stays on the interrupted task's own stack and unwinds
-//! normally whenever that task is resumed. Hand-written stubs would only buy
-//! control over the exact frame layout, which nothing here needs.
+//! normally whenever that task is resumed.
+//!
+//! The clock is the exception, and the reason is the one thing the ABI cannot
+//! give: `x86-interrupt` hides the general registers behind a prologue Rust
+//! cannot address, and a handled signal has to be handed over *at the trap* -
+//! Linux's delivery point - which means rewriting the interrupted program's
+//! whole register file. So the PIT entry ([`timer_stub`]) is hand-written asm
+//! that pushes a [`TrapRegs`] block, calls Rust, pops and `iretq`s. It is the
+//! same block shape `syscall_entry` builds, which is what lets one
+//! `hal::capture_trap_regs` serve both of this machine's doors onto a user
+//! register file (`docs/notes/` §2.13). Everything else here keeps the ABI: a
+//! hand-written stub buys control over the exact frame layout, and only the
+//! entry that must build a *signal* frame needs it.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -96,7 +107,15 @@ pub fn init() {
             .device_not_available
             .set_handler_fn(device_not_available);
 
-        table[pic::IRQ0_VECTOR].set_handler_fn(timer);
+        // The tick is the one entry that is hand-written rather than an
+        // `x86-interrupt` handler: a handled signal is handed over *at the
+        // trap* (`rust_timer`), and that needs the interrupted program's whole
+        // register file, which the ABI keeps behind a prologue Rust cannot
+        // address. See the module doc and `TrapRegs`.
+        unsafe {
+            table[pic::IRQ0_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(timer_stub as *const () as u64));
+        }
         // IRQ4 is COM1 on every PC that has one: the console's input arrives
         // here, a byte at a time, once `serial::enable_rx` has asked for it.
         // It is the machine's only input line - the console multiplexer is
@@ -134,7 +153,59 @@ pub fn enable() {
     x86_64::instructions::interrupts::enable();
 }
 
-extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
+/// The PIT tick's register block, built by [`timer_stub`].
+///
+/// Its field order *is* the stub's push order, which is also the architecture's
+/// own order for a trap: the fifteen general registers the stub pushes, and then
+/// the frame the CPU pushed before entering - `rip`, `cs`, `rflags`, and, only
+/// for a trap from ring 3, `rsp` and `ss`. Everything below `ss` is written
+/// unconditionally; the two words a ring-0 trap does not push are simply absent
+/// from that frame, which is why a ring-0 trap passes a **null** frame to the
+/// kernel rather than a block holding whatever was on the stack.
+///
+/// This is not the shape of [`super::syscall::Regs`], and the difference is the
+/// point: `syscall` clobbers `rcx` and `r11` (it stashes the return address and
+/// the flags there), so that block reports `rip`/`eflags` in their slots. A trap
+/// clobbers neither, so this block carries them where the register file names
+/// them - `r11` is the program's `r11`, and the flags live in the CPU's frame.
+/// A signal frame built from this block therefore reports the register file the
+/// *program* had, not one reconstructed from what an instruction happened to
+/// clobber (`docs/notes/` §2.13).
+#[repr(C)]
+pub(super) struct TrapRegs {
+    pub r15: usize,
+    pub r14: usize,
+    pub r13: usize,
+    pub r12: usize,
+    pub rbp: usize,
+    pub rbx: usize,
+    pub r11: usize,
+    pub r10: usize,
+    pub r9: usize,
+    pub r8: usize,
+    pub rax: usize,
+    pub rcx: usize,
+    pub rdx: usize,
+    pub rsi: usize,
+    pub rdi: usize,
+    pub rip: usize,
+    pub cs: usize,
+    pub rflags: usize,
+    pub rsp: usize,
+    pub ss: usize,
+}
+
+/// The PIT tick, entered through [`timer_stub`].
+///
+/// `frame` is the register block the stub built, or null when the tick
+/// interrupted the kernel: a trap from ring 0 has no program context to hand a
+/// signal handler, and its frame carries no user `rsp`/`ss` to build one from.
+///
+/// The work is what the `x86-interrupt` version did, plus the one thing that
+/// version could not do: hand a waiting signal over *here*, which is Linux's
+/// delivery point and the only one a program that never calls can reach
+/// (`deliver_at_trap`, `docs/notes/` §2.13).
+extern "C" fn rust_timer(frame: *mut TrapRegs, in_user: bool) {
     super::timer::tick();
     // Charge the tick to the process that was running before the interrupt,
     // attributed user or system by the ring the core was left in: a code
@@ -142,22 +213,114 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // own ring-3 code (`utime`), anything else means the kernel was running on
     // its behalf (`stime`). Charged before the EOI and the preempt, so the tick
     // lands on the task that actually held the core.
-    let in_user = frame.code_segment == super::gdt::user_selectors().0;
-    let user_ip = frame.instruction_pointer.as_u64() as usize;
     crate::hal::kernel::charge_cpu(in_user);
     // EOI before preempting: once the scheduler switches away this handler does
     // not return until the task is resumed, and an unacknowledged PIC would
     // block every interrupt until then.
     pic::end_of_interrupt(0);
+    // A handled signal is handed over at this trap when there is a program to
+    // hand it to - before the preempt below, not after: a delivery rewrites the
+    // register block, and a task switched away first would resume into the
+    // block without the handler in it. The clock is the interrupt guaranteed to
+    // keep arriving while a program computes, which is what makes it the one
+    // that can reach a program that never calls.
+    #[cfg(mpos_signal_frame)]
+    {
+        if in_user && !frame.is_null() {
+            crate::hal::kernel::deliver_at_trap(frame as *mut ());
+        }
+    }
     // Where the tick landed is what lets the scheduler keep a restartable
     // sequence unbroken: a task in ring 3 inside an armed span is not switched
     // away from (`crate::sched::rseq`). A tick in kernel mode has no user
     // address to offer, and uses the address-less call.
-    if in_user {
+    if in_user && !frame.is_null() {
+        // SAFETY: the stub built this block on the task's own kernel stack and
+        // has not returned, so it is live for the length of this call.
+        let user_ip = unsafe { (*frame).rip };
         crate::hal::kernel::preempt_at(user_ip);
     } else {
         crate::hal::kernel::preempt();
     }
+}
+
+core::arch::global_asm!(
+    ".section .text.timer_stub, \"ax\"",
+    ".globl timer_stub",
+    ".p2align 4",
+    "timer_stub:",
+    // Save the fifteen general registers, in the order `TrapRegs` lists them
+    // from the top down. Nothing here is ring-dependent: the CPU has already
+    // pushed its own frame (rip/cs/rflags, plus rsp/ss for a trap from ring 3)
+    // above what these pushes build, so the block below it is the same shape
+    // either way - which is what lets one struct serve both entries.
+    "    push rdi",
+    "    push rsi",
+    "    push rdx",
+    "    push rcx",
+    "    push rax",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    // rbp becomes the frame base, now that the program's own value is safely
+    // below. Every load and the epilogue's `mov rsp, rbp` go through it.
+    "    mov  rbp, rsp",
+    // The ring the trap came from, read from the CS the CPU pushed - at a fixed
+    // offset from the base, because 15 pushes sit between it and rbp. `and
+    // ecx, 3` answers 0 for a kernel CS and 3 for a user one, so the same value
+    // is both the answer and the null/non-null decision for the frame argument.
+    "    mov  rcx, [rbp + 128]",
+    "    and  ecx, 3",
+    // A null frame for a trap from the kernel: there is no program context, and
+    // the block's `rsp`/`ss` words did not get pushed at all. `in_user` is a
+    // Rust `bool`, so it is set to exactly 0 or 1 - the ring bits are 0 or 3,
+    // and handing Rust a 3 as a `bool` is undefined behaviour, not a shorthand
+    // for true.
+    "    xor  edi, edi",
+    "    xor  esi, esi",
+    "    cmp  ecx, 3",
+    "    jne  2f",
+    "    mov  rdi, rbp",
+    "    mov  esi, 1",
+    "2:",
+    // The call's own alignment rule, and rbp is what survives it.
+    "    and  rsp, -16",
+    "    call {rust_timer}",
+    "    mov  rsp, rbp",
+    // Pop the block back. `rbp` is restored fifth, which is the last moment the
+    // base is needed - after it the stack pointer walks up through the rest on
+    // its own.
+    "    pop  r15",
+    "    pop  r14",
+    "    pop  r13",
+    "    pop  r12",
+    "    pop  rbp",
+    "    pop  rbx",
+    "    pop  r11",
+    "    pop  r10",
+    "    pop  r9",
+    "    pop  r8",
+    "    pop  rax",
+    "    pop  rcx",
+    "    pop  rdx",
+    "    pop  rsi",
+    "    pop  rdi",
+    // What is left under the stack pointer is the CPU's own frame, and `iretq`
+    // pops it exactly as far as the CS it finds says to - so the ring-3 and
+    // ring-0 returns are the same instruction here, and neither needs a branch.
+    "    iretq",
+    rust_timer = sym rust_timer,
+);
+
+unsafe extern "C" {
+    fn timer_stub();
 }
 
 /// The local APIC's one-shot: a wait shorter than a tick is due now.
