@@ -41,13 +41,18 @@ One-glance status of the whole roadmap.
   not hand a `SIGSTOP`ped task back with the stop still installed (§6.88, item
   201); the named
   residues are the kernel-spawned program path's `SIG_DFL` start, the
-  alternate-stack pin's shape, and one gap that is **closed on aarch64 and open on
-  x86_64**: a handled signal is handed over on the return from a *system call* on
-  x86_64, so a task that computes in ring 3 without entering the kernel holds it
-  until it next calls something. On aarch64 it is handed over at the tick, because
-  the EL0 interrupt stub now builds a whole `UserFrame` and the entry delivers from
-  it before preempting: `t-iret` leaves by the signal after 12 559 965 of
-  400 000 000 iterations, where before the fix it ran to its limit (§2.13, item 261).
+  alternate-stack pin's shape, and one gap that is **closed on both machines**:
+  a handled signal used to be handed over only on the return from a *system call*,
+  so a task that computed in ring 3 without entering the kernel held it until it
+  next called something. Both machines deliver at the trap now - aarch64 since
+  2026-11-12 (its EL0 interrupt stub builds a whole `UserFrame` and the entry
+  delivers from it before preempting), x86_64 since 2026-11-13 (the PIT entry is a
+  hand-written stub pushing a `TrapRegs` block, the one thing the `x86-interrupt`
+  ABI cannot give). `t-iret` asserts Linux's answer unconditionally: the loop leaves
+  by the signal after 12 067 696 of 400 000 000 iterations on aarch64 and
+  153 985 811 on x86_64, where before the fix both ran to their limit (§2.13, items
+  261-262). What is left on this surface is narrower and named there: a signal handed
+  over at a trap while the task is traced still goes back to the pending set.
   x86_64 keeps the gap because its `extern "x86-interrupt"` frame carries no GPRs -
   `Gate::capture_trap_regs` answers `false`, and `t-iret` pins exactly that
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
@@ -990,9 +995,9 @@ One-glance status of the whole roadmap.
   only returned the right errno would miss. The 32-bit word now lives in one
   host-testable verdict, the order in the handlers' statements; the three stale
   "no per-task CPU accounting" comments now name the real gap (CPU time is
-  charged, but the expiry scan covers `ITIMER_REAL` only - and that half is now
-  reachable on aarch64, where §2.13's trap-time delivery exists to hand the
-  expiry over). Pinned by `t-itimer-order` (27 claims,
+  charged, but the expiry scan covers `ITIMER_REAL` only - and that half is
+  reachable on **both** machines now that §2.13's trap-time delivery is on both,
+  which is the door that hands an expiry over to a task that never calls). Pinned by `t-itimer-order` (27 claims,
   counterfactually 8 red) (§6.125, item 239)
 - [x] `/proc/uptime`'s two columns are two `%lu.%02lu` words and the idle column is a live counter,
   not a literal `0.0`: an unpadded `S.4` was read by `atof` as `S+0.4` (360 ms high) on ~9% of reads,
@@ -1343,10 +1348,14 @@ its 900 s budget with no summary has no reading yet.
 
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
-the delivery *point* is open on one machine only now - a handled signal waits for a system call on
-x86_64, where Linux hands it over on the way back to ring 3 from any trap, so a task computing
-without kernel entries ignores `Ctrl-C` until its next call; **aarch64 delivers at the trap** since
-2026-11-12 (`t-iret` measures it: 12 559 965 of 400 000 000 iterations, §2.13, item 261);  
+the delivery *point* is Linux's on **both machines** now - a handled signal is handed over on the
+way back to ring 3 from a trap, not only from a system call, so a program computing without kernel
+entries is still interrupted (`Ctrl-C` works): aarch64 since 2026-11-12, x86_64 since 2026-11-13,
+where the PIT entry became a hand-written stub pushing a `TrapRegs` block because the
+`x86-interrupt` ABI hides the general registers (`t-iret` measures both: 12 067 696 and 153 985 811
+of 400 000 000 iterations, §2.13, items 261-262); what stays named is the narrower case - a delivery at
+a trap while the task is traced falls back to the pending set, because a ptrace stop here is a
+syscall-exit shape;  
 `memfd_secret` is the one number left whose honest answer is `ENOSYS` — Linux's own answer without `CONFIG_SECRETMEM`, measured and pinned (`docs/notes/` §8.4, item 131) (the `rseq` registration, the `fanotify` notification class, the kernel keyring, the `io_uring` ring and `userfaultfd` are served); xattrs keep `user.*` on the memory filesystems and refuse the other namespaces by name (item 132, §3.15);  
 the datagram lines are Linux's now - 65 507 for a datagram, and `EMSGSIZE` from the  
 destination link's MTU where Linux's default would fragment it - while IP fragmentation  

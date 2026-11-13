@@ -854,8 +854,8 @@ first. And the pick is `wants_signal` without its "prefer a thread not
 already handling it" half - one copy, one handler run is what the pin's
 third claim reads, and nothing in the sweep depends on the finer choice yet.
 
-### 2.13 A handled signal waits for a system call — **CLOSED ON AARCH64 2026-11-12,
-STILL THE GAP ON X86_64**
+### 2.13 A handled signal waits for a system call — **CLOSED ON BOTH MACHINES**
+(aarch64 2026-11-12, x86_64 2026-11-13)
 
 **The question.** A task in ring 3 that computes and never makes a system call: does a signal with a
 handler reach it? Linux says yes, at the next trap. This kernel says no: the signal is queued and
@@ -1081,12 +1081,38 @@ hands a handled signal over only at a system call". That second half is what mak
 the line to change. It is no longer in `tests.toml`'s `diagnostic` group: a reading with no claim to
 fail on was why it was there.
 
-**What remains, and why it is a different change.** On x86_64 the tick handler is
-`extern "x86-interrupt" fn timer(frame: InterruptStackFrame)` (`arch/src/arch/x86_64/idt.rs`). That
-ABI's prologue saves the general-purpose registers *below* the frame Rust is handed, at an offset it
-has no name for. Closing the gap means replacing that entry with a hand-written stub that pushes a
-`Regs`-shaped block (the same shape `syscall_entry` already uses) before calling a Rust fn - new
-assembly on the one path that preempts, which is why it is a change of its own with its own
-before/after rather than a second edit here. `Gate::capture_trap_regs` answering `false` is the
-honest placeholder: it makes the ABI layer behave exactly as it did before this round on that
-machine, instead of inventing twenty-two registers.
+**x86_64 was a different change, and it landed the next day (2026-11-13).** The tick handler was
+`extern "x86-interrupt" fn timer(frame: InterruptStackFrame)` (`arch/src/arch/x86_64/idt.rs`), whose
+prologue saves the general-purpose registers *below* the frame Rust is handed, at an offset it has
+no name for. So that entry became `timer_stub`, hand-written asm that pushes a 20-word `TrapRegs`
+block (fifteen GPRs, then the CPU's own `rip`/`cs`/`rflags`/`rsp`/`ss`), calls `rust_timer`, pops
+and `iretq`s. `Gate::capture_trap_regs` answers `true` there now, and the delivery runs inside the
+same `if ticked` block the aarch64 entry uses.
+
+Three things the stub had to get right, each of which is a mistake that would have booted and then
+been wrong:
+
+- **The frame shape is not the gate's.** `syscall_entry`'s `Regs` reports `rip`/`eflags` in the
+  `rcx`/`r11` slots, because `syscall` stashes them there. A trap clobbers neither, so `TrapRegs`
+  carries `r11` as the program's own register and the flags in the CPU's frame. Copying the gate's
+  layout would have reported a program's `r11` as its instruction pointer.
+- **`in_user` is a `bool`, and a ring is 0 or 3.** The stub first passed the raw `cs & 3`; handing
+  Rust a `3` where it expects a `bool` is undefined behaviour, not a truthy shorthand. It now
+  normalises to exactly 0 or 1 and uses the same compare for the null-frame decision.
+- **A trap frame is written by its own writer.** `apply_frame` writes the *gate's* frame, and on this
+  machine that is a different object - so `Gate::restore_trap_regs` was added as the twin of
+  `capture_trap_regs`, and `build_frame_at` takes an `at_trap` flag to pick the writer. Likewise
+  `Gate::trap_sp`, because `user_sp` reads the gate's field and the two objects do not line up on
+  x86_64 (`user_rsp` has no trap-frame counterpart at all).
+
+Measured, same instrument: `THE SIGNAL after 19 102 910 of 400 000 000` on the x86_64 guest
+(`build/boot-iret-x86b.log`), against `count exhaustion` before the stub. `t-iret` therefore stopped
+being a per-kernel claim and became one unconditional one - the arm that asserted the gap is what
+reddened the moment the stub started delivering, which is how the change was known to be finished.
+
+**What is still not covered, and is a different question.** A signal delivered at a trap while the
+task is **traced** goes back to the pending set (`has_tracer` guard in `proc::deliver_at_trap`),
+because a ptrace stop in this kernel is a syscall-exit shape: the tracer reads and rewrites the
+gate's frame, and the report carries a call number. No test in the suite runs a signal under a
+tracer, so that branch has never executed on either machine; making it work means giving a trap-side
+stop a report shape of its own. That is the next named gap on this surface, not a bug in this one.

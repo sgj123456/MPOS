@@ -1543,20 +1543,27 @@ item 131; `t-enosys` keeps the plain fall-through claim).
 
 **POSIX timers (222–226): implemented** (`t-timer-create`). The number used to be blamed for a hang was `vim`'s: its `timers` feature asks for 222 while drawing, and the failure after the refusal is what §2.5's follow-up is about — the redraw path then dereferenced a null timeout flag and died. What the family answers, measured on a 6.x Linux at the raw-syscall level so nobody has to re-derive it: `timer_create(CLOCK_REALTIME, NULL, &id)` succeeds and the expiry queues **`SIGALRM`** — a null `evp` is `SIGEV_SIGNAL` with `sigev_signo = SIGALRM` (measured by blocking `SIGALRM` and reading `rt_sigpending`), *not* the `SIGEV_NONE` an earlier revision of this note claimed; the id handed back is a small per-process integer, not a pointer, and a bogus id answers `EINVAL` on all five calls — *not* the `EBADF` the man page claims. The accepted clocks, measured: `REALTIME`(0), `MONOTONIC`(1), `PROCESS_CPUTIME_ID`(2), `THREAD_CPUTIME_ID`(3), `BOOTTIME`(7) and `TAI`(11) are accepted; `MONOTONIC_RAW`(4) and the two `*_COARSE` clocks answer `EOPNOTSUPP`; the two `*_ALARM` clocks answer `EPERM` (they need `CAP_WAKE_ALARM`); a number no clock has is `EINVAL`. This kernel accepts `REALTIME`/`MONOTONIC`/`BOOTTIME`/`TAI` — one tick clock under four names — and since §6.123 also `PROCESS_CPUTIME_ID`(2), whose deadline counts the timer's own thread group's CPU and not machine uptime (a 30 ms CPU-time timer does not fire across 200 ms of sleeping, measured on the host: `build/scratch/timerclock/fire.c`). This paragraph refused that clock for two years with "because it keeps no per-task CPU accounting" — a reason §6.95 and §6.99 had already retired. `THREAD_CPUTIME_ID`(3) stays `EOPNOTSUPP`: its clock belongs to the creating thread while the timer hangs off the group and outlives it, and Linux's frozen reading for a dead thread has nowhere to live in this table (§6.123). `sigev_notify` outside `{NONE, SIGNAL, THREAD_ID}` is `EINVAL` (including `SIGEV_THREAD`(2), a libc value that never reaches the kernel); a signal number runs `1..=64` on Linux, this kernel stops at `SIGRTMIN` (32) and refuses the range above it rather than accepting a number with no disposition storage behind it. `TIMER_ABSTIME` is `EINVAL` here, the same refusal `clock_nanosleep` makes: one monotonic clock, no `CLOCK_REALTIME` epoch to name an absolute deadline against (§2 records that choice; §6.124 keeps it as a named gap while fixing the flag word's other bits and this family's refusal order). `SIGEV_THREAD_ID` aims the expiry at one thread of the caller's group (a tid outside it is `EINVAL`, as on Linux); `timer_getoverrun` on a fresh timer answers 0. **The shape musl actually builds works end to end**: `timer_create(..., SIGEV_THREAD)` is a helper thread blocked in a wait plus a `SIGEV_THREAD_ID` timer carrying `SIGRTMIN`; this kernel queues the expiry with `SI_TIMER` siginfo and the caller's `sigval`, and `rt_sigtimedwait` hands the record back with `si_code` intact — the one field musl checks before calling the callback. That needed three things beyond the timer table: `SIGRTMIN` as a queueable number, a 64-bit pending mask, and the signal **mask inherited across `clone`/`fork`** — musl blocks `SIGRTMIN` before creating the helper and the helper is what waits on it. Divergences: ids are the lowest free slot (Linux never reuses an id); the expiry runs on the scheduler's tick, so a deadline is tick-quantised and a 50 ms arm reads back as 52 ms — rounded up, never early. The prerequisite named here was right: "a per-task list of armed clocks the scheduler's tick scan can run down" is `sched::Table::check_posix_timers`, behind its own armed flag, so a machine that never calls `timer_create` never scans for one. A timer belongs to the **thread group** since item 128 (§2.11): the leader's table is the group's, a worker's timer outlives its maker and a sibling's `timer_delete` finds it - measured on the guest as Linux answers it (a worker's `timer_create`, then the leader's `timer_delete` -> 0 on both, `build/scratch/ipc/truth.c`), with the process-directed expiry going to a live thread that does not block the signal. This paragraph said the timer was the creating task's until 2026-11-01, after the group table had landed.
 
-**A handled signal is handed over at a system call, not at a trap.** The queue, the mask and the
-handler table are Linux's (§2.12), but the *delivery point* is not: `deliver_pending_signal` runs on
-the scheduler's clock and only takes a **fatal** signal, because a signal with a handler needs the
-interrupted task's register file to build a frame on, and `src/syscall/mod.rs:284`'s
-`deliver_signal` is the only caller that has one. So a `SIGKILL` ends a task spinning in ring 3 at
-the next tick, while a `SIGINT`/`SIGALRM`/`SIGUSR1` that a handler catches waits for the task's next
-system call. Measured on both sides: Linux's burn loop (`build/scratch/timerclock/iret.c`, nothing
-in the loop but a `volatile double` add) leaves `by THE SIGNAL` 4 257 819 iterations into a
-400-million limit, and the same program here runs to its limit with the timer's `remaining` already
-`0 ms` (`build/boot-iret1.log`, staged as `t-iret`). Closing it needs each machine's tick vector to
-carry a full user register image - x86_64's `extern "x86-interrupt"` frame is
-`RIP`/`CS`/`RFLAGS`/`RSP`/`SS` only, and aarch64's IRQ stub saves `x0..x18`/`x29`/`x30`, the
-registers a Rust callee may clobber - which is a trap-entry change on both machines, not a field
-(§2.13).
+**A handled signal is handed over at a trap, on both machines — CLOSED 2026-11-13.** The queue, the
+mask and the handler table are Linux's (§2.12), but the *delivery point* used to be a system call,
+not a trap: `deliver_pending_signal` runs on the scheduler's clock and only took a **fatal** signal,
+because a signal with a handler needs the interrupted task's register file to build a frame on, and
+`deliver_signal` (the syscall exit) was the only caller that had one. A `SIGKILL` therefore ended a
+task spinning in ring 3 at the next tick, while a caught `SIGINT`/`SIGALRM`/`SIGUSR1` waited for the
+task's next system call — which is why `Ctrl-C` ignored a program that was computing. The reading
+that indicted it: Linux's burn loop (`build/scratch/timerclock/iret.c`, nothing in the loop but a
+`volatile double` add) left `by THE SIGNAL` 4 257 819 iterations into a 400-million limit, and the
+same program here ran to its limit with the timer's `remaining` already `0 ms`
+(`build/boot-iret1.log`). Closing it was a trap-entry change, not a field: each machine's tick
+vector had to carry a full user register image — x86_64's `extern "x86-interrupt"` frame is
+`RIP`/`CS`/`RFLAGS`/`RSP`/`SS` only, and aarch64's IRQ stub saved `x0..x18`/`x29`/`x30`. Both were
+rebuilt (§2.13): aarch64's EL0 IRQ stub now builds the same 816-byte `UserFrame` its sync stub does,
+and x86_64's PIT entry is a hand-written `timer_stub` pushing a 20-word `TrapRegs`. `Gate::capture_trap_regs`
+and `Gate::restore_trap_regs` gave the delivery one seam over two different frame objects, and
+`proc::deliver_at_trap` is the door both entries call inside their tick before preempting. Measured
+after: `THE SIGNAL` at 12 067 696 of 400 000 000 on aarch64 and 153 985 811 on x86_64, and `t-iret`
+asserts that unconditionally on both. What stays named is narrower: a delivery at a trap while the
+task is **traced** falls back to the pending set (`has_tracer`), because a ptrace stop in this kernel
+is a syscall-exit shape — no test runs a signal under a tracer, so that branch has never executed.
 
 **Other missing (lower priority).** `userfaultfd` (323) — **served now** for its measured
 subset (item 116, §6.33): `UFFDIO_API`, `REGISTER` in `MODE_MISSING`, `COPY`, `ZEROPAGE`,

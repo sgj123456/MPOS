@@ -11498,6 +11498,67 @@ day the naked tick stub lands, this program reddens and names the line. It is no
 **Gate:** `build/gate-213.log`, `GATE_EXIT=0` - stage 1 793 host tests 0 failed; x86_64
 `pass=307 fail=0`, kunit 35/0; aarch64 `pass=306 fail=0`, kunit 35/0.
 
-**Still open.** x86_64's half: replace the tick handler's `extern "x86-interrupt"` entry with a stub
-that pushes a `Regs`-shaped block before calling a Rust fn. New assembly on the one path that
-preempts, so it is a change of its own with its own before/after (`docs/notes/` §2.13's last section).
+**x86_64's half** was a change of its own with its own before/after, on the one path that preempts:
+**Item 262**, landed 2026-11-13.
+
+### Item 262 A handled signal reaches a program that never calls - on x86_64
+
+Item 261 closed §2.13 on aarch64 and left one sentence standing in `docs/notes/` §2.13: "on x86_64
+the tick handler is `extern "x86-interrupt" fn timer(frame: InterruptStackFrame)`; that ABI's
+prologue saves the general-purpose registers *below* the frame Rust is handed, at an offset it has
+no name for." Everything the delivery needs is in that sentence, including why it could not be
+solved the way aarch64's was: there is no frame to grow, only an entry to replace.
+
+**The frame's shape is not the gate's, and that is the first hazard.** `syscall_entry` builds
+`Regs`, whose `rcx`/`r11` slots hold the return `RIP` and `RFLAGS` because `syscall` stashes them
+there. A trap clobbers neither register, so a stub that pushed the gate's layout and read it back
+with the gate's readers would report a program's `r11` as its instruction pointer and its flags out
+of whatever `rcx` happened to be. `TrapRegs` is therefore its own `#[repr(C)]` block: fifteen GPRs in
+push order, then the `rip`/`cs`/`rflags`/`rsp`/`ss` the CPU pushed.
+
+**Three things the stub had to get right.**
+
+- **A `bool` is not a truthy integer.** The first version handed `rust_timer` the raw `cs & 3` as
+  Rust's `bool`, which is undefined behaviour the moment the value is `3` - and it is `3` for every
+  trap that matters here. Normalised to exactly `0`/`1`, with the same compare that decides whether
+  a frame pointer is passed at all.
+- **A trap frame is written by its own writer.** `apply_frame` writes the *gate's* object, so
+  `Gate::restore_trap_regs` was added beside `capture_trap_regs`, and `build_frame_at` takes an
+  `at_trap` flag to pick one. `Gate::trap_sp` came with it: `user_sp` reads the gate's `user_rsp`
+  field, and this machine's trap block has no such word - the read would land in a register and
+  answer a number that is not a stack.
+- **`cs`/`ss` are not written back.** They are read from the block to build the frame, and never
+  stored from a register file on the way out: a signal runs in the ring it interrupted, so writing
+  them would let a handler's return change rings.
+
+**The delivery runs inside the tick, before the preempt**, exactly as on aarch64: a delivery rewrites
+the register block, and a task switched away first would resume into the block without the handler
+in it.
+
+**Measured.** The same instrument as Item 261 (`t-iret`'s `CLOCK_PROCESS_CPUTIME_ID` timer, a loop
+with no system call):
+
+| | control | armed |
+|---|---|---|
+| x86_64 before | 400 000 000 of 400 000 000 | `count exhaustion` after 400 000 000 |
+| **x86_64 after** | 400 000 000 of 400 000 000 | **`THE SIGNAL` after 19 102 910** |
+| Linux 7.2.14 host | 400 000 000 of 400 000 000 | `THE SIGNAL` after 7 086 584 |
+
+**The pin, and how the change announced itself.** `t-iret` carried a per-kernel expectation while
+this was open, and its x86_64 arm asserted the *gap*. On the first boot with the stub installed that
+program printed `FAIL: with a 30 ms CPU-time signal armed, the loop runs to its limit (18 913 221 of
+400 000 000) because this kernel hands a handled signal over only at a system call (§2.13)` - the
+claim reddening on cue, naming its own line, and the recorded iteration count inside the failure
+being the evidence that the stub already worked. The program now asserts Linux's answer
+unconditionally, because all three kernels this suite runs on have one answer.
+
+**Gate:** `build/gate-213x64.log`, `GATE_EXIT=0` - stage 1 1301 host tests 0 failed; x86_64
+`pass=307 fail=0`, kunit 35/0; aarch64 `pass=306 fail=0`, kunit 35/0; fuzz workspace 23 targets.
+Both arms' lane logs show the claim green (`THE SIGNAL after 153 985 811` on x86_64,
+`12 067 696` on aarch64).
+
+**What this does not cover.** A signal delivered at a trap while the task is **traced** still goes
+back to the pending set: a ptrace stop in this kernel is a syscall-exit shape, and the tracer reads
+and rewrites the gate's frame with a call number in it. That branch has never executed on either
+machine, and giving a trap-side stop a report shape of its own is the next named gap on this
+surface, not a defect in this one.
