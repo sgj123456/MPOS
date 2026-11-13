@@ -158,6 +158,53 @@ struct ArmOutcome {
     ok: bool,
 }
 
+/// The fifth structural check, and the first one that reads a *built image*
+/// rather than a source tree: the kernel this sweep is about to boot must not
+/// carry the boot-hang instrument, and the feature that does carry it must
+/// still compile.
+///
+/// Two halves, because either alone is satisfiable by an accident. A byte scan
+/// alone stays green while the instrument's body rots out of compiling - no
+/// xtask command passes `--features heartbeat` (`Cargo.toml` says so), so
+/// nothing in this repository builds that shape except this check. A compile
+/// alone says nothing about the build being booted. Together they are the two
+/// statements §7 R.9 now makes: an ordinary boot is silent, and the reading a
+/// stalled boot needs is one build away.
+///
+/// The compile is a `cargo check`, not a build: a build would land an artifact
+/// on the path the loader embeds, and the sweep's job is not to leave a second
+/// kernel whose mtime lies about what a boot will see (`AGENTS.md` §5).
+fn check_hang_instrument(kernel: &Path, arch: Arch) -> Result<()> {
+    println!(
+        "Boot instrument: the {} kernel carries no hang-heartbeat table",
+        arch.name()
+    );
+    let offset = crate::gates::hang_instrument_offset(kernel).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(offset) = offset {
+        bail!(
+            "the {} kernel carries the boot-hang instrument at byte {offset}: a console printing \
+             a table of every task slot every five seconds is not a machine anybody can use, so \
+             `Cargo.toml`'s `heartbeat` feature is off in every ordinary build and this one has \
+             it on. Silence it, or boot it deliberately to read a stall",
+            kernel.display()
+        );
+    }
+    let root = utils::project_root()?;
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "check",
+        "-p",
+        "mpos",
+        "--target",
+        arch.kernel_target(),
+        "--features",
+        "heartbeat",
+    ])
+    .current_dir(&root);
+    run_captured(&mut cmd, "the boot-hang instrument's own build")?;
+    Ok(())
+}
+
 /// The gate: the host unit tests once, then the same sweep on every machine
 /// the command names. `--all-targets` (the default) names both; `--arch`
 /// narrows the run to the one it names - and both shapes run the *same* flow
@@ -282,6 +329,7 @@ fn run_one(
     // `--features selftest` build produces (`utils::build_test_kernel` says
     // why the two cannot be the same artifact).
     let kernel = utils::build_test_kernel(build_dir, profile, arch)?;
+    check_hang_instrument(&kernel, arch)?;
     println!();
     let loader = utils::loader_path(profile, arch)?;
 

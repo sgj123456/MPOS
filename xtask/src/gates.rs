@@ -670,6 +670,40 @@ mod tests {
              program silently never built', in its fuzz shape)."
         );
     }
+
+    /// The instrument's byte scan can tell the two builds apart. A scanner that
+    /// answered `None` for both would pass a tree that ships the heartbeat
+    /// table - the one thing the check exists to catch - so the loud image here
+    /// is a positive control, not a courtesy.
+    #[test]
+    fn the_instrument_scan_tells_a_silenced_image_from_a_loud_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "mpos-xtask-gates-instrument-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let loud = dir.join("loud.elf");
+        let silent = dir.join("silent.elf");
+        let mut image = b"\x7fELF\x02\x01".to_vec();
+        image.extend(b"mpos: heartbeat age=0ms fill-owner=none -- live slots:\n");
+        image.extend([0u8; 64]);
+        fs::write(&loud, &image).unwrap();
+        // An image that carries the *other* `mpos:` lines - a syscall trace, a
+        // slot line - and not the instrument's own header.
+        fs::write(
+            &silent,
+            b"\x7fELF\x02\x01mpos: syscall 9 -> ENOSYS\nmpos:   slot 3 pid 4 park 2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            hang_instrument_offset(&loud).unwrap(),
+            Some(6),
+            "the marker starts right after the ELF magic"
+        );
+        assert_eq!(hang_instrument_offset(&silent).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,4 +896,33 @@ pub fn fuzz_targets_declared(root: &Path) -> Result<Vec<FuzzDrift>, String> {
     }
     drift.sort_by(|a, b| a.what.cmp(&b.what));
     Ok(drift)
+}
+
+/// What the boot-hang instrument writes, and the bytes that say whether a built
+/// image carries it.
+///
+/// `src/sched/runtime/task.rs`'s `heartbeat` prints a table of every task slot
+/// every five seconds. It is a build switch now (`Cargo.toml`'s `heartbeat`
+/// feature; `docs/notes/` §7 R.9 says why a switch rather than a cleverer
+/// condition inside it), and the property an ordinary build has to have is
+/// *silence* - which no test on a booted machine can observe, because "these
+/// lines did not appear" is not a claim a log can make. So the gate reads the
+/// artifact: a kernel the sweep is about to boot must not contain this string.
+///
+/// Measured, so that this is a reading of the build rather than of the
+/// optimiser's mood: the guarding `cfg!` drops the format string from both a
+/// debug and an `-O` build of the same shape (`build/scratch/cfgstr.rs`), and
+/// the two real artifacts differ by exactly it - the same kernel built with
+/// `--features heartbeat` carries `mpos: heartbeat`, the ordinary build carries
+/// none of it (`build/scratch/mpos-heartbeat.elf` against
+/// `target/x86_64-unknown-none/debug/mpos`).
+pub const HANG_INSTRUMENT_MARKER: &[u8] = b"mpos: heartbeat";
+
+/// Where [`HANG_INSTRUMENT_MARKER`] first appears in a kernel image, or `None`
+/// for an image that does not carry the instrument.
+pub fn hang_instrument_offset(image: &Path) -> Result<Option<usize>, String> {
+    let bytes = fs::read(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    Ok(bytes
+        .windows(HANG_INSTRUMENT_MARKER.len())
+        .position(|window| window == HANG_INSTRUMENT_MARKER))
 }
