@@ -441,6 +441,94 @@ fn main() {
     r.check("the retirement reports IGNORED", retired);
 
     // ------------------------------------------------------------------
+    // A rename that replaces a name retires the replaced inode's watch.
+    //
+    // Measured on a current host first (`build/scratch/inotify2/c.c`,
+    // Linux 7.2.14): `rename(source, victim)` over a name that already
+    // exists tells the watched directory `IN_MOVED_FROM` + `IN_MOVED_TO`
+    // on one cookie and *nothing else* - a replace is one move, so there is
+    // no `IN_DELETE` for the name that went - while the victim's own watch
+    // hears `IN_DELETE_SELF` and then retires with `IN_IGNORED`, after
+    // which `inotify_rm_watch` of it is `EINVAL` because the watch is gone.
+    // This kernel's rename copies the body into a fresh inode and unlinks
+    // the victim on the way; that unlink reported nothing, so the watch
+    // stayed in the table for ever keyed on an inode no name reached - a
+    // watcher of a file that a package install replaced was never told its
+    // file had died. The last claim below is the counterfactual: a leaked
+    // watch still answers `inotify_rm_watch` with 0.
+    // ------------------------------------------------------------------
+    let victim_path = "/tmp/ino-dir/victim";
+    let source_path = "/tmp/ino-dir/source";
+    for path in [victim_path, source_path] {
+        let made = openat(
+            CWD,
+            path,
+            OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+            Mode::from_bits_retain(0o644),
+        );
+        r.check("the replacing rename's two names were made", made.is_ok());
+        if let Ok(f) = &made {
+            let _ = write(f, b"x");
+        }
+        drop(made);
+    }
+    let wd_rdir = add_watch(q, "/tmp/ino-dir", IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE);
+    let wd_victim = add_watch(q, victim_path, IN_DELETE_SELF | IN_MOVE_SELF);
+    r.check(
+        "the watched directory and the victim get two distinct wds",
+        wd_rdir >= 0 && wd_victim >= 0 && wd_victim != wd_rdir,
+    );
+    let _ = drain(q, &mut buf);
+    r.check(
+        "the replacing rename lands",
+        std::fs::rename(source_path, victim_path).is_ok(),
+    );
+    let mut from = (0u32, false);
+    let mut to = (0u32, false);
+    let mut dir_delete = false;
+    let mut victim_steps = 0u32;
+    let mut victim_move_self = false;
+    foreach_record(drain(q, &mut buf), |hdr, name| {
+        if hdr.wd == wd_rdir as i32 {
+            if hdr.mask & IN_MOVED_FROM != 0 && name == b"source" {
+                from = (hdr.cookie, true);
+            }
+            if hdr.mask & IN_MOVED_TO != 0 && name == b"victim" {
+                to = (hdr.cookie, true);
+            }
+            if hdr.mask & IN_DELETE != 0 {
+                dir_delete = true;
+            }
+        }
+        if hdr.wd == wd_victim as i32 {
+            if hdr.mask & IN_MOVE_SELF != 0 {
+                victim_move_self = true;
+            }
+            if hdr.mask == IN_DELETE_SELF && victim_steps == 0 {
+                victim_steps = 1;
+            } else if hdr.mask == IN_IGNORED && victim_steps == 1 {
+                victim_steps = 2;
+            }
+        }
+    });
+    r.check(
+        "the replacing move pairs FROM and TO on one nonzero cookie",
+        from.1 && to.1 && from.0 != 0 && from.0 == to.0,
+    );
+    r.check(
+        "the directory is told nothing of the replaced name going",
+        !dir_delete,
+    );
+    r.check(
+        "the victim's watch hears DELETE_SELF then retires with IGNORED",
+        victim_steps == 2 && !victim_move_self,
+    );
+    r.check(
+        "the retired victim wd is gone, so rm_watch answers EINVAL",
+        refused(rm_watch(q, wd_victim as i32), libc::EINVAL),
+    );
+
+    // ------------------------------------------------------------------
     // IN_ACCESS - the record a read of a watched file produces.
     //
     // Measured whole on a current host first
