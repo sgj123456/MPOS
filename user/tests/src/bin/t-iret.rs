@@ -131,8 +131,12 @@ fn burn(armed: bool) -> (i64, bool) {
         i += 1;
     }
     // Keep `x` observable so the arithmetic cannot be optimised away - a loop
-    // that the compiler removed would be a reading about nothing.
-    let managed = i + (x as i64 & 0);
+    // that the compiler removed would be a reading about nothing. `black_box`
+    // is the door that says so; the older shape here was `i + (x as i64 & 0)`,
+    // an expression whose `& 0` the compiler may simply fold away, which makes
+    // the corpus a reading about nothing after all.
+    core::hint::black_box(x);
+    let managed = i;
     // **Read the flag before any system call.** This is the instrument's whole
     // correctness: the question is whether the signal interrupted *the loop*,
     // and the first syscall after it is a door the signal can come through.

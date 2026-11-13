@@ -497,21 +497,19 @@ fn wait_channel(file: &Arc<crate::vfs::File>) -> isize {
     // - measured at 257 ms for a 0.2 s option on both a stream and a datagram
     // pair, `docs/notes/` §4.7.
     let deadline = channel_recv_deadline(file);
-    loop {
-        while !ready() {
-            if crate::sched::has_deliverable_signal() {
-                return err::EINTR;
-            }
-            let woke = park_with_timeout(ready, deadline);
-            if woke == err::EAGAIN {
-                return err::EAGAIN;
-            }
-            if woke == err::EINTR {
-                return err::EINTR;
-            }
+    while !ready() {
+        if crate::sched::has_deliverable_signal() {
+            return err::EINTR;
         }
-        return 0;
+        let woke = park_with_timeout(ready, deadline);
+        if woke == err::EAGAIN {
+            return err::EAGAIN;
+        }
+        if woke == err::EINTR {
+            return err::EINTR;
+        }
     }
+    0
 }
 
 /// The `SO_RCVTIMEO` a channel end carries, as a deadline.

@@ -229,7 +229,7 @@ impl Ring {
     /// names the slot - the array is userspace's to write (Linux leaves it as
     /// the mapping gave it; the measured probes wrote it explicitly, and a
     /// ring that does not write it re-reads one stale SQE for every entry).
-    fn push(&self) -> &mut Sqe {
+    fn push(&mut self) -> &mut Sqe {
         let tail = self.sq_tail();
         let slot = tail & self.word(self.params.sq_off.ring_mask);
         unsafe {
@@ -272,7 +272,7 @@ impl Ring {
 
     /// Submit one SQE and take its single completion: the shape most of these
     /// claims use.
-    fn one(&self, fill: impl FnOnce(&mut Sqe)) -> Cqe {
+    fn one(&mut self, fill: impl FnOnce(&mut Sqe)) -> Cqe {
         let sqe = self.push();
         *sqe = Sqe::default();
         fill(sqe);
@@ -328,7 +328,7 @@ fn main() {
         Err(-22) => r.check("entries=0 is EINVAL", true),
         other => r.check("entries=0 is EINVAL", other.is_err()),
     }
-    let ring = Ring::setup(8).expect("a ring of eight entries can be built");
+    let mut ring = Ring::setup(8).expect("a ring of eight entries can be built");
     r.check(
         "setup answers sq_entries=8, cq_entries=16",
         ring.params.sq_entries == 8 && ring.params.cq_entries == 16,
@@ -574,7 +574,7 @@ fn main() {
 
     // An `entries=1` ring works end to end (mask 1, cq 2).
     match Ring::setup(1) {
-        Ok(tiny) => {
+        Ok(mut tiny) => {
             let cqe = tiny.one(|sqe| {
                 sqe.opcode = OP_NOP;
                 sqe.user_data = 7;

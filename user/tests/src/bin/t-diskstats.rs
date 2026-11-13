@@ -155,9 +155,13 @@ fn main() {
                 after.field(2) >= before.field(2) + 8,
             );
             r.check("nothing is in flight at rest", after.field(8) == 0);
+            // `field` is a `u64`, so the lower bound this claim used to spell
+            // out (`>= 0`) is vacuous - the columns are six figures the counter
+            // keeps adding to its own total, so this pins the clock and the unit
+            // under load.
             r.check(
                 "the millisecond columns are milliseconds, not a constant zero",
-                after.field(3) >= 0 && after.field(3) < 60_000,
+                after.field(3) < 60_000,
             );
         }
         _ => {
