@@ -15,22 +15,52 @@ name = "mpos"
 version = "0.1.0"
 edition = "2024"
 
-# The kernel's one build-time switch, and it is the test build: with `selftest`
-# off - every ordinary build, and the only shape that ships - the wiring layer
-# compiles neither the boot's check families nor the harness that runs them, so
-# "does the production kernel contain test code" is answered by the compiler
-# rather than by a reviewer.
+# The kernel's build-time switches, and there are two - both are *instruments*,
+# neither is behaviour, and an ordinary build (the only shape that ships)
+# carries neither. That is the whole point of them being switches: "does the
+# production kernel contain test code, or print a debugging table at whoever is
+# using the machine" is answered by the compiler rather than by a reviewer.
 #
-# A cargo feature rather than a `--cfg`: the `mpos_*` words in
+# `selftest` is the test build: with it off the wiring layer compiles neither
+# the boot's check families nor the harness that runs them, and
+# `cargo xtask test` is the only thing that passes it (`docs/notes/` §15.19).
+#
+# `heartbeat` is the boot-hang instrument: `src/sched/runtime/task.rs`'s
+# `heartbeat` writes one table of every task slot - and how long ago the last
+# task switch was - to the wire every five seconds. It exists because a hung
+# boot cannot run `ps`, and because the udev livelock's own reading was an `age`
+# that never left 0-3 ms (the machine was switching constantly, into the same
+# spin): no progress-based trigger could ever have fired, which is why the
+# instrument has to be unconditional *while it is built in* - and therefore why
+# the honest way to keep an ordinary console readable is a build switch rather
+# than a cleverer condition inside the instrument (`docs/notes/` §7 R.9). Five
+# seconds of quiet is not enough time to type a command, so in a build that
+# carries it the console belongs to the instrument; a boot that has to read a
+# stall is built the way a test build is, by hand, because no xtask command
+# passes this feature:
+#
+#     cargo build --release --target x86_64-unknown-none --features heartbeat
+#
+# and then the loader re-embedded over it (`AGENTS.md` §5: the loader *carries*
+# the kernel, so rebuilding one without the other boots the old bytes). That
+# second step is subtler than it looks: `boot/build.rs` watches the kernel
+# file's mtime, and toggling a feature re-*links* an artifact whose mtime can be
+# older than the build script's last run, so a rebuild that looks like it
+# happened can keep the previous kernel - remove
+# `target/<arch>-unknown-uefi/release/build/mpos-boot` first, and believe the
+# wire rather than the file (`docs/notes/` §7.9v).
+#
+# Both are cargo features rather than a `--cfg`: the `mpos_*` words in
 # `.cargo/config.toml` are *machine* facts and belong unconditionally in their
-# target's block, while this is a fact about the *build*. Adding a `--cfg` there
-# is not possible - setting `RUSTFLAGS` **replaces** that block rather than
-# extending it, taking the linker script and all nine capability flags with it
-# (measured: four errors in `mpos-arch`) - so the additive form of the switch is
-# the only one that works, and it is also the shape of the thing it imitates
-# (`CONFIG_KUNIT=y`). `docs/NOTES.md` §15.19.
+# target's block, while these are facts about the *build*. Adding a `--cfg`
+# there is not possible - setting `RUSTFLAGS` **replaces** that block rather
+# than extending it, taking the linker script and all nine capability flags with
+# it (measured: four errors in `mpos-arch`) - so the additive form is the only
+# one that works, and it is also the shape of the thing it imitates
+# (`CONFIG_KUNIT=y`). `docs/notes/` §15.19.
 [features]
 selftest = []
+heartbeat = []
 
 # Machine-dependent crates are gated behind `target_os = "none"`. That keeps the
 # host build (cargo test --lib --target x86_64-unknown-linux-gnu) free of

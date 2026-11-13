@@ -4101,7 +4101,27 @@ const HEARTBEAT_NS: u64 = 5_000_000_000;
 /// and which slots are switched to says what spins - a single last-ran line
 /// named the spinner and could not say that udev's own processes were asleep
 /// (`docs/notes/` §7 R.9).
+///
+/// It is a **build switch** - `Cargo.toml`'s `heartbeat` feature, off in every
+/// ordinary build - and that is a statement about what this table is: a
+/// twenty-line burst every five seconds is a console nobody can type on, so a
+/// build that carries the instrument is a build being used to read a stall, and
+/// nothing else. The reason a switch is the honest quieting rather than a
+/// smarter condition is in the note: the stall this was written for had an
+/// `age` that never left 0-3 ms, so "print only when nothing is progressing"
+/// is exactly the state the instrument could not have detected.
 fn heartbeat() {
+    // Off: this is a `ret` (the guard is a compile-time constant), so an
+    // ordinary boot pays nothing for the instrument existing. An early return
+    // rather than `#[cfg]`d bodies keeps every static this reads a *reader*,
+    // which is what stops a quiet build's dead-code report naming
+    // `LAST_BEAT_NS`; measured with rustc (`build/scratch/cfgstr.rs`) that the
+    // optimiser still drops the format string from both a debug and an `-O`
+    // binary in this shape, which is what the gate's byte scan of the image
+    // reads.
+    if !cfg!(feature = "heartbeat") {
+        return;
+    }
     use core::sync::atomic::Ordering;
     let now = hal::since_boot_nanos();
     let last = LAST_BEAT_NS.load(Ordering::Relaxed);
