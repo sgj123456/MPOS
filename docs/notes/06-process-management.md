@@ -9290,11 +9290,13 @@ prints zeros for everything satisfies "the child matches the parent" and
 the zombie's zero row is paired with a live row in the same claim set.
 
 **Named gaps left deliberately open**, each an honest `0` rather than an
-estimate: `VmLck` and `VmPin` (no mlock/pin accounting), `RssAnon`/`RssFile`/
-`RssShmem` (the frames table does not record what backs a page — a private file
-mapping's page and a demand-faulted anonymous page are the same kind of frame
-to it), `VmPTE` (no page-table byte count) and `VmSwap` (no swap). `RssAnon`
-keeping the whole resident set is the one that most deserves a follow-up.
+estimate: `VmLck` and `VmPin` (no mlock/pin accounting), `VmPTE` (no page-table
+byte count) and `VmSwap` (no swap). `RssAnon`/`RssFile`/`RssShmem` were in this
+list — "the frames table does not record what backs a page" — and
+**§6.147 / item 264** closed it six days later by recounting the *describing*
+VMA and eager-range tables instead; `RssAnon` no longer keeps the whole
+resident set. This paragraph records the state at §6.109's landing, not a live
+gap.
 
 **The rule.** Two files answered the same question with different shapes — and
 the answer was in Linux's source, not in either shape. A count of "mapped
@@ -13206,3 +13208,147 @@ The full gate (`build/gate-pollaudit.log`) is `GATE_EXIT=0`, stage 1 `1296 tests
 each. **Four programs changed out of 321 audited; no kernel behaviour was touched and no genuine
 kernel bug was found** - the class's remaining instances were claims asking a timed park for a
 continuity, or for an instant, that it does not promise.
+
+## §6.147 the resident set is three books, not one number with three names (LANDED 2026-11-13)
+
+`/proc/<pid>/status` printed the *whole* resident set as `RssAnon:` and a literal
+`0 kB` for `RssFile:`/`RssShmem:`; `/proc/<pid>/statm` printed a literal `0` for
+its third field, `shared`. Three places called it a named gap on the same
+reason: "the frames table does not record what backs a page"
+(`src/vfs/procfs.rs`'s `vm_block` and `statm_text` docs, items 222/232). The
+frames table really is just `Vec<usize>` physical frame numbers
+(`Mm::frames`, `src/sched/runtime/child_mm.rs:1722`) - but the sentence was a
+non-sequitur: **the two tables that describe the address space already say what
+backs each range**, and `smaps` has been reading them for months
+(`mapping_lines`, `src/vfs/procfs.rs:2978`).
+
+### The measurement (Linux 7.2.14, `build/scratch/rsssplit/{p,q,r,s}.c`)
+
+Read `/proc/self/status` and `/proc/self/statm` at one instant, then make and
+**touch** one mapping at a time. The three lines are not three estimates of
+`VmRSS`; they partition it:
+
+| step | `RssAnon` | `RssFile` | `RssShmem` | `VmRSS` | `statm shared` |
+|---|---|---|---|---|---|
+| baseline | 100 | 1624 | 0 | 1724 | 406 |
+| 4 MiB `MAP_PRIVATE\|MAP_ANONYMOUS`, touched | **4200** | 1940 | 0 | 6140 | 485 |
+| 64 KiB file `MAP_PRIVATE`, read only | 104 | **2008** | 0 | 2112 | 502 |
+| the same 64 KiB written (CoW) | **168** | **1944** | 0 | 2112 | 486 |
+| 4 MiB `MAP_SHARED\|MAP_ANONYMOUS`, touched | 4200 | 1940 | **4096** | 10236 | 1509 |
+| 4 MiB SysV shm, touched | 4200 | 1940 | **4096** | 10236 | 1509 |
+
+Two relations hold on every reading: `RssAnon + RssFile + RssShmem == VmRSS`
+**exactly**, and `statm.shared == (RssFile + RssShmem)/4` in pages, with
+`statm.resident == VmRSS/4`. A 4 MiB touched mapping moves its own line by
+exactly 4096 kB = 1024 pages and leaves the others alone. The CoW row is the
+sharp one: writing a private file page **moves** 64 kB from `RssFile` to
+`RssAnon` while `VmRSS` stays put. A monitor subtracts two readings of these
+fields to get a rate; the whole-resident-set answer makes `RssFile` growth
+invisible and `RssAnon` growth a fiction.
+
+`r.c` also measured why the pin cannot use constants: the first reading in a
+process differs from the next by ~32 pages purely because opening a proc file
+faults the reader's own stack. Every claim is a **movement or a relation within
+one read pair**. On a busy host even two opens can drift (one reading here was
+`statm 2343 1516 1490 …` against `VmRSS 6580`, `RssFile 6424`: shared 1490 vs
+1606), so `statm.resident` gets a ±64-page bound and the exact `VmRSS`
+agreement is pinned inside one `status` read by the sum.
+
+### Why a recount, and why anon is the remainder
+
+Two designs were on the table. The obvious one - tag each frame with its backing
+at `own()` time - would change `frames: Mutex<RefCell<Vec<usize>>>` to a tagged
+vector and touch all eight `own`/`disown` sites, `replace` (CoW), `take_frames`
+and the loader's initial `Vec`. That is the frame-accounting primitive every
+fault, fork, exec and exit goes through; a bug there ends the machine. The
+shipped house style points the other way: `Mm::vm_books()`
+(`child_mm.rs:2707`) recounts the VMA and eager tables rather than keeping
+counters, "because this kernel has two tables describing one address space and
+a counter would need six mutation sites". `smaps`' `resident_lines` already
+pays for a `resident_pages` walk per mapping.
+
+So `rss_split(pid, rss_pages)` (`src/vfs/procfs.rs`) recounts:
+
+* `VmaKind::Anon` - skip (anonymous, brk, stack VMAs all land here);
+* `VmaKind::Frames { object, .. }` - count the range's resident pages as
+  `shmem` when `object.is_shmem()`, else `file`. The predicate is a new
+  `MappedObject::is_shmem()` (default `false`), answered `true` by SysV
+  `Segment` (`src/mm/sysv_shm.rs`) and by `Memfd` through a new, **not
+  cfg-gated** `Inode::is_shmem()` (`src/vfs/mod.rs`) - it cannot be
+  `as_memfd()` because `MappedInode`'s `MappedObject` impl is host-compiled
+  while `as_memfd` is `#[cfg(target_os = "none")]`. dma-buf, the framebuffer,
+  dumb buffers and private `FilePages` are the file half.
+* eager `MappedRange`s - file, **except** `name == Some("[stack]")`, which is
+  anonymous. This is `vm_book`'s shipped `[stack]`-by-name precedent, and
+  `grow_stack_range` keeps that name when the stack grows. Eager ranges are the
+  program image segments, a `MAP_SHARED` ordinary-file copy and the stack.
+
+The fold then **makes** Linux's invariant true by construction:
+`shared = (file + shmem).min(rss_pages)`, `file` capped at `shared`, `shmem`
+the rest, and `anon = rss_pages - shared`. One frame described by two ranges
+therefore cannot make the three over-report. This matters because the split is
+a *model*, not a per-page truth: this kernel has no page cache, so
+`FilePages::frame_at` (`child_mm.rs:563`) always allocates a fresh private
+frame and copies the file's bytes - there is no shared page to CoW from, and a
+written private file page stays `RssFile` here where Linux moves it to
+`RssAnon`. Naming that residual is AGENTS.md §3 rule 5; printing the nearest
+number would be rule 3. `smaps` calling eager pages `Anonymous:` while
+`status` calls them `RssFile` is the same honesty: the two files ask different
+questions (`Anonymous:` is "nobody else's frame", `RssFile` is "a file
+mapping's resident pages") and both answers are written down.
+
+The fold runs in `status_of`/`statm_line`, **after** `snapshot_of`, not inside
+it: all three of `snapshot_of`'s callers sit inside `with_table`, and a
+per-page walk there would hold interrupts off for up to 262144 pages
+(AGENTS.md §3 rule 5). `resident_pages` re-enters `with_table` once per page
+precisely to keep them on. `TaskSnapshot`/the host `Process` mirror carry
+`rss_split: (usize, usize, usize)` in pages; both generators fill it, guarded
+by `state != 'Z'` because a zombie has released its address space. The
+renderer reads it off `task` rather than taking an 11th parameter - `vm_block`
+is already at clippy's `too_many_arguments` limit and the ratchet (§1.6) would
+have failed on the growth.
+
+Linux's `Vm*` counts are `%8lu`, not a fixed prefix: `cat -A` reads
+`RssAnon:^I     164 kB$`, `RssFile:^I    6432 kB$`, `VmPin:^I       0 kB$`.
+A new `vm_count` right-aligns in eight columns; the old literal-zero lines
+keep their seven-space zero. A first draft using `\t   ` reddened
+`a_zombies_status_has_no_vm_line`, which is the pin doing its job.
+
+### Pins, and their counterfactuals
+
+* `user/tests/src/bin/t-rsssplit.rs` - 13 claims, ungrouped (default sweep on
+  both machines). Reads both files at one instant; asserts the sum, `statm`'s
+  `shared`, that an untouched program's image is `RssFile > 0` (the old kernel
+  printed 0), that touching 4 MiB of private anon moves `RssAnon` by ~1024
+  pages and nothing else, that touching 4 MiB of shared anon moves `RssShmem`
+  and **leaves `RssAnon` standing** (both mappings stay mapped so the claim is
+  literal), and that the sum and `statm.shared` still hold after each.
+  `MPOS_ON_HOST=1` passes on real Linux (`128+2232+0 vs 2360`, `4228 -> 4228`,
+  `0 -> 4096`). A fresh 4 MiB `MAP_SHARED|MAP_ANONYMOUS` on a read-only fd is
+  `EPERM`, so the shared anon shape uses `-1`. The CoW residual is named in
+  the header and deliberately **not** asserted.
+* Host unit test `the_rss_lines_and_statm_shared_are_read_from_the_split` -
+  a `Process` with `rss_split = (100, 50, 10)` must print 400/200/40 kB and a
+  `statm` third field of 60. Counterfactually verified: reverting `vm_block`
+  to `anon = rss_kb`, literal `0`/`0` and `statm_text`'s third field to `0`
+  fails it (`build/scratch/cf-rsssplit.log`), and restoring the file returns
+  794/794 green.
+* One-shot x86_64 boot (`build/scratch/oneshot-rss2.log`): 13/13 `PASS` on the
+  real kernel, `RssFile: 416 kB` where the old kernel printed 0 and
+  `RssShmem: 0 -> 4096 kB`.
+* Full gate `build/gate-rsssplit-final.log`, `GATE_EXIT=0`: stage 1 **1311 tests, 0
+  failed**, lint 162/162 + 168/168 + 389/389 + 273/273 + 3/3 + 1/1, formatting
+  clean in both workspaces, fuzz 23 targets, x86_64 `pass=308 fail=0`, aarch64
+  `pass=307 fail=0`, `mpos-kunit 35 passed, 0 failed` on each. `t-rsssplit`
+  ran in both arms (`build/test-costs-*.tsv`: 21 ms / 321 ms;
+  `build/test-lane-{x86_64,aarch64}-2/serial.log`: `=== PASS t-rsssplit`).
+
+### What is still not covered
+
+`RssFile`'s per-page CoW move (above) is the named residual: it needs a page
+cache, which this kernel does not have. `VmPTE`, `VmSwap`, `VmLck`/`VmPin`
+accounting and `statm`'s `dirty` remain honest zeros, as items 222/232 record.
+A shared file mapping whose inode is a dma-buf or framebuffer is counted as
+`RssFile` (its object is not shmem), which is Linux's answer for a page cache
+backed by a device file, but this kernel serves it from a private copy rather
+than a shared page - the same model boundary, not a new gap.

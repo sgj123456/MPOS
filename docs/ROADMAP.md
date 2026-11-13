@@ -2518,3 +2518,26 @@ carries the per-phase history.*
   drove were each a claim that was false rather than a style preference - `mut_from_ref` in
   `t-io-uring`'s hand-built ring, `erasing_op` in an anti-optimisation that `& 0` had folded away,
   `absurd_extreme_comparisons` on a `u64`, and the socket wait above. (§1.6, item 263)
+- **`status`'s resident set is three books now, not one number with three names**: `RssAnon` had
+  printed the *whole* `VmRSS`, `RssFile`/`RssShmem` a literal `0 kB`, and `statm`'s third field
+  (`shared`) a literal `0` - three places named the gap on the reason "the frames table does not
+  record what backs a page". The frames table is just `Vec<usize>` frame numbers, but the two tables
+  that *describe* the address space already say what backs each range and `smaps` has been reading
+  them for months. Measured on Linux 7.2.14: the three lines sum to `VmRSS` exactly, `statm.shared`
+  is `RssFile + RssShmem` in pages, a touched 4 MiB private anon mapping moves only `RssAnon` by
+  4096 kB, a shared anon mapping moves `RssShmem`, and writing a private file page moves 64 kB from
+  `RssFile` to `RssAnon` (CoW). `rss_split` recounts the VMA and eager ranges by backing object,
+  runs **outside** the task-table lock (`snapshot_of`'s three callers are all inside it, and a
+  gigabyte of pages must not hold interrupts off), and makes anon the **remainder** so the sum holds
+  by construction even when one frame is described twice. New `MappedObject::is_shmem()` / not-gated
+  `Inode::is_shmem()` hooks answer shmem for SysV segments and memfds; `[stack]` eager ranges are the
+  one anonymous exception, by `vm_book`'s shipped name precedent. `TaskSnapshot`/host `Process` carry
+  the split in pages; `vm_block` reads it off `task` rather than taking an 11th argument, because
+  clippy's ratchet (item 263) is already at `too_many_arguments`' limit. Linux's counts are `%8lu`, so
+  a `vm_count` right-aligns them. **Named residual**: without a page cache this kernel cannot
+  reproduce the per-page CoW move (`FilePages::frame_at` always makes a private copy), so the split
+  is an honest model over ranges, not a per-page truth. Pins: `t-rsssplit` (13 claims, green on real
+  Linux, on a one-shot x86_64 boot and in both gate arms), host unit test
+  `the_rss_lines_and_statm_shared_are_read_from_the_split` (counterfactually red against the old
+  whole/0/0 renderer). Gate `build/gate-rsssplit-final.log` `GATE_EXIT=0`: stage 1 1311 tests, x86_64
+  `pass=308`, aarch64 `pass=307`, kunit 35/0, lint/formatting clean, fuzz 23. (§6.147, item 264)
