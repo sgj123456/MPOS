@@ -2150,7 +2150,10 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // pair, and the inode that travelled says `IN_MOVE_SELF` to its own
     // watchers. The old name is gone and the new one stands for a fresh
     // inode (this kernel's rename copies), so the moved report names both
-    // sides as it should.
+    // sides as it should - and for a regular file the inode that
+    // "travelled" is that fresh one, which is why the old name's watchers
+    // hear `IN_DELETE_SELF` below rather than a `IN_MOVE_SELF` they could
+    // follow.
     crate::vfs::inotify::emit_move(
         &old_dir,
         &old_name,
@@ -2159,6 +2162,19 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         &inode_for_news(&old_inode, &dir, &name),
     );
     crate::vfs::inotify::notify_deleted(&old_inode);
+    // The name this rename replaced is gone. `claim_name!` unlinked it on the
+    // way to creating the new one - replacing by unlink-and-create is what
+    // keeps a link from being written in place of the link it points at - and
+    // that unlink is not the one above: the victim is a *different* inode,
+    // nothing was told its watchers, and their registrations stayed in the
+    // table for ever keyed on an inode no name reached. Measured on a current
+    // host (`.workbuddy/probe_inotify_rename.c`, Linux 7.2.14): the watch on the
+    // replaced file hears `IN_DELETE_SELF` then retires with `IN_IGNORED`,
+    // and a later `inotify_rm_watch` of it is `EINVAL`; the watched directory
+    // hears only the moved pair - never an `IN_DELETE` for the victim.
+    if let Some(victim) = &existing {
+        crate::vfs::inotify::notify_deleted(victim);
+    }
     0
 }
 

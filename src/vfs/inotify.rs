@@ -40,9 +40,16 @@
 //! The deliberate departures from Linux that remain, each visible from
 //! userland: `IN_UNMOUNT` is not emitted (unmount does not track watches; a
 //! stale one simply stops matching); a watched directory's `IN_MOVE_SELF`
-//! is unreachable while `renameat2` refuses directory renames; and a rename
-//! that replaces a name really does unlink the old inode here, so the
-//! replaced name truthfully reports `IN_DELETE` before `IN_CREATE`.
+//! is unreachable while `renameat2` refuses directory renames; and a
+//! watched *regular file* does not survive a rename here - this kernel's
+//! rename copies the body into a fresh inode, so the old watch is retired
+//! with `IN_DELETE_SELF` then `IN_IGNORED` where Linux hands the travelling
+//! watch `IN_MOVE_SELF` and keeps it live on the same inode. A rename that
+//! replaces a name reports what Linux reports - one `IN_MOVED_FROM` +
+//! `IN_MOVED_TO` pair on one cookie, and *no* `IN_DELETE` for the name that
+//! went, because a replace is one move and not a delete plus a create - and
+//! the replaced inode's own watch is retired the same way a delete retires
+//! it (measured against Linux 7.2.14: `.workbuddy/probe_inotify_rename.c`).
 //! `IN_EXCL_UNLINK` is honoured at the unlink boundary itself - the one
 //! moment the question has an answer without hunting the tree for names.
 
@@ -899,7 +906,11 @@ pub fn emit_access(inode: &Arc<dyn Inode>) {
 
 /// Report one rename: the pair of directory events share the cookie the
 /// reader joins them by, and the moved inode itself reports
-/// `IN_MOVE_SELF`. `moved` is the inode that travelled.
+/// `IN_MOVE_SELF`. `moved` is the inode that travelled - and on this
+/// kernel's copy-based rename that is the *fresh* inode for a regular
+/// file, so the watchers of the name that moved hear no `IN_MOVE_SELF` at
+/// all: they are retired by [`notify_deleted`] instead, which is the
+/// honest report for an inode that no longer has a name.
 pub fn emit_move(
     old_dir: &Arc<dyn Inode>,
     old_name: &str,
