@@ -84,6 +84,22 @@ pub trait MappedObject {
         None
     }
 
+    /// Whether pages of this object are shmem-backed, for `/proc/<pid>/status`'s
+    /// `RssShmem` and `statm`'s `shared` field.
+    ///
+    /// Linux splits the resident set into anonymous, file and shmem pages, and
+    /// a reader subtracts the three from `VmRSS` to find private anonymous
+    /// memory. A `MappedObject` cannot be downcast, so the object answers the
+    /// one question the split needs rather than exposing its type. Default
+    /// `false` is the file half: a dma-buf, the framebuffer, a DRM dumb buffer
+    /// and a private mapping of a file all report `RssFile`. The two objects
+    /// that answer `true` are a System V segment and a memfd (which is what a
+    /// `MAP_SHARED | MAP_ANONYMOUS` mapping is built from); both are measured
+    /// as `RssShmem` on a current host (`docs/notes/` §6.147).
+    fn is_shmem(&self) -> bool {
+        false
+    }
+
     /// Whether `other` is this same object.
     ///
     /// Defaulted to identity, which is the strongest comparison a trait object

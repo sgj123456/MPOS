@@ -1666,6 +1666,9 @@ pub struct Process {
     /// See [`crate::sched::TaskSnapshot::books`] - `(exec_vm, stack_vm,
     /// data_vm)`, the three page books behind `VmExe`/`VmLib`/`VmStk`/`VmData`.
     pub books: (usize, usize, usize),
+    /// See [`crate::sched::TaskSnapshot::rss_split`] - `(anon, file, shmem)`
+    /// pages, behind `RssAnon`/`RssFile`/`RssShmem` and `statm`'s third field.
+    pub rss_split: (usize, usize, usize),
     /// See [`crate::sched::TaskSnapshot::locked_pages`] - the pages pinned by
     /// `mlock`, which `VmLck` prints in kilobytes.
     pub locked_pages: usize,
@@ -2254,12 +2257,15 @@ fn text_span_pages(bounds: crate::mm::ImageBounds) -> usize {
 /// them from.
 ///
 /// `size`, `resident`, `text` and `data` come from `task_statm`
-/// (`fs/proc/task_mmu.c`), `lib` and `dt` are the two Linux prints as literal
-/// zeros, and `shared` is this kernel's named gap: Linux's third field is
-/// `MM_FILEPAGES + MM_SHMEMPAGES`, the resident set's file-backed and shared
-/// half, and no counter here splits residency that way (`docs/uapi/` Item 232).
-/// It prints `0` the way a machine with no such book honestly reports, rather
-/// than borrowing `resident`.
+/// (`fs/proc/task_mmu.c`), and `lib` and `dt` are the two Linux prints as
+/// literal zeros. `shared` is the resident set's file-backed and shared half:
+/// Linux's third field is `MM_FILEPAGES + MM_SHMEMPAGES`, which on this kernel
+/// is `rss_split`'s file + shmem pages. It used to print `0` under a named gap
+/// (`docs/uapi/` Item 232); the split is now folded from the describing ranges
+/// by [`rss_split`], and the generator fills `task.rss_split` before calling
+/// here. Measured on Linux 7.2.14 (`build/scratch/rsssplit/s.c`): at every
+/// step `shared == (RssFile_kB + RssShmem_kB)/4` and `resident == VmRSS/4`
+/// exactly, so the two files are two units over one resident set.
 ///
 /// Three of these are **not** what `status` prints beside them, and the
 /// difference is Linux's own, measured on one `mm` at one instant
@@ -2272,8 +2278,16 @@ fn text_span_pages(bounds: crate::mm::ImageBounds) -> usize {
 /// * `text` is the unclamped span, so it is the reader that can still answer
 ///   for an image whose executable segments are far apart (`far.c`: 1281
 ///   pages here, `16 kB` in `VmExe:`).
-/// * `shared` is a counter this kernel does not keep, where `status`'s
-///   `RssFile:`/`RssShmem:` are the same gap under other names.
+/// * `shared` counts file and shmem resident pages; `status`'s `RssFile:` /
+///   `RssShmem:` print the same two numbers in kilobytes, and `RssAnon:` is
+///   the remainder of `VmRSS`.
+///
+/// The residual the split does **not** reproduce: Linux moves a private file
+/// page from `RssFile` to `RssAnon` when the process copy-on-writes it, a
+/// per-page fact. This kernel has no page cache - a private file mapping's
+/// `frame_at` always allocates a fresh private frame and copies the bytes - so
+/// the split is a model over the describing ranges, not a per-page truth, and
+/// such a page stays `RssFile` here (`docs/notes/` §6.147).
 ///
 /// A zombie is seven zeros because `task_statm` is only reachable through an
 /// `mm` and a zombie has none (`build/scratch/statm/z.c`: `0 0 0 0 0 0 0`).
@@ -2282,10 +2296,12 @@ fn statm_text(task: &Process) -> alloc::string::String {
         return alloc::string::String::from("0 0 0 0 0 0 0\n");
     }
     let (_, stack_pages, data_pages) = task.books;
+    let shared = task.rss_split.1 + task.rss_split.2;
     alloc::format!(
-        "{} {} 0 {} 0 {} 0\n",
+        "{} {} {} {} 0 {} 0\n",
         task.virtual_pages,
         task.rss_pages,
+        shared,
         text_span_pages(task.image),
         data_pages + stack_pages
     )
@@ -2341,16 +2357,22 @@ fn exit_code_word(status: i32) -> alloc::string::String {
 /// `1048` with `total` unchanged - the two questions a reader of this file
 /// asks, which is why printing the resident count twice answered neither.
 ///
-/// The remaining three - `shared`, `library` and `dirty` - are a **named gap**
-/// rather than a shape: `shared` is the resident set's file-backed and shared
-/// half (a counter this kernel does not keep), `library` is zero on Linux
-/// itself, and no dirty-page book exists. They print `0` the way a machine
-/// with none of them would honestly report. `data` used to print the resident
-/// count, which is not that question at all - a number that looked plausible
-/// is worse here than an honest zero, because `ps_mem` and `smem` fold these
-/// fields into a total (`docs/ROADMAP.md`, `docs/uapi/` Item 232).
+/// `shared` is the resident set's file-backed and shared half, folded by
+/// [`rss_split`] from the describing ranges and filled into the snapshot here,
+/// *outside* the task-table lock (the fold walks one `phys_for_virt` per
+/// resident page). `library` is zero on Linux itself and `dirty` is still a
+/// named gap - no dirty-page book exists - so those two print `0` the way a
+/// machine with none of them would honestly report. `data` used to print the
+/// resident count, which is not that question at all; a number that looked
+/// plausible is worse here than an honest zero, because `ps_mem` and `smem`
+/// fold these fields into a total (`docs/ROADMAP.md`, `docs/uapi/` Item 232).
+/// A zombie keeps the seven zeros: its address space is gone, so no fold runs.
 fn statm_line(pid: usize) -> Option<String> {
-    Some(statm_text(&task(pid)?))
+    let mut process = task(pid)?;
+    if process.state != 'Z' {
+        process.rss_split = rss_split(pid, process.rss_pages);
+    }
+    Some(statm_text(&process))
 }
 
 /// The column a mapping's name starts in, on Linux.
@@ -3257,6 +3279,14 @@ fn vm_kilobytes(pages: usize) -> usize {
     pages * 4096 / 1024
 }
 
+/// A `Vm*` count in Linux's `%8lu` field: right-aligned in eight characters,
+/// so a zero reads `       0` and `6432` reads `    6432`. Measured with
+/// `cat -A /proc/self/status` on Linux 7.2.14; the three `Rss*` lines use it
+/// because their values are real counts now, not literal zeros.
+fn vm_count(kb: usize) -> alloc::string::String {
+    alloc::format!("{kb:>8}")
+}
+
 /// The four page counts `status`'s `Vm` lines are made from.
 struct VmFacts {
     /// Right now: the address space (`VmSize`) and what is resident (`VmRSS`).
@@ -3283,6 +3313,83 @@ fn vm_lines(facts: VmFacts) -> (usize, usize, usize, usize) {
     let rss_kb = vm_kilobytes(facts.rss_pages);
     let hwm_kb = vm_kilobytes(facts.hwm_frames.max(facts.rss_pages));
     (peak_kb, size_kb, hwm_kb, rss_kb)
+}
+
+/// The resident set split into `(anonymous, file, shmem)` **pages**, folded
+/// from the two tables that describe the address space.
+///
+/// The frames table holds physical frame numbers and nothing about what backs
+/// a page, so a split cannot be read off it. What *can* answer is the pair of
+/// describing structures `crate::sched::map_facts` snapshots: a `Vma` says
+/// `VmaKind::Anon` or `VmaKind::Frames { object, .. }`, and the object says
+/// `is_shmem()`; an eagerly-mapped `MappedRange` is a program image segment or
+/// a `MAP_SHARED` file copy (file-backed), except the `[stack]` range, whose
+/// pages are anonymous. Counting the *resident* pages of each such range (the
+/// same [`crate::sched::resident_pages`] walk `smaps` pays for) gives file and
+/// shmem; anonymous is the remainder.
+///
+/// Kept as a recount rather than a counter for the same reason `vm_books` is:
+/// two tables describe one address space and a counter would need a mutation
+/// at every `own`/`disown`/`replace` site. It runs **outside** the task-table
+/// critical section - `status_of`/`statm_line` call it after `snapshot_of` -
+/// and `resident_pages` re-enters `with_table` once per page so interrupts
+/// stay on across a gigabyte-sized walk (AGENTS.md §3 rule 5).
+///
+/// Linux's three values sum to `VmRSS` exactly (`build/scratch/rsssplit/q.c`),
+/// so the fold *makes* that true by construction: `shared` is capped at
+/// `rss_pages`, file is capped at `shared`, shmem is the rest of `shared`, and
+/// anon is `rss_pages - shared`. One frame described by two ranges - a shared
+/// mapping seen twice - therefore cannot make the three over-report.
+///
+/// The residual this cannot reproduce: Linux moves a private file page from
+/// `RssFile` to `RssAnon` on a copy-on-write, page by page. This kernel has no
+/// page cache (`FilePages::frame_at` always allocates a private frame and
+/// copies the bytes), so the split is a model over ranges, not a per-page
+/// truth; such a page stays `RssFile` here (`docs/notes/` §6.147).
+fn rss_split(pid: usize, rss_pages: usize) -> (usize, usize, usize) {
+    #[cfg(not(target_os = "none"))]
+    {
+        // The describing structures live behind `runtime`, which is a
+        // bare-metal tree; a host build has no address space to walk. The
+        // rendering pins set `rss_split` on `Process` directly.
+        let _ = pid;
+        (rss_pages, 0, 0)
+    }
+    #[cfg(target_os = "none")]
+    {
+        use crate::mm::vma::VmaKind;
+        let Some(facts) = crate::sched::map_facts(pid) else {
+            return (rss_pages, 0, 0);
+        };
+        let (mut file, mut shmem) = (0usize, 0usize);
+        for vma in facts.vmas.iter() {
+            match &vma.kind {
+                // Anonymous, brk and stack VMAs: the remainder, not counted.
+                VmaKind::Anon => {}
+                VmaKind::Frames { object, .. } => {
+                    let n = crate::sched::resident_pages(pid, vma.start, vma.end);
+                    if object.is_shmem() {
+                        shmem += n;
+                    } else {
+                        file += n;
+                    }
+                }
+            }
+        }
+        for range in &facts.eager {
+            // The `[stack]` eager range is anonymous, exactly the name
+            // `vm_book` uses to recognise it. Program image segments and
+            // MAP_SHARED file copies are file-backed.
+            if range.name.as_deref() == Some("[stack]") {
+                continue;
+            }
+            file += crate::sched::resident_pages(pid, range.start, range.end);
+        }
+        let shared = (file + shmem).min(rss_pages);
+        let file = file.min(shared);
+        let shmem = shared - file;
+        (rss_pages - shared, file, shmem)
+    }
 }
 
 /// How `status` splits the executable book into `VmExe` and `VmLib`: the
@@ -3367,16 +3474,28 @@ fn sigq_line(queued: u64, limit: u64) -> alloc::string::String {
 /// Order and spacing are Linux's literally, tabs included: a reader that
 /// greps `^VmSize:` or splits on `\t` is reading a format, and the whole job
 /// of this file is to answer in that format. The unit is always kB, and the
-/// seven lines whose count this kernel does not keep print `0` rather than an
+/// lines whose count this kernel does not keep print `0` rather than an
 /// estimate:
 ///
 /// * `VmLck`/`VmPin` need a mlock/pin accounting `mlock` does not keep.
-/// * `RssAnon`/`RssFile`/`RssShmem` need the resident pages split by what
-///   backs them, which the frames table does not record - a private file
-///   mapping's page and a demand-faulted anonymous page are the same kind of
-///   frame to it. Linux reports them apart and the difference is not small
-///   (a measured process read `RssAnon: 100` against `RssFile: 1752`).
 /// * `VmPTE` needs a page-table byte count; `VmSwap` needs swap.
+///
+/// The three `Rss*` lines used to be a named gap: `RssAnon` printed the whole
+/// resident set and `RssFile`/`RssShmem` a literal `0`, because the frames
+/// table records physical frame numbers and nothing about what backs a page.
+/// They now read `task.rss_split` (anon/file/shmem **pages**), which
+/// [`rss_split`] folds from the VMA and eager-range tables; `status_of` fills
+/// that field before calling here. Linux's three sum to `VmRSS` exactly
+/// (`build/scratch/rsssplit/q.c`), so the fold makes anon the remainder and
+/// caps file+shmem at the resident count - the one claim that cannot be wrong
+/// is the sum. The residual is the per-page CoW move (a private file page
+/// Linux sends from `RssFile` to `RssAnon` when written), which this kernel
+/// cannot reproduce without a page cache; a mapping-based split is a model
+/// over ranges, not a per-page truth (`docs/notes/` §6.147).
+///
+/// `rss_kb` stays a parameter because `VmRSS` and the split are two views of
+/// one number; the three split values are read off `task` rather than passed,
+/// so this function's argument count does not grow into clippy's ratchet.
 #[allow(clippy::too_many_arguments)]
 fn vm_block(
     task: &Process,
@@ -3393,6 +3512,16 @@ fn vm_block(
     if task.state == 'Z' {
         return alloc::string::String::new();
     }
+    let anon_kb = vm_kilobytes(task.rss_split.0);
+    let file_kb = vm_kilobytes(task.rss_split.1);
+    let shmem_kb = vm_kilobytes(task.rss_split.2);
+    // Linux prints these counts with `%8lu kB`, so a value's leading spaces
+    // depend on its width. The literal-zero lines below keep the eight-space
+    // zero (`       0`) that `cat -A` reads; the three split lines are built
+    // by `vm_count` so a 4-digit value like `6432` reads `    6432`, not `6432`.
+    let anon = vm_count(anon_kb);
+    let file = vm_count(file_kb);
+    let shmem = vm_count(shmem_kb);
     alloc::format!(
         "VmPeak:\t   {peak_kb} kB\n\
          VmSize:\t   {size_kb} kB\n\
@@ -3400,9 +3529,9 @@ fn vm_block(
          VmPin:\t       0 kB\n\
          VmHWM:\t   {hwm_kb} kB\n\
          VmRSS:\t   {rss_kb} kB\n\
-         RssAnon:\t   {rss_kb} kB\n\
-         RssFile:\t       0 kB\n\
-         RssShmem:\t       0 kB\n\
+         RssAnon:\t{anon} kB\n\
+         RssFile:\t{file} kB\n\
+         RssShmem:\t{shmem} kB\n\
          VmData:\t   {data_kb} kB\n\
          VmStk:\t   {stack_kb} kB\n\
          VmExe:\t   {exe_kb} kB\n\
@@ -3414,7 +3543,14 @@ fn vm_block(
 }
 
 fn status_of(slot: usize) -> Option<String> {
-    let task = task(slot)?;
+    let mut task = task(slot)?;
+    // The split walks one `phys_for_virt` per resident page, so it runs here,
+    // after the snapshot, rather than inside `snapshot_of`'s table lock. A
+    // zombie has released its address space; its `status` has no Vm block at
+    // all and its `statm` is seven zeros, so no fold is due for it.
+    if task.state != 'Z' {
+        task.rss_split = rss_split(slot, task.rss_pages);
+    }
     let leader = task.pid;
     // Four different facts, which one number used to pretend to be: the address
     // space (`VmSize`), its high water (`VmPeak`), what is present (`VmRSS`) and
@@ -3431,11 +3567,12 @@ fn status_of(slot: usize) -> Option<String> {
     });
     let fd_size_value = fd_size(task.fd_slots);
     let sig_q = sigq_line(task.sig_queued, task.sig_pending_limit);
-    // The four mapping lines `RssAnon`/`VmData`/`VmStk`/`VmExe`/`VmLib` are
-    // built from: the three page books the VMA and eager tables classify into
-    // (`build/scratch/vmlines/` measured each rule on Linux 7.2.14), and the
-    // one interval the image's text spans, which splits the executable book
-    // into `VmExe` and `VmLib`.
+    // `VmData`/`VmStk`/`VmExe`/`VmLib` are built from the three page books the
+    // VMA and eager tables classify into (`build/scratch/vmlines/` measured
+    // each rule on Linux 7.2.14) and the one interval the image's text spans,
+    // which splits the executable book. The `Rss*` lines are a *different*
+    // question - what backs each resident page - and come from `rss_split`'s
+    // recount above, not from these books.
     let (exec_pages, stack_pages, data_pages) = task.books;
     let (exe_kb, lib_kb) = text_and_lib_kb(task.image, exec_pages);
     let data_kb = vm_kilobytes(data_pages);
@@ -6868,6 +7005,52 @@ mod tests {
         }
     }
 
+    /// The three `Rss*` lines and `statm`'s third field are *read from the
+    /// split*, not invented from `VmRSS` and not literals. A snapshot whose
+    /// split says (100, 50, 10) **pages** must print 400/200/40 kB and a
+    /// `shared` of 60 pages. The old renderer printed the whole resident set
+    /// as `RssAnon` (`VmRSS`), a literal `0` for the other two lines, and `0`
+    /// for `statm`'s third field - so every claim here is a counterfactual
+    /// against it, and none can pass with a hardcoded whole/0/0 split.
+    #[test]
+    fn the_rss_lines_and_statm_shared_are_read_from_the_split() {
+        let mut task = process(7, 7, None, 0, 'R');
+        task.virtual_pages = 744;
+        task.rss_pages = 160; // 160 pages = 640 kB
+        task.rss_split = (100, 50, 10); // anon, file, shmem - sums to the 160
+        task.books = (1, 33, 51);
+        // `vm_kilobytes(100+50+10) == 640`: the fold makes anon the remainder
+        // so the three always add back up to `VmRSS` by construction.
+        assert_eq!(vm_kilobytes(100 + 50 + 10), 640);
+
+        let block = vm_block(&task, 640, 2976, 640, 640, 5, 6, 7, 8, 9);
+        // Read each count back out, so the test does not depend on the number
+        // of leading spaces - but also pin Linux's `%8lu` right-alignment once.
+        let value = |key: &str| -> usize {
+            block
+                .lines()
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|number| number.parse().ok())
+                .unwrap_or(usize::MAX)
+        };
+        assert_eq!(value("RssAnon:"), 400, "{block}");
+        assert_eq!(value("RssFile:"), 200, "{block}");
+        assert_eq!(value("RssShmem:"), 40, "{block}");
+        assert!(
+            block.contains("RssAnon:\t     400 kB\n"),
+            "a 3-digit count is right-aligned in eight columns: {block}"
+        );
+
+        // `statm`'s third field is file+shmem in pages, not a literal zero.
+        let line = statm_text(&task);
+        let shared: usize = line.split_whitespace().nth(2).unwrap().parse().unwrap();
+        assert_eq!(shared, 60, "{line}");
+        // A zombie never reaches the fold and keeps seven zeros.
+        let zombie = process(9, 9, None, 7, 'Z');
+        assert_eq!(statm_text(&zombie), "0 0 0 0 0 0 0\n");
+    }
+
     #[test]
     fn vsize_counts_address_space_and_rss_counts_what_is_behind_it() {
         let mut p = process(7, 7, None, 0, 'R');
@@ -8010,6 +8193,7 @@ mod tests {
             // a loaded image sets both itself (§6.117's host tests do).
             image: crate::mm::ImageBounds::default(),
             books: (0, 0, 0),
+            rss_split: (0, 0, 0),
             locked_pages: 0,
             // No controlling terminal: field 7 is the zero and field 8 the
             // `-1` Linux prints for a process that has acquired none. A test

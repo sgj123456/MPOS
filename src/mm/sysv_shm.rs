@@ -319,6 +319,14 @@ impl crate::mm::vma::MappedObject for Segment {
     fn shm_id(&self) -> Option<u64> {
         Some(self.id())
     }
+
+    /// A segment's resident pages are shmem, not file-backed: measured on a
+    /// current host, attaching and touching a 4 MiB segment moves `RssShmem`
+    /// by 4096 kB and `statm`'s `shared` field by 1024 pages, while `RssFile`
+    /// does not move. The object says so itself so `procfs` need not downcast.
+    fn is_shmem(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(target_os = "none")]

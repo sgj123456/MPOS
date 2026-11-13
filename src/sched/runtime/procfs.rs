@@ -265,6 +265,18 @@ pub struct TaskSnapshot {
     /// Frames behind the group's user mappings. `stat` wants resident pages,
     /// `status` wants kilobytes, and both are this number.
     pub rss_pages: usize,
+    /// The resident set split into `(anonymous, file, shmem)` **pages**, for
+    /// `/proc/<pid>/status`'s `RssAnon`/`RssFile`/`RssShmem` and `statm`'s
+    /// third field.
+    ///
+    /// Kept at `(0, 0, 0)` in the snapshot proper: the fold that answers it
+    /// walks the describing ranges one resident page at a time, which is far
+    /// too long to hold the task table's critical section (the three callers of
+    /// `snapshot_of` are all inside `with_table`). The status and statm
+    /// generators fill this in afterwards, outside that lock, from
+    /// `crate::vfs::procfs::rss_split`; a zombie keeps the zeros because its
+    /// address space has already been released.
+    pub rss_split: (usize, usize, usize),
     /// Pages the group's address space has **mapped**, present or not: `stat`'s
     /// field 23 (`vsize`, in bytes) and `/proc/<pid>/statm`'s first field (in
     /// pages). [`crate::sched::child_mm`]'s `Mm::mapped_pages` owns the
@@ -804,6 +816,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .count()
             .max(1),
         rss_pages,
+        rss_split: (0, 0, 0),
         peak_pages,
         hwm_frames,
         virtual_pages,

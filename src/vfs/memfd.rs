@@ -261,6 +261,13 @@ impl Inode for Memfd {
         true
     }
 
+    /// A memfd's pages are shmem, the same class as a System V segment's: on
+    /// a current host a `MAP_SHARED | MAP_ANONYMOUS` mapping (which this kernel
+    /// builds from an unnamed memfd) reads as `RssShmem`, not `RssFile`.
+    fn is_shmem(&self) -> bool {
+        true
+    }
+
     fn as_memfd(&self) -> Option<&Memfd> {
         Some(self)
     }

@@ -905,6 +905,20 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether this node's pages are shmem-backed, for the resident-set split
+    /// `/proc/<pid>/status` prints.
+    ///
+    /// Not gated with the `memfd` module, unlike [`Self::as_memfd`]: the one
+    /// reader is `MappedInode`'s `MappedObject` impl below, which is compiled
+    /// for the host, and a default on a trait method is an answer just as much
+    /// as an override is. The default is the honest "not shmem" for every node
+    /// except a memfd; a `MappedInode` wrapping one delegates here, so a
+    /// `MAP_SHARED | MAP_ANONYMOUS` mapping is counted in `RssShmem` without
+    /// a name or a downcast deciding it.
+    fn is_shmem(&self) -> bool {
+        false
+    }
+
     /// Check a mapping request against the object's own regions before any
     /// frame is handed out. A frame-backed node with more than one region - an
     /// `io_uring` ring's SQ/CQ/SQE areas - answers which offsets it serves and
@@ -1484,6 +1498,13 @@ impl crate::mm::vma::MappedObject for MappedInode {
 
     fn name_is_gone(&self) -> bool {
         self.0.name_is_gone()
+    }
+
+    /// A memfd is shmem-backed; every other node this wraps answers the trait
+    /// default's `false`. The `is_shmem` method is deliberately not gated on
+    /// `target_os`, so this host-compiled impl can ask the inode.
+    fn is_shmem(&self) -> bool {
+        self.0.is_shmem()
     }
 }
 
