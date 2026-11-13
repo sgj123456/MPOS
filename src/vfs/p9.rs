@@ -913,6 +913,13 @@ mod device {
     }
 
     impl Inode for P9Inode {
+        /// The share's regular files are storage the server serves a page at a
+        /// time; its directories are not mappable and are refused like any
+        /// other (measured `build/scratch/mmapdir/p.c` on the same question).
+        fn mappable(&self) -> bool {
+            matches!(self.kind, NodeKind::File)
+        }
+
         fn metadata(&self) -> Metadata {
             let Ok(fs) = self.up() else {
                 let size = critical_section::with(|cs| *self.size.borrow(cs).borrow());

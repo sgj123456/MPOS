@@ -568,6 +568,13 @@ macro_rules! names_live_in_dirs {
 }
 
 impl Inode for RamFile {
+    /// A ramfs file's bytes are in the frame store behind this node, which is
+    /// exactly what a mapping is filled from; the default refusal exists for
+    /// the nodes whose bytes are produced per read instead.
+    fn mappable(&self) -> bool {
+        true
+    }
+
     fn flags(&self) -> VfsResult<u32> {
         Ok(self.flags.get())
     }
@@ -1705,6 +1712,24 @@ mod tests {
         assert_eq!(file.flags().unwrap(), FS_APPEND_FL);
         file.set_flags(0).unwrap();
         assert_eq!(file.flags().unwrap(), 0);
+    }
+
+    /// A file's bytes are storage a mapping can be filled from; a directory's
+    /// are not, and Linux answers `mmap` of one with `ENODEV`.
+    ///
+    /// The counterfactual is the bug this pair exists for: with the default
+    /// answer reversed, the mmap door accepted a private mapping of a directory
+    /// and the fault that first touched it was refused - so the program was
+    /// killed by a SIGSEGV inside a mapping the call had said was fine, which
+    /// is how `mkfontscale` died scanning `/root` (measured on Linux 7.2.14:
+    /// `mmap` of a directory is `-1 ENODEV`, never a mapping).
+    #[test]
+    fn a_file_is_mappable_and_a_directory_is_not() {
+        let fs = RamFs::new();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
+        assert!(file.mappable(), "a file's bytes are storage");
+        let dir = fs.root().create("d", NodeKind::Dir, None).unwrap();
+        assert!(!dir.mappable(), "a directory has no pages to map");
     }
 
     /// A flag this cannot keep is refused *and not stored*.

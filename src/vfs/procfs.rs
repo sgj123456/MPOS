@@ -7869,6 +7869,25 @@ mod tests {
     /// shape say so - each measured on a current host
     /// (`.workbuddy/probe_proc_node_modes.c`).
     #[test]
+    /// A `procfs` file is generated per read, so it has no pages to map -
+    /// Linux answers `mmap` of one with `ENODEV` (measured: `/proc/self/stat`,
+    /// `/proc/self/maps` and `/sys/kernel/notes` are all `-1 ENODEV`).
+    ///
+    /// The counterfactual is a mapping whose pages nothing can fill: the fault
+    /// that first touched it is refused, and the program dies of a SIGSEGV
+    /// inside a mapping `mmap` reported as successful.
+    #[test]
+    fn a_generated_file_is_not_mappable() {
+        assert!(
+            !file(|| String::new()).mappable(),
+            "nothing is stored to map"
+        );
+        assert!(
+            !maybe_file(|| None).mappable(),
+            "nor is the same node the other way around"
+        );
+    }
+
     fn a_proc_nodes_own_mode_follows_its_shape() {
         // A directory in the tree is `0555`, not the kind's `0755`; the two
         // whose own word is narrower are `/proc/<pid>/fd` and

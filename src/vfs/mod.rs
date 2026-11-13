@@ -933,6 +933,32 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether this node's bytes are *storage* - something a mapping can be
+    /// filled from, the question Linux's `mmap` puts to the file as
+    /// `f_op->mmap`.
+    ///
+    /// It is not the same question as [`Self::frame_backed`], which asks
+    /// whether the node has frames to *alias*; a regular file has no frames of
+    /// its own and is still mappable - its pages are read in on the faults that
+    /// need them. What is left over after both questions is the set Linux
+    /// answers `ENODEV`: a directory, a FIFO, a socket, a character device with
+    /// no mmap operation, and the generated files of `procfs`/`sysfs`, whose
+    /// bytes are produced per read rather than stored. Measured on Linux 7.2.14
+    /// (`build/scratch/mmapdir/{p,q,r}.c`): every one of those is `-1 ENODEV`,
+    /// while `/etc/hostname` maps and reads `a` from its first byte.
+    ///
+    /// The default is **false**, and that direction is the whole point. A node
+    /// that forgets to say "my bytes are storage" is refused with the number
+    /// Linux gives for a node that has none; a default of true would let it
+    /// accept a mapping its faults cannot serve, and the failure is not an
+    /// errno at the `mmap` - it is a SIGSEGV on the first touch of the page,
+    /// which is how `mkfontscale` died in the guest (it maps every entry of the
+    /// directory it is asked to scan, and a directory's `read_at` answers
+    /// `EISDIR`): the page is inside a mapping, and nothing brought it in.
+    fn mappable(&self) -> bool {
+        false
+    }
+
     /// Whether this node's pages are shmem-backed, for the resident-set split
     /// `/proc/<pid>/status` prints.
     ///

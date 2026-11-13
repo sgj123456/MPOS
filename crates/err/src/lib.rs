@@ -53,8 +53,10 @@ pub const EEXIST: isize = -17;
 /// answers when the child it was asked about is still running.
 pub const EAGAIN: isize = -11;
 pub const ENOTDIR: isize = -20;
-/// ENODEV: no such device. What an `mmap` that asked for a mapping mpos
-/// has no way to build - a file-backed one - is answered with.
+/// ENODEV: no such device. What `mmap` answers for a node Linux has no
+/// mapping operation for either - a directory, a FIFO, a socket, a device
+/// without one, and here every node whose bytes are produced per read rather
+/// than stored (`Inode::mappable`, measured on Linux 7.2.14).
 pub const ENODEV: isize = -19;
 pub const EISDIR: isize = -21;
 pub const EINVAL: isize = -22;

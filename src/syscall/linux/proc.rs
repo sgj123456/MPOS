@@ -4082,6 +4082,21 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 name,
             );
         }
+        // A node with no storage behind it cannot be mapped at all, and the
+        // answer is Linux's: `ENODEV`, from a file whose `f_op->mmap` does not
+        // exist. Measured on Linux 7.2.14 (`build/scratch/mmapdir/{p,q}.c`): a
+        // directory, a FIFO, a socket, `/dev/null` and every `procfs`/`sysfs`
+        // file are `-1 ENODEV`, while `/etc/hostname` maps. Asked here, before
+        // the two copy arms below, because both of them spend frames on a node
+        // they cannot serve - and the private one spends them on a *fault*
+        // instead, so the failure a program sees is a SIGSEGV on the page it
+        // touched rather than an errno at the call. That is exactly how
+        // `mkfontscale` died: it maps every entry of the directory it scans, a
+        // directory was accepted, and the first read of it killed the process
+        // (`build/test-.../serial.log`'s `PFDIAG`, and the guest's own
+        // `strace`: `mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 4, 0)` on
+        // `./.local`, `st_mode=S_IFDIR|0700`, then `killed by SIGSEGV`).
+        Some(file) if !file.inode().mappable() => return err::ENODEV,
         // An ordinary file, mapped privately: the pages arrive on the faults
         // that need them, so `mmap` is a statement about addresses again -
         // measured, a 189 MB shared object cost 3.4 s *inside the call* while

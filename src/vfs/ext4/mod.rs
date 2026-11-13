@@ -1296,6 +1296,13 @@ impl Ext4Ino {
 }
 
 impl Inode for Ext4Ino {
+    /// A regular file's blocks are storage a mapping can be filled from; a
+    /// directory is not, and Linux answers `mmap` of one with `ENODEV` - the
+    /// kind, not the filesystem, is the question (measured `build/scratch/mmapdir/p.c`).
+    fn mappable(&self) -> bool {
+        matches!(self.data().map(|data| data.kind()), Ok(NodeKind::File))
+    }
+
     fn metadata(&self) -> Metadata {
         let data = self.data_or_empty();
         let kind = data.kind();
