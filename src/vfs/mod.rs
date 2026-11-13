@@ -359,6 +359,13 @@ pub enum VfsError {
     /// alternative: taking the machine down over it, or freeing the inode a
     /// second time and handing its blocks to two owners.
     Corrupt,
+    /// EIO: the address does not name a mapped page of the address space it
+    /// was asked about - `/proc/<pid>/mem`'s answer for a page no VMA covers
+    /// (measured: a read or write `EIO(5)` at a hole, at `vaddr 0`, and at the
+    /// user limit, `build/scratch/pmem/n.c`). Linux shares the word with a
+    /// damage report, so this and [`Self::Corrupt`] both answer `EIO`; the two
+    /// are kept apart because a caller reading them means two different things.
+    Unmapped,
     /// EXDEV: a hard link whose two ends live on different filesystems -
     /// the one request `link(2)` refuses by design, since a name edge is
     /// the filesystem's own bookkeeping and cannot reach into another's.

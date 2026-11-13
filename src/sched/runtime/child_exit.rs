@@ -156,6 +156,75 @@ pub(crate) fn write_user_of_at(root: usize, virt: usize, bytes: &[u8], populate:
     true
 }
 
+/// The frame behind `virt` in the address space `root` names, for a copy made
+/// on the target's behalf rather than as the target: Linux's `FOLL_FORCE`.
+///
+/// The page table's permission bits say what the *target* may do; they do not
+/// say what the kernel may do for it once the ptrace question has been
+/// answered, and that is the whole of `FOLL_FORCE`'s meaning. A `PROT_NONE`
+/// page is the case that shows the difference: it has a present frame and no
+/// `USER` bit, and Linux serves both a read and a write of it through
+/// `/proc/<pid>/mem` (measured, `build/scratch/pmem/n.c`). [`resolve_page_of`]
+/// asks for `USER` - right for the copies that claim to *be* the process's own
+/// access, `process_vm_readv` and a tracer's `PTRACE_PEEKDATA` - and so answers
+/// `None` there.
+///
+/// The permissive walk is safe only because the caller filters the address
+/// first: every address space carries the kernel's own mappings above
+/// [`crate::mm::elf::USER_LIMIT`], and a caller that has walked the VMA table
+/// only ever asks about a range a VMA describes. `/proc/<pid>/mem` does exactly
+/// that before it copies, and answers `EIO` for anything else.
+fn resolve_forced_page_of(root: usize, virt: usize, write: bool, populate: bool) -> Option<usize> {
+    if let Some(phys) = hal::phys_for_virt_of(root, virt) {
+        return Some(phys);
+    }
+    if !populate || !super::child_mm::populate_forced_page_at(root, virt, write) {
+        return None;
+    }
+    hal::phys_for_virt_of(root, virt)
+}
+
+/// [`read_user_of`] with Linux's `FOLL_FORCE`: the target's own permissions are
+/// not asked, only that the address is one its mappings describe.
+pub fn read_user_forced_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = resolve_forced_page_of(root, at, false, true) else {
+            return false;
+        };
+        let src =
+            unsafe { core::slice::from_raw_parts(mm::phys_to_virt(phys) as *const u8, chunk) };
+        bytes[done..done + chunk].copy_from_slice(src);
+        done += chunk;
+    }
+    true
+}
+
+/// [`write_user_of`] with Linux's `FOLL_FORCE`. Unlike the plain half this does
+/// not break a copy-on-write page - `/proc/<pid>/mem`'s caller breaks it, with
+/// the tracee's own books, before reaching here.
+pub fn write_user_forced_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = resolve_forced_page_of(root, at, true, true) else {
+            return false;
+        };
+        let dest =
+            unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(phys) as *mut u8, chunk) };
+        dest.copy_from_slice(&bytes[done..done + chunk]);
+        done += chunk;
+    }
+    true
+}
+
 /// The frame behind `virt` in the address space `root` names, bringing the page
 /// in first when it is one of a mapping nobody has touched yet.
 ///

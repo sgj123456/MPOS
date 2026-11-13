@@ -2825,7 +2825,7 @@ impl Table {
         // brought in here, where the table is already borrowed and asking for
         // it again would be a second `&mut Table`.
         if hal::phys_for_virt_of(root, address).is_none() {
-            populate_in(self, root, address, true);
+            populate_in(self, root, address, true, false);
         }
         crate::hal::write_user_u32(root, address, 0);
     }

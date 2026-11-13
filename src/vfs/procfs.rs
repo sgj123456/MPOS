@@ -410,54 +410,19 @@ fn pagemap_entry(present: bool, inside: bool, file: bool, shared: bool) -> u64 {
 /// The whole answer for one address: which VMA describes it, whether it has a
 /// frame, and therefore which word it reads.
 ///
-/// The VMA table is the same one `maps`/`smaps` read ([`crate::sched::map_facts`]),
-/// so the classification is a linear scan over the describing ranges - the
-/// structure this kernel keeps - and the frame question is one page-table walk
-/// per page ([`crate::sched::page_present`], which re-enters the table so a
-/// walk over 262144 pages does not hold interrupts off).
+/// The classification is [`address_facts`] - the same walk `mem` uses, because
+/// both files ask the same question of the same structure - and the frame
+/// question is one page-table walk per page ([`crate::sched::page_present`],
+/// which re-enters the table so a walk over 262144 pages does not hold
+/// interrupts off).
 #[cfg(target_os = "none")]
 fn pagemap_word(facts: &crate::sched::MapFacts, pid: usize, vaddr: usize) -> u64 {
-    use crate::mm::vma::VmaKind;
-    let mut inside = false;
-    let mut file = false;
-    let mut shared = false;
-    for vma in facts.vmas.iter() {
-        if vaddr >= vma.start && vaddr < vma.end {
-            inside = true;
-            if let VmaKind::Frames {
-                shared: is_shared, ..
-            } = &vma.kind
-            {
-                file = true;
-                shared = *is_shared;
-            }
-            break;
-        }
-    }
-    if !inside {
-        // The eager ranges are a file's bytes read into this process's own
-        // frames, so they are file pages - except the stack, which is the
-        // process's own memory and reads as anonymous (`MappedRange` has no
-        // `[stack]` bit; the name is the shipped way `vm_book` tells them
-        // apart, `src/mm/vma.rs`).
-        for range in &facts.eager {
-            if vaddr >= range.start && vaddr < range.end {
-                inside = true;
-                file = range.name.as_deref() != Some("[stack]");
-                break;
-            }
-        }
-    }
-    if !inside {
-        inside = facts
-            .heap
-            .is_some_and(|(start, end)| vaddr >= start && vaddr < end);
-    }
-    if !inside {
+    let described = address_facts(facts, vaddr);
+    if !described.inside {
         return 0;
     }
     let present = crate::sched::page_present(pid, vaddr);
-    pagemap_entry(present, inside, file, shared)
+    pagemap_entry(present, described.inside, described.file, described.shared)
 }
 
 #[cfg(target_os = "none")]
@@ -551,6 +516,289 @@ impl Inode for PageMap {
             written += 8;
         }
         Ok(written)
+    }
+}
+
+/// The `/proc/<pid>/mem` node: the target's address space as one byte stream,
+/// addressed by **virtual address**.
+///
+/// Linux's shape was measured before this was written (`build/scratch/pmem/n.c`,
+/// 7.2.14): the offset *is* the address and needs no alignment; a page no VMA
+/// covers is `EIO(5)`, at `vaddr 0` and at the top of the user half alike; a
+/// transfer that runs off the end of a mapping answers the bytes it had (a read
+/// of 16 running into a hole answered `8`, a write of 8 across one answered
+/// `4`); a `PROT_READ` page takes a write and a `PROT_NONE` page takes both,
+/// which is Linux's `FOLL_FORCE` and the reason
+/// [`crate::sched::populate_forced_page_at`] exists; a descriptor opened for
+/// reading alone answers `EBADF(9)` to a write, which the fd layer already says
+/// before the node is asked; and the open is the same ladder as `pagemap`'s -
+/// the ptrace question first (`EACCES`, even for a zombie), then the address
+/// space (`ESRCH(3)` for one that is gone, `ENOENT(2)` for a number that names
+/// nothing).
+///
+/// Writing is not a plain store: a page a `fork` still shares has to be broken
+/// first (Linux's `FOLL_FORCE|FOLL_WRITE` does), or the bytes would land in the
+/// frame the other process still maps. [`crate::sched::break_cow_at`] is that
+/// step, and it is why [`crate::sched::write_user_of`] - which deliberately does
+/// not break one - is not enough on its own.
+///
+/// The one thing the descriptor does **not** do that Linux's does is hold the
+/// `mm`: a target that dies after the open leaves this node with nothing to read
+/// and it answers `ESRCH`, where Linux's open file keeps serving. That is the
+/// same named gap `pagemap` carries (`docs/notes/` §6.150), not a new one.
+#[cfg(target_os = "none")]
+struct ProcessMem {
+    ino: Ino,
+    /// The owner this node inherits from the process it describes.
+    owner: Inherited,
+    /// The task whose address space the stream addresses.
+    pid: usize,
+}
+
+/// The `/proc/<pid>/mem` node for one task, under both of its names, the way
+/// Linux binds it: both names address the group's `mm`.
+#[cfg(target_os = "none")]
+fn process_mem_file(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcessMem {
+        ino: next_ino(),
+        owner: Inherited::new(),
+        pid,
+    })
+}
+
+/// Where one `read`/`write` of `/proc/<pid>/mem` starts, in the address space it
+/// names.
+///
+/// The file's offset **is** a virtual address, so the fd layer's rules are the
+/// address's: a negative `loff_t` is `EINVAL(22)` before this node is reached
+/// (measured: `pread(fd, …, -8)`), and an address at or above the machine's user
+/// limit is `EIO(5)` - the same answer a page in no VMA gives, and what Linux
+/// answers at `1 << 47` (`build/scratch/pmem/n.c`).
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn mem_address(offset: u64, limit: usize) -> VfsResult<usize> {
+    if offset & (1 << 63) != 0 {
+        return Err(VfsError::Invalid);
+    }
+    let addr = offset as usize;
+    if addr >= limit {
+        return Err(VfsError::Unmapped);
+    }
+    Ok(addr)
+}
+
+/// What the describing ranges say about one address: whether a mapping covers
+/// it, whether that mapping is a file's, and whether more than this process can
+/// see it.
+///
+/// One walk, because `pagemap` and `mem` ask the same question of the same
+/// structure - the table `maps`/`smaps` read
+/// ([`crate::sched::map_facts`]) - and two copies of it would drift.
+#[cfg(target_os = "none")]
+#[derive(Clone, Copy)]
+struct AddressFacts {
+    inside: bool,
+    file: bool,
+    shared: bool,
+}
+
+#[cfg(target_os = "none")]
+fn address_facts(facts: &crate::sched::MapFacts, vaddr: usize) -> AddressFacts {
+    use crate::mm::vma::VmaKind;
+    let mut answer = AddressFacts {
+        inside: false,
+        file: false,
+        shared: false,
+    };
+    for vma in facts.vmas.iter() {
+        if vaddr >= vma.start && vaddr < vma.end {
+            answer.inside = true;
+            if let VmaKind::Frames {
+                shared: is_shared, ..
+            } = &vma.kind
+            {
+                answer.file = true;
+                answer.shared = *is_shared;
+            }
+            return answer;
+        }
+    }
+    // The eager ranges are a file's bytes read into this process's own frames,
+    // so they are file pages - except the stack, which is the process's own
+    // memory and reads as anonymous (`MappedRange` has no `[stack]` bit; the
+    // name is the shipped way `vm_book` tells them apart, `src/mm/vma.rs`).
+    for range in &facts.eager {
+        if vaddr >= range.start && vaddr < range.end {
+            answer.inside = true;
+            answer.file = range.name.as_deref() != Some("[stack]");
+            return answer;
+        }
+    }
+    // The program break is a range of its own in the table, and it is anonymous.
+    answer.inside = facts
+        .heap
+        .is_some_and(|(start, end)| vaddr >= start && vaddr < end);
+    answer
+}
+
+/// The address a transfer starts at, the describing ranges it is classified
+/// against, and the space root the copy reaches - the preamble both halves
+/// share.
+#[cfg(target_os = "none")]
+fn mem_start(pid: usize, offset: u64) -> VfsResult<(usize, crate::sched::MapFacts, usize)> {
+    let addr = mem_address(offset, crate::mm::elf::USER_LIMIT)?;
+    let Some(facts) = crate::sched::map_facts(pid) else {
+        // The descriptor holds no `mm`, so a task that died since the open has
+        // no address space left; the open's own ladder is what says so.
+        return Err(VfsError::NoProcess);
+    };
+    let Some(root) = crate::sched::space_root_of(crate::sched::TaskId(pid)) else {
+        return Err(VfsError::NoProcess);
+    };
+    Ok((addr, facts, root))
+}
+
+/// Read from the target's address space, a page at a time.
+///
+/// Linux's `mem_rw`: a page that cannot be served **ends** the transfer rather
+/// than failing it once something has crossed - which is what makes the measured
+/// short read at a hole come out right, while a transfer whose *first* page
+/// cannot be served is `EIO(5)`.
+///
+/// The copy is [`crate::sched::read_user_forced_of`], which asks the page tables
+/// what frame is behind the address and not what the target may do with it -
+/// `FOLL_FORCE`: a `PROT_NONE` page answers a read of zeros, measured.
+#[cfg(target_os = "none")]
+fn mem_read(pid: usize, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let (mut addr, facts, root) = mem_start(pid, offset)?;
+    let page_size = crate::mm::pframe::PAGE_SIZE;
+    let mut done = 0;
+    while done < buf.len() {
+        let page = addr & !(page_size - 1);
+        let chunk = core::cmp::min(page + page_size - addr, buf.len() - done);
+        // A page no mapping covers ends the transfer here, before the copy asks
+        // the tables for it: the address filter is also what keeps the forced
+        // walk on the target's own side of `USER_LIMIT`.
+        if !address_facts(&facts, addr).inside
+            || !crate::sched::read_user_forced_of(root, addr, &mut buf[done..done + chunk])
+        {
+            break;
+        }
+        done += chunk;
+        addr += chunk;
+    }
+    if done == 0 {
+        return Err(VfsError::Unmapped);
+    }
+    Ok(done)
+}
+
+/// Write into the target's address space, a page at a time: [`mem_read`]'s other
+/// half, with one step the read does not need.
+///
+/// A page a `fork` still shares has to get its own frame before the bytes land,
+/// or the process that still maps it would see them too; Linux's
+/// `FOLL_FORCE|FOLL_WRITE` breaks it the same way. The break is
+/// [`crate::sched::break_cow_at`], because [`crate::sched::write_user_of`]'s own
+/// doc records that it deliberately does not break one - `strace` only reads.
+#[cfg(target_os = "none")]
+fn mem_write(pid: usize, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let (mut addr, facts, root) = mem_start(pid, offset)?;
+    let page_size = crate::mm::pframe::PAGE_SIZE;
+    let mut done = 0;
+    while done < buf.len() {
+        let page = addr & !(page_size - 1);
+        let chunk = core::cmp::min(page + page_size - addr, buf.len() - done);
+        if !address_facts(&facts, addr).inside {
+            break;
+        }
+        if crate::sched::page_present(pid, page) {
+            crate::sched::break_cow_at(root, page);
+        }
+        if !crate::sched::write_user_forced_of(root, addr, &buf[done..done + chunk]) {
+            break;
+        }
+        done += chunk;
+        addr += chunk;
+    }
+    if done == 0 {
+        return Err(VfsError::Unmapped);
+    }
+    Ok(done)
+}
+
+#[cfg(target_os = "none")]
+impl Inode for ProcessMem {
+    /// The stream is the task's address space, so the ptrace question answers
+    /// for this node first, exactly as for `maps` and `pagemap`: a stranger is
+    /// `EACCES` (`build/scratch/pmem/p.c`).
+    fn describes_task(&self) -> Option<usize> {
+        Some(self.pid)
+    }
+
+    fn open_check(&self) -> VfsResult<()> {
+        match crate::sched::address_space_of(crate::sched::TaskId(self.pid)) {
+            crate::sched::TaskMemory::Bytes(_) => Ok(()),
+            crate::sched::TaskMemory::NoMemory => Err(VfsError::NoProcess),
+            crate::sched::TaskMemory::NoTask => Err(VfsError::NoEntry),
+        }
+    }
+
+    /// Linux's byte stream is writable, so the file has a write method - and
+    /// the open decides which direction a descriptor got, which is where the
+    /// measured `EBADF` for a write through a read-only descriptor comes from.
+    fn has_write_method(&self) -> bool {
+        true
+    }
+
+    fn mode_polices_access(&self) -> bool {
+        true
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.owner.get()
+    }
+
+    fn adopt_process(&self, ids: crate::cred::Ids, dumpable: u8) {
+        self.owner.set(crate::cred::task_dump_owner(ids, dumpable));
+    }
+
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn refuses_mode_change(&self) -> bool {
+        true
+    }
+
+    fn metadata(&self) -> Metadata {
+        // `st_size` 0, which is Linux's: the file is as long as the address
+        // space, and `fstat` reports none of it (measured,
+        // `build/scratch/pmem/n.c`).
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: 0,
+        }
+    }
+
+    /// `0600`, Linux's word for the file - the owner's, so a stranger is
+    /// refused by the bits as well as by the ptrace question.
+    fn mode(&self) -> u32 {
+        0o600
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        mem_read(self.pid, offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        mem_write(self.pid, offset, buf)
     }
 }
 
@@ -4259,6 +4507,13 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     // own shape).
     #[cfg(target_os = "none")]
     node.add("pagemap", NodeKind::File, pagemap_file(tid));
+    // `/proc/<pid>/mem`, the same address space as one writable byte stream:
+    // Linux's sibling of `pagemap`, and the file a debugger actually trades
+    // bytes through. Both of this task's names are one descriptor shape - the
+    // group's `mm` - and the open's refusals are `pagemap`'s ladder with the
+    // permission word first, measured on the host (`build/scratch/pmem/p.c`).
+    #[cfg(target_os = "none")]
+    node.add("mem", NodeKind::File, process_mem_file(tid));
     node.add(
         "children",
         NodeKind::File,
@@ -4905,6 +5160,10 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // group's `mm`, so this node and the thread's are two names for one answer.
     #[cfg(target_os = "none")]
     node.add("pagemap", NodeKind::File, pagemap_file(slot));
+    // The group's address space as a writable byte stream; see the thread
+    // directory's `mem` for the measured shape.
+    #[cfg(target_os = "none")]
+    node.add("mem", NodeKind::File, process_mem_file(slot));
     // The process's POSIX timers, four lines each, newest number first -
     // `0444` because Linux's `proc_pid_timers` is `S_IRUGO`, and *not* offered
     // per thread: measured on the host, `/proc/<pid>/task/<tid>/timers` and
@@ -8768,6 +9027,42 @@ mod tests {
     ///   file-page);
     /// - a touched `MAP_SHARED|MAP_ANONYMOUS` page reads file-page **without**
     ///   exclusive, because two processes own it;
+    /// The offset of `/proc/<pid>/mem` **is** a virtual address, and the two
+    /// refusals are split the way Linux splits them.
+    ///
+    /// A negative `loff_t` never reaches this function - the fd layer answers
+    /// `EINVAL(22)` first (measured: `pread(fd, …, -8)`) - so the guard on the
+    /// top bit is the same answer arriving by the only door left open to it. An
+    /// address at or above the user limit is `EIO(5)`, which is Linux's answer
+    /// at `1 << 47` as surely as at a hole inside a mapping
+    /// (`build/scratch/pmem/n.c`). Everything below it is asked about, and
+    /// address `0` is included: what Linux refuses there, it refuses from the
+    /// page walk - `EIO` for a page no VMA covers - not from the offset check.
+    #[test]
+    fn a_mem_offset_is_an_address_or_a_refusal() {
+        use super::mem_address;
+        use crate::vfs::VfsError;
+        let limit = crate::mm::elf::USER_LIMIT;
+        assert_eq!(mem_address(0, limit).ok(), Some(0));
+        assert_eq!(mem_address(0x4000, limit).ok(), Some(0x4000));
+        assert_eq!(mem_address((limit - 1) as u64, limit).ok(), Some(limit - 1));
+        assert_eq!(
+            mem_address(limit as u64, limit).err(),
+            Some(VfsError::Unmapped),
+            "an address at the top of the user half is EIO, not a short read"
+        );
+        assert_eq!(
+            mem_address((1u64 << 48) + 0x1000, limit).err(),
+            Some(VfsError::Unmapped),
+            "and so is anything past it"
+        );
+        assert_eq!(
+            mem_address(u64::MAX - 0xfff, limit).err(),
+            Some(VfsError::Invalid),
+            "a negative loff_t reaches the node as its top bit set"
+        );
+    }
+
     /// - an address outside every VMA reads `0` - measured at `vaddr 0`, where
     ///   Linux answers all-zero, soft-dirty included.
     ///

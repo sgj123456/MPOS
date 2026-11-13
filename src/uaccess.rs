@@ -40,6 +40,9 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::NoProcess => err::ESRCH,
         VfsError::BadFd => err::EBADF,
         VfsError::NoRoot | VfsError::Invalid => err::EINVAL,
+        // EIO for an address `/proc/<pid>/mem` cannot reach: the page is not
+        // the target's. Linux's own number for it.
+        VfsError::Unmapped => err::EIO,
         VfsError::NoSpace => err::ENOSPC,
         VfsError::FileTooBig => err::EFBIG,
         VfsError::BrokenPipe => err::EPIPE,

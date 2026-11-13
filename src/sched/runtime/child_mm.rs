@@ -288,11 +288,21 @@ fn owner_of_root(t: &Table, root: usize) -> Option<TaskId> {
 /// one that dereferenced a wild pointer. The frame it asks for comes from
 /// [`mm::alloc_user_frame`], which keeps the kernel's own reserve back so the
 /// death it triggers can run.
+///
+/// `force` is Linux's `FOLL_FORCE`: bring the page in even though the range does
+/// not permit the access. It is the flag behind `ptrace`'s `POKEDATA` and
+/// `/proc/<pid>/mem`, and it is a *second door* rather than a relaxation of the
+/// first - a ring-3 store into a read-only page is still `SIGSEGV` through
+/// [`resolve_anon_fault`], which passes `false`. Measured on a current host
+/// before this parameter existed (`build/scratch/pmem/n.c`, Linux 7.2.14):
+/// writing eight bytes at a child's `PROT_READ` page answered `8` and the child
+/// read them back, and a `PROT_NONE` page took the write too.
 pub(crate) fn populate_in(
     t: &mut Table,
     root: usize,
     virt: usize,
     write: bool,
+    force: bool,
 ) -> crate::hal::kernel::FaultAnswer {
     use crate::hal::kernel::FaultAnswer;
     let page = pframe::align_down(virt, PAGE_SIZE);
@@ -312,7 +322,7 @@ pub(crate) fn populate_in(
     let Some(vma) = mm.vma_at(page) else {
         return FaultAnswer::Refused;
     };
-    if !vma.permits(write) {
+    if !vma.permits(write) && !force {
         return FaultAnswer::Refused;
     }
     let mut minor = false;
@@ -401,7 +411,7 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> crate::hal::kernel::Fault
     if super::super::userfault::deliver(pframe::align_down(virt, PAGE_SIZE), write) {
         return crate::hal::kernel::FaultAnswer::Resolved;
     }
-    with_table(|t| populate_in(t, root, virt, write))
+    with_table(|t| populate_in(t, root, virt, write, false))
 }
 
 /// [`resolve_anon_fault`] for an address space named by its root rather than by
@@ -414,7 +424,61 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> crate::hal::kernel::Fault
 /// the *fault handler's* answer, for a process faulting on its own memory
 /// (`docs/notes/` §8.0).
 pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
-    with_table(|t| populate_in(t, root, virt, write)) == crate::hal::kernel::FaultAnswer::Resolved
+    with_table(|t| populate_in(t, root, virt, write, false))
+        == crate::hal::kernel::FaultAnswer::Resolved
+}
+
+/// [`populate_user_page_at`] with Linux's `FOLL_FORCE`: bring the page in even
+/// where the range does not permit the access.
+///
+/// The one caller is `/proc/<pid>/mem`, whose whole business is the target's
+/// memory rather than its own: measured (`build/scratch/pmem/n.c`, 7.2.14), a
+/// write of eight bytes at a `PROT_READ` page answered `8`, and a `PROT_NONE`
+/// page answered both the read and the write. Nothing that faults for a *task*
+/// reaches this - [`resolve_anon_fault`] keeps the permission check, because a
+/// ring-3 store into a read-only page is still `SIGSEGV`.
+pub fn populate_forced_page_at(root: usize, virt: usize, write: bool) -> bool {
+    with_table(|t| populate_in(t, root, virt, write, true))
+        == crate::hal::kernel::FaultAnswer::Resolved
+}
+
+/// Break the copy-on-write page `virt` names in the address space `root` names,
+/// for a writer that is not that space's own task: `/proc/<pid>/mem`'s write
+/// half.
+///
+/// [`split_cow`] is the fault handler's own break and needs the *owner's* space
+/// and books; a cross-process writer reaches them only through the table, and
+/// this is that door. `false` means nothing needed breaking - the page is not
+/// copy-on-write, or the space is gone - which the caller reads as "write where
+/// the page is", not as a refusal.
+///
+/// It has to be here at all because [`write_user_of`]'s own doc records that it
+/// deliberately does **not** break a shared page: `strace` only reads. A
+/// debugger writing into a forked tracee's memory without this would write the
+/// frame the parent still shares - the child would read its new value and the
+/// parent its old one, from one frame, and the kernel's books would be wrong
+/// about which page belongs to whom.
+pub fn break_cow_at(root: usize, virt: usize) -> bool {
+    with_table(|t| {
+        let Some(owner) = owner_of_root(t, root) else {
+            return false;
+        };
+        let owner = t.space_owner(owner);
+        let Some(task) = t.tasks[owner.0].as_mut() else {
+            return false;
+        };
+        let mm = task.mm.clone();
+        let split = {
+            let Some(space) = task.space.as_mut() else {
+                return false;
+            };
+            split_cow(space, &mm, pframe::align_down(virt, PAGE_SIZE))
+        };
+        if split {
+            charge_thread_minor_fault(t, t.current);
+        }
+        split
+    })
 }
 
 /// Whether the kernel may treat the *absent* page holding `virt` as one it can
