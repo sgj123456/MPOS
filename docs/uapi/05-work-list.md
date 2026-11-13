@@ -12299,6 +12299,13 @@ never parks) and the aarch64 lane's disk reads did not park, so 313 programs and
 ran green while the shipped image could not boot. The pin is the boot itself: three boots and the
 serial line each of them ends on, recorded in §6.155.
 
+**Gate.** `build/gate-execorder2.log`, exit 0: stage 1 `1320 tests, 0 failed`; x86_64 `pass=314`;
+aarch64 `pass=313` with `all 313 user tests passed`; `mpos-kunit 35 passed, 0 failed` per arm. The
+sweep before it (`build/gate-execorder.log`) was red on two aarch64 boot cases that are not this
+change's: `arch.console_receive` bounded the console's own queued bytes at eight and a loaded lane
+queued more, and its leftover `Z` became `ipc.tty`'s first input byte; both are fixed in `c4a6443`
+and recorded with their readings in `docs/notes/15-boot-flow.md` §15.102.
+
 **What this does not do.** No `t-*` asserts the rule "no file read while the table lock is held":
 that is a claim about the kernel's call graph, and the honest instrument is a boot on a real root.
 A later reader adding a read inside `with_table` will not be told by the sweep; the comment on

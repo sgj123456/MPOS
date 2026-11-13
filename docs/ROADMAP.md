@@ -2700,4 +2700,7 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   (§10.5) while it holds the one lock the scheduler needs — a ramfs root never parks, which is why
   every test and initramfs boot was green. Building the space before the lock is also Linux's
   order for a failed `execve` (the caller keeps its image). Three boots with their last serial line
-  are the counterfactual, the middle one naming the read and not the loader (§6.155, item 273).
+  are the counterfactual, the middle one naming the read and not the loader. Gate
+  `build/gate-execorder2.log` exit 0: stage 1 1320, x86_64 `pass=314`, aarch64 `pass=313`, kunit
+  35/0 per arm; the sweep before it reddened two aarch64 boot cases that bounded the console's own
+  queued bytes at eight (`c4a6443`, §15.102). (§6.155, item 273).

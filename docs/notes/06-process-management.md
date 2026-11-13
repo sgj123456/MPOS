@@ -14074,6 +14074,16 @@ untouched; the old structure dropped the address space before `load_user` could 
 refused load left the task aimed at freed tables. The measurement sits in the same place as the
 first half's: the lock's own doc and `exec_replace`'s new comment carry the three boots above.
 
+**Gate.** `build/gate-execorder2.log`, `GATE_EXIT=0`: stage 1 `1320 tests, 0 failed`; x86_64
+`pass=314 fail=0`; aarch64 `pass=313 fail=0 (313 built)`, `all 313 user tests passed`; `mpos-kunit 35
+passed, 0 failed` per arm; the console receive case reports `the injected line read back through the
+tty` on the aarch64 lanes. The first sweep (`build/gate-execorder.log`) was red on that same pair of
+aarch64 boot cases - `arch.console_receive`'s `gave Some(13) after 8 foreign byte(s)` and
+`ipc.tty`'s line with a leading `Z` - and neither was this change's: the console check bounded
+somebody else's bytes at eight, a loaded lane queues more, and the leftover then became the next
+case's input. `c4a6443` puts the bound on the wait instead, drains after, and `§15.102` records both
+readings.
+
 **What this does not do, named.** The self-test sweep cannot reproduce this defect: its x86_64
 root is the boot archive (ramfs, no park) and the aarch64 lane's disk reads did not park, so both
 arms were green while the shipped image could not boot. The pin is therefore the boot measurement
