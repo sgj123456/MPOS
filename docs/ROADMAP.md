@@ -2376,8 +2376,10 @@ carries the per-phase history.*
   one: a `setuid` after `exec` does not move the ids the file reports, because the stack's vector did
   not move either. Pin `t-proc-auxv` (16 claims) is `PASS` on both arms and **15 of 16 red**
   counterfactually. Named gaps: this kernel's vector is sixteen entries where Linux's is
-  twenty-three (the loader's gap, not the file's), and a zombie answers `ENOENT` where Linux answers
-  `ESRCH`. (§6.136, item 250)
+  twenty-three (the loader's gap, not the file's). The zombie's refusal was the other half of the
+  promise: it refused at the **read** and always as `ENOENT`, where Linux refuses the **open** with
+  `ESRCH` (and `ENOENT` only once collected) - closed by item 268, which also captured the body the
+  open took. (§6.136, item 250; §6.149, item 268)
 - **`/proc/<pid>/timers` lists the group's POSIX timers, and a `timer_t` is a counter now.** The file
   did not exist, so a program could only remember what it had created; writing it exposed the worse
   defect underneath: the handle **was the slot index**, so `delete(1); create()` handed `1` back and
@@ -2601,3 +2603,24 @@ Pin: `t-inotify` 8 new claims (67 → 75) on both machines, whose leak detector 
 retired wd answering `EINVAL`; the counterfactual reddens exactly that pair and nothing else. Named
 departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - structural, not bookkeeping
 - a watched regular file not surviving a rename (the copy is a fresh inode). (§15.101, item 267)
+- **A dead task's memory files refuse the *open*, and the open keeps what it took.** `/proc/<pid>/auxv`
+  and `/proc/<pid>/environ` refused at the **read** and always with `ENOENT`, so a task that had just
+  died looked like a number that never existed - and `environ` did not refuse at all: it served the
+  dead task's 14 bytes of environment. Measured on a current host first
+  (`build/scratch/zombiemm/{z,q,s,t}.c`, Linux 7.2.14): a zombie's `auxv`, `environ`,
+  `smaps_rollup`, `pagemap` and `mem` refuse the **open** with `ESRCH(3)` where a collected number
+  gets `ENOENT(2)`; a stranger's open of a root-owned zombie is `EACCES(13)`, because the permission
+  word answers before the address space; `cmdline`/`maps`/`smaps`/`numa_maps` open and read nothing;
+  and a descriptor opened while the task lived serves what the open took (`16 + 352 = 368` of 368,
+  with no read before the kill) while a re*open* after the death is `ENOENT`. `crate::sched::TaskMemory`
+  (`Bytes`/`NoMemory`/`NoTask`, in `sched/policy.rs` because `mod runtime` is bare-metal only) carries
+  the split in one table walk, and a defaulted `Inode::open_check` is asked by the open handler
+  **after** the permission word - not in `open_replacement`, which runs before it and would answer
+  `ESRCH` to the stranger Linux answers `EACCES`. `ProcFile` gained a `capture` the open runs,
+  distinct from `generate`, so a captured body is the descriptor's for its life; `smaps_rollup`
+  renders text through the same gate (`memory_text_file`), and `cmdline`/`mapping_lines` answer
+  empty for a dead task instead of a body. Pin `t-proc-dead` (17 claims) is green on both machines
+  and under `MPOS_ON_HOST=1`; three counterfactuals redden exactly the claims they remove, and a
+  host unit test pins the two refusals and the capture. Named leftovers: `pagemap`/`mem`/`stack`
+  have no node here (the path itself is `ENOENT`, so Linux's `ESRCH` is moot), and the `X` state
+  shares the zombie's predicate without its own measurement. (§6.149, item 268)

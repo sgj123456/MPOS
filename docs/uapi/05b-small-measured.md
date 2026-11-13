@@ -1623,3 +1623,23 @@ Section numbers are unchanged from the original `UAPI.md`.
   Pinned by `t-io-uring` (22/22 on the host, Linux being the reference, and the guest
   claims including the three divergences); counterfactual reddens the pin with `-38`.
   Record: `docs/notes/` §6.32, item 115.
+- **A dead task's memory files refuse the *open*, and the open keeps what it took (item 268).**
+  `/proc/<pid>/auxv` and `/proc/<pid>/environ` refused at the read and always with `ENOENT`, so a
+  task that had just died looked like a number that never existed — and `environ` did not refuse at
+  all, handing out the dead task's 14 bytes of environment. Measured on a current host first
+  (`build/scratch/zombiemm/z.c`, `q.c`, `s.c`, `t.c`; Linux 7.2.14): a zombie's `auxv`, `environ`,
+  `smaps_rollup`, `pagemap` and `mem` refuse the **open** with `ESRCH`, a collected number with
+  `ENOENT`, a stranger's open of a root-owned zombie with `EACCES` (the permission word answers
+  first), and `cmdline`/`maps`/`smaps`/`numa_maps` open and read nothing; a descriptor opened while
+  the task lived serves what the open took (`16 + 352 = 368` of `368`, with no read before the
+  kill), where a *re*open after the death is `ENOENT`. This kernel now answers through
+  `crate::sched::TaskMemory` (`Bytes`/`NoMemory`/`NoTask`, in `sched/policy.rs` because `runtime`
+  is bare-metal only) and a defaulted `Inode::open_check` asked by the open handler **after** the
+  permission word — not in `open_replacement`, which runs before it and would answer `ESRCH` to the
+  stranger Linux answers `EACCES`. `ProcFile` gained a `capture` the open runs, distinct from
+  `generate`, so a captured body is the descriptor's for its life. Pin `t-proc-dead` (17 claims) is
+  green on both machines and under `MPOS_ON_HOST=1`; three counterfactuals redden exactly the
+  claims they remove (`.../cf2.log` 3, `.../cf3.log` 3, `.../cf4.log` 1), and a host unit test pins
+  the two refusals and the capture. Named leftovers: `pagemap`/`mem`/`stack` have no node here
+  (`ENOENT` for the path, so Linux's `ESRCH` is moot), and the `X`-state task shares only the
+  zombie's measured answers. `docs/notes/` §6.149.

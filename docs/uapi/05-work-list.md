@@ -11992,3 +11992,67 @@ live on the same inode. That is the copy-based rename's shape, not this item's
 bookkeeping, and it is recorded as a departure rather than approximated.
 `IN_UNMOUNT` and a watched directory's `IN_MOVE_SELF` (which waits on directory
 rename) remain the module's two other named departures.
+
+**Item 268**, landed 2026-11-13.
+
+### Item 268 — a dead task's memory files refuse the open, and the open keeps what it took
+
+| question | before | now |
+|---|---|---|
+| a zombie's `auxv`, `environ` | open succeeded, the **read** answered `ENOENT` | the **open** answers `ESRCH` (3) |
+| a zombie's `environ` body | served the dead task's 14 bytes | refused; nothing is served |
+| a zombie's `smaps_rollup` | a header whose numbers were all zero | the **open** answers `ESRCH` |
+| a collected number | `ENOENT` at the read | `ENOENT` at the open |
+| an fd opened while the task lived | re-rendered on the read; after the death it failed | serves the body the open captured (`288` of `288` on the guest) |
+| a zombie's `cmdline`/`maps`/`smaps`/`numa_maps` | a body (`21`/`512`/`512`/`-` bytes) | opens and reads nothing, as Linux does |
+| a stranger's open of a root-owned zombie's `auxv` | `EACCES` (the word already answered) | `EACCES`, unchanged — the gate is asked *after* the word |
+
+**Measurement** (`build/scratch/zombiemm/{z,q,s,t}.c`, Linux 7.2.14): `z.c` a parent
+reading its own zombie - `auxv`/`environ` open `ESRCH(3)`, `cmdline`/`maps`/`smaps` open and read
+`0` bytes, `statm` 14 bytes (`0 0 0 0 0 0 0\n`), `status` 512; after `waitpid`, `auxv`/`environ`
+open `ENOENT(2)`. `t.c` adds `smaps_rollup` `ESRCH`, `numa_maps` open-and-0, `pagemap`/`mem`
+`ESRCH`, `stack` open-then-failed-read, `wchan` 1 byte. `q.c` (the capture): open a live task's
+`auxv`, read 16 bytes, kill, reap, read 352 more - `368` of `368`, and a *re*open then `ENOENT`.
+`s.c` (under `sudo -n`): on one root-owned zombie, root's own open is `ESRCH` while a
+`setuid(65534)` child's is `EACCES` - the permission word first, the address space second.
+
+**Decision.** Three pieces, each the shape Linux's own boundary has:
+
+- `crate::sched::TaskMemory` (`Bytes` / `NoMemory` / `NoTask`) answers the two-question split in
+  one table walk, and lives in `sched/policy.rs` because `mod runtime` is `#[cfg(target_os = "none")]`
+  and the host stubs need the type. `saved_auxv_of` and `environment_of` return it; a third door,
+  `address_space_of`, answers the same question with no body for the files procfs renders itself.
+- `Inode::open_check`, defaulted to `Ok(())` for the whole tree, is asked by the open handler
+  **after** the shape, the permission word and the flags - the point where Linux's `proc_reg_open`
+  runs the file's own `open`. Not `open_replacement`: that door runs before the permission word,
+  and folding this into it would answer `ESRCH` where Linux answers `EACCES` (measured in `s.c`).
+- `ProcFile` gained a `capture` distinct from `generate`: the capture runs at the open and its
+  answer is the descriptor's for its whole life, so a read from offset 0 no longer re-renders for
+  those nodes, while every other generated file keeps the re-render-at-zero rule. `memory_file`
+  carries the `TaskMemory` nodes; `memory_text_file` the one whose text procfs writes.
+
+**Pins.** `user/tests/src/bin/t-proc-dead.rs`, 17 claims - green on both machines and under
+`MPOS_ON_HOST=1` on Linux 7.2.14. Host unit test
+`a_memory_files_open_carries_the_two_refusals_and_the_body` pins the pure half (the two errnos, a
+captured body read from zero and from its end, and a second open re-capturing, which is the
+refusal).
+
+**Counterfactuals**, each reverting only the kernel half:
+
+| reverted | red claims |
+|---|---|
+| the `open_check` call in the handler | the `auxv` and `environ` `ESRCH` claims, and the capture (`got 0` of 288) |
+| `cmdline_of`'s zombie branch and `mapping_lines`' `exited` branch | `cmdline` (17 bytes), `maps` (539), `smaps` (5364) |
+| `smaps_rollup` back to a plain generated file | `smaps_rollup` `ESRCH` (`None vs 3`) |
+
+**Gate.** `build/gate-procdead2.log`, exit 0: stage 1 1315 host tests 0 failed, x86_64
+`pass=310 fail=0` (exit 33), aarch64 `pass=309 fail=0` (ended on `=== END`), `mpos-kunit 35
+passed, 0 failed` on both, lint ratcheted, formatting clean in both workspaces, fuzz 23 targets,
+`t-proc-dead` green in both arms.
+
+**What this does not do.** `pagemap`, `mem` and `stack` have no node in this kernel at all (the
+path is `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist. A task in the
+`X`/exiting state shares the zombie's `task.exited` predicate - the shape matches, but only the
+zombie's answers were measured. And the empty answers of `maps`/`smaps`/`numa_maps`/`cmdline` ride
+two renderer branches (`cmdline_of` and `mapping_lines`); a future door that formatted the mapping
+facts without them would drift back to a body for a dead task.

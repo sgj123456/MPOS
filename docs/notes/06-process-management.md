@@ -13461,3 +13461,123 @@ the ordering is the measurement, not a convenience.
 the inode having a method) and `O_DIRECT` (no direct-I/O path, machine-specific
 number). Both stay in `docs/uapi/05b-small-measured.md` §5.2. `F_SETFL` still
 cannot make a description *direct*, and nothing here claims it can.
+
+## §6.149 a dead task's memory files refuse the open, and the open keeps what it took (LANDED 2026-11-13)
+
+`/proc/<pid>/auxv` and `/proc/<pid>/environ` were served from the process table's
+snapshot, so a task that had died answered at the **read** and always with `ENOENT`
+- the shape a number that names nothing gets. Linux splits those two questions, and
+answers a third (the file's own `open` is the step that fails):
+
+| door | live task | its own zombie | collected | root-owned zombie, uid 65534 |
+|---|---|---|---|---|
+| `auxv` | open ok, 368 B | open `ESRCH` (3) | open `ENOENT` (2) | open `EACCES` (13) |
+| `environ` | open ok, 512 B | open `ESRCH` | open `ENOENT` | open `EACCES` |
+| `cmdline` | open ok, 59 B | open ok, **0 B** | `ENOENT` | open ok, 0 B |
+| `maps` | open ok, 512 B | open ok, **0 B** | - | - |
+| `smaps` | open ok, 512 B | open ok, **0 B** | - | - |
+| `smaps_rollup` | open ok, 698 B | open `ESRCH` | - | - |
+| `numa_maps` | open ok, 1865 B | open ok, **0 B** | - | - |
+| `pagemap`, `mem` | open ok | open `ESRCH` | - | - |
+| `statm` | 20 B | 14 B, `0 0 0 0 0 0 0\n` | `ENOENT` | - |
+| `status` | 512 B | 512 B, still names it | - | - |
+| `wchan` | 14 B | 1 B (`0`) | - | - |
+
+Measured on a current host, Linux 7.2.14 (the four probes are kept as
+`.workbuddy/probe_zombiemm_{z,q,s,t}.c`; `z.c` for the middle columns, `s.c`
+under `sudo -n` for the last, `t.c` for the memory files the table above adds,
+`q.c` for the capture). Three shapes, and each one
+is a different promise:
+
+1. **The refusal belongs to the `open`, and there are two of them.** A zombie's
+   address space is gone, so a file that reads it is `ESRCH`; a number no task
+   answers to is `ENOENT`. This kernel answered neither at the open - `auxv`
+   opened and refused the read with `ENOENT` (the guest probe:
+   `build/scratch/oneshot-procded.log`, `auxv open ok, read -> errno 2`), and
+   `environ` did not refuse at all: it handed out the dead task's 14 bytes of
+   environment. `smaps_rollup`, a *sum* of the mappings, printed a header whose
+   every number was zero - a reader would conclude the process still exists with
+   no memory.
+2. **The `open` keeps what it took.** Linux's open grabs the address space
+   (`mm_access`), so a descriptor opened while the task lived goes on serving it:
+   `q.c` read 16 bytes before the kill and 352 more after the child had died and
+   been reaped (368 of 368), and a *re*open then answered `ENOENT`. A body
+   captured only when the first read arrived has nothing to serve if that read
+   comes after the death - which the guest counterfactual measured as `0` of 288.
+3. **The permission word answers first.** On one and the same root-owned zombie,
+   root's own open of `auxv` is `ESRCH` while a `setuid(65534)` stranger's is
+   `EACCES` (`s.c`). The two refusals are on different paths, in a fixed order.
+
+### The shape of the fix
+
+- `crate::sched::TaskMemory` - `Bytes(Vec<u8>)` / `NoMemory` / `NoTask` - lives in
+  `sched/policy.rs` rather than beside the lookups, because `mod runtime` is
+  `#[cfg(target_os = "none")]` and the enum is what the host stubs answer with.
+  `saved_auxv_of` and `environment_of` return it, and a third door,
+  `address_space_of`, answers the same question with no body for a file whose text
+  procfs renders itself (`smaps_rollup`).
+- `Inode::open_check` is a new defaulted hook (`Ok(())` everywhere else), asked by
+  the open handler **after** the shape, the permission word and the flags - which
+  is where Linux's `proc_reg_open` runs the file's own `open`. It is deliberately
+  not folded into `open_replacement`: that door runs before the permission word,
+  and a gate placed there would answer `ESRCH` to the stranger Linux answers
+  `EACCES` (the ordering measured in `s.c`, and the reason this hook exists rather
+  than a reused one).
+- `ProcFile` gained a `capture`, distinct from its `generate`: the capture runs at
+  the open, and its answer is the descriptor's body for its whole life - a read
+  from offset 0 no longer re-renders for such a node, while every other generated
+  file keeps the re-render-at-zero rule. `memory_file` wraps the
+  `TaskMemory`-answering closures (`auxv`, `environ`), `memory_text_file` the ones
+  whose body procfs writes (`smaps_rollup`): its gate asks
+  `address_space_of` and renders only for a live space.
+- Two renderers were taught a zombie's honest answer rather than a refusal:
+  `cmdline_of` answers the empty string for `Z`/`X`, and `mapping_lines` (which
+  `maps`, `smaps` and `numa_maps` all read) answers an empty list - Linux opens
+  those files and reads nothing, which is a different promise from the three that
+  refuse.
+
+### Pins and counterfactuals
+
+`user/tests/src/bin/t-proc-dead.rs`, 17 claims, green on both machines and under
+`MPOS_ON_HOST=1` on Linux 7.2.14: the live opens; a fork child's `environ` equal to
+its parent's block; the zombie's `auxv`/`environ`/`smaps_rollup` opens answering
+`ESRCH`; `cmdline`/`maps`/`smaps`/`numa_maps` opening and reading nothing;
+`statm`'s seven zeros and a non-empty `status` (the guard against refusing
+everything); a descriptor opened while the task lived serving its whole body when
+first read after the death; `ENOENT` for the three doors once collected; and a
+guest-only stranger claim (`EACCES`, skipped with a printed note on the host, the
+shape `t-atime` uses).
+
+Counterfactuals, each reverting only the kernel half (`diff -q` clean after each):
+
+| reverted | red claims |
+|---|---|
+| the `open_check` call in the handler | `auxv` `ESRCH` (`None vs 3`), `environ` `ESRCH` (`None vs 3`), and the capture (`got 0` of 288) - `build/scratch/oneshot-procdead-cf2.log` |
+| `cmdline_of`'s zombie branch and `mapping_lines`' `exited` branch | `cmdline` (`17 bytes`), `maps` (`539`), `smaps` (`5364`) - `.../cf3.log` |
+| `smaps_rollup` back to a plain generated file | `smaps_rollup` `ESRCH` (`None vs 3`) - `.../cf4.log` |
+
+A host unit test (`a_memory_files_open_carries_the_two_refusals_and_the_body`, in
+`src/vfs/procfs.rs`'s tests) pins the pure half: `NoMemory` -> `VfsError::NoProcess`,
+`NoTask` -> `VfsError::NoEntry`, a captured body read from zero and from its end
+without asking again, and a second open re-capturing (which is the refusal).
+
+**Gate:** `build/gate-procdead2.log`, exit 0 - see the round's ledger row; stage 1
+797 host tests, both arms' sweeps green, `t-proc-dead` in both.
+
+### What this does not cover, named
+
+- `pagemap` and `mem` have no node in this kernel at all (the path itself is
+  `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist;
+  `stack` is the same shape (Linux opens it and fails the read).
+- A task in the `X`/exiting state is answered by the same `task.exited` predicate
+  the zombie is - Linux releases the address space before the zombie state, so the
+  shape matches, but only the zombie's own answers were measured.
+- The empty answers of `maps`/`smaps`/`numa_maps`/`cmdline` ride two renderer
+  branches; a future door that formatted the mapping facts without them would
+  drift back to a body for a dead task.
+
+**Gate:** `build/gate-procdead2.log`, exit 0 - stage 1 1315 host tests 0 failed, x86_64
+`pass=310 fail=0` (exit 33), aarch64 `pass=309 fail=0` (ended on `=== END`), the kernel's 35
+self-test cases 0 failed on both, lint ratcheted, both workspaces rustfmt's shape, the fuzz
+workspace's 23 targets built, and `t-proc-dead` green in both arms (`build/test-lane-x86_64-1`
+and `build/test-lane-aarch64-0`).
