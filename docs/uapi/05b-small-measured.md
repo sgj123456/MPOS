@@ -1640,6 +1640,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   `generate`, so a captured body is the descriptor's for its life. Pin `t-proc-dead` (17 claims) is
   green on both machines and under `MPOS_ON_HOST=1`; three counterfactuals redden exactly the
   claims they remove (`.../cf2.log` 3, `.../cf3.log` 3, `.../cf4.log` 1), and a host unit test pins
-  the two refusals and the capture. Named leftovers: `pagemap`/`mem`/`stack` have no node here
-  (`ENOENT` for the path, so Linux's `ESRCH` is moot), and the `X`-state task shares only the
+  the two refusals and the capture. Named leftovers at the time: `pagemap`/`mem`/`stack` had no node here
+  (`ENOENT` for the path, so Linux's `ESRCH` was moot) - `pagemap` was built by **item 269**
+  (`docs/notes/` §6.150), `mem`/`stack` still have none - and the `X`-state task shares only the
   zombie's measured answers. `docs/notes/` §6.149.
+
+- **`/proc/<pid>/pagemap` answers the page tables as words (item 269), with three bits named as
+  models.** No node existed at all (`ENOENT` for the path). Measured on a current host first
+  (`build/scratch/pmap/{p,q,s}.c`, Linux 7.2.14): `0400` and `st_size` **0**; the offset is a byte
+  offset into a stream of 8-byte words, so a non-word offset or a non-word length is `EINVAL(22)`
+  and a read past the top of the address space is a plain end-of-file; a touched private anon page
+  reads `0x8180_0000_0000_0000` (present, exclusive, soft-dirty), an untouched page of the same
+  mapping reads soft-dirty alone, a read-faulted private file page adds the file-page bit, an
+  address in no VMA reads `0x0`, a zombie's open is `ESRCH(3)`, a collected number's is
+  `ENOENT(2)`, and a stranger's open of a root-owned zombie's is `EACCES(13)` because the ptrace
+  question answers before the address space is asked about. This kernel answers the same words
+  from the two structures it keeps - the describing ranges (`sched::map_facts`) and the page
+  tables (a new `sched::page_present`, one walk per page, the table's lock entered and left around
+  each) - and names its three derived bits instead of faking them: PFNs are always 0 (Linux's own
+  unprivileged answer), soft-dirty is always set inside a VMA because nothing here has ever cleared
+  a reference and there is no `clear_refs`, and `exclusive` means "present and not shared" because
+  there is no page mapcount (measured divergence: a single-process `MAP_SHARED|MAP_ANONYMOUS` page
+  is `0xa180_…` on the host and `0xa080_…` here). Pin `t-pagemap` (17 claims) is green on both
+  machines and under `MPOS_ON_HOST=1`; two host unit tests pin the arithmetic; counterfactuals
+  redden exactly 3 and exactly 1 claim. `docs/notes/` §6.150.

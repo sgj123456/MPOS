@@ -1609,8 +1609,9 @@ verdicts for a root process and a dropped child.
 not modelled here: `may_inspect` answers on ids and dumpability, so a process
 started as uid 1000 reads a root process's `maps` on Linux and is refused here
 (the probe's own shape is the one the pin drives, and the measurement above
-records why the two differ). (2) `pagemap`/`mem`/`auxv` are not served at all,
-so their verdicts are moot. (3) `/proc/<pid>/environ` is refused by its `0400`
+records why the two differ). (2) `pagemap`/`mem`/`auxv` were not served at the time
+(the state this measurement records - `auxv` was built later, `pagemap` by item
+269 / §6.150, `mem` still has no node), so their verdicts were moot. (3) `/proc/<pid>/environ` is refused by its `0400`
 word, which this tree already policed, not by the ptrace rule — same errno, a
 different door.
 

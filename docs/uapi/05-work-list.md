@@ -7792,7 +7792,9 @@ predicate reads.
 **Named divergences**: (1) the caller's credential transition is not modelled —
 `may_inspect` answers on ids plus dumpability, so a process started as uid 1000
 reads a root process's `maps` on Linux and is refused here; (2) `pagemap`,
-`mem` and `auxv` are not served, so their verdicts are moot; (3)
+`mem` and `auxv` were not served when this was measured (the state recorded here -
+`auxv` and `pagemap` have since been built, items 268's neighbour and 269; `mem`
+still has no node), so their verdicts were moot; (3)
 `/proc/<pid>/environ` is refused by its already-policed `0400` word rather than
 by this rule (same errno, a different door).
 
@@ -12050,9 +12052,67 @@ refusal).
 passed, 0 failed` on both, lint ratcheted, formatting clean in both workspaces, fuzz 23 targets,
 `t-proc-dead` green in both arms.
 
-**What this does not do.** `pagemap`, `mem` and `stack` have no node in this kernel at all (the
-path is `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist. A task in the
+**What this does not do.** `mem` and `stack` have no node in this kernel at all (the
+path is `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist.
+`pagemap` was in this list when item 268 landed; **item 269** built the node and its own section
+(`docs/notes/` §6.150) carries the shape. A task in the
 `X`/exiting state shares the zombie's `task.exited` predicate - the shape matches, but only the
 zombie's answers were measured. And the empty answers of `maps`/`smaps`/`numa_maps`/`cmdline` ride
 two renderer branches (`cmdline_of` and `mapping_lines`); a future door that formatted the mapping
 facts without them would drift back to a body for a dead task.
+
+---
+
+**Item 269**, landed 2026-11-13. `/proc/<pid>/pagemap` exists: a word per page,
+read from the describing ranges and the page tables, with Linux's shape measured
+first (`build/scratch/pmap/{p,q,s}.c`, Linux 7.2.14).
+
+| question | Linux 7.2.14 | this kernel before | this kernel now |
+|---|---|---|---|
+| `open("/proc/self/pagemap")` | `0400`, `st_size` **0** | `ENOENT` (no node) | same node, same word |
+| word for a touched private anon page | `0x8180_…` | - | `0x8180_…` |
+| untouched page of that mapping | `0x0080_…` (soft-dirty alone) | - | `0x0080_…` |
+| private **file** page, read-faulted | `0xa180_…` (file-page bit) | - | `0xa180_…` |
+| `MAP_SHARED\|MAP_ANONYMOUS`, touched | `0xa180_…` (mapcount = 1) | - | `0xa080_…` (VMA shared bit; named divergence) |
+| `vaddr 0`, in no VMA | `0x0` | - | `0x0` |
+| byte offset not a multiple of 8, or a 4-byte read | `EINVAL(22)` | - | `EINVAL(22)` |
+| read past the top of the address space | `0` bytes, no error | - | `0` bytes, no error |
+| unreaped zombie's open | `ESRCH(3)` | - | `ESRCH(3)` |
+| after the reap | `ENOENT(2)` | - | `ENOENT(2)` |
+| a stranger's open of a root zombie's file | `EACCES(13)` (ptrace first) | - | `EACCES(13)` |
+| `/proc/<pid>/task/<tid>/pagemap` | exists, one `mm` for the group | - | same |
+
+**Decision.** The words come from two structures the kernel already keeps: the
+describing ranges (`sched::map_facts`, the table `maps`/`smaps` read) and the
+page tables (a new `sched::page_present`, one walk per page with the table's
+critical section entered and left around each - a reader may walk 262144 pages,
+which is AGENTS.md §3's unbounded-work rule). Three bits are **derived** and each
+is named rather than faked: the frame number is always 0 (exactly Linux's
+unprivileged answer), soft-dirty is always set inside a VMA because nothing here
+has ever cleared a reference and there is no `clear_refs` node, and `exclusive`
+answers "present and not shared" because this kernel has no page mapcount. The
+open order is Linux's and is the reason the node declares `describes_task`: the
+ptrace question (EACCES) answers before the address space is asked about
+(ESRCH/ENOENT), because a stranger is `EACCES` even against a root-owned zombie.
+
+**Pins.** `user/tests/src/bin/t-pagemap.rs`, 17 claims - `MPOS_ON_HOST=1` answers
+16 `ok:` plus the stranger's `note:` on Linux 7.2.14, the guest answers all 17.
+Two host unit tests pin the arithmetic (`a_pagemap_read_is_whole_words_or_refused`,
+`a_pagemap_word_names_the_facts_it_can_answer`). Counterfactuals, each a kernel
+rebuilt and a boot:
+
+| change | reds |
+|---|---|
+| `page_present` always false (never walk the tables) | exactly 3: private anon, private file, shared anon |
+| `open_check` always `Ok(())` | exactly 1: the zombie's `ESRCH` |
+
+**Gate.** `build/gate-pagemap2.log`, exit 0: stage 1 1317 host tests 0 failed, x86_64
+`pass=311 fail=0` (exit 33), aarch64 `pass=310 fail=0` (ended on `=== END`, 16 of 326 left out),
+`mpos-kunit 35 passed, 0 failed` on both, lint ratcheted, both workspaces rustfmt's shape, fuzz
+23 targets, `t-pagemap` green in both arms (20 ms / 208 ms). The gate's first run failed on
+aarch64 in `t-rr-interval`'s sampling window - the claim's bound is §6.151's measurement.
+
+**What this does not do.** `mem` and `stack` still have no node. Bit 62 (swapped) is always 0
+because there is no swap. A pagemap descriptor does not pin the address space, so a read after the
+target dies is `ENOENT` where Linux's open-held `mm` keeps serving. The huge-page bit and the
+`clear_refs` transitions are not served.

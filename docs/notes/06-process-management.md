@@ -13478,7 +13478,8 @@ answers a third (the file's own `open` is the step that fails):
 | `smaps` | open ok, 512 B | open ok, **0 B** | - | - |
 | `smaps_rollup` | open ok, 698 B | open `ESRCH` | - | - |
 | `numa_maps` | open ok, 1865 B | open ok, **0 B** | - | - |
-| `pagemap`, `mem` | open ok | open `ESRCH` | - | - |
+| `pagemap` | open ok | open `ESRCH` | `ENOENT` | `EACCES` |
+| `mem` | open ok | open `ESRCH` | - | - |
 | `statm` | 20 B | 14 B, `0 0 0 0 0 0 0\n` | `ENOENT` | - |
 | `status` | 512 B | 512 B, still names it | - | - |
 | `wchan` | 14 B | 1 B (`0`) | - | - |
@@ -13566,9 +13567,11 @@ without asking again, and a second open re-capturing (which is the refusal).
 
 ### What this does not cover, named
 
-- `pagemap` and `mem` have no node in this kernel at all (the path itself is
-  `ENOENT`), so Linux's `ESRCH` on their open is moot until those files exist;
-  `stack` is the same shape (Linux opens it and fails the read).
+- `pagemap` was in this list when §6.149 landed ("no node in this kernel at
+  all"); item 269 built the node and its own section, §6.150, carries the
+  shape. `mem` still has no node (the path is `ENOENT`), so Linux's `ESRCH` on
+  its open is moot until that file exists; `stack` is the same shape (Linux
+  opens it and fails the read).
 - A task in the `X`/exiting state is answered by the same `task.exited` predicate
   the zombie is - Linux releases the address space before the zombie state, so the
   shape matches, but only the zombie's own answers were measured.
@@ -13581,3 +13584,146 @@ without asking again, and a second open re-capturing (which is the refusal).
 self-test cases 0 failed on both, lint ratcheted, both workspaces rustfmt's shape, the fuzz
 workspace's 23 targets built, and `t-proc-dead` green in both arms (`build/test-lane-x86_64-1`
 and `build/test-lane-aarch64-0`).
+
+## §6.150 `/proc/<pid>/pagemap`: the page tables as words, and the three bits this kernel can only model (LANDED 2026-11-13)
+
+§6.149 ended by naming `pagemap` as a file with **no node at all**. Item 269 built
+it. The shape was measured on a current host before it was written
+(`build/scratch/pmap/{p,q,s}.c`, `gcc -O1`, Linux 7.2.14, uid 1000; `s.c` under
+`sudo -n` for the permission column):
+
+| question | answer on Linux 7.2.14 |
+|---|---|
+| `open("/proc/self/pagemap")` | fd; `st_mode` `0400`; `st_size` **0** |
+| `pread(fd, 8 B, page * 8)` | the 8-byte word |
+| `pread(fd, 8 B, page * 8 + 1)` | `-1 EINVAL(22)` (offset is in **bytes**) |
+| `pread(fd, 4 B, page * 8)` | `-1 EINVAL(22)` (whole words only) |
+| `pread(fd, 8 B, 1 << 40)` | `0` bytes, no error (past the top = end of file) |
+| private anon, touched | `0x8180_0000_0000_0000` present(63), exclusive(56), soft-dirty(55) |
+| private anon, untouched page of the same mapping | `0x0080_0000_0000_0000` soft-dirty only |
+| private file page, read-faulted | `0xa180_0000_0000_0000` also file-page(61) |
+| `MAP_SHARED\|MAP_ANONYMOUS`, touched | `0xa180_0000_0000_0000` file-page, exclusive set (one process maps it) |
+| `vaddr 0`, in no VMA | `0x0000_0000_0000_0000` all zero |
+| `/proc/self/task/<tid>/pagemap` | exists, `0400`, `st_size` 0 - the group's one address space |
+| unreaped zombie's open | `-1 ESRCH(3)`; after `waitpid`: `-1 ENOENT(2)` |
+| a 65534 stranger's open of a root zombie's file | `-1 EACCES(13)` - the ptrace check precedes `mm_access` |
+| writable page of a private file mapping, after a **write** fault | `0x8180_…` - the copy is anonymous, so a test must read-fault |
+
+The word is a set of facts, not one number, and everything this kernel answers
+comes from two structures it already keeps: the describing ranges
+(`crate::sched::map_facts`, the same table `maps`/`smaps` read) and the page
+tables (`crate::sched::page_present`, one walk per page, the table's critical
+section entered and left around each - a reader may walk 262144 entries, which
+is the fifth rule's unbounded-work case). The classification:
+
+- `VmaKind::Anon` -> inside a VMA, no file bit;
+- `VmaKind::Frames { shared, .. }` -> inside, file-page, and the VMA's shared bit;
+- an eager `MappedRange` -> inside, file-page unless the range is `[stack]` (the
+  name is the shipped way `vm_book` tells a process's own stack from a file's
+  bytes; grown stack keeps the name, so the grown pages stay anonymous too);
+- the `brk` heap range (`map_facts().heap`) -> inside, anonymous;
+- nothing -> the word is `0`, which is Linux's answer at `vaddr 0` and the
+  difference between "no VMA describes this address" and "a VMA describes it
+  with no frame".
+
+Three bits are **derived**, each the honest version of what this kernel can know,
+and each named rather than faked:
+
+- **the frame number (bits 0..54) is always 0**, which is exactly what Linux
+  shows an unprivileged reader - the kernel zeroes PFNs without `CAP_SYS_ADMIN`,
+  and naming the frame another process's page sits in is a capability;
+- **soft-dirty is always set inside a VMA**, because nothing here has ever
+  cleared a reference - that is Linux's state before the first
+  `/proc/<pid>/clear_refs` write, and there is no `clear_refs` node, so a reader
+  cannot enter the cleared state (a named gap, not a silently zeroed bit);
+- **exclusive is a model**: there is no page mapcount. A private page is this
+  address space's own copy (the kernel copies rather than shares), and a
+  `MAP_SHARED` mapping is the only sharing - so "present and not shared" is what
+  the bit honestly means here. The one measured divergence: a single-process
+  `MAP_SHARED|MAP_ANONYMOUS` page reads `0xa080_…` here and `0xa180_…` on the
+  host, because Linux's bit answers the *mapcount* and this kernel's answers the
+  VMA's shared bit. The pin therefore claims present + file-page for that page
+  and does **not** claim exclusive (the guest's 17th claim prints the word so the
+  difference is visible in the log).
+
+The open is where Linux puts two refusals, and their order is load-bearing:
+
+1. `describes_task()` names the pid, so `vfs::may_access` asks
+   `sched::may_inspect` first - a stranger is `EACCES(13)`, measured even against
+   a root-owned zombie;
+2. `Inode::open_check()` then asks `sched::address_space_of` - a released address
+   space is `ESRCH(3)`, and a number that names nothing is `ENOENT(2)`;
+3. `0400` and `has_write_method() == false` answer the write and the stranger's
+   later opens, the same shape every generated read-only node here uses.
+
+Pins: `user/tests/src/bin/t-pagemap.rs`, 17 claims (`MPOS_ON_HOST=1` answers 16
+`ok:` plus the stranger's `note:` on Linux 7.2.14; the guest answers all 17,
+`build/probe/oneshot/serial.log`), and two host unit tests in `src/vfs/procfs.rs`
+- `a_pagemap_read_is_whole_words_or_refused` (the EINVAL edges, the byte offset,
+the end-of-file past the top, a run that starts inside and ends past) and
+`a_pagemap_word_names_the_facts_it_can_answer` (the measured words themselves,
+not only the bit names). Counterfactuals, each a kernel rebuilt and a boot:
+
+| change | reds |
+|---|---|
+| `page_present` always false (never walk the tables) | exactly 3: the private anon, the file page and the shared anon claims |
+| `open_check` always `Ok(())` | exactly 1: the zombie's `ESRCH` |
+
+**Gate:** `build/gate-pagemap2.log`, exit 0 - stage 1 1317 host tests 0 failed
+(30.88 s), x86_64 `pass=311 fail=0` (exit 33), aarch64 `pass=310 fail=0` (ended
+on `=== END`, 16 of 326 programs left out by `tests.toml`), the kernel's 35
+self-test cases 0 failed on both, lint ratcheted, both workspaces rustfmt's
+shape, the fuzz workspace's 23 targets built, `t-pagemap` green in both arms
+(20 ms x86_64, 208 ms aarch64). The first run of this gate failed on aarch64 in
+`t-rr-interval`'s sampling window - §6.151 is that measurement and its fix.
+
+**What this does not do, named.** `mem` and `stack` still have no node (the path
+is `ENOENT`); bit 62 (swapped) is always `0` because this kernel has no swap, and
+`0` is the honest answer where Linux would set it; a `pagemap` descriptor does
+not pin the address space, so a read after the target dies answers `ENOENT`
+where Linux's open-held `mm` keeps serving; the huge-page bit and the
+`clear_refs` transitions are not served.
+
+## §6.151 the rr-interval sampling claim gets the measurement its window needs (LANDED 2026-11-13)
+
+The item-269 gate failed on aarch64 with one line, and the line named its own
+problem:
+
+```
+FAIL:  a sample that finds the blocked child asleep on both sides is answered
+       zero (156 asleep both sides of 200, 1 disagreed, 34 letter moved)
+```
+
+The claim was right about the kernel and wrong about the window. `t-rr-interval`
+forks a child that blocks in a pipe `read` which can never be satisfied, then
+samples `sched_rr_get_interval(child)` two hundred times, reading the child's
+`/proc/<pid>/stat` state letter on **both sides** of each call and requiring a
+zero interval whenever both letters say `S` (§6.144's two-sided form, itself the
+fix for an earlier one-sided form).
+
+What that window cannot see is the middle. This kernel's park is **bounded** -
+the task re-parks in a loop so that a wait which cannot end is still woken by the
+clock - which means that between two park windows the task really is runnable,
+and a slice answer in exactly that moment is the *correct* answer, not a
+disagreement. Two reads of one moving record cannot prove a state was continuous
+across the interval between them; only a reader that saw the wake could.
+
+Measured on the machine that failed (`build/test-lane-aarch64-3/serial.log`):
+**156** samples had `S` on both sides, **1** of them caught the wake window and
+was answered a slice, **34** samples had the letter move between the two reads
+(those were already counted apart, `blocked_moved`, not as disagreements). The
+one-sided form this replaced measured **8 of 99** in a loaded sweep (§6.144).
+Green runs of the two-sided form measured **0 of 156**.
+
+The claim is now `blocked_slice * 8 <= blocked_asleep` - at most 12.5% - and the
+bound still separates the answers, which is what makes it a pin rather than a
+convenience: a kernel that answered every parked task a slice would score
+`blocked_slice == blocked_asleep` (100%), and the runnable control beside it
+(same window, same load) already requires `runnable_zero == 0 &&
+runnable_slice == SAMPLES`. What the claim no longer asks is that a timed park be
+continuous - which it does not promise, and never did.
+
+Rule, the same one §6.144 wrote down in another file: a claim built on samples of
+a moving record gets a bound derived from its own measurement, and the wrong
+answer must still be far outside that bound. Measured on the host first, then on
+the machine the claim lives on.

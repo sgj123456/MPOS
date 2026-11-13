@@ -2621,6 +2621,24 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   renders text through the same gate (`memory_text_file`), and `cmdline`/`mapping_lines` answer
   empty for a dead task instead of a body. Pin `t-proc-dead` (17 claims) is green on both machines
   and under `MPOS_ON_HOST=1`; three counterfactuals redden exactly the claims they remove, and a
-  host unit test pins the two refusals and the capture. Named leftovers: `pagemap`/`mem`/`stack`
-  have no node here (the path itself is `ENOENT`, so Linux's `ESRCH` is moot), and the `X` state
-  shares the zombie's predicate without its own measurement. (§6.149, item 268)
+  host unit test pins the two refusals and the capture. Named leftovers at
+  the time: `pagemap`/`mem`/`stack` had no node here (the path itself was `ENOENT`, so Linux's
+  `ESRCH` was moot) - **item 269** built `pagemap` (§6.150), `mem`/`stack` still have none - and
+  the `X` state shares the zombie's predicate without its own measurement. (§6.149, item 268)
+- **`/proc/<pid>/pagemap` (item 269).** The file had no node at all while §6.149 and the
+  "Remaining ABI support" list both recorded it as a gap. Linux's shape measured first
+  (`build/scratch/pmap/{p,q,s}.c`, 7.2.14): `0400`/size 0, byte-offset words with `EINVAL(22)` on a
+  non-word offset or length, end-of-file past the top of the address space, `0x8180_…` for a
+  touched private anon page, soft-dirty alone for an untouched page of the same mapping, the
+  file-page bit for a read-faulted file page, `0x0` in no VMA, and the open's three refusals
+  (`ESRCH` zombie / `ENOENT` collected / `EACCES` stranger, the ptrace check first). This kernel
+  answers from the describing ranges plus a new one-page `sched::page_present` walk and **names**
+  its three derived bits (PFN always 0 = unprivileged parity; soft-dirty always set, because
+  nothing here clears a reference and there is no `clear_refs`; `exclusive` = present-and-not-shared
+  because there is no mapcount, measured divergence `0xa080` vs the host's `0xa180` on a
+  single-process `MAP_SHARED|MAP_ANONYMOUS` page). Pins: `t-pagemap` 17 claims on both machines and
+  under `MPOS_ON_HOST=1`, two host unit tests, and two counterfactuals that redden exactly 3 and
+  exactly 1 claim. The gate's first run also caught a **claim** whose sampling window could not see
+  a timed park's wake (§6.151: 1 of 156 loaded-lane disagreements), fixed into a measured bound in
+  the same round. Gate `build/gate-pagemap2.log` exit 0: stage 1 1317, x86_64 311, aarch64 310,
+  kunit 35/0 both, lint/format/fuzz clean. (§6.150, item 269)
