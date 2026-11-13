@@ -12278,3 +12278,28 @@ before injecting, §15.102).
 A file whose program-header or dynamic table exceeds the parse's caps is refused rather than
 streamed. Bytes past the last `PT_LOAD` are ignored - Linux's behaviour, and what makes the padded
 copy of a real program run. (§6.154)
+
+**Item 273**, landed 2026-11-14. `execve` builds the new address space **before** it takes the
+task-table lock, and before it tears the old image down.
+
+| | before | now |
+|---|---|---|
+| when the image is read | inside `with_table`, page by page (item 272's `InodeSource`) | before the lock is taken |
+| a page of a file on a block device | the read parks the task **while it holds the table lock** | the task holds nothing while it waits |
+| a load that fails | the old space had already been dropped; the task was aimed at freed tables | the old space, tables and frames are untouched, and the caller keeps its image |
+
+The defect was reported as `cargo xtask run --mode terminal` dying with `SIGSEGV` after
+`MPOS_SWITCH_ROOT_OK`; the signal was the host's Mesa teardown (`egl_cleanup`, masking the guest's
+exit), and the guest's own death was a triple fault inside the load of `/sbin/openrc`. The
+discriminating measurement is in `docs/notes/` §6.155: the same streaming loader with the image
+read whole — outside the lock — reaches `mpos login:`, and so does the final shape.
+
+**Why it was invisible to the gate.** The sweep's x86_64 root is the boot archive (ramfs: a read
+never parks) and the aarch64 lane's disk reads did not park, so 313 programs and 35 kernel cases
+ran green while the shipped image could not boot. The pin is the boot itself: three boots and the
+serial line each of them ends on, recorded in §6.155.
+
+**What this does not do.** No `t-*` asserts the rule "no file read while the table lock is held":
+that is a claim about the kernel's call graph, and the honest instrument is a boot on a real root.
+A later reader adding a read inside `with_table` will not be told by the sweep; the comment on
+`exec_replace` and this row are the record.

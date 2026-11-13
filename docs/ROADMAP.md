@@ -2693,3 +2693,11 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   runs, a 96 MiB non-program is `ENOEXEC`, a 96 MiB script runs); counterfactual reddens the three
   size claims with `ENOMEM` 12 - and with the errno lie back, `ENOSPC` 28, the report verbatim.
   Named: the *interpreter* is still read whole (`ld-musl` is small). (§6.154, item 272)
+
+- **Item 273 — `execve` loads its image outside the table lock, and before it tears the old one
+  down** (2026-11-14). `cargo xtask run` died after `MPOS_SWITCH_ROOT_OK`: item 272's page-by-page
+  read happens inside `with_table`, and a page of a file on a block device **parks** the task
+  (§10.5) while it holds the one lock the scheduler needs — a ramfs root never parks, which is why
+  every test and initramfs boot was green. Building the space before the lock is also Linux's
+  order for a failed `execve` (the caller keeps its image). Three boots with their last serial line
+  are the counterfactual, the middle one naming the read and not the loader (§6.155, item 273).

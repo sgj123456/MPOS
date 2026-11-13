@@ -14028,3 +14028,54 @@ through at most eight foreign bytes (`docs/notes/` §15.102).
 up to `META_MAX` of a file's own metadata; a file whose program header table or dynamic table is
 larger than that is refused, not read. And the padding case is Linux's shape rather than a licence:
 bytes past the last `PT_LOAD` are ignored by both loaders.
+
+## §6.155 the image is loaded before the table lock is taken, and before the old one is torn down (item 273, LANDED 2026-11-14)
+
+**The report.** `cargo xtask run --mode terminal` died with `SIGSEGV` after
+`MPOS_SWITCH_ROOT_OK: / is /dev/vda2 (ext4)`, and the guest's console never reached a prompt
+(`m11282`). The signal itself was QEMU's: a `coredumpctl info` reading shows the host's
+`qemu-system-x86_64` faulting inside `libgallium`/`libEGL_mesa`'s `egl_cleanup`, i.e. in the
+compositor's teardown, which is why the *process* died with the address of a Mesa routine and not
+of the guest. Booting the same image by hand with `-display none -device virtio-gpu-pci` answered
+`QEMU_EXIT=0` and the same serial cut-off, so the guest itself had stopped.
+
+**What the guest was doing.** Under `-accel tcg -d int,cpu_reset`, the last events were a
+`v=0e e=0010` page fault at CPL 0 fetching `ffffffff80084d27` with `CR2` equal to it — an
+*instruction fetch of a non-present kernel text page* under `CR3=0000000000364000` — followed by a
+double fault and a triple fault. The disk-boot path was dying inside the load of `/sbin/openrc`;
+the initramfs path (all ramfs) had never had a problem, and every host test was green.
+
+**The cause: a file read under the task-table lock.** Item 272 (`§6.154`) made `execve` read the
+image page by page through `vfs::InodeSource`. A page of a file on a **block device** parks the
+task while the device answers — `docs/notes/` §10.5's rule — and the space was being built inside
+`with_table`, i.e. holding the one lock every other task needs to be scheduled. On a ramfs root
+there is no device and nothing parks, which is why the whole test sweep and every initramfs boot
+was green; on the ext4 root the first large program (`/sbin/openrc`, 42920 bytes through 4 `PT_LOAD`
+segments plus a 670312-byte interpreter) parked with the lock held.
+
+Three boots name it, and they are the counterfactual:
+
+| kernel | root | serial ends at |
+|---|---|---|
+| before the fix (item 272 as landed) | ext4 | `MPOS_SWITCH_ROOT_OK`, then the triple fault (`build/scratch/qemu-int2.log`) |
+| item 272's image read **whole** in `handle_execve` (streaming loader kept) | ext4 | `mpos login:` (`build/scratch/run-cf-whole.log`) |
+| after this fix (streaming loader kept) | ext4 | `mpos login:`, after openrc's services report `[ ok ]` (`build/scratch/run-fix1.log`) |
+
+The middle row is the discriminating one: the same streaming loader with the image read *outside*
+the lock reaches a prompt, so the loader's page reads were correct and only their position was
+wrong.
+
+**The fix, two halves.** `exec_replace` now builds the new `AddressSpace`, loads the image and
+writes the argument block **before** `with_table`, and only then takes the lock to end the group's
+siblings, drop the old space and install the new one. The second half is Linux's ordering and was
+already wrong here: an `execve` that fails must leave the caller running the image it had. Building
+first means every refusal returns with the old space, the old page tables and the old frames
+untouched; the old structure dropped the address space before `load_user` could answer, so a
+refused load left the task aimed at freed tables. The measurement sits in the same place as the
+first half's: the lock's own doc and `exec_replace`'s new comment carry the three boots above.
+
+**What this does not do, named.** The self-test sweep cannot reproduce this defect: its x86_64
+root is the boot archive (ramfs, no park) and the aarch64 lane's disk reads did not park, so both
+arms were green while the shipped image could not boot. The pin is therefore the boot measurement
+above, not a `t-*`: a claim about "no file read while the table lock is held" is a statement about
+the kernel's own call graph, and the honest instrument for it is the boot on a real root.
