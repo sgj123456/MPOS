@@ -136,11 +136,6 @@ fn put(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-/// A little-endian 32-bit field, for `siginfo_t`'s pid and uid.
-fn put_i32(bytes: &mut [u8], at: usize, value: i32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
 fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -343,30 +338,13 @@ impl SignalFrame for Current {
         put_u32(out, reserved + fpsimd::BYTES + ctx::MAGIC, 0);
         put_u32(out, reserved + fpsimd::BYTES + ctx::SIZE, 0);
 
-        // A `siginfo_t`: signo, errno, code, and - for a signal that names a
-        // sender - the pid and uid, with the union at offset 24. These are the
-        // offsets the kernel's own `static_assert`s pin for arm64, and the ones
-        // x86_64 uses.
+        // A `siginfo_t`, rendered by `hal`'s one writer: signo, errno, code,
+        // and the union at offsets 16 and 24 - a sender's pid/uid/sigval, a
+        // child's status and CPU time, or a CPU fault's `si_addr`. These are
+        // the offsets the kernel's own `static_assert`s pin for arm64, and
+        // the ones x86_64 uses; `sigtimedwait` renders the same bytes.
         let info = &delivery.info;
-        out[SIGINFO..SIGINFO + 4].copy_from_slice(&info.signo.to_le_bytes());
-        out[SIGINFO + 4..SIGINFO + 8].copy_from_slice(&info.errno.to_le_bytes());
-        out[SIGINFO + 8..SIGINFO + 12].copy_from_slice(&info.code.to_le_bytes());
-        put_i32(out, SIGINFO + 16, info.pid);
-        put_i32(out, SIGINFO + 20, info.uid);
-        // Which union member that word is depends on the code's class, and the
-        // rule is `hal`'s: a child's death puts `si_status` there, every other
-        // sender the `sigval`.
-        if info.chld_union() {
-            put_i32(out, SIGINFO + 24, info.status);
-            // The rest of the `_sigchld` member: the child's CPU in `USER_HZ`
-            // ticks, `si_utime` at 32 and `si_stime` at 40 - the same offsets
-            // arm64's own `static_assert`s pin and x86_64 uses. The frame is
-            // zeroed before this runs, so a zero sender writes nothing.
-            put(out, SIGINFO + 32, info.utime);
-            put(out, SIGINFO + 40, info.stime);
-        } else {
-            put(out, SIGINFO + 24, info.value);
-        }
+        out[SIGINFO..SIGINFO + 128].copy_from_slice(&info.to_wire());
 
         // Enter the handler: the signal number in `x0`, the `siginfo_t` and the
         // `ucontext` in `x1`/`x2`, the restorer in `x30`, the unwind record in

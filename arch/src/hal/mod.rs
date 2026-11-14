@@ -503,7 +503,7 @@ pub trait FpuTrap: Contexts {
 
 /// The `siginfo_t` fields a handler's frame carries, in the shape the ABI layer
 /// holds them: the signal, the error, the code, the sender, and the `sigqueue`
-/// payload.
+/// payload, plus the fault address a synchronous CPU exception reports.
 ///
 /// A plain struct rather than `sched`'s `SigInfo`, because `hal` names no layer
 /// above it - the caller unpacks its own type into this one.
@@ -525,6 +525,21 @@ pub struct SignalInfo {
     /// machine's frame writer has one unit to write on both.
     pub utime: u64,
     pub stime: u64,
+    /// `si_addr`: the address a synchronous CPU exception names. On Linux
+    /// x86_64 and arm64 it is the **same eight bytes at offset 16** that a
+    /// sender's `si_pid`/`si_uid` occupy, so a fault record writes this word
+    /// there instead of those two fields. Measured on Linux 7.2.14 with a
+    /// null-store `SIGSEGV` handler: `+16` reads `0x10` (the faulting
+    /// address), `+8` reads `si_code = 1` (`SEGV_MAPERR`), and `+24..+48`
+    /// are zero (`build/scratch/siginfo/wire.c`).
+    pub addr: u64,
+    /// Whether this record is a CPU fault rather than a signal a sender sent.
+    /// The union class cannot be derived from [`code`](Self::code) alone:
+    /// `SEGV_MAPERR` is 1 and so is `CLD_EXITED`, so `(signo, code)` needs a
+    /// third fact to keep a fault record out of the `_sigchld` layout. Linux
+    /// picks the union member by the *origin* of the signal, and this is that
+    /// origin's one-bit answer in this kernel.
+    pub fault: bool,
 }
 
 impl SignalInfo {
@@ -537,8 +552,55 @@ impl SignalInfo {
     /// is negative. It lives here because both machines lay a frame out and
     /// the rule is neither machine's: two writers spelling `1..=6` themselves
     /// is how one of them comes to spell it `1..=5`.
+    ///
+    /// A CPU fault is the one record whose code can collide with the `CLD_*`
+    /// range while its union is **not** `_sigchld` at all: `SEGV_MAPERR` is 1,
+    /// the same number as `CLD_EXITED`, but its eight bytes at 16 are `si_addr`.
+    /// The origin bit is what separates them - `(signo, code)` cannot, because
+    /// a `clone(SIGTERM)` child's death is a genuine `_sigchld` record with a
+    /// `CLD_*` code and a `signo` that is not `SIGCHLD`. Before fault records
+    /// existed this predicate was latent-safe keyed on the code alone; now it
+    /// must answer the truth about its own name, so any caller - not only
+    /// [`to_wire`](Self::to_wire) - is told a fault is not a child.
     pub fn chld_union(&self) -> bool {
-        (1..=6).contains(&self.code)
+        !self.fault && (1..=6).contains(&self.code)
+    }
+
+    /// Render one whole `siginfo_t` (128 bytes) exactly as this kernel hands
+    /// it to userspace, whichever door asked: a handler's signal frame on
+    /// either machine, or `sigtimedwait`'s output buffer.
+    ///
+    /// Three writers used to spell the union themselves - two frame builders
+    /// and one syscall - and each new field was three chances to disagree.
+    /// This is the one writer now. For a sender-shaped record its bytes are
+    /// unchanged: signo/errno/code at 0/4/8, pid/uid at 16/20, then either the
+    /// child's status/utime/stime or the `sigval` at 24/32/40. For a fault
+    /// record the eight bytes at 16 are [`addr`](Self::addr) (Linux's
+    /// `si_addr`, measured above) and 24..48 stay zero; the machine-specific
+    /// `_sigfault` bits that follow (`si_addr_lsb`, `si_addr_bnd`, `si_pkey`)
+    /// remain a named gap.
+    pub fn to_wire(&self) -> [u8; 128] {
+        fn put(bytes: &mut [u8], at: usize, value: u64) {
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut wire = [0u8; 128];
+        wire[0..4].copy_from_slice(&self.signo.to_le_bytes());
+        wire[4..8].copy_from_slice(&self.errno.to_le_bytes());
+        wire[8..12].copy_from_slice(&self.code.to_le_bytes());
+        if self.fault {
+            put(&mut wire, 16, self.addr);
+        } else {
+            wire[16..20].copy_from_slice(&self.pid.to_le_bytes());
+            wire[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            if self.chld_union() {
+                wire[24..28].copy_from_slice(&self.status.to_le_bytes());
+                put(&mut wire, 32, self.utime);
+                put(&mut wire, 40, self.stime);
+            } else {
+                put(&mut wire, 24, self.value);
+            }
+        }
+        wire
     }
 }
 

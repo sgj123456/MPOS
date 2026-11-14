@@ -119,6 +119,8 @@ fn build_frame_at(
             status: info.status,
             utime: info.utime,
             stime: info.stime,
+            addr: info.addr,
+            fault: info.fault,
         },
         alt: alt.map(|stack| (stack.sp, stack.size)),
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
@@ -3529,14 +3531,12 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                 // timer working and a program that hangs waiting for a
                 // timeout the kernel said it set.
                 //
-                // The `union` at offset 16 is written in the shape every
-                // sender here uses - `si_pid`/`si_uid` for a `kill`, and the
-                // word at 24 that its *class* selects: the `union sigval` for
-                // every sender that names one, and `si_status` for a child's
-                // death, which is the record a blocked `SIGCHLD` carries
-                // (`signal::SigInfo::child`). The class test is the same one
-                // the machines' frame writers use (`hal::SignalInfo::chld_union`),
-                // because it is one rule about one struct.
+                // The renderer owns the union at offset 16 now: a sender's
+                // `si_pid`/`si_uid`, or a CPU fault's `si_addr`, and the word
+                // at 24 that its class selects. Three writers spelling the
+                // layout themselves is how one of them comes to spell `1..=5`;
+                // `sigtimedwait` renders the same bytes a handler's frame does
+                // because they are the same record through a different door.
                 //
                 // A `SI_TIMER` record's `si_tid`/`si_overrun` slots (16 and 20)
                 // are left zero: no caller in this image reads them, and
@@ -3551,29 +3551,15 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                     status: record.status,
                     utime: record.utime,
                     stime: record.stime,
+                    addr: record.addr,
+                    fault: record.fault,
                 };
+                let bytes = wire.to_wire();
+                // SAFETY: `buffer_ok(info, SIGINFO_BYTES, false, from_user)`
+                // checked the whole 128-byte user buffer above, and `to_wire`
+                // answers exactly that many bytes.
                 unsafe {
-                    core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
-                    (info as *mut i32).write_unaligned(record.signo); // si_signo
-                    ((info + 4) as *mut i32).write_unaligned(record.errno); // si_errno
-                    ((info + 8) as *mut i32).write_unaligned(record.code); // si_code
-                    ((info + 16) as *mut i32).write_unaligned(record.pid); // si_pid
-                    ((info + 20) as *mut i32).write_unaligned(record.uid); // si_uid
-                    if wire.chld_union() {
-                        ((info + 24) as *mut i32).write_unaligned(record.status); // si_status
-                        // The child's CPU, the rest of the `_sigchld` member:
-                        // `si_utime`/`si_stime`, each an 8-byte `clock_t`, at
-                        // Linux's offsets 32 and 40. `sigtimedwait` renders the
-                        // same record a handler's frame does, so both must carry
-                        // them - the record is the sender's, the door is not.
-                        ((info + 32) as *mut u64).write_unaligned(record.utime); // si_utime
-                        ((info + 40) as *mut u64).write_unaligned(record.stime); // si_stime
-                    } else {
-                        // The `union sigval`, at the offset the `si_value` of a
-                        // queued signal lives in the ABI's layout - the same
-                        // word `sigqueue`'s handler reads.
-                        ((info + 24) as *mut u64).write_unaligned(record.value);
-                    }
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), info as *mut u8, SIGINFO_BYTES);
                 }
             }
             return sig as isize;

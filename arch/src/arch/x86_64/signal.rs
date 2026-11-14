@@ -106,11 +106,6 @@ fn put(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-/// A little-endian 32-bit field, for the `siginfo_t`'s pid and uid.
-fn put_i32(bytes: &mut [u8], at: usize, value: i32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
 /// The inverse of [`put`].
 fn get(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
@@ -261,31 +256,13 @@ impl SignalFrame for Current {
             }
         }
 
-        // A `siginfo_t`: signo, errno, code, and - for a signal that names a
-        // sender - the pid and uid, with the union at offset 24. The offsets
+        // A `siginfo_t`, rendered by `hal`'s one writer: signo, errno, code,
+        // and the union at offsets 16 and 24 - a sender's pid/uid/sigval, a
+        // child's status and CPU time, or a CPU fault's `si_addr`. The offsets
         // are Linux x86_64's, so a handler written against `<signal.h>` reads
-        // the right fields.
+        // the right fields; `sigtimedwait` renders the same bytes.
         let info = &delivery.info;
-        out[SIGINFO..SIGINFO + 4].copy_from_slice(&info.signo.to_le_bytes());
-        out[SIGINFO + 4..SIGINFO + 8].copy_from_slice(&info.errno.to_le_bytes());
-        out[SIGINFO + 8..SIGINFO + 12].copy_from_slice(&info.code.to_le_bytes());
-        put_i32(out, SIGINFO + 16, info.pid);
-        put_i32(out, SIGINFO + 20, info.uid);
-        // Which union member that word is depends on the code's class, and the
-        // rule is `hal`'s - a child's death puts `si_status` there, every other
-        // sender puts the `sigval`.
-        if info.chld_union() {
-            put_i32(out, SIGINFO + 24, info.status);
-            // And the rest of the `_sigchld` member: the child's CPU in
-            // `USER_HZ` ticks, `si_utime` at offset 32 and `si_stime` at 40 -
-            // Linux x86_64's own offsets, where the 8-byte `clock_t`s sit after
-            // the 4-byte status. The frame buffer is zeroed before this runs, so
-            // a record whose sender left them zero writes nothing here.
-            put(out, SIGINFO + 32, info.utime);
-            put(out, SIGINFO + 40, info.stime);
-        } else {
-            put(out, SIGINFO + 24, info.value);
-        }
+        out[SIGINFO..SIGINFO + 128].copy_from_slice(&info.to_wire());
 
         // Enter the handler with the three arguments the ABI gives it: the
         // signal number, a `siginfo_t`, and the `ucontext` to hand back. The

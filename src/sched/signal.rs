@@ -582,6 +582,15 @@ pub struct SigInfo {
     /// same unit; the conversion is `crate::abi::clock_ticks_to_user_hz`.
     pub utime: u64,
     pub stime: u64,
+    /// `si_addr`: the faulting address a synchronous CPU exception names, at
+    /// the same wire offset 16 as a sender's `si_pid`/`si_uid`. Zero for a
+    /// signal a sender sent. See [`crate::hal::SignalInfo::addr`].
+    pub addr: u64,
+    /// Whether a CPU fault produced this record rather than a sender. The
+    /// union renderer needs this because `SEGV_MAPERR` (1) and `CLD_EXITED`
+    /// (1) share a code: `(signo, code)` alone cannot tell the two layouts
+    /// apart, but the signal's origin can.
+    pub fault: bool,
 }
 
 impl SigInfo {
@@ -596,6 +605,8 @@ impl SigInfo {
         status: 0,
         utime: 0,
         stime: 0,
+        addr: 0,
+        fault: false,
     };
 
     /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
@@ -610,6 +621,8 @@ impl SigInfo {
             status: 0,
             utime: 0,
             stime: 0,
+            addr: 0,
+            fault: false,
         }
     }
 
@@ -625,6 +638,8 @@ impl SigInfo {
             status: 0,
             utime: 0,
             stime: 0,
+            addr: 0,
+            fault: false,
         }
     }
 
@@ -647,6 +662,8 @@ impl SigInfo {
             status: 0,
             utime: 0,
             stime: 0,
+            addr: 0,
+            fault: false,
         }
     }
 
@@ -662,6 +679,8 @@ impl SigInfo {
             status: 0,
             utime: 0,
             stime: 0,
+            addr: 0,
+            fault: false,
         }
     }
 
@@ -677,6 +696,8 @@ impl SigInfo {
             status: 0,
             utime: 0,
             stime: 0,
+            addr: 0,
+            fault: false,
         }
     }
 
@@ -739,6 +760,8 @@ impl SigInfo {
             status,
             utime,
             stime,
+            addr: 0,
+            fault: false,
         }
     }
 }
