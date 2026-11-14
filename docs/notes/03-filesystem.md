@@ -2019,6 +2019,16 @@ ceiling bites: the second descriptor is EMFILE`, and `the queue ceiling can be m
 The three reads and the two `EINVAL` refusals stayed green, which is what makes the other four the
 claims that measure policy rather than reporting.
 
+**The gate.** `build/gate-inolimits2.log`, exit 0: stage 1 `1322 host unit tests, 0 failed`
+(56.96 s); x86_64 `pass=315 fail=0` with `mpos-kunit 35 passed, 0 failed`; aarch64 `pass=314 fail=0`
+with the same 35/0; lint ratcheted, both workspaces rustfmt's shape, the fuzz workspace's 23 targets
+built; `t-inotify-limits` 0 ms on x86_64 and 203 ms on aarch64. The sweep before it
+(`build/gate-inolimits.log`) reddened the x86_64 lane on one claim - "the lowered ceiling bites:
+two watches taken, the third is ENOSPC" - because the cap is whole-system and that lane's earlier
+programs already held watches, so the *first* add was the refused one. The claim now says "at most
+two taken, then `ENOSPC`", which holds either way and still separates a ceiling that bites from a
+stub (`build/scratch/oneshot-inolimits-cf.log`'s four reds are unchanged).
+
 **What this does not do.** `max_queued_events`' cap is enforced per descriptor, which is Linux's own
 shape; nothing else under `/proc/sys/fs/inotify` exists in Linux either. The per-user watch
 accounting above stays a named gap.

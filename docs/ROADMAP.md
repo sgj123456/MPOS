@@ -2725,4 +2725,5 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   directory with a shared `sysctl_count` parse. Pinned by 14 claims in `t-inotify-limits` (host 6,
   guest 14) with a four-red counterfactual; the ceilings are counted whole-system (Linux counts them
   per user, which is the same figure with one user) and the pin's claim says "at most two taken" for
-  that reason (§3.30, item 275).
+  that reason. Gate `build/gate-inolimits2.log` exit 0: stage 1 1322, x86_64 `pass=315`, aarch64
+  `pass=314`, kunit 35/0 per arm (§3.30, item 275).

@@ -12366,6 +12366,11 @@ refusal an unprivileged writer sees); counterfactual with the accessors answered
 and the setters made no-ops: exactly four red - the two bites, "root can lower", and "the queue
 ceiling can be moved and put back" - while the three reads and the two `EINVAL`s stayed green.
 
+Gate `build/gate-inolimits2.log`, exit 0: stage 1 1322 host tests 0 failed, x86_64 `pass=315`,
+aarch64 `pass=314`, `mpos-kunit 35 passed, 0 failed` per arm. The sweep before it reddened one
+x86_64 claim because the cap is whole-system and that lane already held watches; the claim now says
+"at most two taken, then `ENOSPC`".
+
 **What this does not do.** The ceiling is the *system's* rather than a user's: Linux counts per
 user, this kernel whole-system (one `REGISTRY`, one `LIVE_INSTANCES`), which is the same figure with
 one user - but it also means a program that lowers the ceiling lowers it for everyone, and a lane's
