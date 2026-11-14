@@ -40,6 +40,23 @@ pub const SIGKILL: u8 = 9;
 /// Fatal by default - a session that wants to keep its display must install a
 /// handler, which is the agreement `VT_SETMODE` makes.
 pub const SIGUSR1: u8 = 10;
+/// An instruction the CPU cannot execute: x86_64's `#UD` (`ud2`), and a64's
+/// undefined-instruction exception. Measured on Linux 7.2.14
+/// (`build/scratch/trapsig/w.c`): a child that executes `ud2` with no handler
+/// dies `WIFSIGNALED`/`WTERMSIG=4`, and a `SA_SIGINFO` handler reads
+/// `si_code=2` (`ILL_ILLOPN`).
+pub const SIGILL: u8 = 4;
+/// A bad memory alignment or a bus error: x86_64's `#AC`. Measured on Linux
+/// 7.2.14 (`build/scratch/trapsig/ac.c`): setting EFLAGS.AC from ring 3 and
+/// loading an odd address dies `WTERMSIG=7` (the same unaligned load with AC
+/// clear exits normally), so the vector's signal is neither `SIGSEGV` nor a
+/// guess.
+pub const SIGBUS: u8 = 7;
+/// An arithmetic exception: x86_64's `#DE` (integer divide by zero), and the
+/// aarch64 FP traps this kernel does not enable. Measured on Linux 7.2.14
+/// (`build/scratch/trapsig/w.c`): a `div` by zero dies `WTERMSIG=8`, and a
+/// handler reads `si_code=1` (`FPE_INTDIV`).
+pub const SIGFPE: u8 = 8;
 /// A bad memory reference. Userspace reaches it through the machine's own fault
 /// handlers, which is why this list did not need the number for a long time -
 /// but the kernel raises it too, for the one case where *it* decides a task's
@@ -430,6 +447,40 @@ pub fn default_action(sig: u8) -> DefaultAction {
 /// Whether `sig`'s default action is to stop the task.
 pub fn stops_by_default(sig: u8) -> bool {
     default_action(sig) == DefaultAction::Stop
+}
+
+/// The signal a synchronous x86_64 CPU exception ends a process with.
+///
+/// A CPU exception is not one event with one answer: Linux 7.2.14 measured
+/// (`build/scratch/trapsig/w.c`, `ac.c`, `g.c`) ends a child with `SIGFPE` for
+/// `#DE` (integer divide by zero), `SIGTRAP` for `#BP` (`int3`), `SIGILL` for
+/// `#UD` (`ud2`), `SIGBUS` for `#AC` (EFLAGS.AC set from ring 3, then an
+/// unaligned load), and `SIGSEGV` for `#GP` (`hlt`, `mov %cr0`) and `#PF`.
+/// A parent's `wait` reads that number back through `WTERMSIG`, and a program
+/// that installs a handler for one of them must not be told a different one
+/// died - so the vector, not the trap door, decides it.
+///
+/// The map lives here rather than in a machine file because it is kernel
+/// policy over the ABI's signal numbers: `arch/` declares `mpos-abi` as no
+/// dependency of its own, and the machine layer reaches the answer through
+/// `hal::kernel::signal_for_trap` so it keeps no second copy of the table.
+/// Unknown vectors answer `SIGSEGV`: every vector this kernel installs is
+/// listed, and a fault path that could fail to name a signal would be worse
+/// than one that reports a memory fault for a trap it does not know.
+///
+/// A synchronous *fault* is not a `#PF`: the page-fault path keeps its own
+/// `SIGSEGV` because its resolvers decide whether the address was the
+/// process's before any signal is raised (`docs/notes/` §6.159). Vector 14
+/// is deliberately absent from the match below: a `#PF` never reaches this
+/// door.
+pub fn signal_for_trap(vector: u8) -> u8 {
+    match vector {
+        0 => SIGFPE,  // #DE divide error
+        3 => SIGTRAP, // #BP breakpoint (`int3`)
+        6 => SIGILL,  // #UD invalid opcode
+        17 => SIGBUS, // #AC alignment check
+        _ => SIGSEGV, // #SS, #NP, #GP and every vector we do not install
+    }
 }
 
 /// Whether a signal with **no handler** and **nothing blocking it** would be
@@ -892,7 +943,10 @@ mod tests {
         // These are the traditional values; the libc will bind them as is.
         assert_eq!(SIGINT, 2);
         assert_eq!(SIGQUIT, 3);
+        assert_eq!(SIGILL, 4);
         assert_eq!(SIGTRAP, 5);
+        assert_eq!(SIGBUS, 7);
+        assert_eq!(SIGFPE, 8);
         assert_eq!(SIGKILL, 9);
         assert_eq!(SIGUSR1, 10);
         assert_eq!(SIGUSR2, 12);
@@ -904,6 +958,26 @@ mod tests {
         assert_eq!(SIGTSTP, 20);
         assert_eq!(SIGURG, 23);
         assert_eq!(SIGWINCH, 28);
+    }
+
+    /// The counterfactual for a trap door that queues `SIGSEGV` for every
+    /// vector: each measured Linux verdict is its own signal, and the two
+    /// protection vectors beside them stay `SIGSEGV` rather than inheriting a
+    /// neighbour's answer.
+    #[test]
+    fn a_trap_vector_ends_the_process_with_its_own_signal() {
+        assert_eq!(signal_for_trap(0), SIGFPE); // #DE: div by zero
+        assert_eq!(signal_for_trap(3), SIGTRAP); // #BP: int3
+        assert_eq!(signal_for_trap(6), SIGILL); // #UD: ud2
+        assert_eq!(signal_for_trap(17), SIGBUS); // #AC: unaligned load
+        assert_eq!(signal_for_trap(11), SIGSEGV); // #NP
+        assert_eq!(signal_for_trap(12), SIGSEGV); // #SS
+        assert_eq!(signal_for_trap(13), SIGSEGV); // #GP: hlt
+        assert_eq!(signal_for_trap(2), SIGSEGV); // no IDT entry: still total
+        assert_eq!(signal_for_trap(255), SIGSEGV);
+        // A trap is not a page fault. The #PF door is a separate path whose
+        // resolvers decide the address's meaning before it signals.
+        assert_ne!(signal_for_trap(0), signal_for_trap(14));
     }
 
     /// `signal(7)`: the default action of a signal with no handler is what

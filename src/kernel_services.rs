@@ -119,6 +119,12 @@ impl Kernel for Services {
         console::print_args(format_args!("{line}\n"));
     }
 
+    fn signal_for_trap(&self, vector: u8) -> u8 {
+        // The vocabulary owns the table, not this impl: the numbers are ABI
+        // facts a host unit test pins, and the machine only asks the seam.
+        sched::signal::signal_for_trap(vector)
+    }
+
     fn current_stack_range(&self) -> Option<(usize, usize)> {
         sched::current_stack_range()
     }

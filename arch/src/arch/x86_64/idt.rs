@@ -21,6 +21,7 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use spin::Once;
+use x86_64::PrivilegeLevel;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -67,7 +68,10 @@ pub fn init() {
         let mut table = InterruptDescriptorTable::new();
 
         table.divide_error.set_handler_fn(divide_error);
-        table.breakpoint.set_handler_fn(breakpoint);
+        table
+            .breakpoint
+            .set_handler_fn(breakpoint)
+            .set_privilege_level(PrivilegeLevel::Ring3);
         table.invalid_opcode.set_handler_fn(invalid_opcode);
         // The one vector that gets a stack of its own, and it is not a
         // tidiness. Every other fault pushes its frame on the stack it just found
@@ -405,8 +409,26 @@ extern "x86-interrupt" fn virtio_net(_frame: InterruptStackFrame) {
     crate::hal::kernel::preempt();
 }
 
-/// Deliberately reachable from tests: `int3` must return here, not panic.
+/// `#BP` has two callers and they are not the same event.
+///
+/// The boot's own check executes `int3` in **ring 0** (`src/board/suites.rs`),
+/// and counts on returning from this handler with the counter moved: that is a
+/// kernel probe, not a process's trap, and it must stay a no-op with a print.
+///
+/// A ring-3 `int3` is a program's breakpoint instruction and Linux answers it
+/// with `SIGTRAP`. The gate's DPL is 3 now (`init`), so the instruction reaches
+/// this handler at all - with DPL 0 the CPU refused the software interrupt at
+/// the gate and raised `#GP(0x1a)`, whose `error` word names vector 3 as the
+/// one it could not deliver. Musl's `a_crash()` and chromium's padding are
+/// `int3` bytes, so that refusal turned an ordinary trap into a protection
+/// fault and sent the reader after a fault that never happened. Ring 3 goes
+/// down the same trap door as the other six vectors, with vector 3, and the
+/// kernel's map answers `SIGTRAP` for it (`docs/notes/` §6.159).
 extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
+    if (frame.instruction_pointer.as_u64() as usize) < (1 << 47) {
+        user_fault_or_die(&frame, 3, 0);
+        return;
+    }
     BREAKPOINTS_CAUGHT.fetch_add(1, Ordering::Relaxed);
     crate::hal::kernel::kprintln!("caught #BP at rip {:#x}", frame.instruction_pointer);
 }
@@ -1078,20 +1100,32 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
 /// rest are the process retrying the same instruction, which Linux logs too,
 /// rate limited, and which would otherwise bury the first one.
 ///
-/// What happens after the report is the same answer the `#PF` path gives, and
-/// for the same reason: a signal queued here is delivered at a *syscall*
-/// boundary, and a faulting instruction never reaches one, so returning to it
-/// only faults again. A default disposition is therefore death here (with the
-/// signal number as the exit code), and a task that installed a handler is
-/// ended once it has faulted at the same instruction
-/// [`FAULT_REPEAT_LIMIT`] times - the handler cannot be entered from a trap
-/// frame either way, and a death with a reason beats a flood. `hlt` is the
-/// case that made this visible: it is musl's `a_crash()`, the instruction its
-/// allocator runs when it has found the heap corrupted, and a compositor that
-/// hits it used to spin instead of dying.
+/// What happens after the report is the vector's own signal, not one signal
+/// for the whole door. The map was measured one instruction at a time on
+/// Linux 7.2.14 (`docs/notes/` §6.159): `#DE` ends the child `SIGFPE`,
+/// `#UD` `SIGILL`, `#BP` `SIGTRAP`, `#AC` `SIGBUS`, and `#SS`/`#NP`/`#GP`
+/// `SIGSEGV`. A parent's `wait` reads that number back through `WTERMSIG`, so
+/// a door that answers `SIGSEGV` for a `ud2` is not a cosmetic difference -
+/// it tells the caller a different event happened. This door used to do
+/// exactly that, with `send_signal(11)` spelled as the only answer.
+///
+/// A signal queued here is delivered at a *syscall* boundary, and a faulting
+/// instruction never reaches one, so returning to it only faults again. A
+/// default disposition is therefore death here (with the signal number as the
+/// exit code), and a task that installed a handler is ended once it has
+/// faulted at the same instruction [`FAULT_REPEAT_LIMIT`] times - the
+/// handler cannot be entered from this trap frame either way, and a death with
+/// a reason beats a flood. That the **handler** cannot run at the trap is a
+/// named gap, not the signal's absence: §2.13 built the delivery door for the
+/// timer interrupt, whose hand-written stub preserves the general registers;
+/// these six entries are `x86-interrupt` handlers and have no such frame.
+/// `hlt` is the case that made this visible: it is musl's `a_crash()`, the
+/// instruction its allocator runs when it has found the heap corrupted, and a
+/// compositor that hits it used to spin instead of dying.
 fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool {
     let rip = frame.instruction_pointer.as_u64() as usize;
     if rip < (1 << 47) {
+        let sig = crate::hal::kernel::signal_for_trap(vector);
         if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
             // Only up to the end of the page the instruction is on: a read
             // past it would fault inside the handler, and a double fault
@@ -1113,17 +1147,17 @@ fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool
             frame.stack_pointer.as_u64() as usize,
             code as usize,
         );
-        crate::hal::kernel::send_signal(11); // SIGSEGV
-        if crate::hal::kernel::disposition_is_default(11) {
-            crate::hal::kernel::die_of_fatal_signal(11);
+        crate::hal::kernel::send_signal(sig);
+        if crate::hal::kernel::disposition_is_default(sig) {
+            crate::hal::kernel::die_of_fatal_signal(sig);
         }
         if fault_repeats(rip) {
             crate::hal::kernel::kprintln!(
-                "task {} died of SIGSEGV it could not be handed: trap {vector} code {code:#x} \
+                "task {} died of signal {sig} it could not be handed: trap {vector} code {code:#x} \
                  at {rip:#x}, the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
                 crate::hal::kernel::current()
             );
-            crate::hal::kernel::die_of_fatal_signal(11);
+            crate::hal::kernel::die_of_fatal_signal(sig);
         }
         crate::hal::kernel::preempt();
         return true;

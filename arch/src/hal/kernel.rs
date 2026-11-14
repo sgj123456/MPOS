@@ -126,6 +126,22 @@ pub trait Kernel: Sync {
     /// table.
     fn report_user_trap(&self, vector: u8, ip: usize, sp: usize, error: usize);
 
+    /// The signal a synchronous CPU exception ends a process with, given the
+    /// vector that took it.
+    ///
+    /// A trap door is not one event with one answer: Linux ends a child with
+    /// `SIGFPE` for `#DE`, `SIGTRAP` for `#BP`, `SIGILL` for `#UD`, `SIGBUS`
+    /// for `#AC` and `SIGSEGV` for `#GP`, all measured through `WTERMSIG` on
+    /// Linux 7.2.14 (`docs/notes/` §6.159). The six vectors share one handler
+    /// on x86_64 that used to answer `SIGSEGV` for every one of them, so a
+    /// process that executed `ud2` died of a bad memory reference and a parent
+    /// that waited for `SIGILL` was told a different signal happened.
+    ///
+    /// The answer is the kernel's policy over ABI signal numbers, so this seam
+    /// carries the *number* and the machine keeps no second copy of the table -
+    /// the same shape as [`report_user_trap`](Kernel::report_user_trap).
+    fn signal_for_trap(&self, vector: u8) -> u8;
+
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
 
@@ -618,6 +634,13 @@ pub fn report_user_fault(addr: usize, ip: usize, sp: usize, error: usize) {
 #[inline]
 pub fn report_user_trap(vector: u8, ip: usize, sp: usize, error: usize) {
     registered().report_user_trap(vector, ip, sp, error)
+}
+
+/// The signal a synchronous CPU exception ends a process with. See
+/// [`Kernel::signal_for_trap`].
+#[inline]
+pub fn signal_for_trap(vector: u8) -> u8 {
+    registered().signal_for_trap(vector)
 }
 
 /// The running task's `comm`. See [`Kernel::current_comm`].

@@ -205,6 +205,20 @@ pub fn enable_user_sse() {
         cr4 |= 1 << 9; // OSFXSR — enables SSE
         cr4 |= 1 << 10; // OSXMMEXCPT — enables unmasked SSE exceptions
         core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+        // `CR0.AM` is the *enable* behind EFLAGS.AC: without it a ring-3
+        // program can set AC (`popfq` is allowed at CPL 3, measured on this
+        // host) and an unaligned load still cannot raise #AC, so the vector
+        // 17 handler is unreachable and Linux's SIGBUS answer is a promise
+        // this machine could not keep. Linux sets it in its own per-CPU setup.
+        // The flag is bit 18 of CR0, here written through the raw register
+        // rather than `Cr0Flags::ALIGNMENT_MASK`: the loader hands us a CR0
+        // whose other bits (PE, PG, WP, NE, ET, MP, TS) it and the paging
+        // setup own, and this is one bit inserted into that word.
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1 << 18; // AM — alignment mask
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
     }
 }
 
