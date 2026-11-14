@@ -2713,4 +2713,5 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   canaries for both calls and the page-ending slot - green on both arms and red in exactly those
   three with the old store back. `setsid` measured too and correct. Chromium now reaches its own
   `CHECK` instead of a corrupted stack; the missing dbus and the node-less
-  `/proc/sys/fs/inotify/max_user_watches` are separate items (§6.156, item 274).
+  `/proc/sys/fs/inotify/max_user_watches` are separate items. Gate `build/gate-resid2.log` exit 0:
+  stage 1 1320, x86_64 `pass=314`, aarch64 `pass=313`, kunit 35/0 per arm (§6.156, item 274).

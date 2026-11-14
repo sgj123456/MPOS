@@ -14134,6 +14134,15 @@ answers exactly that. The crashpad line in the user's log did not come back afte
 next run chromium's own output held only the sandbox complaint (`Running as root without
 --no-sandbox is not supported`), so the `EPERM` was another face of the smashed stack, not a refusal.
 
+**The gate.** `build/gate-resid2.log`, exit 0: stage 1 `1320 host unit tests, 0 failed` (30.59 s);
+x86_64 `pass=314 fail=0` with `mpos-kunit 35 passed, 0 failed`; aarch64 `pass=313 fail=0` with the
+same 35/0; lint ratcheted, both workspaces rustfmt's shape, the fuzz workspace's 23 targets built;
+`t-posix` 61 ms on x86_64 and 218 ms on aarch64. The sweep before it (`build/gate-resid.log`) ran
+every user test green and then failed on `the kernel printed no mpos-kunit line` - because the
+loader still carried the production kernel this round had hand-embedded (its payload cached in
+`target/x86_64-unknown-uefi/release/build/mpos-boot` while the kernel's mtime looked unchanged, the
+AGENTS.md §5 trap); clearing that directory made the harness appear and the gate green.
+
 **What this does not do, named.** Chromium still does not *run* in the guest; with
 `--no-sandbox --headless=new` it now gets much further - it starts its threads, fails to reach dbus
 (absent from the image, and logged as an error by chromium itself), cannot read

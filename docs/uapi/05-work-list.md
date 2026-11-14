@@ -12334,6 +12334,11 @@ eight-byte store restored exactly those three red (`build/scratch/oneshot-resid-
 `setsid` was measured too and is not implicated: a non-leader child succeeds, a second call is
 `EPERM`, `setpgid(0,0)`-then-`setsid` is `EPERM`, a group leader is `EPERM` - Linux's answers.
 
+Gate `build/gate-resid2.log`, exit 0: stage 1 1320 host tests 0 failed, x86_64 `pass=314`,
+aarch64 `pass=313`, `mpos-kunit 35 passed, 0 failed` per arm; the sweep before it was red only
+because the loader still carried the hand-embedded production kernel (`build/gate-resid.log`,
+"the kernel printed no mpos-kunit line") - the payload cache AGENTS.md §5 records.
+
 **What this does not do.** Chromium still does not run: with `--no-sandbox --headless=new` it now
 starts, reports the missing dbus and the unreadable `/proc/sys/fs/inotify/max_user_watches` (a named
 gap: that sysctl node has no file here), and dies in its own `CHECK`/`IMMEDIATE_CRASH` path. Those
