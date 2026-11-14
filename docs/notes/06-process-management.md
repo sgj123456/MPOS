@@ -14422,3 +14422,143 @@ repository after the wrong fault twice.
    numbering, and a future caller may use it.
 3. **The aarch64 machine has no equivalent line**: its traps are `ESR_EL1` exceptions whose class
    names the reason directly, and it has no six-vector shared door, so nothing changed there.
+
+## §6.159 one signal for six traps became six signals: a synchronous x86_64 exception ends the process with its vector's own signal (item 279, LANDED 2026-11-14)
+
+### The observation
+
+Item 278 fixed the *name* in the `traps:` line and left the *verdict* alone. That was the next
+wrong shape this kernel shipped: `user_fault_or_die` in `arch/src/arch/x86_64/idt.rs` is one door
+for `#DE` (0), `#UD` (6), `#NP` (11), `#SS` (12), `#GP` (13) and `#AC` (17), and its body sent
+**`SIGSEGV` (11) for every one of them**. A parent that waited for a child after a division by zero
+was told the child had made a bad memory reference. A program that installed `SIGILL` and then ran
+`ud2` died of a signal it had not been sent. Exit status is ABI: `WTERMSIG` is what shells,
+ supervisors and crash handlers read.
+
+The seventh vector was worse. `#BP` (3) — the `int3` instruction, the `cc` padding around musl's
+`a_crash()` and chromium's `__builtin_trap()` — had its own handler but **a DPL-0 IDT gate**. The
+x86_64 crate's `set_handler_fn` installs a Ring-0 gate by default; software `int` from CPL 3 checks
+`CPL <= DPL`, so a plain breakpoint never reached the handler at all: the CPU raised `#GP` with
+error `0x1a`, whose IDT index (`0x1a >> 3 = 3`) literally names the vector it could not deliver.
+The kernel then reported a protection fault and killed the process with `SIGSEGV`. Measured in the
+guest (`build/scratch/int3/i.c`, static musl on the 9p share, `build/scratch/xt17.log`):
+`traps: i-musl[839] general protection fault ip:401277 sp:3fff0c20 error:1a` → `INT3_RC=139`.
+Setting the gate to Ring 3 alone (`build/scratch/xt18.log`) removed the `#GP` but left `int3`
+with **no signal at all** — the `breakpoint` handler only bumped a counter and printed, so the
+program carried on to its next instruction. Nearly-right twice; neither could ship.
+
+### The measurement, on the host first
+
+Linux 7.2.14, one instruction in a forked child per trial, read back through `wait4`'s
+`WTERMSIG` (`build/scratch/trapsig/w.c`, `g.c`, `ac.c`, `s.c`):
+
+| instruction | vector | `WTERMSIG` | with a handler, `si_code` |
+|---|---|---|---|
+| `int3` | `#BP` 3 | **5** `SIGTRAP` | 128 `SI_KERNEL` |
+| `ud2` | `#UD` 6 | **4** `SIGILL` | 2 `ILL_ILLOPN` |
+| `idiv` by zero | `#DE` 0 | **8** `SIGFPE` | 1 `FPE_INTDIV` |
+| unaligned dword load with `EFLAGS.AC` set | `#AC` 17 | **7** `SIGBUS` | — |
+| `hlt` at CPL 3, `mov cr0` | `#GP` 13 | **11** `SIGSEGV` | — |
+| null store | `#PF` 14 | **11** `SIGSEGV` | 1 `SEGV_MAPERR` |
+
+The `#AC` row needed a second measurement: a ring-3 program can set `EFLAGS.AC` with `pushfq;
+or [rsp], 0x40000; popfq`, but Linux only lets it bite with `CR0.AM` set. This kernel's
+`enable_user_sse()` set `CR0.EM`/`MP`/`TS` for x87/SSE and left `AM` clear — measured in the
+guest, the flag was set (`EFLAGS.AC after popfq = 262726 (bit18=1)`) and the unaligned load
+completed. QEMU's **TCG does not emulate alignment checking at all**: with `CR0.AM` set the load
+still completes under TCG, while under KVM the same binary raises `#AC`. Linux's row is
+unambiguous; the machine's ability to raise it is not.
+
+### The change
+
+1. `src/sched/signal.rs` owns `signal_for_trap(vector) -> u8`, a host-compiled table beside the
+   signal constants (the arch crate has no `mpos-abi` dependency, so the map sits in the
+   vocabulary module and is reached through the same seam item 278 used):
+   `0 => SIGFPE`, `3 => SIGTRAP`, `6 => SIGILL`, `17 => SIGBUS`, `_ => SIGSEGV`. Vector 14 is
+   deliberately absent: `#PF` has its own handler, whose resolvers decide whether the address
+   was the process's before any signal is raised. `SIGILL`/`SIGBUS`/`SIGFPE` are now named
+   constants in that module and pinned in `numbers_are_pinned`.
+2. `arch/src/hal/kernel.rs` gains `Kernel::signal_for_trap(vector)` and its forwarder;
+   `src/kernel_services.rs` answers it from the table. `user_fault_or_die` now asks
+   `let sig = hal::kernel::signal_for_trap(vector)` and uses that same `sig` for `send_signal`,
+   `disposition_is_default`, both `die_of_fatal_signal` calls and the repeat-death line. One
+   verdict, one variable — a second hard-coded `11` anywhere would be a new bug.
+3. The `#BP` gate is installed with `.set_privilege_level(PrivilegeLevel::Ring3)`. Its handler
+   routes a user `rip` through `user_fault_or_die(&frame, 3, 0)`, while ring 0 keeps the
+   counter and the print — the boot's own `int3` self-test (`src/board/suites.rs`) asserts the
+   counter still moves, and must not be killed.
+4. `enable_user_sse()` sets `CR0.AM` too, with the measurement above in the doc comment.
+5. `#PF` is unchanged: `page_fault` still sends `SIGSEGV` on its own path.
+
+The stale paragraph above `user_fault_or_die` that claimed a signal queued here can only be
+delivered at a syscall boundary was rewritten. §2.13 *did* build a trap-time delivery door
+(`deliver_at_trap`), but it is wired only to the hand-written PIT `timer_stub`, the one entry
+that preserves all GPRs; the six `x86-interrupt` entries have no such frame. **A handler for one
+of these signals is still not entered at the trap** — the signal is queued, a default disposition
+dies with the right number, and a task with a handler is ended after `FAULT_REPEAT_LIMIT` repeats
+of the same instruction. That is a named gap, not a design presented as complete.
+
+### The pins
+
+- `src/sched/signal.rs::a_trap_vector_ends_the_process_with_its_own_signal` (host unit test) pins
+  all eight rows of the map and asserts `#DE` and `#PF` are not the same answer.
+  `numbers_are_pinned` asserts the three new constants.
+- `user/tests/src/bin/t-trap-signal.rs` (x86_64 claims only; in `[aarch64] gaps`, see below):
+  `int3` → `SIGTRAP`, `ud2` → `SIGILL`, `idiv` by zero → `SIGFPE`, `hlt` → `SIGSEGV`, null store
+  → `SIGSEGV`, unaligned load → `SIGBUS`. `hlt` and the null store are the controls: a map that
+  changed *every* vector's answer, or that routed `#PF` through the trap door, reddens them.
+  Every fault runs in a forked child and is read through `wait4` (`libc`'s raw call is the
+  crate's clause (b): no wrapper names the wait-status word). Host `MPOS_ON_HOST=1` → PASS;
+  guest `build/scratch/oneshot-trapsignal.log` → PASS, with `traps: … breakpoint / invalid
+  opcode / divide error / general protection fault / alignment check` each naming its vector.
+  The `#AC` claim is accelerator-tolerant: under TCG the program prints a `note:` that the
+  machine cannot raise `#AC` instead of pretending the claim was tested, and the host unit test
+  pins that row unconditionally. The gate's x86_64 arm runs under KVM here, so the row is read.
+
+### The counterfactual
+
+The five changed kernel files were saved to `build/scratch/*.trapfix`, the map replaced with
+`match vector { _ => SIGSEGV }`, the breakpoint gate put back to DPL 0, and the kernel + loader
+rebuilt (payload cache cleared). Guest one-shot `build/scratch/oneshot-trapsignal-cf.log`:
+**FAILED**, five red claims — `int3 ends the child with SIGTRAP`, `ud2 ends the child with
+SIGILL`, `idiv by zero (#DE): the child died of a signal`, `an integer divide by zero ends the
+child with SIGFPE`, `an alignment-check exception ends the child with SIGBUS`. The two
+`SIGSEGV` controls stayed green, which is the point of writing them. All five files restored
+byte-identically (sha256), rebuilt, guest PASS again
+(`build/scratch/oneshot-trapsignal-restore.log`).
+
+### Gate
+
+`build/gate-trapsignal-final.log`, exit 0: stage 1 **1327** host tests, 0 failed (30.27 s); x86_64
+`verdict pass=318 fail=0`; aarch64 `verdict pass=316 fail=0` (`t-trap-signal` built there and
+correctly left out as a named gap); `mpos-kunit 38 passed, 0 failed` on each arm; lint ratcheted
+(`162/162`, `168/168`, `389/389`, `273/273`, `3/3`, `1/1`), both workspaces formatted, fuzz 23
+targets. `t-trap-signal` is `=== PASS` in `build/test-lane-x86_64-1/serial.log` of the final run.
+The first run (`build/gate-trapsignal.log`, 57.46 s) was green too and taught one small thing: an
+unguarded `use mpos_user_tests::Report;` is an unused import on the aarch64 build, so the import is
+`#[cfg(target_arch = "x86_64")]`; the final gate is the clean one.
+
+### What this does not do, named
+
+1. **A handler is still not entered at the trap.** The vector's signal is queued and the death
+   carries its number; §2.13's `deliver_at_trap` is only on the PIT stub. A process that installs
+   `SIGILL`/`SIGFPE`/`SIGTRAP` and then faults still dies after three repeats. Trap-time handler
+   delivery for these six vectors needs a GPR-preserving stub per vector (with and without an
+   error code on the stack), the same shape §2.13 built for the timer.
+2. **aarch64 has no per-class signal map.** Its `el0_sync` decodes `ESR_EL1`, and every refused
+   EL0 fault ends in `die_of_fatal_signal(11)` with no disposition check, no queued signal and
+   no `brk`/undefined-instruction class decoding; only `EC_SYS64` has a distinct `SIGILL` death.
+   `t-trap-signal` therefore joins `[aarch64] gaps` (it builds there and says "skipped"). The
+   work is: decode the `ESR` classes (`BRK`, undef, FP, data/instruction abort `DFSC`), queue the
+   class's signal through `send_signal`, and call the *existing* `deliver_at_trap` on the EL0
+   sync frame, which already has the full `UserFrame`.
+3. **`siginfo_t` still carries no fault address.** `SigInfo` and `SignalInfo` have no `addr`
+   field; `send_signal` produces `SigInfo::user` (`SI_USER`), and a guest `SA_SIGINFO` handler
+   for a null store read `si_code=0` and a garbage `si_addr` where Linux answers
+   `SEGV_MAPERR` and the fault address. `si_code` per trap (`ILL_ILLOPN`, `FPE_INTDIV`,
+   `TRAP_BRKPT`, `BUS_ADRERR`) is likewise absent. Changing the signal *number* was the
+   question this item answered; the payload is its own measured item.
+4. **Chromium is not unblocked by this.** The `cc 0f 0b` bytes at its crash site are an
+   intentional `__builtin_trap()` after an earlier logical failure; it is *trying* to die. Its
+   remaining causes are the dbus-less image and the parked-fault race (`libcrc32c`/`libdbus-1`
+   instruction-fetch `#PF` on a table-present page, §6.153's open question).

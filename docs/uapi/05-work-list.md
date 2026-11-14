@@ -12467,3 +12467,50 @@ display suite's, this harness having no display).
 line, so no ABI depends on it. `#PF` has its own handler and is in the table only because the
 numbering is shared. Nothing on aarch64 changed — its traps carry `ESR_EL1`, whose class names the
 reason, and it has no six-vector door.
+
+**Item 279**, landed 2026-11-14.
+
+### Item 279 a synchronous x86_64 exception ends the process with its vector's own signal
+
+`user_fault_or_die` is one IDT door for `#DE`, `#UD`, `#NP`, `#SS`, `#GP` and `#AC`, and it sent
+`SIGSEGV` for all six. Exit status is ABI: a parent waiting after `ud2` was told a bad memory
+reference had happened. `#BP` was worse - its DPL-0 gate refused a ring-3 `int3` and raised
+`#GP(0x1a)`, an error word whose index names vector 3 as the one it could not deliver.
+
+| instruction | vector | before | now (Linux's `WTERMSIG`) |
+|---|---|---|---|
+| `int3` | `#BP` 3 | `#GP` → `SIGSEGV` | `SIGTRAP` (5) |
+| `ud2` | `#UD` 6 | `SIGSEGV` | `SIGILL` (4) |
+| `idiv` by zero | `#DE` 0 | `SIGSEGV` | `SIGFPE` (8) |
+| unaligned load, `EFLAGS.AC` set | `#AC` 17 | `SIGSEGV` (and never raised) | `SIGBUS` (7) |
+| `hlt` at CPL 3 | `#GP` 13 | `SIGSEGV` | `SIGSEGV` (control) |
+| null store | `#PF` 14 | `SIGSEGV` | `SIGSEGV` (separate path, unchanged) |
+
+Measured on Linux 7.2.14 first (`build/scratch/trapsig/{w,g,ac,s}.c`, one forked child per
+instruction, `wait4`'s status word). The map `src/sched/signal.rs::signal_for_trap` is
+host-compiled (the arch crate has no `mpos-abi` dep) and reached through a new
+`Kernel::signal_for_trap(vector)` seam; `user_fault_or_die` uses that one `sig` for the send, the
+disposition check, both deaths and the log line. The `#BP` gate is Ring 3 and its handler routes a
+user `rip` through the same door while ring 0 keeps the boot self-test's counter; `#PF` keeps its
+own `SIGSEGV`. `enable_user_sse()` sets `CR0.AM` as Linux does - without it `EFLAGS.AC` is set but
+the CPU never raises `#AC`. QEMU TCG does not emulate alignment checking at all, so that one claim
+is accelerator-tolerant (a `note:` under TCG; the host unit test pins the row unconditionally).
+
+Pins: host unit test `a_trap_vector_ends_the_process_with_its_own_signal` (all eight map rows,
+`#DE != #PF`), `numbers_are_pinned` for the three new constants, and `t-trap-signal` (x86_64, six
+instructions in forked children, `hlt` + null store as controls, `MPOS_ON_HOST=1` PASS). It is in
+`[aarch64] gaps`: that machine's `ESR` → signal decoding is a named gap, and the program builds
+there and says "skipped". Counterfactual (map → all `SIGSEGV`, gate → DPL 0) reddens five claims
+and leaves the two `SIGSEGV` controls green; the five kernel files were restored byte-identically.
+
+**Gate** `build/gate-trapsignal-final.log` exit 0: stage 1 **1327** host tests, 0 failed (30.27 s);
+x86_64 `pass=318 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit 38 passed, 0 failed` per arm;
+lint ratcheted, both workspaces formatted, fuzz 23 targets; `t-trap-signal` `=== PASS` on x86_64.
+**What this does not do.** A handler for one of these signals is still not entered *at the trap*
+(§2.13's `deliver_at_trap` is only on the PIT stub; a task with a handler dies after three repeats)
+- that needs a GPR-preserving stub per vector, error-code-aware. aarch64 has no per-class signal
+map (`el0_sync` ends every refused EL0 fault in `die_of_fatal_signal(11)`). `siginfo_t` still has
+no `si_addr` and no per-trap `si_code` (`SigInfo`/`SignalInfo` have no address field; `send_signal`
+produces `SI_USER`) - measured in the guest as `si_code=0` and a garbage address where Linux
+answers `SEGV_MAPERR` and the fault address. Chromium is not unblocked: its `cc 0f 0b` bytes are
+an intentional `__builtin_trap()` after an earlier logical failure.
