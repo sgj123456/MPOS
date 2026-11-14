@@ -2721,6 +2721,30 @@ impl Table {
             })
             .collect();
 
+        // Priority-inheritance futex words this batch still holds. A task that
+        // dies holding one owes its waiters an answer, and the words live in
+        // its memory: this runs before the loop below frees any of it. The
+        // words are stored through the same ring-0 writer `write_clear_tid`
+        // uses, then the waiters are woken once the table is free again.
+        let mut pi_words: alloc::vec::Vec<(TaskId, usize, u32)> = alloc::vec::Vec::new();
+        let mut pi_wake: alloc::vec::Vec<TaskId> = alloc::vec::Vec::new();
+        for (slot, _) in &due {
+            let id = crate::sched::policy::TaskId(*slot);
+            let mut words = alloc::vec::Vec::new();
+            let mut wake = alloc::vec::Vec::new();
+            crate::sched::futex::release_pi(id, &mut words, &mut wake);
+            for (address, word) in words {
+                pi_words.push((id, address, word));
+            }
+            pi_wake.extend(wake);
+        }
+        for (owner, address, word) in pi_words {
+            self.write_pi_word(owner, address, word);
+        }
+        for task in pi_wake {
+            crate::sched::wake(task);
+        }
+
         // The words the leaving threads named, written after the loop rather
         // than inside it: the write reaches into the leader's task, and the
         // loop already holds a mutable borrow of the table.
@@ -2828,6 +2852,30 @@ impl Table {
             populate_in(self, root, address, true, false);
         }
         crate::hal::write_user_u32(root, address, 0);
+    }
+
+    /// Store a priority-inheritance futex word in a task's memory.
+    ///
+    /// The same three steps as [`write_clear_tid`](Self::write_clear_tid) and
+    /// for the same reasons: a copy-on-write page is copied first (this store
+    /// is ring 0, where a fault is a panic), a page nobody has touched is
+    /// brought in through the table this call already holds, and only then is
+    /// the word written.
+    pub(crate) fn write_pi_word(&mut self, owner: TaskId, address: usize, word: u32) {
+        let Some(task) = self.tasks[owner.0].as_ref() else {
+            return;
+        };
+        let mm = task.mm.clone();
+        let Some(root) = task.space.as_ref().map(|space| space.root()) else {
+            return;
+        };
+        if let Some(space) = self.tasks[owner.0].as_mut().and_then(|t| t.space.as_mut()) {
+            split_cow(space, &mm, address);
+        }
+        if hal::phys_for_virt_of(root, address).is_none() {
+            populate_in(self, root, address, true, false);
+        }
+        crate::hal::write_user_u32(root, address, word);
     }
 
     /// Which task owns the address space a group runs on. A process owns its

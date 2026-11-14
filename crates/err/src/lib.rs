@@ -92,6 +92,16 @@ pub const EDOM: isize = -33;
 pub const EPIPE: isize = -32;
 pub const ENOSYS: isize = -38;
 pub const EPERM: isize = -1;
+/// EDEADLK: the call would deadlock its own caller - a thread asking for a
+/// mutex it already holds. A priority-inheritance futex answers this on the
+/// recursive `FUTEX_LOCK_PI`/`FUTEX_TRYLOCK_PI` (measured on a current host:
+/// both answer `EDEADLK`, `docs/notes/` §4.5).
+pub const EDEADLK: isize = -35;
+/// EOWNERDEAD: the previous owner of a robust mutex died holding it, and the
+/// caller now owns a mutex whose protected state may be inconsistent. It is
+/// not a failure - the lock *was* taken - which is why it travels beside a
+/// zero-length success rather than in place of the call.
+pub const EOWNERDEAD: isize = -130;
 /// EIDRM: the object a System V call named has been removed, and this is the
 /// answer to a caller that was already waiting on it. A `semop` asleep on a set
 /// another process `IPC_RMID`s wakes with this (measured on a current host,

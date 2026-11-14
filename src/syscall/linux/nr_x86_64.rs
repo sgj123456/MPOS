@@ -145,6 +145,11 @@ pub const FUTEX: u64 = 202;
 /// has exactly one.
 pub const FUTEX_WAIT: usize = 0;
 pub const FUTEX_WAKE: usize = 1;
+/// The priority-inheritance trio. The number is the same on both machines:
+/// the futex operations are a table, not a per-architecture ABI.
+pub const FUTEX_LOCK_PI: usize = 6;
+pub const FUTEX_UNLOCK_PI: usize = 7;
+pub const FUTEX_TRYLOCK_PI: usize = 8;
 pub const FUTEX_WAIT_BITSET: usize = 9;
 pub const FUTEX_WAKE_BITSET: usize = 10;
 pub const FUTEX_PRIVATE_FLAG: usize = 128;

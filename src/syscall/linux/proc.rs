@@ -5351,6 +5351,40 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
             }
             crate::sched::futex::wake_bitset(uaddr, val, val3 as u32) as isize
         }
+        // The priority-inheritance trio. The word carries the owner's task id
+        // and the two bits above it, and the operations are Linux's measured
+        // answers (`build/scratch/pifutex/probe.c`): a free word is taken and
+        // reads back the taker's id, the taker's own repeat is `EDEADLK`, a
+        // stranger's `UNLOCK_PI` is `EPERM`, and a `FUTEX_CLOCK_REALTIME`
+        // request is `ENOSYS` because these operations take no clock flag -
+        // measured, and worth answering the way Linux does rather than
+        // pretending the flag applied.
+        nr::FUTEX_LOCK_PI | nr::FUTEX_TRYLOCK_PI | nr::FUTEX_UNLOCK_PI => {
+            if op & nr::FUTEX_CLOCK_REALTIME != 0 {
+                return err::ENOSYS;
+            }
+            // A PI word is read and written as one thirty-two-bit word, so
+            // an address that does not sit on one is refused rather than
+            // silently split: measured `EINVAL` on Linux for a `+1` address.
+            if uaddr % 4 != 0 {
+                return err::EINVAL;
+            }
+            match command {
+                nr::FUTEX_LOCK_PI => {
+                    let deadline = if timeout_ptr != 0 {
+                        match futex_deadline(timeout_ptr, true, false) {
+                            Ok(deadline) => deadline,
+                            Err(e) => return e,
+                        }
+                    } else {
+                        None
+                    };
+                    crate::sched::futex::lock_pi(uaddr, deadline)
+                }
+                nr::FUTEX_TRYLOCK_PI => crate::sched::futex::trylock_pi(uaddr),
+                _ => crate::sched::futex::unlock_pi(uaddr),
+            }
+        }
         // Linux has a dozen operations this kernel does not serve, and they are
         // not all the same kind of absence. `FUTEX_REQUEUE` and its compare
         // spelling are how a libc's `pthread_cond_broadcast` hands its waiters
