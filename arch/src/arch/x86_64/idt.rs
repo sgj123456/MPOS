@@ -578,37 +578,40 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         if crate::hal::kernel::resolve_stack_growth(addr) {
             return; // The page is there now; the instruction retries.
         }
-        crate::hal::kernel::send_signal(11);
-        // A queued signal is delivered at a syscall boundary, and a faulting
-        // instruction never reaches one: returning to it just faults again,
-        // forever, with the signal never leaving the pending set. A SIGSEGV
-        // with no handler is death - end the task here, the way the delivery
-        // path at a syscall exit would, with the signal number in the exit
-        // code for the parent's `wait` to read. The whole group dies with it
-        // (`die_of_fatal_signal`): a `SIGSEGV` with no handler kills the
-        // *process* on Linux, not one thread of it, and ending only this thread
-        // leaves a sibling parked with nobody to wake it (`docs/notes/` §6.77b).
-        if crate::hal::kernel::disposition_is_default(11) {
-            crate::hal::kernel::die_of_fatal_signal(11);
+        // The fault's own record: `si_addr` is `CR2`, and `si_code` is
+        // `SEGV_MAPERR` when the page is absent or `SEGV_ACCERR` when the
+        // page-table word says the mapping refused the access. `send_signal`
+        // would raise a `SI_USER` record with a pid in those eight bytes
+        // instead (`docs/notes/` §6.160).
+        let sig = crate::hal::kernel::send_fault_signal(
+            14,
+            addr,
+            rip,
+            code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
+        );
+        // A `#PF` with no handler is death - end the task here, with the
+        // signal number in the exit code for the parent's `wait` to read.
+        // The whole group dies with it (`die_of_fatal_signal`): a `SIGSEGV`
+        // with no handler kills the *process* on Linux, not one thread of it
+        // (`docs/notes/` §6.77b).
+        if crate::hal::kernel::disposition_is_default(sig) {
+            crate::hal::kernel::die_of_fatal_signal(sig);
         }
-        // A task that *installed* a handler needs the signal-frame machinery,
-        // and that machinery is written against the syscall gate's frame - a
-        // faulting instruction has none, and re-entering it produces the same
-        // fault at the same instruction for as long as the task is allowed to
-        // run. That is a livelock, and it is not a harmless one: the console
-        // gets a line per fault (thousands a second, which is how `fish`'s own
-        // crash handler buried everything else the machine was saying) and the
-        // task holds its slice forever. Counting repeats at one instruction and
-        // ending the task is what a kernel without an interrupt-frame signal
-        // path can honestly do: the handler does not run either way, and a
-        // death with a reason beats a spin with a flood.
+        // A task that *installed* a handler needs a trap-time signal frame.
+        // §2.13 built one for the PIT's GPR-preserving `timer_stub`, so the
+        // next ring-3 tick can hand the record over; a fault that re-executes
+        // at the same `rip` [`FAULT_REPEAT_LIMIT`] times before then ends the
+        // task rather than holding its slice and flooding the console. That
+        // window is a measured 2/16 in a guest (`docs/notes/` §6.159) - the
+        // six `x86-interrupt` entries have no GPR frame of their own, so
+        // handler-at-trap delivery for them is still a named gap.
         if fault_repeats(rip) {
             crate::hal::kernel::kprintln!(
                 "task {} died of SIGSEGV it could not be handed: {addr:#x} ({code:?}) at {rip:#x}, \
                  the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
                 crate::hal::kernel::current()
             );
-            crate::hal::kernel::die_of_fatal_signal(11);
+            crate::hal::kernel::die_of_fatal_signal(sig);
         }
         crate::hal::kernel::preempt();
         return;
@@ -1125,7 +1128,10 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
 fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool {
     let rip = frame.instruction_pointer.as_u64() as usize;
     if rip < (1 << 47) {
-        let sig = crate::hal::kernel::signal_for_trap(vector);
+        // One table answers both halves: the signal number (Item 279) and the
+        // fault-shaped `siginfo_t` record (Item 280). A trap with no faulting
+        // address passes zero; `#DE`/`#UD` name `rip` as their `si_addr`.
+        let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip, false);
         if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
             // Only up to the end of the page the instruction is on: a read
             // past it would fault inside the handler, and a double fault
@@ -1147,7 +1153,6 @@ fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool
             frame.stack_pointer.as_u64() as usize,
             code as usize,
         );
-        crate::hal::kernel::send_signal(sig);
         if crate::hal::kernel::disposition_is_default(sig) {
             crate::hal::kernel::die_of_fatal_signal(sig);
         }

@@ -549,6 +549,34 @@ pub const SI_MESGQ: i32 = -3;
 /// `-1`, `-2`, `-7`, `-8` and `-100` are accepted and preserved.
 pub const SI_TKILL: i32 = -6;
 
+/// `si_code` values for a **synchronous CPU exception** - the fault-shaped
+/// branch of the union, not a sender's. Each is measured on Linux 7.2.14
+/// (`build/scratch/siginfo/faultcodes.c`, one forked child per trial with an
+/// `SA_SIGINFO` handler that prints and `_exit(0)`s), beside the vector that
+/// produces it:
+///
+/// * `SEGV_MAPERR` 1 - a null store / a read from an unmapped page, `si_addr`
+///   is the address (`0x10` for the null store).
+/// * `SEGV_ACCERR` 2 - a write to a `PROT_READ` page or a read of `PROT_NONE`,
+///   `si_addr` is the address.
+/// * `ILL_ILLOPN` 2 - `ud2` (`#UD`), `si_addr` is the faulting `rip`.
+/// * `FPE_INTDIV` 1 - integer divide by zero (`#DE`), `si_addr` is `rip`.
+/// * `BUS_ADRALN` 1 - an unaligned load with EFLAGS.AC set (`#AC`); Linux's
+///   `si_addr` is nil here and the detail sits in `si_addr_lsb` instead.
+/// * `SI_KERNEL` 0x80 - `int3` (`#BP`) and `hlt` (`#GP`): the kernel raised
+///   the signal with no fault address, so `si_addr` is nil.
+///
+/// A trap door used to queue `SI_USER` (code 0) with the sender's pid where
+/// `si_addr` belongs, so a handler asking "which address faulted" was told a
+/// pid. The named gaps are the machine-specific `_sigfault` members
+/// `si_addr_lsb`/`si_addr_bnd`/`si_pkey`: this kernel has no MPX, no pkeys and
+/// no per-fault alignment bit, so those slots stay zero (`docs/notes/` §6.160).
+pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
+pub const ILL_ILLOPN: i32 = 2;
+pub const FPE_INTDIV: i32 = 1;
+pub const BUS_ADRALN: i32 = 1;
+
 /// The part of a `siginfo_t` this kernel can honour for the signals it names:
 /// the number, where it came from, and - for `sigqueue` - the one word of the
 /// caller's payload that survives to the handler. Standard signals are not
@@ -764,6 +792,79 @@ impl SigInfo {
             fault: false,
         }
     }
+
+    /// The record a **synchronous CPU exception** raises, rather than a sender.
+    ///
+    /// This is the one record that takes the `_sigfault` branch of the
+    /// `siginfo_t` union: `si_addr` lives at wire offset 16, where a `kill`'s
+    /// `si_pid`/`si_uid` would sit, and +24..+48 stay zero. `fault: true` is
+    /// what tells the renderer that, because `SEGV_MAPERR` and `CLD_EXITED`
+    /// are both code 1 - a `(signo, code)` test alone cannot choose. The
+    /// measured layout: Linux 7.2.14's null store renders
+    /// `signo=11 code=1 addr=0x10` with the first 48 bytes
+    /// `0b 00 00 00 00 00 00 00 / 01 00 00 00 00 00 00 00 /
+    /// 10 00 00 00 00 00 00 00 / 00 …` (`build/scratch/siginfo/wire.c`).
+    pub fn fault(sig: u8, code: i32, addr: usize) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno: 0,
+            code,
+            pid: 0,
+            uid: 0,
+            value: 0,
+            status: 0,
+            utime: 0,
+            stime: 0,
+            addr: addr as u64,
+            fault: true,
+        }
+    }
+}
+
+/// The `(signal, record)` a synchronous x86_64 CPU exception must queue.
+///
+/// The trap doors know the vector, the faulting address (`CR2` for a `#PF`,
+/// zero for a trap with no address), the interrupted `rip`, and - for a page
+/// fault - whether the page-table error word says *protection* rather than
+/// *not present*. Linux's `si_code` and `si_addr` for each are measured, not
+/// guessed (`build/scratch/siginfo/faultcodes.c`, Linux 7.2.14):
+///
+/// | vector | signal | `si_code` | `si_addr` |
+/// |---|---|---|---|
+/// | 0 `#DE` | `SIGFPE` | `FPE_INTDIV` 1 | `rip` |
+/// | 3 `#BP` | `SIGTRAP` | `SI_KERNEL` 0x80 | 0 |
+/// | 6 `#UD` | `SIGILL` | `ILL_ILLOPN` 2 | `rip` |
+/// | 14 `#PF` | `SIGSEGV` | `SEGV_MAPERR` 1 / `SEGV_ACCERR` 2 | `cr2` |
+/// | 17 `#AC` | `SIGBUS` | `BUS_ADRALN` 1 | 0 |
+/// | 11/12/13 and unknown | `SIGSEGV` | `SI_KERNEL` 0x80 | 0 |
+///
+/// The signal half is [`signal_for_trap`] (Item 279, `docs/notes/` §6.159);
+/// this is the *payload* half, which a `SI_USER` record could not carry. The
+/// map is host-compiled so a host unit test can pin every row without booting
+/// a machine, and the machine layer reaches it through
+/// `hal::kernel::send_fault_signal` so it keeps no second copy.
+///
+/// What is still not done, named: handing this record to a handler **at the
+/// trap**. §2.13 built `deliver_at_trap` for the PIT's GPR-preserving stub;
+/// the six `x86-interrupt` exception entries have no such frame, so a fault's
+/// handler is entered only if a timer tick intervenes - measured 2/16 in a
+/// guest (`build/scratch/siginfo/rel.c`, `docs/notes/` §6.159). The record's
+/// shape is pinned here and by the boot kunit regardless; aarch64's ESR→signal
+/// decoding is the other named gap.
+pub fn fault_record(vector: u8, addr: usize, rip: usize, protection: bool) -> (u8, SigInfo) {
+    let (code, fault_addr) = match vector {
+        0 => (FPE_INTDIV, rip), // #DE divide error
+        3 => (SI_KERNEL, 0),    // #BP breakpoint (`int3`)
+        6 => (ILL_ILLOPN, rip), // #UD invalid opcode
+        14 => {
+            let code = if protection { SEGV_ACCERR } else { SEGV_MAPERR };
+            (code, addr)
+        } // #PF page fault
+        17 => (BUS_ADRALN, 0),  // #AC alignment check
+        _ => (SI_KERNEL, 0),    // #SS, #NP, #GP and unknown
+    };
+    let sig = signal_for_trap(vector);
+    (sig, SigInfo::fault(sig, code, fault_addr))
 }
 
 /// How many queued real-time records one task can hold. This ring is where the
@@ -981,6 +1082,75 @@ mod tests {
         assert_eq!(SIGTSTP, 20);
         assert_eq!(SIGURG, 23);
         assert_eq!(SIGWINCH, 28);
+        // The `si_code` words a fault's handler reads (`signal(7)`,
+        // `build/scratch/siginfo/faultcodes.c`, Linux 7.2.14). `SEGV_MAPERR`
+        // and `FPE_INTDIV` sharing 1 is why the union's discriminator is the
+        // record's origin, not `(signo, code)`.
+        assert_eq!(SEGV_MAPERR, 1);
+        assert_eq!(SEGV_ACCERR, 2);
+        assert_eq!(ILL_ILLOPN, 2);
+        assert_eq!(FPE_INTDIV, 1);
+        assert_eq!(BUS_ADRALN, 1);
+        assert_eq!(SI_KERNEL, 0x80);
+    }
+
+    /// A fault record takes the `_sigfault` union, not a sender's shape. The
+    /// counterfactual is `SigInfo::kernel`/`SigInfo::user`: both leave
+    /// `fault` false and `addr` zero, so every claim below reddens if the
+    /// trap door goes back to `send_signal`.
+    #[test]
+    fn a_cpu_fault_record_names_its_code_and_address() {
+        let (sig, info) = fault_record(14, 0x10, 0xdead, false);
+        assert_eq!(sig, SIGSEGV);
+        assert_eq!(info.signo, SIGSEGV as i32);
+        assert_eq!(info.code, SEGV_MAPERR);
+        assert_eq!(info.addr, 0x10);
+        assert!(info.fault);
+        assert_eq!(info.pid, 0);
+        assert_eq!(info.uid, 0);
+        assert_eq!(info.value, 0);
+        assert_eq!(info.status, 0);
+        assert_eq!(SigInfo::fault(SIGTRAP, SI_KERNEL, 0).code, SI_KERNEL);
+    }
+
+    /// Every vector's measured `(signal, si_code, si_addr)` row. A map that
+    /// answers `SI_USER` (0) for a fault, or puts a pid where `si_addr`
+    /// belongs, reddens here on the host without booting a machine.
+    #[test]
+    fn every_trap_vector_queues_its_own_fault_record() {
+        let rip = 0x4012_3456usize;
+        let cases: [(u8, u8, i32, usize); 9] = [
+            (0, SIGFPE, FPE_INTDIV, rip),     // #DE: si_addr = rip
+            (3, SIGTRAP, SI_KERNEL, 0),       // #BP: int3
+            (6, SIGILL, ILL_ILLOPN, rip),     // #UD: si_addr = rip
+            (11, SIGSEGV, SI_KERNEL, 0),      // #NP
+            (12, SIGSEGV, SI_KERNEL, 0),      // #SS
+            (13, SIGSEGV, SI_KERNEL, 0),      // #GP: hlt
+            (14, SIGSEGV, SEGV_MAPERR, 0x10), // #PF: not present
+            (17, SIGBUS, BUS_ADRALN, 0),      // #AC
+            (255, SIGSEGV, SI_KERNEL, 0),     // unknown: still total
+        ];
+        for (vector, sig, code, addr) in cases {
+            let (got_sig, info) = fault_record(vector, 0x10, rip, false);
+            assert_eq!(got_sig, sig, "vector {vector} answered the wrong signal");
+            assert_eq!(
+                info.code, code,
+                "vector {vector} answered the wrong si_code"
+            );
+            assert_eq!(
+                info.addr as usize, addr,
+                "vector {vector} answered the wrong si_addr"
+            );
+            assert!(
+                info.fault,
+                "vector {vector} did not mark its record as a fault"
+            );
+        }
+        // A protection violation is the one row the caller's error word decides.
+        let (_, accerr) = fault_record(14, 0x7fff_0000, rip, true);
+        assert_eq!(accerr.code, SEGV_ACCERR);
+        assert_eq!(accerr.addr, 0x7fff_0000);
+        assert_ne!(accerr.code, SEGV_MAPERR);
     }
 
     /// The counterfactual for a trap door that queues `SIGSEGV` for every

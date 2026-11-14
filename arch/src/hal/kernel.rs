@@ -142,6 +142,26 @@ pub trait Kernel: Sync {
     /// the same shape as [`report_user_trap`](Kernel::report_user_trap).
     fn signal_for_trap(&self, vector: u8) -> u8;
 
+    /// Queue the signal a synchronous CPU exception raised, **with its
+    /// fault-shaped `siginfo_t` record**, and answer the signal number the
+    /// caller must then use for its disposition and death checks.
+    ///
+    /// `vector` is the x86_64 IDT vector (14 for a `#PF`); `addr` is `CR2`
+    /// for a page fault and zero for a trap with no faulting address; `rip`
+    /// is the interrupted instruction pointer, which is `si_addr` for `#DE`
+    /// and `#UD`; `protection` is the page-table word's `P` bit, deciding
+    /// `SEGV_ACCERR` over `SEGV_MAPERR`. The kernel owns the map of vectors
+    /// to `(signal, si_code, si_addr)` - measured on Linux 7.2.14,
+    /// `docs/notes/` §6.160 - so this seam carries the raw facts rather than
+    /// a second copy of the table, the same shape as
+    /// [`signal_for_trap`](Kernel::signal_for_trap).
+    ///
+    /// This is deliberately not [`send_signal`](Kernel::send_signal): that
+    /// door raises a `SI_USER` record with the sender's pid at wire offset
+    /// 16, which is exactly the eight bytes a fault's `si_addr` occupies. A
+    /// handler asking "which address faulted" was told a pid.
+    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize, protection: bool) -> u8;
+
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
 
@@ -641,6 +661,13 @@ pub fn report_user_trap(vector: u8, ip: usize, sp: usize, error: usize) {
 #[inline]
 pub fn signal_for_trap(vector: u8) -> u8 {
     registered().signal_for_trap(vector)
+}
+
+/// Queue a CPU exception's fault-shaped record. See
+/// [`Kernel::send_fault_signal`].
+#[inline]
+pub fn send_fault_signal(vector: u8, addr: usize, rip: usize, protection: bool) -> u8 {
+    registered().send_fault_signal(vector, addr, rip, protection)
 }
 
 /// The running task's `comm`. See [`Kernel::current_comm`].

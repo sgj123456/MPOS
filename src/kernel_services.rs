@@ -125,6 +125,16 @@ impl Kernel for Services {
         sched::signal::signal_for_trap(vector)
     }
 
+    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize, protection: bool) -> u8 {
+        // One table, one record, one door. `send_signal` would queue a
+        // SI_USER record with a pid at `si_addr`'s offset; the fault's own
+        // `si_code`/`si_addr` are the payload a handler is given, and the
+        // vocabulary keeps the measured map host-testable.
+        let (sig, info) = sched::signal::fault_record(vector, addr, rip, protection);
+        sched::send_signal_info(sched::current(), sig, info);
+        sig
+    }
+
     fn current_stack_range(&self) -> Option<(usize, usize)> {
         sched::current_stack_range()
     }
