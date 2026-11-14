@@ -12410,3 +12410,30 @@ kernel-internal bands, so a waiter gets Linux's handshake but not the latency gu
 `FUTEX_WAIT_REQUEUE_PI`/`CMP_REQUEUE_PI` (13, 12) are still `ENOSYS`. The owner-died handover has a
 host test but no user-visible reading yet. And a user `#UD` is still reported as a
 general-protection fault (`src/kernel_services.rs:93`).
+
+**Item 277**, landed 2026-11-14.
+
+### Item 277 `/sys/devices/system/cpu`: the four CPU lists, so crashpad stops guessing
+
+Chromium's crash handler opened `/sys/devices/system/cpu/online` and got `No such file or
+directory`; it falls back to guessing its thread list and the rest of its report is noise.
+
+| path | before | now |
+|---|---|---|
+| `/sys/devices/system/cpu/online` | `ENOENT` | `0\n` (`0444`) |
+| `/sys/devices/system/cpu/present` | `ENOENT` | `0\n` |
+| `/sys/devices/system/cpu/possible` | `ENOENT` | `0\n` |
+| `/sys/devices/system/cpu/offline` | `ENOENT` | `\n` (empty, and present) |
+
+Linux measured first: all four are `0444`, the contents are a CPU list (`0-15` on the host), and
+`offline` is empty but exists. This kernel runs one CPU (uniprocessor by design, which is why
+`/proc/stat` prints `cpu` and `cpu0` for the same figure), so the lists name `0`.
+
+Pins: a host unit test over the built tree plus `t-sysfs-cpu` (14 claims in the guest, including
+that `/proc/stat`'s `cpu0` line agrees). Counterfactual: class removed, unit test red and 12 guest
+claims red.
+
+**Gate** `build/gate-sysfscpu.log` exit 0: stage 1 **1326** host tests, 0 failed (51.41 s); x86_64 `pass=317 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit 35 passed, 0 failed` per arm; lint ratcheted, formatting clean in both workspaces, fuzz 23 targets; `t-sysfs-cpu` green on both arms (0 ms / 272 ms).
+**What this does not do.** No `cpuN` directories (`topology`, `cpufreq`, `cpuidle`, `cache`,
+per-CPU `uevent`), no `isolated`/`nohz_full`/`smt` lists, and no hotplug — this kernel cannot online
+or offline anything.

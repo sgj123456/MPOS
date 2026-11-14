@@ -2032,3 +2032,47 @@ stub (`build/scratch/oneshot-inolimits-cf.log`'s four reds are unchanged).
 **What this does not do.** `max_queued_events`' cap is enforced per descriptor, which is Linux's own
 shape; nothing else under `/proc/sys/fs/inotify` exists in Linux either. The per-user watch
 accounting above stays a named gap.
+
+### 3.31 `/sys/devices/system/cpu`: the four lists crashpad reads (item 277, LANDED 2026-11-14)
+
+Chromium's crash handler gave up on this tree before the guest could show why:
+
+```
+[1114/063645.828192:ERROR:third_party/crashpad/crashpad/util/file/file_io_posix.cc:145]
+open /sys/devices/system/cpu/online: No such file or directory (2)
+```
+
+crashpad opens `online` to size its thread list; without it the handler falls back to guessing, and
+the rest of its report is the noise that follows (`no module mappings`, `ptrace: I/O error (5)`
+twenty times). The file is not optional in a procfs/sysfs a modern program can live with: libc's
+`sysconf(_SC_NPROCESSORS_ONLN)` and every thread-pool sized from it read the same list.
+
+**Measured on a current host first** (7.2.14): all four attributes are `0444`; `online`, `present`
+and `possible` hold a Linux CPU list (`0-15` on this 16-way machine, i.e. runs of numbers separated
+by commas, ranges written `first-last`, one trailing newline); `offline` is **empty** (`"\n"`), and
+it exists even so - a reader that parses it gets an empty list rather than `ENOENT`. The class
+directory itself is `0755`, and each CPU has a `cpuN` directory beside the lists.
+
+**What landed**: `/sys/devices/system` and `/sys/devices/system/cpu` in the tree, with the four
+attributes as fixed read-only files. The value is this machine's: the scheduler is **uniprocessor by
+design** (which is why `/proc/stat` prints `cpu` and `cpu0` for the same figure), so `online`,
+`present` and `possible` hold `0` and `offline` is empty - nothing can be offlined when the one CPU
+is the one running. The shape is a list, so a reader that parses one is ready for a machine that
+ever ran more.
+
+**Pins**: a host unit test walks the built tree (`the_cpu_class_names_the_one_cpu_this_machine_runs`)
+and asserts the directory, the four contents and the `0444` word; `user/tests/src/bin/t-sysfs-cpu.rs`
+(14 claims) checks the same **in the guest**, plus that `/proc/stat`'s `cpu0` line agrees with the
+list - the two doors are the same fact read twice. `MPOS_ON_HOST=1` runs the shape claims against
+the host's own list (a parseable non-empty list, `0444`, every online CPU also present and
+possible) and prints a note that the values are the host's.
+
+**Counterfactual**: with the class removed from the tree, the unit test reds and the guest pin
+reddens **12** claims (every CPU claim) and ends `FAILED` - then the crashpad line comes back.
+
+**Gate** `build/gate-sysfscpu.log` exit 0: stage 1 **1326** host tests, 0 failed (51.41 s); x86_64 `pass=317 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit 35 passed, 0 failed` per arm; lint ratcheted, formatting clean in both workspaces, fuzz 23 targets; `t-sysfs-cpu` green on both arms (0 ms / 272 ms).
+
+**What this does not do.** No `cpuN` directories (no `topology/`, `cpufreq/`, `cpuidle/`, `cache/`,
+`uevent` per CPU), no `isolated`/`nohz_full`/`smt` lists, and no hotplug: this kernel cannot online
+or offline anything, so the lists are the machine's and never change. A program that walks
+`cpu0..cpuN` for per-CPU attributes will find only the lists.

@@ -1717,3 +1717,5 @@ refusal is not `ENOSPC`); host PASS, guest 5/5. Counterfactual: the whole-file r
 those three with `ENOMEM` 12, and with the errno lie restored, `ENOSPC` 28 - the report.
 
 - **`FUTEX_LOCK_PI`/`UNLOCK_PI`/`TRYLOCK_PI` are served** (item 276, §6.157): the PI word names its owner's tid and honours `FUTEX_WAITERS`/`FUTEX_OWNER_DIED`, a dead owner's word is handed on, and `PTHREAD_PRIO_INHERIT` is no longer `ENOSYS` — which is what pulseaudio's assert was waiting for. Priority inheritance itself is still a named gap (kernel-internal ready bands).
+
+- **`/sys/devices/system/cpu/{online,present,possible,offline}` are served** (item 277, §3.31): a Linux CPU list (`0`, one CPU, uniprocessor by design) and an empty `offline`, which is what crashpad reads before it can size its thread list. No `cpuN` directories or hotplug yet.
