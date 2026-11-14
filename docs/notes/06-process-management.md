@@ -13855,6 +13855,7 @@ claims, neither about this item's code: `t-rr-interval`'s parked-slice bound (13
 a 12.5% bound) and `t-times`' thread-vs-group relation (one tick of lag). Both are the
 "two snapshots of one moving record" class and both are re-derived with their own
 measurements in §6.151 and §6.153; this log is the sweep after those fixes.
+- **Gate** `build/gate-pifutex.log` exit 0: stage 1 **1325** host tests, 0 failed (50.97 s); x86_64 `pass=316 fail=0`; aarch64 `pass=315 fail=0 (315 built)`; `mpos-kunit 35 passed, 0 failed` per arm; lint ratcheted, formatting clean in both workspaces, fuzz 23 targets; `t-pi-futex` green on both arms.
 
 ### What this does not do, named
 
@@ -14151,3 +14152,124 @@ AGENTS.md §5 trap); clearing that directory made the harness appear and the gat
 dies with a `#GP` executing the same `cc 0f 0b` padding, i.e. chromium's own `CHECK`/`IMMEDIATE_CRASH`
 path, which is what an unconfigured headless browser does on a bare system. Those are the next
 round's questions, not this one's: this round's claim is the width of one store.
+
+## §6.157 the priority-inheritance futex trio, and the `ENOSYS` that aborted chromium (item 276, LANDED 2026-11-14)
+
+Chromium aborted in the guest before it drew anything, and the abort was pulseaudio's:
+
+```
+Assertion 'r == 0 || r == 95' failed at ../src/pulsecore/mutex-posix.c:57, function pa_mutex_new(). Aborting.
+```
+
+`pa_mutex_new` creates its mutex with `PTHREAD_PRIO_INHERIT` and accepts exactly two answers from
+`pthread_mutex_init`: `0`, or `ENOTSUP` (95, "this libc cannot do PI mutexes"). It got a third, so
+something under musl was answering with a number pulseaudio had no case for.
+
+### The measurement that named it
+
+A probe replicating pulseaudio's attribute sequence, run on the host and then in the guest
+(`build/scratch/pifutex/`, the guest's copy staged into the image's `/root` with `debugfs`):
+
+| call | host (Linux 7.2.14) | guest (this kernel) |
+|---|---|---|
+| `pthread_mutexattr_init` | 0 | 0 |
+| `pthread_mutexattr_settype` | 0 | 0 |
+| `pthread_mutexattr_setrobust` | 0 | 0 |
+| `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` | 0 | **38** |
+| `pthread_mutexattr_setpshared` | 0 | 0 |
+| `pthread_mutex_init` | 0 | 0 |
+
+38 is `ENOSYS`. `strace` in the guest says where it comes from:
+
+```
+mpos: futex op 0x6 -> ENOSYS
+futex(0x3fbc6a54, FUTEX_LOCK_PI, NULL) = -1 ENOSYS
+```
+
+musl's `pthread_mutexattr_setprotocol` **probes** the kernel's PI support with `FUTEX_LOCK_PI` on a
+scratch word and returns whatever that says; Linux answers 0, this kernel answered `ENOSYS`, so
+musl reported "the program asked for something this libc cannot do" and pulseaudio aborted. The
+abort is `__builtin_trap` (`0f 0b`), which the machine's trap report calls a general-protection
+fault: the "jump into inter-function padding" that the round before this one chased through the
+page tables was a `#UD` wearing the wrong name (`src/kernel_services.rs:93` hardcodes the string;
+named below, not fixed here).
+
+### Linux's answers, measured first
+
+`build/scratch/pifutex/probe.c` (`gcc -O1`, 7.2.14):
+
+| call | answer |
+|---|---|
+| `FUTEX_LOCK_PI` on a free word | `0`, word = taker's tid (`0x00017a1c`) |
+| `FUTEX_LOCK_PI` again, same thread | `EDEADLK(35)` |
+| `FUTEX_TRYLOCK_PI` by the owner | `EDEADLK(35)` |
+| `FUTEX_UNLOCK_PI`, no waiters | `0`, word `0` |
+| `FUTEX_UNLOCK_PI` by a non-owner | `EPERM(1)` |
+| `FUTEX_TRYLOCK_PI` on a free word | `0`, word = tid |
+| misaligned address (`+1`) | `EINVAL(22)` |
+| another process's `TRYLOCK_PI` while owned | `EAGAIN(11)`, and the kernel sets `FUTEX_WAITERS` (word `0x80017a1c`) |
+| a word whose owner tid names no registered owner | `ESRCH(3)` |
+| `LOCK_PI \| FUTEX_CLOCK_REALTIME` | `ENOSYS(38)` |
+
+The word's layout is the same on every architecture: owner tid in bits 0..29, `FUTEX_WAITERS` at
+bit 31, `FUTEX_OWNER_DIED` at bit 30.
+
+### What landed
+
+- `crates/err` grew `EDEADLK` (-35) and `EOWNERDEAD` (-130); the number table in
+  `src/syscall/linux/nr_{x86_64,aarch64}.rs` grew `FUTEX_LOCK_PI = 6`, `FUTEX_UNLOCK_PI = 7`,
+  `FUTEX_TRYLOCK_PI = 8`.
+- `src/sched/futex.rs` gained the PI section: the word helpers (`pi_owner`, `pi_word`,
+  `pi_tid_of`), two registries — `PI_WAITERS` (who is parked on which word) and `PI_HELD` (which
+  words each task holds, the exit path's ledger, because a dying task's memory cannot be read) —
+  and `lock_pi`/`trylock_pi`/`unlock_pi`. The claim of a free word is decided under a critical
+  section that re-reads the word, so two takers cannot both see it free; a contended waiter is in
+  `PI_WAITERS` before the word says so; a handover sets the word to the next waiter's tid and wakes
+  it; `UNLOCK_PI` with no waiter writes `0`.
+- `release_pi` runs in `Table::release_exited`'s **pre-pass**, before the space teardown: it takes
+  the dying task's words out of `PI_HELD`, grants each to its first waiter with `FUTEX_OWNER_DIED`
+  set (or writes the bit when nobody waits), and the words land through `write_pi_word` — the
+  populate-and-write shape `write_clear_tid` already used.
+- **The number in the word is resolved through the pid namespace**, the same way `gettid` resolves
+  it (`pi_tid_of`). Linux puts the *global* tid there; a machine whose programs only ever see
+  namespaced numbers would be handing them a number they cannot compute, so the word carries the
+  number the reader's namespace gives the owner. With one namespace the two are the same figure.
+- The `handle_futex` door refuses `FUTEX_CLOCK_REALTIME` with `ENOSYS` and a misaligned address
+  with `EINVAL` **before** the three operations, which is Linux's order for the PI forms.
+
+### Pins
+
+- Host unit tests in `src/sched/futex.rs`: the word's layout, the handover's grant order and the
+  waiters bit behind it, one place per task and address.
+- `user/tests/src/bin/t-pi-futex.rs` (22 claims): every row of the measured table above, the
+  contended `EAGAIN`-with-`FUTEX_WAITERS`, a real handover across `fork` (the child blocks in
+  `LOCK_PI`, the parent unlocks, the child is handed the word and answers 0 with the word naming
+  it), the child's release on exit, and the two calls the report came from —
+  `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` answering 0 and a PI mutex locking,
+  unlocking and destroying.
+- `MPOS_ON_HOST=1` (Linux 7.2.14): 22/22 `ok:`. Guest: 22/22 `ok:`.
+
+### The counterfactual
+
+With the three dispatch arms made to answer `ENOSYS` (the state before this item) and everything
+else untouched, the guest reddens **17** claims — every PI claim including
+`pthread_mutexattr_setprotocol(PRIO_INHERIT) answers 0` — and ends `FAILED`
+(`build/scratch/oneshot-pifutex-cf.log`); the restored kernel answers 22/22 again
+(`build/scratch/oneshot-pifutex3.log`).
+
+### What this does not do, named
+
+1. **No priority inheritance.** The word's states are Linux's; *acting* on them — raising the
+   owner's scheduling priority to its waiter's while it holds the word — is not implemented,
+   because this kernel's ready queues are kernel-internal bands chosen by the scheduler, and user
+   `nice` does not order them. A program gets Linux's handshake and Linux's answers; what it does
+   not get is the latency guarantee the attributes exist for.
+2. `FUTEX_WAIT_REQUEUE_PI` (13) and `FUTEX_CMP_REQUEUE_PI` (12) still answer `ENOSYS` — condvar
+   waiters on a PI mutex are a separate item, and the `probe2.c` case that would have measured
+   their handover blocks in this kernel before it can be compared.
+3. The owner-died handover is implemented and unit-tested on the host side, but not measured
+   against Linux end to end: the pin's child unlocks before it exits, so the `FUTEX_OWNER_DIED`
+   path has no user-visible reading yet.
+4. The `#GP` the abort produced is still reported under the wrong name: a user `#UD`
+   (`__builtin_trap`) arrives at `user_fault_or_die`, which prints the general-protection string
+   for every vector.

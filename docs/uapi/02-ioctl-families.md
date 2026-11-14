@@ -43,7 +43,7 @@ these arrives as `futex`. Served commands, measured in `src/syscall/linux/proc.r
 | `FUTEX_WAKE` | 1 | Served | `t-futex` |
 | `FUTEX_FD` | 2 | Refused `ENOSYS` (Linux removed it in 2.6.26) | `note_missing_futex_op` names it in the log |
 | `FUTEX_REQUEUE` / `CMP_REQUEUE` / `WAKE_OP` | 3, 4, 5 | Refused `ENOSYS` | " |
-| `FUTEX_LOCK_PI` / `UNLOCK_PI` / `TRYLOCK` | 6, 7, 8 | Refused `ENOSYS` (no priority-inheritance futexes) | " |
+| `FUTEX_LOCK_PI` / `UNLOCK_PI` / `TRYLOCK_PI` | 6, 7, 8 | Served — the word names its owner's tid in the low 30 bits with `FUTEX_WAITERS`/`FUTEX_OWNER_DIED` above it; a dead owner's word is handed on with `FUTEX_OWNER_DIED`; **priority** inheritance itself is the named gap (this kernel's ready queues are internal bands) | `t-pi-futex` |
 | `FUTEX_WAIT_BITSET` | 9 | Served — an empty bitset is `EINVAL`, which is Linux's answer and the claim `t-futex` opens with | `t-futex` |
 | `FUTEX_WAKE_BITSET` | 10 | Served | `t-futex` |
 | `FUTEX_CMP_REQUEUE_PI` / `WAIT_REQUEUE_PI` | 12, 13 | Refused `ENOSYS` | " |

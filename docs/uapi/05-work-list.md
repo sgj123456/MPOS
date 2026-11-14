@@ -12375,3 +12375,38 @@ x86_64 claim because the cap is whole-system and that lane already held watches;
 user, this kernel whole-system (one `REGISTRY`, one `LIVE_INSTANCES`), which is the same figure with
 one user - but it also means a program that lowers the ceiling lowers it for everyone, and a lane's
 earlier programs may already hold watches. `docs/notes/` §3.30.
+
+**Item 276**, landed 2026-11-14.
+
+### Item 276 the PI futex trio is served, so `PTHREAD_PRIO_INHERIT` is not `ENOSYS`
+
+Chromium's first blocker in the guest was pulseaudio's `Assertion 'r == 0 || r == 95' failed …
+pa_mutex_new()`, and the number it objected to was `38`: musl's
+`pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` probes PI support with `FUTEX_LOCK_PI`, and
+this kernel answered `ENOSYS`.
+
+| call | before | now |
+|---|---|---|
+| `FUTEX_LOCK_PI` (6) on a free word | `ENOSYS` | `0`, word = owner's tid |
+| same thread again / `TRYLOCK_PI` by the owner | `ENOSYS` | `EDEADLK` |
+| `FUTEX_UNLOCK_PI` (7) by the owner / a non-owner | `ENOSYS` | `0` / `EPERM` |
+| `FUTEX_TRYLOCK_PI` (8), free / owned | `ENOSYS` | `0`, word = tid / `EAGAIN` + `FUTEX_WAITERS` |
+| misaligned address | `ENOSYS` | `EINVAL` |
+| `FUTEX_CLOCK_REALTIME` on a PI form | `ENOSYS` | `ENOSYS` (measured: the PI forms take no clock) |
+| a dead owner's word | — | handed to the first waiter with `FUTEX_OWNER_DIED` |
+| `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` | `38` | `0` |
+
+The word carries the owner's tid in bits 0..29 with `FUTEX_WAITERS` at 31 and `FUTEX_OWNER_DIED` at
+30, resolved through the reader's pid namespace the way `gettid` resolves it — Linux writes the
+global tid, which a program on a machine with namespaces could not compute.
+
+Pins: `t-pi-futex` (22 claims, host and guest: the measured table, a handover across `fork`, the
+child's release on exit, and the two calls the report came from) plus three host unit tests for the
+word's layout, the grant order and one place per task and address. Counterfactual: with the three
+dispatch arms answering `ENOSYS` again, 17 claims red and the guest ends `FAILED`.
+- **Gate** `build/gate-pifutex.log` exit 0: stage 1 **1325** host tests, 0 failed (50.97 s); x86_64 `pass=316 fail=0`; aarch64 `pass=315 fail=0 (315 built)`; `mpos-kunit 35 passed, 0 failed` per arm; lint ratcheted, formatting clean in both workspaces, fuzz 23 targets; `t-pi-futex` green on both arms.
+**What this does not do.** No priority inheritance is *acted* on — the ready queues are
+kernel-internal bands, so a waiter gets Linux's handshake but not the latency guarantee.
+`FUTEX_WAIT_REQUEUE_PI`/`CMP_REQUEUE_PI` (13, 12) are still `ENOSYS`. The owner-died handover has a
+host test but no user-visible reading yet. And a user `#UD` is still reported as a
+general-protection fault (`src/kernel_services.rs:93`).
