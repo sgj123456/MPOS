@@ -356,8 +356,17 @@ pub fn handle_getresgid(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 fn identity_words(args: [usize; ARG_COUNT], from_user: bool, uid: bool) -> isize {
     let ptrs = [args[0], args[1], args[2]];
+    // One `uid_t`/`gid_t` per pointer - Linux's `put_user` of a `kuid_t` is a
+    // **four-byte** store, and this kernel used to write eight. Measured on a
+    // current host (`build/scratch/resid/k.c`, 7.2.14): a canary word placed
+    // immediately after each `uid_t` survives the call, so the write is exactly
+    // the id and nothing more. The eight-byte store was not harmless: glibc's
+    // `getresuid(&r, &e, &s)` declares three four-byte locals, so each call
+    // clobbered the four bytes above them - the callers' saved pointers - and
+    // chromium died in a musl allocator check (`hlt`, musl's `a_crash()`) a few
+    // instructions after `getresgid`.
     for &ptr in &ptrs {
-        if ptr == 0 || !buffer_ok(ptr, 8, true, from_user) {
+        if ptr == 0 || !buffer_ok(ptr, 4, true, from_user) {
             return err::EFAULT;
         }
     }
@@ -368,7 +377,7 @@ fn identity_words(args: [usize; ARG_COUNT], from_user: bool, uid: bool) -> isize
         [identity.rgid, identity.egid, identity.sgid]
     };
     for (&ptr, word) in ptrs.iter().zip(words) {
-        unsafe { (ptr as *mut u64).write_unaligned(word as u64) };
+        unsafe { (ptr as *mut u32).write_unaligned(word) };
     }
     0
 }

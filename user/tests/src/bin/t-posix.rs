@@ -194,6 +194,95 @@ fn main() {
     );
     r.check("the gids are root's", gids == [0, 0, 0]);
 
+    // The write is one `uid_t`, and a `uid_t` is four bytes. Measured on a
+    // current host (`build/scratch/resid/k.c`, Linux 7.2.14): a canary word
+    // placed immediately after each slot survives the call untouched, and a
+    // four-byte slot at the very end of a page - the next page unmapped - is
+    // written without complaint. This kernel used to store eight bytes per
+    // slot, which clobbered the four bytes above each one; that is not a
+    // tidiness question: glibc's `getresuid(&r, &e, &s)` declares three
+    // four-byte locals and chromium died in a musl allocator check a few
+    // instructions after `getresgid`, with the stack it had just filled in.
+    #[repr(C)]
+    struct Slot {
+        id: u32,
+        canary: u32,
+    }
+    let mut ru = Slot {
+        id: 0xdead_beef,
+        canary: 0x1111_1111,
+    };
+    let mut eu = Slot {
+        id: 0xdead_beef,
+        canary: 0x2222_2222,
+    };
+    let mut su = Slot {
+        id: 0xdead_beef,
+        canary: 0x3333_3333,
+    };
+    let rc_uid = unsafe { libc::getresuid(&mut ru.id, &mut eu.id, &mut su.id) };
+    r.check(
+        "getresuid still succeeds against separate slots",
+        rc_uid == 0,
+    );
+    r.check(
+        "getresuid writes four bytes per slot, leaving the next word alone",
+        (ru.canary, eu.canary, su.canary) == (0x1111_1111, 0x2222_2222, 0x3333_3333),
+    );
+    let mut rg = Slot {
+        id: 0xdead_beef,
+        canary: 0x4444_4444,
+    };
+    let mut eg = Slot {
+        id: 0xdead_beef,
+        canary: 0x5555_5555,
+    };
+    let mut sg = Slot {
+        id: 0xdead_beef,
+        canary: 0x6666_6666,
+    };
+    let rc_gid = unsafe { libc::getresgid(&mut rg.id, &mut eg.id, &mut sg.id) };
+    r.check(
+        "getresgid still succeeds against separate slots",
+        rc_gid == 0,
+    );
+    r.check(
+        "getresgid writes four bytes per slot, leaving the next word alone",
+        (rg.canary, eg.canary, sg.canary) == (0x4444_4444, 0x5555_5555, 0x6666_6666),
+    );
+
+    // And the boundary the eight-byte store could not reach: three slots that
+    // each end a page, with the next page unmapped.
+    let page = 4096usize;
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            6 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        r.check("a three-page scratch mapping was made", false);
+    } else {
+        // Six pages, three kept: each slot ends a page whose next page is
+        // unmapped, so an eight-byte write could not be completed.
+        let last = |i: usize| (base as usize + (2 * i + 1) * page - 4) as *mut u32;
+        unsafe {
+            libc::munmap((base as usize + page) as *mut _, page);
+            libc::munmap((base as usize + 3 * page) as *mut _, page);
+            libc::munmap((base as usize + 5 * page) as *mut _, page);
+        }
+        let rc_edge = unsafe { libc::getresuid(last(0), last(1), last(2)) };
+        r.check(
+            "a four-byte slot that ends a page is written, not EFAULT",
+            rc_edge == 0,
+        );
+        unsafe { libc::munmap(base, page) };
+    }
+
     // The res spelling, as the privilege dance sudo actually performs: root
     // lowers its effective id, reads its own three words back, and raises
     // itself again through the saved one - the word that never moved. The
