@@ -2723,5 +2723,6 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   three `EINVAL` shapes, `0` legal, and both ceilings biting), then the constants became
   `AtomicUsize`-backed policy read by the three enforcement sites, and `/proc/sys/fs` grew the
   directory with a shared `sysctl_count` parse. Pinned by 14 claims in `t-inotify-limits` (host 6,
-  guest 14) with a four-red counterfactual; the per-user-vs-per-descriptor watch accounting stays a
-  named gap (§3.30, item 275).
+  guest 14) with a four-red counterfactual; the ceilings are counted whole-system (Linux counts them
+  per user, which is the same figure with one user) and the pin's claim says "at most two taken" for
+  that reason (§3.30, item 275).

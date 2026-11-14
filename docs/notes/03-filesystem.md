@@ -1997,11 +1997,12 @@ grew an `inotify` directory whose three files report the live value and accept a
 the same one `/proc/sys/vm/max_map_count` uses, factored out as `sysctl_count` (digits only, at most
 `INT_MAX`, trailing newline trimmed), so the `EINVAL` shapes are shared rather than re-derived.
 
-**A divergence kept named**: Linux counts `max_user_watches` per **user**; this kernel counts it per
-descriptor (`reg.watches`), because the machine has one user. A program that opens two descriptors
-and raises the ceiling gets the same number of watches *per descriptor* here, which is more than
-Linux would give it - it does not lie about the number it reports, but the accounting behind it is
-not Linux's.
+**The accounting behind it**: Linux counts these per **user**; this kernel counts them whole-system
+(the watch cap reads the one `REGISTRY`, and the instance cap a `LIVE_INSTANCES` counter), which is
+the same figure on a machine with one user. That also means the ceiling is the *system's*: raising it
+raises it for every descriptor, and a lane's earlier programs may already hold watches when a later
+one lowers it - which is why the pin's claim says "at most two taken, then `ENOSPC`" rather than
+"exactly two".
 
 **The pin.** `user/tests/src/bin/t-inotify-limits.rs`, 14 claims: on both machines each file answers a
 positive count; on the host an unprivileged write is `EACCES` even for a good number (the open is

@@ -118,10 +118,13 @@ fn main() {
         "root can lower the watch ceiling",
         code == 0 && read("max_user_watches") == Some(2),
     );
+    // The cap is whole-system, so a lane's earlier programs may already hold
+    // watches: what must be true either way is that the ceiling is what
+    // refuses, and that no more than the ceiling was taken.
     let (taken, _, errno) = watches(2);
     report.check(
-        "the lowered ceiling bites: two watches taken, the third is ENOSPC",
-        taken == 2 && errno == libc::ENOSPC,
+        "the lowered ceiling bites: at most two watches taken, then ENOSPC",
+        taken <= 2 && errno == libc::ENOSPC,
     );
 
     let code = write("max_user_watches", &format!("{original}\n"));

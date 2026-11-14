@@ -144,9 +144,11 @@ pub const DEFAULT_MAX_WATCHES: usize = 8192;
 /// next allocation is refused (measured on a current host,
 /// `build/scratch/inoctl/r.c`: `max_user_watches` set to 3 makes the first
 /// `inotify_add_watch` answer `ENOSPC`, and `max_user_instances` set to 1
-/// makes the next `inotify_init1` answer `EMFILE`). One divergence stays
-/// named: Linux counts watches per **user**, this kernel per descriptor
-/// (`reg.watches`), because there is one user here.
+/// makes the next `inotify_init1` answer `EMFILE`). Linux counts these per
+/// **user**; this kernel counts them whole-system, which is the same figure
+/// on a machine with one user - and the registry the watch cap reads is
+/// system-wide (`REGISTRY`), so a program that raises the ceiling raises it
+/// for every descriptor.
 static MAX_QUEUED_EVENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_QUEUED_EVENTS);
 static MAX_INSTANCES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_INSTANCES);
 static MAX_WATCHES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WATCHES);

@@ -12366,6 +12366,7 @@ refusal an unprivileged writer sees); counterfactual with the accessors answered
 and the setters made no-ops: exactly four red - the two bites, "root can lower", and "the queue
 ceiling can be moved and put back" - while the three reads and the two `EINVAL`s stayed green.
 
-**What this does not do.** Linux counts `max_user_watches` per user; this kernel counts it per
-descriptor (one user here), so a program with two descriptors can hold more watches than Linux would
-allow it. Named, not hidden: `docs/notes/` §3.30.
+**What this does not do.** The ceiling is the *system's* rather than a user's: Linux counts per
+user, this kernel whole-system (one `REGISTRY`, one `LIVE_INSTANCES`), which is the same figure with
+one user - but it also means a program that lowers the ceiling lowers it for everyone, and a lane's
+earlier programs may already hold watches. `docs/notes/` §3.30.
