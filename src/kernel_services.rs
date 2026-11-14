@@ -24,6 +24,14 @@
 use crate::hal::kernel::{self, Kernel, MemoryStartup};
 use crate::{boot, console, drivers, mm, net, sched, syscall, vfs};
 
+/// The boot self-tests for the trap reporter's words.
+///
+/// A child of this module so a case can read the table directly, and behind the
+/// gate every suite is behind (`--features selftest`, which only
+/// `cargo xtask test` builds) - `src/board/kunit.rs` lists it with the others.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
+
 /// The kernel this boot is running.
 struct Services;
 
@@ -83,15 +91,26 @@ impl Kernel for Services {
         console::print_args(format_args!("{line}\n"));
     }
 
-    fn report_user_trap(&self, ip: usize, sp: usize, error: usize) {
+    fn report_user_trap(&self, vector: u8, ip: usize, sp: usize, error: usize) {
         // The `traps:` shape, which carries no `at <address>` because the
-        // machine did not name one: a ring-3 `hlt` or a `#GP` is a trap the
+        // machine did not name one: a ring-3 `hlt` or a `#UD` is a trap the
         // process took, not an address it touched. Printing a borrowed address
         // beside it would report a page that had nothing to do with the fault.
+        //
+        // The fault's **name comes from the vector**, which is the machine's
+        // own word for what happened and the only thing the trap frame carries
+        // that identifies it ([`trap_name`]). This line said "general
+        // protection fault" for every trap until 2026-11-14 - six vectors share
+        // this door (`#DE`, `#UD`, `#SS`, `#NP`, `#AC`, `#GP`) and the first of
+        // them to reach it was usually `#UD`, musl's `a_crash` after it has
+        // found the heap corrupted. A line that names the wrong trap is worse
+        // than no line: it sent two separate diagnoses of a chromium fault
+        // looking for a protection fault that was never raised
+        // (`docs/notes/` §6.158).
         let (comm, tid) = fault_identity();
-        let line = alloc::format!(
-            "traps: {comm}[{tid}] general protection fault ip:{ip:x} sp:{sp:x} error:{error:x}"
-        );
+        let name = trap_name(vector);
+        let line =
+            alloc::format!("traps: {comm}[{tid}] {name} ip:{ip:x} sp:{sp:x} error:{error:x}");
         // The newline is part of the *ring* line, not decoration: the ring
         // is a byte stream, and a line filed without it is glued to whatever
         // the next writer files - which is how a `traps:` line came to carry
@@ -265,6 +284,57 @@ impl Kernel for Services {
         // SAFETY: the caller's contract, passed through unchanged: `frame` is
         // null or the gate's own frame for the calling task.
         unsafe { syscall::linux_dispatch(nr, args, from_user, frame) }
+    }
+}
+
+/// What a trap vector **is**, as a word for the report line.
+///
+/// The IDT names its entries by number, and the number is the only fact about a
+/// trap the frame preserves - `#DE` and `#GP` and `#UD` all arrive with the same
+/// shape (an `InterruptStackFrame`, an error code that is often zero), so the
+/// name has to come from the vector the machine dispatched through. Six of them
+/// share one reporting door on x86_64, and the door said "general protection
+/// fault" for all six until 2026-11-14: a chromium crash that was really an
+/// `#UD` in musl's `a_crash` (`0f 0b` after the heap was found corrupted, the
+/// instruction *after* the `ud2`) was reported as a protection fault, and two
+/// separate readings of that log went looking for the wrong fault
+/// (`docs/notes/` §6.158).
+///
+/// The words are this kernel's own, not Linux's: Linux prints a `traps:` line
+/// whose wording per vector could not be measured on the machine that made this
+/// change (its kernel log is unreadable without `CAP_SYSLOG`,
+/// `build/scratch/trapname/u.c`), and a diagnostic that *claims* to be Linux's
+/// while being recalled is the failure mode the report itself exists to avoid.
+/// What a reader needs is which exception happened and where, and that is what
+/// this states.
+///
+/// A vector with no row answers `"trap"`: an unknown vector is a machine state
+/// this kernel's IDT does not install, so naming it is honest rather than
+/// inventing a word for it - and it keeps the table total, because the reporter
+/// must never be able to fail on the fault path.
+pub fn trap_name(vector: u8) -> &'static str {
+    match vector {
+        // x86_64's vectors, in the IDT's numbering (`arch/src/arch/x86_64/idt.rs`).
+        0 => "divide error",
+        1 => "debug",
+        3 => "breakpoint",
+        4 => "overflow",
+        5 => "bounds",
+        6 => "invalid opcode",
+        7 => "device not available",
+        8 => "double fault",
+        10 => "invalid TSS",
+        11 => "segment not present",
+        12 => "stack-segment fault",
+        13 => "general protection fault",
+        14 => "page fault",
+        16 => "x87 floating-point exception",
+        17 => "alignment check",
+        18 => "machine check",
+        19 => "SIMD floating-point exception",
+        20 => "virtualization exception",
+        21 => "control protection exception",
+        _ => "trap",
     }
 }
 

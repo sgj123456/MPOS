@@ -412,42 +412,42 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame, 0) {
+    if user_fault_or_die(&frame, 0, 0) {
         return;
     }
     fatal("#DE divide error", &frame, 0)
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame, 0) {
+    if user_fault_or_die(&frame, 6, 0) {
         return;
     }
     fatal("#UD invalid opcode", &frame, 0)
 }
 
 extern "x86-interrupt" fn stack_segment(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, code) {
+    if user_fault_or_die(&frame, 12, code) {
         return;
     }
     fatal("#SS stack segment", &frame, code)
 }
 
 extern "x86-interrupt" fn segment_not_present(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, code) {
+    if user_fault_or_die(&frame, 11, code) {
         return;
     }
     fatal("#NP segment not present", &frame, code)
 }
 
 extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, code) {
+    if user_fault_or_die(&frame, 17, code) {
         return;
     }
     fatal("#AC alignment check", &frame, code)
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, code) {
+    if user_fault_or_die(&frame, 13, code) {
         return;
     }
     fatal("#GP general protection", &frame, code)
@@ -1059,18 +1059,24 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
 /// it a signal, and return `true`. Otherwise return `false` so the caller can
 /// panic.
 ///
-/// The one printed line matters more than it looks: a `#GP` in ring 3 means
-/// user code attempted something the CPU refuses - `hlt` outside ring 0, a
-/// non-canonical operand, an SSE access the FPU state does not allow - and the
-/// only evidence that it happened is this line. Silently converting it to a
-/// signal leaves the bytes, which are the diagnostic, on the floor.
+/// The one printed line matters more than it looks: a trap in ring 3 means
+/// user code executed something the CPU refuses to complete, and the only
+/// evidence that it happened is this line. Silently converting it to a signal
+/// leaves the bytes, which are the diagnostic, on the floor.
 ///
-/// The *first* fault is reported in full - the error code, the bytes of the
-/// instruction the CPU refused, and the stack pointer it refused them on -
-/// because the interesting ring-3 `#GP`s are one instruction made illegal by
-/// kernel state the process cannot see, and the bytes name it. The rest are
-/// the process retrying the same instruction, which Linux logs too, rate
-/// limited, and which would otherwise bury the first one.
+/// `vector` is which trap it was, and this door serves six of them (`#DE` 0,
+/// `#UD` 6, `#NP` 11, `#SS` 12, `#GP` 13, `#AC` 17) - the caller passes its own
+/// vector because the frame does not carry it. Until 2026-11-14 the line said
+/// `#GP` for all six, so the `0f 0b` musl's `a_crash` runs after the allocator
+/// has found the heap corrupted was reported as a protection fault - a word
+/// that sends the reader after the wrong fault (`docs/notes/` §6.158).
+///
+/// The *first* fault is reported in full - the vector, the error code, the
+/// bytes of the instruction the CPU refused, and the stack pointer it refused
+/// them on - because the interesting ring-3 traps are one instruction made
+/// illegal by kernel state the process cannot see, and the bytes name it. The
+/// rest are the process retrying the same instruction, which Linux logs too,
+/// rate limited, and which would otherwise bury the first one.
 ///
 /// What happens after the report is the same answer the `#PF` path gives, and
 /// for the same reason: a signal queued here is delivered at a *syscall*
@@ -1083,17 +1089,17 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
 /// case that made this visible: it is musl's `a_crash()`, the instruction its
 /// allocator runs when it has found the heap corrupted, and a compositor that
 /// hits it used to spin instead of dying.
-fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
+fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool {
     let rip = frame.instruction_pointer.as_u64() as usize;
     if rip < (1 << 47) {
-        if !GP_REPORTED.swap(true, Ordering::Relaxed) {
+        if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
             // Only up to the end of the page the instruction is on: a read
             // past it would fault inside the handler, and a double fault
             // would take the machine down instead of reporting anything.
             let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
             let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
             crate::hal::kernel::kprintln!(
-                "  #GP code {:#x} rip {:#x} rsp {:#x} rflags {:#x}",
+                "  trap {vector} code {:#x} rip {:#x} rsp {:#x} rflags {:#x}",
                 code,
                 rip,
                 frame.stack_pointer.as_u64(),
@@ -1102,6 +1108,7 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
             crate::hal::kernel::kprintln!("  bytes at rip: {:02x?}", bytes);
         }
         crate::hal::kernel::report_user_trap(
+            vector,
             rip,
             frame.stack_pointer.as_u64() as usize,
             code as usize,
@@ -1112,8 +1119,8 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
         }
         if fault_repeats(rip) {
             crate::hal::kernel::kprintln!(
-                "task {} died of SIGSEGV it could not be handed: #GP {code:#x} at {rip:#x}, \
-                 the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
+                "task {} died of SIGSEGV it could not be handed: trap {vector} code {code:#x} \
+                 at {rip:#x}, the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
                 crate::hal::kernel::current()
             );
             crate::hal::kernel::die_of_fatal_signal(11);
@@ -1129,8 +1136,9 @@ fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
 /// what keeps the report from faulting itself.
 const PAGE_SIZE: usize = 4096;
 
-/// Whether the full report of the first ring-3 `#GP` has been printed. A
+/// Whether the full report of the first ring-3 trap has been printed. A
 /// process that returns from its own SIGSEGV handler faults again on the very
 /// next instruction, so the console sees the same fault thousands of times;
-/// one full report is what a reader needs.
-static GP_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// one full report is what a reader needs. One flag for every vector the door
+/// serves, because the reader is debugging one crash, not counting traps.
+static TRAP_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

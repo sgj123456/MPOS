@@ -105,14 +105,26 @@ pub trait Kernel: Sync {
     /// words are therefore not comparable to each other, exactly as on Linux.
     fn report_user_fault(&self, addr: usize, ip: usize, sp: usize, error: usize);
 
-    /// Report a userland trap that has no faulting address - a ring-3 `#GP` on
-    /// x86_64 (a `hlt`, an `int` the process may not issue, a bad descriptor).
+    /// Report a userland trap that has no faulting address - a ring-3 `#UD`
+    /// (`hlt` is `#GP`; `0f 0b` is this one) and the five other vectors that
+    /// share the machine's trap door.
     ///
     /// Linux has a second line shape for that class and it is not a formatting
-    /// accident: `traps: comm[tid] general protection fault ip:… sp:… error:0`
-    /// carries no `at <address>` because there is none, and printing a borrowed
-    /// address beside it would be an invention.
-    fn report_user_trap(&self, ip: usize, sp: usize, error: usize);
+    /// accident: `traps: comm[tid] <what happened> ip:… sp:… error:0` carries no
+    /// `at <address>` because there is none, and printing a borrowed address
+    /// beside it would be an invention. The kernel fills in the words for what
+    /// happened from the vector, in its own vocabulary rather than Linux's -
+    /// this host's kernel log is not readable, so a borrowed wording would be a
+    /// recalled one (`docs/notes/` §6.158).
+    ///
+    /// `vector` is the machine's own word for *which* exception this was, and it
+    /// is the only fact that survives a trap frame: `#DE`, `#UD`, `#SS`, `#NP`,
+    /// `#AC` and `#GP` all arrive as an `InterruptStackFrame` with an error code
+    /// that is usually zero. The kernel names it
+    /// (`crate::kernel_services::trap_name`), and this seam carries the number
+    /// rather than the word so the machine layer keeps no second copy of the
+    /// table.
+    fn report_user_trap(&self, vector: u8, ip: usize, sp: usize, error: usize);
 
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
@@ -601,11 +613,11 @@ pub fn report_user_fault(addr: usize, ip: usize, sp: usize, error: usize) {
     registered().report_user_fault(addr, ip, sp, error)
 }
 
-/// Report a userland trap with no faulting address. See
+/// Report a userland trap with no faulting address, naming its vector. See
 /// [`Kernel::report_user_trap`].
 #[inline]
-pub fn report_user_trap(ip: usize, sp: usize, error: usize) {
-    registered().report_user_trap(ip, sp, error)
+pub fn report_user_trap(vector: u8, ip: usize, sp: usize, error: usize) {
+    registered().report_user_trap(vector, ip, sp, error)
 }
 
 /// The running task's `comm`. See [`Kernel::current_comm`].
