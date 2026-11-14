@@ -14562,3 +14562,138 @@ unguarded `use mpos_user_tests::Report;` is an unused import on the aarch64 buil
    intentional `__builtin_trap()` after an earlier logical failure; it is *trying* to die. Its
    remaining causes are the dbus-less image and the parked-fault race (`libcrc32c`/`libdbus-1`
    instruction-fetch `#PF` on a table-present page, §6.153's open question).
+
+## §6.160 `siginfo_t`'s `si_addr` and `si_code`: a fault record is not a sender (item 280, LANDED 2026-11-14)
+
+### The observation
+
+Item 279 gave every synchronous x86_64 exception its own signal number, but the
+*record* the signal carried was still a sender's. `hal::kernel::send_signal`
+queues `SigInfo::user` — `si_code = SI_USER` (0) with the sender's pid and uid
+at wire offset 16 — and a fault's `si_addr` occupies **those same eight
+bytes**. A guest program that installed an `SA_SIGINFO` handler for `SIGSEGV`
+and then wrote to `0x10` read `si_code=0` and a garbage `si_addr` (the pid),
+where Linux answers `SEGV_MAPERR` (1) and `0x10`. A debugger asking "which
+address faulted" was told a process id. Three different writers laid the
+`siginfo_t` out — x86_64's signal frame, aarch64's signal frame, and
+`sigtimedwait`'s output — so any fix applied to one of them was a fix that
+left two wrong.
+
+The delivery itself is not reliable enough to be a gate pin:
+`build/scratch/siginfo/rel.c` forked 16 children with a null-store handler on
+the guest (KVM) and measured `REL null-store: handler_ran=2/16 died=14
+other=0` — the two that ran printed `H sig=11 code=0 addr=0xb` /
+`addr=0xc`. `fault_repeats` kills a re-faulting task after three tries, and
+only §2.13's PIT timer stub has a GPR-preserving frame that can call
+`deliver_at_trap`. Handler-at-trap delivery for the six `x86-interrupt`
+vectors is therefore still the named gap of §6.159; this item pins the
+**record and its rendering**, which are deterministic on both machines.
+
+### The measurement, on the host first
+
+Linux 7.2.14, one forked child per trial, an `SA_SIGINFO` handler that prints
+and `_exit(0)`s (`build/scratch/siginfo/wire.c`, `faultcodes.c`, `probe2.c`).
+`sizeof(siginfo_t) = 128`. A null store's first 48 bytes:
+
+```
++00: 0b 00 00 00 00 00 00 00    signo = 11, errno = 0
++08: 01 00 00 00 00 00 00 00    code  = 1 (SEGV_MAPERR)
++16: 10 00 00 00 00 00 00 00    addr  = 0x10
++24/+32/+40: all zero
+```
+
+| fault | signal | `si_code` | `si_addr` |
+|---|---|---|---|
+| null store / unmapped read | `SIGSEGV` 11 | `SEGV_MAPERR` 1 | the address |
+| `PROT_READ` write / `PROT_NONE` read | `SIGSEGV` 11 | `SEGV_ACCERR` 2 | the address |
+| `ud2` (`#UD`) | `SIGILL` 4 | `ILL_ILLOPN` 2 | `rip` |
+| integer divide by zero (`#DE`) | `SIGFPE` 8 | `FPE_INTDIV` 1 | `rip` |
+| unaligned load with EFLAGS.AC (`#AC`) | `SIGBUS` 7 | `BUS_ADRALN` 1 | nil |
+| `int3` (`#BP`), `hlt` (`#GP`) | `SIGTRAP` 5 / `SIGSEGV` 11 | `SI_KERNEL` 0x80 | nil |
+
+`SEGV_MAPERR` (1) and `CLD_EXITED` (1) are the same number. That is the
+latent bug this item exposed: `hal::SignalInfo::chld_union()` keyed the union
+on `code` alone, so a fault record's `si_addr` would have been spelled as a
+sender's `si_pid`/`si_uid` and its +24 word as `si_status`. The origin bit,
+not `(signo, code)`, decides the layout — a `clone(SIGTERM)` child's death is
+a genuine `_sigchld` record whose `signo` is not `SIGCHLD`, so signo cannot
+replace it. A SIGBUS handler must clear EFLAGS.AC first or its own `dprintf`
+faults again.
+
+### The change
+
+1. **One renderer.** `hal::SignalInfo` and `sched::SigInfo` carry `addr: u64`
+   and `fault: bool`; `hal::SignalInfo::to_wire() -> [u8; 128]` is the single
+   writer of signo/errno/code at 0/4/8, the union at 16/20/24/32/40, and the
+   fault branch at 16. `chld_union()` answers `!fault && code in 1..=6` now,
+   so the predicate tells the truth about its own name for every caller.
+   Both machines' `SignalFrame::enter` copy `info.to_wire()` verbatim, and
+   `sigtimedwait` copies the same 128 bytes into its user buffer. For a
+   sender-shaped record the bytes are unchanged; the two `put_i32` helpers
+   (one per machine) are gone.
+2. **The fault record.** `src/sched/signal.rs` gained the five measured
+   `si_code` constants, `SigInfo::fault(sig, code, addr)`, and the host-compiled
+   `fault_record(vector, addr, rip, protection)` table with one row per
+   installed vector; the signal half stays `signal_for_trap` (item 279). A new
+   `Kernel::send_fault_signal(vector, addr, rip, protection) -> u8` seam
+   (trait + forwarder + `src/kernel_services.rs` impl) queues the record
+   through `sched::send_signal_info` and answers the signal number, so the
+   machine layer keeps no copy of the map.
+3. **The two x86_64 doors.** `page_fault` calls
+   `send_fault_signal(14, cr2, rip, code.contains(PROTECTION_VIOLATION))`;
+   `user_fault_or_die` calls `send_fault_signal(vector, 0, rip, false)`. Both
+   use the returned signal for `disposition_is_default` and
+   `die_of_fatal_signal`. The stale comment claiming a queued signal can only
+   be delivered at a syscall boundary is rewritten: §2.13 made trap-time
+   delivery reachable through the PIT stub, and the 2/16 measurement is
+   written down beside `fault_repeats`.
+
+### Pins and counterfactual
+
+- **Boot kunit, both machines** (`src/kernel_services/kunit.rs`, three new
+  cases in the `kernel_services` suite): a sender keeps `si_pid`/`si_uid`/
+  `sigval` at 16/20/24; a fault record with decoy sender fields puts
+  `si_code` 1 and `si_addr = 0x10` at 8/16 with +24..+48 zero and
+  `!chld_union()`; a child's death keeps `si_status`/`si_utime`/`si_stime`
+  at 24/32/40. These render the bytes directly, so they do not depend on a
+  handler being entered.
+- **Host unit tests** (`src/sched/signal.rs`): `numbers_are_pinned` gained the
+  five codes; `a_cpu_fault_record_names_its_code_and_address` and
+  `every_trap_vector_queues_its_own_fault_record` pin all nine `fault_record`
+  rows plus the protection-bit split. Host lib **811** tests, 0 failed.
+- **Counterfactual, both layers.** (a) `fault_record` flattened to
+  `SI_USER`/no address → the two new host tests red, `809 passed; 2 failed`.
+  (b) `to_wire`'s fault branch removed → the selftest boot reds
+  `a_fault_siginfo_puts_the_address_at_sixteen FAILED: si_addr is
+  0x580000004d, not 0x10` (the decoy pid/uid spelling), while the sender and
+  child cases stay `OK`. All nine files were restored byte-identically
+  (`build/scratch/item280/good.sha`), and a production-kernel field reading
+  then printed `H sig=11 code=1 addr=0x10` twice where the old kernel had
+  `code=0 addr=0xb`/`0xc`.
+- **Verification.** `cargo fmt --all --check` root + fuzz clean; host lib
+  811, xtask 162; six-arm clippy `162/162, 168/168, 389/389, 273/273, 3/3,
+  1/1` — "no lint has appeared and no count has grown"; `cargo check` clean
+  on host, x86_64 bare metal, aarch64 bare metal and the selftest build;
+  selftest boot `mpos-kunit: 35 passed, 6 failed` in the `-display none`
+  harness (the six are the known display suite), with all six
+  `kernel_services` cases `OK`.
+
+### What this does not do, named
+
+1. **Handler-at-trap delivery is still absent** for the six `x86-interrupt`
+   exception vectors (§6.159's gap 1). The record is right, but only a timer
+   tick's GPR-preserving stub can hand it to a handler; 14 of 16 null-store
+   children still die after three repeats. Per-vector error-code-aware stubs
+   are the prerequisite.
+2. **aarch64's `el0_sync` has no ESR→signal map** (§6.159's gap 2). The
+   renderer is shared and the kunit cases run on both machines, but a
+   refused EL0 fault there still ends in `die_of_fatal_signal(11)` with no
+   queued record.
+3. **The machine-specific `_sigfault` members stay zero**: `si_addr_lsb`
+   (BUS_ADRALN's detail), `si_addr_bnd` (MPX), `si_pkey` (memory protection
+   keys). This kernel has none of the three; a plausible number there would
+   be worse than an honest zero.
+4. **`signalfd_siginfo` is a different wire shape** and still has no
+   `ssi_addr`; `PTRACE_GETSIGINFO` synthesizes a stop's code rather than
+   reading the queued record. Both are separate doors, measured separately
+   when they are landed.

@@ -12514,3 +12514,61 @@ no `si_addr` and no per-trap `si_code` (`SigInfo`/`SignalInfo` have no address f
 produces `SI_USER`) - measured in the guest as `si_code=0` and a garbage address where Linux
 answers `SEGV_MAPERR` and the fault address. Chromium is not unblocked: its `cc 0f 0b` bytes are
 an intentional `__builtin_trap()` after an earlier logical failure.
+
+**Item 280**, landed 2026-11-14.
+
+### Item 280 a fault's `siginfo_t` carries `si_addr` and its own `si_code`
+
+Item 279 gave each synchronous x86_64 exception its own signal number; the
+record it carried was still `SigInfo::user` — `si_code = 0` (`SI_USER`) with
+the sender's pid at wire offset 16, which is exactly where Linux puts a
+fault's `si_addr`. A guest `SA_SIGINFO` handler for a null store read
+`si_code=0 addr=0xb` (a pid); Linux 7.2.14 answers `SEGV_MAPERR` (1) and
+`0x10`. Three writers laid `siginfo_t` out (x86_64's frame, aarch64's frame,
+`sigtimedwait`), so fixing one left two wrong.
+
+Measured on the host first (`build/scratch/siginfo/wire.c`, `faultcodes.c`):
+`sizeof(siginfo_t)=128`; signo/errno/code at +0/+4/+8; `si_addr` as an 8-byte
+word at +16; +24..+48 zero for a fault. Codes: `SEGV_MAPERR 1`,
+`SEGV_ACCERR 2`, `ILL_ILLOPN 2` (si_addr = rip), `FPE_INTDIV 1` (rip),
+`BUS_ADRALN 1` (nil), `SI_KERNEL 0x80` for `int3`/`#GP` (nil). `SEGV_MAPERR`
+and `CLD_EXITED` are both 1 — the union's discriminator had to become the
+record's origin, not `(signo, code)`.
+
+| | before | now |
+|---|---|---|
+| writers | three, each spelling the union | `hal::SignalInfo::to_wire()` on both machines and `sigtimedwait` |
+| record | `SigInfo::user` (`SI_USER`, pid at +16) | `SigInfo::fault` with `addr` and `fault: true` |
+| doors | `send_signal(11/sig)` | `send_fault_signal(vector, cr2/0, rip, protection)` behind a new `Kernel` seam |
+| `si_addr` | a pid | `cr2` for `#PF`, `rip` for `#DE`/`#UD`, nil for `#BP`/`#GP`/`#AC` |
+| `si_code` | 0 | `SEGV_MAPERR`/`SEGV_ACCERR`/`ILL_ILLOPN`/`FPE_INTDIV`/`BUS_ADRALN`/`SI_KERNEL` |
+
+Pins: three new `kernel_services` boot kunit cases (sender bytes unchanged,
+fault bytes at +8/+16 with +24..+48 zero and `!chld_union()`, child's
+status/utime/stime intact) on **both machines**, plus two host unit tests
+pinning all nine `fault_record` rows and the protection-bit split (host lib
+**811**). Counterfactual: flattening `fault_record` to `SI_USER` reds both
+host tests (`809 passed; 2 failed`); removing `to_wire`'s fault branch reds
+the boot case `a_fault_siginfo_puts_the_address_at_sixteen FAILED: si_addr is
+0x580000004d, not 0x10` while the sender/child cases stay `OK`. All nine
+files restored byte-identically; a production field reading then printed
+`H sig=11 code=1 addr=0x10` where the old kernel printed `code=0 addr=0xb`.
+
+The end-to-end handler pin was deliberately NOT used: 16 forked null-store
+children ran their handler `2/16` times on the guest, because only §2.13's
+PIT stub can call `deliver_at_trap` and `fault_repeats` kills after three
+re-faults. That is named, not hidden.
+
+**Gate** `build/gate-siginfo.log` exit 0: stage 1 **1329** host tests, 0
+failed; x86_64 `pass=318 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit 41
+passed, 0 failed` per arm (38 + the three new cases); lint ratcheted, both
+workspaces formatted, fuzz 23 targets.
+
+**What this does not do.** A fault's handler is still not entered *at the
+trap* for the six `x86-interrupt` vectors (needs per-vector GPR-preserving
+stubs); aarch64's `el0_sync` still ends refused EL0 faults in
+`die_of_fatal_signal(11)` with no queued record; `si_addr_lsb`/`si_addr_bnd`/
+`si_pkey` stay zero (no MPX/pkeys/alignment detail); `signalfd_siginfo` has
+no `ssi_addr` and `PTRACE_GETSIGINFO` still synthesizes a stop's code.
+Chromium is not unblocked — its `cc 0f 0b` is an intentional
+`__builtin_trap()` after an earlier logical failure. (§6.160, item 280)
