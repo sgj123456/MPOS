@@ -125,13 +125,61 @@ pub const EVENT_HEADER_SIZE: usize = 16;
 pub const EVENT_ALIGN: usize = 8;
 
 /// Linux's `fs.inotify.max_queued_events` default, per descriptor.
-pub const MAX_QUEUED_EVENTS: usize = 16384;
+pub const DEFAULT_MAX_QUEUED_EVENTS: usize = 16384;
 /// Linux's `fs.inotify.max_user_instances` default, whole-system here: one
 /// root, so the per-user and the per-system figure are the same number.
-pub const MAX_INSTANCES: usize = 128;
+pub const DEFAULT_MAX_INSTANCES: usize = 128;
 /// Linux's `fs.inotify.max_user_watches` default, whole-system for the
 /// same reason as above.
-pub const MAX_WATCHES: usize = 8192;
+pub const DEFAULT_MAX_WATCHES: usize = 8192;
+
+/// The three ceilings are **policy**, not constants: `/proc/sys/fs/inotify`
+/// reports them and a write moves them, which is how a program that needs
+/// more watches than the default raises its own allowance (`chromium` writes
+/// them on start-up, and `systemd`'s own defaults are 524288/1024).
+///
+/// Their defaults are Linux's, and each is enforced where the code below
+/// reads it - the queue's cap in `push`, the instance cap in `try_new`, the
+/// watch cap in `add`. A `set` to zero is Linux's own "none at all": the
+/// next allocation is refused (measured on a current host,
+/// `build/scratch/inoctl/r.c`: `max_user_watches` set to 3 makes the first
+/// `inotify_add_watch` answer `ENOSPC`, and `max_user_instances` set to 1
+/// makes the next `inotify_init1` answer `EMFILE`). One divergence stays
+/// named: Linux counts watches per **user**, this kernel per descriptor
+/// (`reg.watches`), because there is one user here.
+static MAX_QUEUED_EVENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_QUEUED_EVENTS);
+static MAX_INSTANCES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_INSTANCES);
+static MAX_WATCHES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WATCHES);
+
+/// The live per-descriptor queue ceiling: `fs.inotify.max_queued_events`.
+pub fn max_queued_events() -> usize {
+    MAX_QUEUED_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Move the per-descriptor queue ceiling, from a write to the sysctl.
+pub fn set_max_queued_events(count: usize) {
+    MAX_QUEUED_EVENTS.store(count, Ordering::Relaxed);
+}
+
+/// The live whole-system instance ceiling: `fs.inotify.max_user_instances`.
+pub fn max_instances() -> usize {
+    MAX_INSTANCES.load(Ordering::Relaxed)
+}
+
+/// Move the instance ceiling, from a write to the sysctl.
+pub fn set_max_instances(count: usize) {
+    MAX_INSTANCES.store(count, Ordering::Relaxed);
+}
+
+/// The live watch ceiling: `fs.inotify.max_user_watches`.
+pub fn max_watches() -> usize {
+    MAX_WATCHES.load(Ordering::Relaxed)
+}
+
+/// Move the watch ceiling, from a write to the sysctl.
+pub fn set_max_watches(count: usize) {
+    MAX_WATCHES.store(count, Ordering::Relaxed);
+}
 
 /// The `wd` of a record no watch produced - the queue-overflow report.
 pub const NO_WD: i32 = -1;
@@ -243,7 +291,7 @@ impl InotifyInstance {
     /// Linux's own refusal.
     pub fn try_new(ino: Ino, nonblock: bool) -> Option<Arc<InotifyInstance>> {
         let held = LIVE_INSTANCES.fetch_add(1, Ordering::Relaxed);
-        if held >= MAX_INSTANCES {
+        if held >= max_instances() {
             LIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
@@ -286,7 +334,7 @@ impl InotifyInstance {
     fn push(&self, ev: InotifyEvent) -> Vec<crate::sched::TaskId> {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
-            if st.queue.len() >= MAX_QUEUED_EVENTS {
+            if st.queue.len() >= max_queued_events() {
                 st.dropped = true;
                 // One overflow report per episode: `dropped` is raised,
                 // and the record goes in only as the flag goes up. The
@@ -741,7 +789,7 @@ pub fn add_watch(
             }
             return AddOutcome::Replaced(wd);
         }
-        if reg.watches.len() >= MAX_WATCHES {
+        if reg.watches.len() >= max_watches() {
             // The cap refuses rather than prunes: a machine at eight
             // thousand watches is doing something the caller knows about,
             // and silently dropping their news would be the worse answer.
@@ -1222,23 +1270,35 @@ mod tests {
         assert_eq!(fd.watch_count(), 0);
     }
 
+    /// The three ceilings start where Linux's do - a program that reads
+    /// `/proc/sys/fs/inotify/*` before raising them reads the defaults.
+    #[test]
+    fn the_ceilings_start_at_linuxs_defaults() {
+        assert_eq!(super::max_queued_events(), DEFAULT_MAX_QUEUED_EVENTS);
+        assert_eq!(super::max_instances(), DEFAULT_MAX_INSTANCES);
+        assert_eq!(super::max_watches(), DEFAULT_MAX_WATCHES);
+        assert_eq!(DEFAULT_MAX_QUEUED_EVENTS, 16_384);
+        assert_eq!(DEFAULT_MAX_INSTANCES, 128);
+        assert_eq!(DEFAULT_MAX_WATCHES, 8_192);
+    }
+
     /// Overflow: a full queue drops new events, raises exactly one
     /// `IN_Q_OVERFLOW` report with wd -1, and does not raise a second one
     /// while the episode lasts.
     #[test]
     fn a_full_queue_reports_overflow_once() {
         let fd = instance(4, false);
-        for i in 0..MAX_QUEUED_EVENTS as u32 {
+        for i in 0..max_queued_events() as u32 {
             fd.push(self_event(i as i32, IN_MODIFY));
         }
         assert_eq!(
             critical_section::with(|cs| fd.state.borrow(cs).borrow().queue.len()),
-            MAX_QUEUED_EVENTS
+            max_queued_events()
         );
         fd.push(self_event(1, IN_MODIFY));
         fd.push(self_event(1, IN_MODIFY));
         let q = critical_section::with(|cs| fd.state.borrow(cs).borrow().queue.clone());
-        assert_eq!(q.len(), MAX_QUEUED_EVENTS, "dropped, never grown");
+        assert_eq!(q.len(), max_queued_events(), "dropped, never grown");
         assert_eq!(
             q.iter().filter(|e| e.mask == IN_Q_OVERFLOW).count(),
             1,
@@ -1260,10 +1320,10 @@ mod tests {
         let mut held: Vec<Arc<InotifyInstance>> = Vec::new();
         while let Some(fd) = InotifyInstance::try_new(5000 + held.len() as u64, false) {
             held.push(fd);
-            assert!(held.len() <= MAX_INSTANCES, "the cap is the promise");
+            assert!(held.len() <= max_instances(), "the cap is the promise");
         }
         assert!(
-            held.len() + 8 >= MAX_INSTANCES,
+            held.len() + 8 >= max_instances(),
             "the refusals came from the cap, not from something else"
         );
         drop(held.pop());

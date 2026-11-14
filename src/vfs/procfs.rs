@@ -1596,6 +1596,24 @@ fn ctl(
     })
 }
 
+/// Parse one `/proc/sys` decimal count.
+///
+/// Linux's own refusals, measured (`build/scratch/inoctl/r.c`, 7.2.14): `abc`,
+/// `-1` and `2147483648` each answer `EINVAL` and leave the value alone, while
+/// `0` is a legal count. The text a tool writes carries a trailing newline,
+/// which `trim` takes off - `sysctl -w` and `echo` both end there.
+fn sysctl_count(text: &str) -> VfsResult<usize> {
+    let value = text.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(VfsError::Invalid);
+    }
+    let count: usize = value.parse().map_err(|_| VfsError::Invalid)?;
+    if count > i32::MAX as usize {
+        return Err(VfsError::Invalid);
+    }
+    Ok(count)
+}
+
 /// A sysctl knob whose value the kernel reports but does not enforce.
 ///
 /// Each of these is a real Linux default, honestly labelled: the read answers
@@ -6503,6 +6521,47 @@ impl ProcFs {
         let fs_knobs = dir();
         fs_knobs.add("protected_hardlinks", NodeKind::File, stub("1"));
         fs_knobs.add("protected_symlinks", NodeKind::File, stub("1"));
+        // `/proc/sys/fs/inotify`: the three ceilings the `inotify` code
+        // itself enforces, unlike the stubs above - the queue's cap, the
+        // instance cap and the watch cap all read these numbers, so a write
+        // changes what the next allocation answers. Measured on a current
+        // host (`build/scratch/inoctl/r.c`, Linux 7.2.14): root's write is
+        // accepted (`EACCES` for anyone else, the file is `0644`), `abc`,
+        // `-1` and `2147483648` are each `EINVAL` with the value untouched,
+        // and `max_user_watches = 3` makes the next `inotify_add_watch`
+        // answer `ENOSPC` while `max_user_instances = 1` makes the next
+        // `inotify_init1` answer `EMFILE`. `0` is accepted and means "none at
+        // all", which is why the enforcement compares `>=`. One divergence is
+        // named rather than hidden: Linux counts watches per *user*, this
+        // kernel per descriptor, because the machine has one user.
+        fs_knobs.add("inotify", NodeKind::Dir, {
+            let inotify = dir();
+            inotify.add(
+                "max_queued_events",
+                NodeKind::File,
+                ctl(
+                    || alloc::format!("{}\n", crate::vfs::inotify::max_queued_events()),
+                    |text| sysctl_count(text).map(crate::vfs::inotify::set_max_queued_events),
+                ),
+            );
+            inotify.add(
+                "max_user_instances",
+                NodeKind::File,
+                ctl(
+                    || alloc::format!("{}\n", crate::vfs::inotify::max_instances()),
+                    |text| sysctl_count(text).map(crate::vfs::inotify::set_max_instances),
+                ),
+            );
+            inotify.add(
+                "max_user_watches",
+                NodeKind::File,
+                ctl(
+                    || alloc::format!("{}\n", crate::vfs::inotify::max_watches()),
+                    |text| sysctl_count(text).map(crate::vfs::inotify::set_max_watches),
+                ),
+            );
+            inotify
+        });
         sys.add("fs", NodeKind::Dir, fs_knobs);
         // `/proc/sys/vm`: the one knob in this tree whose number the kernel
         // *asks*. `max_map_count` is the ceiling the `mmap` handler reads
@@ -9003,6 +9062,29 @@ mod tests {
     /// that emptiness is an end-of-file - the measured `0` bytes at `1 << 40` -
     /// while a read that starts inside the space and runs past its top answers
     /// the words it has.
+    /// A `/proc/sys` count is digits and nothing else, with `INT_MAX` as its
+    /// ceiling - measured on a current host (`build/scratch/inoctl/r.c`,
+    /// Linux 7.2.14): `abc`, `-1` and `2147483648` are each `EINVAL` with the
+    /// value untouched, `0` is a legal count, and the text a tool writes ends
+    /// in a newline.
+    #[test]
+    fn a_sysctl_count_is_digits_and_no_more() {
+        assert_eq!(super::sysctl_count("16384\n"), Ok(16384));
+        assert_eq!(super::sysctl_count("0\n"), Ok(0));
+        assert_eq!(super::sysctl_count(" 524288 "), Ok(524288));
+        assert_eq!(
+            super::sysctl_count(&alloc::format!("{}\n", i32::MAX as usize)),
+            Ok(i32::MAX as usize)
+        );
+        for bad in ["abc\n", "-1\n", "2147483648\n", "\n", "", "1_0\n"] {
+            assert_eq!(
+                super::sysctl_count(bad),
+                Err(VfsError::Invalid),
+                "{bad:?} is not a count"
+            );
+        }
+    }
+
     #[test]
     fn a_pagemap_read_is_whole_words_or_refused() {
         use super::pagemap_span;
