@@ -826,6 +826,39 @@ impl SysFs {
         // everything it held dropped without a word.
         let devices = fs.root.add_dir("devices", next);
         next += 1;
+        // `/sys/devices/system/cpu`: the CPU class, and the four lists that
+        // say which CPUs the machine is running. crashpad reads `online`
+        // before it can size its thread list, and without it a crash handler
+        // reports "no such file" and falls back to guessing; measured on a
+        // current host, all four are `0444` and their contents are a Linux
+        // CPU list (`0-15` on this 16-way machine) with `offline` empty.
+        //
+        // This kernel runs **one** CPU - the scheduler is uniprocessor by
+        // design, which is why `/proc/stat` prints `cpu` and `cpu0` for the
+        // same figure - so the list is the single entry `0` and `offline` is
+        // empty: nothing can be offlined when the one CPU is the one running.
+        // A machine that ever ran more would make these values a count; the
+        // shape is the list, so a reader that parses one is ready for it.
+        let system = devices.add_dir("system", next);
+        next += 1;
+        let cpus = system.add_dir("cpu", next);
+        next += 1;
+        for (name, content) in [
+            ("online", "0\n"),
+            ("present", "0\n"),
+            ("possible", "0\n"),
+            ("offline", "\n"),
+        ] {
+            cpus.add(
+                name,
+                Arc::new(SysFile {
+                    mode: AtomicU32::new(SYS_RO_ATTR_MODE),
+                    ino: next,
+                    content,
+                }),
+            );
+            next += 1;
+        }
         // `/sys/devices/virtual`: the home of every device in this tree that no
         // bus discovered. Created once, here, for exactly the reason the line
         // above gives - the input devices and the DRM nodes both hang under it,
@@ -3238,5 +3271,31 @@ mod tests {
         assert!(uevent.write_at(0, b"frobnicate").is_err());
         assert!(!crate::uevent::ready(watcher));
         crate::uevent::close(watcher);
+    }
+
+    /// The CPU class is Linux's list shape, and the machine it describes is the
+    /// one this kernel runs: a uniprocessor, which is why the list has one
+    /// entry and `offline` is empty.
+    ///
+    /// Measured on a current host first: all four attributes are `0444`, and
+    /// `online`/`present`/`possible` hold a Linux CPU list (`0-15` there) with
+    /// `offline` empty. crashpad opens `online` before it can size its thread
+    /// list, and a `ENOENT` there is the "no such file" it falls back from.
+    #[test]
+    fn the_cpu_class_names_the_one_cpu_this_machine_runs() {
+        let fs = fs();
+        let cpu = resolve(&fs, "/sys/devices/system/cpu");
+        assert_eq!(cpu.metadata().kind, NodeKind::Dir, "the class directory");
+        // The four lists, in their Linux spellings.
+        for name in ["online", "present", "possible"] {
+            let node = cpu.lookup(name).expect(name);
+            assert_eq!(text(&node), "0\n", "{name}");
+            assert_eq!(node.mode(), SYS_RO_ATTR_MODE, "{name}'s word");
+        }
+        let offline = cpu.lookup("offline").expect("offline");
+        assert_eq!(text(&offline), "\n", "nothing is offline");
+        // And the aggregate `/proc/stat` line this list agrees with names one
+        // CPU too - the two doors are the same fact.
+        assert!(text(&cpu.lookup("online").expect("online")).starts_with('0'));
     }
 }
