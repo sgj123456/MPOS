@@ -1,22 +1,26 @@
 //! Interrupt Descriptor Table and dispatch.
 //!
-//! Every handler but the clock uses the `x86-interrupt` ABI (nightly-only), which
-//! lets the compiler emit the register save/restore and `iretq` itself. That
-//! composes with preemption: a handler can switch tasks without ever returning,
-//! because the trap frame stays on the interrupted task's own stack and unwinds
-//! normally whenever that task is resumed.
+//! Two entries are hand-written asm; every other handler uses the
+//! `x86-interrupt` ABI (nightly-only), which lets the compiler emit the register
+//! save/restore and `iretq` itself. That composes with preemption: a handler can
+//! switch tasks without ever returning, because the trap frame stays on the
+//! interrupted task's own stack and unwinds normally whenever that task is
+//! resumed.
 //!
-//! The clock is the exception, and the reason is the one thing the ABI cannot
-//! give: `x86-interrupt` hides the general registers behind a prologue Rust
-//! cannot address, and a handled signal has to be handed over *at the trap* -
-//! Linux's delivery point - which means rewriting the interrupted program's
-//! whole register file. So the PIT entry ([`timer_stub`]) is hand-written asm
-//! that pushes a [`TrapRegs`] block, calls Rust, pops and `iretq`s. It is the
-//! same block shape `syscall_entry` builds, which is what lets one
-//! `hal::capture_trap_regs` serve both of this machine's doors onto a user
-//! register file (`docs/notes/` §2.13). Everything else here keeps the ABI: a
-//! hand-written stub buys control over the exact frame layout, and only the
-//! entry that must build a *signal* frame needs it.
+//! The two exceptions share a reason - the one thing the ABI cannot give:
+//! `x86-interrupt` hides the general registers behind a prologue Rust cannot
+//! address, and a handled signal has to be handed over *at the trap* - Linux's
+//! delivery point - which means rewriting the interrupted program's whole
+//! register file. Both stubs push a [`TrapRegs`] block, call Rust, pop and
+//! `iretq`. The PIT entry ([`timer_stub`]) has done this since signals were
+//! first delivered at a trap; the page-fault entry ([`page_fault_stub`]) does
+//! it so a fault a task installed a `SIGSEGV` handler for enters that handler
+//! here, instead of waiting for the next tick to deliver - a measured 2/16 in a
+//! guest (`docs/notes/` §6.161). It is the same block shape `syscall_entry`
+//! builds, which is what lets one `hal::capture_trap_regs` serve every door onto
+//! a user register file (`docs/notes/` §2.13). A hand-written stub buys control
+//! over the exact frame layout, and only an entry that must build a *signal*
+//! frame needs one.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -98,7 +102,11 @@ pub fn init() {
         table
             .general_protection_fault
             .set_handler_fn(general_protection);
-        table.page_fault.set_handler_fn(page_fault);
+        unsafe {
+            table
+                .page_fault
+                .set_handler_addr(x86_64::VirtAddr::new(page_fault_stub as *const () as u64));
+        }
         table.stack_segment_fault.set_handler_fn(stack_segment);
         table
             .segment_not_present
@@ -496,19 +504,38 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
     fatal("#DF double fault", &frame, code)
 }
 
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+/// The `#PF` entry, reached through [`page_fault_stub`] rather than the
+/// `x86-interrupt` ABI the other exceptions keep.
+///
+/// A resolved fault (copy-on-write, a demand-paged mapping, a grown stack) just
+/// returns and the instruction retries - that is the overwhelming majority of
+/// `#PF`s and needs no signal frame. But a fault a task installed a handler for
+/// has to enter that handler *at this trap*: Linux delivers it here, and a
+/// faulting instruction never reaches a syscall boundary. The `x86-interrupt`
+/// prologue hides the fifteen general registers Rust cannot address, so the
+/// hand-written stub pushes a [`TrapRegs`] block - the same one [`rust_timer`]
+/// hands `deliver_at_trap` - and this function can rewrite it. Relying on the
+/// next PIT tick to do the delivery was a measured 2/16 in a guest
+/// (`docs/notes/` §6.160); `fault_repeats` killed the other fourteen before a
+/// tick arrived. `docs/notes/` §6.161.
+///
+/// `frame` is that block: fifteen general registers, then the CPU's five-word
+/// frame shifted down over the error code (which `iretq` does not pop and the
+/// handler consumes). `code` is the raw error-code word passed separately.
+extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64) {
+    let code = PageFaultErrorCode::from_bits_truncate(code);
+    // Copy the facts out before any delivery rewrites the block: holding a
+    // `&TrapRegs` across `deliver_at_trap` (which writes through a raw pointer)
+    // would alias a shared reference with a mutable one.
+    let (rip, rsp, cs) = unsafe { ((*frame).rip, (*frame).rsp, (*frame).cs) };
     let addr = Cr2::read().map_or(0, |a| a.as_u64()) as usize;
-    let rip = frame.instruction_pointer.as_u64() as usize;
     // The top of the canonical lower half: everything a process may map.
     let user_address = addr < (1 << 47);
 
-    // A write to a copy-on-write page is resolved whoever made it. Usually that
-    // is ring 3 writing its own variable after a `fork`, but it is just as often
-    // ring 0: every syscall that fills a user buffer - `uname`, `getrandom`,
-    // `clock_gettime`, the `CLONE_CHILD_SETTID` write - lands on the same shared
-    // page, and the page must split for the kernel's write exactly as it would
-    // for the process's own. Refusing it here would take the machine down over
-    // an operation Linux performs without a second thought.
+    // A write to a copy-on-write page is resolved whoever made it - ring 3
+    // writing its own variable after a `fork`, or ring 0 filling a user buffer
+    // through a syscall (`uname`, `getrandom`, `clock_gettime`). Refusing the
+    // kernel's half would take the machine down over an ordinary operation.
     let cow = user_address
         && code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
         && crate::hal::kernel::resolve_cow_fault(addr);
@@ -516,95 +543,63 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         return; // The faulting instruction retries and succeeds.
     }
 
-    // A page of a mapping the process has made but never touched. The order
-    // against the two neighbours is the whole of the reasoning: a *present* page
-    // that is copy-on-write is handled above, so a page reaching here is absent
-    // and a COW split could not have been what it wanted; and the stack is
-    // handled below because a stack fault is a growth the stack's own bounds
-    // decide, over a region with no VMA to find.
-    //
-    // Unlike the COW case this is not gated on the fault being a write. A read
-    // of an address that has never been written is exactly what a demand-paged
-    // mapping is for, and the populate tells the two apart the only way that
-    // matters: the VMA's permissions decide, so a read of a `PROT_NONE` page is
-    // still refused and still a signal.
-    //
-    // The third answer is the machine's: the address is the process's to touch
-    // and there is no frame left to bring the page in with. Linux's measured
-    // answer (`docs/notes/` §8.0) is the OOM killer - the process is killed with
-    // `SIGKILL` and the machine carries on - and reading it as a `SIGSEGV` here
-    // was the defect: a machine out of memory looked like a program with a wild
-    // pointer.
+    // A mapping made but never touched, an absent stack page, and the machine's
+    // own out-of-memory answer. The order against COW above and stack growth
+    // below is the reasoning: a present COW page is handled first, and a stack
+    // fault is a growth the stack's bounds decide, over a region with no VMA.
+    // A demand fault is not gated on being a write - a read of an address never
+    // written is exactly what demand paging is for; the VMA's permissions still
+    // refuse a `PROT_NONE` read here. Linux's measured OOM answer is the OOM
+    // killer, not a `SIGSEGV` (`docs/notes/` §8.0).
     if user_address {
         match crate::hal::kernel::resolve_anon_fault(
             addr,
             code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
         ) {
-            crate::hal::kernel::FaultAnswer::Resolved => return, // Retries and succeeds.
+            crate::hal::kernel::FaultAnswer::Resolved => return,
             crate::hal::kernel::FaultAnswer::Refused => {}
             crate::hal::kernel::FaultAnswer::OutOfMemory => crate::hal::kernel::out_of_memory(),
         }
     }
-
-    // A push past the end of what the loader mapped is an ordinary thing for a
-    // program to do, and Linux answers it by extending the stack. The bounds
-    // that make that safe - how far below `rsp`, and how far down in total -
-    // live with the stack itself; here all that matters is that the fault is
-    // at a user address and the process was running when it happened.
     if user_address && crate::hal::kernel::resolve_stack_growth(addr) {
         return; // The page is there now; the instruction retries.
     }
 
     // Anything else at a user address is the process's own fault to bear. The
-    // `rip` test keeps this from claiming a kernel fault that merely named a
-    // user address: a ring-0 dereference of a bad user pointer is a kernel bug,
-    // not a signal to deliver.
+    // `rip` test keeps a ring-0 dereference of a bad user pointer (a kernel bug)
+    // out of the signal path and in the panic below.
     if rip < (1 << 47) {
-        // Linux's own line, in Linux's shape (`docs/notes/` §6.73): the program
-        // and the thread that took the fault, then the address, the
-        // instruction, the stack and the machine's fault word. The machine
-        // layer supplies nothing but the numbers - which program is running is
-        // the kernel's answer, not this port's.
-        crate::hal::kernel::report_user_fault(
-            addr,
-            rip,
-            frame.stack_pointer.as_u64() as usize,
-            code.bits() as usize,
-        );
-        pf_diag(addr, rip, frame.stack_pointer.as_u64() as usize);
-        // Still extends the stack when the fault is a push past the mapped
-        // end - the same call, moved here so its answer can be printed with
-        // the rest of what the page tables say.
+        crate::hal::kernel::report_user_fault(addr, rip, rsp, code.bits() as usize);
+        pf_diag(addr, rip, rsp);
+        // A push past the mapped end is still an ordinary stack growth, moved
+        // here so its answer prints with the rest of what the tables say.
         if crate::hal::kernel::resolve_stack_growth(addr) {
-            return; // The page is there now; the instruction retries.
+            return;
         }
-        // The fault's own record: `si_addr` is `CR2`, and `si_code` is
-        // `SEGV_MAPERR` when the page is absent or `SEGV_ACCERR` when the
-        // page-table word says the mapping refused the access. `send_signal`
-        // would raise a `SI_USER` record with a pid in those eight bytes
-        // instead (`docs/notes/` §6.160).
+        // The fault's own record: `si_addr` is `CR2`, `si_code` is SEGV_MAPERR
+        // for an absent page or SEGV_ACCERR for a refused one. `send_signal`
+        // would put a pid in those eight bytes instead (`docs/notes/` §6.160).
         let sig = crate::hal::kernel::send_fault_signal(
             14,
             addr,
             rip,
             code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
         );
-        // A `#PF` with no handler is death - end the task here, with the
-        // signal number in the exit code for the parent's `wait` to read.
-        // The whole group dies with it (`die_of_fatal_signal`): a `SIGSEGV`
-        // with no handler kills the *process* on Linux, not one thread of it
-        // (`docs/notes/` §6.77b).
         if crate::hal::kernel::disposition_is_default(sig) {
             crate::hal::kernel::die_of_fatal_signal(sig);
         }
-        // A task that *installed* a handler needs a trap-time signal frame.
-        // §2.13 built one for the PIT's GPR-preserving `timer_stub`, so the
-        // next ring-3 tick can hand the record over; a fault that re-executes
-        // at the same `rip` [`FAULT_REPEAT_LIMIT`] times before then ends the
-        // task rather than holding its slice and flooding the console. That
-        // window is a measured 2/16 in a guest (`docs/notes/` §6.159) - the
-        // six `x86-interrupt` entries have no GPR frame of their own, so
-        // handler-at-trap delivery for them is still a named gap.
+        // Hand the record over *here*. The block has the whole register file,
+        // so `deliver_at_trap` rewrites it and this exception's `iretq` enters
+        // the handler - not a later timer tick. A traced task (or a build with
+        // no signal-frame support) declines the door and keeps the record
+        // pending for the syscall/timer paths; `fault_repeats` is the backstop
+        // that ends a task stuck re-faulting at one instruction.
+        #[cfg(mpos_signal_frame)]
+        {
+            if crate::hal::kernel::deliver_at_trap(frame as *mut ()) {
+                return;
+            }
+        }
         if fault_repeats(rip) {
             crate::hal::kernel::kprintln!(
                 "task {} died of SIGSEGV it could not be handed: {addr:#x} ({code:?}) at {rip:#x}, \
@@ -616,29 +611,100 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         crate::hal::kernel::preempt();
         return;
     }
-    // The report is the whole point of this path, and on a `--mode mirror` boot
-    // the console is the framebuffer - so without pulling it back to the
-    // wire first, a kernel that dies here leaves the reader with a vanished
-    // machine and no explanation. The same move as `fatal` and the panic
-    // handler in `main`.
+
+    // A kernel `#PF` is a bug, not a signal. A ring-0 trap pushed no `rsp`/`ss`,
+    // so the block's stack word is not a user stack pointer - walk from the
+    // frame's own address, which is the kernel stack the fault came from. The
+    // report is the whole point: on a `--mode mirror` boot the console is the
+    // framebuffer, so force it back to the wire before the machine stops.
+    let kernel_stack = frame as usize + 160;
     crate::hal::kernel::force_serial();
     crate::hal::kernel::kprintln!(
         "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x} cs {:#x} rsp {:#x}",
         addr,
         code,
-        frame.instruction_pointer,
-        frame.code_segment.0,
-        frame.stack_pointer
+        rip,
+        cs,
+        kernel_stack
     );
-    // One address is a coincidence; the chain is the diagnosis. A kernel fault
-    // is noticed at the instruction that touched the bad address, and what the
-    // reader needs is *how the kernel got there* - which, without a frame
-    // pointer to walk, means the words on the faulting stack that can only be
-    // return addresses into kernel text. Printed here rather than left to a
-    // host-side script for the reason the report is printed at all: on a GUI or
-    // compositor boot this is the only copy that leaves the machine.
-    report_frames(frame.stack_pointer.as_u64() as usize);
+    report_frames(kernel_stack);
     crate::hal::exit_qemu(crate::hal::TEST_EXIT_PANIC)
+}
+
+core::arch::global_asm!(
+    ".section .text.page_fault_stub, \"ax\"",
+    ".globl page_fault_stub",
+    ".p2align 4",
+    "page_fault_stub:",
+    // Unlike the timer vector, `#PF` pushes an error code: at entry the stack
+    // is [error code, rip, cs, rflags, rsp, ss]. Push the same fifteen general
+    // registers as `timer_stub`, so the block below the CPU frame is identical.
+    "    push rdi",
+    "    push rsi",
+    "    push rdx",
+    "    push rcx",
+    "    push rax",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov  rbp, rsp",
+    // Save the error code in rax (its user value is already safe in the block)
+    // and shift the CPU's five-word frame down eight bytes over it. `iretq`
+    // does not pop the error code - the handler consumes it - so removing that
+    // word is exactly right, and it makes the block at rbp a contiguous
+    // `TrapRegs`: fifteen GPRs then rip/cs/rflags/rsp/ss, with no gap. A
+    // forward `rep movsq` is safe because the destination is always one word
+    // behind the source, so no unread source is overwritten. `cld` in case a
+    // user program left DF set. rsi/rdi/rcx are scratch here; their saved user
+    // values are in the block and the epilogue pops them back (or the signal
+    // frame's values, if `deliver_at_trap` rewrites them).
+    "    mov  rax, [rbp + 120]",
+    "    cld",
+    "    lea  rsi, [rbp + 128]",
+    "    lea  rdi, [rbp + 120]",
+    "    mov  ecx, 5",
+    "    rep  movsq",
+    // arg1 = the `TrapRegs` block, arg2 = the error code.
+    "    mov  rdi, rbp",
+    "    mov  rsi, rax",
+    "    and  rsp, -16",
+    "    call {rust_page_fault}",
+    "    mov  rsp, rbp",
+    "    pop  r15",
+    "    pop  r14",
+    "    pop  r13",
+    "    pop  r12",
+    "    pop  rbp",
+    "    pop  rbx",
+    "    pop  r11",
+    "    pop  r10",
+    "    pop  r9",
+    "    pop  r8",
+    "    pop  rax",
+    "    pop  rcx",
+    "    pop  rdx",
+    "    pop  rsi",
+    "    pop  rdi",
+    // What is left under rsp is the shifted CPU frame with no error-code word;
+    // `iretq` pops it exactly as far as the CS says to (ring 3 adds rsp/ss,
+    // ring 0 does not). A signal delivery rewrote rip/rsp/rflags in this frame,
+    // so this same instruction enters the handler instead of re-faulting.
+    "    iretq",
+    // Restore the generic `.text` section so later `global_asm!`
+    // fragments that name no section do not inherit ours.
+    ".section .text, \"ax\"",
+    rust_page_fault = sym rust_page_fault,
+);
+
+unsafe extern "C" {
+    fn page_fault_stub();
 }
 
 /// How many words of the faulting kernel stack are walked for return addresses.
@@ -996,10 +1062,13 @@ fn pf_diag(addr: usize, rip: usize, rsp: usize) {
 /// for one that does not - which is exactly why the offset comes out the same
 /// for both: the compiler emits one extra push (and a wider `sub`) for a
 /// handler carrying an error code, and consumes them in its epilogue with the
-/// matching `add $0x10`. Verified against the disassembly of both
-/// `page_fault` (10 pushes, `sub $0x1d8`, epilogue `add $0x1d8` + 9 pops +
-/// `add $0x10`) and `breakpoint` (9 pushes, `sub $0x30`, epilogue `add $0x30`
-/// + 9 pops, no extra skip).
+/// matching `add $0x10`. Verified against the disassembly of the handlers that
+/// still use the ABI: `breakpoint` is 9 pushes, `sub $0x30`, epilogue
+/// `add $0x30` + 9 pops with no extra skip, while an error-code sibling is one
+/// push and `add $0x10` wider. `#PF` no longer belongs to that set: its entry
+/// is [`page_fault_stub`], which consumes the error code itself and leaves a
+/// contiguous [`TrapRegs`] block, because a handled fault has to be handed
+/// over at the trap (§2.13, §6.161).
 ///
 /// So the words around the struct read, for *any* vector, as:
 ///
