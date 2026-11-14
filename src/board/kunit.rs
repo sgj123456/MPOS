@@ -40,6 +40,10 @@ pub(crate) const SUITES: &[Suite] = &[
     mpos::vfs::kunit::SUITE,
     mpos::syscall::kunit::SUITE,
     mpos::syscall::kunit::IPC_SUITE,
+    // The trap reporter's words: six exception vectors share one door, and the
+    // table that names them is pure, so it needs nothing of the machine but the
+    // allocator an answer's message uses (`docs/notes/` §6.158).
+    mpos::kernel_services::kunit::SUITE,
     // The block layer's, which needs the devices the boot step before this one
     // registered (§10.5's last row is about what a read costs the machine).
     mpos::drivers::kunit::SUITE,
