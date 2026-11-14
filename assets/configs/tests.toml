@@ -198,6 +198,13 @@ diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 #                 `ESR`, and its per-class signal mapping is a named gap, so
 #                 this program's x86_64 claims have no counterpart there yet.
 #                 It builds on both machines and says "skipped" on the second.
+#
+#   t-fault-at-trap
+#                 x86_64's register-preserving `#PF` entry and its trap-time
+#                 signal handover (`docs/notes/` §6.161). On the second machine
+#                 an EL0 fault still dies without queueing a signal, so the
+#                 handler-at-the-fault claim has no counterpart there. It
+#                 builds on both machines and says "skipped" on the second.
 
 [aarch64]
-gaps = ["t-arch-prctl", "t-trap-signal"]
+gaps = ["t-arch-prctl", "t-trap-signal", "t-fault-at-trap"]
