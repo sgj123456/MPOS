@@ -14680,11 +14680,11 @@ faults again.
 
 ### What this does not do, named
 
-1. **Handler-at-trap delivery is still absent** for the six `x86-interrupt`
-   exception vectors (§6.159's gap 1). The record is right, but only a timer
-   tick's GPR-preserving stub can hand it to a handler; 14 of 16 null-store
-   children still die after three repeats. Per-vector error-code-aware stubs
-   are the prerequisite.
+1. **Handler-at-trap delivery was absent at the time of writing** for all
+   synchronous faults. §6.161 has since closed it for `#PF` (a hand-written
+   GPR-preserving stub, 2/16 → 16/16); the six `x86-interrupt` exception
+   vectors still wait for a timer tick's stub, and per-vector error-code-aware
+   stubs remain their prerequisite.
 2. **aarch64's `el0_sync` has no ESR→signal map** (§6.159's gap 2). The
    renderer is shared and the kunit cases run on both machines, but a
    refused EL0 fault there still ends in `die_of_fatal_signal(11)` with no
@@ -14697,3 +14697,121 @@ faults again.
    `ssi_addr`; `PTRACE_GETSIGINFO` synthesizes a stop's code rather than
    reading the queued record. Both are separate doors, measured separately
    when they are landed.
+
+---
+
+## §6.161 A handled `#PF` enters its handler at the trap, not a timer tick
+
+**The gap Item 280 named.** A queued `SIGSEGV` for a fault a task installed a
+handler for could only be handed over by §2.13's PIT `timer_stub`, because the
+`x86-interrupt` ABI on `page_fault` hides the fifteen general registers behind
+a prologue Rust cannot address. Twenty-for-one: a sixteen-child null-store
+probe ran its handler **2/16** times in a guest; the other fourteen re-faulted
+at the same `rip` and `fault_repeats` killed them after
+[`FAULT_REPEAT_LIMIT`] = 3 before a ~4 ms tick arrived
+(`build/scratch/item280/rel-guest.log`, `docs/notes/` §6.160's gap 1). Linux
+does not do this: its handler runs *at the fault*.
+
+**Measure first (Linux 7.2.14, `build/scratch/pfdeliver/`).** Three C probes,
+each a forked child with an `SA_SIGINFO` `SIGSEGV` handler:
+
+| Probe | What the handler does | Linux's answer |
+|---|---|---|
+| `rel.c` | prints `si_code`/`si_addr`, `_exit` | `REL null-store: handler_ran=16/16 wrong=0 died=0` |
+| `resume.c` | `mprotect(PROT_NONE → RW)` and **returns** | `RESUME page=42 keep=12345678abcdef00`, `RESUME_RC=0` — the faulting store re-executes and callee-saved `rbx` survives |
+| `resume8.c` | the same, eight children | `RESUME8 good=8/8 died=0 other=0` |
+
+`resume.c` is the load-bearing shape: a handler that merely exits would not pin
+the frame, because it never returns through `rt_sigreturn`, and a null store
+would not pin the resume, because there is nothing to repair. `resume8.c` first
+read `good=0/8` on **both** host and guest while every child printed correct
+values — a compiler-reordering artifact: `ok` was computed before the
+handler's non-atomic writes were visible. An `asm volatile("" ::: "memory")`
+fence before the check fixed it to `8/8`; the Rust pin uses atomics and
+`compiler_fence` for the same reason.
+
+**The change.** `arch/src/arch/x86_64/idt.rs` gives `#PF` its own
+register-preserving entry, the second hand-written stub in that port (the PIT's
+[`timer_stub`] was the first):
+
+- `extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64)` replaces
+  `extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code:
+  PageFaultErrorCode)`. The COW / demand-fault / stack-growth / report / siginfo
+  order is unchanged; `code` is rebuilt with
+  `PageFaultErrorCode::from_bits_truncate`, and `(rip, rsp, cs)` are copied out
+  of the block *before* any delivery can rewrite it (aliasing).
+- `page_fault_stub` (`.section .text.page_fault_stub`) pushes the same fifteen
+  GPRs as `timer_stub`. `#PF` alone pushes an error code, so the CPU frame is
+  `[error, rip, cs, rflags, rsp, ss]`; the stub saves the error word in `rax`
+  and shifts the five CPU words down eight bytes over it with
+  `cld; rep movsq` (`iretq` does not pop the error code — consuming it is
+  correct). 15 pushes × 8 = 120, so `[rbp+120..160)` becomes a contiguous
+  `[`TrapRegs`]` whose `rip/rflags/rsp` a signal frame can rewrite.
+- The user tail calls
+  `#[cfg(mpos_signal_frame)] { if crate::hal::kernel::deliver_at_trap(frame as
+  *mut ()) { return; } }` **at the fault**, right after `send_fault_signal(14,
+  addr, rip, protection)` and `disposition_is_default`. A traced task (or a
+  build without signal-frame support) declines the door; `fault_repeats` stays
+  as the backstop. The kernel-`#PF` panic path walks from the frame's own
+  address (a ring-0 trap pushes no `rsp`/`ss`, so the block's stack word is not
+  a user stack pointer). `fatal`'s stale disassembly note is corrected: `#PF`
+  is no longer one of the ABI handlers it describes.
+
+Nothing about `sigtimedwait`, the siginfo renderer, or the six other exception
+vectors moves. On aarch64 `el0_sync` still dies on a refused EL0 fault with no
+queued record — its `ESR`→signal map remains §6.159's named gap.
+
+**The pin, `t-fault-at-trap`.** Eight forked children (the reliability claim —
+one child can get lucky on a tick, eight in a row cannot). Each maps a
+`PROT_NONE` page, installs an `SA_SIGINFO` handler, holds
+`KEEP = 0x1234_5678_abcd_ef00` in callee-saved `r12` across an inline-asm
+store (`mov rsi, {p}; mov byte ptr [rsi], 42`), and the handler reads
+`si_code`/`si_addr` into atomics and calls `mprotect(READ|WRITE)` before
+returning. The child's claim: the handler ran once, `si_addr` is the page,
+`si_code` is fault-shaped, the store now reads back `42`, and `r12` still holds
+`KEEP` — so the frame resumed *into* the faulting instruction with all
+registers intact. Linux reports `SEGV_ACCERR` (2) for a `PROT_NONE` VMA; this
+kernel's `#PF` door reports `SEGV_MAPERR` (1) for an absent leaf; the claim
+accepts either and refuses `SI_USER` (0). That divergence is named in §6.160.
+`MPOS_ON_HOST=1` passes on Linux 7.2.14; the guest one-shot passes
+(`=== PASS t-fault-at-trap`). The program is in `[aarch64] gaps`.
+
+**Counterfactual.** Removing only the `deliver_at_trap` call (the record is
+still fault-shaped; only its handover point moves back to the PIT) reddens the
+claim exactly as the gap predicted: `FAIL: all 8 handled faults resumed at the
+trap (good=2 died=6 other=0)` → `FAILED`, `exit=1`
+(`build/scratch/pfdeliver/pin-cf.log`). The stub and door were restored
+byte-identically (`build/scratch/pfdeliver/good.sha`) and the guest passed
+again. A production field reading with the older sixteen-child null-store
+probe now prints `REL null-store: handler_ran=16/16 died=0 other=0` where the
+pre-change kernel printed `2/16`.
+
+**Gate.** `build/gate-pfdeliver.log` exit 0: stage 1 **1329** host tests, 0
+failed (50.51 s); x86_64 `verdict pass=319 fail=0` (319 programs, 28.89 s),
+aarch64 `verdict pass=316 fail=0` (78.59 s); `mpos-kunit 41 passed, 0 failed`
+per arm; `t-fault-at-trap` `=== PASS` in `build/test-lane-x86_64-1/serial.log`
+and built-but-skipped in the aarch64 `gaps`. `cargo fmt --all --check` root +
+fuzz clean; host lib **811**, xtask **162**; six-arm clippy ratchet
+`162/162, 168/168, 389/389, 273/273, 3/3, 1/1` — "no lint has appeared and
+no count has grown"; bare metal both arches and the selftest build compile.
+
+### What this does not do, named
+
+1. **The other six `x86-interrupt` exception vectors** (`#DE`, `#UD`, `#BP`,
+   `#NP`, `#SS`, `#GP`, `#AC`) still have no GPR-preserving stub: a handled
+   `SIGILL`/`SIGFPE`/`SIGTRAP` still waits for a timer tick. Each needs an
+   error-code-aware stub of the same shape (three of the seven push an error
+   code, four do not), and a `t-*` pin that can resume or at least prove the
+   frame. `t-trap-signal` (§6.159) still pins only their *terminating* signal.
+2. **aarch64's `el0_sync`** has no per-ESR-class signal map; refused EL0 faults
+   still end in `die_of_fatal_signal(11)` with no queued record.
+3. **`PROT_NONE`'s `si_code`** is `SEGV_MAPERR` here against Linux's
+   `SEGV_ACCERR`; the pin accepts both and §6.160 names the reason (the leaf is
+   absent rather than present-but-refusing).
+4. **`fault_repeats`' counter is still global and never reset** by a delivery;
+   it is now only a backstop for a task the trap-time door declined (a traced
+   task, or a build without `mpos_signal_frame`), which is the case it was
+   written for.
+5. **Chromium is not unblocked.** Its `cc 0f 0b` is an intentional
+   `__builtin_trap()` after an earlier logical failure, and the dbus-less image
+   and the unpinnable parked-fault race remain.

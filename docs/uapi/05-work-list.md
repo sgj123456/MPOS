@@ -12564,11 +12564,51 @@ failed; x86_64 `pass=318 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit 41
 passed, 0 failed` per arm (38 + the three new cases); lint ratcheted, both
 workspaces formatted, fuzz 23 targets.
 
-**What this does not do.** A fault's handler is still not entered *at the
-trap* for the six `x86-interrupt` vectors (needs per-vector GPR-preserving
-stubs); aarch64's `el0_sync` still ends refused EL0 faults in
+**What this does not do.** At the time of writing a fault's handler was not
+entered *at the trap* at all; §6.161 / item 281 has since closed `#PF` (its own
+GPR-preserving stub), leaving the six `x86-interrupt` vectors on the timer
+tick; aarch64's `el0_sync` still ends refused EL0 faults in
 `die_of_fatal_signal(11)` with no queued record; `si_addr_lsb`/`si_addr_bnd`/
 `si_pkey` stay zero (no MPX/pkeys/alignment detail); `signalfd_siginfo` has
 no `ssi_addr` and `PTRACE_GETSIGINFO` still synthesizes a stop's code.
 Chromium is not unblocked — its `cc 0f 0b` is an intentional
 `__builtin_trap()` after an earlier logical failure. (§6.160, item 280)
+
+## Item 281 — a handled `#PF` enters its handler at the trap
+
+| | Before | Now |
+|---|---|---|
+| `#PF` entry | `extern "x86-interrupt" fn page_fault` — the GPRs are hidden behind the compiler's prologue | `page_fault_stub` (hand-written asm) pushes a `TrapRegs` block, consumes the error code, and calls `rust_page_fault` |
+| A handled `SIGSEGV` | queued at the fault, delivered only at the next PIT tick: **2/16** children ran their handler; 14 re-faulted to death | `deliver_at_trap(frame)` at the fault: **16/16**; the handler repairs the page and `iretq` resumes the same instruction with every GPR intact |
+| Kernel-`#PF` panic | `frame.stack_pointer` from the `x86-interrupt` struct | the frame block's own address (a ring-0 trap pushes no `rsp`/`ss`) |
+
+Measured first on Linux 7.2.14 (`build/scratch/pfdeliver/{rel,resume,resume8}.c`):
+`handler_ran=16/16`, and a `PROT_NONE` page repaired by the handler resumes
+with callee-saved `rbx = 0x12345678abcdef00`. The last probe's first reading
+(`good=0/8` on both machines) was a missing compiler fence, not a kernel
+answer — fixed to `8/8`; the Rust pin uses atomics + `compiler_fence`.
+
+Pins: `t-fault-at-trap` — eight forked children, an `SA_SIGINFO` handler that
+`mprotect`s and returns, a live `r12 = 0x1234_5678_abcd_ef00` across the
+faulting store, and claims on `si_code`/`si_addr`, the resumed value `42` and
+the preserved register. `MPOS_ON_HOST=1` PASS; guest x86_64 PASS; aarch64 in
+`gaps` (its `ESR`→signal map is §6.159's named gap). Counterfactual: removing
+only the trap-time door → `FAIL: all 8 handled faults resumed at the trap
+(good=2 died=6 other=0)`, `FAILED exit=1`; restored byte-identically, PASS.
+Production field reading `REL null-store: handler_ran=16/16 died=0 other=0`
+(old kernel `2/16`).
+
+**Gate** `build/gate-pfdeliver.log` exit 0: stage 1 **1329** host tests, 0
+failed (50.51 s); x86_64 `verdict pass=319 fail=0`, aarch64
+`verdict pass=316 fail=0`; `mpos-kunit 41 passed, 0 failed` per arm;
+`t-fault-at-trap` `=== PASS` on the x86_64 lane. fmt both workspaces, host lib
+**811** / xtask **162**, six-arm clippy ratchet unchanged, bare metal both
+arches and selftest build all clean.
+
+**What this does not do.** The other six `x86-interrupt` exception vectors
+still have no GPR-preserving stub (a handled `SIGILL`/`SIGFPE`/`SIGTRAP` waits
+for a tick); aarch64 `el0_sync` still has no ESR→signal map; `PROT_NONE`'s
+`si_code` is `SEGV_MAPERR` here against Linux's `SEGV_ACCERR` (§6.160);
+`fault_repeats`' counter is still global and never reset; chromium is not
+unblocked (`cc 0f 0b` is an intentional `__builtin_trap()`). (§6.161, item
+281)
