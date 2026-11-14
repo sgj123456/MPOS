@@ -192,6 +192,12 @@ diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 #                 it - TLS goes through other doors there). The program builds
 #                 on both machines and says "skipped" on the second; naming it
 #                 here keeps the sweep's question honest on both.
+#
+#   t-trap-signal  x86_64's synchronous-exception vector table (`docs/notes/`
+#                 §6.159). The second machine decodes an EL0 fault through
+#                 `ESR`, and its per-class signal mapping is a named gap, so
+#                 this program's x86_64 claims have no counterpart there yet.
+#                 It builds on both machines and says "skipped" on the second.
 
 [aarch64]
-gaps = ["t-arch-prctl"]
+gaps = ["t-arch-prctl", "t-trap-signal"]
