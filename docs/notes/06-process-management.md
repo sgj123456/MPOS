@@ -14146,7 +14146,8 @@ AGENTS.md §5 trap); clearing that directory made the harness appear and the gat
 **What this does not do, named.** Chromium still does not *run* in the guest; with
 `--no-sandbox --headless=new` it now gets much further - it starts its threads, fails to reach dbus
 (absent from the image, and logged as an error by chromium itself), cannot read
-`/proc/sys/fs/inotify/max_user_watches` (that sysctl node has no file here - a named gap), and then
+`/proc/sys/fs/inotify/max_user_watches` (that node did not exist yet then - item 275 built it,
+`docs/notes/` §3.30), and then
 dies with a `#GP` executing the same `cc 0f 0b` padding, i.e. chromium's own `CHECK`/`IMMEDIATE_CRASH`
 path, which is what an unconfigured headless browser does on a bare system. Those are the next
 round's questions, not this one's: this round's claim is the width of one store.

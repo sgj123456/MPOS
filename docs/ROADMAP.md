@@ -2715,3 +2715,13 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `CHECK` instead of a corrupted stack; the missing dbus and the node-less
   `/proc/sys/fs/inotify/max_user_watches` are separate items. Gate `build/gate-resid2.log` exit 0:
   stage 1 1320, x86_64 `pass=314`, aarch64 `pass=313`, kunit 35/0 per arm (§6.156, item 274).
+
+- **Item 275 — `/proc/sys/fs/inotify`: three ceilings that are policy, not constants** (2026-11-14).
+  Chromium logged `Failed to read /proc/sys/fs/inotify/max_user_watches`; the numbers existed only as
+  `const`s inside `src/vfs/inotify.rs` (`16384`/`128`/`8192`, Linux's defaults) with no door to read
+  or raise them. Measured Linux first (`build/scratch/inoctl/r.c`: `0644` and `EACCES`-at-open, the
+  three `EINVAL` shapes, `0` legal, and both ceilings biting), then the constants became
+  `AtomicUsize`-backed policy read by the three enforcement sites, and `/proc/sys/fs` grew the
+  directory with a shared `sysctl_count` parse. Pinned by 14 claims in `t-inotify-limits` (host 6,
+  guest 14) with a four-red counterfactual; the per-user-vs-per-descriptor watch accounting stays a
+  named gap (§3.30, item 275).

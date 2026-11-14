@@ -12340,6 +12340,32 @@ because the loader still carried the hand-embedded production kernel (`build/gat
 "the kernel printed no mpos-kunit line") - the payload cache AGENTS.md §5 records.
 
 **What this does not do.** Chromium still does not run: with `--no-sandbox --headless=new` it now
-starts, reports the missing dbus and the unreadable `/proc/sys/fs/inotify/max_user_watches` (a named
-gap: that sysctl node has no file here), and dies in its own `CHECK`/`IMMEDIATE_CRASH` path. Those
+starts, reports the missing dbus and (at the time) an unreadable
+`/proc/sys/fs/inotify/max_user_watches` - item 275 has since built that node (§3.30) - and dies in
+its own `CHECK`/`IMMEDIATE_CRASH` path. Those
 are separate items. `docs/notes/` §6.156 has the whole reading.
+
+**Item 275**, landed 2026-11-14. `/proc/sys/fs/inotify/{max_queued_events,max_user_instances,max_user_watches}`
+exist, report the live ceiling, and a write moves it.
+
+| | before | now |
+|---|---|---|
+| the path | absent, `ENOENT` | three files, `0644`, the live number + newline |
+| where the numbers live | three `const`s (`16384`/`128`/`8192`) | `DEFAULT_*` behind `AtomicUsize`, with get/set accessors |
+| the enforcement sites | compare against the constants | compare against the accessors |
+| a write of `abc`/`-1`/`2147483648` | no door | `EINVAL`, value untouched (root; a stranger is refused at the open, `EACCES`) |
+| lowering `max_user_watches` to 2 | nothing anywhere reads it | two watches taken, the third `ENOSPC` |
+| lowering `max_user_instances` to 1 | ditto | the next `inotify_init1` `EMFILE` |
+
+Measured on the host first (`build/scratch/inoctl/r.c`, Linux 7.2.14): the mode and the `EACCES`-at-open
+ordering, the three `EINVAL` shapes, `0` as a legal count, and both ceilings biting. The parse is the
+same `sysctl_count` `/proc/sys/vm/max_map_count` uses, now factored out.
+
+Pin `user/tests/src/bin/t-inotify-limits.rs`, 14 claims (6 on a host run, where the claim is the
+refusal an unprivileged writer sees); counterfactual with the accessors answered from the constants
+and the setters made no-ops: exactly four red - the two bites, "root can lower", and "the queue
+ceiling can be moved and put back" - while the three reads and the two `EINVAL`s stayed green.
+
+**What this does not do.** Linux counts `max_user_watches` per user; this kernel counts it per
+descriptor (one user here), so a program with two descriptors can hold more watches than Linux would
+allow it. Named, not hidden: `docs/notes/` §3.30.

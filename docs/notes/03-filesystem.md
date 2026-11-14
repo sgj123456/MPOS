@@ -1967,3 +1967,57 @@ host suite is 793 passed / 0 failed.
    The backtrace named `read_bytes`; the defect was two frames up in `ptr_at`, and the same word had a
    second consumer (`ensure_slot`) that no crash had reached yet. Fix the **number's** journey, then
    walk every other reader of that word.
+
+### 3.30 `/proc/sys/fs/inotify`: the three ceilings are policy, and a write moves them (item 275, LANDED 2026-11-14)
+
+**The report.** Chromium on the disk image logged `Failed to read
+/proc/sys/fs/inotify/max_user_watches` and carried on; the path did not exist. Linux answers three
+files there, and programs read them before deciding how many watches they may afford.
+
+**Measured on the host first** (`build/scratch/inoctl/r.c`, Linux 7.2.14):
+
+| probe | answer |
+|---|---|
+| `max_user_watches`, `max_user_instances`, `max_queued_events`, mode | `0644` - root writes, anyone else `EACCES` at **open** |
+| this host's values | `524288`, `1024`, `16384` (tuned; the kernel defaults are `8192`, `128`, `16384`) |
+| write `abc`, `-1`, `2147483648` (as root) | `EINVAL`, value untouched |
+| write `0` | accepted - and it means *none at all* |
+| `max_user_watches = 3`, then `inotify_add_watch` | first allocations succeed, the next answers `ENOSPC` |
+| `max_user_instances = 1`, then `inotify_init1` | the next descriptor answers `EMFILE` |
+
+**What was wrong here.** The three numbers existed only as `const`s in `src/vfs/inotify.rs`
+(`MAX_QUEUED_EVENTS = 16384`, `MAX_INSTANCES = 128`, `MAX_WATCHES = 8192` - Linux's defaults), which
+the queue's `push`, the instance's `try_new` and the watch's `add` compared against. Correct numbers,
+no door: nothing could read them and nothing could raise them.
+
+**What landed.** The three constants became policy: `DEFAULT_MAX_*` (unchanged values) behind
+`AtomicUsize` cells with `max_queued_events()`/`set_max_queued_events()` and the same pair for the
+other two, and the three enforcement sites read the accessors rather than the constants. `/proc/sys/fs`
+grew an `inotify` directory whose three files report the live value and accept a write; the parse is
+the same one `/proc/sys/vm/max_map_count` uses, factored out as `sysctl_count` (digits only, at most
+`INT_MAX`, trailing newline trimmed), so the `EINVAL` shapes are shared rather than re-derived.
+
+**A divergence kept named**: Linux counts `max_user_watches` per **user**; this kernel counts it per
+descriptor (`reg.watches`), because the machine has one user. A program that opens two descriptors
+and raises the ceiling gets the same number of watches *per descriptor* here, which is more than
+Linux would give it - it does not lie about the number it reports, but the accounting behind it is
+not Linux's.
+
+**The pin.** `user/tests/src/bin/t-inotify-limits.rs`, 14 claims: on both machines each file answers a
+positive count; on the host an unprivileged write is `EACCES` even for a good number (the open is
+refused before any parse); on the machine `abc`/`-1` are `EINVAL` with the value untouched, the watch
+ceiling can be lowered to 2 so that exactly two watches are taken and the third is `ENOSPC`, the
+queue ceiling moves to 32 and back, and `max_user_instances = 1` makes the next `inotify_init1`
+`EMFILE` - each ceiling restored at the end. Host `MPOS_ON_HOST=1`: 6/6 PASS. Guest:
+14/14 PASS (`build/probe/oneshot/serial.log`).
+
+**Counterfactual** (`build/scratch/oneshot-inolimits-cf.log`): with the accessors answered from the
+constants and the setters made no-ops - i.e. stubs - exactly four red: `root can lower the watch
+ceiling`, `the lowered ceiling bites: two watches taken, the third is ENOSPC`, `the lowered instance
+ceiling bites: the second descriptor is EMFILE`, and `the queue ceiling can be moved and put back`.
+The three reads and the two `EINVAL` refusals stayed green, which is what makes the other four the
+claims that measure policy rather than reporting.
+
+**What this does not do.** `max_queued_events`' cap is enforced per descriptor, which is Linux's own
+shape; nothing else under `/proc/sys/fs/inotify` exists in Linux either. The per-user watch
+accounting above stays a named gap.
