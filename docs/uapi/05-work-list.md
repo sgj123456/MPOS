@@ -12408,8 +12408,8 @@ dispatch arms answering `ENOSYS` again, 17 claims red and the guest ends `FAILED
 **What this does not do.** No priority inheritance is *acted* on — the ready queues are
 kernel-internal bands, so a waiter gets Linux's handshake but not the latency guarantee.
 `FUTEX_WAIT_REQUEUE_PI`/`CMP_REQUEUE_PI` (13, 12) are still `ENOSYS`. The owner-died handover has a
-host test but no user-visible reading yet. And a user `#UD` is still reported as a
-general-protection fault (`src/kernel_services.rs:93`).
+host test but no user-visible reading yet. (The user `#UD` that abort produced used to be
+reported as a general-protection fault; that is fixed — item 278.)
 
 **Item 277**, landed 2026-11-14.
 
@@ -12437,3 +12437,33 @@ claims red.
 **What this does not do.** No `cpuN` directories (`topology`, `cpufreq`, `cpuidle`, `cache`,
 per-CPU `uevent`), no `isolated`/`nohz_full`/`smt` lists, and no hotplug — this kernel cannot online
 or offline anything.
+
+### Item 278 a trap report names the trap: six vectors, one door, one wrong word
+
+Chromium's crash log said `traps: chromium[737] general protection fault …` and printed the bytes at
+the faulting instruction: `0f 0b`. That is `ud2`, i.e. vector 6 (`#UD`), not vector 13 (`#GP`). One
+function — `user_fault_or_die` in `arch/src/arch/x86_64/idt.rs` — is shared by six IDT entries
+(`#DE` 0, `#UD` 6, `#NP` 11, `#SS` 12, `#GP` 13, `#AC` 17) and reported the general-protection
+literal for all of them.
+
+| what | before | now |
+|---|---|---|
+| `traps:` name, `#UD` (`0f 0b`, musl `a_crash`) | `general protection fault` | `invalid opcode` |
+| `traps:` name, `#DE`/`#NP`/`#SS`/`#AC`/`#GP` | `general protection fault` | each its own word |
+| first-fault line above it | `#GP code 0x1a …` | `trap 6 code 0x1a …` |
+| the seam | `report_user_trap(ip, sp, error)` | `report_user_trap(vector, ip, sp, error)` |
+
+Linux's per-vector wording could not be measured on this host (`dmesg` refuses without
+`CAP_SYSLOG`), so the words are this kernel's own and the code says so rather than claiming Linux's
+(`src/kernel_services.rs::trap_name`).
+
+Pins: the `kernel_services` boot suite (`src/kernel_services/kunit.rs`, `Phase::Arch`, three cases —
+`#UD` is not `#GP`, the seven dispatched vectors are pairwise distinct, an uninstalled vector still
+names). Counterfactual: with vector 6 answering the old word, two of the three cases red
+(`30 passed, 8 failed` against a `32 passed, 6 failed` baseline whose six failures are the
+display suite's, this harness having no display).
+
+**What this does not do.** The words are not Linux's (unmeasurable here); a program cannot see this
+line, so no ABI depends on it. `#PF` has its own handler and is in the table only because the
+numbering is shared. Nothing on aarch64 changed — its traps carry `ESR_EL1`, whose class names the
+reason, and it has no six-vector door.

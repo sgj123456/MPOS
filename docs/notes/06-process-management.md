@@ -1866,7 +1866,7 @@ The file a crash reporter reads to find a program's base address: every mapping 
 
 **And it is pinned now** (`t-maps`, 2026-10-23): a `MAP_PRIVATE` mapping of a three-page `memfd` — the shape whose pages come from the recorded range and not from a VMA — then `munmap` of its middle page and `mprotect` of its first. The file must split around the hole (no line at the hole, one line ending at it, one starting after it) and show `r--p` on the page the call named while the page it did not keeps `rw-p`; measured on the host first, where the same three observations come out of a VMA rather than a recorded range. Until this pin the two calls were wired and *nothing asserted them*, which is the "a complete driver plus green host tests" shape §13.29 warns about.
 
-**Two divergences, pinned as divergences:** an image's and a private file mapping's line reports `dev` `00:00` and inode `0`, because there is no object left to name — and `00:00` is what this kernel's own `stat` reports for every filesystem, so the two files agree rather than disagreeing. And a *shared anonymous* mapping is named `/memfd: (deleted)`, which is Linux's own name for a nameless `memfd` mapping (measured: `memfd_create("", 0)` + `MAP_SHARED` reports exactly that), because that is what the object here is; Linux reaches the same shape through `/dev/zero (deleted)`, which is an artefact of its own implementation. `memfd_create` now *keeps* the name it used to only validate, as `/memfd:<name> (deleted)` — the spelling both of its readers expect, measured on Linux — so a `wl_shm` pool's mapping says which buffer it is instead of leaving the column blank. Not written: `/proc/<pid>/numa_maps` and `/proc/<pid>/smaps_rollup` - the same accounting in two other spellings, whose formats are measured in `docs/uapi/` §5.2. (`/proc/<pid>/smaps` *is* written now, and it is this file's records with a field block under each: item 54, `docs/uapi/` §5.1, §15.73.)
+**Two divergences, pinned as divergences:** an image's and a private file mapping's line reports `dev` `00:00` and inode `0`, because there is no object left to name — and `00:00` is what this kernel's own `stat` reports for every filesystem, so the two files agree rather than disagreeing. And a *shared anonymous* mapping is named `/memfd: (deleted)`, which is Linux's own name for a nameless `memfd` mapping (measured: `memfd_create("", 0)` + `MAP_SHARED` reports exactly that), because that is what the object here is; Linux reaches the same shape through `/dev/zero (deleted)`, which is an artefact of its own implementation. `memfd_create` now *keeps* the name it used to only validate, as `/memfd:<name> (deleted)` — the spelling both of its readers expect, measured on Linux — so a `wl_shm` pool's mapping says which buffer it is instead of leaving the column blank. `numa_maps` and `smaps_rollup` **are** written (they were not when this paragraph was first drafted): the same accounting in two other spellings, measured and pinned — `t-numamaps` 20 claims and `t-smaps-rollup`, `docs/notes/15-boot-flow.md` §15.81. (`/proc/<pid>/smaps` *is* written now, and it is this file's records with a field block under each: item 54, `docs/uapi/` §5.1, §15.73.)
 
 **The offset column is a byte offset, and the line a copy used to hide it** (2026-11-01). `t-maps` now pins the column itself: a `memfd` mapped at byte 4096 reads `00001000` and one at 8192 reads `00002000`, with the memfd's own inode in the inode column — measured on Linux 7.2.11 first (`vm_pgoff << PAGE_SHIFT`, not `vm_pgoff`; a kernel printing pages would be off by 4096 and every tool that parses the column with it). The counterfactual (`line.offset / 4096` in the renderer) reddens exactly those two claims and nothing else, on both mappings, so the column is pinned as the shape rather than as a spelling.
 
@@ -14189,10 +14189,10 @@ futex(0x3fbc6a54, FUTEX_LOCK_PI, NULL) = -1 ENOSYS
 musl's `pthread_mutexattr_setprotocol` **probes** the kernel's PI support with `FUTEX_LOCK_PI` on a
 scratch word and returns whatever that says; Linux answers 0, this kernel answered `ENOSYS`, so
 musl reported "the program asked for something this libc cannot do" and pulseaudio aborted. The
-abort is `__builtin_trap` (`0f 0b`), which the machine's trap report calls a general-protection
+abort is `__builtin_trap` (`0f 0b`), which the machine's trap report called a general-protection
 fault: the "jump into inter-function padding" that the round before this one chased through the
-page tables was a `#UD` wearing the wrong name (`src/kernel_services.rs:93` hardcodes the string;
-named below, not fixed here).
+page tables was a `#UD` wearing the wrong name (`src/kernel_services.rs` hardcoded the string;
+fixed the same day, §6.158).
 
 ### Linux's answers, measured first
 
@@ -14270,6 +14270,155 @@ else untouched, the guest reddens **17** claims — every PI claim including
 3. The owner-died handover is implemented and unit-tested on the host side, but not measured
    against Linux end to end: the pin's child unlocks before it exits, so the `FUTEX_OWNER_DIED`
    path has no user-visible reading yet.
-4. The `#GP` the abort produced is still reported under the wrong name: a user `#UD`
-   (`__builtin_trap`) arrives at `user_fault_or_die`, which prints the general-protection string
-   for every vector.
+4. The `#GP` the abort produced used to be reported under the wrong name — a user `#UD`
+   (`__builtin_trap`) arrives at `user_fault_or_die`, which printed the general-protection string
+   for every vector. **Fixed the same day**: §6.158.
+
+## §6.158 one trap door, six exceptions, one word: the `#UD` chromium never took (item 278, LANDED 2026-11-14)
+
+### The observation
+
+A chromium crash for the second time in two days, and the log said the same thing both times:
+
+```
+ThreadPoolForeg[730]: segfault at 7ed7213230ce ip 00007ed7213230ce ... error 14 ...
+traps: chromium[737] general protection fault ip:7dde2df7194e sp:3ffc... error:0
+  #GP code 0x1a rip 0x...126 rsp ... rflags ...
+  bytes at rip: [cc, 0f, 0b, cc, 0f, 0b, cc, cc, cc, cc, 55, 48, 89, e5, 41, 56]
+```
+
+Those bytes are the answer to the question the line claims to answer. `0f 0b` is `ud2`, and in musl
+that is `a_crash()` — the instruction the allocator runs once it has found the heap corrupted
+(item 274's bug, already fixed and no longer the cause of this run). Everything around it is `cc`
+(`int3`) padding. The process did not attempt something the CPU refused as a *protection* fault: it
+executed an **invalid opcode**, which is vector 6, not vector 13.
+
+The name in that line came from `user_fault_or_die` in `arch/src/arch/x86_64/idt.rs`, one function
+that six IDT entries share:
+
+```rust
+extern "x86-interrupt" fn divide_error(frame)         { if user_fault_or_die(&frame, 0) {…} }
+extern "x86-interrupt" fn invalid_opcode(frame)       { if user_fault_or_die(&frame, 0) {…} }
+extern "x86-interrupt" fn segment_not_present(frame, code) { … }
+extern "x86-interrupt" fn stack_segment(frame, code)  { … }
+extern "x86-interrupt" fn alignment_check(frame, code){ … }
+extern "x86-interrupt" fn general_protection(frame, code) { … }
+```
+
+and it reported through `hal::kernel::report_user_trap(ip, sp, error)`, which formatted the literal
+`general protection fault` into every line, and printed `#GP code …` above it. The seam had no room
+for the one fact that distinguishes the six: the vector the machine dispatched through.
+
+### Why this is a bug and not cosmetics
+
+A trap frame preserves three facts — the interrupted `rip`, `rsp`, the error code — and the error
+code is usually zero for all six. The vector is the *only* thing that says which exception
+happened. Naming it wrongly is worse than not naming it: this repository's own reading of that log
+spent two rounds on hypotheses about a protection fault (a non-canonical operand, an SSE access the
+FPU state refused) that the machine never raised, and the actual instruction was in the bytes the
+same report printed.
+
+`docs/notes/` §6.73 records the shape this line *should* have — a `traps:` line carries no
+`at <address>` because the machine did not name one — and that remains right. What was wrong is the
+word.
+
+### What was measured, and what could not be
+
+- The `#UD` was produced deliberately: `build/scratch/trapname/u.c` is `__asm__ volatile("ud2")`,
+  exits 132 (`Illegal instruction (core dumped)`) on Linux 7.2.14.
+- **Linux's own wording per vector could not be measured here**: `dmesg` answers
+  `读取内核缓冲区失败: 不允许的操作` (no `CAP_SYSLOG` in this container), and `printk`'s trap
+  messages are not in any userspace-visible file. So this kernel does **not** claim Linux's words.
+  It names the vector in its own vocabulary, and says so in the code
+  (`src/kernel_services.rs::trap_name`).
+
+### The change
+
+1. `hal::kernel::Kernel::report_user_trap` takes the vector:
+   `fn report_user_trap(&self, vector: u8, ip: usize, sp: usize, error: usize)` (with the forwarder
+   in `arch/src/hal/kernel.rs`). The seam carries the *number*, not the word, so the machine layer
+   keeps no second copy of the table.
+2. Each of the six IDT entries passes its own vector (0, 6, 11, 12, 13, 17); the first-fault line
+   above the `traps:` line reads `trap {vector} code …` instead of `#GP code …`, and the
+   repeat-death line names the vector too. The one-shot flag `GP_REPORTED` became `TRAP_REPORTED`,
+   which is what it always was (one full report per boot, whichever vector).
+3. `src/kernel_services.rs::trap_name(vector) -> &'static str` is the table, total (`_ => "trap"`,
+   because the fault path must not be able to fail on its own diagnostic): 0 divide error, 1 debug,
+   3 breakpoint, 4 overflow, 5 bounds, 6 invalid opcode, 7 device not available, 8 double fault,
+   10 invalid TSS, 11 segment not present, 12 stack-segment fault, 13 general protection fault,
+   14 page fault, 16 x87 floating-point exception, 17 alignment check, 18 machine check,
+   19 SIMD floating-point exception, 20 virtualization exception, 21 control protection exception.
+   The report is then `traps: {comm}[{tid}] {name} ip:… sp:… error:…`.
+
+The six-vector door is intentional and stays: they are the traps with no faulting address, and one
+reporter is what keeps their bodies identical. What changed is that the reporter now asks which one
+it is serving.
+
+### The pins
+
+The reporter itself cannot be driven from a boot self-test — a fault taken from a suite would end
+the boot it is reporting on — so the pin is the table, which is the whole of the change:
+
+- `src/kernel_services/kunit.rs`, suite `kernel_services` at `Phase::Arch`, three cases:
+  - `an_invalid_opcode_is_not_a_protection_fault` — vector 6 is `invalid opcode`, vector 13 is
+    `general protection fault`, and the two are not the same word. This is the bug, in one case.
+  - `the_vectors_one_door_serves_each_answer_their_own_word` — the seven vectors the trap door and
+    the page-fault path dispatch through (`#DE`, `#UD`, `#NP`, `#SS`, `#GP`, `#PF`, `#AC`) each
+    answer a word, pairwise distinct, and none of them the `"trap"` fallback.
+  - `a_vector_the_idt_never_installs_is_still_named` — six uninstalled vectors answer a non-empty
+    word (the total function's contract).
+- Guest, selftest kernel booted on its own (`.workbuddy/one-test-boot.sh`, serial log
+  `build/scratch/boot-kunit.log`): all three cases `OK`; the boot's total is `32 passed, 6 failed`
+  because that harness is not the sweep's wiring (no display, hence the display suite's six
+  cases — the same 6 before and after this change).
+
+### The counterfactual
+
+With the old behaviour restored in the table — vector 6 answering `general protection fault`, i.e.
+the one-word reporter — the same boot reads:
+
+```
+mpos-kunit: kernel_services.an_invalid_opcode_is_not_a_protection_fault FAILED: vector 6 is
+  `general protection fault`, not the invalid opcode `#UD` is
+mpos-kunit: kernel_services.the_vectors_one_door_serves_each_answer_their_own_word FAILED:
+  vectors 6 and 13 are both `general protection fault`
+mpos-kunit: kernel_services.a_vector_the_idt_never_installs_is_still_named OK
+mpos-kunit: 30 passed, 8 failed
+```
+
+`build/scratch/boot-kunit-cf.log`; the third case stays green because the fallback is orthogonal to
+the bug, which is why it is written as its own claim.
+
+### The field reading
+
+The same guest kernel, booted on the disk image, runs chromium again (`--no-sandbox --headless=new
+--disable-gpu --dump-dom about:blank`, still `rc=191`) and its three traps are all vector 13, so the
+line is unchanged **and correct**:
+
+```
+  trap 13 code 0x1a rip 0x7d9af876f126 rsp 0x3f966d40 rflags 0x10246
+traps: chromium[736] general protection fault ip:7d9af876f126 sp:3f966d40 error:1a
+```
+
+and a `ud2` executed deliberately inside the guest by a program dropped on the 9p share
+(`build/scratch/uaddr.c`, musl, `fork` + `ud2` in the child) is reported as the trap it is:
+
+```
+traps: uaddr[764] invalid opcode ip:4011a9 sp:3fe9ccb0 error:0
+```
+
+(the `trap 6 code …` line above it does not appear because the one-shot full report had already been
+printed for chromium's earlier fault — one flag per boot, whichever vector). Under the old table
+that second line read `general protection fault`, which is exactly the sentence that sent this
+repository after the wrong fault twice.
+
+### What this does not do, named
+
+1. **The words are not Linux's.** `dmesg` is unreadable here (above), so reproducing `traps:`
+   wording per vector would be recalled, not measured. A program cannot see this line either way —
+   it is a diagnostic, not ABI — and the doc says which vocabulary it is in.
+2. **`#PF` is named but does not come through this door**: `page_fault` has its own handler and its
+   own `segfault at …` line; the vector appears in `trap_name`'s table because it is the same
+   numbering, and a future caller may use it.
+3. **The aarch64 machine has no equivalent line**: its traps are `ESR_EL1` exceptions whose class
+   names the reason directly, and it has no six-vector shared door, so nothing changed there.
