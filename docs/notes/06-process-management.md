@@ -14089,3 +14089,55 @@ root is the boot archive (ramfs, no park) and the aarch64 lane's disk reads did 
 arms were green while the shipped image could not boot. The pin is therefore the boot measurement
 above, not a `t-*`: a claim about "no file read while the table lock is held" is a statement about
 the kernel's own call graph, and the honest instrument for it is the boot on a real root.
+
+## §6.156 three four-byte words: the eight-byte store in `getresuid`, and the chromium crash it caused (item 274, LANDED 2026-11-14)
+
+**The report.** `chromium` on the disk image got past the loader and then died: with strace, the
+main thread's last two syscalls were `getresuid(...) = 0` and `getresgid(...) = 0`, and the next
+line was `+++ killed by SIGSEGV (core dumped) +++`. The kernel's own trap report named the
+instruction: `#GP code 0x1a`, `bytes at rip: [cc, 0f, 0b, cc, 0f, 0b, ...]` - `int3; ud2` repeated,
+which is musl's `a_crash()` padding, the instruction its allocator runs when it has decided its own
+metadata is corrupt (`arch/src/arch/x86_64/idt.rs`'s report already knew the shape: "`hlt` is the
+case that made this visible: it is musl's `a_crash()`"). A crashpad child had earlier printed
+`Check failed: setsid: Operation not permitted (1)`.
+
+**What the kernel was doing wrong.** `getresuid`/`getresgid` wrote each id with an **eight-byte**
+store (`(ptr as *mut u64).write_unaligned(word as u64)`) and validated eight bytes first. Linux
+writes one `uid_t`/`gid_t` - four bytes - per pointer. glibc's `getresuid(&r, &e, &s)` declares
+three four-byte locals, so every call overwrote the four bytes immediately above each one: the
+callers' saved words and pointers. musl's allocator found the wreckage a few instructions later and
+took the machine's only remaining exit, `a_crash()`.
+
+**Measured on the host first** (`build/scratch/resid/k.c`, Linux 7.2.14): a canary word placed
+immediately after each slot comes back `0x11111111, 0x22222222, 0x33333333` unchanged for `getresuid`
+and the same shape for `getresgid`; and three slots that each end a page - the next page unmapped -
+are written without complaint. Both are statements only a four-byte store satisfies.
+
+**The fix.** `identity_words` (`src/syscall/linux/posix.rs`) validates four bytes per pointer and
+stores `u32`. No behaviour changes for a caller that passed three real `uid_t`s - which is why
+nothing in the suite had ever seen it: `t-posix` read the ids back out of one `[u32; 3]`, where the
+two extra bytes landed inside the array that was about to be overwritten anyway.
+
+**The pin.** `t-posix` gained six claims: `getresuid`/`getresgid` still succeed against three
+*separate* `#[repr(C)]` slots, and each slot's canary word is untouched; and a `u32` slot that ends
+a page (its next page unmapped) is written rather than refused. Counterfactual, with the eight-byte
+store restored (`build/scratch/oneshot-resid-cf.log`): exactly those three red -
+`getresuid writes four bytes per slot, leaving the next word alone`,
+`getresgid writes four bytes per slot, leaving the next word alone`,
+`a four-byte slot that ends a page is written, not EFAULT` - and the fixed kernel is green
+(`build/scratch/oneshot-resid.log`). Host `MPOS_ON_HOST=1` green too: the claims are Linux's answer.
+
+**`setsid` is not a bug here.** Measured both ways (`build/scratch/setsid/b.c`, and the same program
+run in the guest): a plain child (not a group leader) gets `setsid` = its own pid and a second call
+`EPERM`; a child that `setpgid(0,0)`s first gets `EPERM`; a group leader gets `EPERM`. This kernel
+answers exactly that. The crashpad line in the user's log did not come back after the fix - in the
+next run chromium's own output held only the sandbox complaint (`Running as root without
+--no-sandbox is not supported`), so the `EPERM` was another face of the smashed stack, not a refusal.
+
+**What this does not do, named.** Chromium still does not *run* in the guest; with
+`--no-sandbox --headless=new` it now gets much further - it starts its threads, fails to reach dbus
+(absent from the image, and logged as an error by chromium itself), cannot read
+`/proc/sys/fs/inotify/max_user_watches` (that sysctl node has no file here - a named gap), and then
+dies with a `#GP` executing the same `cc 0f 0b` padding, i.e. chromium's own `CHECK`/`IMMEDIATE_CRASH`
+path, which is what an unconfigured headless browser does on a bare system. Those are the next
+round's questions, not this one's: this round's claim is the width of one store.

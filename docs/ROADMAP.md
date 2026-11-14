@@ -2704,3 +2704,13 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `build/gate-execorder2.log` exit 0: stage 1 1320, x86_64 `pass=314`, aarch64 `pass=313`, kunit
   35/0 per arm; the sweep before it reddened two aarch64 boot cases that bounded the console's own
   queued bytes at eight (`c4a6443`, §15.102). (§6.155, item 273).
+
+- **Item 274 — `getresuid`/`getresgid` write four bytes, not eight** (2026-11-14). The user's
+  chromium died in musl's `a_crash()` a few instructions after `getresgid`: this kernel stored each
+  id through a `*mut u64`, and glibc's three `uid_t` locals are four bytes each, so every call
+  overwrote the words above them. Linux's shape measured first (`build/scratch/resid/k.c`: canaries
+  survive, a page-ending slot is written), then the four-byte store, then six `t-posix` claims -
+  canaries for both calls and the page-ending slot - green on both arms and red in exactly those
+  three with the old store back. `setsid` measured too and correct. Chromium now reaches its own
+  `CHECK` instead of a corrupted stack; the missing dbus and the node-less
+  `/proc/sys/fs/inotify/max_user_watches` are separate items (§6.156, item 274).

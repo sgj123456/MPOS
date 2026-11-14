@@ -12310,3 +12310,31 @@ and recorded with their readings in `docs/notes/15-boot-flow.md` §15.102.
 that is a claim about the kernel's call graph, and the honest instrument is a boot on a real root.
 A later reader adding a read inside `with_table` will not be told by the sweep; the comment on
 `exec_replace` and this row are the record.
+
+**Item 274**, landed 2026-11-14. `getresuid`/`getresgid` write one four-byte word per pointer, as
+Linux does; they used to write eight and smash the caller's stack.
+
+| | before | now |
+|---|---|---|
+| bytes written per pointer | 8 (`*mut u64`, and eight validated) | 4 (`*mut u32`) |
+| a caller's canary word after the slot | overwritten with the id's high half (zero) | untouched |
+| a four-byte slot that ends a page | `EFAULT`, the next page is not mapped | written |
+
+Found from the user's chromium report (`SIGSEGV` right after `getresgid`): glibc's
+`getresuid(&r, &e, &s)` declares three four-byte locals, so each call clobbered the four bytes above
+each of them; musl's allocator noticed and ran `a_crash()` (`int3; ud2`, which the kernel reported as
+`#GP` with `bytes at rip: [cc, 0f, 0b, ...]`). Measured on the host first
+(`build/scratch/resid/k.c`, Linux 7.2.14): canaries survive the call and a page-ending slot is
+accepted.
+
+Pins: six claims in `t-posix` - three separate `#[repr(C)]` slots with canary words for each of
+`getresuid`/`getresgid`, and the page-ending slot; green on the host and in the guest; with the
+eight-byte store restored exactly those three red (`build/scratch/oneshot-resid-cf.log`).
+
+`setsid` was measured too and is not implicated: a non-leader child succeeds, a second call is
+`EPERM`, `setpgid(0,0)`-then-`setsid` is `EPERM`, a group leader is `EPERM` - Linux's answers.
+
+**What this does not do.** Chromium still does not run: with `--no-sandbox --headless=new` it now
+starts, reports the missing dbus and the unreadable `/proc/sys/fs/inotify/max_user_watches` (a named
+gap: that sysctl node has no file here), and dies in its own `CHECK`/`IMMEDIATE_CRASH` path. Those
+are separate items. `docs/notes/` §6.156 has the whole reading.
