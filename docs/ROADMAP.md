@@ -2823,3 +2823,33 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   leave one marker (the model's limit, not measured against Linux), the stale bit's window
   duration is unpinned, and a `SIGEV_THREAD_ID` expiry's marker lands on the named
   thread's record. (§6.167, item 287)
+
+- **Item 288 — a `CLOCK_THREAD_CPUTIME_ID` timer counts its creating thread, and is
+  disarmed when that thread ends**: §6.166's gap 2 named the refusal with a reason that
+  had never been measured — "the clock belongs to the creating thread while the timer
+  hangs off the group and outlives it; Linux freezes the clock when the thread dies, and
+  this table cannot express a frozen reading". The ownership half was right; the
+  mechanism half was **wrong**. Measured on Linux 7.3.4 (`build/scratch/thrcpu/
+  {t,t2,t3,t4,disarm}.c`): the clock counts the **creating thread's** CPU (a creator
+  burning ~60 ms fired a 30 ms repeating timer once, and the process's own `RUSAGE_SELF`
+  is irrelevant to it); it **stops** when that thread exits (300 ms of *main-thread* CPU
+  produced 0 further expiries); and Linux **disarms** the timer rather than freezing a
+  reading — after `pthread_join`, `timer_gettime` succeeds with value *and* interval 0,
+  `timer_getoverrun` is 0, `timer_settime` answers **`ESRCH`**, and `timer_delete` still
+  answers 0. So `TimerClock` gained a `Thread` arm carrying the creating thread's slot
+  **and generation** (a recycled slot must not read a stranger's CPU — the §5 trap this
+  repository has paid for with `setpriority` and pidfds), an optional latched final
+  reading; the rule itself is the `abi` leaf's pure `thread_clock_reading(live,
+  latched)`, host-testable because the decisive case needs a thread to die.
+  `latch_thread_clocks` runs from `exit` before the task is marked gone and disarms the
+  timers whose clock it was; `timer_arm` answers a `TimerArm` enum so `EINVAL` and
+  `ESRCH` stay distinct. Pin `t-timer-cpuclock` grew eight claims and **lost its
+  `host_run` branch entirely** (every one is Linux's answer on both arms); host leaf test
+  pins the four reading cases, including the one that must not be spelled as a zero.
+  Counterfactual reddens exactly the refusal (`code: 95`), the rest gated behind it.
+  Named: Linux's own reading for a 60 s timer whose creator died is `0.000000000` where
+  this kernel reads `9.728 s` (an arithmetic artefact of the frozen counter — the pin
+  asserts the agreement, not the artefact), and a `SIGEV_THREAD_ID` expiry aimed at a
+  thread other than the clock's is separated but not yet exercised. Gate: stage 1 1338,
+  x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet unchanged
+  (`build/gate-item288.log`, `build/gate-item288-arm3.log`). (§6.168, item 288)

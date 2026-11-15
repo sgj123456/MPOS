@@ -15546,8 +15546,11 @@ workspaces formatted.
    task. `Note 287` adds the freed marker; `note_timer_delivered` still finds no
    timer for such a record and leaves the counter alone, which is the honest
    half.
-2. **`CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`** (§6.123), so the CPU
-   clock's overrun path is unwitnessed.
+2. ~~**`CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`.**~~ **Closed by item
+   288** (§6.168): the clock counts the creating thread and Linux **disarms** the
+   timer when that thread ends (it does not freeze a reading, which is what this
+   list assumed) — `timer_gettime` 0/0, `timer_settime` `ESRCH`, `timer_delete`
+   still 0.
 3. **The overrun counters are not reported anywhere else** - `/proc/<pid>/timers`
    carries the clock word and the signal, not the run state, which is a
    separate door nobody has asked for.
@@ -15654,9 +15657,7 @@ tests 0 failed (59.13 s, lib **819** with this item's new case); stage 2 **323**
 programs over 6 lanes (38.44 s); x86_64 `pass=323 fail=0`,
 `mpos-kunit 41 passed, 0 failed`, exit 33, 15 of 338 left out by `tests.toml`.
 aarch64 `pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed`, 19 of 338 left out
-(`build/gate-item287-arm.log`, `ARM_EXIT=0` — its own arm, for the reason
-§6.166 records: this sandbox's `/var/tmp` is read-only and QEMU hardcodes it as
-the `snapshot=on` overlay directory, so the arm runs against a writable medium).
+(`build/gate-item287-arm.log`, `ARM_EXIT=0` — its own arm).
 Clippy ratchet unchanged at `162/168/389/273/3/1` ("no lint has appeared and no
 count has grown"), both workspaces formatted.
 
@@ -15678,17 +15679,15 @@ count has grown"), both workspaces formatted.
    leader therefore cannot mark a worker's record — the same shape §6.166 names
    for the expiry's target, unwitnessed by any fixture.
 
-## §6.168 `CLOCK_THREAD_CPUTIME_ID` timers: the clock is the creating thread's, and it freezes (measured, NOT YET BUILT)
+## §6.168 a `CLOCK_THREAD_CPUTIME_ID` timer counts its creating thread, and is disarmed when that thread ends (item 288, LANDED 2026-11-15)
 
-**Why this is here and not in a landing.** §6.166's gap 2 names
-`clock_create(CLOCK_THREAD_CPUTIME_ID)` staying `EOPNOTSUPP`. The refusal's
-*reason* — "the clock belongs to the thread that called `timer_create`, while the
-timer hangs off the group and outlives that thread; Linux freezes the clock when
-the thread dies, and this table cannot express a frozen reading" — had never been
-measured. It is correct, and the measurement is below, but the build is a larger
-change than the reason's one sentence suggests, so this section records the
-contract for the item that takes it rather than starting a half-built
-implementation at the end of a session.
+§6.166's gap 2 named `timer_create(CLOCK_THREAD_CPUTIME_ID)` staying
+`EOPNOTSUPP`. The refusal's *reason* — "the clock belongs to the thread that
+called `timer_create`, while the timer hangs off the group and outlives that
+thread; Linux freezes the clock when the thread dies, and this table cannot
+express a frozen reading" — was measured first, and it was right about the
+ownership and **wrong about the mechanism**: Linux does not freeze a reading, it
+**disarms the timer**.
 
 **Measured on Linux 7.3.4** (`build/scratch/thrcpu/{t,t2,t3,t4}.c`):
 
@@ -15714,30 +15713,125 @@ implementation at the end of a session.
   `si_code` -2 and reaches a `signalfd` like any other (`t2.c`: one expiry, read
   back through the descriptor).
 
-**What building it needs**, so the next session starts from the shape rather
-than the sentence:
+**The change.** `TimerClock` gained a `Thread` arm carrying the creating
+thread's slot **and its generation** plus an optional latched final reading; the
+reading itself is the `abi` leaf's pure `thread_clock_reading(live, latched)`,
+which is where the rule can be host-tested (the case that matters needs a thread
+to die, which a unit test cannot do on a machine). The generation is what keeps a
+recycled slot from reading a stranger's CPU - the class AGENTS.md §5 records for
+`setpriority`/`prlimit64` indexing a table with a raw number. `latch_thread_clocks`
+runs from `exit` **before** the task is marked gone, walks the thread **group's**
+timer table (a worker may create a timer that outlives it, `§2.11`), and for each
+matching clock latches the final reading and **disarms** the timer - `deadline`,
+`interval_ticks` and both overrun counters to zero, which is Linux's disarmed
+shape. `timer_arm` answers a new `TimerArm` enum so the three answers stay
+distinct: `Armed`, `NoSuchTimer` (`EINVAL`), and `ClockGone` (**`ESRCH`**).
 
-1. `TimerClock` gains a `Thread(TaskId)` arm — the creating thread's id, kept on
-   the timer because the *timer* outlives the thread and the reading belongs to
-   that thread and no other.
-2. `Task` must keep a **frozen final CPU pair**, written when a task exits, so a
-   clock that names a dead thread has something honest to answer. That is the
-   prerequisite the current comment names, and it is a task-lifecycle change
-   rather than a timer-table one.
-3. `TimerClock::now` needs the frozen pair threaded to it; the expiry scan reads
-   the group's CPU today (`group_now` in `check_posix_timers`) and would need the
-   named thread's instead, falling back to the frozen pair.
-4. The `deadline` arithmetic, `timer_settime`'s `old_value`, `timer_gettime` and
-   `timer_delete` all read the same clock through `TimerClock::now`, so one
-   reading function is the whole of the arithmetic — the shape §6.123 established
-   for the process clock.
-5. The pin belongs in `t-timer-cpuclock` (it already walks the process clock):
-   the thread's expiry fires while it burns, the reading *stops* when the thread
-   exits, and main-thread CPU does not move it. That last claim is the
-   counterfactual's own target — a clock that fell back to the group's CPU would
-   pass the first two and fail it.
+**The pins.** `t-timer-cpuclock` grew eight claims and **lost its `host_run`
+branch entirely** - every one is Linux's answer on both arms: a timer builds on
+the creating thread's clock; 60 s of its CPU can be armed; while the creator
+lives the clock counts (59999 ms left); a *thread* can own a timer on its own
+clock; after that thread exits the timer still exists (`timer_gettime` answers
+0); it is disarmed with value **and** interval zero; its overrun is 0; re-arming
+answers `ESRCH` not `EINVAL`; and it still deletes, so it was never removed.
+Host: the leaf test `a_thread_clock_reads_live_then_final_then_nothing` pins the
+four cases, including the one that cannot be spelled as a zero - a thread gone
+with nothing latched is `None`, because a zero is a reading a deadline could
+satisfy. Guest `=== PASS t-timer-cpuclock exit=0`, `MPOS_ON_HOST=1` `PASS`.
 
-**Named before it is built:** a `SIGEV_THREAD_ID` expiry aims at a named thread
-while the *clock* names the creating one, and the two can differ; Linux allows
-that (the record goes to the named thread, the clock stays the creator's), so the
-pin should separate them rather than assume one thread.
+**Counterfactual.** The kernel half stashed (five files), kernel and loader
+rebuilt, the pin in the guest: **one claim red** -
+`FAIL: a timer can be built on the creating thread's own CPU clock (Err(Os { code:
+95, kind: Unsupported }))` - with the rest gated behind it, which is the right
+shape for a "serve this" item: the refusal is the promise that moved, and every
+later claim is about a timer that could not be made. Restored from
+`build/scratch/thrcpu/good/*.rs` with `sha256sum -c` (成功 on all six), rebuilt,
+`PASS`.
+
+**Gate.** `build/gate-item288.log` (x86_64 arm, `TMPDIR` unset) and
+`build/gate-item288-arm3.log` (aarch64, `TMPDIR=/dev/shm`): stage 1 **1338** host
+tests 0 failed (63.75 s, lib **819** plus the leaf test's own crate); x86_64
+`pass=323 fail=0`, `mpos-kunit 41 passed, 0 failed`, exit 33, 15 of 338 left out;
+aarch64 `pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed`, 19 of 338 left out.
+Two earlier aarch64 attempts are part of this item's record and §6.169 carries
+them: one failed `t-9p` in all six lanes because a wrong workaround had deleted
+`snapshot=on` (each lane needs its private overlay), and one caught the pin's own
+over-tight coalescing claim. Clippy ratchet unchanged at `162/168/389/273/3/1`,
+both workspaces formatted.
+
+**An improvement over the reference, worth noting rather than glossing.** Linux's
+reading for a 60 s timer whose creator died within 20 ms of CPU is
+`0.000000000` - the frozen counter value drives the remaining-time subtraction to
+zero (`t3.c`). This kernel keeps the *arithmetic* honest instead: the guest read
+`value = 9.728 s` and it did not move across 150 ms of main-thread CPU, which is
+the claim both machines agree on (the clock does not follow another thread)
+expressed without Linux's artefact. The pin asserts the agreement, not the
+artefact.
+
+**Named.** A `SIGEV_THREAD_ID` expiry aims at a named thread while the *clock*
+names the creating one, and the two can differ; Linux allows that (the record
+goes to the named thread, the clock stays the creator's), so the pin separates
+them rather than assuming one thread - and does not yet exercise the pair.
+`CLOCK_THREAD_CPUTIME_ID`'s `clock_gettime` reading was already served (§6.99);
+what this item added is the *timer* on that clock.
+
+## §6.169 the aarch64 arm's lane isolation is `TMPDIR`, not a crippled `snapshot=on` (a sandbox lesson, and the claim it caught)
+
+**What happened.** This sandbox's `/var/tmp` is read-only, and QEMU puts a
+`-drive ...,snapshot=on` overlay there, so on 2026-11-15 every aarch64 lane
+refused to start:
+
+```
+qemu-system-aarch64: -drive file=…,snapshot=on: Could not open temporary file
+  '/var/tmp/vl.XXXXXX': Read-only file system
+```
+
+The first workaround was to delete `snapshot=on` from `xtask/src/qemu.rs` for the
+verification run. **That was wrong, and it cost two hours.** `snapshot=on` is what
+gives each lane a private overlay over the one shared sweep medium; without it six
+lanes wrote the same disk concurrently, and `t-9p` then failed in **all six** lanes
+with
+
+```
+mkdir: can't create directory '/sysroot/mnt/share': File exists
+mount: mounting  on /sysroot/mnt/share failed: Not a directory
+initramfs: no host share to re-mount
+```
+
+which reads like a kernel regression and is a fixture race the flag exists to
+prevent.
+
+**The correct answer was already in this library.** §6.145/§6.44's gate lines are
+written `TMPDIR=$PWD/build/tmp cargo xtask test`, and QEMU resolves that overlay
+through `TMPDIR` — so setting it costs nothing and touches no source:
+
+```bash
+TMPDIR=$PWD/build/tmp cargo xtask test --arch aarch64
+```
+
+Verified directly: with `TMPDIR=$PWD/build/tmp` and `snapshot=on` intact, QEMU
+starts (it is still running at the 8 s timeout, which is the pass condition for
+"did it get past the overlay"); with `TMPDIR=/tmp` it does not, so the variable
+must name a directory `qemu-img`-writable, not merely a writable one. The arm ran
+green at `pass=319 fail=0`.
+
+**The claim the crippled run caught anyway, which was worth having.** On the
+aarch64 arm `t-sfd-timer-record` (item 286's pin) reddened on
+
+```
+FAIL: the expiries coalesce: further intervals leave at most one record (drained 2)
+```
+
+and the **claim** was the wrong side, not the kernel. A drain loop on a
+*repeating* timer races the timer: how many records it collects depends on how
+long the drain runs, which is the machine's speed. The measured property is
+narrower and is true everywhere - expiries that arrive while a record waits move
+that record's **count** instead of queueing copies - so the claim is now "the
+next record carries the pile-up (`si_overrun > 0`)", which a queueing kernel
+would fail with `si_overrun` 0. That is the same lesson §6.128 records for a
+poll-window claim, one shape over: **a claim about how many records a drain
+collects is a claim about the drain.**
+
+**For the next session:** run both arms with `TMPDIR=$PWD/build/tmp` in the
+environment before reaching for any source change. And when a fix makes a
+*fixture* redden -- `t-9p` here -- suspect the fix before the fixture.

@@ -12851,3 +12851,24 @@ reports the stale bit until a door drops it (Linux's shape), and nothing pins
 that window's duration. And a `SIGEV_THREAD_ID` expiry's marker lands on the
 named thread's record, so a process-directed delete from the leader cannot mark a
 worker's — §6.166's own target rule, unwitnessed by any fixture.
+
+## Item 288 — a `CLOCK_THREAD_CPUTIME_ID` timer counts its creating thread, and is disarmed when that thread ends (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **Before** | `timer_create(CLOCK_THREAD_CPUTIME_ID, …)` answered `EOPNOTSUPP`, with a reason that had never been measured: "the clock belongs to the creating thread while the timer hangs off the group and outlives that thread; Linux freezes the clock when the thread dies, and this table cannot express a frozen reading." The ownership half was right and the mechanism half was wrong. |
+| **Now** | `TimerClock` gained a `Thread` arm carrying the creating thread's slot **and its generation** plus an optional latched final reading. The reading is the `abi` leaf's pure `thread_clock_reading(live, latched)` — host-testable because the case that matters needs a thread to die — and the generation is what stops a recycled slot reading a stranger's CPU (the class AGENTS.md §5 records for `setpriority`/`prlimit64`). `latch_thread_clocks` runs from `exit` **before** the task is marked gone, walks the thread group's timer table (a worker's timer outlives it, §2.11), and for each matching clock latches the final reading and **disarms** the timer. `timer_arm` answers a `TimerArm` enum so the three answers stay distinct: armed, `EINVAL` for a bad id, and **`ESRCH`** for a clock that is over. |
+| **Measured first** | Linux 7.3.4, `build/scratch/thrcpu/{t,t2,t3,t4,disarm}.c`. The clock counts the **creating thread's** CPU (a creator burning ~60 ms with a 30 ms repeating timer produced **1** expiry; the process's own `RUSAGE_SELF` is irrelevant); it **stops** when that thread exits (300 ms of *main-thread* CPU produced **0** further expiries); and what Linux does to the timer is **disarm** it, not freeze a reading: after `pthread_join`, `timer_gettime` succeeds with `value = interval = 0`, `timer_getoverrun` is 0, `timer_settime` answers **`ESRCH`** (3), and `timer_delete` still answers 0. While the creator is alive and idle a 10 s timer reads `9.999995…` — only the creating call's own µs charged — so the reading is genuinely that thread's counter. |
+| **Pins** | `t-timer-cpuclock` grew eight claims and **lost its `host_run` branch entirely** — every one is Linux's answer on both arms: the timer builds on the thread clock; 60 s of its CPU arms; while the creator lives the clock counts (59999 ms left); a *thread* can own a timer on its own clock; after that thread exits the timer still exists (`timer_gettime` 0); it is disarmed with value **and** interval zero; its overrun is 0; re-arming answers `ESRCH` not `EINVAL`; and it still deletes. Host leaf test `a_thread_clock_reads_live_then_final_then_nothing` pins the four cases, including the one that must not be a zero: a thread gone with nothing latched is `None`, because a zero is a reading a deadline could satisfy. |
+| **Counterfactual** | The kernel half stashed (five files), kernel and loader rebuilt, the pin in the guest: **one claim red** — `FAIL: a timer can be built on the creating thread's own CPU clock (Err(Os { code: 95, kind: Unsupported }))` — the rest gated behind it, which is the right shape for a "serve this" item. Restored with `sha256sum -c` on all six files, rebuilt, `PASS`. |
+| **Gate** | x86_64 arm (`build/gate-item288.log`): stage 1 **1338** host tests 0 failed (lib **819** plus the leaf crate), `pass=323 fail=0`, `mpos-kunit 41/0`, exit 33. aarch64 arm (`build/gate-item288-arm3.log`): `pass=319 fail=0`, `mpos-kunit 41/0`. Clippy ratchet unchanged `162/168/389/273/3/1`; both workspaces formatted. Two earlier aarch64 attempts are part of the record (§6.169): one was a wrong workaround that deleted `snapshot=on` (and so reddened `t-9p` in all six lanes), the other caught this pin's own over-tight coalescing claim. |
+
+**What this does not do / diverges, named.** Linux's reading for a 60 s timer
+whose creator died within 20 ms of CPU is `0.000000000` (the frozen counter drives
+the remaining-time subtraction to zero); this kernel keeps the arithmetic honest
+and reads `9.728 s`, unchanged across 150 ms of main-thread CPU. The pin asserts
+the claim both machines agree on — the clock does not follow another thread —
+rather than Linux's artefact. A `SIGEV_THREAD_ID` expiry aims at a named thread
+while the *clock* names the creating one; the pin separates them but does not yet
+exercise a pair that differs. `CLOCK_THREAD_CPUTIME_ID`'s `clock_gettime` reading
+was already served (§6.99); what this item added is the timer on that clock.
