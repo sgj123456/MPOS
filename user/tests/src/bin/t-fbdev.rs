@@ -238,7 +238,16 @@ fn main() {
     println!("t-fbdev");
     let mut r = Report::new();
 
-    let fb = match rustix::fs::open("/dev/fb0", OFlags::RDONLY, rustix::fs::Mode::empty()) {
+    // `O_RDWR`, because the mapping below is `MAP_SHARED|PROT_WRITE`: Linux
+    // refuses that on a read-only descriptor with `EACCES` for *every* file -
+    // measured on a host (`build/scratch/zeromap/{mat,n}.c`): `O_RDONLY` +
+    // `MAP_SHARED` + a write protection is `-1 EACCES` on `/dev/zero` and on
+    // `/etc/hostname` alike, while the same request privately is served. A
+    // compositor draws through the mapping, so it opens the card for writing;
+    // this program did not, and the claim below was asking for a mapping no
+    // kernel hands out (item 285 gave the door that rule, and the gate it first
+    // ran on named this file).
+    let fb = match rustix::fs::open("/dev/fb0", OFlags::RDWR, rustix::fs::Mode::empty()) {
         Ok(fd) => fd,
         Err(e) => {
             // Under a payload sweep the node missing is a failed check, not a
