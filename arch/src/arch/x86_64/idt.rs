@@ -576,15 +576,14 @@ extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64) {
         if crate::hal::kernel::resolve_stack_growth(addr) {
             return;
         }
-        // The fault's own record: `si_addr` is `CR2`, `si_code` is SEGV_MAPERR
-        // for an absent page or SEGV_ACCERR for a refused one. `send_signal`
-        // would put a pid in those eight bytes instead (`docs/notes/` §6.160).
-        let sig = crate::hal::kernel::send_fault_signal(
-            14,
-            addr,
-            rip,
-            code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
-        );
+        // The fault's own record: `si_addr` is `CR2`, and `si_code` is the
+        // **mapping's** answer - `SEGV_ACCERR` when a VMA describes the address
+        // and refused the access, `SEGV_MAPERR` when nothing describes it. The
+        // error word's `P` bit is a different question and answers wrong for
+        // the most common self-repair case, a `PROT_NONE` page
+        // (`docs/notes/` §6.162). `send_signal` would put a pid in those eight
+        // bytes instead (`docs/notes/` §6.160).
+        let sig = crate::hal::kernel::send_fault_signal(14, addr, rip);
         if crate::hal::kernel::disposition_is_default(sig) {
             crate::hal::kernel::die_of_fatal_signal(sig);
         }
@@ -1200,7 +1199,7 @@ fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool
         // One table answers both halves: the signal number (Item 279) and the
         // fault-shaped `siginfo_t` record (Item 280). A trap with no faulting
         // address passes zero; `#DE`/`#UD` name `rip` as their `si_addr`.
-        let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip, false);
+        let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip);
         if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
             // Only up to the end of the page the instruction is on: a read
             // past it would fault inside the handler, and a double fault

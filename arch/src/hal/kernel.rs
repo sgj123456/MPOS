@@ -149,18 +149,23 @@ pub trait Kernel: Sync {
     /// `vector` is the x86_64 IDT vector (14 for a `#PF`); `addr` is `CR2`
     /// for a page fault and zero for a trap with no faulting address; `rip`
     /// is the interrupted instruction pointer, which is `si_addr` for `#DE`
-    /// and `#UD`; `protection` is the page-table word's `P` bit, deciding
-    /// `SEGV_ACCERR` over `SEGV_MAPERR`. The kernel owns the map of vectors
-    /// to `(signal, si_code, si_addr)` - measured on Linux 7.2.14,
-    /// `docs/notes/` §6.160 - so this seam carries the raw facts rather than
-    /// a second copy of the table, the same shape as
+    /// and `#UD`; `mapped` says whether **a mapping describes the address**,
+    /// which is the question that decides `SEGV_ACCERR` over `SEGV_MAPERR`
+    /// (measured on Linux 7.2.14 across four refused-access classes, and on a
+    /// never-mapped read and a hole between two mappings:
+    /// `docs/notes/` §6.162). The page-table error word is a *different*
+    /// question and answers wrong for the most common self-repair case - a
+    /// `PROT_NONE` page, which the CPU reports as not present. The kernel owns
+    /// the map of vectors to `(signal, si_code, si_addr)` - measured on Linux
+    /// 7.2.14, `docs/notes/` §6.160 - so this seam carries the raw facts
+    /// rather than a second copy of the table, the same shape as
     /// [`signal_for_trap`](Kernel::signal_for_trap).
     ///
     /// This is deliberately not [`send_signal`](Kernel::send_signal): that
     /// door raises a `SI_USER` record with the sender's pid at wire offset
     /// 16, which is exactly the eight bytes a fault's `si_addr` occupies. A
     /// handler asking "which address faulted" was told a pid.
-    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize, protection: bool) -> u8;
+    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize) -> u8;
 
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
@@ -666,8 +671,8 @@ pub fn signal_for_trap(vector: u8) -> u8 {
 /// Queue a CPU exception's fault-shaped record. See
 /// [`Kernel::send_fault_signal`].
 #[inline]
-pub fn send_fault_signal(vector: u8, addr: usize, rip: usize, protection: bool) -> u8 {
-    registered().send_fault_signal(vector, addr, rip, protection)
+pub fn send_fault_signal(vector: u8, addr: usize, rip: usize) -> u8 {
+    registered().send_fault_signal(vector, addr, rip)
 }
 
 /// The running task's `comm`. See [`Kernel::current_comm`].

@@ -825,9 +825,9 @@ impl SigInfo {
 ///
 /// The trap doors know the vector, the faulting address (`CR2` for a `#PF`,
 /// zero for a trap with no address), the interrupted `rip`, and - for a page
-/// fault - whether the page-table error word says *protection* rather than
-/// *not present*. Linux's `si_code` and `si_addr` for each are measured, not
-/// guessed (`build/scratch/siginfo/faultcodes.c`, Linux 7.2.14):
+/// fault - whether a mapping **describes** the address at all. Linux's
+/// `si_code` and `si_addr` for each are measured, not guessed
+/// (`build/scratch/siginfo/faultcodes.c`, Linux 7.2.14):
 ///
 /// | vector | signal | `si_code` | `si_addr` |
 /// |---|---|---|---|
@@ -844,20 +844,32 @@ impl SigInfo {
 /// a machine, and the machine layer reaches it through
 /// `hal::kernel::send_fault_signal` so it keeps no second copy.
 ///
-/// What is still not done, named: handing this record to a handler **at the
-/// trap**. §2.13 built `deliver_at_trap` for the PIT's GPR-preserving stub;
-/// the six `x86-interrupt` exception entries have no such frame, so a fault's
-/// handler is entered only if a timer tick intervenes - measured 2/16 in a
-/// guest (`build/scratch/siginfo/rel.c`, `docs/notes/` §6.159). The record's
-/// shape is pinned here and by the boot kunit regardless; aarch64's ESR→signal
-/// decoding is the other named gap.
-pub fn fault_record(vector: u8, addr: usize, rip: usize, protection: bool) -> (u8, SigInfo) {
+/// The `#PF` answer is the *mapping's*, not the CPU's. Linux asks "does a
+/// mapping describe this address": four measured classes agree
+/// (`build/scratch/protcode/`, Linux 7.2.14) - a read of a `PROT_NONE` page
+/// `code=2`, a write to a `PROT_READ` page `code=2`, an instruction fetch from
+/// a non-executable anon page `code=2`, a write to a read-only *file* mapping
+/// `code=2`, while a never-mapped read and a read from the hole between two
+/// mappings both answer `code=1`. The page-table error word is a different
+/// question: a `PROT_NONE` page has a not-present entry, so a kernel reading
+/// the CPU's `P` bit calls Linux's `SEGV_ACCERR` case `SEGV_MAPERR` and sends
+/// a handler down its "nothing to repair" branch when `mprotect` was exactly
+/// what would have fixed it. [`SEGV_ACCERR`] therefore means *a mapping covers
+/// this address and refused the access*; [`SEGV_MAPERR`] means *nothing
+/// describes it*.
+///
+/// What is still not done, named: `si_addr_lsb`/`si_addr_bnd`/`si_pkey` are
+/// not carried (the union past `si_addr` is zero); aarch64's `ESR`→signal
+/// decoding is still absent, so on that machine every refused EL0 fault is
+/// `SIGSEGV` with no record; and the three reserved bits of `si_code` are not
+/// left for a future `SEGV_ACCERR` subclass.
+pub fn fault_record(vector: u8, addr: usize, rip: usize, mapped: bool) -> (u8, SigInfo) {
     let (code, fault_addr) = match vector {
         0 => (FPE_INTDIV, rip), // #DE divide error
         3 => (SI_KERNEL, 0),    // #BP breakpoint (`int3`)
         6 => (ILL_ILLOPN, rip), // #UD invalid opcode
         14 => {
-            let code = if protection { SEGV_ACCERR } else { SEGV_MAPERR };
+            let code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
             (code, addr)
         } // #PF page fault
         17 => (BUS_ADRALN, 0),  // #AC alignment check
@@ -1146,11 +1158,41 @@ mod tests {
                 "vector {vector} did not mark its record as a fault"
             );
         }
-        // A protection violation is the one row the caller's error word decides.
+        // `#PF`'s code is the mapping's answer, not the CPU's error word.
         let (_, accerr) = fault_record(14, 0x7fff_0000, rip, true);
         assert_eq!(accerr.code, SEGV_ACCERR);
         assert_eq!(accerr.addr, 0x7fff_0000);
         assert_ne!(accerr.code, SEGV_MAPERR);
+    }
+
+    /// The four fault classes Linux measured `SEGV_ACCERR` for, and the two it
+    /// measured `SEGV_MAPERR` for, all decided by **one** question: does a
+    /// mapping describe the address? The counterfactual is the page-table
+    /// error word this function used to read: a `PROT_NONE` page has a
+    /// not-present entry, so a `P`-bit implementation answers
+    /// `SEGV_MAPERR` - which is the one row below that a booted machine can
+    /// redden (Item 282, `docs/notes/` §6.162).
+    #[test]
+    fn a_page_fault_code_asks_the_mapping_not_the_page_table() {
+        // A mapping refused the access: PROT_NONE read, PROT_READ write, an
+        // NX fetch, a read-only file mapping written. All measured 2.
+        for (what, mapped) in [
+            ("PROT_NONE read", true),
+            ("PROT_READ write", true),
+            ("NX fetch", true),
+            ("read-only file write", true),
+            ("never-mapped read", false),
+            ("hole between two mappings", false),
+        ] {
+            let (_, info) = fault_record(14, 0x1234_5000, 0x401000, mapped);
+            let want = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
+            assert_eq!(
+                info.code, want,
+                "{what}: si_code {} where Linux answers {want}",
+                info.code
+            );
+            assert_eq!(info.addr, 0x1234_5000, "{what}: si_addr is CR2");
+        }
     }
 
     /// The counterfactual for a trap door that queues `SIGSEGV` for every
