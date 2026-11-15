@@ -15768,10 +15768,11 @@ the claim both machines agree on (the clock does not follow another thread)
 expressed without Linux's artefact. The pin asserts the agreement, not the
 artefact.
 
-**Named.** A `SIGEV_THREAD_ID` expiry aims at a named thread while the *clock*
-names the creating one, and the two can differ; Linux allows that (the record
-goes to the named thread, the clock stays the creator's), so the pin separates
-them rather than assuming one thread - and does not yet exercise the pair.
+**The pair, now witnessed** (§6.170, item 289). A `SIGEV_THREAD_ID` expiry aims
+at a named thread while the *clock* names the creating one, and the two can
+differ; this landing separated them in code but did not exercise the pair. That
+is closed by item 289.
+
 `CLOCK_THREAD_CPUTIME_ID`'s `clock_gettime` reading was already served (§6.99);
 what this item added is the *timer* on that clock.
 
@@ -15835,3 +15836,118 @@ collects is a claim about the drain.**
 **For the next session:** run both arms with `TMPDIR=$PWD/build/tmp` in the
 environment before reaching for any source change. And when a fix makes a
 *fixture* redden -- `t-9p` here -- suspect the fix before the fixture.
+
+## §6.170 the clock's thread and the signal's thread are two roles (item 289, LANDED 2026-11-15)
+
+**The gap this closes.** §6.168 separated two things in code and said so in its
+own "named" list: a `CLOCK_THREAD_CPUTIME_ID` timer's **clock** is the creating
+thread's CPU, while its `SIGEV_THREAD_ID` **target** is whichever thread the
+caller named — and the two can be different threads. No fixture exercised a pair
+that differs, so "the record goes to the named thread" was a reading of the code
+rather than a measurement.
+
+**Measured first** (`build/scratch/thrsig/t.c`, Linux 7.3.4). Three threads: a
+**target** that blocks the signal and owns a `signalfd` but burns no CPU, a
+**creator** that owns the clock (it calls `timer_create`) and burns ~120 ms of its
+own CPU, and a main thread that owns neither. The timer is
+`timer_create(CLOCK_THREAD_CPUTIME_ID, SIGEV_THREAD_ID → target)`:
+
+```
+create(THREAD_CPUTIME, THREAD_ID tid=11) -> 0 errno=0
+clock thread burned ~120 ms of its own CPU
+clock thread joined; created=1
+records on TARGET thread = 28
+records left on MAIN thread = 0
+gettime -> 0 value=0.000000000 interval=0.000000000 errno=0
+re-arm -> -1 errno=3
+```
+
+So the three roles are genuinely independent:
+
+* `timer_create` **accepts** the pair;
+* the expiry is driven by the **clock's** thread's CPU — the target burns none,
+  and records appear only while the creator burns;
+* every record goes to the **named** thread: 28 there, **0** left on the main
+  thread (which also had a `signalfd` open, so a misrouted record would have been
+  seen rather than ignored);
+* and when the clock's thread exits, the clock **still ends** — `timer_gettime`
+  reads 0/0 and `timer_settime` answers `ESRCH` — even though the named thread is
+  alive and still has somewhere to put a record. The clock's lifetime is the
+  clock's thread's; the signal's destination is the named thread's; neither
+  borrows the other's.
+
+**One thing the same probe taught about the ABI, which cost the first two
+attempts.** `struct sigevent`'s thread id is **not** in the `sigval` at byte 0.
+It sits in the union at byte **16** — `offsetof(struct sigevent,
+sigev_notify_thread_id)` is 16 on musl *and* glibc — and a program that writes it
+into the `sigval` gets `EINVAL` from a kernel that cannot find the thread it was
+told to aim at. Two drafts of the probe and one of the pin failed that way before
+the offset was measured rather than recalled. (`sigevent` is 64 bytes: `sigval`
+0, `signo` 8, `notify` 12, then the union at 16.)
+
+**The machine agrees.** The same probe built static for the guest answers every
+row the same way:
+
+```
+create(THREAD_CPUTIME, THREAD_ID tid=11) -> 0 errno=0
+clock thread joined; created=1
+records on TARGET thread = 91
+records left on MAIN thread = 0
+gettime -> 0 value=0.000000000 interval=0.000000000 errno=0
+re-arm -> -1 errno=3
+```
+
+**The count is the machine's, not the kernel's.** 28 on the host against 91 on
+the guest is the *burn's duration*, not a defect: the same 120 M-iteration loop
+takes **499 ms** on the host and **1635 ms** under TCG (`build/scratch/thrsig/
+t2.c`, measured on both). That is why the land's claim is about **routing** and
+the **end**, never about how many records arrived — a count claim there would be
+a claim about the host's speed, the same mistake §6.169 records for a drain
+length.
+
+**The change is a pin, and it is the claim that was missing rather than a
+behaviour.** `t-timer-cpuclock` grew five claims — the signal can be blocked, a
+timer can hold a thread clock and a *different* target thread, the record goes to
+the named thread (`got > 0`), the timer is still readable when the clock's thread
+exits, it is disarmed though the named thread still lives, and re-arming is
+`ESRCH`. Nothing in the kernel moved: §6.168's routing arm
+(`TimerNotify::Thread(t)` resolving the named task inside the group) was already
+Linux's shape, and this item is the measurement that says so.
+
+**Counterfactual.** The kernel's thread-target arm was changed to fall back to
+the group's leader — a plausible wrong implementation, and the one a kernel that
+conflated "the timer's group" with "the timer's thread" would have — and the pin
+reddened **exactly one** claim:
+
+```
+FAIL:  the record goes to the named thread (0 records on tid 12)
+```
+
+with everything else green, which is the shape wanted: the routing claim is the
+one that moved, and the clock's lifetime claims are unaffected by where the
+record goes. Restored from `build/scratch/thrsig/task.rs.good`, rebuilt, `PASS`
+(`build/scratch/thrsig/{guest-cf,guest-green}.log`).
+
+**Gate.** `build/gate-item289.log`, `GATE_EXIT=0` — **both arms in one run**,
+which is itself the answer to §6.169: with `TMPDIR=$PWD/build/tmp` in the
+environment the aarch64 lanes start on their own overlays and the combined
+command is green, so no arm needs running separately any more. Stage 1 **1338**
+host tests 0 failed (57.39 s); stage 2 **323** programs over 6 lanes (37.00 s) on
+x86_64 and **319** (52.26 s) on aarch64; `pass=323 fail=0` and `pass=319 fail=0`
+with `mpos-kunit 41 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/389/273/3/1`; both workspaces formatted.
+
+### What this does not do, named
+
+1. **The mirror pair was not built**: a timer whose *target* thread exits while
+   the *clock's* thread lives. Its reading would be the opposite — the clock goes
+   on counting and deliveries are dropped, because
+   `TimerNotify::Thread`'s resolution filters on `!exited` — but that is derived
+   from the code, not measured, and a fixture needs the target's death to be
+   observable from the creator.
+2. **The tid's namespace is not exercised.** `SIGEV_THREAD_ID`'s tid is read in
+   the caller's pid namespace; a timer created inside one and aimed at a thread
+   outside it is unmeasured here.
+3. **The `si_overrun` count for this pair** is whatever the record carries, and
+   nothing asked whether a thread-targeted expiry accumulates them the way §6.166
+   measured for a process-directed one.

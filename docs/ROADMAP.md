@@ -2853,3 +2853,31 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   thread other than the clock's is separated but not yet exercised. Gate: stage 1 1338,
   x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet unchanged
   (`build/gate-item288.log`, `build/gate-item288-arm3.log`). (§6.168, item 288)
+
+- **Item 289 — the clock's thread and the signal's thread are two roles**: §6.168
+  separated them in code and named the gap in its own list — a
+  `CLOCK_THREAD_CPUTIME_ID` timer's **clock** is the creating thread's CPU while its
+  `SIGEV_THREAD_ID` **target** is the thread the caller named, and no fixture exercised
+  a pair that differs, so "the record goes to the named thread" was a reading of the
+  code. Measured on Linux 7.3.4 (`build/scratch/thrsig/t.c`, three threads — target
+  blocks the signal and owns a signalfd but burns no CPU, creator owns the clock and
+  burns ~120 ms, main owns neither): `timer_create` accepts the pair; the expiry is
+  driven by the **clock's** thread; all 28 records land on the **named** thread with
+  **0** left on main (which also had a signalfd open, so a misrouted record would have
+  been seen); and when the clock's thread exits the clock still **ends** — `gettime`
+  0/0, `settime` `ESRCH` — though the target lives. The guest agrees row for row (91
+  records rather than 28 — the same burn is 499 ms on the host and 1635 ms under TCG,
+  so the count is the machine's and the claims are about routing and the end, never
+  the count: the error §6.169 records for a drain length). **No kernel code moved** —
+  `TimerNotify::Thread`'s routing arm was already Linux's shape; what landed is the
+  measurement and five claims in `t-timer-cpuclock`, which is the whole of the item,
+  and a gap closed by measurement should not be dressed as a behaviour change. Also
+  measured, at the cost of two failed drafts: `sigevent`'s thread id is the union at
+  byte **16**, not the `sigval` at 0, and aiming through the wrong word is `EINVAL`.
+  Counterfactual routes a thread-targeted expiry to the group's **leader** and reddens
+  exactly `FAIL: the record goes to the named thread (0 records on tid 12)`. Named: the
+  mirror pair (target dies, clock lives) is derived rather than measured, the tid's pid
+  namespace is not exercised, and a thread-targeted expiry's `si_overrun` was not
+  asked. Gate `build/gate-item289.log` exit 0, **both arms in one run**: stage 1
+  1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet
+  unchanged. (§6.170, item 289)
