@@ -321,6 +321,50 @@ fn main() {
             &format!("fstat on the same descriptor is still served, got {st:?}"),
             st.is_ok_and(|s| s.st_size == 5),
         );
+
+        // === `fcntl`'s own split on an `O_PATH` descriptor ==================
+        //
+        // `fcntl` is a table, and `O_PATH` partitions it: the commands that ask
+        // *what this descriptor is* are **served** (`F_GETFD`, `F_GETFL`,
+        // `F_SETFD`, `F_DUPFD*`), and the ones that would act on the file
+        // behind it are `EBADF` (`F_SETFL` and the six lock commands).
+        // Measured raw on Linux 7.3.4 (`build/scratch/fcntl/t.c`). This
+        // kernel served `F_SETFL` - which stored a status word on a descriptor
+        // that has no open file to carry one - and answered the lock commands
+        // from the lock table.
+        for (name, cmd) in [
+            ("F_SETFL", libc::F_SETFL),
+            ("F_SETLK", libc::F_SETLK),
+            ("F_GETLK", libc::F_GETLK),
+            ("F_OFD_SETLK", libc::F_OFD_SETLK),
+        ] {
+            // The lock commands take a `struct flock`; `F_SETFL` a flag word.
+            let mut flock: libc::flock = unsafe { core::mem::zeroed() };
+            flock.l_type = libc::F_WRLCK as i16;
+            let arg: usize = if name == "F_SETFL" {
+                libc::O_NONBLOCK as usize
+            } else {
+                (&raw mut flock) as usize
+            };
+            // SAFETY: `raw` is a live descriptor, and `arg` is either a flag
+            // word or a live `struct flock` this test owns.
+            let rc = unsafe { libc::fcntl(raw, cmd, arg) };
+            r.check(
+                &format!(
+                    "{name}(O_PATH fd) is EBADF, got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
+            );
+        }
+        // And the served half, so the claims above are about the split rather
+        // than about `fcntl` refusing everything on one.
+        // SAFETY: as above; `F_GETFD` takes no argument.
+        let getfd = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        r.check(
+            &format!("F_GETFD on the same descriptor is served, got {getfd}"),
+            getfd >= 0,
+        );
     }
 
     let _ = std::fs::remove_dir_all(DIR);
