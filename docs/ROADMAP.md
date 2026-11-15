@@ -3076,3 +3076,37 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   untested, and `fdinfo`'s semaphore word has no pin. Gate `build/gate-item296.log`
   `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64 `pass=323`, aarch64
   `pass=319`, kunit 41/0 per arm, clippy ratchet unchanged. (§6.176, item 296)
+
+- **Item 297 — `O_PATH` was recorded and never enforced, so a descriptor that names was
+  reading**: the third flag sweep, over the flags that have **no** getter. It split in
+  two, and the first half came out **clean** — seven behavioural rows (`O_TRUNC` empties;
+  `O_EXCL|O_CREAT` is `EEXIST` and does not truncate; `O_NOFOLLOW` on a link is `ELOOP`;
+  `O_TRUNC|O_RDONLY` truncates despite the mode; `O_TRUNC` on a directory is `EISDIR`;
+  `O_EXCL` without `O_CREAT` is ignored; `O_NOFOLLOW` on a regular file is ordinary)
+  all answer the same here first try, which is recorded because a sweep that only
+  reports its wins is one nobody can trust. The second half did not: `O_PATH` was
+  **recorded** (so `F_GETFL` reported the bit, with a comment saying so) and acted on
+  **nowhere** — `read(O_PATH)` answered `Ok(5)` where Linux answers `EBADF`, so a
+  descriptor whose whole purpose is "name this, do not open it" read the file. Measured
+  whole on Linux 7.3.4 (`build/scratch/opath/{t,combos}.c`): `read`/`write` `EBADF`;
+  `fstat` works; `F_GETFL` carries the bit; `F_DUPFD` works; no `atime` movement;
+  `O_PATH|O_NOFOLLOW` on a symlink is **served and is the *link***; `O_PATH` alone
+  follows to the target; `O_DIRECTORY|O_NOFOLLOW` is **`ENOTDIR`**, the kind asked
+  first. **Three defects**: enforcing `O_PATH` in `pre_read`/`pre_write`; then the pair
+  — `O_NOFOLLOW`'s check was "a link is `ELOOP`" rather than "do not *traverse* one", so
+  the one combination that exists to hand out a descriptor **on** a link was refused;
+  then the order — the kind question comes before the link one. A trap inside the third
+  fix: both flags are **machine-specific** (`O_DIRECTORY` is `0o20_0000` on x86_64 and
+  `0o40000` on aarch64, `O_PATH`/`O_NOFOLLOW` moving with them), so they are named in
+  `abi.rs` rather than spelled. New pin `t-open-path` (13 claims) in `t-fsflags`' shape
+  — the four doors that answer *on* the descriptor, the `atime` non-effect, and the five
+  `O_NOFOLLOW` combinations with their two neighbours. Counterfactual reddens **three**
+  claims, each a distinct defect — the most informative red in this series. Two stale
+  comments corrected with it: `xattr_inode_of_fd`'s "this kernel has no `O_PATH`" is now
+  false, so the `EBADF` those three `f*` doors owe is a **named gap** rather than a
+  vacuous one. Named: `O_NOCTTY` unswept (its effect is on the session), `O_PATH` as a
+  **dirfd** not exercised (the flag's largest remaining use), `O_PATH`'s `EBADF` on the
+  other fd-taking calls unpinned, and `O_SYNC` unobservable without a power cycle.
+  Gate `build/gate-item297.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340,
+  x86_64 `pass=324`, aarch64 `pass=320` (each one more than 323/319 — the new pin is
+  in both sweeps), kunit 41/0 per arm, clippy ratchet unchanged. (§6.177, item 297)

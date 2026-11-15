@@ -16569,3 +16569,115 @@ unchanged at `162/168/389/273/3`; both workspaces formatted.
    for this mode.
 4. **`fdinfo`'s semaphore word has no pin.** It changed from the constant `0` to
    the mode, and `t-fdinfo` does not read that line for a semaphore instance.
+
+## §6.177 `O_PATH` was recorded and never enforced - a descriptor that names was reading (item 297, LANDED 2026-11-15)
+
+**The third sweep, and the first with two halves.** §6.176 swept the flags that
+*have* a getter. This takes the ones that do not, and it split in two: the flags
+whose effect is only visible through a *later call*, and `O_PATH`, whose effect is
+what every other door answers on the descriptor.
+
+**The behavioural half came out clean**, and that is worth recording because a
+sweep that only reports its wins is a sweep nobody can trust. Seven rows on Linux
+7.3.4 (`build/scratch/behavflags/t.c`) — `O_TRUNC` empties a 10-byte file and
+leaves size 0; `O_EXCL|O_CREAT` on an existing name is `EEXIST` **and does not
+truncate**; `O_NOFOLLOW` on a symlink is `ELOOP`; `O_TRUNC|O_RDONLY` truncates
+despite the read-only mode (Linux permits it, POSIX leaves it undefined);
+`O_TRUNC` on a directory is `EISDIR`; `O_EXCL` without `O_CREAT` is ignored; and
+`O_NOFOLLOW` on a regular file is an ordinary open. **All seven answer the same
+here**, first try. `O_TMPFILE` was already served (the comment at `open_linux`
+records the `apk` report that made it so).
+
+**`O_PATH` was not clean, and it is the same shape as §6.175's `dup3` one layer
+up.** This kernel *recorded* the flag — `set_born` keeps it so `F_GETFL` reports
+the bit, and there is a comment saying so ("`O_PATH` and the rest of `O_*`, which
+Linux's `F_GETFL` reports back") — and then **acted on it nowhere**. Measured on
+the machine:
+
+```
+read(O_PATH)  -> Ok(5)          Linux: EBADF
+```
+
+So a descriptor whose entire purpose is "name this, do not open it" **read the
+file**. A flag accepted, reported back and enforced nowhere is worse than one
+refused: the caller has been told it holds something it does not.
+
+**Measured whole before implementing** (`build/scratch/opath/{t,combos}.c`, Linux
+7.3.4):
+
+| what | Linux |
+|---|---|
+| `read`/`write` on `O_PATH` | **`EBADF`**, both |
+| `fstat` on one | works, real size |
+| `F_GETFL` | carries `O_PATH` |
+| `F_DUPFD` | works |
+| an `O_PATH` open's effect on `atime` | none |
+| `O_PATH\|O_NOFOLLOW` on a symlink | **served**, and it is the *link* |
+| `O_PATH` alone on a symlink | served, the *target* |
+| `O_RDONLY\|O_NOFOLLOW` | `ELOOP` |
+| `O_PATH\|O_RDONLY\|O_NOFOLLOW` | served, the *link* |
+| `O_DIRECTORY\|O_NOFOLLOW` | **`ENOTDIR`**, the kind asked first |
+
+**Three defects, and the second and third are the interesting ones.** Enforcing
+`O_PATH` in `pre_read`/`pre_write` fixed the first. Then the *pair* row failed:
+this kernel refused `O_PATH|O_NOFOLLOW` on a symlink with `ELOOP`, because
+`O_NOFOLLOW`'s check was "a link is `ELOOP`" rather than Linux's "do not
+*traverse* one" — and `O_PATH` is precisely the flag that says "give me the link
+itself", which is how a `/proc`-style door hands out a descriptor on a link
+without following it. Third, once that was served, `O_DIRECTORY|O_NOFOLLOW`
+answered `ELOOP` where Linux answers `ENOTDIR`: the **kind** question comes
+before the link one, and a symlink is simply not a directory.
+
+A trap inside the third fix, worth the line it costs: the first attempt wrote
+`O_PATH` as the literal `0x20_0000` and compared `O_DIRECTORY` as a `u32`, but
+**both flags are machine-specific** — x86_64's `O_DIRECTORY` is `0o20_0000`
+(`0x10000`) and aarch64's is `0o40000`, and `O_PATH`/`O_NOFOLLOW` move with them.
+`abi.rs` already carries the per-machine pair, so the fix is to name them there
+rather than to spell them; the probe is what showed the branch was not being
+reached at all.
+
+**The pin** is a new program, `t-open-path` (13 claims), in `t-fsflags`' shape: the
+four doors that must answer *on* the descriptor (`read`/`write` `EBADF`, `fstat`
+working with the real size, `F_GETFL` carrying the bit, `F_DUPFD` working), the
+`atime` non-effect compared against a stamp the test itself read, and the five
+`O_NOFOLLOW` combinations with their two neighbours (`O_PATH` alone follows to the
+target; `O_RDONLY|O_NOFOLLOW` refuses). A separate program rather than another
+claim in `t-open-flags`, because that one's subject is the *per-machine bit table*
+and this one's is the descriptor's contract.
+
+**Counterfactual.** Both kernel files stashed, rebuilt, the pin in the guest:
+**three claims red**, each a distinct defect —
+
+```
+FAIL: read on it is EBADF, got Ok(5)
+FAIL: O_PATH|O_NOFOLLOW on a symlink is served, got ELOOP
+FAIL: O_DIRECTORY|O_NOFOLLOW on a symlink is ENOTDIR, got ELOOP
+```
+
+- which is the most informative red this series has produced: one flag, three
+  different wrong answers, and the pin names each. Restored from
+  `build/scratch/opath/good/*.rs`, `sha256sum -c` 成功 on all three, rebuilt,
+  `PASS`.
+
+**Gate.** `build/gate-item297.log`, `GATE_EXIT=0`, both arms in one run. Stage 1
+**1340** host tests 0 failed (66.70 s); stage 2 **324** programs over 6 lanes on
+x86_64 (45.89 s) and **320** on aarch64 — each one more than the previous 323/319,
+because `t-open-path` is a new program in both sweeps; `pass=324 fail=0` /
+`pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`; both workspaces formatted.
+
+### What this does not do, named
+
+1. **`O_NOCTTY` was not swept.** Its effect is on the *session*, not on the
+   descriptor: opening a tty without it claims the controlling terminal, and
+   nothing here makes a session and a tty to observe that.
+2. **`O_PATH` as a dirfd was not exercised.** It is the largest remaining use of
+   the flag (`openat(O_PATH_fd, "child")`), and the probe only used it as a
+   *subject*; whether every `*at` door accepts one is a separate walk.
+3. **`O_PATH`'s `EBADF` on the other fd-taking calls is unpinned.** Linux refuses
+   `getdents`, the xattr `f*` forms and `fchmod` over one; only `read`/`write` are
+   claimed. The xattr comment at `xattr_inode_of_fd` said "this kernel has no
+   `O_PATH`" and is now false — corrected in place, but not given claims.
+4. **`O_SYNC`'s effect** (a write visible before the call returns) is a
+   durability property this kernel cannot observe without a power cycle, and was
+   not swept.
