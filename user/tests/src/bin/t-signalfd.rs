@@ -742,6 +742,62 @@ fn main() {
         );
     }
 
+    // === the code says which door raised the signal ==========================
+    //
+    // `si_code` is not decoration: a receiver reads it to learn how a signal
+    // arrived, and four doors answer four different codes. Measured on Linux
+    // 7.3.4 (`build/scratch/sfdaddr2/t4.c`, one blocked signal read through a
+    // descriptor per door): `raise` -6, `kill(self)` 0, `tgkill(self)` -6,
+    // `tkill(self)` -6, `sigqueue` -1. This kernel answered `SI_USER` (0) for
+    // every sender door, so a receiver could not tell `tgkill` from `kill` -
+    // and `libc::raise` is `tgkill`, which is why the first claim below is
+    // about a call every C program makes.
+    {
+        let door_mask = set_of(&[libc::SIGUSR2]);
+        let door_sfd = signalfd_new(&door_mask, libc::SFD_NONBLOCK);
+        if door_sfd.is_none() {
+            r.check("a descriptor for the door claims is made", false);
+        } else if let Some(sfd) = door_sfd.as_ref() {
+            let blocked = mask_change(libc::SIG_BLOCK, &door_mask);
+            r.check("SIGUSR2 is blocked for the door claims", blocked);
+            if blocked {
+                // `raise(3)` is `tgkill` underneath: SI_TKILL, not SI_USER.
+                // SAFETY: raising a blocked signal this process owns, so it
+                // queues rather than running a disposition.
+                let raised = unsafe { libc::raise(libc::SIGUSR2) };
+                r.check("raise of the blocked signal succeeds", raised == 0);
+                let mut b = [0u8; 128];
+                let got = read(sfd, &mut b);
+                let info = record_of(&b);
+                r.check(
+                    &format!(
+                        "raise's record is SI_TKILL ({}), the code tgkill sends, got {}",
+                        libc::SI_TKILL,
+                        info.ssi_code
+                    ),
+                    got == Ok(128) && info.ssi_code == libc::SI_TKILL,
+                );
+
+                // And `kill` is the other side of the same pair: SI_USER.
+                // SAFETY: killing this process, whose SIGUSR2 is blocked.
+                let killed = unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) };
+                r.check("kill of the blocked signal succeeds", killed == 0);
+                let got = read(sfd, &mut b);
+                let info = record_of(&b);
+                r.check(
+                    &format!(
+                        "kill's record is SI_USER ({}), got {}",
+                        libc::SI_USER,
+                        info.ssi_code
+                    ),
+                    got == Ok(128) && info.ssi_code == libc::SI_USER,
+                );
+            }
+            let _ = mask_change(libc::SIG_UNBLOCK, &door_mask);
+        }
+        drop(door_sfd);
+    }
+
     // The flag-wordless form makes a descriptor too - the same handler as the
     // flagged one here (see the door note above), and the form a caller that
     // wants the descriptor's own blocking behaviour uses.
