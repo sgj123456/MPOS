@@ -5397,7 +5397,29 @@ pub fn handle_dup3(args: [usize; ARG_COUNT]) -> isize {
         Err(e) => return err_of(e),
     };
     match crate::sched::current_fds().install_at(file, new) {
-        Ok(()) => new as isize,
+        Ok(()) => {
+            // `install_at` clears the number's `FD_CLOEXEC` - which is what
+            // `dup2` owes (`docs/notes/` §6.175: measured, `dup2` clears it) -
+            // so the flag this call exists for has to be set here, after the
+            // install. The doc above claimed this door carried `O_CLOEXEC` and
+            // it did not: `handle_dup3` accepted the flag, dispatched on it for
+            // `old == new`'s `EINVAL`, and never installed it, so a caller
+            // asking for close-on-exec got a plain descriptor and leaked it
+            // across `execve`.
+            // The **descriptor** flag, not the `open` one: the table stores
+            // and `F_GETFD` reports `FD_CLOEXEC` (1), while `dup3`'s argument is
+            // `O_CLOEXEC` (0x80000) - the same promise in two different flag
+            // spaces, which is exactly the confusion that made the first fix
+            // store the wrong word and `F_GETFD` report `0x80000` where Linux
+            // answers `0x1`.
+            if flags & O_CLOEXEC != 0
+                && let Err(e) =
+                    crate::sched::current_fds().fd_flags_set(new, crate::vfs::file::FD_CLOEXEC)
+            {
+                return err_of(e);
+            }
+            new as isize
+        }
         Err(e) => err_of(e),
     }
 }
