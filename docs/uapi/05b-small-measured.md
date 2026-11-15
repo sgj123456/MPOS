@@ -1699,7 +1699,9 @@ the node says its bytes are storage - `RamFile`, `Ext4Ino` (a regular file's ino
 `false` is deliberate: a node that forgets is refused with Linux's number, where a default of
 `true` would accept a mapping its faults cannot serve - and that failure is a kill, not an
 errno. Pin `t-mmap-refuse` (14 claims, host + both arms); the counterfactual reproduces the
-report (`exit=139`). `/dev/zero` remains a named divergence. (§5.6, item 271)
+report (`exit=139`). `/dev/zero` was a named divergence then; **item 285** (§5.7) maps it, via a
+third question (`maps_as_anonymous()`) that routes it into the anonymous arm instead of adding a
+mapping kind, and gives the door the descriptor-access rule it had never had. (§5.6, item 271)
 
 **`execve` reads a window, not the file (item 272, §6.154).** The guest's `chromium` answered
 `/usr/bin/chromium: exec: line 36: /usr/lib/chromium/chromium: No space left on device` for a

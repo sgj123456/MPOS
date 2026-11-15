@@ -259,7 +259,7 @@ instead the process died inside a mapping it believed in.
 | `/dev/null` (mode `020666`) | `-1 ENODEV` |
 | `/proc/self/stat`, `/proc/self/maps`, `/sys/kernel/notes` | `-1 ENODEV` |
 | `/etc/hostname` (mode `100644`) | maps; first byte `97` |
-| `/dev/zero` | maps - it has its own mmap operation |
+| `/dev/zero` | maps - it has its own mmap operation (what it maps is anonymous memory: §5.7) |
 
 Order of the refusals, same probes: `len 0` → `EINVAL`; `offset 1` → `EINVAL`;
 `fd = -1` → `EBADF`; `PROT_NONE` → `ENODEV`; `MAP_SHARED` → `ENODEV`;
@@ -304,3 +304,140 @@ host tests, 0 failed (51.24 s); x86_64 `verdict pass=313 fail=0`; aarch64 `pass=
 aarch64).
 
 Full record: [`docs/uapi/`](../uapi/05-work-list.md) §5.1 item 271.
+
+### 5.7 `/dev/zero` maps, and what it maps is anonymous memory — **DONE** (2026-11-15)
+
+`§5.6` left one name behind, in its own closing sentence and in four other
+places that quoted it: "`/dev/zero` still answers `ENODEV` where Linux maps it
+(it needs a zero-page mapping operation, named rather than faked)". That was
+honest about the refusal and wrong about the prerequisite — there is no
+zero-page mapping operation to write. What `/dev/zero` hands a mapping is
+**fresh private anonymous memory**, and this kernel already has that: the arm
+`MAP_ANONYMOUS` takes. The four other memory streams (`/dev/null`, `/dev/full`,
+`/dev/random`, `/dev/urandom`) are the ones a mapping must refuse, and they were
+already refused.
+
+**Measured on Linux 7.2.14 first** (`build/scratch/zeromap/{z,w,v,mat,n}.c`):
+
+| question | answer |
+|---|---|
+| `/dev/zero`, `MAP_PRIVATE` / `MAP_SHARED` | maps both ways |
+| `/dev/null`, `/dev/full`, `/dev/random`, `/dev/urandom` | `-1 ENODEV` both ways |
+| two `MAP_SHARED` mappings of one page | **not aliased** — `a[0]=0xabc` leaves `b[0]=0` |
+| `MAP_PRIVATE` beside a shared one | independent |
+| `offset 4096*1000`, `len 2^46` | accepted — no extent to run past |
+| `len 0`, unaligned `offset` | `EINVAL`, before anything else |
+| fd closed after mapping | the mapping survives; `fork` shares it |
+| `maps`, private | `rw-p 00000000 00:09 6    /dev/zero` |
+| `maps`, shared | `rw-s 00000000 00:01 <ino>  /dev/zero (deleted)` |
+| smaps, private page | `Rss: 4 kB`, `Anonymous: 4 kB` |
+| smaps, shared page | `Rss: 4 kB`, `Anonymous: 0 kB` |
+
+So a shared `/dev/zero` mapping prints the *same shape* Linux prints for
+`MAP_SHARED|MAP_ANONYMOUS` (`/dev/zero (deleted)` there, because Linux builds
+that from a deleted tmpfs inode) — the two are the same memory with different
+paperwork. The aliasing row is the one that decides the design: a mapping that
+looked like a window on the device would alias, and a fixture that only read
+zeroes could not tell the difference. `/dev/zero` is anonymous memory wearing a
+device's name.
+
+**The descriptor's access mode is part of the rule, and it does not exist in this
+kernel at all** (`build/scratch/zeromap/mat.c`, `n.c`):
+
+| fd mode | `MAP_PRIVATE` | `MAP_SHARED` |
+|---|---|---|
+| `O_RDONLY`, `PROT_READ` | ok | ok |
+| `O_RDONLY`, `PROT_WRITE` or `PROT_READ\|PROT_WRITE` | **ok** (a private write is the process's own copy) | `-1 EACCES` |
+| `O_WRONLY`, any prot incl. `PROT_NONE` | `-1 EACCES` | `-1 EACCES` |
+| `O_RDWR` | ok | ok |
+
+The same table holds for a read-only *file* (`/etc/hostname`), so it is not a
+device rule. `O_WRONLY` is refused even for `PROT_NONE` and for a private
+mapping: a mapping is a view of the file's bytes, and a write-only descriptor
+has no view to give. Across all of it the order is fixed, measured by asking two
+questions at once: `EINVAL` (length, offset) first, then the descriptor's access
+mode, then the node's own answer — a directory asked `MAP_SHARED|PROT_WRITE` is
+`EACCES` while the same directory asked `MAP_SHARED|PROT_READ` is `ENODEV`.
+
+**What the fix is.** A third question beside `mappable()` and `frame_backed()`,
+because `/dev/zero` answers neither: it has no frames to alias and its
+`read_at` invents the bytes rather than serving storage. `Inode::maps_as_anonymous()`
+defaults to `false`, `CharDevice` carries the same predicate (Linux asks the
+driver through `f_op->mmap`), `DevNode` forwards its driver's answer, and
+`ZeroDev` says `true`. The `mmap` door's arm sits immediately after the
+`MAP_ANONYMOUS` arm and before the `frame_backed`/`ENODEV`/copy arms: private
+routes to `map_anon_named` (new — the name cannot be inferred from
+`VmaKind::Anon`, and Linux prints `/dev/zero` beside anonymous pages), shared
+reuses the unnamed `Memfd` object the `MAP_SHARED|MAP_ANONYMOUS` arm already
+builds. Deliberately **not** a new `VmaKind`: the memory is `Anon`, and a
+variant would have touched 24 match sites to describe something this kernel
+already models. The descriptor rule went into the backing resolution with
+`err::EACCES` (which already existed) and a comment naming the measured order.
+
+**Pinned** by `t-dev-zero-mmap` (new, both machines, 17 claims), written against
+Linux first: `MPOS_ON_HOST=1` **17/17 ok, `PASS`, exit 0**. Guest: **17/17 ok,
+`PASS`, `exit=0`**. The claims: `/dev/null` still `ENODEV` both ways (the half a
+"let every char device map" fix would break), `/dev/zero` maps both ways and
+reads zero and keeps a written byte, two shared mappings are separate memory, an
+offset a thousand pages in is accepted, a write-only descriptor is `EACCES` for
+`PROT_READ` / `PROT_READ|PROT_WRITE` / `PROT_NONE`, a read-only descriptor
+refuses a shared write with `EACCES` **and serves the same write privately**, a
+private mapping is named `/dev/zero` in `maps`, and the mapping outlives its
+descriptor.
+
+**Counterfactual** — the kernel half stashed (`git stash push` of the six
+files), kernel and loader rebuilt: the two `/dev/null` refusals stay green and
+**all fifteen `/dev/zero` claims go red**, every one of them answering errno 19
+(`ENODEV`) — including the three `EACCES` rows, which is the reading that proves
+the descriptor rule is new rather than an accident of the node question. Output:
+`build/scratch/zeromap/guest-cf.log`, `=== t-dev-zero-mmap exit=1`. Restored
+with `git stash pop` and `sha256sum -c build/scratch/zeromap/good/good.sha` (all
+eight 成功), rebuilt, 17/17 green again.
+
+**The first gate was red, on a pin that predates this item.** `t-fbdev` opened
+`/dev/fb0` **`O_RDONLY`** and then mapped it `MAP_SHARED|PROT_WRITE`, which the
+new descriptor rule refuses with `EACCES` — `FAIL: the framebuffer maps`, both
+arms. The measurement that decided which side was wrong is the host's own card,
+as root (`build/scratch/zeromap/fb.c`): `open RDONLY /dev/fb0 = 3`,
+`RDONLY + SHARED|RW = EACCES`, `RDONLY + PRIVATE|RW = ok`. Linux refuses that
+call too, so the *test* was asking for a mapping no kernel hands out; a
+compositor draws through the mapping and therefore opens the card for writing.
+`t-fbdev` now opens `O_RDWR`, with the measurement in its comment. That is the
+"when the gate goes red, the code changes, not the test" rule being answered
+rather than followed: the counter-evidence had to be Linux's own answer for the
+test's own call.
+
+**One divergence, recorded rather than faked.** The guest's `maps` line for a
+private `/dev/zero` mapping reads `7e9cb4a84000-7e9cb4a85000 r--p 00000000 00:00 0
+/dev/zero` where Linux reads `00:09 6`: the name is right, the device and inode
+are `00:00 0` because this kernel's `stat` reports no filesystem for any node.
+`/memfd: (deleted)` carries the same two zeroes for the same reason, so this is
+one divergence with two spellings rather than a new one — and a fabricated inode
+number in a field a program parses would be worse than the zero.
+
+**What this does not do, named.**
+
+1. `maps`'s device and inode fields are `00:00 0` for every mapping, `/dev/zero`
+   included (above). Fixing it means a `stat` that reports a node's owning
+   filesystem, which no node carries today.
+2. A shared `/dev/zero` mapping prints `/memfd: (deleted)` where Linux prints
+   `/dev/zero (deleted)`. Both name the same thing — an object with no
+   filesystem — and this kernel's spelling is already documented for
+   `MAP_SHARED|MAP_ANONYMOUS`; matching Linux's exactly would mean a mapping
+   name derived from the *file* for a range that does not alias it.
+3. 1 GiB of `/dev/zero` maps but still costs a frame per page on first touch —
+   there is no shared zero page, so two processes touching the same offsets get
+   two frames. Linux's kernel does the same for a *write*, and this kernel has no
+   read-only zero page to hand out; a process that maps 1 GiB and touches all of
+   it will OOM, as it would on Linux without overcommit.
+4. `mmap` of a **pipe**'s or a **socket**'s node is `ENODEV` (`§5.6`), and
+   `/dev/zero`'s new predicate does not change that — no memory stream but
+   `zero` answers it.
+
+**Gate** — `cargo xtask test`, `build/gate-devzero2.log`, `GATE_EXIT=0`: stage 1
+**1331** host tests, 0 failed (29.56 s); x86_64 `verdict pass=322 fail=0`; aarch64
+`pass=318 fail=0`; `mpos-kunit 41 passed, 0 failed` both; lint ratcheted at
+162/168/389/273/3/1, both workspaces rustfmt's shape, the fuzz workspace's targets built;
+`t-dev-zero-mmap` green in both arms.
+
+Full record: [`docs/uapi/`](../uapi/05-work-list.md) item 285.

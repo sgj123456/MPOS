@@ -12230,11 +12230,14 @@ x86_64 `pass=313 fail=0`; aarch64 `pass=312 fail=0` (16 of 328 left out by `test
 rustfmt's shape; the fuzz workspace 23 targets; `t-mmap-refuse` green in both arms (0 ms
 x86_64, 191 ms aarch64).
 
-**What this does not do.** `/dev/zero` still answers `ENODEV` where Linux maps it (it needs a
-zero-page mapping operation, named rather than faked); the `EACCES` that Linux's
-`MAP_SHARED|PROT_WRITE` of a read-only file answers was already this kernel's answer and is
-not re-pinned here; and a mapping's *later* pages are still not re-checked against this
-question (the refusal is at the call, which is where Linux asks it). (§5.6, item 271)
+**What this did not do** (written then; both later items are named so the reader is not left
+guessing). `/dev/zero` still answered `ENODEV` where Linux maps it — **closed by item 285**
+(§5.7), which found the prerequisite was not a "zero-page mapping operation" but the
+anonymous arm this kernel already had. And the `EACCES` that Linux's
+`MAP_SHARED|PROT_WRITE` of a read-only file answers was **not** this kernel's answer at all —
+item 285 measured that the door had no descriptor-access check anywhere and added it. What
+remains true: a mapping's *later* pages are not re-checked against this question (the refusal
+is at the call, which is where Linux asks it). (§5.6, item 271)
 
 ---
 
@@ -12783,3 +12786,25 @@ still is not written (`src/vfs/signalfd.rs` drops `SigInfo::addr`) and
 EL0 sync path produces `Page` and `InvalidOpcode` and the rest are unwitnessed
 there, recorded rather than glossed. Chromium is not unblocked (its `cc 0f 0b`
 is an intentional `__builtin_trap()`).
+
+## Item 285 — `/dev/zero` maps, and the descriptor's access mode is judged first (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **Before** | The `mmap` door answered `ENODEV` for every character device: `Inode::mappable()` defaults to false and nothing overrode it, so `/dev/zero` — the one memory stream POSIX promises a program it may map — was refused beside `/dev/null`. Named residual of §5.6/item 271 as "it needs a zero-page mapping operation, named rather than faked". **And there was no descriptor-access check anywhere in the door** (`grep -rn "may_write()\|ACC_RDONLY" src/syscall/linux/proc.rs` → no hits), so `MAP_SHARED|PROT_WRITE` of a read-only descriptor was accepted where Linux answers `EACCES`. |
+| **Now** | A third `Inode` question beside `mappable()` and `frame_backed()`: `maps_as_anonymous()`, defaulted false, carried on `CharDevice` (Linux asks the driver through `f_op->mmap`), forwarded by `DevNode` from its driver, answered `true` by `ZeroDev`. The door routes that node into the arms `MAP_ANONYMOUS` already has — `map_anon_named` (new; the name cannot be inferred from `VmaKind::Anon`) privately, the unnamed `Memfd` object the shared-anonymous arm builds, shared. Deliberately not a `VmaKind` variant: the memory *is* `Anon`, and a variant would have touched 24 match sites. The measured descriptor rule went into the backing resolution: `O_WRONLY` → `EACCES` for every prot including `PROT_NONE`, and a write prot on a non-writable descriptor under `MAP_SHARED` → `EACCES` while the same request privately is served. Order preserved: `EINVAL` → descriptor access → the node's answer. |
+| **Measured first** | Linux 7.2.14, `build/scratch/zeromap/{z,w,v,mat,n}.c`: `/dev/zero` maps both ways while `/dev/null`/`full`/`random`/`urandom` are `ENODEV` both ways; **two shared mappings of one page do not alias** (`a[0]=0xabc`, `b[0]=0`); `MAP_PRIVATE` is independent; an offset a thousand pages in and `len 2^46` are accepted (no extent); smaps says `Anonymous: 4 kB` for a private page and `0 kB` for a shared one; `maps` prints `/dev/zero` privately and `/dev/zero (deleted)` shared — the same shape it prints for `MAP_SHARED\|MAP_ANONYMOUS`. The access table (`mat.c`, same for a read-only file, so not a device rule): `O_RDONLY` + private + write prot **ok**, `O_RDONLY` + shared + write prot **`EACCES`**, `O_WRONLY` **`EACCES`** for every prot, `O_RDWR` ok. |
+| **Pins** | `user/tests/src/bin/t-dev-zero-mmap.rs` (new, both machines, **17 claims**). `MPOS_ON_HOST=1` **17/17 ok, PASS, exit 0**; guest **17/17 ok, PASS, exit 0**. `/dev/null` still `ENODEV` both ways is the half a "map every char device" fix breaks; `/dev/zero` maps both ways, reads zero, keeps a written byte; two shared mappings are separate memory; offset `4096*1000` accepted; a write-only descriptor `EACCES` for `PROT_READ`/`PROT_READ\|PROT_WRITE`/`PROT_NONE`; a read-only descriptor refuses a shared write `EACCES` **and serves the same write privately** (the neighbour that makes the claim about the shared half rather than about read-only fds); the private mapping is named `/dev/zero` in maps; the mapping outlives its descriptor. Host unit test in `src/vfs/devfs.rs` (`the_node_answers_a_mapping_question_the_way_its_driver_does`) pins that `maps_as_anonymous` and `mappable` are different questions — host lib **813**. |
+| **Counterfactual** | The kernel half stashed (`git stash push` of the six files), kernel and loader rebuilt, pin run in the guest → the two `/dev/null` claims stay green and **all fifteen `/dev/zero` claims redden**, every one answering errno 19 (`ENODEV`) — including the three `EACCES` rows, which is the reading that proves the descriptor rule is new rather than a side effect. `build/scratch/zeromap/guest-cf.log`, `=== t-dev-zero-mmap exit=1`. Restored with `git stash pop` + `sha256sum -c build/scratch/zeromap/good/good.sha` (all eight 成功), rebuilt, 17/17 green. |
+| **Gate** | `build/gate-devzero2.log`, `GATE_EXIT=0`: stage 1 **1331** tests 0 failed (29.56 s); x86_64 `verdict pass=322 fail=0`; aarch64 `verdict pass=318 fail=0` (each one more than the previous green — the newly-open pin); `mpos-kunit 41 passed, 0 failed` per arm; fmt both workspaces, host lib 813 / xtask 162, six-arm clippy ratchet `162/168/389/273/3/1` unchanged ("no lint has appeared and no count has grown"), bare metal both arches clean. |
+| **The first gate was red, on a pin that predates this item** | `t-fbdev` opened `/dev/fb0` **`O_RDONLY`** and then mapped it `MAP_SHARED\|PROT_WRITE`, so the new descriptor rule answered `EACCES` and `FAIL: the framebuffer maps`. Measured on the host's own card as root (`sudo -n build/scratch/zeromap/fb`): `open RDONLY /dev/fb0 = 3`, `RDONLY + SHARED\|RW = EACCES`, `RDONLY + PRIVATE\|RW = ok` — Linux refuses it too, so the *test* was asking for a mapping no kernel hands out. Fixed by opening the card `O_RDWR` (what a compositor does) with the measurement in the comment; that is the rule "when the gate goes red, the code changes, not the test" being *answered* rather than followed — the counter-evidence was that Linux's answer for the test's own call is the `EACCES` the kernel now gives. |
+
+**What this does not do, named.** `maps`'s device and inode fields read
+`00:00 0` for *every* mapping — the guest's `/dev/zero` line is `r--p 00000000
+00:00 0 /dev/zero` where Linux prints `00:09 6` — because no node carries its
+owning filesystem; `/memfd: (deleted)` has the same two zeroes for the same
+reason, so it is one divergence with two spellings. A shared `/dev/zero` mapping
+prints `/memfd: (deleted)` where Linux prints `/dev/zero (deleted)`: both name an
+object with no filesystem. There is no shared zero page, so 1 GiB of `/dev/zero`
+still costs a frame per page on first touch. And `mmap` of a pipe or socket node
+remains `ENODEV` — only `zero` answers the new predicate.
