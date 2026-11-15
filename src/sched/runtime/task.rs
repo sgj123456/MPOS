@@ -4520,6 +4520,19 @@ pub fn set_signal_fpu(bytes: &[u8; hal::FPU_BYTES]) {
 
 /// The one path off a task's stack.
 pub(crate) fn schedule(prepare: impl FnOnce(&mut Table)) {
+    // A switch under a live `&mut Table` aliases it. That is not a rule anyone
+    // can reliably remember across a call graph - `with_table`'s closures call
+    // into the filesystem, the filesystem parks, and the park lands here - so it
+    // is checked at the one place every switch goes through
+    // (`docs/notes/` §6.181: the fault that resolved its own page inside a
+    // borrow). The panic names the rule and the caller, because the fix is
+    // always to move the parking call out of the closure.
+    assert!(
+        !table_borrowed(),
+        "a task switch was asked for inside a `with_table` closure: that closure \
+         must not park, sleep or yield (see `with_table`'s doc, and \
+         `docs/notes/` 6.181 for the fault that did)",
+    );
     critical_section::with(|cs| {
         // Deliberately not `with_table`: the borrow has to be dead before the
         // switch below, and a closure would hold it across.
@@ -4533,12 +4546,61 @@ pub(crate) fn schedule(prepare: impl FnOnce(&mut Table)) {
     });
 }
 
+/// How many [`with_table`] closures are live right now.
+///
+/// Zero everywhere except inside one, and it exists to make
+/// "`f` must not switch tasks" **checkable** rather than a sentence in a doc
+/// comment. A closure that parks switches tasks, the switch re-enters the table,
+/// and the two `&mut Table`s alias - which is not a race that needs luck to show
+/// (one core) but is undefined behaviour the compiler is entitled to miscompile,
+/// and which in practice showed as a fault resolved twice
+/// (`docs/notes/` §6.181).
+///
+/// The check is in [`schedule`], the one path off a task's stack: if a borrow is
+/// live when a switch is asked for, the borrow was held across the switch and the
+/// closure broke its contract. Zero cost when nothing is wrong - one relaxed
+/// load.
+static TABLE_DEPTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Run `f` on the task table with interrupts off.
 ///
-/// `f` must not switch tasks. See the module docs for why that is a rule rather
-/// than a preference.
+/// `f` must not switch tasks - and since item 301 that is **enforced** rather
+/// than asked for: [`schedule`] refuses to switch while a borrow is live, so the
+/// violation halts the machine with a named panic instead of aliasing two
+/// `&mut Table`s and corrupting whichever structure the closure held. See the
+/// module docs for why the rule exists.
 pub(crate) fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
-    critical_section::with(|cs| unsafe { f(&mut *TABLE.borrow(cs).get()) })
+    critical_section::with(|cs| {
+        TABLE_DEPTH.fetch_add(1, Ordering::Relaxed);
+        let out = unsafe { f(&mut *TABLE.borrow(cs).get()) };
+        TABLE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        out
+    })
+}
+
+/// Whether a [`with_table`] closure is live - the question [`schedule`] asks
+/// before it switches.
+pub fn table_borrowed() -> bool {
+    TABLE_DEPTH.load(Ordering::Relaxed) != 0
+}
+
+/// [`with_table`], named for the boot suite.
+///
+/// The suite is a child of `sched` but reaches the table through this crate's
+/// public surface (that module's own header says why), and it has to *enter* a
+/// borrow to prove the depth counter rises inside one. A `pub(crate)` door
+/// would do; a named one says at the call site that this is the suite's window
+/// into the invariant rather than a general-purpose escape hatch.
+///
+/// Gated to the test build, because nothing else may have it: an escape hatch
+/// that exists in a production kernel is one a production caller can reach for,
+/// and the whole point of §6.181's rule is that parking inside a borrow must be
+/// unspellable rather than merely discouraged. In a non-test build this function
+/// does not exist, so the gate's `dead_code` arm does not see it and no caller
+/// can.
+#[cfg(feature = "selftest")]
+pub fn with_table_public<R>(f: impl FnOnce(&mut Table) -> R) -> R {
+    with_table(f)
 }
 
 /// When a task last ran and which one: the answer to "the machine is alive but
