@@ -36,6 +36,29 @@ use crate::drivers::virtio::input::EvdevNode;
 pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, request) = (args[0] as i32, args[1] as u32);
     let buf = args[2];
+    // An `O_PATH` descriptor takes **no** `ioctl` at all: it does not open the
+    // file, so every request on it is `EBADF`. This is judged before the request
+    // is dispatched, because `ioctl` is a table of doors and each one would have
+    // to remember the rule - the mistake `ftruncate` made one branch over, where
+    // the argument was judged before the descriptor and a legal length came back
+    // as `EINVAL`. Measured raw on Linux 7.3.4
+    // (`build/scratch/opathrest/t.c`): `ioctl(O_PATH_fd, TCGETS)` is `EBADF`.
+    //
+    // The lookup is fallible and **must** be: this runs before the request is
+    // dispatched, which means it also runs for the ioctls the payload's own
+    // `/init` makes while the task table is still settling, and
+    // `sched::current_fds()` panics on a `current` whose slot is momentarily
+    // empty. The first version of this guard used `clone_at` on that call and
+    // took the machine's init down with a `#GP` in `sh` before a single program
+    // ran (`build/test-lane-x86_64-3/serial.log`: `INIT_EXITED`). A *refusal*
+    // that can end the machine is worse than the leniency it replaces, so the
+    // guard answers only when it can see the descriptor and lets the door's own
+    // `clone_at` produce `EBADF` otherwise.
+    if let Some(file) = crate::sched::running_fd(fd)
+        && file.is_path_only()
+    {
+        return err::EBADF;
+    }
     match request {
         0x5421 => {
             // FIONBIO: set or clear `O_NONBLOCK` - `fcntl(F_SETFL)`'s bit in

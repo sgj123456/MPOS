@@ -3352,6 +3352,30 @@ pub fn current_fds() -> Arc<FdTable> {
     with_table(|t| t.task(id).fds.clone())
 }
 
+/// The running task's descriptor `fd`, or `None` when there is no running task
+/// to ask or that number names nothing.
+///
+/// The **fallible** sibling of [`current_fds`], for a caller that has to ask a
+/// question about a descriptor on a path that also runs during the boot, where
+/// `current` can name a slot the table has momentarily emptied - `current_fds`
+/// panics there, which is right for a door that is already committed to having a
+/// task and wrong for a guard whose answer is "not this one, carry on".
+///
+/// `ioctl`'s `O_PATH` refusal is the caller (`docs/notes/` §6.179): judging it
+/// before the request is dispatched is the honest placement, and doing so with
+/// the panicking lookup ended the machine's init with a `#GP` in `sh` before one
+/// program ran - a refusal that can kill the machine being worse than the
+/// leniency it replaces.
+pub fn running_fd(fd: i32) -> Option<Arc<crate::vfs::file::File>> {
+    let table = with_table(|t| {
+        t.tasks
+            .get(t.current.0)
+            .and_then(|s| s.as_ref())
+            .map(|task| task.fds.clone())
+    })?;
+    table.clone_at(fd).ok()
+}
+
 /// The path the running process was started from - what a `readlink` of
 /// `/proc/self/exe` hands back. Empty when the process has no named image.
 pub fn current_exe() -> alloc::string::String {

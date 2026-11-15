@@ -125,7 +125,7 @@ pub use runtime::{
     release_controlling_tty, release_pid, release_user_frames, reset_disposition, resident_pages,
     resolve_anon_fault, resolve_cow_fault, resolve_pid, resolve_script, resolve_stack_growth,
     resume_traced, retired_status, rlimits_of, robust_head, root_ns, run_owner,
-    run_seccomp_filters, runnable_count, saved_auxv_of, seal_user_range, send_signal,
+    run_seccomp_filters, runnable_count, running_fd, saved_auxv_of, seal_user_range, send_signal,
     send_signal_every_process, send_signal_group, send_signal_group_checked,
     send_signal_group_info, send_signal_info, send_signal_process, send_signal_process_info,
     send_signal_tkill, session_of, session_of_tty, set_brk_base, set_child_subreaper,

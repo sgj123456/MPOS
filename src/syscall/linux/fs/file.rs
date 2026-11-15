@@ -747,6 +747,15 @@ pub fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // `O_PATH` **first**, and that order is the whole finding: this door judged
+    // its length argument before it looked at the descriptor, so
+    // `ftruncate(O_PATH_fd, 0)` answered `EINVAL` (a legal length refused for
+    // the wrong reason) where Linux answers `EBADF`. Measured raw on 7.3.4
+    // (`build/scratch/opathrest/t.c`): every descriptor-taking door refuses
+    // `EBADF` for an `O_PATH` descriptor, and `EBADF` outranks the argument.
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     // Linux refuses to resize anything but a regular file, and `EINVAL` is
     // what a caller reads as "this descriptor is not that": a pipe, a
     // terminal, a socket. A pipe's inode reports [`NodeKind::File`] - the
@@ -1221,10 +1230,16 @@ pub fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// since item 297 this kernel makes one - so the rule is owed rather than
 /// vacuously satisfied. Named gap: see the note below.
 fn xattr_inode_of_fd(fd: i32) -> Result<Arc<dyn Inode>, isize> {
-    crate::sched::current_fds()
-        .clone_at(fd)
-        .map(|file| file.inode())
-        .map_err(err_of)
+    let file = crate::sched::current_fds().clone_at(fd).map_err(err_of)?;
+    // One refusal here covers all four `f*` xattr doors, because they all reach
+    // the file through this helper: an `O_PATH` descriptor names the file and
+    // does not open it, so `fgetxattr`/`fsetxattr`/`flistxattr`/`fremovexattr`
+    // are each `EBADF` (measured raw on Linux 7.3.4
+    // (`build/scratch/opathrest/t.c`), where this kernel served all four).
+    if file.is_path_only() {
+        return Err(err::EBADF);
+    }
+    Ok(file.inode())
 }
 
 /// The node a path names, checked the way the xattr layer reaches it: the
@@ -6284,6 +6299,12 @@ pub fn handle_chown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 pub fn handle_fchown(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(file) => {
+            // `fchown` over an `O_PATH` descriptor is `EBADF`, the same rule as
+            // `fchmod` (measured raw, `build/scratch/opathrest/t.c`); this
+            // kernel answered 0 and changed the owner.
+            if file.is_path_only() {
+                return err::EBADF;
+            }
             let inode = file.inode();
             chown_apply(&inode, args[1] as i32, args[2] as i32)
         }
@@ -6548,6 +6569,12 @@ pub fn handle_fadvise64(args: [usize; ARG_COUNT]) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // An `O_PATH` descriptor first: this door answered 0 for one, i.e. told the
+    // caller its advice had been taken about a file it never opened. Measured
+    // raw on 7.3.4 (`build/scratch/opathrest/t.c`).
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     // A pipe has no byte range to give advice about, and Linux says so before it
     // judges either the range or the advice.
     if file.inode().as_pipe().is_some() {
