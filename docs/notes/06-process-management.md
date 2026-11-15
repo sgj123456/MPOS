@@ -16811,3 +16811,125 @@ is part of the record.
    already serves), and `ioctl`'s file-descriptor commands over one. The predicate
    exists now, so each is one line — but a line nobody has written is a gap, not a
    guarantee.
+
+## §6.179 the rest of `O_PATH`'s refusals: seven doors served what nine must refuse (item 299, LANDED 2026-11-15)
+
+**What §6.178 left.** Its own named gap list said: "`fchmod`/`getdents64` are the
+two refusals claimed, not the set… the predicate exists now, so each is one line —
+but a line nobody has written is a gap, not a guarantee." This is the rest of the
+set, and the sentence was right about the cost and wrong about the size: seven more
+doors needed the line, and two of those were not merely lenient.
+
+**Measured first**, all raw (`build/scratch/opathrest/t.c`, Linux 7.3.4), because
+§6.178 showed that two of these doors have libc fallbacks that hide the kernel's
+answer:
+
+| door | Linux | this kernel (before) |
+|---|---|---|
+| `fchown` | `EBADF` | **0 — and the owner changed** |
+| `fgetxattr` | `EBADF` | served, returned the value |
+| `flistxattr` | `EBADF` | served, returned the list |
+| `fsetxattr` | `EBADF` | served — **wrote the attribute** |
+| `fremovexattr` | `EBADF` | served — **removed it** |
+| `ftruncate` | `EBADF` | `EINVAL` (a legal length refused, for the wrong reason) |
+| `fadvise64` | `EBADF` | **0 — advice "taken" on a file never opened** |
+| `ioctl` (any request) | `EBADF` | `ENOTTY`, after the request was dispatched |
+| `fstat`, `fchdir` | served | served — the neighbours that must stay |
+
+Nine refusals, two served. Seven of the nine were wrong, and the two that were
+"right" in errno were right by accident: `ftruncate` answered `EINVAL` because it
+judged its **length** before its descriptor, and `ioctl` answered `ENOTTY` because
+it dispatched on the **request** first. Both are the same shape - *the argument was
+judged before the descriptor* - and it is the same shape `linkat`'s source-base bug
+had one item over: a door that reads its own arguments before it asks what it was
+handed.
+
+**Why the wrong-ness mattered, beyond the errno.** `fchown` and `fsetxattr` are
+*writes*. An `O_PATH` descriptor exists so a caller can hold a name without holding
+the right to change the thing named - that is the whole reason `shm_open`-style and
+`/proc`-style doors use it - and this kernel let one change the owner and the
+extended attributes. A caller could hold an `O_PATH` descriptor for a file it may
+only name and still have its mode, owner and xattrs written through it. The errno
+is the visible half; the authority was the real half.
+
+**The change is one predicate and nine lines**, and the *placement* is the finding
+three times over:
+
+* the four `f*xattr` doors were already funnelled through one helper
+  (`xattr_inode_of_fd`), so they took **one** check rather than four - the
+  arrangement §6.178 recommended for the rest of the set, found already in place;
+* `fchown`, `fadvise64` and `ftruncate` got the check **before** their argument
+  validation, which is where Linux puts it - `ftruncate`'s `EINVAL` is the reading
+  that proves the order is the bug;
+* `ioctl` got it **before the request is dispatched**, at the entry point. That is
+  the one place it can live honestly: `ioctl` is a table of a hundred doors, and a
+  rule every door must remember is a rule some door will forget.
+
+**The pin.** `t-open-path` grew eight more claims (25 total): the seven refusals
+above plus the `fstat` neighbour that proves they are about `O_PATH` rather than
+about a broken descriptor. Every one is a **raw syscall** — and this item is why:
+musl's `fchown`, like its `fchmod`, routes through `/proc/self/fd` when the direct
+call fails, so a wrapper-level claim would have measured the libc.
+
+**Counterfactual.** The two kernel files stashed, rebuilt, the pin in the guest:
+**seven claims red**, each with its own wrong answer —
+
+```
+FAIL: fchown(O_PATH fd) is EBADF (raw), got rc=0
+FAIL: fgetxattr(O_PATH fd) …, got rc=-1        (a different refusal, not EBADF)
+FAIL: flistxattr(O_PATH fd) …, got rc=0
+FAIL: fsetxattr(O_PATH fd) …, got rc=0
+FAIL: fadvise64(O_PATH fd) …, got rc=0
+FAIL: ftruncate(O_PATH fd) …, got rc=-1        (EINVAL)
+FAIL: ioctl(TCGETS)(O_PATH fd) …, got rc=-1    (ENOTTY)
+```
+
+Restored from `build/scratch/opathrest/good/*.rs`, `sha256sum -c` 成功 on all
+three, rebuilt, `PASS`.
+
+**A refusal that could kill the machine, found by the gate.** The first version of
+the `ioctl` guard asked `sched::current_fds()` - which calls `t.task(current)` and
+**panics** on a `current` whose slot is momentarily empty. With a guard before the
+request is dispatched that is not a rare path: it runs for the ioctls the payload's
+own `/init` makes while the task table settles, and the gate's first arm died
+
+```
+trap 13 code 0x0 rip 0x7db9e9446038 …
+traps: sh[1] general protection fault ip:7db9e9446038
+INIT_EXITED: the system has no init left
+```
+
+before a single program ran. The fix is a **fallible** sibling,
+`sched::running_fd(fd)`, which answers `None` when there is no task to ask and lets
+the door's own `clone_at` produce `EBADF`; the `O_PATH` guard then never has to
+panic to say "not this one". The lesson is one this repository has in several
+currencies already and now has it in this one: **a refusal that can end the machine
+is worse than the leniency it replaces**, so a guard on a shared path must be
+fallible by construction rather than by argument.
+
+**Gate.** `build/gate-item299b.log`, `GATE_EXIT=0`, both arms in one run. Stage 1
+**1340** host tests 0 failed (97.98 s); stage 2 **324** programs over 6 lanes on
+x86_64 (60.24 s) and **320** on aarch64 (52.86 s); `pass=324 fail=0` /
+`pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`; both workspaces formatted. The **first** run of
+this item (`build/gate-item299.log`) reddened x86_64 at the init death above and is
+part of the record.
+
+### What this does not do, named
+
+1. **The nine are the doors that *delete* or *write*; `O_PATH` also changes what a
+   door may *read*.** `getdents64` (§6.178) and `read`/`write` are claimed; `readv`/
+   `pread64`/`preadv` go through the same `pre_read` and are therefore covered by
+   construction rather than by a claim of their own - which is the shape this
+   repository prefers, but it does mean no pin names them.
+2. **`fcntl` is deliberately not in the list.** Linux serves `F_GETFL`/`F_GETFD`/
+   `F_DUPFD`/`F_SETFD` on an `O_PATH` descriptor and refuses `F_SETFL` and the lock
+   commands; this kernel's `fcntl` was not re-read for those two refusals, so the
+   half that is wrong could be in either direction.
+3. **`mmap` of an `O_PATH` descriptor** is `EBADF` on Linux and was not swept; the
+   `mmap` door's descriptor-access check (§5.7) asks `prot`/mode, not `O_PATH`.
+4. **Nothing pins the *authority* reading** - that an `O_PATH` descriptor may not
+   write the owner or the xattrs - beyond the errno. A claim phrased as "the owner
+   did not change" would be the one a future implementation could not satisfy by
+   returning `EBADF` for a different reason; it is named here as the sharper pin
+   nobody wrote.

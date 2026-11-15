@@ -3147,3 +3147,36 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `build/gate-item298b.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64
   `pass=324`, aarch64 `pass=320`, kunit 41/0 per arm, clippy ratchet unchanged.
   (§6.178, item 298)
+
+- **Item 299 — the rest of `O_PATH`'s refusals: seven doors served what nine must refuse**:
+  §6.178's gap list said the predicate existed and "each is one line — but a line nobody
+  has written is a gap, not a guarantee". This is the rest, and the sentence was right
+  about the cost and wrong about the size: **seven more doors** needed it, two not merely
+  lenient. Measured raw on Linux 7.3.4 (`build/scratch/opathrest/t.c`): nine refusals and
+  two served. `fchown` → `EBADF` (this kernel **0, owner changed**); `fgetxattr`/
+  `flistxattr` served; `fsetxattr` served and **wrote the attribute**; `fremovexattr`
+  served and **removed it**; `ftruncate` → `EINVAL`; `fadvise64` → **0, advice "taken" on
+  a file never opened**; `ioctl` → `ENOTTY`; `fstat`/`fchdir` served on both. **Why it
+  mattered beyond the errno**: `fchown` and `fsetxattr` are *writes*, and an `O_PATH`
+  descriptor exists so a caller may hold a **name** without holding the right to change
+  the thing named — that is why `shm_open`-style and `/proc`-style doors use it — so the
+  authority was the real half and the errno only the visible one. The two that refused
+  "correctly" were right by accident: `ftruncate` judged its **length** before its
+  descriptor, `ioctl` dispatched on the **request** first — the same shape as `linkat`'s
+  source-base bug one item over, and the placement became the finding three times (one
+  check for the four `f*xattr` doors, which already shared a helper; argument-order for
+  `fchown`/`fadvise`/`ftruncate`; and the `ioctl` **entry point**, because a rule every
+  one of a hundred doors must remember is a rule some door will forget). `t-open-path`
+  grew eight more claims (25 total), all raw syscalls — musl's `fchown` routes through
+  `/proc/self/fd` like its `fchmod`, so a wrapper claim would have measured the libc.
+  Counterfactual reddens **seven** claims, each with its own wrong answer. Named: the
+  read side (`readv`/`pread64`/`preadv`) is covered by construction not by a claim;
+  `fcntl`'s `F_SETFL`/lock refusals were not re-read; `mmap` of an `O_PATH` fd unswept;
+  and nothing pins the **authority** reading, only the errno. **The first gate run went
+  red on x86_64**: the `ioctl` guard used `sched::current_fds()`, which panics on a
+  `current` whose slot is momentarily empty, so the payload's own `sh` died of a `#GP`
+  with `INIT_EXITED` before one program ran — fixed with a fallible `sched::running_fd`,
+  the lesson being that a refusal which can end the machine is worse than the leniency it
+  replaces. Gate `build/gate-item299b.log` `GATE_EXIT=0`, both arms in one run: stage 1
+  1340, x86_64 `pass=324`, aarch64 `pass=320`, kunit 41/0 per arm, clippy ratchet
+  unchanged. (§6.179, item 299)
