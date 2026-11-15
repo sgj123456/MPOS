@@ -2796,3 +2796,30 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   queued record is still kept (a pre-existing, separately pinned divergence),
   `CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`, and the counters are reported
   nowhere else. (§6.166, item 286)
+
+- **Item 287 — a deleted timer's record is freed, and the pending bit is left standing**:
+  §6.166 closed with this as a named divergence — "this kernel keeps the record, Linux
+  frees the `sigqueue` and a take answers `EAGAIN`". Measuring it showed the sentence was
+  wrong in both directions. Linux frees the record and **leaves the pending bit set**
+  (`pending=1` before and after the delete); a take then answers `EAGAIN`; a *blocking*
+  `sigtimedwait` parks its whole timeout and only then answers `EAGAIN`; that failed
+  dequeue is what drops the bit; unblocking runs no handler and does not end the task;
+  a `signalfd` read is `EAGAIN`; a later `kill` of the same number is delivered normally;
+  and deleting an unfired timer touches nothing (`build/scratch/timerdel/{del,del2,del3,
+  del4}.c`, Linux 7.3.4, both signal classes). This kernel did worse than "keeps the
+  record": the handler **ran** for a timer that no longer existed, a `signalfd` handed
+  back a full record naming it, and a task blocked in a syscall **died** of the number —
+  and the pinned claim called that a divergence by design, which is the shape §3 rule 2
+  forbids. The fix is a marker **on the record** (`SigInfo::freed`, keyed by the timer's
+  handle so a second timer's record on the same number is not marked by mistake) plus one
+  `record_is_freed(task, sig)` predicate asked by all three doors that could hand the
+  signal over; `RtQueue::holds_freed` answers the real-time half. The fatal door was the
+  third one found, by the guest dying of signal 38 in the probe's own cleanup. Pin
+  `t-timer-create`'s divergence claim became three claims of Linux's answer with no
+  `host_run` branch (green on both arms) plus host lib 819; the counterfactual reddens
+  exactly `so a take of that number answers EAGAIN, not a record (got Ok(14))` while the
+  other two stay green. Gate `build/gate-item287-x86.log` exit 0: stage 1 1337, x86_64
+  `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet unchanged. Named: two timers on one signal each deleted with a record queued
+  leave one marker (the model's limit, not measured against Linux), the stale bit's window
+  duration is unpinned, and a `SIGEV_THREAD_ID` expiry's marker lands on the named
+  thread's record. (§6.167, item 287)

@@ -15537,12 +15537,15 @@ workspaces formatted.
 
 ### What this does not do, named
 
-1. **A deleted timer's queued record is kept.** Linux frees the `sigqueue` and
-   a polling take answers `EAGAIN`; this kernel leaves the record takeable.
-   That divergence predates this item and is still pinned as such by
-   `t-timer-create`'s "a deleted timer's queued record is still takeable" claim.
-   `note_timer_delivered` finds no timer for such a record and so leaves the
-   counter alone, which is the honest half.
+1. ~~**A deleted timer's queued record is kept.**~~ **Closed by item 287**
+   (§6.167), and the sentence above was wrong about Linux in both directions:
+   the delete frees the record but leaves the pending **bit** standing, so a
+   take answers `EAGAIN` while `sigpending` still names the number. This kernel
+   was worse than "keeps the record" — it *delivered* it (a handler ran, a
+   `signalfd` returned a full record) and the die-in-a-syscall door ended the
+   task. `Note 287` adds the freed marker; `note_timer_delivered` still finds no
+   timer for such a record and leaves the counter alone, which is the honest
+   half.
 2. **`CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`** (§6.123), so the CPU
    clock's overrun path is unwitnessed.
 3. **The overrun counters are not reported anywhere else** - `/proc/<pid>/timers`
@@ -15551,3 +15554,126 @@ workspaces formatted.
 4. **`si_overrun`'s saturation** at `INT_MAX` is untested: Linux caps it
    (`it_overrun` is an `int` and `send_sigqueue` stops incrementing at
    `INT_MAX`), and a probe would have to miss two billion expiries.
+
+## §6.167 a deleted timer's record is freed, and the pending bit is left standing (item 287, LANDED 2026-11-15)
+
+**The observation.** §6.166 closed its list with a named divergence: "a deleted
+timer's queued record is kept. Linux frees the `sigqueue` and a polling take
+answers `EAGAIN`; this kernel leaves the record takeable." Reading that as a
+one-line change would have been wrong in two directions — it is not "keep versus
+free the record", and the divergence was worse than the sentence said.
+
+**Measured first** (`build/scratch/timerdel/{del,del2,del3,del4}.c`, Linux
+7.3.4, for `SIGALRM` and `SIGRTMIN+3` alike):
+
+```
+before delete: pending=1
+timer_delete=0
+after delete:  pending=1          <- the bit SURVIVES
+sigtimedwait after delete -> EAGAIN (11)
+sigtimedwait again        -> EAGAIN (11)
+control: not deleted      -> took 14 code=-2 timerid=1 overrun=0
+```
+
+So the delete frees the record and **leaves the pending bit standing**. What
+follows from that is the part worth measuring, because each answer is a
+different door:
+
+* a **blocking** `sigtimedwait` on the stale bit parks for its *whole* timeout
+  and only then answers `EAGAIN` (`del4.c`: `after 150 ms`);
+* the bit disappears at that failed dequeue — `after the blocking take:
+  pending=0` — so the stale bit is a one-read phenomenon, not a leak;
+* **unblocking runs no handler**, and does not end the task even though the
+  number's default action is to terminate (`del2.c`: `handler runs after unblock
+  = 0`);
+* a `signalfd` read is `EAGAIN` (`del3.c`), and the pending set it consults
+  still reports the bit until that read;
+* a later `kill` of the same number is delivered normally (`del2.c`: `take after
+  kill -> took 38 code=0`), so the stale bit costs its own answer and nothing
+  else;
+* deleting a timer that has **not** fired touches nothing (`del3.c`: `unfired
+  after delete: pending=0`).
+
+**What this kernel did** — measured with the same probe on the guest, before the
+change:
+
+```
+after delete: pending=1 handler_runs=0
+after unblock: handler_runs=1        <- Linux: 0
+signalfd read -> n=128 errno=0       <- Linux: EAGAIN
+```
+
+Two wrong answers, not one: the handler **ran** for a timer that no longer
+existed, and a `signalfd` handed back a full record naming it. The pinned claim
+had been written as a *divergence by design* — "the claim is this kernel's
+answer" — which is exactly the shape AGENTS.md §3 rule 2 forbids, and it had
+hidden a door that could kill a program.
+
+**And the fatal door was the third.** The first version of this fix taught the
+two take paths about the freed record, and the guest then died of signal 38
+(`exit=166`) in `del4.c`'s cleanup: `take_fatal_signal` — the door a task
+blocked in a syscall uses — took the stale bit and ran `die_of_fatal_signal`,
+because a real-time number's default action is to terminate. Linux's measured
+answer is that nothing happens. That door has to ask the same question, which is
+why the predicate is one function.
+
+**The change.** `SigInfo` gained `freed` — a marker **on the record**, not a
+second per-signal set, because the record is the thing the two disagree about
+and one place saying "the bit is set and the record is gone" cannot drift.
+`timer_remove` sets it when a record is actually waiting (by handle, so a second
+timer's record on the same number is not marked by mistake), `RtQueue` gained
+`holds_freed` for the real-time half, and one `record_is_freed(task, sig)`
+predicate is asked by every door that could hand the signal over:
+
+| door | before | now |
+|---|---|---|
+| `take_deliverable_siginfo` (a handler's frame) | ran the handler | drops the bit, delivers nothing |
+| `take_signal_in_set` (`sigtimedwait`/`signalfd`) | handed back the record | clears the bit, answers "nothing" |
+| `take_fatal_signal` (die-in-a-syscall) | `die_of_fatal_signal` | drops the bit, the task lives |
+
+**The pins.** Host lib **819**, one new case
+(`a_freed_record_is_marked_in_place_and_still_held`: the marker names a *handle*,
+so a second timer's queued record on the same number is untouched; a number with
+nothing queued reports false; a popped freed record still carries the flag).
+`t-timer-create`'s divergence claim became three claims of Linux's answer with no
+`host_run` branch, and they are **green on both arms**: the bit is still set
+after the delete, the take answers `EAGAIN`, and that failed take has dropped
+the bit. Guest `=== PASS t-timer-create exit=0`
+(`build/scratch/timerdel/guest-green.log`).
+
+**Counterfactual.** The kernel half stashed (three files), kernel and loader
+rebuilt, `t-timer-create` in the guest: **one claim red** —
+`FAIL: so a take of that number answers EAGAIN, not a record (got Ok(14))`
+(`build/scratch/timerdel/guest-cf.log`, `exit=1`) — and the other two green,
+which is the right shape: the bit's survival never depended on the fix, and the
+take is the promise that did. Restored from `build/scratch/timerdel/good/*.rs`
+with `sha256sum -c good.sha` (成功 on all three), rebuilt, `PASS`.
+
+**Gate.** `build/gate-item287-x86.log` (`X86_EXIT=0`): stage 1 **1337** host
+tests 0 failed (59.13 s, lib **819** with this item's new case); stage 2 **323**
+programs over 6 lanes (38.44 s); x86_64 `pass=323 fail=0`,
+`mpos-kunit 41 passed, 0 failed`, exit 33, 15 of 338 left out by `tests.toml`.
+aarch64 `pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed`, 19 of 338 left out
+(`build/gate-item287-arm.log`, `ARM_EXIT=0` — its own arm, for the reason
+§6.166 records: this sandbox's `/var/tmp` is read-only and QEMU hardcodes it as
+the `snapshot=on` overlay directory, so the arm runs against a writable medium).
+Clippy ratchet unchanged at `162/168/389/273/3/1` ("no lint has appeared and no
+count has grown"), both workspaces formatted.
+
+### What this does not do, named
+
+1. **The stale bit is carried on the record, so a *second* delete cannot add
+   one.** Two timers on one signal, each deleted with a record queued, leave one
+   stale bit and one marker: the second delete finds the bit set but the record
+   already marked, and `mark_freed` returns false. Linux would leave two stale
+   bits' worth of *answers* — but the answer is `EAGAIN` either way, and a
+   standard signal's bit is a set membership, not a count, so the observable
+   contract is the same. Not measured against Linux directly; recorded as the
+   limit of the model.
+2. **`sigpending` reports the stale bit until a door drops it**, which is
+   Linux's shape too — but nothing here pins the *duration* of that window, only
+   that it ends at a failed dequeue.
+3. **A `SIGEV_THREAD_ID` timer's expiry is aimed at one thread**, so the freed
+   marker lands on that thread's record. A process-directed delete from the
+   leader therefore cannot mark a worker's record — the same shape §6.166 names
+   for the expiry's target, unwitnessed by any fixture.
