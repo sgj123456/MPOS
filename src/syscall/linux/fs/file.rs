@@ -5355,6 +5355,12 @@ pub fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
+    // A directory read through an `O_PATH` descriptor is `EBADF` - the
+    // descriptor names the directory and does not open it (measured raw,
+    // `build/scratch/opathfd/fin.c`).
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     let entries = match file.inode().read_dir() {
         Ok(e) => e,
         Err(e) => return err_of(e),
@@ -6102,6 +6108,15 @@ pub fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 pub fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(file) => {
+            // `fchmod` over an `O_PATH` descriptor is `EBADF`: the descriptor
+            // does not open the file, so it may not change its mode. Measured
+            // with the **raw** door on Linux 7.3.4
+            // (`build/scratch/opathfd/fin.c`) - and the raw door is the only
+            // one that measures it, because musl's `fchmod()` falls back to
+            // `fchmodat(AT_FDCWD, "/proc/self/fd/N")`, which Linux *does* serve.
+            if file.is_path_only() {
+                return err::EBADF;
+            }
             let inode = file.inode();
             match chmod_mode(&inode, args[1] as u32) {
                 Ok(mode) => {
@@ -6385,7 +6400,7 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // file with no name of its own gets one, which is what `apk` does with the
     // repository index it wrote through `O_TMPFILE`.
     let followed = if args[4] & abi::AT_SYMLINK_FOLLOW != 0 {
-        match followed_link(&old_path, old_base) {
+        match followed_link(&old_path, old_base.clone()) {
             Ok(inode) => Some(inode),
             Err(e) => return err_of(e),
         }
@@ -6444,7 +6459,32 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             _ => false,
         }
     } else {
-        crate::vfs::mount::fs_of_path(&absolute(&old_path)).0
+        // The source's base is its **dirfd**, not the calling directory:
+        // `absolute()` uses cwd, which is right only for `AT_FDCWD`, so a
+        // `linkat(dirfd, "file", AT_FDCWD, "/x")` compared `/cwd/file` against
+        // `/x` and answered `EXDEV` for a link inside one filesystem
+        // (`build/scratch/opathfd/l2.c`: Linux serves it; the same call with
+        // *both* sides on the dirfd worked here, which is what named the bug).
+        //
+        // Resolving the dirfd to a **path** and composing is what keeps the
+        // primary test the path test it was: `fs_serving_inode_of` alone only
+        // places a node *at* a mountpoint root, so asking it about a file
+        // inside a mount answers `None` and the comparison would fail - which is
+        // exactly the regression the first attempt at this fix caused on
+        // `t-link` and `t-fsflags`.
+        let base_path = crate::vfs::mount::caller_table()
+            .path_of(&old_base)
+            .unwrap_or_else(crate::sched::current_cwd_path);
+        let source_path = if old_path.starts_with('/') {
+            crate::vfs::path::normalize(&old_path)
+        } else {
+            crate::vfs::path::normalize(&alloc::format!(
+                "{}/{}",
+                base_path.trim_end_matches('/'),
+                old_path
+            ))
+        };
+        crate::vfs::mount::fs_of_path(&source_path).0
             == crate::vfs::mount::fs_of_path(&absolute(parent_path)).0
     };
     if !same_filesystem {

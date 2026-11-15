@@ -375,6 +375,20 @@ impl File {
         self.born.load(Ordering::Relaxed) & !SETFL_MASK
     }
 
+    /// Whether the descriptor is an **`O_PATH`** one: it names its subject and
+    /// does not open it, so every door that would touch the file's *contents*
+    /// answers `EBADF`.
+    ///
+    /// One predicate because several doors owe the same answer and a second
+    /// spelling of it is how a door gets forgotten - this kernel enforced
+    /// `O_PATH` on `read`/`write` only, so `fchmod(O_PATH_fd)` **changed the
+    /// file's mode** and `getdents64(O_PATH_fd)` **listed the directory** where
+    /// Linux answers `EBADF` from both (measured, `build/scratch/opathfd/t.c`,
+    /// `docs/notes/` §6.178).
+    pub fn is_path_only(&self) -> bool {
+        self.born.load(Ordering::Relaxed) & O_PATH != 0
+    }
+
     /// Record the flag word the open was asked for. [`SPENT_AT_OPEN`]'s bits
     /// are dropped, because Linux's `F_GETFL` does not report them: the
     /// creation flags are answered by the open itself, `O_CLOEXEC` lives on the
@@ -554,7 +568,7 @@ impl File {
         // recorded the flag for `F_GETFL` and never acted on it, so a `read` on
         // an `O_PATH` descriptor **succeeded** - the one thing such a descriptor
         // exists to prevent.
-        if self.born.load(Ordering::Relaxed) & O_PATH != 0 {
+        if self.is_path_only() {
             return Err(VfsError::BadFd);
         }
         self.check_readable()?;
@@ -573,7 +587,7 @@ impl File {
     pub(crate) fn pre_write(&self) -> VfsResult<()> {
         // The write half of the same rule, and the same measurement: `write(2)`
         // on an `O_PATH` descriptor is `EBADF`, before the access mode is asked.
-        if self.born.load(Ordering::Relaxed) & O_PATH != 0 {
+        if self.is_path_only() {
             return Err(VfsError::BadFd);
         }
         self.check_writable()?;
