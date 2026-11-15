@@ -584,15 +584,26 @@ fn main() {
             );
         }
 
-        // === one divergence, named: a deleted timer's queued record =========
+        // === a deleted timer's queued record is freed, and the bit stays =====
         //
-        // Measured on a host Linux (`.workbuddy/probe_timer_delete.c`): after
-        // deleting a timer whose expiry had already queued `SIGALRM`, the
-        // pending *bit* is still set in `sigpending`, but there is no queued
-        // record behind it - the delete freed the `sigqueue` - so the polling
-        // take answers `EAGAIN`. This kernel keeps the record and the take
-        // succeeds. The claim is this kernel's answer, which is the one the
-        // no-std suite pinned; a host run prints what its own kernel did.
+        // Linux's shape, measured on 7.3.4 (`build/scratch/timerdel/
+        // {del,del2,del3,del4}.c`) and stranger than the divergence this
+        // replaces: deleting a timer whose expiry already queued a signal frees
+        // the `sigqueue` but **leaves the pending bit set**, so
+        //   * `sigpending` still shows the number,
+        //   * a take answers `EAGAIN` (and that failed dequeue drops the bit),
+        //   * a *blocking* `sigtimedwait` parks its whole timeout and only then
+        //     answers `EAGAIN`,
+        //   * unblocking runs no handler **and does not end the task**, even
+        //     though the number's default action is to terminate,
+        //   * a `signalfd` read is `EAGAIN`,
+        //   * and a later `kill` of the same number is delivered normally.
+        //
+        // This kernel used to keep the record, so the expiry was still
+        // *delivered*: the handler ran and a `signalfd` read handed back a full
+        // record naming a timer that no longer existed. The claims below are
+        // Linux's answers now, so they hold on both arms with no `host_run`
+        // branch.
         let mut gone_id: i32 = -1;
         ok_is(
             &mut r,
@@ -614,24 +625,34 @@ fn main() {
                 timer_delete(gone_id),
                 0,
             );
+            // The bit survives the delete...
+            let mut pend: libc::sigset_t = unsafe { core::mem::zeroed() };
+            // SAFETY: `pend` is this program's own set, which the call fills.
+            unsafe { libc::sigpending(&mut pend) };
+            r.check(
+                "the deleted timer's pending bit is still set, as Linux leaves it",
+                // SAFETY: `pend` was just filled by `sigpending`.
+                unsafe { libc::sigismember(&pend, libc::SIGALRM) } == 1,
+            );
+            // ...but there is no record behind it, so the take answers EAGAIN.
             let mut seen = Siginfo::zeroed();
-            match sigtimedwait_poll(SIGALRM_BIT, &mut seen) {
-                Ok(v) if v == libc::SIGALRM as isize => {
-                    r.check("a deleted timer's queued record is still takeable", true)
-                }
-                Err(e) if e == Errno::AGAIN && host_run() => {
-                    println!(
-                        "note: this host's kernel frees a deleted timer's `sigqueue`, so \
-                         `sigpending` still shows the SIGALRM bit while the take answers \
-                         EAGAIN; mpos keeps the record"
-                    );
-                    r.check("a deleted timer's queued record is still takeable", true);
-                }
-                other => r.check(
-                    &format!("a deleted timer's queued record is still takeable (got {other:?})"),
-                    false,
-                ),
-            }
+            let taken = sigtimedwait_poll(SIGALRM_BIT, &mut seen);
+            check_with(
+                &mut r,
+                "so a take of that number answers EAGAIN, not a record",
+                taken == Err(Errno::AGAIN),
+                taken,
+            );
+            // And the failed dequeue is what drops the bit: Linux keeps the stale
+            // bit only until somebody looks.
+            let mut after: libc::sigset_t = unsafe { core::mem::zeroed() };
+            // SAFETY: as above.
+            unsafe { libc::sigpending(&mut after) };
+            r.check(
+                "and the failed take has dropped it",
+                // SAFETY: `after` was just filled by `sigpending`.
+                unsafe { libc::sigismember(&after, libc::SIGALRM) } == 0,
+            );
         }
 
         let unblocked = sigmask(libc::SIG_UNBLOCK, SIGALRM_BIT);
