@@ -92,7 +92,37 @@ fn main() {
 
     let clo = unsafe { libc::dup3(1, 6, libc::O_CLOEXEC) };
     r.check("dup3 with O_CLOEXEC succeeds", clo == 6);
+    // **The flag has to take effect**, not merely be accepted. This is the claim
+    // this program was missing, and the reason a defect lived here: it checked
+    // that `O_CLOEXEC` was a legal argument and never that the descriptor came
+    // back close-on-exec. Measured on Linux 7.3.4
+    // (`build/scratch/dupclox/t.c`): `dup3(a, 200, O_CLOEXEC)` leaves
+    // `F_GETFD(200) = 0x1` (`FD_CLOEXEC`), `dup3(a, 201, 0)` leaves `0x0`, and
+    // `dup2` clears it. This kernel answered `0x0` for the first.
+    //
+    // The word that comes back is `FD_CLOEXEC` (1), *not* `O_CLOEXEC` (0x80000):
+    // the two are the same promise in different flag spaces, and a fix that
+    // stored the `open` word made `F_GETFD` report `0x80000` - a number no
+    // Linux ever answers - which is why the value is asserted, not just its
+    // truthiness.
+    let f = unsafe { libc::fcntl(6, libc::F_GETFD) };
+    r.check(
+        &format!("and the flag is really set (F_GETFD = {f:#x}, want FD_CLOEXEC = 1)"),
+        f == libc::FD_CLOEXEC,
+    );
     unsafe { libc::close(6) };
+
+    // Its complement, which is what makes the claim about `dup3` rather than
+    // about "the table has a close-on-exec bit": a `dup3` with **no** flags
+    // leaves the number NOT close-on-exec, even when it replaced one that was.
+    let unset = unsafe { libc::dup3(1, 7, 0) };
+    r.check("dup3 with no flags succeeds", unset == 7);
+    let g = unsafe { libc::fcntl(7, libc::F_GETFD) };
+    r.check(
+        &format!("and it is not close-on-exec (F_GETFD = {g:#x}, want 0)"),
+        g == 0,
+    );
+    unsafe { libc::close(7) };
 
     let a = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
     r.check("the file opens on the lowest free fd", a == base);
