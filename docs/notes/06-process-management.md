@@ -17123,7 +17123,13 @@ work, named rather than papered over: **AGENTS.md §3 rule 6 says a gap gets a p
 it is not done, and by that rule this item is not done** - it is a fix landed against
 a mechanism proven by reading, with the pin owed.
 
-**Gate.** `build/gate-item301b.log` (with the assertion and the boot case),
+**Gate.** `build/gate-item302.log` (the structural half: the trait contract and the
+accounted-for arm), `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests
+0 failed (58.90 s); stage 2 **324** programs over 6 lanes on x86_64 (40.00 s) and
+**320** on aarch64 (57.75 s); `mpos-kunit 42 passed, 0 failed` per arm; six-arm
+clippy ratchet unchanged at `162/168/389/273/3`.
+
+`build/gate-item301b.log` (with the assertion and the boot case),
 `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed (45.20 s);
 stage 2 **324** programs over 6 lanes on x86_64 (42.05 s) and **320** on aarch64
 (54.03 s); `pass=324 fail=0` / `pass=320 fail=0`, and **`mpos-kunit 42 passed, 0
@@ -17138,6 +17144,36 @@ six-arm clippy ratchet unchanged at `162/168/389/273/3`; both workspaces formatt
 A **second** full aarch64 arm was run against the *unfixed* kernel as attempt 2 of
 the counterfactual (`build/gate-item301-cf-arm.log`, exit 0) - and it was green,
 which is the negative result the section above records.
+
+**The structural half, landed after the pin.** Item 301's own gap list said:
+"`MappedObject::frame_at` is still allowed to park at all. Every caller now has to
+know that, and the trait's doc does not say it." Both halves of that are now
+answered.
+
+*The contract is written where a caller reads it.* `frame_at`'s doc says the method
+**may park**, names why (a device-backed object reads the page and a block transfer
+parks the task, §10.5), and says where that is illegal - not inside a `with_table`
+closure, not in interrupt context - with the weston fault as the worked example and
+`schedule`'s assertion as the thing that now catches a violation. It also states the
+part that keeps the doc honest: the other four implementations in this tree (a
+System V segment, a `memfd`/`tmpfs` page, an `io_uring` ring, and the stand-in the
+host tests use) allocate or copy in memory and never park, so the contract is
+written for the object that *could* grow a device behind it rather than for the four
+that have not.
+
+*The one arm that could still park is accounted for.* `populate_in`'s own
+`Frames` arm still calls `frame_at`, and it is *not* deleted - the host build answers
+through it, where an object's page never parks. Its doc says so, says the machine
+cannot reach it (every `Frames` page is claimed by `claim_object_page` before the
+borrow), and names the fallback that would make that false: a `Frames` page whose
+**permission** check fails returns `None` from the claim and is answered by
+`populate_in` - which re-checks the same permission and refuses at
+`!vma.permits(write)` before it ever reaches the arm. That is a reading of the two
+functions agreeing, and it is recorded as a reading: a first draft put
+`debug_assert!(false)` there, which was **wrong** because the host build reaches the
+arm legitimately, and a guard that fires on correct code is worse than no guard.
+What actually protects the machine is `schedule`'s assertion, which needs no reading
+of this comment at all.
 
 ### What this does not do, named
 

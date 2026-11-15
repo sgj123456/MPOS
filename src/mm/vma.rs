@@ -53,6 +53,30 @@ pub trait MappedObject {
     /// The frame holding the object's `index`-th page, or `None` if it has no
     /// such page - which is what makes a mapping of it grow lazily rather than
     /// being sized up front.
+    ///
+    /// # This may **park**
+    ///
+    /// An implementation backed by a device or a file reads the page, and a read
+    /// from a block device parks the calling task while the transfer runs
+    /// (`docs/notes/` §10.5). So a caller of this method must be somewhere a task
+    /// switch is legal: **not** inside a `with_table` closure, whose contract is
+    /// that it must not switch tasks, and not in interrupt context.
+    ///
+    /// That is not a hypothetical. The fault path called this from inside the
+    /// task table's borrow, so a cache **hit** was silently fine and a **miss**
+    /// switched tasks under a live `&mut Table` - two mutable references to one
+    /// object, which is undefined behaviour and showed as weston dying on a page
+    /// that was present by the time the diagnostic printed (`docs/notes/`
+    /// §6.181). Since that item `schedule` asserts no closure is live when a
+    /// switch is asked for, so the violation is now a named halt rather than
+    /// corruption - but the *contract* is this paragraph, and it is why the
+    /// three call sites were split into "claim outside, adopt inside".
+    ///
+    /// The other implementations in this tree - a System V segment, a
+    /// `memfd`/`tmpfs` page, an `io_uring` ring - allocate or copy in memory and
+    /// never park; the doc is here because the trait is what a caller sees, and
+    /// an object that later grows a device behind it must not be able to change
+    /// its callers' contract silently.
     fn frame_at(&self, index: u64) -> Option<usize>;
 
     /// The `(device, inode)` pair a mapping of this object reports. A device

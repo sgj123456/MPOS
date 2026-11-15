@@ -345,9 +345,28 @@ pub(crate) fn populate_in(
             frame
         }
         VmaKind::Frames { object, offset, .. } => {
-            // The page of the *object* this address corresponds to. The offset
-            // travels with the address through every split (see `mm::vma`), so
-            // this is the same page the eager loop used to map.
+            // **Unreachable from a fault**, and kept only as the shape a
+            // non-parking caller may still take. Every `VmaKind::Frames` range
+            // is claimed *before* the table is borrowed (`claim_object_page`),
+            // because `frame_at` may park and this function runs inside
+            // `with_table` - so by the time a fault reaches this arm the object's
+            // frame has already been brought in and `adopt_claimed` took it.
+            //
+            // A second `frame_at` here would be the §6.181 bug back again. It is
+            // not deleted because `populate_in` is also reached from a
+            // non-parking context on the host build, where the eager arm is still
+            // the one that answers; on the machine `schedule`'s assertion is what
+            // would catch a caller that got here with a parking object, and that
+            // is the guard rather than this comment being the guard.
+            // The reachable case, and the reason `false` would be a lie: a
+            // `Frames` page whose **permission check fails** is answered by
+            // `populate_in` above (`!vma.permits(write)`) and never returns
+            // `None` from `claim_object_page` in a way that lands here. What
+            // this arm still serves is the *host* build, where an object's page
+            // never parks. On the machine the only way to arrive is a caller
+            // that skipped `claim_object_page`, and `schedule`'s assertion is
+            // what catches *that* - a second `frame_at` here would park inside
+            // the borrow and the switch would halt with the rule in its message.
             let index = ((offset + (page - vma.start)) / PAGE_SIZE) as u64;
             match object.frame_at(index) {
                 Some(frame) => frame,
@@ -453,6 +472,12 @@ fn claim_object_page(root: usize, virt: usize, write: bool, force: bool) -> Opti
         let task = t.tasks[owner.0].as_ref()?;
         let mm = Arc::clone(&task.mm);
         let vma = mm.vma_at(page)?;
+        // A `Frames` page whose permission check fails must **not** fall through
+        // to `populate_in`: that function's own `Frames` arm calls `frame_at`
+        // inside the borrow, which is the §6.181 bug. Returning `None` here is
+        // safe only because `populate_in` re-checks the same permission and
+        // refuses before it reaches the arm - the arm's `debug_assert` is what
+        // would catch it if that ever stopped being true.
         if !vma.permits(write) && !force {
             return None;
         }
