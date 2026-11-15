@@ -57,6 +57,10 @@ pub const SUITE: Suite = Suite {
             run: reaping,
         },
         Case {
+            name: "table_borrow_is_enforced",
+            run: table_borrow_is_enforced,
+        },
+        Case {
             name: "stacks_returned",
             run: stacks_returned,
         },
@@ -335,5 +339,57 @@ fn stacks_returned(_info: &crate::boot::BootInfo) -> Result<(), String> {
         heap_growth
     );
     println!("every stack returned to the frame allocator");
+    Ok(())
+}
+
+/// A task switch asked for **inside** a `with_table` closure is refused, not
+/// aliased.
+///
+/// This is the invariant item 301 found the hard way (`docs/notes/` §6.181): a
+/// fault resolved a file mapping's page by reading it, the read parked on the
+/// block device, the park switched tasks, and the switch re-entered the task
+/// table while its `&mut` was still live. Two `&mut Table`s to one object is not
+/// a race that needs luck to show - one core makes it deterministic undefined
+/// behaviour - but it *showed* as an intermittent weston segfault, which is why
+/// the rule is now a check at the one path every switch takes rather than a
+/// sentence in a doc comment.
+///
+/// The claim is the guard, so the case has to make a closure that yields and see
+/// it refused. `catch_unwind` is not available (`panic = "abort"` ends the
+/// machine), so the probe is a **nested** borrow instead: entering `with_table`
+/// and asking the same question the switch asks, which must read `true` from
+/// inside and `false` from outside. That pins the depth counter the assertion is
+/// built on - a counter that read zero inside would make the assertion vacuous,
+/// and a vacuous assertion passes every test.
+fn table_borrow_is_enforced(_info: &crate::boot::BootInfo) -> Result<(), String> {
+    case_check!(
+        !crate::sched::runtime::table_borrowed(),
+        "a table borrow was reported live outside any closure"
+    );
+    let (inside, nested) = crate::sched::runtime::with_table_public(|t| {
+        let inside = crate::sched::runtime::table_borrowed();
+        // A nested entry must also be visible - the counter is a depth, not a
+        // flag, because a closure that calls a helper which borrows again is
+        // legal as long as neither of them parks.
+        let nested =
+            crate::sched::runtime::with_table_public(|_| crate::sched::runtime::table_borrowed());
+        let _ = t;
+        (inside, nested)
+    });
+    case_check!(
+        inside,
+        "the borrow counter read zero from inside a `with_table` closure, so the \
+         switch assertion is vacuous"
+    );
+    case_check!(
+        nested,
+        "a nested `with_table` did not raise the depth, so the assertion could be \
+         fooled by one level of indirection"
+    );
+    case_check!(
+        !crate::sched::runtime::table_borrowed(),
+        "the borrow counter was left raised after the closure returned"
+    );
+    println!("a table borrow is visible while it is held, and the switch guard can see it");
     Ok(())
 }
