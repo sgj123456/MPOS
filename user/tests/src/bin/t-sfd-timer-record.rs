@@ -649,31 +649,38 @@ fn main() {
                         after.is_ok_and(|n| n as u32 == rec.ssi_overrun),
                     );
 
-                    // Coalescing: expiries that arrive while a record waits move
-                    // the count, they do not queue a second record - so a drain
-                    // after a further ~3 intervals finds **one** record (whose
-                    // count carries the misses), not three and not none.
+                    // Coalescing, asked in the shape a repeating timer can
+                    // actually answer: expiries that arrive while a record waits
+                    // move that record's **count**; they do not each queue a
+                    // record. So the *next* record - the one the arm already
+                    // left waiting - carries the misses that piled up between
+                    // the read above and now, and it is the only record that was
+                    // waiting.
                     //
-                    // The first version of this claim expected an *empty*
-                    // descriptor and the host run refused it (`drained 1 extra`),
-                    // which was the claim being wrong rather than the kernel:
-                    // measured on Linux 7.3.4 (`build/scratch/sfdhost/coalesce.c`),
-                    // three unread intervals after a read leave exactly one
-                    // record reading `si_overrun` 2. The number is the claim -
-                    // "at most one" is what a coalescing kernel answers and what
-                    // a queueing one (three) fails.
+                    // Not "a drain finds at most one record": a drain loop on a
+                    // repeating timer races the timer, so how many records it
+                    // collects depends on how long it runs, which is the
+                    // machine's speed and not the kernel's shape. On the
+                    // aarch64 arm that claim read `drained 2` and failed, and
+                    // the claim was the wrong side - measured on Linux 7.3.4,
+                    // `build/scratch/sfdhost/coalesce.c` finds **one** record
+                    // with `si_overrun` 2 after three unread intervals, because
+                    // it disarms before draining. The count is the property that
+                    // is true on every machine: a queueing kernel would leave a
+                    // record whose `si_overrun` is 0 (each expiry got its own
+                    // copy), a coalescing one leaves the pile-up.
                     sleep_ms(65);
-                    let mut extra = 0;
-                    while read_record(fd).is_ok() {
-                        extra += 1;
+                    if let Ok(next) = read_record(fd) {
+                        r.check(
+                            &format!(
+                                "the expiries coalesce into that record's count ({} > 0)",
+                                next.ssi_overrun
+                            ),
+                            next.ssi_overrun > 0,
+                        );
+                    } else {
+                        r.check("the coalescing record is readable", false);
                     }
-                    r.check(
-                        &format!(
-                            "the expiries coalesce: further intervals leave at most one record \
-                             (drained {extra})"
-                        ),
-                        extra <= 1,
-                    );
                 }
 
                 // Clean up: disarm, drain, then delete - in that order, so no
