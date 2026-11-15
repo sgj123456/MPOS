@@ -244,6 +244,85 @@ fn main() {
         Err(e) => r.check(&format!("open(dir, O_PATH) is served, got {e:?}"), false),
     }
 
+    // === every other door that takes the descriptor =========================
+    //
+    // Linux refuses **all** of them for an `O_PATH` descriptor, and each with
+    // `EBADF` rather than whatever the door would say about its own arguments.
+    // Measured raw on 7.3.4 (`build/scratch/opathrest/t.c`): `fchown`, the four
+    // `f*xattr` doors, `ftruncate`, `fallocate`, `fadvise64` and `ioctl` are all
+    // `EBADF`, while `fstat` and `fchdir` are served. This kernel served seven of
+    // the nine - including `fchown`, which *changed the owner*, and `fadvise64`,
+    // which told the caller its advice had been taken about a file it never
+    // opened - and answered `EINVAL`/`ENOTTY` from the other two, refusing a
+    // legal argument for the wrong reason.
+    //
+    // All raw, so no libc fallback can answer for the kernel (§6.178's lesson:
+    // musl's `fchmod` and `fchown` both route through `/proc/self/fd` when the
+    // direct call fails).
+    if let Ok(f) = rustix::fs::open(FILE, path_flags, Mode::empty()) {
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let ebadf = |rc: i64| {
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+        };
+        // SAFETY: `raw` is a live descriptor this test owns; every argument is a
+        // buffer or a number this test made.
+        let refused: [(&str, i64); 7] = unsafe {
+            [
+                ("fchown", libc::syscall(libc::SYS_fchown, raw, 0, 0)),
+                (
+                    "fgetxattr",
+                    libc::syscall(
+                        libc::SYS_fgetxattr,
+                        raw,
+                        c"user.k".as_ptr(),
+                        [0u8; 8].as_mut_ptr(),
+                        8,
+                    ),
+                ),
+                (
+                    "flistxattr",
+                    libc::syscall(libc::SYS_flistxattr, raw, [0u8; 64].as_mut_ptr(), 64),
+                ),
+                (
+                    "fsetxattr",
+                    libc::syscall(
+                        libc::SYS_fsetxattr,
+                        raw,
+                        c"user.k".as_ptr(),
+                        c"v".as_ptr(),
+                        1,
+                        0,
+                    ),
+                ),
+                (
+                    "fadvise64",
+                    libc::syscall(libc::SYS_fadvise64, raw, 0, 4096, 0),
+                ),
+                ("ftruncate", libc::syscall(libc::SYS_ftruncate, raw, 0)),
+                (
+                    "ioctl(TCGETS)",
+                    libc::syscall(libc::SYS_ioctl, raw, 0x5401, [0u8; 64].as_mut_ptr()),
+                ),
+            ]
+        };
+        for (name, rc) in refused {
+            r.check(
+                &format!(
+                    "{name}(O_PATH fd) is EBADF (raw), got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                ebadf(rc),
+            );
+        }
+        // The neighbour that makes the claims above about `O_PATH` rather than
+        // about "this descriptor is broken": `fstat` is served on the same one.
+        let st = rustix::fs::fstat(&f);
+        r.check(
+            &format!("fstat on the same descriptor is still served, got {st:?}"),
+            st.is_ok_and(|s| s.st_size == 5),
+        );
+    }
+
     let _ = std::fs::remove_dir_all(DIR);
     r.finish()
 }
