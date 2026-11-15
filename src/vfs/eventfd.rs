@@ -29,16 +29,42 @@ pub struct EventFd {
     /// fd-monitor loop does exactly that, 256 msec at a time - sleeps here
     /// forever while holding the very mutex its main thread is waiting for.
     nonblocking: AtomicBool,
+    /// `EFD_SEMAPHORE`: a read takes **one** rather than the whole counter, so
+    /// the descriptor counts available slots and each `read` claims one.
+    ///
+    /// Measured on Linux 7.3.4 (`build/scratch/flagsw/sem.c`): a semaphore with
+    /// 3 reads `1`, `1`, `1` and then `EAGAIN` (non-blocking); a plain eventfd
+    /// with 3 reads `3` and is then empty. The flag also changes the write
+    /// ceiling: a plain eventfd saturates at `0xfffffffffffffffe`, while a
+    /// semaphore write that would pass it is **`EAGAIN`** (measured,
+    /// `sem2.c`), because a semaphore represents a count that cannot overflow.
+    semaphore: bool,
 }
 
 impl EventFd {
     pub fn new(ino: Ino, initial: u64, nonblocking: bool) -> Arc<EventFd> {
+        Self::with_semaphore(ino, initial, nonblocking, false)
+    }
+
+    /// The same node in the `EFD_SEMAPHORE` shape (`docs/notes/` §6.176).
+    pub fn with_semaphore(
+        ino: Ino,
+        initial: u64,
+        nonblocking: bool,
+        semaphore: bool,
+    ) -> Arc<EventFd> {
         Arc::new(EventFd {
             ino,
             counter: Mutex::new(RefCell::new(initial)),
             waiters: Mutex::new(RefCell::new(Vec::new())),
             nonblocking: AtomicBool::new(nonblocking),
+            semaphore,
         })
+    }
+
+    /// Whether this is the `EFD_SEMAPHORE` shape.
+    pub fn is_semaphore(&self) -> bool {
+        self.semaphore
     }
 
     pub fn set_nonblocking(&self, on: bool) {
@@ -95,10 +121,13 @@ impl Inode for EventFd {
     /// decimal, unique per instance. And the semaphore word is decimal `0` or
     /// `1`, which is the creation mode and not the current count.
     ///
-    /// `eventfd-semaphore` is always `0` here, and that is honest rather than
-    /// stale: this kernel's `eventfd2` refuses `EFD_SEMAPHORE` with
-    /// `EOPNOTSUPP` (`handle_eventfd` in the syscall layer), so an instance that
-    /// was the semaphore shape cannot exist to be reported.
+    /// `eventfd-semaphore` is the creation **mode**, not the current count, so
+    /// it stays `1` for a semaphore however many reads have taken from it -
+    /// measured (`build/scratch/fdinfo/pertype.c`: the word is `0` or `1` and
+    /// does not follow the counter). It reports
+    /// [`EventFd::is_semaphore`], which this item made reachable: before it,
+    /// `eventfd2(EFD_SEMAPHORE)` answered `EOPNOTSUPP` and the field could only
+    /// ever be `0`.
     ///
     /// `eventfd-id` reports [`EventFd::ino`], this instance's own number from
     /// the machine's anonymous-inode counter. Linux's id comes from a separate
@@ -108,9 +137,10 @@ impl Inode for EventFd {
     /// existing only for a debug line.
     fn fdinfo_lines(&self) -> Option<alloc::string::String> {
         Some(alloc::format!(
-            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: 0\n",
+            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: {}\n",
             self.value(),
-            self.ino
+            self.ino,
+            u8::from(self.semaphore)
         ))
     }
 
@@ -125,6 +155,12 @@ impl Inode for EventFd {
                 let mut counter = self.counter.borrow(cs).borrow_mut();
                 if *counter == 0 {
                     None
+                } else if self.semaphore {
+                    // One per read, decrementing - the shape a caller uses as a
+                    // counting semaphore. Measured: three reads on a counter of
+                    // 3 answer 1, 1, 1 then `EAGAIN`.
+                    *counter -= 1;
+                    Some(1)
                 } else {
                     let value = *counter;
                     *counter = 0;
@@ -153,12 +189,34 @@ impl Inode for EventFd {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&buf[..8]);
         let value = u64::from_ne_bytes(bytes);
-        critical_section::with(|cs| {
+        let refused = critical_section::with(|cs| {
             let mut counter = self.counter.borrow(cs).borrow_mut();
-            // Saturating, as Linux's counter is: adding past the maximum stops
-            // rather than wrapping to a number that means nothing.
-            *counter = counter.saturating_add(value);
+            // `EVENTFD_MAX` is `0xfffffffffffffffe`, the largest count a plain
+            // eventfd holds. Two shapes answer an overflow differently, and
+            // both are measured (`build/scratch/flagsw/sem2.c`): a plain
+            // eventfd **saturates**, while a semaphore write that would pass
+            // the maximum is `EAGAIN` - a semaphore stands for available slots,
+            // and a saturated count would tell a caller it may take one more
+            // than exists.
+            //
+            // **Both shapes refuse**, which is the reading this item had to
+            // correct: the first version saturated a plain eventfd, following
+            // the comment that had been there, and the measurement says Linux
+            // answers `EAGAIN` for one too (`build/scratch/flagsw/ovf.c`:
+            // `plain: write MAX -> 8, then 1 more -> -1 errno=11`). A count
+            // that saturated would tell a caller its previous writes were all
+            // accepted when the last one was not.
+            const MAX: u64 = 0xffff_ffff_ffff_fffe;
+            if counter.checked_add(value).is_none_or(|next| next > MAX) {
+                true
+            } else {
+                *counter += value;
+                false
+            }
         });
+        if refused {
+            return Err(VfsError::Again);
+        }
         // Whoever is waiting on the counter looks again. On the host there is
         // no scheduler to wake and nothing asleep, so the list is empty and
         // the loop is not there at all.
@@ -243,6 +301,62 @@ impl EventFd {
 mod tests {
     use super::*;
 
+    /// The two shapes differ in exactly two places, and both are the flag's
+    /// whole meaning: a semaphore's read takes **one** and decrements, and a
+    /// write past the ceiling is `EAGAIN` in **both** shapes rather than
+    /// saturating.
+    ///
+    /// Measured on Linux 7.3.4 (`build/scratch/flagsw/{sem,sem2,ovf}.c`,
+    /// `docs/notes/` §6.176). The saturation half is a corrected reading: this
+    /// kernel's comment said "saturating, as Linux's counter is", and Linux
+    /// answers `EAGAIN` - so a claim that saturated would have been pinning the
+    /// comment rather than the behaviour.
+    #[test]
+    fn a_semaphore_takes_one_per_read_and_neither_shape_overflows() {
+        // Three in, three reads of one out, then empty.
+        let semi = EventFd::with_semaphore(2, 3, true, true);
+        assert!(semi.is_semaphore());
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0u8; 8];
+            assert_eq!(semi.read_at(0, &mut buf), Ok(8));
+            got.push(u64::from_ne_bytes(buf));
+        }
+        assert_eq!(got, [1, 1, 1], "one per read, not the whole counter");
+        let mut buf = [0u8; 8];
+        assert_eq!(semi.read_at(0, &mut buf), Err(VfsError::Again));
+
+        // The neighbour: the same counter without the flag comes out whole.
+        let plain = EventFd::new(3, 3, true);
+        assert!(!plain.is_semaphore());
+        let mut buf = [0u8; 8];
+        assert_eq!(plain.read_at(0, &mut buf), Ok(8));
+        assert_eq!(u64::from_ne_bytes(buf), 3);
+
+        // The ceiling, in both shapes: a write that would pass
+        // `0xfffffffffffffffe` is `EAGAIN`, measured on Linux for a plain
+        // eventfd too (`ovf.c`: `plain: write MAX -> 8, then 1 more -> EAGAIN`).
+        const MAX: u64 = 0xffff_ffff_ffff_fffe;
+        for fd in [
+            EventFd::new(4, 0, true),
+            EventFd::with_semaphore(5, 0, true, true),
+        ] {
+            assert_eq!(fd.write_at(0, &MAX.to_ne_bytes()), Ok(8));
+            assert_eq!(
+                fd.write_at(0, &1u64.to_ne_bytes()),
+                Err(VfsError::Again),
+                "a write past the maximum is refused, not saturated"
+            );
+            // Read it back in whatever the shape's unit is, to prove nothing
+            // was silently added: the plain one holds MAX, the semaphore MAX
+            // ones one read at a time.
+            let mut buf = [0u8; 8];
+            assert_eq!(fd.read_at(0, &mut buf), Ok(8));
+            let want = if fd.is_semaphore() { 1 } else { MAX };
+            assert_eq!(u64::from_ne_bytes(buf), want);
+        }
+    }
+
     #[test]
     fn a_write_adds_and_a_read_takes_everything() {
         let fd = EventFd::new(1, 0, false);
@@ -299,15 +413,31 @@ mod tests {
     }
 
     #[test]
-    fn an_eventfd_starts_at_its_initial_value_and_saturates() {
+    fn an_eventfd_starts_at_its_initial_value() {
         let fd = EventFd::new(2, 7, false);
         let mut buf = [0u8; 8];
         fd.read_at(0, &mut buf).unwrap();
         assert_eq!(u64::from_ne_bytes(buf), 7);
 
-        fd.write_at(0, &u64::MAX.to_ne_bytes()).unwrap();
-        fd.write_at(0, &u64::MAX.to_ne_bytes()).unwrap();
+        // The ceiling is `0xfffffffffffffffe`, **not** `u64::MAX`, and a write
+        // past it is `EAGAIN` rather than a saturation - both measured on Linux
+        // 7.3.4 (`build/scratch/flagsw/ovf.c`: `write MAX -> 8`, `write 1 more
+        // -> -1 EAGAIN`). This test used to assert that two `u64::MAX` writes
+        // left `u64::MAX` ("no wrap"), which pinned the *comment* beside the
+        // counter ("saturating, as Linux's counter is") rather than Linux: the
+        // maximum is one less than that word, and the overflow is reported.
+        const MAX: u64 = 0xffff_ffff_ffff_fffe;
+        fd.write_at(0, &MAX.to_ne_bytes()).unwrap();
+        assert_eq!(
+            fd.write_at(0, &1u64.to_ne_bytes()),
+            Err(VfsError::Again),
+            "a write past the maximum is EAGAIN, not a saturating add"
+        );
         fd.read_at(0, &mut buf).unwrap();
-        assert_eq!(u64::from_ne_bytes(buf), u64::MAX, "no wrap");
+        assert_eq!(
+            u64::from_ne_bytes(buf),
+            MAX,
+            "and the count is the maximum, not wrapped"
+        );
     }
 }

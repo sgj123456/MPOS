@@ -3587,16 +3587,17 @@ pub fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
     if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | O_CLOEXEC) != 0 {
         return err::EINVAL;
     }
-    if flags & EFD_SEMAPHORE != 0 {
-        // The counter is taken whole here; a caller that asked for one-per-read
-        // asked for something else, and saying so beats doing something close.
-        return err::EOPNOTSUPP;
-    }
     let nonblocking = flags & EFD_NONBLOCK != 0;
-    let fd = match crate::vfs::open_inode(crate::vfs::eventfd::EventFd::new(
+    // `EFD_SEMAPHORE` is **served**, and it changes the node rather than the
+    // door: a read takes one instead of the whole counter, and a write that
+    // would pass the ceiling is `EAGAIN` rather than saturating. Measured whole
+    // on 7.3.4 (`build/scratch/flagsw/{sem,sem2}.c`, `docs/notes/` §6.176).
+    let semaphore = flags & EFD_SEMAPHORE != 0;
+    let fd = match crate::vfs::open_inode(crate::vfs::eventfd::EventFd::with_semaphore(
         next_anon_ino(),
         args[0] as u32 as u64,
         nonblocking,
+        semaphore,
     )) {
         Ok(fd) => fd,
         Err(e) => return err_of(e),
