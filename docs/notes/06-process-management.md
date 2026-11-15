@@ -16474,3 +16474,98 @@ unchanged at `162/168/389/273/3`; both workspaces formatted.
    `dup2` without reddening anything.
 3. **`F_DUPFD_CLOEXEC` is a third spelling** of the same promise, and was not
    looked at; §5's table would need the same audit.
+
+## §6.176 the flag-to-getter sweep: `EFD_SEMAPHORE` was refused, and two claims were pinning comments (item 296, LANDED 2026-11-15)
+
+**The sweep, and why it was worth running.** The "flag accepted, effect never
+checked" gap had produced two defects in a row (§6.172's `UFFDIO_COPY` bound,
+§6.175's `dup3`). So instead of another pair, this walks every *flag → getter* pair
+in one probe: `O_CLOEXEC`/`EFD_CLOEXEC`/`SFD_CLOEXEC`/`MFD_CLOEXEC` read back at
+`F_GETFD`, `O_NONBLOCK`/`EFD_NONBLOCK`/`SFD_NONBLOCK` at `F_GETFL`, `O_APPEND` by
+behaviour (a write after `lseek(0)`), `O_DIRECTORY` by refusal on a non-directory,
+and `EFD_SEMAPHORE` by what a read returns.
+
+Twelve rows. On Linux all twelve answer correctly
+(`build/scratch/flagsw/t.c`); on this kernel **eleven did and one did not print at
+all** —
+
+```
+  eventfd EFD_SEMAPHORE (counter 5)          <missing>
+```
+
+- because `eventfd(5, EFD_SEMAPHORE)` answered `EOPNOTSUPP` and the probe's `if
+  (se >= 0)` skipped the row. The refusal had been **pinned as a divergence** in
+  `t-eventfd` ("EFD_SEMAPHORE answers EOPNOTSUPP (whole-count take only)"), with a
+  `host_run` branch accepting Linux's success and naming the difference - which is
+  the shape §3 rule 2 forbids dressed as honesty, and it hid a real gap.
+
+**Measured, whole, before implementing** (`build/scratch/flagsw/{sem,sem2,ovf}.c`,
+Linux 7.3.4):
+
+| question | Linux |
+|---|---|
+| a semaphore of 3, three reads | `1`, `1`, `1` - one per read, decrementing |
+| a fourth read, non-blocking | `EAGAIN` |
+| a plain eventfd of 3, one read | `3` - the whole counter |
+| a semaphore after `write(7)` | the next read takes `1`, leaving 6 |
+| a read with a 4-byte buffer | `EINVAL` |
+| an unknown flag bit | `EINVAL` |
+| `EFD_SEMAPHORE\|EFD_NONBLOCK` | composes: one read, then `EAGAIN` |
+| `write` that would pass `0xfffffffffffffffe` | **`EAGAIN`** |
+
+**The last row corrected a second thing, and it is the more interesting find.**
+This kernel's `write_at` said, in a comment, "Saturating, as Linux's counter is:
+adding past the maximum stops rather than wrapping" - and a host test,
+`an_eventfd_starts_at_its_initial_value_and_saturates`, asserted that two
+`u64::MAX` writes left `u64::MAX` "no wrap". Both were wrong about Linux twice
+over: the maximum is `0xfffffffffffffffe` (one below `u64::MAX`), and the overflow
+is **reported** as `EAGAIN`, not absorbed. So the probe's first version also
+recorded a MISMATCH on the *plain* eventfd, and fixing only the semaphore would
+have left the neighbour wrong. **A comment and a test can agree with each other and
+both be wrong** - the test was pinning the comment, not the kernel.
+
+**The change.** `EventFd` gained the `semaphore` mode with
+`with_semaphore(..)`/`is_semaphore()`; `read_at` takes one and decrements in that
+mode; `write_at` refuses an overflow in **both** shapes (`EAGAIN`); the door serves
+`EFD_SEMAPHORE` instead of refusing it; and `fdinfo`'s `eventfd-semaphore` word
+reports the mode rather than the constant `0` it could only ever have been.
+
+**The pins.** `t-eventfd`'s divergence claim became two claims of Linux's answer
+with **no `host_run` branch**: a semaphore of 3 reads `[1, 1, 1, EAGAIN]`, and a
+plain eventfd of 3 reads the whole counter - the neighbour that makes the first
+claim about the *mode* rather than about reads in general. The host test was
+rewritten to the measured ceiling and renamed (`..._starts_at_its_initial_value`,
+the "saturates" half now asserting `EAGAIN`), and a second host case, `a_semaphore_
+takes_one_per_read_and_neither_shape_overflows`, pins both shapes' read unit and
+both shapes' ceiling - host lib **820**.
+
+**Counterfactual.** The two kernel files stashed, kernel and loader rebuilt, the pin
+in the guest: **exactly one claim red** -
+
+```
+FAIL: eventfd(3, EFD_SEMAPHORE) is served, got EOPNOTSUPP
+```
+
+- with the plain neighbour green. Restored from `build/scratch/flagsw/good/*.rs`,
+`sha256sum -c` 成功 on all three, rebuilt, `PASS`.
+
+**Gate.** `build/gate-item296.log`, `GATE_EXIT=0`, both arms in one run. Stage 1
+**1340** host tests 0 failed (62.82 s, one more than the previous 1339 - the new
+eventfd case, net of the rewritten one); stage 2 **323** programs over 6 lanes on
+x86_64 (41.29 s) and **319** on aarch64 (53.19 s); `pass=323 fail=0` /
+`pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`; both workspaces formatted.
+
+### What this does not do, named
+
+1. **The sweep is one probe, not a suite.** Twelve rows, and every flag that has a
+   getter that can see it. Flags with **no** getter (`O_TRUNC`'s effect, `O_EXCL`'s,
+   `O_NOFOLLOW`'s) need behavioural probes of their own, and were not swept.
+2. **`MFD_ALLOW_SEALING` is a flag whose "getter" is a refusal** (`F_ADD_SEALS`
+   answers `EPERM` without it) and was not included.
+3. **`EFD_SEMAPHORE`'s blocking shape is untested.** The claims use `NONBLOCK`;
+   a *blocking* read of an empty semaphore should park and be woken by a write,
+   which is the same path the plain eventfd's park uses (§3.12) but is not pinned
+   for this mode.
+4. **`fdinfo`'s semaphore word has no pin.** It changed from the constant `0` to
+   the mode, and `t-fdinfo` does not read that line for a semaphore instance.

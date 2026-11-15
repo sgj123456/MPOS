@@ -13013,3 +13013,27 @@ measured here and it is what the implementation does, but no claim asserts that 
 `dup2` onto a close-on-exec number clears it, so a change to `install_at` could
 break `dup2` without reddening anything. And `F_DUPFD_CLOEXEC` is a **third
 spelling** of the same promise, not looked at.
+
+## Item 296 — the flag-to-getter sweep: `EFD_SEMAPHORE` was refused, and two claims were pinning comments (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **The sweep, and why** | The "flag accepted, effect never checked" gap had produced two defects in a row (§6.172's `UFFDIO_COPY` bound, §6.175's `dup3`). So instead of another pair, this walks every **flag → getter** pair in one probe: `O_CLOEXEC`/`EFD_CLOEXEC`/`SFD_CLOEXEC`/`MFD_CLOEXEC` at `F_GETFD`; `O_NONBLOCK`/`EFD_NONBLOCK`/`SFD_NONBLOCK` at `F_GETFL`; `O_APPEND` by behaviour; `O_DIRECTORY` by refusal; `EFD_SEMAPHORE` by what a read returns. Twelve rows, all correct on Linux (`build/scratch/flagsw/t.c`); on this kernel eleven did and **one did not print at all**, because `eventfd(5, EFD_SEMAPHORE)` answered `EOPNOTSUPP` and the probe's guard skipped the row. |
+| **Before** | The refusal was **pinned as a divergence** in `t-eventfd` — "EFD_SEMAPHORE answers EOPNOTSUPP (whole-count take only)" — with a `host_run` branch accepting Linux's success and naming the difference. That is the shape AGENTS.md §3 rule 2 forbids dressed as honesty, and it hid a real gap. |
+| **Measured first** | Linux 7.3.4, `build/scratch/flagsw/{sem,sem2,ovf}.c`: a semaphore of 3 reads `1`, `1`, `1` then `EAGAIN`; a plain eventfd of 3 reads `3`; a semaphore after `write(7)` takes `1` leaving 6; a 4-byte read buffer is `EINVAL`; an unknown flag bit is `EINVAL`; `EFD_SEMAPHORE\|EFD_NONBLOCK` composes; and a write past `0xfffffffffffffffe` is **`EAGAIN`**. |
+| **The second correction** | This kernel's `write_at` said "Saturating, as Linux's counter is" and a host test asserted two `u64::MAX` writes left `u64::MAX` "no wrap". Both were wrong about Linux twice: the maximum is `0xfffffffffffffffe` (one below `u64::MAX`) and the overflow is **reported** as `EAGAIN`. **A comment and a test can agree with each other and both be wrong** — the test was pinning the comment, not the kernel. Fixing only the semaphore would have left the neighbour wrong. |
+| **Now** | `EventFd` gained the `semaphore` mode (`with_semaphore`/`is_semaphore`); `read_at` takes one and decrements in that mode; `write_at` refuses an overflow in **both** shapes; the door serves `EFD_SEMAPHORE`; and `fdinfo`'s `eventfd-semaphore` word reports the mode rather than the constant `0` it could only ever have been. |
+| **Pins** | `t-eventfd`'s divergence claim became two claims of Linux's answer with **no `host_run` branch**: a semaphore of 3 reads `[1, 1, 1, EAGAIN]`, and a plain eventfd of 3 reads the whole counter — the neighbour that makes the first claim about the *mode*. The host test was rewritten to the measured ceiling and renamed, and a second host case pins both shapes' read unit and both shapes' ceiling — host lib **820**. |
+| **Counterfactual** | The two kernel files stashed, rebuilt, the pin in the guest: **exactly one claim red** — `FAIL: eventfd(3, EFD_SEMAPHORE) is served, got EOPNOTSUPP` — with the plain neighbour green. Restored with `sha256sum -c`, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item296.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed (62.82 s); stage 2 323 programs over 6 lanes on x86_64 (41.29 s) and 319 on aarch64 (53.19 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged at `162/168/389/273/3`; both workspaces formatted. |
+
+**What this does not do, named.** The sweep is **one probe, not a suite**: twelve
+rows covering every flag that has a getter able to see it. Flags with **no** getter
+(`O_TRUNC`, `O_EXCL`, `O_NOFOLLOW`) need behavioural probes of their own and were
+not swept. `MFD_ALLOW_SEALING` is a flag whose "getter" is a *refusal*
+(`F_ADD_SEALS` answers `EPERM` without it) and was not included.
+`EFD_SEMAPHORE`'s **blocking** shape is untested — the claims use `NONBLOCK`, and a
+blocking read of an empty semaphore should park and be woken by a write, which is
+the plain eventfd's path but is not pinned for this mode. And `fdinfo`'s semaphore
+word **has no pin**: it changed from a constant to the mode, and `t-fdinfo` does
+not read that line for a semaphore instance.
