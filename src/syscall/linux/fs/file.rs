@@ -23,6 +23,7 @@ use crate::syscall::linux::abi::{
     write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
+use crate::vfs::file::O_PATH;
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsResult, W_OK, X_OK};
 // The concrete node types these handlers drive: the devices, and the socket
 // families whose syscalls live here. Naming one is the *syscall* layer's job -
@@ -256,11 +257,47 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     // O_NOFOLLOW at all, so the bit was silently dropped and the open followed
     // the very link the caller said to stop at - the classic `/tmp` defence,
     // and a §4.2 accept-and-drop with security meaning.
+    //
+    // **Unless `O_PATH` is there**, and that exception is the whole reason
+    // `O_PATH|O_NOFOLLOW` exists: it is how a caller opens the *link itself*
+    // rather than its target - the pair `readlink` has, for the `/proc`-style
+    // doors that need a descriptor on a link. Measured on Linux 7.3.4
+    // (`build/scratch/opath/combos.c`):
+    //
+    //     O_RDONLY|O_NOFOLLOW      -> ELOOP (40)
+    //     O_PATH|O_NOFOLLOW        -> served, and `fstat` says S_ISLNK
+    //     O_PATH                   -> served, the *target*
+    //     O_DIRECTORY|O_NOFOLLOW   -> ENOTDIR (20), the kind asked first
     if flags & O_NOFOLLOW != 0
         && let Ok(inode) = crate::vfs::resolve_no_follow_at(path, base.clone())
         && inode.metadata().kind == NodeKind::Symlink
     {
-        return err::ELOOP;
+        // `O_PATH|O_NOFOLLOW` is the one combination that opens the **link**
+        // rather than refusing: it is how a caller holds a descriptor on a link
+        // itself (measured, `build/scratch/opath/combos.c`: served, and `fstat`
+        // says `S_ISLNK`). Every other combination is `ELOOP`, except that
+        // `O_DIRECTORY` asks the kind first and answers `ENOTDIR` - a link is
+        // not a directory - which is why the bit is tested before the refusal.
+        // `O_DIRECTORY` is judged **first**, and it is a kind question rather
+        // than a link one: a symlink is not a directory, so the answer is
+        // `ENOTDIR` (20) and not the `ELOOP` the flag pair would give. Measured
+        // (`combos.c`): `O_DIRECTORY|O_NOFOLLOW` on a link is `ENOTDIR`.
+        if flags & O_DIRECTORY != 0 {
+            return err::ENOTDIR;
+        }
+        if flags & O_PATH as usize == 0 {
+            return err::ELOOP;
+        }
+        return match crate::vfs::open_inode(inode) {
+            Ok(fd) => {
+                if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+                    file.set_born(flags as u32);
+                    file.set_status(flags as u32);
+                }
+                fd as isize
+            }
+            Err(e) => err_of(e),
+        };
     }
     let opened = match crate::vfs::open_opt(path, Some(base.clone()), flags) {
         Ok(fd) => Ok(fd),
@@ -1180,10 +1217,9 @@ pub fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// `O_RDONLY` descriptor is as good as a writable one (measured: the fd forms
 /// answer on both, because the call names the file rather than its contents).
 ///
-/// Linux answers `EBADF` for these three calls over an `O_PATH` descriptor. This
-/// kernel's `open` does not make one - it carries the bit through `F_GETFL` like
-/// every other flag it was handed - so the rule has nothing to catch here yet;
-/// the divergence is named in `docs/notes/` 3.15 rather than pretended away.
+/// Linux answers `EBADF` for these three calls over an `O_PATH` descriptor, and
+/// since item 297 this kernel makes one - so the rule is owed rather than
+/// vacuously satisfied. Named gap: see the note below.
 fn xattr_inode_of_fd(fd: i32) -> Result<Arc<dyn Inode>, isize> {
     crate::sched::current_fds()
         .clone_at(fd)
@@ -8150,8 +8186,11 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// * `readahead(999, -1, 4096) = EBADF`, so the descriptor is asked before the
 ///   range.
 ///
-/// An `O_PATH` descriptor is `EBADF` on Linux as well, but this kernel has no
-/// `O_PATH`, so the readable test here stands in for a state it cannot reach.
+/// An `O_PATH` descriptor is `EBADF` on Linux as well, and since item 297 this
+/// kernel **has** one - so the rule is reachable and owed here rather than
+/// standing in for a state that cannot exist. It is a named gap: only
+/// `read`/`write` enforce `O_PATH` (`File::pre_read`/`pre_write`), and these
+/// three `f*` doors do not (#6.177).
 pub fn handle_readahead(args: [usize; ARG_COUNT]) -> isize {
     let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(f) => f,

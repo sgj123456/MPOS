@@ -151,6 +151,20 @@ pub const SPENT_AT_OPEN: u32 = O_ACCMODE
     // O_CLOEXEC.
     | 0o200_0000;
 
+/// `O_PATH`: the descriptor **names** its subject and does not open it, so
+/// `read(2)`/`write(2)` answer `EBADF` while `fstat`, `fcntl(F_GETFL)` and the
+/// `*at` family (as a dirfd) all work.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opath/t.c`): a regular file opened
+/// `O_PATH` answers `EBADF` from both `read` and `write`, `fstat` reports the
+/// real size, `F_GETFL` carries the bit, `F_DUPFD` works, an `O_PATH` open does
+/// not move `atime`, and `O_PATH|O_NOFOLLOW` on a symlink gives the **link**.
+///
+/// This kernel recorded the flag for `F_GETFL` (via [`File::set_born`]) and never
+/// acted on it, so `read` on an `O_PATH` descriptor **succeeded** - the one thing
+/// such a descriptor exists to prevent.
+pub const O_PATH: u32 = 0x20_0000;
+
 /// The access mode a description was made under, as the low two bits of
 /// `O_ACCMODE`. `File::read`/`File::write` refuse a mismatch with `EBADF`, which
 /// is Linux's answer for `write()` on an `O_RDONLY` descriptor and the reverse,
@@ -529,6 +543,20 @@ impl File {
     /// called from both because two spellings of one prefix is how the two
     /// doors come to disagree.
     pub(crate) fn pre_read(&self) -> VfsResult<()> {
+        // `O_PATH` first: it is a descriptor that **names** and does not open,
+        // so reading it is `EBADF` whatever the access mode says - and it comes
+        // before every other check, because the access-mode one would answer
+        // `EBADF` for a different reason and a directory one `EISDIR`.
+        //
+        // Measured on Linux 7.3.4 (`build/scratch/opath/t.c`): a regular file
+        // opened `O_PATH` answers `EBADF` from `read(2)` **and** from
+        // `write(2)`, while `fstat` works and reports the real size. This kernel
+        // recorded the flag for `F_GETFL` and never acted on it, so a `read` on
+        // an `O_PATH` descriptor **succeeded** - the one thing such a descriptor
+        // exists to prevent.
+        if self.born.load(Ordering::Relaxed) & O_PATH != 0 {
+            return Err(VfsError::BadFd);
+        }
         self.check_readable()?;
         if self.inode.refuses_file_io() {
             return Err(VfsError::BadFd);
@@ -543,6 +571,11 @@ impl File {
     /// inode's own flags, and the append-only rule, all of which Linux answers
     /// before it touches the caller's bytes.
     pub(crate) fn pre_write(&self) -> VfsResult<()> {
+        // The write half of the same rule, and the same measurement: `write(2)`
+        // on an `O_PATH` descriptor is `EBADF`, before the access mode is asked.
+        if self.born.load(Ordering::Relaxed) & O_PATH != 0 {
+            return Err(VfsError::BadFd);
+        }
         self.check_writable()?;
         crate::vfs::may_modify(&self.inode)?;
         if crate::vfs::is_append_only(&self.inode)
