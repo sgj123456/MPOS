@@ -159,22 +159,68 @@ fn main() {
         }
     }
 
-    // The semaphore mode mpos deliberately does not offer. On real Linux the
-    // flag is served (measured here: it creates fine), so under a host run
-    // Linux's own success is accepted and named; the payload sweep pins the
-    // EOPNOTSUPP refusal.
-    let sem = eventfd(0, EventfdFlags::SEMAPHORE);
-    let sem_answer_ok = match sem {
-        Err(Errno::NOTSUP) => true,
-        Ok(_) => mpos_user_tests::host_run(),
-        Err(_) => false,
-    };
-    r.check(
-        "EFD_SEMAPHORE answers EOPNOTSUPP (whole-count take only)",
-        sem_answer_ok,
-    );
-    if let Ok(fd) = sem {
-        drop(fd);
+    // === `EFD_SEMAPHORE` is served, and it is a counting semaphore =========
+    //
+    // A read takes **one**, not the whole counter, and a write past the ceiling
+    // is `EAGAIN` rather than saturating. Measured on Linux 7.3.4
+    // (`build/scratch/flagsw/{sem,sem2,ovf}.c`, `docs/notes/` §6.176): a
+    // semaphore with 3 reads 1, 1, 1 and then `EAGAIN`; a plain eventfd with 3
+    // reads 3 and is then empty; and **both** shapes answer `EAGAIN` to a write
+    // that would pass `0xfffffffffffffffe`.
+    //
+    // This pair of claims replaces a divergence claim that pinned the refusal
+    // ("EFD_SEMAPHORE answers EOPNOTSUPP"), which is what the flag did here
+    // until item 296 - so the claim was right about the kernel and wrong about
+    // Linux, and the `host_run` branch was hiding it.
+    match eventfd(3, EventfdFlags::SEMAPHORE | EventfdFlags::NONBLOCK) {
+        Ok(fd) => {
+            r.check("eventfd(3, EFD_SEMAPHORE) hands back a descriptor", true);
+            {
+                let mut took = Vec::new();
+                for _ in 0..4 {
+                    let mut v = [0u8; 8];
+                    match unsafe {
+                        libc::read(
+                            std::os::fd::AsRawFd::as_raw_fd(&fd),
+                            v.as_mut_ptr().cast::<libc::c_void>(),
+                            8,
+                        )
+                    } {
+                        8 => took.push(u64::from_ne_bytes(v)),
+                        _ => took.push(u64::MAX), // EAGAIN with nothing left
+                    }
+                }
+                r.check(
+                    &format!("a semaphore of 3 reads 1, 1, 1 then EAGAIN, got {took:?}"),
+                    took == [1, 1, 1, u64::MAX],
+                );
+            }
+        }
+        Err(e) => r.check(
+            &format!("eventfd(3, EFD_SEMAPHORE) is served, got {e:?}"),
+            false,
+        ),
+    }
+
+    // A plain eventfd of 3 reads the **whole** counter, which is the
+    // neighbour that makes the claim above about the mode rather than about
+    // reads in general.
+    match eventfd(3, EventfdFlags::NONBLOCK) {
+        Ok(plain) => {
+            let mut v = [0u8; 8];
+            let n = unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(&plain),
+                    v.as_mut_ptr().cast::<libc::c_void>(),
+                    8,
+                )
+            };
+            r.check(
+                &format!("a plain eventfd of 3 reads the whole counter, got {n}"),
+                n == 8 && u64::from_ne_bytes(v) == 3,
+            );
+        }
+        Err(_) => r.check("the plain neighbour is made", false),
     }
 
     // The flag word is validated, not ignored: a bit outside the three
