@@ -2935,3 +2935,42 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   measurement. Gate `build/gate-item291.log` `GATE_EXIT=0`, both arms in one run:
   stage 1 1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy
   ratchet unchanged. (§6.172, item 291)
+
+- **Item 292 — a symlink target is `PATH_MAX - 1`, not one `NAME_MAX` component, and
+  its inode's `size` was an allocation**: the inventory §6.172 said was owed — a hand
+  walk of the syscall-facing layers for a length the caller *or the medium* supplies
+  that reaches an allocation. The syscall layer came out clean (`MAX_PAYLOAD`,
+  `NGROUPS_MAX`, `SEMOPM`, the msg-queue budget, `WAITV_MAX`, `collect_capacity`);
+  what the walk found was in `vfs`. Two defects sharing one number, in opposite
+  directions. (1) `symlink` read its target through `cstr_arg`, whose limit is
+  `MAX_PATH` = 255 — the cap for one path **component**, right for the link's own name
+  and wrong for the target, which is a whole path — so a link a real filesystem holds
+  was refused by the call that makes it. (2) `Ext4Ino::readlink` allocated from
+  `data.size`, a field **in the inode on disk**, on both branches — so a corrupt or
+  hostile image named any length it liked, §8.0.2's catalogue exactly. Measured on
+  Linux 7.3.4 (`build/scratch/symcap/t.c`): `symlink(4095)` succeeds and reads back
+  4095, while 4096 and 4097 are `ENAMETOOLONG` — so the bound is `PATH_MAX - 1`, and
+  the creation door refusing past it is what makes the same number safe to bound a
+  read against. `mpos_abi::MAX_SYMLINK_TARGET_BYTES` is the leaf constant (both layers
+  need it, neither may name the other), **both** `symlink` and `symlinkat` read the
+  target through `cstr_limit(.., MAX_SYMLINK_TARGET_BYTES)` while keeping 255 for the
+  link's name, and `readlink` refuses a longer on-disk `size` as `Invalid`. **A third
+  defect surfaced through the gate and through only one arm**: the first version fixed
+  `symlink` alone, the gate reddened only on aarch64 at the 4095 claim on a genuinely
+  rebuilt, ungated path, and the missing half was `symlinkat` — same bug, untouched.
+  glibc's `symlink()` goes through `symlinkat` and musl's issues `symlink` directly, so
+  the x86_64 arm (glibc, wrong door unused) was green and the aarch64 one (musl, wrong
+  door used) failed, and a hand probe in an initramfs could not see it either way. `t-readlink` grew four
+  claims (4095 accepted and reading back 4095; 4096 and 4097 `ENAMETOOLONG`) — the
+  **pair** is the claim, since a `PATH_MAX` version accepts 4096 and a `MAX_PATH`
+  version refuses 4095. Counterfactual reddens **exactly one**: the 4095 acceptance,
+  with both refusals green — the sharpest shape yet, because the bug was a bound too
+  *tight*. Also lowered the `unused_imports` clippy baseline 4 → 3 for
+  `mpos-user-tests`, which the ratchet demanded. Named: the **other paired doors were not audited**
+  (`mknod`/`mknodat`, `chmod`/`fchmodat`, `utimes`/`utimensat` are the same shape, and
+  the gate can only redden for the half a given arm's libc uses), the inventory is a
+  hand walk and not a proof, other filesystems' `readlink` hold targets the kernel
+  wrote (a reading, not a measurement), and the link's own name limit was not
+  re-measured. Gate `build/gate-item292b.log` `GATE_EXIT=0`, both arms in one run
+  after the `symlinkat` half: stage 1 1339, x86_64 `pass=323`, aarch64 `pass=319`,
+  kunit 41/0 per arm, clippy ratchet unchanged. (§6.173, item 292)

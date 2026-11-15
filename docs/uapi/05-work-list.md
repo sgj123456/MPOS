@@ -12936,3 +12936,30 @@ exhaustive** — a wrapper type that makes an unbounded size unspellable is the 
 fix and is design work. And `UFFDIO_ZEROPAGE` shares `copy_len_ok`, so it
 tightened with it: consistent (its measured answer is the same one-page shape) but
 not independently re-measured for a multi-page `len`.
+
+## Item 292 — a symlink target is `PATH_MAX - 1`, not one `NAME_MAX` component — and its inode's `size` was an allocation (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **How found** | The inventory §6.172 said was owed: a hand walk of the syscall-facing layers for a length the caller *or the medium* supplies that reaches an allocation. The syscall layer came out clean (`MAX_PAYLOAD`, `NGROUPS_MAX`, `SEMOPM`, the msg-queue budget, `WAITV_MAX`, `collect_capacity`) — what the walk found was in `vfs`: an inode's on-disk `size` used as an allocation length. |
+| **Before** | Two defects sharing one number, in opposite directions. (1) `symlink` read its target through `cstr_arg`, whose limit is `MAX_PATH` = **255** — the cap for one path *component*, right for the link's own name and wrong for the target, which is a whole path — so a link a real filesystem holds was refused by the call that makes it (`symlink(len=4095) -> ENAMETOOLONG` on the machine). (2) `Ext4Ino::readlink` did `let size = data.size as usize` and allocated from it on **both** branches; `size` is a field in the inode on disk, so a corrupt or hostile image names any length it likes — §8.0.2's catalogue exactly, a `Vec` grown at a number somebody else wrote. |
+| **Measured first** | Linux 7.3.4, `build/scratch/symcap/t.c`: `symlink(len=4095)` succeeds and `readlink` reads 4095 back; 4096 and 4097 are `ENAMETOOLONG` (36). So the target is bounded at `PATH_MAX - 1` = 4095, the creation door refuses past it, and hence the longest a Linux-served filesystem can *hold* is 4095 — which is what makes the same number safe to bound a read against. |
+| **Now** | `mpos_abi::MAX_SYMLINK_TARGET_BYTES = 4095` in the leaf (both layers need it, neither may name the other — the same reason `wait_status` is there); **both** `symlink` and `symlinkat` read the target through `cstr_limit(.., MAX_SYMLINK_TARGET_BYTES)` and keep `cstr_arg`'s 255 for the link's own name; `Ext4Ino::readlink` refuses `size > MAX_SYMLINK_TARGET_BYTES` with `Invalid`, the honest answer for a corrupt inode. `src/syscall/mod.rs`'s constant became an alias, so the number has one home. |
+| **A third defect, found by the gate and by only one arm** | The first version fixed `symlink` and `readlink`. The gate reddened **only on aarch64**, at the 4095 claim, with the fixture directory made successfully, on an ungated code path and a genuinely rebuilt kernel. The missing half was `symlinkat` — `symlink`'s sibling, same `cstr_arg` bug, untouched by the fix. **Which door a libc calls is the libc's business**: glibc's `symlink()` goes through `symlinkat`, musl's issues `symlink` directly, so the x86_64 arm (glibc, wrong door unused) looked green and the aarch64 one (musl, wrong door used) failed. A hand probe in an initramfs could not see it either way, because both doors reach the same ramfs. Rule added: **when a call has two doors, fixing the one the report names is half a fix, and only the arm whose libc uses the other half can say so.** |
+| **Pins** | `t-readlink` grew four claims beside its *buffer*-shaped ones (which is why it never noticed: it asked how much a read returns, never how long a target may be): 4095 accepted **and reads back 4095**; 4096 `ENAMETOOLONG`; 4097 `ENAMETOOLONG`. The pair is the claim — a `PATH_MAX` version accepts 4096, a `MAX_PATH` version refuses 4095, each failing a different member. Host: `mpos-abi`'s `a_symlink_target_is_bounded_by_path_max_minus_one`. |
+| **Counterfactual** | The four kernel files stashed, rebuilt, the pin in the guest: **exactly one claim red** — `a 4095-byte target is accepted … got Err(... 36)` — with the 4096 and 4097 refusals **green**. The sharpest shape this session has produced: the bug was a bound too *tight*, so the too-long refusals were already right and only the accepted side moved. Restored, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item292b.log`, `GATE_EXIT=0`, both arms in one run after the `symlinkat` half landed: stage 1 **1339** host tests 0 failed; stage 2 323 programs over 6 lanes on x86_64 (40.00 s) and 319 on aarch64 (53.12 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged at `162/168/389/273/3`. Two earlier runs are part of the record: the first reddened on aarch64 at the 4095 claim (the missing `symlinkat`), the second was needed only to rebuild that arm's kernel. Also lowered the `unused_imports` clippy baseline 4 → 3 for `mpos-user-tests`, which the ratchet demanded after this pin's own import cleanup (a count that *fell* is the one case where the constant must move). |
+
+**What this does not do, named.** The **other paired doors were not audited**:
+`symlink`/`symlinkat` is the pair this item found by failing, and
+`mknod`/`mknodat`, `chmod`/`fchmodat`, `utimes`/`utimensat` and the rest are the
+same shape — whether each half carries the same validation is an open question
+worth its own walk, since the gate can only redden for the half a given arm's libc
+uses. The inventory is a **hand walk**, not a proof —
+`with_capacity`/`vec![` in `src/syscall/` and `src/vfs/`, each site read; the
+structural fix (a type that makes an unbounded length unspellable) is still design
+work. Other filesystems' `readlink` (`ramfs`, `devfs`, the pseudo-filesystems) hold
+targets the kernel itself wrote and have no on-disk field to distrust — but that is
+a reading of each, not a measurement, and only `ext4` has the corrupt-image
+exposure. And the link's own *name* limit (`cstr_arg`'s 255) was not re-measured
+here.
