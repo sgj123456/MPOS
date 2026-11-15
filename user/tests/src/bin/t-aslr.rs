@@ -32,8 +32,18 @@
 //!
 //! What is not tested here is the load bias of a position-independent image as
 //! a *number*: nothing the test can exec in this initramfs has an address the
-//! kernel is allowed to choose, so the claim is the property - two runs differ
-//! - and not a magnitude.
+//! kernel is allowed to choose, so the claim is the property - the draw lands
+//! somewhere other than where it landed before - and not a magnitude.
+//!
+//! **Why six runs and not two.** Two runs compared is a coin flip, not a test:
+//! this kernel's stack draw spans `ASLR_STACK_PAGES` = 2048 pages
+//! (`src/sched/runtime/mod.rs`), so a perfectly randomising kernel repeats
+//! itself once in 2048. That is not hypothetical - it reddened a gate on
+//! 2026-11-15 with nothing wrong in the kernel (`docs/notes/` §6.163), and a
+//! pin that fails on a correct kernel teaches the next session to re-run it
+//! away. Six samplings make the false-failure rate (1/2048)^5 while a kernel
+//! that pins either landmark still fails every time. The magnitude remains
+//! unpinned, which §6.163 names.
 //!
 //! Nor does anything redraw a layout on `fork`, which is the property the two
 //! samples above rest on: a child that inherited its parent's pages at
@@ -206,28 +216,43 @@ fn main() {
     };
     let me = cstr(me0);
     let first_path = cstr("/tmp/t-aslr.1");
-    let second_path = cstr("/tmp/t-aslr.2");
     let _ = unlinkat(CWD, "/tmp/t-aslr.1", AtFlags::empty());
-    let _ = unlinkat(CWD, "/tmp/t-aslr.2", AtFlags::empty());
 
-    let first = redraw(&me, &first_path);
-    let second = redraw(&me, &second_path);
+    // Six fresh runs, not two. Two is a coin flip: this kernel draws the stack
+    // start from `ASLR_STACK_PAGES` = 2048 pages, so "two runs differ" fails by
+    // luck once in 2048 - which is how `t-aslr` reddened a gate on 2026-11-15
+    // with nothing wrong in the kernel. Six runs make that (1/2048)^5, and the
+    // claim is the honest one anyway: randomisation is a *distribution*, and
+    // what a kernel that does not randomise must fail is "more than one page
+    // appeared at all".
+    let mut samples = Vec::new();
+    for _ in 0..6 {
+        samples.push(redraw(&me, &first_path));
+    }
     r.check(
-        "two fresh runs of this program reported where each one was",
-        first.is_some() && second.is_some(),
+        "six fresh runs of this program reported where each one was",
+        samples.iter().all(Option::is_some),
     );
-    let (Some(a), Some(b)) = (first, second) else {
+    let Some(samples) = samples.into_iter().collect::<Option<Vec<_>>>() else {
         r.finish();
     };
+    let a = samples[0];
+    let distinct = |which: usize| {
+        let mut pages: Vec<usize> = samples.iter().map(|s| s.page(which)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages.len()
+    };
 
-    // Both landmarks that are free to choose, chose.
+    // Both landmarks that are free to choose, chose - more than one value, so
+    // a kernel that pins either one to a fixed page cannot pass.
     r.check(
-        "the stack does not start at the same page twice",
-        a.page(STACK) != b.page(STACK),
+        "the stack start lands on more than one page across six runs",
+        distinct(STACK) > 1,
     );
     r.check(
         "and neither does the mmap region",
-        a.mmap != 0 && b.mmap != 0 && a.page(MMAP) != b.page(MMAP),
+        samples.iter().all(|s| s.mmap != 0) && distinct(MMAP) > 1,
     );
 
     // The image's own address: pinned as an equality here because every
@@ -237,8 +262,8 @@ fn main() {
     // position-independent, so its code - and the heap anchor that begins just
     // above it - are drawn too, and what is pinned there is that the two moved
     // *together*, which is the property either way.
-    let code_same = a.page(CODE) == b.page(CODE);
-    let heap_follows = a.page(HEAP) == b.page(HEAP);
+    let code_same = samples.iter().all(|s| s.page(CODE) == a.page(CODE));
+    let heap_follows = samples.iter().all(|s| s.page(HEAP) == a.page(HEAP));
     r.check(
         "a fixed-address image keeps its code address - that is what fixed means",
         // On a host this program is a PIE, so Linux draws its code address and
@@ -260,7 +285,7 @@ fn main() {
             "note: the host draws the heap anchor too - brk page {:x} then {:x}, where this \
              kernel pins it just above the image (NOTES.md's ASLR row names the three landmarks)",
             a.page(HEAP),
-            b.page(HEAP),
+            samples[1].page(HEAP),
         );
     }
     r.check(
@@ -268,8 +293,8 @@ fn main() {
         heap_follows || host_run(),
     );
 
-    // The sample files are the test's own litter.
+    // The sample file is the test's own litter: one path is enough, because
+    // each run overwrites the last one's answer before it is read.
     let _ = unlinkat(CWD, "/tmp/t-aslr.1", AtFlags::empty());
-    let _ = unlinkat(CWD, "/tmp/t-aslr.2", AtFlags::empty());
     r.finish();
 }
