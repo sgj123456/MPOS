@@ -14685,10 +14685,11 @@ faults again.
    GPR-preserving stub, 2/16 → 16/16); the six `x86-interrupt` exception
    vectors still wait for a timer tick's stub, and per-vector error-code-aware
    stubs remain their prerequisite.
-2. **aarch64's `el0_sync` has no ESR→signal map** (§6.159's gap 2). The
-   renderer is shared and the kunit cases run on both machines, but a
-   refused EL0 fault there still ends in `die_of_fatal_signal(11)` with no
-   queued record.
+2. **aarch64's `el0_sync` had no ESR→signal map** (§6.159's gap 2) when this
+   landed. The renderer was shared and the kunit cases ran on both machines,
+   but a refused EL0 fault there ended in `die_of_fatal_signal(11)` with no
+   queued record — closed by item 284, which gave both machines one
+   `FaultKind` vocabulary (§6.165).
 3. **The machine-specific `_sigfault` members stay zero**: `si_addr_lsb`
    (BUS_ADRALN's detail), `si_addr_bnd` (MPX), `si_pkey` (memory protection
    keys). This kernel has none of the three; a plausible number there would
@@ -14758,8 +14759,9 @@ register-preserving entry, the second hand-written stub in that port (the PIT's
   is no longer one of the ABI handlers it describes.
 
 Nothing about `sigtimedwait`, the siginfo renderer, or the six other exception
-vectors moves. On aarch64 `el0_sync` still dies on a refused EL0 fault with no
-queued record — its `ESR`→signal map remains §6.159's named gap.
+vectors moves. On aarch64 `el0_sync` still died on a refused EL0 fault with no
+queued record when this landed — its `ESR`→signal map was §6.159's named gap,
+and item 284 closed it (§6.165).
 
 **The pin, `t-fault-at-trap`.** Eight forked children (the reliability claim —
 one child can get lucky on a tick, eight in a row cannot). Each maps a
@@ -14803,8 +14805,9 @@ no count has grown"; bare metal both arches and the selftest build compile.
    error-code-aware stub of the same shape (three of the seven push an error
    code, four do not), and a `t-*` pin that can resume or at least prove the
    frame. `t-trap-signal` (§6.159) still pins only their *terminating* signal.
-2. **aarch64's `el0_sync`** has no per-ESR-class signal map; refused EL0 faults
-   still end in `die_of_fatal_signal(11)` with no queued record.
+2. **aarch64's `el0_sync`** had no per-ESR-class signal map when this landed;
+   refused EL0 faults still ended in `die_of_fatal_signal(11)` with no queued
+   record. Item 284 closed it (§6.165).
 3. **`PROT_NONE`'s `si_code`** was `SEGV_MAPERR` here against Linux's
    `SEGV_ACCERR` when this landed; §6.162 (item 282) closed it by asking the
    VMA tree instead of the page-table word, and `t-fault-at-trap`'s claim that
@@ -14880,8 +14883,9 @@ installing an `SA_SIGINFO` handler that records `si_code`/`si_addr` into a
 `MAP_SHARED` page and `_exit(0)`s: `PROT_NONE` read ⇒ `SEGV_ACCERR` + `si_addr`
 is the page; write a `PROT_READ` page ⇒ `SEGV_ACCERR` + `si_addr`; read
 `0x1000` ⇒ `SEGV_MAPERR` + the address; read the hole between two mappings ⇒
-`SEGV_MAPERR` + the hole. It is in `[aarch64] gaps` — the second machine has no
-`ESR`→signal map at all, so it has no record to read a code out of.
+`SEGV_MAPERR` + the hole. It sat in `[aarch64] gaps` while the second machine
+had no `ESR`→signal map at all; item 284 opened the wall (§6.165), and the same
+nine claims now pass on both machines.
 
 Three probe bugs, each costing a run: a forked child's private memory is not the
 parent's, so a handler's findings must live in a shared page (the C probes print
@@ -14917,9 +14921,10 @@ and no count has grown"; bare metal both arches compile.
    GPR-preserving stub (§6.161's gap 1), so a handled `SIGILL`/`SIGFPE`/
    `SIGTRAP` still waits for a timer tick. Their `si_code` rows are measured and
    pinned, but the *delivery point* is not.
-2. **aarch64's `el0_sync`** has no `ESR`→signal map. Every refused EL0 fault
-   still ends in `die_of_fatal_signal(11)` with no record — so this item's whole
-   question does not arise there yet, which is why the pin is in its `gaps`.
+2. **aarch64's `el0_sync`** had no `ESR`→signal map when this landed, so every
+   refused EL0 fault ended in `die_of_fatal_signal(11)` with no record and this
+   item's question did not arise there — which is why the pin sat in `gaps`.
+   Item 284 closed it (§6.165); the pin runs on both machines now.
 3. **The machine-specific `_sigfault` members stay zero** — `si_addr_lsb`,
    `si_addr_bnd`, `si_pkey` — and `signalfd_siginfo.ssi_addr` and
    `PTRACE_GETSIGINFO`'s synthesized code remain their own doors (§6.160's gaps
@@ -15094,9 +15099,9 @@ direction either loops or skips. `#DE`'s child leaves through `_exit(0)` from
 its handler because there is nothing to repair. Exit codes 10/11/12/13 name
 which claim failed. `MPOS_ON_HOST=1` runs the same fixture against Linux 7.2.14
 and passes (`9 ok`, `PASS`), which is what makes the numbers a measurement
-rather than a description. It sits in `tests.toml`'s `[aarch64] gaps`: the second
-machine's `el0_sync` has no `ESR`→signal map, so this claim has no counterpart
-there.
+rather than a description. It sat in `tests.toml`'s `[aarch64] gaps` while the
+second machine's `el0_sync` had no `ESR`→signal map; item 284 gave it one and
+the program now runs on both (§6.165).
 
 Guest, on the new kernel (`build/scratch/traptrap/boot-pin.log`, 24 children):
 
@@ -15152,11 +15157,12 @@ allowed — the count is a ceiling, not a budget.
 
 ### What this does not do, named
 
-1. **The second machine has no equivalent.** `el0_sync` decodes an `ESR` into
-   an exception class and this port maps none of them to a signal yet; a refused
-   EL0 fault there still dies without queueing anything (§6.159's gap, still
-   open). Every `#PF`/exception pin therefore names `t-trap-at-trap`-class
-   programs in `[aarch64] gaps`.
+1. **The second machine had no equivalent when this landed.** `el0_sync`
+   decoded an `ESR` into an exception class and this port mapped none of them to
+   a signal, so a refused EL0 fault there died without queueing anything
+   (§6.159's gap). Item 284 closed it (§6.165) — but this item's own subject is
+   x86_64's *vectors*, which aarch64 does not have, so `t-trap-at-trap` stays in
+   `[aarch64] gaps` by design rather than by gap.
 2. **`#BP` from ring 3 has no `si_addr`.** Linux reports 0 and so does this
    kernel, but nothing pins the `PTRACE`-visible half: a debugger attaching to a
    task stopped at an `int3` reads its registers through the syscall path, which
@@ -15170,3 +15176,187 @@ allowed — the count is a ceiling, not a budget.
 4. **`device_not_available` (7) and `double_fault` (8) stay on the ABI.** Neither
    is a signal a program can handle: `#DF` is unrecoverable by definition, and
    vector 7 is the lazy-FPU path that must return into the instruction.
+
+## §6.165 a fault's *class*, not a vector: aarch64 signs its EL0 faults and delivers them at the trap (item 284, LANDED 2026-11-15)
+
+**The observation.** Item 283 closed the x86_64 half of §2.13's question and,
+in its own closing list, named the other half: "the second machine has no
+equivalent". `arch/src/arch/aarch64/vectors.rs`'s `el0_sync` decoded `ESR_EL1`
+into a class, resolved what it could (`resolve_cow_fault`, `resolve_anon_fault`,
+`resolve_stack_growth`) and then, for anything left, called
+`report_user_fault` and `die_of_fatal_signal(11)` — one hardcoded `SIGSEGV`,
+no `siginfo_t` record, and no handler entry anywhere on the path. Four programs
+in `[aarch64] gaps` said so in their own words: each ran, reported
+
+```
+t-trap-signal: skipped (the x86_64 vector table is not this machine's)
+```
+
+and passed without a claim to fail on. A pin that cannot fail pins nothing.
+
+**Why the seam could not carry it.** `Kernel::send_fault_signal` was
+`fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize) -> u8`, and
+its whole per-vector policy was one comparison in `src/kernel_services.rs`:
+
+```rust
+let mapped = vector == 14 && sched::in_task() && sched::vma_prot_at(addr).is_some();
+let (sig, info) = sched::signal::fault_record(vector, addr, rip, mapped);
+```
+
+`vector == 14` is `#PF`. Every other number — including every class aarch64
+could ever name — fell through `fault_record`'s `_` arm to
+`SIGSEGV`/`SI_KERNEL`, and `signal_for_trap`'s first match arm (then
+`0 => SIGFPE, 3 => SIGTRAP, 6 => SIGILL, 17 => SIGBUS, _ => SIGSEGV`) was keyed
+on words only one machine has. A port cannot describe a `Data Abort` with a
+number it never issues. This is the same failure the repo has paid for twice
+already (`docs/notes/` §14.2: the kernel-services table "was written twice only
+because it looked machine-shaped, and it never was").
+
+**The change: a class both machines can name.** A new leaf enum, in
+`crates/vm/src/lib.rs` because *both* halves of the seam must name it and
+`sched::signal` is host-compiled while `arch` cannot be reached from a leaf —
+the same reason `MapFlags` lives there:
+
+```rust
+pub enum FaultKind { Divide, Breakpoint, InvalidOpcode, Page, Alignment, Other }
+```
+
+The machine keeps what only it knows (which vector fired, which `ESR` class
+arrived) and answers the class; the kernel keeps the ABI table:
+
+- `src/sched/signal.rs` gained `signal_for_kind(FaultKind) -> u8`,
+  `fault_kind_of_vector(u8) -> FaultKind`, and a re-keyed
+  `fault_record(kind, addr, rip, mapped) -> (u8, SigInfo)`. The old spelling
+  survives as `fault_record_of_vector` / `signal_for_trap` so x86_64's doors —
+  which hold a vector and nothing else — still read naturally.
+- `arch/src/hal/kernel.rs`: `signal_for_kind`, `send_fault_signal(kind, addr,
+  rip)`, and a new `fault_kind_of_vector`, each documented with why the argument
+  is a class. The stale sentence in `send_fault_signal`'s doc that still named a
+  `mapped` parameter (removed by item 282) went with it.
+- `src/kernel_services.rs` asks the mapping question only for
+  `kind == FaultKind::Page`, still behind `sched::in_task()`.
+- `arch/src/arch/x86_64/idt.rs` reads its own vector once, at the door:
+  `let kind = fault_kind_of_vector(vector);`.
+
+**The aarch64 half.** `el0_sync`'s three dying arms now queue a record and hand
+it over through the door §2.13 built, via a new `deliver_or_die`:
+
+```rust
+fn deliver_or_die(frame: &mut UserFrame, sig: u8) {
+    #[cfg(mpos_signal_frame)]
+    if crate::hal::kernel::deliver_at_trap(core::ptr::from_mut(frame).cast::<()>()) {
+        return;
+    }
+    crate::hal::kernel::die_of_fatal_signal(sig);
+}
+```
+
+| `ESR_EL1` class | `FaultKind` | signal | `si_code` | `si_addr` |
+|---|---|---|---|---|
+| `EC_DATA_ABORT_EL0` (0x24) | `Page` | SIGSEGV | `SEGV_ACCERR` if a mapping describes it, `SEGV_MAPERR` if not | `FAR_EL1` |
+| `EC_INSTR_ABORT_EL0` (0x20) | `Page` | SIGSEGV | as above | `FAR_EL1` |
+| `EC_SYS64` naming an unmapped address | `Page` | SIGSEGV | as above | the address the system instruction named |
+| `EC_SYS64` naming an unhandled register | `InvalidOpcode` | SIGILL | `ILL_ILLOPN` | `0` — see below |
+| any other class | `Other` | SIGSEGV | `SI_KERNEL` | `0` |
+
+`si_addr = 0` for the unhandled register is deliberate: `FAR_EL1` still holds
+whichever page fault came last, so copying it into a record about an instruction
+would be an invented answer, and the kernel's own comment on that arm already
+said printing it "would be an invented answer". The instruction pointer is what
+a caller can use, and `SIGILL`'s Linux `si_addr` is the faulting instruction —
+which is `frame.pc`; the record carries `rip` through `fault_record`'s existing
+`InvalidOpcode` row, so the field is right without the port inventing one.
+
+`deliver_or_die` returns only when a handler's frame is installed, so all three
+call sites `return 0` — a non-zero answer means "the frame is dead, leave for
+the kernel", which is the opposite of what a delivery asks for. Before this,
+the machine could not have run a SIGSEGV handler entered from the trap at all.
+
+**The pin, `t-fault-sicode`, now on both machines.** It was written for item 282
+and carried 19 `#[cfg(target_arch = "x86_64")]` items plus a skipped `main`. The
+program names no vector anywhere — its four trials ask "does a mapping describe
+this address" and "what did the record say" — so the wall was the only thing
+keeping it off the second machine. Both removed. It now runs 9 claims on each
+machine:
+
+```
+ok:    PROT_NONE read: a mapping describes it, so the code is SEGV_ACCERR
+ok:    PROT_NONE read: si_addr is the page, not the bus address
+ok:    write to PROT_READ: the code is SEGV_ACCERR
+ok:    write to PROT_READ: si_addr is the page
+ok:    never-mapped read: nothing describes it, so the code is SEGV_MAPERR
+ok:    never-mapped read: si_addr is the address that was read
+ok:    hole between mappings: the middle page was unmapped
+ok:    hole between mappings: the code is SEGV_MAPERR
+ok:    hole between mappings: si_addr is the hole
+note: this host's answers are Linux's; the guest arm pins the kernel's
+PASS
+```
+
+Three readings, each a measurement rather than a description:
+
+- **Linux 7.2.14, x86_64**: `MPOS_ON_HOST=1 … --bin t-fault-sicode` → 9 ok + PASS.
+- **Linux, aarch64**: the pin's *host* leg is measurable by cross-building
+  `--target aarch64-unknown-linux-musl` (nothing links with gcc; `.cargo/config.toml`
+  pins `linker=rust-lld` and `+crt-static`) and running it under
+  `qemu-aarch64` → **9 ok + PASS**. So the four claims are Linux's on both
+  instruction sets, not a description of one host repeated twice.
+- **The machine, aarch64**: `cargo xtask test --arch aarch64` →
+  `verdict pass=317 fail=0` (316 before), `mpos-kunit 41 passed, 0 failed`, and
+  the lane log shows `=== RUN t-fault-sicode`, the four `segfault at …` diag
+  lines of the four trials, `=== PASS t-fault-sicode`.
+
+**Counterfactual — the honest before.** Restoring the pre-item
+`arch/src/arch/aarch64/vectors.rs` (the three `die_of_fatal_signal` sites back,
+`grep -c "deliver_or_die\|FaultKind"` → 0), rebuilding kernel and loader and
+re-running the arm gave `EXIT=1`, `Error: self-test failed on: aarch64`, and this
+from `build/test-lane-aarch64-2/serial.log`:
+
+```
+FAIL:  PROT_NONE read: the handler ran (not a default death)
+FAIL:  write to PROT_READ: the handler ran (not a default death)
+FAIL:  never-mapped read: the handler ran (not a default death)
+FAIL:  hole between mappings: the handler ran (not a default death)
+FAILED
+=== FAIL t-fault-sicode exit=1
+```
+
+**No handler ran at all**, on any of the four classes — the strongest form this
+counterfactual can take, because the claim that failed is the precondition
+every other claim rests on. Nothing about `si_code` or `si_addr` is even reached.
+
+**Gate.** `build/gate-item284.log`, `GATE_EXIT=0`: stage 1 **1330** host tests,
+0 failed, 52.13 s; x86_64 `verdict pass=321 fail=0`, `mpos-kunit 41 passed, 0
+failed`, 19 of 336 user tests left out by `tests.toml`; aarch64 `verdict
+pass=317 fail=0` (one more than the previous green, the newly-open pin),
+`mpos-kunit 41 passed, 0 failed`, 19 of 336 left out. Clippy ratchet within
+bounds (`162/162`, `168/168`, `389/389`, `273/273`, `3/3`, `1/1`), both
+workspaces formatted.
+
+### What this does not do, named
+
+1. **`t-fault-at-trap` and `t-trap-at-trap` stay in `[aarch64] gaps`.** The
+   first pins a register-preserving `#PF` entry and the second names seven
+   x86_64 vectors; both subjects are the *first* machine's. What aarch64 now
+   has is the delivery, not that entry — its `el0_sync` stub already saved every
+   register (§2.13), which is why `deliver_at_trap` could be laid over it at
+   all. Opening those programs would need their claims re-phrased around
+   "a handler was entered and the registers survived", which is a different pin.
+2. **`fault_repeats` still does not exist on aarch64**, and on x86_64 it is one
+   global counter keyed on `(task, rip)` that is never reset (§6.164's gap 3).
+   A trap-time delivery makes it far less reachable on both machines; it does
+   not close it.
+3. **`si_addr_lsb`, `si_addr_bnd`, `si_pkey` stay zero** on every record, and
+   `signalfd_siginfo.ssi_addr` still is not written — `src/vfs/signalfd.rs`
+   drops `SigInfo::addr`, which is a separate door. `PTRACE_GETSIGINFO`
+   synthesizes a stop's `si_code` with no `si_addr` for the same reason: the
+   stop record (`src/sched/runtime/task.rs`'s `Stop`) carries no address at all.
+4. **`device_not_available` (7) and `double_fault` (8)** stay on the x86_64
+   `x86-interrupt` ABI: neither is a signal a program can handle, and vector 7
+   must return into the instruction.
+5. **The `#AC`/`#DE`/`#UD`/`#BP` classes were measured on x86_64 Linux only.**
+   On aarch64 the EL0 sync path has no equivalent of `#DE`/`#UD`/`#AC` as
+   separate classes — an integer divide by zero and an undefined instruction are
+   not synchronous exceptions delivered to EL0 there — so the `FaultKind` rows
+   that only that machine can produce are `Page` and `InvalidOpcode`, and the
+   rest are unwitnessed on it. Recorded rather than glossed.

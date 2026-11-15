@@ -12592,7 +12592,9 @@ Pins: `t-fault-at-trap` — eight forked children, an `SA_SIGINFO` handler that
 `mprotect`s and returns, a live `r12 = 0x1234_5678_abcd_ef00` across the
 faulting store, and claims on `si_code`/`si_addr`, the resumed value `42` and
 the preserved register. `MPOS_ON_HOST=1` PASS; guest x86_64 PASS; aarch64 in
-`gaps` (its `ESR`→signal map is §6.159's named gap). Counterfactual: removing
+`gaps` when this landed (its `ESR`→signal map was §6.159's named gap, closed by
+item 284, §6.165 — but this program's subject is the first machine's entry, so
+it stays in `gaps` by design). Counterfactual: removing
 only the trap-time door → `FAIL: all 8 handled faults resumed at the trap
 (good=2 died=6 other=0)`, `FAILED exit=1`; restored byte-identically, PASS.
 Production field reading `REL null-store: handler_ran=16/16 died=0 other=0`
@@ -12605,9 +12607,11 @@ failed (50.51 s); x86_64 `verdict pass=319 fail=0`, aarch64
 **811** / xtask **162**, six-arm clippy ratchet unchanged, bare metal both
 arches and selftest build all clean.
 
-**What this does not do.** The other six `x86-interrupt` exception vectors
-still have no GPR-preserving stub (a handled `SIGILL`/`SIGFPE`/`SIGTRAP` waits
-for a tick); aarch64 `el0_sync` still has no ESR→signal map; `PROT_NONE`'s
+**What this does not do.** When this landed, the other six `x86-interrupt`
+exception vectors had no GPR-preserving stub (a handled
+`SIGILL`/`SIGFPE`/`SIGTRAP` waited for a tick — item 283, §6.164, closed it) and
+aarch64 `el0_sync` had no `ESR`→signal map (item 284, §6.165, closed it);
+`PROT_NONE`'s
 `si_code` is `SEGV_MAPERR` here against Linux's `SEGV_ACCERR` (§6.160);
 `fault_repeats`' counter is still global and never reset; chromium is not
 unblocked (`cc 0f 0b` is an intentional `__builtin_trap()`). `PROT_NONE`'s
@@ -12736,9 +12740,46 @@ lane. fmt both workspaces, host lib **812** / xtask
 `clippy::doc_lazy_continuation` 36→39 — a `-` that Markdown read as a list item
 — and the doc was reworded rather than allowed), bare metal both arches clean.
 
-**What this does not do.** aarch64 `el0_sync` still has no `ESR`→signal map;
+**What this does not do.** aarch64 `el0_sync` had no `ESR`→signal map when this
+landed (item 284, §6.165, closed it — but this item's own subject is the first
+machine's vectors, so this program stays in `gaps`);
 `#BP`'s `PTRACE`-visible half is a different frame and unpinned; `fault_repeats`
 is still one global counter keyed on `(task, rip)` and never reset;
 `device_not_available` (7) and `double_fault` (8) stay on the `x86-interrupt`
 ABI because neither is a signal a program can handle; chromium is not unblocked
 (its `cc 0f 0b` is an intentional `__builtin_trap()`).
+
+---
+
+## Item 284 — a fault's *class*, not a vector: aarch64 signs its EL0 faults and delivers them at the trap (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **Before** | `arch/src/arch/aarch64/vectors.rs`'s `el0_sync` resolved what it could and then died on anything left: `report_user_fault(...)` + `die_of_fatal_signal(11)` — one hardcoded `SIGSEGV`, no `siginfo_t` record, no handler entry. Four pins sat in `[aarch64] gaps` and printed "skipped". The seam could not have helped: `Kernel::send_fault_signal` took an **x86_64 vector number** and its whole policy was `vector == 14`, so a class aarch64 names from `ESR_EL1` fell to `fault_record`'s `_` arm. |
+| **Now** | One machine-neutral vocabulary in the leaf crate — `mpos_vm::FaultKind { Divide, Breakpoint, InvalidOpcode, Page, Alignment, Other }` — reachable from both `sched::signal` (host-compiled) and `hal::kernel`. The machine answers the *class*; the kernel keeps the ABI table. `el0_sync` queues the record and hands it over through §2.13's `deliver_at_trap` door via a new `deliver_or_die`, so a `SIGSEGV` handler runs **at the trap** on that machine. `EC_DATA_ABORT_EL0`/`EC_INSTR_ABORT_EL0` → SIGSEGV with `SEGV_ACCERR`/`SEGV_MAPERR` from the same `vma_prot_at` question x86_64 asks and `si_addr = FAR_EL1`; `EC_SYS64`'s unhandled register → SIGILL/`ILL_ILLOPN` with `si_addr` the instruction, not stale `FAR_EL1`; anything else → `Other`. |
+| **Seam** | `Kernel::signal_for_trap(u8)` → `signal_for_kind(FaultKind)`; `send_fault_signal(vector, addr, rip)` → `send_fault_signal(kind, addr, rip)`; new `fault_kind_of_vector(u8)`. `src/sched/signal.rs` gained `signal_for_kind`/`fault_kind_of_vector` and a re-keyed `fault_record(kind, …)`; the vector spellings survive as `fault_record_of_vector`/`signal_for_trap` for x86_64's own doors. |
+| **Pins** | `user/tests/src/bin/t-fault-sicode.rs` lost all 19 `#[cfg(target_arch = "x86_64")]` items and its skipped `main` — it names no vector, so nothing kept it off the second machine. 9 claims on each: `PROT_NONE` read → `SEGV_ACCERR` + `si_addr` is the page; write a `PROT_READ` page → `SEGV_ACCERR` + `si_addr`; read `0x1000` → `SEGV_MAPERR` + the address; read the hole between two mappings → `SEGV_MAPERR` + the hole. The unchanged x86_64 claims all still pass. |
+| **Counterfactual** | The pre-item aarch64 `vectors.rs` restored (three `die_of_fatal_signal` sites back), kernel **and** loader rebuilt → `Error: self-test failed on: aarch64`, and the lane log reads `FAIL: PROT_NONE read: the handler ran (not a default death)` ×4 classes → `=== FAIL t-fault-sicode exit=1`. **No handler ran at all**, so not even a `si_code` claim was reached. Restored from `build/scratch/item284/good/` with `sha256sum -c` on all nine files; rebuilt; arm green again. |
+| **Gate** | `build/gate-item284.log` exit 0: stage 1 **1330** tests 0 failed (52.13 s); x86_64 `verdict pass=321 fail=0`; aarch64 `verdict pass=317 fail=0` (**one more than the previous green** — the newly-open pin); `mpos-kunit 41 passed, 0 failed` per arm; 19 of 336 user tests left out on each. fmt both workspaces, host lib **812** / xtask **162**, six-arm clippy ratchet `162/168/389/273/3/1` unchanged ("no lint has appeared and no count has grown"), bare metal both arches clean. |
+
+**A measurement worth repeating.** The pin's *host* leg runs on Linux for
+**both** instruction sets: `cargo build --release --target
+aarch64-unknown-linux-musl` works because nothing links with gcc
+(`.cargo/config.toml` pins `linker=rust-lld`, `+crt-static`), and
+`MPOS_ON_HOST=1 qemu-aarch64 …/t-fault-sicode` gives 9 ok + PASS. So the four
+claims are Linux's answers on x86_64 *and* on aarch64, which is what makes this
+item's table a measurement rather than one host's description.
+
+**What this does not do.** `t-fault-at-trap` and `t-trap-at-trap` stay in
+`[aarch64] gaps` — the first pins a register-preserving `#PF` entry and the
+second names seven x86_64 vectors, and what aarch64 now has is the *delivery*,
+not that entry (its stub already saved every register, §2.13, which is why
+`deliver_at_trap` could be laid over it). `fault_repeats` still does not exist on
+aarch64 and is one never-reset global on x86_64 (§6.164's gap 3).
+`si_addr_lsb`/`si_addr_bnd`/`si_pkey` stay zero; `signalfd_siginfo.ssi_addr`
+still is not written (`src/vfs/signalfd.rs` drops `SigInfo::addr`) and
+`PTRACE_GETSIGINFO` still synthesizes a stop's code with no `si_addr`. And the
+`#DE`/`#UD`/`#AC`/`#BP` classes were measured on x86_64 Linux only — aarch64's
+EL0 sync path produces `Page` and `InvalidOpcode` and the rest are unwitnessed
+there, recorded rather than glossed. Chromium is not unblocked (its `cc 0f 0b`
+is an intentional `__builtin_trap()`).
