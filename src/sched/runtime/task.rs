@@ -1065,16 +1065,83 @@ pub enum TimerClock {
     /// The owning thread group's own CPU time, in ticks, for
     /// `CLOCK_PROCESS_CPUTIME_ID`.
     Process,
+    /// **One thread's** own CPU time, in ticks, for
+    /// `CLOCK_THREAD_CPUTIME_ID` - and it is the **creating** thread's, not the
+    /// reader's, because the timer outlives its creator.
+    ///
+    /// Measured on Linux 7.3.4 (`build/scratch/thrcpu/t4.c`): a creator thread
+    /// that burned ~60 ms of CPU with a 30 ms repeating timer produced **1**
+    /// expiry, the process's own `RUSAGE_SELF` was irrelevant to it, and - the
+    /// decisive reading - 300 ms of *main-thread* CPU after `pthread_join`
+    /// produced **0** further expiries. So the clock counts that one thread and
+    /// **stops** when the thread does; it never silently starts counting
+    /// somebody else's CPU, which is the shape the old refusal existed to
+    /// avoid.
+    ///
+    /// The reading is carried with the timer rather than looked up by slot
+    /// because a slot is recycled: the creator's number would name a stranger
+    /// after its death, which is the class AGENTS.md §5 records for pids and
+    /// pidfds. `frozen` is the answer once the creator is gone.
+    Thread {
+        /// The creating thread's slot **and** the generation it had, so a
+        /// recycled slot cannot read as the original thread.
+        thread: TaskId,
+        generation: u64,
+        /// The creator's final CPU reading, latched when it exited. `None`
+        /// while it lives, which is when the live counter is read instead.
+        frozen: Option<u64>,
+    },
 }
 
 impl TimerClock {
-    /// The reading this clock has right now, in ticks. Both readings are in the
-    /// same unit, which is why the deadline arithmetic needs no conversion.
-    fn now(self, wall: u64, group_cpu: u64) -> u64 {
+    /// The reading this clock has right now, in ticks - or `None` when the
+    /// reading lives on a thread that has gone and has not been latched yet.
+    ///
+    /// All readings are in the same unit, which is why the deadline arithmetic
+    /// needs no conversion.
+    fn now(self, wall: u64, group_cpu: u64, thread_cpu: Option<u64>) -> u64 {
         match self {
             TimerClock::Wall => wall,
             TimerClock::Process => group_cpu,
+            // The rule is the `abi` leaf's (`thread_clock_reading`), so the host
+            // test that pins it pins the arithmetic this line uses. `None` -
+            // the thread is gone and nothing was latched, which the exit path
+            // makes unreachable - reads as 0 here only because `now` owes a
+            // number; the doors that can say "this clock is over" ask
+            // `thread_cpu.is_none()` themselves (`timer_arm`'s `ClockGone`).
+            TimerClock::Thread { frozen, .. } => {
+                mpos_abi::thread_clock_reading(thread_cpu, frozen).unwrap_or(0)
+            }
         }
+    }
+
+    /// The thread this clock counts, if it counts one.
+    fn thread(self) -> Option<(TaskId, u64)> {
+        match self {
+            TimerClock::Thread {
+                thread, generation, ..
+            } => Some((thread, generation)),
+            _ => None,
+        }
+    }
+
+    /// Latch the creator's final reading, if this clock counts `id`, answering
+    /// whether it did. A clock that was already latched does not match twice:
+    /// the first death is the one that stopped it.
+    fn latch(&mut self, id: TaskId, generation: u64, reading: u64) -> bool {
+        if let TimerClock::Thread {
+            thread,
+            generation: mine,
+            frozen,
+        } = self
+            && *thread == id
+            && *mine == generation
+            && frozen.is_none()
+        {
+            *frozen = Some(reading);
+            return true;
+        }
+        false
     }
 }
 
@@ -2378,6 +2445,27 @@ impl Table {
                 ));
             }
         }
+        // Every thread's live CPU, taken **before** the mutable walk below:
+        // a `CLOCK_THREAD_CPUTIME_ID` timer reads the counter of the thread
+        // that created it, and that task is usually not the one whose timer
+        // table is being walked, so the read needs its own borrow (`§6.168`).
+        // `targets` already copied what the scan needs about each task; this is
+        // the same discipline one field further.
+        let thread_cpus: alloc::vec::Vec<(TaskId, u64, u64)> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let task = slot.as_ref()?;
+                Some((
+                    TaskId(i),
+                    self.generations[i],
+                    task.cpu_user
+                        .load(Ordering::Relaxed)
+                        .saturating_add(task.cpu_system.load(Ordering::Relaxed)),
+                ))
+            })
+            .collect();
         // Step 2: walk the timers and decide what each expiry does.
         let mut deliver: alloc::vec::Vec<(TaskId, u8, signal::SigInfo)> = alloc::vec::Vec::new();
         let mut fresh: alloc::vec::Vec<(TaskId, u8)> = alloc::vec::Vec::new();
@@ -2413,7 +2501,20 @@ impl Table {
                 utime.saturating_add(stime)
             };
             for timer in task.timers.iter_mut().flatten() {
-                let now = timer.clock.now(wall_now, group_now);
+                // A `CLOCK_THREAD_CPUTIME_ID` timer reads its own thread's
+                // counter, which is not the group's: measured, a creator's CPU
+                // fires it and the main thread's does not (`§6.168`). The
+                // lookup is by slot **and generation**, because a recycled slot
+                // names a stranger.
+                let thread_now = timer.clock.thread().and_then(|(id, generation)| {
+                    thread_cpus
+                        .iter()
+                        .find(|(slot, generation_of, _)| {
+                            *slot == id && *generation_of == generation
+                        })
+                        .map(|(_, _, cpu)| *cpu)
+                });
+                let now = timer.clock.now(wall_now, group_now, thread_now);
                 if !timer.expired(now) {
                     if timer.deadline.is_some() {
                         any_armed = true;
@@ -3145,6 +3246,18 @@ impl Table {
 }
 pub fn current() -> TaskId {
     with_table(|t| t.current)
+}
+
+/// The running task's slot generation - the second half of "which task is
+/// this?", for anything that has to outlive the moment it was asked.
+///
+/// A slot is recycled the moment a task is collected, so a bare `TaskId` kept
+/// past a death names whoever took the slot next; `Task::cpu_user`'s own
+/// consumer is the case (`TimerClock::Thread`, `§6.168`), and the pair is the
+/// same one `pidfd_open` keeps (`docs/notes/` §6.8) and `AGENTS.md` §5 records
+/// for `setpriority`/`prlimit64`.
+pub fn current_generation() -> Option<u64> {
+    with_table(|t| t.generations.get(t.current.0).copied())
 }
 
 /// Whether the task has already run its exit path - a task this kernel will
@@ -3982,6 +4095,29 @@ pub fn timer_alloc(
     })
 }
 
+/// A named thread's own CPU reading in ticks, or `None` when that thread is
+/// gone or its slot has been handed to somebody else.
+///
+/// The generation is what makes this honest: a `CLOCK_THREAD_CPUTIME_ID` timer
+/// keeps the slot its creator had, and a slot outlives the thread in it, so
+/// without the check a timer whose creator died would read the next task's CPU -
+/// the same class of defect AGENTS.md §5 records for `setpriority`/`prlimit64`
+/// indexing a table with a raw number, and for a pidfd naming a recycled pid.
+fn self_task_cpu(t: &Table, id: TaskId, generation: u64) -> Option<u64> {
+    if t.generations.get(id.0).copied() != Some(generation) {
+        return None;
+    }
+    let task = t.tasks.get(id.0).and_then(|slot| slot.as_ref())?;
+    if task.exited {
+        return None;
+    }
+    Some(
+        task.cpu_user
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(task.cpu_system.load(core::sync::atomic::Ordering::Relaxed)),
+    )
+}
+
 /// The slot holding the running task's timer numbered `id`, or `None` when the
 /// number names no live timer of this group.
 ///
@@ -4006,6 +4142,24 @@ fn task_ok_for_timer(t: &Table, target: TaskId) -> Option<TaskId> {
         .map(|task| task.tgid)
 }
 
+/// What `timer_arm` answers: the state it replaced, or the reason it could not.
+pub enum TimerArm {
+    /// The timer was armed (or disarmed); these are the ticks it held before.
+    Armed(u64, u64),
+    /// No timer of this task's has that id - `EINVAL`.
+    NoSuchTimer,
+    /// The timer exists, but the thread its clock counts has exited, so it
+    /// cannot be armed again - Linux's **`ESRCH`**.
+    ///
+    /// Measured on 7.3.4 (`build/scratch/thrcpu/disarm.c`): after the creating
+    /// thread of a `CLOCK_THREAD_CPUTIME_ID` timer exits, `timer_gettime`
+    /// still answers 0/0 (so the timer was *disarmed*, not deleted),
+    /// `timer_getoverrun` answers 0, `timer_delete` answers 0 - and
+    /// `timer_settime` answers `ESRCH` (3). The clock has no reading left to
+    /// arm a deadline against, and `ESRCH` is Linux's word for exactly that.
+    ClockGone,
+}
+
 /// Arm or disarm the running task's timer `slot`, reporting the state it
 /// replaced as `(interval, remaining)` ticks - the pair `timer_settime`'s
 /// `old_value` wants. `None` is an id that names no timer of this task's.
@@ -4016,23 +4170,40 @@ fn task_ok_for_timer(t: &Table, target: TaskId) -> Option<TaskId> {
 /// reading are in hand - a caller converting a timespec into a tick-counter
 /// value would arm a CPU-time timer against machine uptime, which is the defect
 /// this signature exists to make unspellable (`§6.123`).
-pub fn timer_arm(id: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u64, u64)> {
+pub fn timer_arm(id: usize, interval_ticks: u64, value_ticks: u64) -> TimerArm {
     if value_ticks != 0 {
         POSIX_TIMERS_ARMED.store(true, Ordering::Relaxed);
     }
     with_table(|t| {
-        let slot = timer_slot(t, id)?;
+        let Some(slot) = timer_slot(t, id) else {
+            return TimerArm::NoSuchTimer;
+        };
         let leader = t.task(t.current).tgid;
+        // The clock's own reading first, while the borrow is shared: a
+        // `CLOCK_THREAD_CPUTIME_ID` timer reads a thread that is usually not
+        // the one whose table this is (`§6.168`).
+        let clock = match t.task(leader).timers.get(slot).and_then(Option::as_ref) {
+            Some(timer) => timer.clock,
+            None => return TimerArm::NoSuchTimer,
+        };
+        let thread_now = match clock.thread() {
+            Some((thread, generation)) => self_task_cpu(t, thread, generation),
+            None => None,
+        };
+        // A thread clock whose thread has gone cannot be armed again: Linux
+        // answers `ESRCH`, measured (`build/scratch/thrcpu/disarm.c`).
+        if clock.thread().is_some() && thread_now.is_none() {
+            return TimerArm::ClockGone;
+        }
         let task = t.task_mut(leader);
         let group_now = {
             let (utime, stime, _, _) = task.mm.cpu_all();
             utime.saturating_add(stime)
         };
-        let now = {
-            let clock = task.timers.get(slot)?.as_ref()?.clock;
-            clock.now(hal::ticks(), group_now)
+        let now = clock.now(hal::ticks(), group_now, thread_now);
+        let Some(timer) = task.timers.get_mut(slot).and_then(Option::as_mut) else {
+            return TimerArm::NoSuchTimer;
         };
-        let timer = task.timers.get_mut(slot)?.as_mut()?;
         let old = (
             timer.interval_ticks,
             timer.deadline.map_or(0, |d| d.saturating_sub(now)),
@@ -4046,8 +4217,63 @@ pub fn timer_arm(id: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u6
         // `it_overrun_last = 0` in `do_timer_settime`, which is the same place
         // this assignment sits - the table's own arm/disarm door.
         timer.last_overrun = 0;
-        Some(old)
+        TimerArm::Armed(old.0, old.1)
     })
+}
+
+/// Latch every timer whose `CLOCK_THREAD_CPUTIME_ID` clock counts `id`, so a
+/// thread that has exited leaves its timers a reading they can keep.
+///
+/// Called **before** the exiting task is marked gone, from the one place that
+/// knows a thread's CPU has stopped moving. A timer's clock would otherwise read
+/// a dead thread as "no reading" - and worse, once the slot were reused it would
+/// read the newcomer's CPU, which is the shape `self_task_cpu`'s generation check
+/// refuses and this call makes unnecessary for the ordinary case.
+///
+/// Linux's own answer is that a `CLOCK_THREAD_CPUTIME_ID` timer's clock freezes
+/// when its thread exits, measured on 7.3.4 (`build/scratch/thrcpu/t4.c`: 300 ms
+/// of main-thread CPU produced 0 further expiries), and `timer_gettime` reads
+/// `0.000000000` on the frozen clock (`t3.c`). Latched, a timer armed 10 s on a
+/// dead thread therefore stays armed and silent rather than firing on a
+/// stranger's CPU.
+pub fn latch_thread_clocks(t: &mut Table, id: TaskId) {
+    let generation = match t.generations.get(id.0) {
+        Some(generation) => *generation,
+        None => return,
+    };
+    let reading = match t.tasks.get(id.0).and_then(|slot| slot.as_ref()) {
+        Some(task) => task
+            .cpu_user
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(task.cpu_system.load(core::sync::atomic::Ordering::Relaxed)),
+        None => return,
+    };
+    let leader = match t.tasks.get(id.0).and_then(|slot| slot.as_ref()) {
+        Some(task) => task.tgid,
+        None => return,
+    };
+    // The timer table is the thread **group's** (`§2.11`): a worker may create
+    // a timer that outlives it, so the group's table is what to walk.
+    //
+    // What Linux does to such a timer when its clock dies is **disarm** it, and
+    // that is measured rather than read: after `pthread_join`, `timer_gettime`
+    // succeeds with `value = interval = 0`, `timer_getoverrun` is 0,
+    // `timer_settime` answers **`ESRCH`**, and `timer_delete` still answers 0
+    // (`build/scratch/thrcpu/disarm.c` on 7.3.4). So the timer keeps existing
+    // and stops counting - not a frozen reading, which is what the note this
+    // replaces had assumed, and not a deletion, which would make `delete`
+    // answer `EINVAL`. Disarming is also the shape that cannot lie: a deadline
+    // on a clock nobody can advance has no honest remaining value.
+    if let Some(task) = t.tasks.get_mut(leader.0).and_then(Option::as_mut) {
+        for timer in task.timers.iter_mut().flatten() {
+            if timer.clock.latch(id, generation, reading) {
+                timer.deadline = None;
+                timer.interval_ticks = 0;
+                timer.overrun = 0;
+                timer.last_overrun = 0;
+            }
+        }
+    }
 }
 
 /// Read a timer's `(interval, remaining)` in ticks, for `timer_gettime`.
@@ -4057,9 +4283,17 @@ pub fn timer_state(id: usize) -> Option<(u64, u64)> {
     with_table(|t| {
         let slot = timer_slot(t, id)?;
         let leader = t.task(t.current).tgid;
-        let timer = t.task(leader).timers.get(slot)?.as_ref()?;
+        // Both readings are `&self` reads of the table, so they are taken
+        // before the timer is borrowed out of it (`§6.168`).
         let (utime, stime, _, _) = t.task(leader).mm.cpu_all();
-        let now = timer.clock.now(hal::ticks(), utime.saturating_add(stime));
+        let timer = t.task(leader).timers.get(slot)?.as_ref()?;
+        let thread_now = timer
+            .clock
+            .thread()
+            .and_then(|(id, generation)| self_task_cpu(t, id, generation));
+        let now = timer
+            .clock
+            .now(hal::ticks(), utime.saturating_add(stime), thread_now);
         Some((
             timer.interval_ticks,
             timer.deadline.map_or(0, |d| d.saturating_sub(now)),

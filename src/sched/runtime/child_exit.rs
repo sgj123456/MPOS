@@ -278,6 +278,11 @@ pub fn exit(code: isize) -> ! {
             crate::println!("INIT_EXITED: the system has no init left");
             crate::hal::halt();
         }
+        // A `CLOCK_THREAD_CPUTIME_ID` timer counts *this* thread's CPU and has
+        // to stop when the thread does; latch the reading before the task is
+        // marked gone, while its counters are still the thread's own (`§6.168`,
+        // measured: 300 ms of main-thread CPU moves such a timer 0 times).
+        crate::sched::runtime::task::latch_thread_clocks(t, id);
         t.task_mut(id).exited = true;
 
         // Whether this is the **process's** death or only a thread's. Linux's

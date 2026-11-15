@@ -4734,6 +4734,7 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     const CLOCK_REALTIME: usize = 0;
     const CLOCK_MONOTONIC: usize = 1;
     const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_THREAD_CPUTIME_ID: usize = 3;
     const CLOCK_MONOTONIC_RAW: usize = 4;
     const CLOCK_REALTIME_COARSE: usize = 5;
     const CLOCK_MONOTONIC_COARSE: usize = 6;
@@ -4795,8 +4796,19 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     let clock = match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => TimerClock::Wall,
         CLOCK_PROCESS_CPUTIME_ID => TimerClock::Process,
-        3 /* CLOCK_THREAD_CPUTIME_ID */
-        | CLOCK_MONOTONIC_RAW
+        // `CLOCK_THREAD_CPUTIME_ID` counts the **creating thread's** CPU and
+        // stops when that thread exits - measured on Linux 7.3.4, so the clock
+        // is named by the caller's slot and its generation rather than by a
+        // reading taken now (`build/scratch/thrcpu/{t2,t3,t4}.c`, `§6.168`).
+        CLOCK_THREAD_CPUTIME_ID => TimerClock::Thread {
+            thread: crate::sched::current(),
+            generation: match crate::sched::current_generation() {
+                Some(generation) => generation,
+                None => return err::EINVAL,
+            },
+            frozen: None,
+        },
+        CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
         | CLOCK_MONOTONIC_COARSE
         | 8 /* CLOCK_REALTIME_ALARM */
@@ -4937,11 +4949,17 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
     // existed. The id is judged here (a bad id answers `EINVAL`) and the timer
     // is armed here — before `old_value` is looked at, which is where Linux
     // puts the copy-out (`oldarm.c`).
-    let Some((old_interval, old_remaining)) =
-        crate::sched::timer_arm(id, interval_ticks, value_ticks)
-    else {
-        return err::EINVAL;
-    };
+    // Three answers now, because the clock can outlive nothing: a bad id is
+    // `EINVAL`, and a thread-clock timer whose thread has exited is `ESRCH` -
+    // the timer still exists (a following `timer_delete` answers 0) but has no
+    // reading left to arm a deadline against, which is exactly Linux's word for
+    // it (`build/scratch/thrcpu/disarm.c`, `§6.168`).
+    let (old_interval, old_remaining) =
+        match crate::sched::timer_arm(id, interval_ticks, value_ticks) {
+            crate::sched::TimerArm::Armed(interval, remaining) => (interval, remaining),
+            crate::sched::TimerArm::NoSuchTimer => return err::EINVAL,
+            crate::sched::TimerArm::ClockGone => return err::ESRCH,
+        };
     if old_ptr != 0 {
         if !buffer_ok(old_ptr, ITIMERSPEC_SIZE, true, from_user) {
             return err::EFAULT;

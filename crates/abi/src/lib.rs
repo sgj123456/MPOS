@@ -685,6 +685,40 @@ pub fn exit_chld(code: isize, dumped: bool) -> (i32, i32) {
 /// (`src/sched/runtime/child_exit.rs`) need the same word; a second copy in
 /// `vfs` would have been an upward edge into `syscall`, and two copies is how
 /// one door starts disagreeing with the other.
+/// What a `CLOCK_THREAD_CPUTIME_ID` timer's clock reads, from the three facts
+/// that decide it: the creating thread's **live** counter, its final counter
+/// latched when it exited, and whether it is still alive at all.
+///
+/// A pure function because the rule is arithmetic and policy, not a table
+/// lookup, and because the case that matters cannot be reached on a machine in
+/// a unit test: the creating thread has to die. Measured on Linux 7.3.4
+/// (`build/scratch/thrcpu/{t3,t4,disarm}.c`, `docs/notes/` §6.168):
+///
+/// * while the thread lives the clock is its own CPU counter - a creator that
+///   burned ~60 ms fired a 30 ms timer once, and the process's own `RUSAGE_SELF`
+///   was irrelevant to it;
+/// * once it exits the clock **stops**: 300 ms of another thread's CPU produced
+///   **0** further expiries, so it never starts counting somebody else's;
+/// * and the timer is **disarmed** rather than deleted - `timer_gettime`
+///   answers 0/0, `timer_delete` still succeeds, and `timer_settime` is
+///   `ESRCH` because there is no reading left to build a deadline against.
+///
+/// `live` is `None` when the thread is gone (or its slot has been recycled,
+/// which must read as gone); `latched` is the final counter, present once the
+/// exit path has recorded it. A thread that is gone with nothing latched cannot
+/// answer, and `None` is what the caller turns into "this clock is over" -
+/// never a zero that a deadline could silently satisfy.
+pub fn thread_clock_reading(live: Option<u64>, latched: Option<u64>) -> Option<u64> {
+    match (live, latched) {
+        // A latched reading is final: the thread is gone, and its counter can
+        // never move again. It wins over a `live` slot because a recycled slot
+        // would otherwise report a stranger's CPU as this clock's.
+        (_, Some(final_reading)) => Some(final_reading),
+        (Some(counter), None) => Some(counter),
+        (None, None) => None,
+    }
+}
+
 pub fn wait_status(code: isize, dumped: bool) -> i32 {
     if code < 0 {
         let sig = -code as i32;
@@ -1441,5 +1475,33 @@ mod tests {
             clock_ticks_to_user_hz(u64::MAX, 250),
             (u64::MAX as u128 * 100 / 250) as u64
         );
+    }
+
+    /// The thread clock's reading: live while the thread lives, final once it
+    /// has exited, and **absent** - not zero - when it is gone with nothing
+    /// latched.
+    ///
+    /// The absent case is the one that matters. A zero would be a reading a
+    /// deadline can satisfy, so a timer whose clock has ended would fire; Linux
+    /// disarms such a timer instead (`build/scratch/thrcpu/disarm.c`: value and
+    /// interval both 0, `timer_settime` answering `ESRCH`), and the caller needs
+    /// `None` to know that is what it is looking at.
+    #[test]
+    fn a_thread_clock_reads_live_then_final_then_nothing() {
+        // Alive: its own counter.
+        assert_eq!(thread_clock_reading(Some(1_234), None), Some(1_234));
+        // Gone, with the exit path's latch: the final counter, and no later
+        // value can displace it.
+        assert_eq!(thread_clock_reading(None, Some(9_000)), Some(9_000));
+        // A **recycled slot** must not report the newcomer: the latch wins over
+        // a live reading, because the live one belongs to a different thread.
+        assert_eq!(thread_clock_reading(Some(55), Some(9_000)), Some(9_000));
+        // Gone with nothing latched: no reading at all. Not `Some(0)`, which is
+        // the answer that would arm a deadline against a dead clock.
+        assert_eq!(thread_clock_reading(None, None), None);
+        // And zero is a legal *live* reading - a thread that has not run yet -
+        // which is why the two cases cannot share a representation.
+        assert_eq!(thread_clock_reading(Some(0), None), Some(0));
+        assert_ne!(thread_clock_reading(Some(0), None), None);
     }
 }
