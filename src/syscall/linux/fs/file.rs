@@ -3903,6 +3903,14 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         },
         F_SETFL => match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
+                // An `O_PATH` descriptor takes no `F_SETFL`: it does not open the
+                // file, so there is no status word to change. Measured raw on
+                // Linux 7.3.4 (`build/scratch/fcntl/t.c`): `F_GETFD`, `F_GETFL`,
+                // `F_SETFD` and `F_DUPFD*` are **served** on one, and `F_SETFL`,
+                // the lock family and `F_GETOWN`/`F_SETOWN` all answer `EBADF`.
+                if file.is_path_only() {
+                    return err::EBADF;
+                }
                 // Linux's `setfl` guards the one edge that can *add* O_NOATIME:
                 // a fresh 0->1 set by a caller that is neither the file's owner
                 // nor holds CAP_FOWNER is EPERM, and the refusal stores none of
@@ -3947,7 +3955,16 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         // spinning, so a blocking caller never hangs. The `F_OFD_*` commands
         // are the same call with the open file description as the owner.
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
-            record_lock(fd, cmd, arg)
+            // One refusal covers all six, because they are one arm: an `O_PATH`
+            // descriptor takes no lock command at all - measured raw on Linux
+            // 7.3.4 (`build/scratch/fcntl/t.c`: `F_SETLK`/`F_GETLK`/
+            // `F_OFD_SETLK` on one are each `EBADF`). The check sits here rather
+            // than in `record_lock` so the door's own answer stays the table's.
+            match crate::sched::current_fds().clone_at(fd) {
+                Ok(file) if file.is_path_only() => err::EBADF,
+                Ok(_) => record_lock(fd, cmd, arg),
+                Err(e) => err_of(e),
+            }
         }
         // memfd sealing: only a memfd has a seal state, and only under
         // `MFD_ALLOW_SEALING` can it be added to. The commands are the
