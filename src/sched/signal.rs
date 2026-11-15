@@ -652,6 +652,28 @@ pub struct SigInfo {
     /// (1) share a code: `(signo, code)` alone cannot tell the two layouts
     /// apart, but the signal's origin can.
     pub fault: bool,
+    /// `si_timerid`: the `timer_create` handle a `SI_TIMER` expiry came from,
+    /// which is the `_timer` union member's first word - **at wire offset 16,
+    /// where a sender's `si_pid` sits**, so a renderer chooses between them by
+    /// the record's class rather than writing both.
+    ///
+    /// Measured on Linux 7.3.4 with two timers created so the handle cannot
+    /// be confused with "never written": the second timer's records read
+    /// `si_timerid` 1 through a handler's `siginfo_t` (`[4]=1` on the raw
+    /// words) and `ssi_tid` 1 through a `signalfd` read, while the first
+    /// timer's read 0 (`build/scratch/sfdhost/{h2,dump,all}.c`). Zero for
+    /// every other sender, whose record has no such member.
+    pub tid: i32,
+    /// `si_overrun`: how many expiries of that timer found the previous signal
+    /// still pending - the count `timer_getoverrun` reports, at the `_timer`
+    /// member's second word (wire offset 20).
+    ///
+    /// The number is the timer's own counter at the moment the record is
+    /// handed over, so a caller that reads the record and then asks
+    /// `timer_getoverrun` gets the same answer (measured: a 20 ms repeating
+    /// timer left 200 ms reads record `overrun` 9 and `timer_getoverrun` 9;
+    /// `build/scratch/sfdhost/{life2,last}.c`). Zero for every other sender.
+    pub overrun: i32,
 }
 
 impl SigInfo {
@@ -668,6 +690,8 @@ impl SigInfo {
         stime: 0,
         addr: 0,
         fault: false,
+        tid: 0,
+        overrun: 0,
     };
 
     /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
@@ -684,6 +708,8 @@ impl SigInfo {
             stime: 0,
             addr: 0,
             fault: false,
+            tid: 0,
+            overrun: 0,
         }
     }
 
@@ -701,6 +727,8 @@ impl SigInfo {
             stime: 0,
             addr: 0,
             fault: false,
+            tid: 0,
+            overrun: 0,
         }
     }
 
@@ -725,6 +753,8 @@ impl SigInfo {
             stime: 0,
             addr: 0,
             fault: false,
+            tid: 0,
+            overrun: 0,
         }
     }
 
@@ -742,23 +772,45 @@ impl SigInfo {
             stime: 0,
             addr: 0,
             fault: false,
+            tid: 0,
+            overrun: 0,
         }
     }
 
-    /// A record for a `setitimer`/timerfd expiry: `SI_TIMER`, no payload.
-    pub fn timer(sig: u8) -> SigInfo {
+    /// A record for a **`timer_create` expiry**: `SI_TIMER`, carrying the
+    /// timer's handle and its overrun count.
+    ///
+    /// Both of those are the `_timer` union member, and Linux fills them for
+    /// this class and no other: measured on Linux 7.3.4, a repeating timer
+    /// whose handle was 1 delivered a record reading `si_code` -2,
+    /// `si_timerid` 1 and `si_overrun` equal to the number of expiries that
+    /// arrived while the previous signal was still unread
+    /// (`build/scratch/sfdhost/{h2,all,life2}.c`). The two slots are the ones a
+    /// `_rt` sender spends on the sender's pid and uid - wire offsets 16 and
+    /// 20 - so the class decides which pair a renderer writes, and this record
+    /// is the only one with these two.
+    ///
+    /// A `setitimer` expiry is **not** this record: it has no handle, and
+    /// Linux's measured `si_code` for it is `SI_KERNEL` rather than
+    /// `SI_TIMER` (`build/scratch/sfdhost/it2.c`: an `ITIMER_REAL` expiry
+    /// arrives with code 128, `si_timerid` 0, `si_overrun` 0). It uses
+    /// [`SigInfo::kernel`], which is why that constructor exists beside this
+    /// one.
+    pub fn timer(sig: u8, tid: u32, overrun: u32, value: u64) -> SigInfo {
         SigInfo {
             signo: sig as i32,
             errno: 0,
             code: SI_TIMER,
             pid: 0,
             uid: 0,
-            value: 0,
+            value,
             status: 0,
             utime: 0,
             stime: 0,
             addr: 0,
             fault: false,
+            tid: tid as i32,
+            overrun: overrun as i32,
         }
     }
 
@@ -823,6 +875,8 @@ impl SigInfo {
             stime,
             addr: 0,
             fault: false,
+            tid: 0,
+            overrun: 0,
         }
     }
 
@@ -850,6 +904,8 @@ impl SigInfo {
             stime: 0,
             addr: addr as u64,
             fault: true,
+            tid: 0,
+            overrun: 0,
         }
     }
 }
@@ -1000,6 +1056,33 @@ impl RtQueue {
         self.q[self.len] = info;
         self.len += 1;
         true
+    }
+
+    /// Raise the `si_overrun` of the queued record for `sig`, in place, and
+    /// answer whether one was found.
+    ///
+    /// This is how a POSIX timer's miss count reaches a **real-time** signal's
+    /// record, which is not stored in the task's per-signal slot but here. A
+    /// real-time expiry that finds its own previous copy unread does not queue
+    /// a second copy (Linux's `send_sigqueue` bumps the count of the one
+    /// sitting in the queue), so the counter has to be mutable on the record
+    /// itself; measured identical for both classes on 7.3.4
+    /// (`build/scratch/sfdhost/life2.c`).
+    ///
+    /// The oldest record for `sig` is the one raised longest ago and therefore
+    /// the one an expiry has been waiting behind, which is why it is the one
+    /// bumped - the same record [`pop`](Self::pop) will hand over.
+    pub fn bump_overrun(&mut self, sig: u8, overrun: i32) -> bool {
+        match self.q[..self.len]
+            .iter_mut()
+            .find(|e| e.signo == sig as i32)
+        {
+            Some(entry) => {
+                entry.overrun = overrun;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remove and return the oldest queued record for `sig`, preserving the
@@ -1402,7 +1485,50 @@ mod tests {
         assert_eq!(q.signo, SIGTERM as i32);
         assert_eq!(SigInfo::user(SIGTERM, 7, 0).code, SI_USER);
         assert_eq!(SigInfo::user(SIGTERM, 7, 0).value, 0);
-        assert_eq!(SigInfo::timer(SIGALRM).code, SI_TIMER);
+        let t = SigInfo::timer(SIGALRM, 3, 7, 0x4242);
+        assert_eq!(t.code, SI_TIMER);
+        assert_eq!(t.signo, SIGALRM as i32);
+        // The `_timer` member is all three facts, and Linux fills every one of
+        // them on the same record: the handle `timer_create` answered, the
+        // count of expiries that found the previous signal unread, and the
+        // caller's payload (`docs/notes/` §6.166, measurement
+        // `build/scratch/sfdhost/dump.c`).
+        assert_eq!(t.tid, 3, "si_timerid is the timer_create handle");
+        assert_eq!(
+            t.overrun, 7,
+            "si_overrun is the count timer_getoverrun reports"
+        );
+        assert_eq!(t.value, 0x4242, "the sigval rides on the same record");
+    }
+
+    /// A `setitimer` expiry is **not** a `SI_TIMER` record: it has no
+    /// `timer_create` handle and no overrun counter, and Linux answers
+    /// `SI_KERNEL` with both `_timer` words zero for `ITIMER_REAL`
+    /// (`build/scratch/sfdhost/itimer.c` on 7.3.4). This kernel queued it as
+    /// `SI_TIMER` until item 286, which told a caller it had a handle it never
+    /// had.
+    #[test]
+    fn a_setitimer_expiry_is_not_a_si_timer_record() {
+        let alarm = SigInfo::kernel(SIGALRM);
+        assert_eq!(alarm.code, SI_KERNEL);
+        assert_eq!(alarm.tid, 0);
+        assert_eq!(alarm.overrun, 0);
+        // And the class the timer door builds keeps them apart.
+        assert_ne!(alarm.code, SigInfo::timer(SIGALRM, 1, 0, 0).code);
+    }
+
+    /// A `sigqueue` payload is read through two views by the two doors that
+    /// hand it out: `siginfo_t`'s `sigval` eight bytes at wire 24, and
+    /// `signalfd_siginfo`'s flat `ssi_int` word beside them. Both come from
+    /// `value`, so a payload of `0xdeadbeef` reads back as the same bits
+    /// either way - which is what `src/vfs/signalfd.rs`'s `SSI_INT` write
+    /// asserts at the wire level.
+    #[test]
+    fn a_queue_payload_is_one_value_seen_by_two_doors() {
+        let q = SigInfo::queue(SIGRTMIN, 7, 0, 0xdead_beef);
+        assert_eq!(q.value, 0xdead_beef);
+        assert_eq!(q.value as u32 as i32, -559_038_737);
+        assert_eq!(q.value as u32, 0xdead_beef);
     }
 
     #[test]
@@ -1479,5 +1605,38 @@ mod tests {
     fn rt_queue_starts_empty() {
         assert!(RtQueue::new().empty());
         assert!(!RtQueue::new().holds(SIGRTMIN));
+    }
+
+    /// A real-time timer's record is where its overrun count lives, and it is
+    /// reachable **in place**: an expiry that finds the previous record unread
+    /// bumps that record's `si_overrun` rather than queueing a second copy.
+    ///
+    /// This is the half a `SIGRTMIN`-armed timer needs and the half a first
+    /// version of the timer scan skipped, because the standard-signal path
+    /// stores its record in a per-signal slot and the real-time one stores it
+    /// here. Both classes answer identically on Linux 7.3.4
+    /// (`build/scratch/sfdhost/life2.c`: `si_overrun` 9 then 2 for `SIGALRM`
+    /// and for `SIGRTMIN+3`, one record available at a time). Without this
+    /// method the queue could only be appended to and popped from, so a
+    /// `SIGEV_THREAD` timer - musl's shape for a POSIX callback timer - handed
+    /// its reader a count frozen at 0.
+    #[test]
+    fn a_queued_records_overrun_is_raised_in_place() {
+        let mut q = RtQueue::new();
+        q.push(SigInfo::timer(SIGRTMIN + 3, 7, 0, 0x4242));
+        // A second signal's record sits behind it and must not be touched: the
+        // oldest record for a number is the one an expiry waits behind.
+        q.push(SigInfo::queue(SIGRTMIN + 4, 1, 0, 0x99));
+
+        assert!(q.bump_overrun(SIGRTMIN + 3, 9));
+        assert_eq!(q.queued(), 2, "bumping adds no record");
+        let first = q.pop(SIGRTMIN + 3).expect("the bumped record");
+        assert_eq!(first.overrun, 9, "the count moved in place");
+        assert_eq!(first.tid, 7, "and it is still the timer's record");
+        assert_eq!(first.value, 0x4242, "with the payload it was queued with");
+        assert_eq!(q.pop(SIGRTMIN + 4).map(|r| r.value), Some(0x99));
+
+        // A number with nothing queued says so rather than inventing a record.
+        assert!(!q.bump_overrun(SIGRTMIN + 3, 4));
     }
 }

@@ -2441,6 +2441,28 @@ pub fn take_deliverable_signal() -> Option<u8> {
     })
 }
 
+/// Note that a `timer_create` expiry's record has just been handed to its
+/// reader, which is the moment Linux's `it_overrun_last` moves: a delivered
+/// record's count becomes what `timer_getoverrun` answers, and the live
+/// accumulator starts again from zero for the next record.
+///
+/// Measured on 7.3.4 (`build/scratch/sfdhost/life2.c`): a record delivered
+/// with `si_overrun` 9 leaves `timer_getoverrun` answering 9, three further
+/// unread expiries leave it at 9 (it does not track the accumulation), and the
+/// next record delivers 2 - which is what "reset the accumulator on delivery"
+/// produces.
+///
+/// A record whose number names no live timer - a deleted timer's - is left
+/// alone, and so is every class but `SI_TIMER`, whose `si_overrun` slot means
+/// something else or nothing at all. The counters live on `PosixTimer`, so the
+/// write itself is `Task::note_timer_delivered`.
+fn note_timer_record_delivered(task: &mut Task, sig: u8, info: &crate::sched::signal::SigInfo) {
+    if info.code != crate::sched::signal::SI_TIMER {
+        return;
+    }
+    task.note_timer_delivered(sig, info.tid as u32, info.overrun.max(0) as u32);
+}
+
 /// As [`take_deliverable_signal`], but also handing back the `siginfo_t` the
 /// sender attached, so the delivery path can build a handler's frame with the
 /// real record - `si_code`, `si_pid`, the `sigqueue` payload - rather than a
@@ -2471,6 +2493,7 @@ pub fn take_deliverable_siginfo() -> Option<(u8, crate::sched::signal::SigInfo)>
             if !task.rtq.holds(sig) {
                 task.signals &= !crate::sched::signal::bit(sig);
             }
+            note_timer_record_delivered(task, sig, &info);
             return Some((sig, info));
         }
         None
@@ -2514,6 +2537,7 @@ pub fn take_signal_in_set(
                 if !task.rtq.holds(sig) {
                     task.signals &= !crate::sched::signal::bit(sig);
                 }
+                note_timer_record_delivered(task, sig, &record);
                 Some((sig, record))
             }
             None => None,

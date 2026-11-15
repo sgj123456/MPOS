@@ -147,6 +147,8 @@ fn a_sender_siginfo_keeps_its_pid_and_uid_at_sixteen(
         stime: 0,
         addr: 0,
         fault: false,
+        tid: 0,
+        overrun: 0,
     };
     let w = info.to_wire();
     let i32_at = |at: usize| i32::from_le_bytes(w[at..at + 4].try_into().unwrap());
@@ -186,6 +188,8 @@ fn a_fault_siginfo_puts_the_address_at_sixteen(
         stime: 7,
         addr: 0x10,
         fault: true,
+        tid: 0,
+        overrun: 0,
     };
     let w = info.to_wire();
     let i32_at = |at: usize| i32::from_le_bytes(w[at..at + 4].try_into().unwrap());
@@ -225,6 +229,8 @@ fn a_child_siginfo_keeps_its_status_and_cpu_time(
         stime: 3,
         addr: 0,
         fault: false,
+        tid: 0,
+        overrun: 0,
     };
     let w = info.to_wire();
     let i32_at = |at: usize| i32::from_le_bytes(w[at..at + 4].try_into().unwrap());

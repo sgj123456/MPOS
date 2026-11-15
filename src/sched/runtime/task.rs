@@ -965,11 +965,28 @@ pub struct PosixTimer {
     /// simplification this table owns, and it is spelled out on
     /// `handle_timer_create`, where its one real consumer cannot see it.
     notify: TimerNotify,
-    /// Expiries that found the previous signal still pending — the overrun
-    /// count `timer_getoverrun` reports. Standard signals are not queued, so
-    /// an expiry that arrives while the last one is unread has nowhere to go
-    /// but this counter, which is exactly what the count means.
+    /// Expiries that found the previous signal still pending — the live count
+    /// the *record* carries as `si_overrun`/`ssi_overrun`.
+    ///
+    /// It is not the number `timer_getoverrun` answers, which is
+    /// [`last_overrun`](Self::last_overrun): Linux keeps two counters and this
+    /// struct needs both. Measured on 7.3.4 (`build/scratch/sfdhost/last.c`):
+    /// a 20 ms timer left unread for 400 ms delivered a record carrying
+    /// `si_overrun` 19 while `timer_getoverrun` answered **0** at every one of
+    /// four asks taken along the way, and answered 19 only *after* the record
+    /// was read. So this field moves with every expiry that finds the record
+    /// unread, and `last_overrun` moves only when a record is handed over.
     overrun: u32,
+    /// `it_overrun_last`: the count the last **delivered** record carried,
+    /// which is what `timer_getoverrun` answers. Zero while a record is still
+    /// pending and zero again after an arm or a disarm, because Linux resets
+    /// it there (`build/scratch/sfdhost/{life2,rearm,first}.c`).
+    ///
+    /// The split matters more than it looks: a caller that armed a timer and
+    /// asks `timer_getoverrun` before reading its first record must be told
+    /// 0, not "every expiry since the timer was armed" - and the record it has
+    /// not read yet is the door that carries that number.
+    last_overrun: u32,
     /// The clock the deadline is measured on (`TimerClock`). A wall timer's
     /// `deadline` is a tick-counter value; a CPU-time timer's is a group CPU
     /// reading, and the two never mix.
@@ -1782,6 +1799,34 @@ pub struct Stop {
 }
 
 impl Task {
+    /// Record that a delivered record was a `timer_create` expiry's, carrying
+    /// the count `si_overrun` reported: that count becomes what
+    /// `timer_getoverrun` answers ([`PosixTimer::last_overrun`]), and the live
+    /// accumulator starts again from zero.
+    ///
+    /// Measured on 7.3.4 (`build/scratch/sfdhost/life2.c`): a record delivered
+    /// with `si_overrun` 9 leaves `timer_getoverrun` answering 9, three further
+    /// unread expiries leave it at 9 (it does not track the accumulation), and
+    /// after that record is read the next one delivers 2. So the number this
+    /// door answers is the last *delivered* count, not the pending one - which
+    /// is the difference between "how many did I miss before the last signal I
+    /// got" and "how many have piled up since".
+    ///
+    /// A record whose handle names no live timer of this task's is left alone:
+    /// a timer can be deleted while one of its records is still queued, which
+    /// this kernel keeps (a named divergence, `docs/notes/` §6.166).
+    pub(crate) fn note_timer_delivered(&mut self, sig: u8, handle: u32, overrun: u32) {
+        if let Some(timer) = self
+            .timers
+            .iter_mut()
+            .flatten()
+            .find(|timer| timer.id == handle && timer.signo == sig)
+        {
+            timer.last_overrun = overrun;
+            timer.overrun = 0;
+        }
+    }
+
     /// The boot task: already running, with no body left to start and no stack
     /// of ours beneath it. Its context is empty until it first switches away.
     pub(crate) fn adopted() -> Task {
@@ -2258,10 +2303,18 @@ impl Table {
                 continue;
             }
             let interval = state.interval_ticks;
+            // An `ITIMER_REAL` expiry is `SI_KERNEL`, not `SI_TIMER`: it has
+            // no `timer_create` handle and no overrun counter, so the two
+            // `_timer` words a handler reads are zero, and Linux's own record
+            // for this class says so - measured on 7.2.14, an `ITIMER_REAL`
+            // expiry arrived at a handler with `si_code` 128 and both words 0,
+            // while a `timer_create` expiry of the same signal arrived with
+            // `si_code` -2 and its handle (`build/scratch/sfdhost/it2.c`
+            // against `h2.c`).
             queue_signal(
                 task,
                 signal::SIGALRM,
-                signal::SigInfo::timer(signal::SIGALRM),
+                signal::SigInfo::kernel(signal::SIGALRM),
             );
             self.sched.wake(TaskId(i));
             match task.itimers[ITIMER_REAL].as_mut() {
@@ -2328,6 +2381,14 @@ impl Table {
         // Step 2: walk the timers and decide what each expiry does.
         let mut deliver: alloc::vec::Vec<(TaskId, u8, signal::SigInfo)> = alloc::vec::Vec::new();
         let mut fresh: alloc::vec::Vec<(TaskId, u8)> = alloc::vec::Vec::new();
+        // Expiries that found their own signal still pending: the record
+        // waiting on the target now has a larger overrun than the one it was
+        // queued with, and Linux's reader sees the *current* count rather than
+        // the count at queueing time - measured on 7.2.14, five expiries of a
+        // 50 ms timer left one record reading `si_overrun` near the count (`life2.c`). The
+        // target can be a task other than the timer's owner, so the write is
+        // collected here and applied in step 3 with the deliveries.
+        let mut bump: alloc::vec::Vec<(TaskId, u8, i32)> = alloc::vec::Vec::new();
         let mut any_armed = false;
         for (i, slot) in self.tasks.iter_mut().enumerate() {
             let Some(task) = slot.as_mut() else {
@@ -2425,6 +2486,15 @@ impl Table {
                 // A standard signal is not queued, so an expiry that finds
                 // its own last signal unread has nowhere to go but the
                 // overrun count - Linux's own semantics for this class.
+                //
+                // Both signal classes do this. The count is the *record's*, and
+                // a real-time signal's record lives in `rtq` rather than in
+                // `siginfo`, so the two paths differ only in where the bump
+                // lands - not in whether there is one. Measured on 7.3.4 with
+                // `SIGALRM` and `SIGRTMIN+3` side by side: identical records,
+                // identical counts (`build/scratch/sfdhost/life2.c`). The
+                // real-time half matters because `SIGRTMIN` is exactly the
+                // signal musl's `SIGEV_THREAD` helper arms its timer with.
                 let pending_there = targets
                     .iter()
                     .find(|(id, _, _, _, _)| *id == target_id)
@@ -2432,10 +2502,30 @@ impl Table {
                     || fresh.contains(&(target_id, timer.signo));
                 if pending_there {
                     timer.overrun += 1;
+                    bump.push((target_id, timer.signo, timer.overrun as i32));
                 } else {
+                    // A fresh record: its own count starts at 0.
+                    //
+                    // `last_overrun` is deliberately **not** touched here, and
+                    // that is measured rather than argued: a repeating timer
+                    // keeps firing after its record was read, so a reset at this
+                    // point would take `timer_getoverrun` back to 0 in the
+                    // window between the read and the caller's ask. Linux keeps
+                    // the last *delivered* number until the next delivery
+                    // (`build/scratch/sfdhost/life2.c`: read 9, then three more
+                    // unread expiries, door still 9 - which is what an
+                    // implementation that reset here answered 0 to). The value
+                    // moves in `Task::note_timer_delivered`, at the delivery.
                     timer.overrun = 0;
-                    let mut info = signal::SigInfo::timer(timer.signo);
-                    info.value = timer.value;
+                    // The record carries the handle and the count as well as
+                    // the payload, because Linux's `_timer` member is all
+                    // three: a signalfd reader sees `ssi_tid`/`ssi_overrun`
+                    // and a handler sees `si_timerid`/`si_overrun` at wire
+                    // offsets 16 and 20, which is why the fields ride on the
+                    // record rather than being fetched at the read
+                    // (`build/scratch/sfdhost/{dump,life2}.c`).
+                    let info =
+                        signal::SigInfo::timer(timer.signo, timer.id, timer.overrun, timer.value);
                     fresh.push((target_id, timer.signo));
                     deliver.push((target_id, timer.signo, info));
                 }
@@ -2450,6 +2540,33 @@ impl Table {
                     queue_signal(task, signo, info);
                     self.sched.wake(target);
                 }
+            }
+        }
+        // The overrun counts collected in step 2, written into the record that
+        // is already waiting for its reader. A record whose slot no longer
+        // holds this signal - the reader got there first, or another sender
+        // replaced it - is left alone: the count it names belongs to a timer
+        // whose record has gone.
+        //
+        // Which record that is depends on the class, and both classes have one:
+        // a standard signal's sits in `siginfo`, a real-time one's in `rtq`.
+        // The first version of this loop skipped the real-time half, so a timer
+        // armed on `SIGRTMIN` - every `SIGEV_THREAD` timer musl makes - handed
+        // its reader a count that never moved off 0.
+        for (target, signo, overrun) in bump {
+            let Some(task) = self.tasks.get_mut(target.0).and_then(Option::as_mut) else {
+                continue;
+            };
+            if task.exited {
+                continue;
+            }
+            if crate::sched::signal::is_rt(signo) {
+                task.rtq.bump_overrun(signo, overrun);
+                continue;
+            }
+            let slot = (signo as usize).min(crate::sched::signal::SIGINFO_SLOTS - 1);
+            if task.siginfo[slot].signo == signo as i32 {
+                task.siginfo[slot].overrun = overrun;
             }
         }
         POSIX_TIMERS_ARMED.store(any_armed, Ordering::Relaxed);
@@ -3856,6 +3973,7 @@ pub fn timer_alloc(
             value,
             notify,
             overrun: 0,
+            last_overrun: 0,
             clock,
             clock_id,
             id,
@@ -3921,6 +4039,13 @@ pub fn timer_arm(id: usize, interval_ticks: u64, value_ticks: u64) -> Option<(u6
         );
         timer.interval_ticks = interval_ticks;
         timer.deadline = (value_ticks != 0).then(|| now + value_ticks);
+        // Arming is what resets `it_overrun_last`, and a disarm resets it too:
+        // measured on 7.3.4, a timer read once with 2 overruns answered 0 as
+        // soon as it was disarmed, and re-arming answered 0 as well
+        // (`build/scratch/sfdhost/{rearm,first}.c`). Linux sets
+        // `it_overrun_last = 0` in `do_timer_settime`, which is the same place
+        // this assignment sits - the table's own arm/disarm door.
+        timer.last_overrun = 0;
         Some(old)
     })
 }
@@ -3944,11 +4069,20 @@ pub fn timer_state(id: usize) -> Option<(u64, u64)> {
 
 /// The overrun count `timer_getoverrun` reports, or `None` for an id that
 /// names no timer of this task's.
+///
+/// This is Linux's `it_overrun_last` and not [`PosixTimer::overrun`]: the two
+/// are different numbers on purpose, and the difference is measured. A 20 ms
+/// timer left unread for 400 ms delivered a record carrying `si_overrun` 19
+/// while this door answered **0** at each of four asks taken along the way,
+/// and answered 19 only after the record was read; a disarm took it back to 0
+/// (`build/scratch/sfdhost/{last,life2,rearm,first}.c`). A caller asking here
+/// before it reads its first record must be told 0 - the record it has not
+/// read is the door that carries the accumulation.
 pub fn timer_overrun(id: usize) -> Option<u32> {
     with_table(|t| {
         let slot = timer_slot(t, id)?;
         let leader = t.task(t.current).tgid;
-        Some(t.task(leader).timers.get(slot)?.as_ref()?.overrun)
+        Some(t.task(leader).timers.get(slot)?.as_ref()?.last_overrun)
     })
 }
 

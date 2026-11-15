@@ -501,6 +501,14 @@ pub trait FpuTrap: Contexts {
     unsafe fn reset_live_fpu();
 }
 
+/// `SI_TIMER`: the `si_code` a POSIX `timer_create` expiry carries, and the
+/// only code whose union member is `_timer`.
+///
+/// Spelled here rather than borrowed from the kernel's table because this crate
+/// is below it: `arch` may not name `sched`. The number is Linux's ABI and is
+/// the same on both machines.
+pub const SI_TIMER_CODE: i32 = -2;
+
 /// The `siginfo_t` fields a handler's frame carries, in the shape the ABI layer
 /// holds them: the signal, the error, the code, the sender, and the `sigqueue`
 /// payload, plus the fault address a synchronous CPU exception reports.
@@ -540,6 +548,15 @@ pub struct SignalInfo {
     /// picks the union member by the *origin* of the signal, and this is that
     /// origin's one-bit answer in this kernel.
     pub fault: bool,
+    /// `si_timerid`: the `timer_create` handle a `SI_TIMER` expiry came from.
+    /// It is the `_timer` member's first word, at wire offset 16 - the same
+    /// eight bytes a sender's `si_pid`/`si_uid` occupy - so the record's class
+    /// decides which pair [`to_wire`](Self::to_wire) writes. Zero for every
+    /// other class, and for a `setitimer` expiry, which has no handle.
+    pub tid: i32,
+    /// `si_overrun`: how many expiries of that timer found the previous signal
+    /// still pending, at the `_timer` member's second word (offset 20).
+    pub overrun: i32,
 }
 
 impl SignalInfo {
@@ -566,6 +583,21 @@ impl SignalInfo {
         !self.fault && (1..=6).contains(&self.code)
     }
 
+    /// Whether this record's union member is the `_timer` one, which decides
+    /// what the eight bytes at offset 16 hold: `{ si_timerid, si_overrun }`
+    /// rather than `{ si_pid, si_uid }`.
+    ///
+    /// Only `SI_TIMER` takes it. A `setitimer` expiry does **not**, and that
+    /// is measured rather than assumed: an `ITIMER_REAL` expiry arrives with
+    /// `si_code` 128 (`SI_KERNEL`) and both words zero on Linux 7.2.14, while
+    /// a `timer_create` expiry of the same signal arrives with -2 and its
+    /// handle (`build/scratch/sfdhost/{it2,dump}.c`). This kernel
+    /// used to queue a `setitimer` expiry as `SI_TIMER`, which told a caller
+    /// it had a handle it never had.
+    pub fn timer_union(&self) -> bool {
+        !self.fault && self.code == SI_TIMER_CODE
+    }
+
     /// Render one whole `siginfo_t` (128 bytes) exactly as this kernel hands
     /// it to userspace, whichever door asked: a handler's signal frame on
     /// either machine, or `sigtimedwait`'s output buffer.
@@ -589,6 +621,28 @@ impl SignalInfo {
         wire[8..12].copy_from_slice(&self.code.to_le_bytes());
         if self.fault {
             put(&mut wire, 16, self.addr);
+        } else if self.timer_union() {
+            // `_timer`'s `{ int _tid; int _overrun; }` sits exactly where a
+            // sender's `si_pid`/`si_uid` do, which is Linux's own union: a
+            // `SI_TIMER` record read both words as the timer's handle and
+            // count, measured with two timers created so a handle of 0 could
+            // not be mistaken for "never written"
+            // (`build/scratch/sfdhost/{dump,hov}.c`: raw words `[4]=3`,
+            // `si_timerid=1`, `si_overrun=29`).
+            wire[16..20].copy_from_slice(&self.tid.to_le_bytes());
+            wire[20..24].copy_from_slice(&self.overrun.to_le_bytes());
+            // The member's third word is still the `sigval`, and it sits where a
+            // sender's does (byte 24): the `_timer` arm is
+            // `{ int _tid; int _overrun; sigval_t _sigval; struct rusage _sigchld; }`
+            // so the payload is the same field a `sigqueue` fills. Measured on
+            // Linux 7.3.4 (`build/scratch/sfdhost/hov.c`): a handler for a
+            // repeating timer read raw words `[4]=1 [5]=3 [6]=16962`, i.e.
+            // `si_timerid` 1, `si_overrun` 3 and the `sival_int` 4242 at word 6.
+            // A first version of this arm stopped after the two `int`s, so a
+            // handler over a timer was handed a **zero** payload while the
+            // `signalfd` door carried it - the two doors disagreeing about one
+            // record, which is the shape this single writer exists to prevent.
+            put(&mut wire, 24, self.value);
         } else {
             wire[16..20].copy_from_slice(&self.pid.to_le_bytes());
             wire[20..24].copy_from_slice(&self.uid.to_le_bytes());

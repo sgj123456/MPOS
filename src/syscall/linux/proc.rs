@@ -121,6 +121,8 @@ fn build_frame_at(
             stime: info.stime,
             addr: info.addr,
             fault: info.fault,
+            tid: info.tid,
+            overrun: info.overrun,
         },
         alt: alt.map(|stack| (stack.sp, stack.size)),
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
@@ -3538,9 +3540,18 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                 // `sigtimedwait` renders the same bytes a handler's frame does
                 // because they are the same record through a different door.
                 //
-                // A `SI_TIMER` record's `si_tid`/`si_overrun` slots (16 and 20)
-                // are left zero: no caller in this image reads them, and
-                // `timer_getoverrun` is the ABI the count is asked through.
+                // A `SI_TIMER` record's `_timer` member - `si_timerid` at wire
+                // offset 16 and `si_overrun` at 20 - is rendered by
+                // `SignalInfo::to_wire`, from the two fields the timer's
+                // expiry put on the record. This used to be left zero on the
+                // argument that "no caller in this image reads them and
+                // `timer_getoverrun` is the ABI the count is asked through";
+                // the measurement refuted it. A `signalfd` reader asks for
+                // both slots by name (`ssi_tid`, `ssi_overrun`) and a handler's
+                // `siginfo_t` carries them at 16/20 - Linux 7.3.4 answers a
+                // repeating timer's record with its handle and its missed
+                // count, and `timer_getoverrun` agrees with the count
+                // (`build/scratch/sfdhost/{dump,life2}.c`).
                 let wire = crate::hal::SignalInfo {
                     signo: record.signo,
                     errno: record.errno,
@@ -3553,6 +3564,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                     stime: record.stime,
                     addr: record.addr,
                     fault: record.fault,
+                    tid: record.tid,
+                    overrun: record.overrun,
                 };
                 let bytes = wire.to_wire();
                 // SAFETY: `buffer_ok(info, SIGINFO_BYTES, false, from_user)`
