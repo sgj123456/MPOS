@@ -833,6 +833,176 @@ fn main() {
     // The queues of this test's directories are gone with the dirs.
     let _ = std::fs::remove_dir("/tmp/ino-dir");
     let _ = std::fs::remove_dir("/tmp/ino-to");
+    // === the same create, through every door that makes it =================
+    //
+    // `si_code`-shaped lesson one layer up: a creation has a *pair* of doors
+    // (`mknod`/`mknodat`, `symlink`/`symlinkat`) and a watch must hear about
+    // both. Measured on Linux 7.3.4 (`build/scratch/doorpair/t.c`): each of the
+    // four doors answers `mask=0x100` (`IN_CREATE`) naming the entry it made.
+    //
+    // This kernel's `mknod` kept its own body beside `mknodat` and the two had
+    // drifted - `mknod` emitted nothing, so a daemon watching a directory heard
+    // about a node made by `mknodat` and not about the same node made by
+    // `mknod`. `symlink` was already right because its fix and `symlinkat`'s
+    // went into one shared tail (`docs/notes/` §6.173). A claim per *door* is
+    // what tells the two apart: one claim about "a create is seen" passes on
+    // whichever door the test happens to use.
+    {
+        // The **main** queue is reused rather than a new one made: a host's
+        // `max_user_instances` is one per user here, so the earlier sections
+        // have already spent it and a fresh `inotify_init1` answers `EMFILE`.
+        // (Measured: `FAIL: a fresh queue is made ... (got -1)` on the host,
+        // which is a fact about this test's queue count, not about doors.)
+        let dir = "/tmp/t-inotify-doors";
+        let _ = std::fs::create_dir(dir);
+        {
+            let wd = add_watch(q, dir, IN_CREATE);
+            r.check("a watch on the doors' directory is taken", wd >= 0);
+            // The four doors, each making a fresh name in that directory.
+            // One door that makes a name and answers whether it did. Named
+            // rather than spelled inline: the tuple both drives clippy's
+            // `type_complexity` and, more to the point, is a shape a reader has
+            // to unwind to see that each entry is (label, call).
+            //
+            // **Which doors exist is the machine's.** x86_64 has the legacy
+            // `mknod` (133) and `symlink` (88); arm64 has **no** number for
+            // either - the kernel's own table says so beside them
+            // (`nr_aarch64.rs`: "no arm64 number; unreachable on aarch64"), and
+            // `libc` does not define `SYS_mknod`/`SYS_symlink` there at all. So
+            // the pair is claimed where both halves exist and the `at` forms
+            // alone where they do not: a claim about a door a machine cannot
+            // issue would be a claim about this test's `cfg`, not about the
+            // kernel.
+            type Door = fn(&str) -> bool;
+            #[cfg(target_arch = "x86_64")]
+            let doors: [(&str, Door); 4] = [
+                ("mknodat", |name: &str| {
+                    // SAFETY: a NUL-terminated name this test owns, and
+                    // `AT_FDCWD` for the dirfd.
+                    unsafe {
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_mknodat,
+                            libc::AT_FDCWD,
+                            n.as_ptr().cast::<libc::c_char>(),
+                            libc::S_IFIFO | 0o644,
+                            0,
+                        ) == 0
+                    }
+                }),
+                ("mknod", |name: &str| {
+                    // SAFETY: as above; the legacy door takes no dirfd.
+                    unsafe {
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_mknod,
+                            n.as_ptr().cast::<libc::c_char>(),
+                            libc::S_IFIFO | 0o644,
+                            0,
+                        ) == 0
+                    }
+                }),
+                ("symlinkat", |name: &str| {
+                    // SAFETY: two NUL-terminated names this test owns.
+                    unsafe {
+                        let mut t = b"target".to_vec();
+                        t.push(0);
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_symlinkat,
+                            t.as_ptr().cast::<libc::c_char>(),
+                            libc::AT_FDCWD,
+                            n.as_ptr().cast::<libc::c_char>(),
+                        ) == 0
+                    }
+                }),
+                ("symlink", |name: &str| {
+                    // SAFETY: as above; legacy form, no dirfd.
+                    unsafe {
+                        let mut t = b"target".to_vec();
+                        t.push(0);
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_symlink,
+                            t.as_ptr().cast::<libc::c_char>(),
+                            n.as_ptr().cast::<libc::c_char>(),
+                        ) == 0
+                    }
+                }),
+            ];
+            // arm64 issues only the `at` forms; the legacy pair above is
+            // x86_64's, so this arm claims the two doors it has.
+            #[cfg(not(target_arch = "x86_64"))]
+            let doors: [(&str, Door); 2] = [
+                ("mknodat", |name: &str| {
+                    // SAFETY: a NUL-terminated name this test owns, `AT_FDCWD`.
+                    unsafe {
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_mknodat,
+                            libc::AT_FDCWD,
+                            n.as_ptr().cast::<libc::c_char>(),
+                            libc::S_IFIFO | 0o644,
+                            0,
+                        ) == 0
+                    }
+                }),
+                ("symlinkat", |name: &str| {
+                    // SAFETY: two NUL-terminated names this test owns.
+                    unsafe {
+                        let mut t = b"target".to_vec();
+                        t.push(0);
+                        let mut n = name.as_bytes().to_vec();
+                        n.push(0);
+                        libc::syscall(
+                            libc::SYS_symlinkat,
+                            t.as_ptr().cast::<libc::c_char>(),
+                            libc::AT_FDCWD,
+                            n.as_ptr().cast::<libc::c_char>(),
+                        ) == 0
+                    }
+                }),
+            ];
+            for (label, make) in doors {
+                let name = format!("{dir}/by_{label}");
+                let _ = std::fs::remove_file(&name);
+                let made = make(&name);
+                r.check(&format!("{label} made the entry"), made);
+                // One bounded wait for this door's event, then read what the
+                // queue holds: the claim is that *this* name was announced.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+                let mut seen = false;
+                let mut window = [0u8; 4096];
+                while std::time::Instant::now() < deadline && !seen {
+                    let n = read_raw(q, &mut window);
+                    if n > 0 {
+                        let mut all = Vec::new();
+                        all.extend_from_slice(&window[..n as usize]);
+                        foreach_record(&all, |hdr, seen_name| {
+                            if hdr.mask & IN_CREATE != 0
+                                && seen_name == format!("by_{label}").as_bytes()
+                            {
+                                seen = true;
+                            }
+                        });
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                r.check(
+                    &format!("the watch hears {label}'s entry as IN_CREATE"),
+                    seen,
+                );
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     unsafe { libc::close(q) };
     r.check(
         "a closed queue answers EBADF",
