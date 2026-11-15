@@ -1949,7 +1949,12 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     match tid {
         crate::sched::Named::Gone(_) => 0,
         crate::sched::Named::Thread(target) => {
-            if crate::sched::send_signal(target, sig as u8) {
+            // `SI_TKILL`, not `SI_USER`: the code names which door raised the
+            // signal, and a receiver reads it. Measured on 7.3.4
+            // (`build/scratch/sfdaddr2/t4.c`): `tgkill(self)` and `tkill(self)`
+            // arrive as -6 while `kill(self)` is 0. This kernel answered 0 for
+            // all of them, so a receiver could not tell the doors apart.
+            if crate::sched::send_signal_tkill(target, sig as u8) {
                 0
             } else {
                 err::ESRCH

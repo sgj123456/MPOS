@@ -299,6 +299,34 @@ pub fn send_signal(id: TaskId, sig: u8) -> bool {
     send_signal_info(id, sig, crate::sched::signal::SigInfo::user(sig, pid, uid)) != Sent::NoTask
 }
 
+/// Send `sig` to `id` with the record a **`tkill`/`tgkill`** door owes:
+/// `SI_TKILL` (-6), not the `SI_USER` (0) a plain `kill` produces.
+///
+/// The code names which door raised the signal, and a receiver reads it: Linux
+/// gives `kill(2)` `SI_USER` and `tkill`/`tgkill` `SI_TKILL`, which is the one
+/// negative code `rt_sigqueueinfo` refuses to accept from a caller because it
+/// names a sender only the kernel can have produced. Measured on 7.3.4
+/// (`build/scratch/sfdaddr2/t4.c`, one blocked signal read through a `signalfd`
+/// per door): `raise` -6, `kill(self)` 0, `tgkill(self)` -6, `tkill(self)` -6,
+/// `sigqueue` -1. This kernel answered 0 for all four sender doors, so a
+/// receiver could not tell `tgkill` from `kill` at all.
+///
+/// `libc`'s `raise` is `tgkill`, which is why the same measurement is what pins
+/// `raise`'s record too.
+pub fn send_signal_tkill(id: TaskId, sig: u8) -> bool {
+    let (pid, uid) = with_table(|t| {
+        let cur = t.task(t.current);
+        let number = cur.pid_ns.number_of(cur.tgid.0);
+        (
+            number.map_or(cur.tgid.0 as i32, |n| n as i32),
+            cur.identity.ruid as i32,
+        )
+    });
+    let info =
+        crate::sched::signal::SigInfo::signed(sig, 0, crate::sched::signal::SI_TKILL, pid, uid, 0);
+    send_signal_info(id, sig, info) != Sent::NoTask
+}
+
 /// Generate `SIGPIPE` for the running task: the signal a `write`-family door
 /// owes when it answers `EPIPE`.
 ///
