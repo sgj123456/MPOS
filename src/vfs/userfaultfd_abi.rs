@@ -138,7 +138,20 @@ pub fn register_verdict(mode: u64, start: u64, len: u64, page: u64) -> RegisterV
 /// and an unaligned `src` is **accepted** - the source is read with an ordinary
 /// copy, which does not care where in a page it starts.
 pub fn copy_len_ok(len: u64, page: u64) -> bool {
-    len != 0 && len.is_multiple_of(page)
+    // **One page, exactly.** `UFFDIO_COPY` installs one page and answers
+    // `copy = 4096` - measured on Linux 7.2.11 as real root
+    // (`docs/notes/` §6.33's table: "`UFFDIO_COPY` | 0 with `copy = 4096` and
+    // the page really installed"), and it is the shape the rest of the call
+    // implies: a fault is *one* address, `UFFDIO_ZEROPAGE` below takes the same
+    // `len`, and `fill_page` writes one frame.
+    //
+    // Accepting a longer span was two defects wearing one line. It allocated
+    // `len` bytes from the caller's word before the page was installed - an
+    // allocation a user steers with a single registration, the shape §8.0.2
+    // exists for - and it answered `copy = len` for a call that had installed
+    // one page, so a caller that believed the answer would think the rest of its
+    // span was filled.
+    len == page
 }
 
 /// The mode bits `UFFDIO_COPY` understands: `MODE_DONTWAKE` (bit 0). Linux also
@@ -296,6 +309,16 @@ mod tests {
         assert!(!copy_len_ok(0, 4096));
         assert!(!copy_len_ok(1, 4096));
         assert!(!copy_len_ok(4097, 4096));
+        // More than one page is refused, not merely rounded: `UFFDIO_COPY`
+        // installs one page and answers `copy = 4096` (measured as real root,
+        // `docs/notes/` §6.33). Accepting `2 * page` allocated the caller's
+        // whole span and then answered `copy = len` for one installed page.
+        assert!(!copy_len_ok(2 * 4096, 4096));
+        assert!(!copy_len_ok(16 * 4096, 4096));
+        // A larger page size moves the line with it, so the check is the
+        // machine's page and not a constant.
+        assert!(copy_len_ok(16384, 16384));
+        assert!(!copy_len_ok(4096, 16384));
     }
 
     /// The record a `read(2)` hands back, byte for byte: measured as

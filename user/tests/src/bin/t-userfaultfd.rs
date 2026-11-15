@@ -414,6 +414,32 @@ fn main() {
             copy(&fd, area as usize, page.as_mut_ptr() as usize, PAGE, 0)
                 == Err(-(libc::EEXIST as i64)),
         );
+        // `UFFDIO_COPY` is **one page**, and a longer `len` is refused rather
+        // than truncated. Measured as real root on Linux 7.2.11
+        // (`docs/notes/` §6.33: "0 with `copy = 4096` and the page really
+        // installed"): the call installs one page, so a `len` spanning more is
+        // answered at the argument, and the `len == 0` / `len == 1` refusals
+        // beside it are the same validation.
+        //
+        // This is the claim a `<=` bound would fail. This kernel used to accept
+        // any whole number of pages, allocate that many bytes from the caller's
+        // word, install one page and then report `copy = len` - an allocation a
+        // user steered with a single registration (§8.0.2's shape) and an answer
+        // describing work that was not done.
+        for pages in [2usize, 4, 16] {
+            let want = -(libc::EINVAL as i64);
+            let got = copy(
+                &fd,
+                area as usize,
+                page.as_mut_ptr() as usize,
+                pages * PAGE,
+                0,
+            );
+            r.check(
+                &format!("a COPY of {pages} pages is EINVAL, not truncated (got {got:?})"),
+                got == Err(want),
+            );
+        }
     }
 
     // ---- a zero page ----------------------------------------------------
