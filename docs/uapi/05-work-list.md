@@ -12990,3 +12990,26 @@ not made here because it is not currently wrong, and one intent per commit is th
 rule. And the `IN_CREATE` claim is **one event class**: `IN_ATTRIB`, `IN_DELETE`,
 `IN_MOVED_*` and `IN_OPEN`/`IN_CLOSE_WRITE` each have their own door families, and
 only `IN_CREATE`'s was checked per door.
+
+## Item 294 — `dup3` accepted `O_CLOEXEC` and never installed it (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **The argument-shaped half of §6.174's audit** | Item 293 walked the pairs whose legacy form delegates to its `*at` sibling and named the rest — `kill`/`tgkill`, `dup`/`dup3`, `poll`/`ppoll`, `select`/`pselect6`, `getrlimit`/`prlimit64` — "distinct arguments rather than a dirfd, so 'the same rule' needs its own judgement per pair". This is the first of those, and the same shape one level down: two doors offering one promise in different spellings, where both accepted it and one kept it. |
+| **Before** | `handle_dup3`'s doc said "`dup2` with `O_CLOEXEC`", and its body validated the flag, dispatched `old == new` and unknown bits to `EINVAL`, then called `install_at` — which sets `flags[slot] = 0`, because clearing close-on-exec is exactly what **`dup2`** owes. `dup3` inherited the clearing and never undid it, so a caller asking for close-on-exec got a plain descriptor and leaked it across `execve`. Nothing failed loudly: a descriptor outliving an `execve` is a security property ordinary programs do not notice missing. |
+| **Measured first** | Linux 7.3.4, `build/scratch/dupclox/t.c`: `dup3(a,200,O_CLOEXEC)` → `F_GETFD(200) = 0x1` (`FD_CLOEXEC` set); `dup3(a,201,O_CLOEXEC)` then `dup3(a,201,0)` → `0x0`; `dup2(a,202)` → `0x0`. This kernel answered `0x0` for the first row. |
+| **Now** | `handle_dup3` sets the descriptor's flag **after** `install_at` — the only order that works, since the install must clear it for `dup2`'s sake. The first attempt stored `O_CLOEXEC` (`0x80000`, the *open* flag) instead of `FD_CLOEXEC` (`1`, the *descriptor* flag) and `F_GETFD` answered `0x80000`, a number no Linux returns; the measurement caught it, which is why the pin asserts the **value** and not its truthiness. |
+| **Verified beyond the flag word** | `F_GETFD` says the bit is stored; what close-on-exec *means* is that the number is gone after `execve`. A probe dups onto 300 with the flag and 301 without, `execve`s a child that reports both, and the child reads **300 → `EBADF`**, **301 → open**. Measured, not inferred from the bit. |
+| **Pins** | `t-dup3` grew three claims: the flag is really set (`F_GETFD == FD_CLOEXEC`, expected value printed), its complement (`dup3` with no flags leaves the number NOT close-on-exec even having replaced one that was), and the complement is what makes the claim about `dup3` rather than about "the table has a close-on-exec bit". The program had checked `O_CLOEXEC` was a **legal argument** and never that it **took effect** — the same gap §6.172 found in `UFFDIO_COPY`'s pin (a positive answer checked, a bound not). |
+| **Counterfactual** | The `dup3` arm stashed, kernel and loader rebuilt, the pin in the guest: **exactly one claim red** — `FAIL: and the flag is really set (F_GETFD = 0x0, want FD_CLOEXEC = 1)` — with the no-flag complement green. Restored with `sha256sum -c`, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item294.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1339** host tests 0 failed (61.10 s); stage 2 323 programs over 6 lanes on x86_64 (40.91 s) and 319 on aarch64 (56.21 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged at `162/168/389/273/3`; both workspaces formatted. |
+
+**What this does not do, named.** `kill`/`tgkill`, `poll`/`ppoll` and
+`getrlimit`/`prlimit64` are **still unaudited** — each needs its own judgement
+about what "the same rule" is (`poll`/`ppoll` differ by a `sigset_t` and a
+`timespec`; `getrlimit`/`prlimit64` by the ability to name another process), and
+this item did one pair, not four. **`dup2`'s own clearing is not pinned**: it is
+measured here and it is what the implementation does, but no claim asserts that a
+`dup2` onto a close-on-exec number clears it, so a change to `install_at` could
+break `dup2` without reddening anything. And `F_DUPFD_CLOEXEC` is a **third
+spelling** of the same promise, not looked at.

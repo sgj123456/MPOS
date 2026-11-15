@@ -3013,3 +3013,33 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   Gate `build/gate-item293b.log` `GATE_EXIT=0`, both arms in one run: stage 1 1339,
   x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet
   unchanged. (§6.174, item 293)
+
+- **Item 294 — `dup3` accepted `O_CLOEXEC` and never installed it**: the argument-shaped
+  half of §6.174's audit, and the same shape one level down — two doors offering one
+  promise in different spellings, where both accepted it and one kept it.
+  `handle_dup3`'s doc said "`dup2` with `O_CLOEXEC`", and its body validated the flag,
+  dispatched `old == new` and unknown bits to `EINVAL`, then called `install_at` — which
+  sets `flags[slot] = 0`, because clearing close-on-exec is exactly what **`dup2`** owes.
+  `dup3` inherited the clearing and never undid it, so a caller asking for close-on-exec
+  got a plain descriptor and leaked it across `execve` — nothing fails loudly, because a
+  descriptor outliving an `execve` is a security property ordinary programs do not notice
+  missing. Measured on Linux 7.3.4 (`build/scratch/dupclox/t.c`):
+  `dup3(a,200,O_CLOEXEC)` → `F_GETFD = 0x1`; without the flag → `0x0`; `dup2` → `0x0`;
+  this kernel answered `0x0` for the first. The fix sets the descriptor's flag **after**
+  `install_at` (the only order that works, since the install must clear it for `dup2`) —
+  and the first attempt stored `O_CLOEXEC` (`0x80000`, the *open* flag) instead of
+  `FD_CLOEXEC` (`1`, the *descriptor* flag), which made `F_GETFD` answer a number no
+  Linux returns; the measurement caught it, which is why the pin asserts the **value** and
+  not its truthiness. Verified beyond the bit: a probe dups onto 300 with the flag and
+  301 without, `execve`s a child that reports both, and the child reads **300 → `EBADF`**,
+  **301 → open**. `t-dup3` grew three claims (the flag really set; its complement, `dup3`
+  with no flags leaves it clear; and that complement is what makes the claim about `dup3`
+  rather than about "the table has a bit") — the program had checked `O_CLOEXEC` was a
+  *legal argument* and never that it *took effect*, the same gap §6.172 found in
+  `UFFDIO_COPY`'s pin. Counterfactual reddens exactly `FAIL: and the flag is really set
+  (F_GETFD = 0x0)`, the complement green. Named: `kill`/`tgkill`, `poll`/`ppoll` and
+  `getrlimit`/`prlimit64` are still unaudited, `dup2`'s own clearing is measured but not
+  pinned, and `F_DUPFD_CLOEXEC` is a third spelling not looked at. Gate
+  `build/gate-item294.log` `GATE_EXIT=0`, both arms in one run: stage 1 1339,
+  x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet
+  unchanged. (§6.175, item 294)
