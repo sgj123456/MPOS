@@ -14805,9 +14805,10 @@ no count has grown"; bare metal both arches and the selftest build compile.
    frame. `t-trap-signal` (§6.159) still pins only their *terminating* signal.
 2. **aarch64's `el0_sync`** has no per-ESR-class signal map; refused EL0 faults
    still end in `die_of_fatal_signal(11)` with no queued record.
-3. **`PROT_NONE`'s `si_code`** is `SEGV_MAPERR` here against Linux's
-   `SEGV_ACCERR`; the pin accepts both and §6.160 names the reason (the leaf is
-   absent rather than present-but-refusing).
+3. **`PROT_NONE`'s `si_code`** was `SEGV_MAPERR` here against Linux's
+   `SEGV_ACCERR` when this landed; §6.162 (item 282) closed it by asking the
+   VMA tree instead of the page-table word, and `t-fault-at-trap`'s claim that
+   accepts either code is now the older of the two pins.
 4. **`fault_repeats`' counter is still global and never reset** by a delivery;
    it is now only a backstop for a task the trap-time door declined (a traced
    task, or a build without `mpos_signal_frame`), which is the case it was
@@ -14815,3 +14816,169 @@ no count has grown"; bare metal both arches and the selftest build compile.
 5. **Chromium is not unblocked.** Its `cc 0f 0b` is an intentional
    `__builtin_trap()` after an earlier logical failure, and the dbus-less image
    and the unpinnable parked-fault race remain.
+
+## §6.162 a page fault's `si_code` asks the mapping, not the page table (item 282, LANDED 2026-11-15)
+
+**The question `si_code` answers.** A `SIGSEGV` handler's first branch is
+usually a `switch` on `si_code`: `SEGV_ACCERR` means "a mapping covers this
+address and refused the access — repair it with `mprotect` and retry", and
+`SEGV_MAPERR` means "nothing describes this address — there is nothing to
+repair". That is a question about the **address space**, and §6.160 answered it
+from the CPU's page-table error word instead: `PageFaultErrorCode::PROTECTION_VIOLATION`
+set meant `SEGV_ACCERR`. §6.161's gap 3 named the consequence and Item 280/281's
+pin accepted either code, which is how a wrong answer stayed green.
+
+**Measure first (Linux 7.2.14, `build/scratch/protcode/`).** Four probes, each
+trial a forked child with an `SA_SIGINFO` `SIGSEGV` handler that prints
+`H signo=%d code=%d addr=%p` and `_exit(0)`s:
+
+| Trial | Probe | Linux's answer |
+|---|---|---|
+| read a `PROT_NONE` page | `probe.c` mode 0 | `code=2` `SEGV_ACCERR`, `addr` the page |
+| write a `PROT_READ` page | `probe.c` mode 1 | `code=2` `SEGV_ACCERR`, `addr` the page |
+| read an address never mapped | `probe.c` mode 2 | `code=1` `SEGV_MAPERR`, `addr=0x10` |
+| read the hole between two mappings | `hole.c` (`-O0`) | `code=1` `SEGV_MAPERR`, `addr` the hole |
+| fetch from an `rw-` (NX) page | `nx.c` (`-O0`) | `code=2` `SEGV_ACCERR`, `addr` the page |
+| write a `PROT_READ` file mapping | `nx.c` (`-O0`) | `code=2` `SEGV_ACCERR`, `addr` the page |
+
+Four independent fault classes agree, and the rule they agree on is not the page
+table's: **a VMA covers the address and refuses the access ⇒ `SEGV_ACCERR`;
+nothing covers it ⇒ `SEGV_MAPERR`**. The two questions come apart exactly where
+it matters. A `PROT_NONE` page has an *absent* leaf, so the CPU word says "not
+present" (`SEGV_MAPERR` here) while Linux — which asked its VMA tree — says
+`SEGV_ACCERR`. The `hole.c` probe is the mirror: the leaf is absent *and* no VMA
+covers it, where the page-table reading happens to be right.
+
+`probe.c`'s own hole mode (3) and its control (4) exited 69 without faulting at
+`-O1` — the unmap was optimised around — which is why `hole.c` exists at `-O0`.
+A trial that does not fault is not a reading.
+
+**The change.** The discriminator moves from the machine layer to the kernel,
+because the machine layer cannot answer it:
+
+- `arch/src/hal/kernel.rs`: `send_fault_signal` loses its `protection: bool`
+  parameter entirely. Passing a wrong-shaped fact through a seam is the trap
+  this repository's rules forbid — and the `P` bit is wrong-shaped, not merely
+  uncertain.
+- `src/kernel_services.rs`: `fn send_fault_signal(&self, vector: u8, addr:
+  usize, rip: usize) -> u8` now computes
+  `let mapped = vector == 14 && sched::in_task() && sched::vma_prot_at(addr).is_some();`.
+  The `in_task()` guard is load-bearing: `sched::vma_prot_at` reaches
+  `t.space_owner(t.current)` → `Table::task()`, which panics `there is no task
+  {}` when the slot is empty, and the boot's own EL0 check faults with no
+  tenant (§2.13 measured that exact panic). With no task there is no address
+  space, so "no mapping describes it" is the true answer rather than a
+  guess. `vma_prot_at` is the seam that already existed for `pf_diag`; it
+  answers `Some(prot)` for a covering VMA and `None` for none, which is Linux's
+  question in the form this kernel already stores.
+- `src/sched/signal.rs`: `fault_record(vector, addr, rip, mapped)` — the
+  parameter is renamed and `14 => if mapped { SEGV_ACCERR } else { SEGV_MAPERR }`.
+  `si_addr` stays `CR2`, so nothing about the address moves.
+
+**The pin, `t-fault-sicode`.** Nine claims from four forked trials, each child
+installing an `SA_SIGINFO` handler that records `si_code`/`si_addr` into a
+`MAP_SHARED` page and `_exit(0)`s: `PROT_NONE` read ⇒ `SEGV_ACCERR` + `si_addr`
+is the page; write a `PROT_READ` page ⇒ `SEGV_ACCERR` + `si_addr`; read
+`0x1000` ⇒ `SEGV_MAPERR` + the address; read the hole between two mappings ⇒
+`SEGV_MAPERR` + the hole. It is in `[aarch64] gaps` — the second machine has no
+`ESR`→signal map at all, so it has no record to read a code out of.
+
+Three probe bugs, each costing a run: a forked child's private memory is not the
+parent's, so a handler's findings must live in a shared page (the C probes print
+from inside the handler for the same reason); `MapFlags::ANONYMOUS` does not
+exist in rustix 1.1.5's `mmap_anonymous` (`PRIVATE` alone is right); and the
+hole trial must make its hole **after** the trial's own shared page is mapped,
+or the allocator hands the hole back and the read succeeds — so `trial()` now
+takes a `prepare` step that runs after the mapping.
+
+**Counterfactual, twice.** `let mapped = false;` in the new seam reddens exactly
+the two `SEGV_ACCERR` claims and leaves the two `SEGV_MAPERR` ones and every
+`si_addr` claim green (`build/scratch/oneshot-sicode-cf.log`). Then the honest
+"before": `git stash push` of the five files, kernel and loader rebuilt from
+HEAD `9230404`, same guest run (`build/scratch/oneshot-sicode-before.log`) — the
+same two reds, and a second fact the `P`-bit reading had been hiding: at HEAD an
+untouched anonymous page has **no leaf at all**, so even "write a `PROT_READ`
+page" was reported not-present. The old door got *both* described-access classes
+wrong, not only `PROT_NONE`. Restored with `git stash pop` + `sha256sum -c`
+(`build/scratch/sicode/good.sha`, all four verified), rebuilt, guest **9 ok,
+`PASS`** again.
+
+**Gate.** `build/gate-sicode-v3.log` exit 0: stage 1 **1330** host tests, 0
+failed; x86_64 `verdict pass=320 fail=0`; aarch64 `verdict pass=316 fail=0`;
+`mpos-kunit 41 passed, 0 failed` per arm; `t-fault-sicode` `=== PASS` in
+the x86_64 lane and built-but-skipped in the aarch64 `gaps`. `cargo fmt --all
+--check` root + fuzz clean; host lib **812**, xtask **162**; six-arm clippy
+ratchet `162/162, 168/168, 389/389, 273/273, 3/3, 1/1` — "no lint has appeared
+and no count has grown"; bare metal both arches compile.
+
+### What this does not do, named
+
+1. **The other six `x86-interrupt` exception vectors** still have no
+   GPR-preserving stub (§6.161's gap 1), so a handled `SIGILL`/`SIGFPE`/
+   `SIGTRAP` still waits for a timer tick. Their `si_code` rows are measured and
+   pinned, but the *delivery point* is not.
+2. **aarch64's `el0_sync`** has no `ESR`→signal map. Every refused EL0 fault
+   still ends in `die_of_fatal_signal(11)` with no record — so this item's whole
+   question does not arise there yet, which is why the pin is in its `gaps`.
+3. **The machine-specific `_sigfault` members stay zero** — `si_addr_lsb`,
+   `si_addr_bnd`, `si_pkey` — and `signalfd_siginfo.ssi_addr` and
+   `PTRACE_GETSIGINFO`'s synthesized code remain their own doors (§6.160's gaps
+   3 and 4). Only `si_code` and `si_addr` moved.
+4. **Chromium is not unblocked.** Its `cc 0f 0b` is an intentional
+   `__builtin_trap()`; the dbus-less image and the unpinnable parked-fault race
+   remain.
+
+## §6.163 the ASLR pin drew two samples from 2048 pages and called the draw a proof (LANDED 2026-11-15)
+
+**What happened.** Item 282's first gate run went red on `t-aslr`, and on
+nothing else:
+
+```
+=== RUN t-aslr
+ok:    two fresh runs of this program reported where each one was
+FAIL:  the stack does not start at the same page twice
+ok:    and neither does the mmap region
+```
+
+The kernel was not wrong. `ASLR_STACK_PAGES` is `1 << 11` = 2048
+(`src/sched/runtime/mod.rs:183`), and `random_pages` draws
+`(drawn % count) * PAGE_SIZE`, so "two runs differ" is a claim with a 1/2048
+chance of failing *by construction* on a kernel that randomises perfectly. The
+claim's own subject — randomisation — is a distribution, and one comparison of
+two draws is not a test of a distribution.
+
+That is the failure mode this repository keeps paying for in a different dress:
+a claim whose counterfactual is not the behaviour. "Two runs differ" is
+falsified by luck, so a red there says nothing about the kernel and a green says
+almost nothing either — 2048-way randomisation and 2-way randomisation both pass
+it nearly always.
+
+**The fix.** Six fresh runs, and the claim becomes "more than one distinct page
+across six" for both the stack and the mmap region. The probability of a
+perfectly randomising kernel failing it is `(1/2048)^5`; a kernel that pins
+either landmark to one page fails it always. Six exec'd children cost ~50 ms in
+a sweep that already forks; the disk I/O is one file overwritten six times.
+
+**Counterfactual.** `stack_top: USER_STACK_TOP` (the draw deleted) → six runs,
+and the claim reddens: `FAIL: the stack start lands on more than one page
+across six runs` → `FAILED`, while the other four claims stay green
+(`build/scratch/oneshot-aslr-cf.log`). Restored, rebuilt, guest `PASS`
+(`build/scratch/oneshot-aslr-restore.log`). The mmap claim's own counterfactual
+is the same shape and was not measured separately — `MMAP_BASE` and the stack
+draw are two `random_pages` calls with the same failure mode.
+
+**Why it lives here and not in its own item.** It is not a kernel change: no
+non-test file moves. It is the pin for §6.162 being made honest, and a pin that
+can fail on a correct kernel is worse than no pin, because the next session
+learns to re-run it away.
+
+### What this does not do, named
+
+1. **The draw's *magnitude* is still not pinned.** A kernel that randomises
+   over two pages passes this as surely as one that randomises over 2048. What
+   would pin the magnitude is a claim over many runs about the observed spread
+   against `ASLR_STACK_PAGES`, which is a measurement, not a test — the honest
+   home for it is `docs/notes/` and it is not written.
+2. **The mmap region's and the heap's distributions are likewise unpinned.**
+   The heap is deliberately *not* drawn by this kernel (it follows the image),
+   which the test names as a divergence rather than a failure.

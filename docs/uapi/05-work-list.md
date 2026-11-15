@@ -12610,5 +12610,54 @@ still have no GPR-preserving stub (a handled `SIGILL`/`SIGFPE`/`SIGTRAP` waits
 for a tick); aarch64 `el0_sync` still has no ESR→signal map; `PROT_NONE`'s
 `si_code` is `SEGV_MAPERR` here against Linux's `SEGV_ACCERR` (§6.160);
 `fault_repeats`' counter is still global and never reset; chromium is not
-unblocked (`cc 0f 0b` is an intentional `__builtin_trap()`). (§6.161, item
-281)
+unblocked (`cc 0f 0b` is an intentional `__builtin_trap()`). `PROT_NONE`'s
+`si_code` was among these when this landed and is closed by item 282. (§6.161,
+item 281)
+
+## Item 282 — a page fault's `si_code` asks the mapping, not the page table
+
+| | Before | Now |
+|---|---|---|
+| The discriminator | `PageFaultErrorCode::PROTECTION_VIOLATION` — the CPU's `P` bit, a *page-table* fact | `sched::vma_prot_at(addr).is_some()` — does a **VMA** describe the address |
+| Read a `PROT_NONE` page | `SEGV_MAPERR` (1) — the leaf is absent, so the word says "not present" | `SEGV_ACCERR` (2), as Linux answers |
+| Write a `PROT_READ` page | `SEGV_MAPERR` (1) too — at HEAD the untouched anon page has no leaf at all | `SEGV_ACCERR` (2), as Linux answers |
+| Read `0x1000` / a hole between mappings | `SEGV_MAPERR` (1) | `SEGV_MAPERR` (1) — unchanged, which is why the old rule looked right |
+| The seam | `send_fault_signal(vector, addr, rip, protection: bool)` | `send_fault_signal(vector, addr, rip)` — the machine layer cannot answer the question, so it no longer carries a wrong-shaped answer |
+
+Measured first on Linux 7.2.14 (`build/scratch/protcode/{probe,hole,nx}.c`):
+four fault classes agree that a covered-and-refused access is `SEGV_ACCERR`
+(`PROT_NONE` read, `PROT_READ` write, NX fetch, read-only file write) and two
+that nothing covers the address is `SEGV_MAPERR` (never-mapped, mid-hole). A
+`PROT_NONE` page is exactly where the two questions come apart.
+
+The kernel-side guard is load-bearing: `sched::vma_prot_at` reaches
+`t.space_owner(t.current)` → `Table::task()`, which panics with no task, and the
+boot's own EL0 check faults with no tenant — so the lookup is gated on
+`sched::in_task()`, and "no mapping describes it" is then the true answer rather
+than a guess.
+
+Pins: `t-fault-sicode` — nine claims from four forked trials, each
+`SA_SIGINFO` handler recording `si_code`/`si_addr` into a `MAP_SHARED` page:
+`PROT_NONE` read ⇒ `SEGV_ACCERR`, `PROT_READ` write ⇒ `SEGV_ACCERR`, `0x1000` ⇒
+`SEGV_MAPERR`, hole ⇒ `SEGV_MAPERR`, each with its `si_addr`, and every fault
+code refusing `SI_USER` (0). Plus the host unit test
+`a_page_fault_code_asks_the_mapping_not_the_page_table` over six named classes.
+`MPOS_ON_HOST=1` PASS; guest x86_64 PASS; aarch64 in `gaps` (no `ESR`→signal
+map, so it has no record to read a code from). Counterfactual, twice: `let
+mapped = false;` reddens exactly the two `SEGV_ACCERR` claims; and the honest
+"before" — `git stash`, kernel rebuilt from HEAD `9230404` — reddens the same
+two, showing the old rule got `PROT_READ`-write wrong as well. Restored with
+`sha256sum -c`, PASS again.
+
+**Gate** `build/gate-sicode-v3.log` exit 0: stage 1 **1330** host tests, 0
+failed; x86_64 `verdict pass=320 fail=0`, aarch64 `verdict pass=316 fail=0`;
+`mpos-kunit 41 passed, 0 failed` per arm; `t-fault-sicode` `=== PASS` on
+the x86_64 lane. fmt both workspaces, host lib **812** / xtask **162**, six-arm
+clippy ratchet unchanged, bare metal both arches clean.
+
+**What this does not do.** The other six `x86-interrupt` exception vectors still
+have no GPR-preserving stub (§6.161's gap 1); aarch64 `el0_sync` still has no
+`ESR`→signal map; `si_addr_lsb`/`si_addr_bnd`/`si_pkey` stay zero;
+`signalfd_siginfo.ssi_addr` and `PTRACE_GETSIGINFO` are their own doors;
+`fault_repeats`' counter is still global; chromium is not unblocked (§6.162,
+item 282)
