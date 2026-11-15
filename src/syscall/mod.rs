@@ -129,6 +129,19 @@ pub(crate) use crate::uaccess::{MAX_IO, err_of};
 /// Maximum length of a path argument.
 pub(crate) const MAX_PATH: usize = 255;
 
+/// The longest **symlink target** Linux accepts: `PATH_MAX - 1`.
+///
+/// A path *component* is capped at 255 (`MAX_PATH`), but a symlink's target is a
+/// whole path, not one component - and Linux's own limit is measured rather than
+/// assumed (`build/scratch/symcap/t.c`, 7.3.4): `symlink(4095 bytes)` succeeds
+/// and `readlink` reads 4095 back, while 4096 and 4097 are `ENAMETOOLONG` (36).
+/// So the largest target a valid filesystem can hold is 4095, and that is also
+/// the bound `readlink` may trust an inode's `size` against.
+///
+/// This kernel applied `MAX_PATH` (255) to the target, so a link a real
+/// filesystem can hold was refused by the door that makes it.
+pub const MAX_SYMLINK_TARGET: usize = mpos_abi::MAX_SYMLINK_TARGET_BYTES;
+
 /// Parse a NUL-terminated string argument - the Linux ABI's path shape - into
 /// an owned String.
 ///

@@ -258,7 +258,7 @@ pub const ARMS: &[Arm] = &[
             ("function_casts_as_integer", 5),
             ("unreachable_code", 13),
             ("unused_assignments", 3),
-            ("unused_imports", 4),
+            ("unused_imports", 3),
             ("unused_must_use", 1),
             ("unused_mut", 6),
             ("unused_unsafe", 14),

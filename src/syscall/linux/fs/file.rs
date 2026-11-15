@@ -2328,7 +2328,12 @@ pub fn readlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// exist yet, and POSIX says making one is still allowed. What is an error is
 /// the name already being taken, or the filesystem refusing to hold a link.
 pub fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let target = match cstr_arg(args[0], true) {
+    // The target is a whole path, not one component: Linux's limit is
+    // `PATH_MAX - 1` = 4095, measured (`build/scratch/symcap/t.c`: 4095
+    // succeeds, 4096 is `ENAMETOOLONG`). `cstr_arg`'s 255 is the *name* cap and
+    // belongs to `args[1]` below.
+    let target = match crate::syscall::cstr_limit(args[0], true, crate::syscall::MAX_SYMLINK_TARGET)
+    {
         Ok(target) => target,
         Err(e) => return e,
     };
@@ -2382,7 +2387,16 @@ fn symlink_named(target: &str, path: &str, base: &Arc<dyn Inode>) -> isize {
 /// `getname(newname)`) and the reason an unreadable target pointer is `EFAULT`
 /// rather than a bad dirfd's `EBADF`.
 pub fn symlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let target = match cstr_arg(args[0], true) {
+    // The same bound as `symlink`, and for the same reason: the target is a
+    // whole path (`PATH_MAX - 1`), not one 255-byte component.
+    //
+    // That the two doors each needed it is what the gate found and a hand probe
+    // could not: which door a libc *calls* is the libc's business, so a fix to
+    // one of a pair is a fix to whichever half that libc happens to use -
+    // glibc's `symlink` goes through `symlinkat`, musl's issues `symlink`
+    // directly, and the x86_64 arm was the one that looked green.
+    let target = match crate::syscall::cstr_limit(args[0], true, crate::syscall::MAX_SYMLINK_TARGET)
+    {
         Ok(target) => target,
         Err(e) => return e,
     };

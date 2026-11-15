@@ -719,6 +719,20 @@ pub fn thread_clock_reading(live: Option<u64>, latched: Option<u64>) -> Option<u
     }
 }
 
+/// The longest **symlink target** Linux accepts, in bytes: `PATH_MAX - 1`.
+///
+/// Measured rather than read off a constant (`build/scratch/symcap/t.c`, Linux
+/// 7.3.4): a target of 4095 bytes is created and reads back at 4095, while 4096
+/// and 4097 are `ENAMETOOLONG` (36). Two things follow, and both need this one
+/// number: the door that *makes* a link may refuse a longer target, and a
+/// filesystem reading a link may refuse an inode whose on-disk `size` claims
+/// more - because otherwise that `size` is a length the kernel allocates at,
+/// chosen by whoever wrote the image (§8.0.2's shape).
+///
+/// It lives in this leaf because `syscall` and `vfs` both need it and neither
+/// may name the other's business; the same reason `wait_status` is here.
+pub const MAX_SYMLINK_TARGET_BYTES: usize = 4095;
+
 pub fn wait_status(code: isize, dumped: bool) -> i32 {
     if code < 0 {
         let sig = -code as i32;
@@ -1475,6 +1489,28 @@ mod tests {
             clock_ticks_to_user_hz(u64::MAX, 250),
             (u64::MAX as u128 * 100 / 250) as u64
         );
+    }
+
+    /// The symlink-target bound is Linux's measured `PATH_MAX - 1`, and the one
+    /// number two layers need.
+    ///
+    /// A target of exactly the bound is accepted and one past it refused; the
+    /// 4096 case is the one a "just use `PATH_MAX`" version gets wrong, and the
+    /// 4095 case is the one this kernel refused for years by applying the
+    /// 255-byte *component* cap to a whole path.
+    #[test]
+    fn a_symlink_target_is_bounded_by_path_max_minus_one() {
+        assert_eq!(MAX_SYMLINK_TARGET_BYTES, 4095);
+        assert_eq!(MAX_SYMLINK_TARGET_BYTES + 1, 4096); // PATH_MAX, refused
+        // The two questions the bound answers are "may this be created" and
+        // "may an inode's size be trusted", and they take the same number: a
+        // filesystem cannot hold a target the door never lets in.
+        let accepts = |len: usize| len <= MAX_SYMLINK_TARGET_BYTES;
+        assert!(accepts(0));
+        assert!(accepts(1));
+        assert!(accepts(4095));
+        assert!(!accepts(4096));
+        assert!(!accepts(4097));
     }
 
     /// The thread clock's reading: live while the thread lives, final once it

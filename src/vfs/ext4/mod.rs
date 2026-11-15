@@ -1734,7 +1734,20 @@ impl Inode for Ext4Ino {
         if data.kind() != NodeKind::Symlink {
             return Err(VfsError::Invalid);
         }
+        // An inode's `size` is a field **on disk**, so it is the filesystem's
+        // word rather than the kernel's, and both branches below allocate from
+        // it. A corrupt or hostile image can therefore name a target of any
+        // length, and trusting the field is §8.0.2's shape - a `Vec` grown at a
+        // number somebody else wrote. The bound is Linux's own measured one:
+        // `symlink` refuses a target past `PATH_MAX - 1`, so no filesystem that
+        // Linux would serve can hold a longer one (`build/scratch/symcap/t.c`:
+        // 4095 accepted, 4096 `ENAMETOOLONG`). A longer field is a corrupt
+        // inode, and `Invalid` is the honest answer rather than a guess at what
+        // the bytes meant.
         let size = data.size as usize;
+        if size > mpos_abi::MAX_SYMLINK_TARGET_BYTES {
+            return Err(VfsError::Invalid);
+        }
         if data.is_fast_symlink() {
             // No block was ever allocated: the target is the bytes of
             // i_block, read back as the text it was written as.
