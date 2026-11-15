@@ -285,6 +285,59 @@ fn main() {
     );
     unsafe { libc::munmap(priv_map, BYTES) };
 
+    // === a cache-miss fault, which is where the fault path may PARK =========
+    //
+    // The claims above are about which pages are resident; this one is about the
+    // page's *contents* after the fault that brought it in, and it exists because
+    // the fault path used to bring an object's page in **inside the task table's
+    // borrow** - and a block transfer parks its task (`docs/notes/` §10.5), which
+    // that borrow forbids. On a filesystem whose pages are cached (the ramfs and
+    // tmpfs every other claim here runs on) the fill never parks and the
+    // violation is invisible; on the guest's ext4 root a miss does.
+    //
+    // The shape weston died of: `segfault … error 4` on a **read of a page that
+    // was present** by the time the diagnostic printed, because the transfer that
+    // resolved the fault had already corrupted the borrow (`docs/notes/` §6.181).
+    //
+    // A new mapping after the cache has been through 512 pages is very likely to
+    // miss on at least one page; stride the touches so they are not sequential,
+    // and check the *pattern* rather than a count - a corrupted fill shows as a
+    // page reading as another page's byte.
+    {
+        let fresh = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                BYTES,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        r.check(
+            "a fresh private mapping is made for the miss round",
+            fresh != libc::MAP_FAILED,
+        );
+        if fresh != libc::MAP_FAILED {
+            let mut wrong = 0usize;
+            // Stride by 7 pages: misses rather than a readahead run.
+            let mut i = 0usize;
+            while i < PAGES {
+                let at = (i * PAGE) as isize;
+                let byte = unsafe { *(fresh.cast::<u8>().offset(at)) };
+                if byte != page_byte(i) {
+                    wrong += 1;
+                }
+                i += 7;
+            }
+            r.check(
+                &format!("every strided page of the mapping holds its own byte ({wrong} wrong)"),
+                wrong == 0,
+            );
+            unsafe { libc::munmap(fresh, BYTES) };
+        }
+    }
+
     unsafe { libc::munmap(map, BYTES) };
     unsafe { libc::close(fd) };
     unsafe { libc::unlink(path().as_ptr()) };
