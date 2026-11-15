@@ -2904,3 +2904,34 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   the self-directed doors were re-read. Gate `build/gate-item290.log` `GATE_EXIT=0`,
   both arms in one run: stage 1 1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit
   41/0 per arm, clippy ratchet unchanged. (§6.171, item 290)
+
+- **Item 291 — `UFFDIO_COPY` is one page, and the span it accepted was a user-steered
+  allocation**: found by scanning the syscall layer for an allocation whose *size* is the
+  caller's, chasing §8.0's remaining allocator gap. Most candidates were properly capped
+  (`keys.rs`'s `MAX_PAYLOAD`, `setgroups`' `NGROUPS_MAX`, `semop`'s `SEMOPM`, `msgrcv`'s
+  queue budget); `UFFDIO_COPY` was not, and it was a wrong answer with a free allocation
+  attached. Its bound was "any whole number of pages", so three things disagreed: the
+  handler allocated `vec![0u8; len]` from the caller's word and copied `len` out of the
+  caller's buffer, `fill_page` installs **one** frame, and the answer word was
+  `copy = len`. A caller that registered a 16-page span, faulted its first page and asked
+  for a 16-page copy got one page installed and `copy = 16384` reported — and the kernel
+  allocated 64 KiB at a number one `UFFDIO_REGISTER` makes arbitrarily large. The bound is
+  now `len == page` (a fault is one address; `UFFDIO_ZEROPAGE` takes the same `len`
+  through the same check; `fill_page` writes one frame), with the handler still allocating
+  but only after the bound refuses the bad argument. **Measured**: inherited from §6.33,
+  which took the call as **real root** on Linux 7.2.11 and records
+  `0 with copy = 4096 and the page really installed`, `len` of 0/1 `EINVAL` — and
+  re-confirmed that this sandbox cannot reach the call either way (`EPERM` for uid 1000
+  with `unprivileged_userfaultfd=0`, and for uid 0 inside `unshare -Ur`), so the notes say
+  the shape is inherited and the counterfactual is the proof. Pin `t-userfaultfd` grew
+  three claims beside the `copy == PAGE` assertion it already made — the gap that let this
+  live was checking only the positive answer, never the bound — and the host `copy_len_ok`
+  case gained `2*page`/`16*page`/larger-page pairs. Counterfactual reddens **three**
+  claims with **three different** wrong answers (`EEXIST` for 2 pages, `ENOENT` for 4 and
+  16), which says the old code reached three paths on one malformed argument. Named:
+  §8.0.2 **stays open** (one instance of the shape, not the cause), the scan was not
+  exhaustive (`vfs`/drivers read only where a syscall hands them a length), and
+  `UFFDIO_ZEROPAGE` tightened with the shared check without its own multi-page
+  measurement. Gate `build/gate-item291.log` `GATE_EXIT=0`, both arms in one run:
+  stage 1 1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy
+  ratchet unchanged. (§6.172, item 291)

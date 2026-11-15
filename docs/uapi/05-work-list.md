@@ -12913,3 +12913,26 @@ by `t-pidfd`). `SI_TIMER`'s door distinction belongs to §6.166/§6.167 and was 
 re-measured. And only the **self-directed** doors were measured for their codes:
 `kill(-1)`, the group door and `tgkill`'s cross-process arm are `SI_USER` by
 construction (they are `kill`'s) but were not re-read.
+
+## Item 291 — `UFFDIO_COPY` is one page, and the span it accepted was a user-steered allocation (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **Before** | `copy_len_ok(len, page)` accepted **any** whole number of pages. Three things then disagreed: the handler allocated `vec![0u8; len]` from the caller's word and copied `len` bytes out of the caller's buffer; `fill_page` installs **one** frame and copies at most `PAGE_SIZE`; and the answer word was `copy = len`. So a caller that registered a 16-page span, faulted its first page and asked for a 16-page copy got one page installed and `copy = 16384` reported — an answer about work that was not done — while the kernel had allocated 64 KiB at a number the caller chose. One `UFFDIO_REGISTER` of a large anonymous span makes that number arbitrarily large. |
+| **Now** | `copy_len_ok` is `len == page`, with the reasoning at the site: a fault is one address, `UFFDIO_ZEROPAGE` takes the same `len` through the same check, and `fill_page` writes one frame. The handler still allocates; the bound that refuses the bad argument runs first, so it allocates at most a page. |
+| **Measured** | Inherited, and said so: §6.33 measured the call as **real root** on Linux 7.2.11 (booting the host kernel with the probe as `/init`) and its table settles it — `UFFDIO_COPY` answers **0 with `copy = 4096` and the page really installed**, with `len` of 0 and 1 `EINVAL` beside it. Re-confirmed here that the call is unreachable to this sandbox both ways (`EPERM` for uid 1000 with `unprivileged_userfaultfd=0`, and for uid 0 inside `unshare -Ur`), so the shape is the recorded measurement and the pin's counterfactual is what proves this kernel now matches it. |
+| **Pins** | `t-userfaultfd` grew three claims beside the `copy == PAGE` assertion it already made — which is the gap that let this live: it checked the *positive* answer and never the bound. It now asks for 2, 4 and 16 pages and requires `EINVAL` from each. Host unit test `test_userfaultfd_abi`'s `copy_len_ok` case extended with `2*page`, `16*page` and a larger-page pair (so the check is the machine's page and not a constant) — host lib **819**. |
+| **Counterfactual** | The bound stashed, kernel and loader rebuilt, the pin in the guest: **three claims red, each with a different wrong answer** — `got Err(-17)` (EEXIST) for 2 pages, `got Err(-2)` (ENOENT) for 4 and for 16. Worth more than one red line: the old code reached **three different paths** on one malformed argument, so a caller could not have predicted the answer from the request. Restored with `sha256sum -c` on both files, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item291.log`, `GATE_EXIT=0`, both arms in one run. Stage 1 **1338** host tests 0 failed (64.34 s); stage 2 323 programs over 6 lanes on x86_64 (43.64 s) and 319 on aarch64 (54.29 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged `162/168/389/273/3/1`; both workspaces formatted. |
+
+**What this does not do, named.** §8.0.2 **stays open**: this closed one
+*instance* of "a user-steered allocation with no bound", not the cause — the
+allocator's null path is still `panic!`, and the reason §8.0.2 gives for not
+replacing it (the null is reached under a caller's borrow, and the death path
+allocates) still holds. The scan that found it walked `src/syscall/linux/` for
+caller-shaped allocation sizes and checked each by hand; `src/vfs/` and the driver
+layer were read only where a syscall hands them a length, so it was **not
+exhaustive** — a wrapper type that makes an unbounded size unspellable is the real
+fix and is design work. And `UFFDIO_ZEROPAGE` shares `copy_len_ok`, so it
+tightened with it: consistent (its measured answer is the same one-page shape) but
+not independently re-measured for a multi-page `len`.

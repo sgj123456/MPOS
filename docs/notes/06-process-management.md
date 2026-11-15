@@ -16037,3 +16037,98 @@ unchanged at `162/168/389/273/3/1`; both workspaces formatted.
 3. **`kill(-1)`, the group door and `tgkill`'s cross-process arm** were not
    re-measured for their codes: only the self-directed doors were, and the group
    door's code is `SI_USER` by construction (it is `kill`'s).
+
+## §6.172 `UFFDIO_COPY` is one page, and the span it accepted was an allocation a user steered (item 291, LANDED 2026-11-15)
+
+**How this was found.** Chasing §8.0's remaining allocator gap - "the global
+allocator still panics, so a `Vec` grown on a user's behalf still ends the
+machine" - by scanning the syscall layer for an allocation whose *size* is the
+caller's. Most candidates were properly capped (`keys.rs`'s `MAX_PAYLOAD`,
+`setgroups`' `NGROUPS_MAX`, `semop`'s `SEMOPM`, `msgrcv`'s queue budget). One was
+not, and it was not an allocation bug so much as a **wrong answer with a free
+allocation attached**.
+
+**The defect.** `UFFDIO_COPY`'s validation was `copy_len_ok(len, page) = len != 0
+&& len.is_multiple_of(page)` - any whole number of pages. Three things then
+disagreed:
+
+1. the handler allocated `alloc::vec![0u8; len]` from the caller's word and copied
+   `len` bytes out of the caller's buffer;
+2. `fill_page` installs **one** frame and copies at most `PAGE_SIZE` of what it is
+   given;
+3. the answer word was `copy = len`.
+
+So a caller that registered a 16-page span, faulted its first page and asked for a
+16-page copy got one page installed and `copy = 16384` reported - an answer about
+work that was not done - while the kernel had allocated 64 KiB at a number the
+caller chose. A single `UFFDIO_REGISTER` of a large anonymous span makes that
+number arbitrarily large, which is exactly the shape §8.0.2 catalogues ("a `Vec`
+grown on a user's behalf in any path other than demand paging still ends the
+machine").
+
+**The measurement, inherited rather than re-taken - and why.** `userfaultfd` asks
+`CAP_SYS_ADMIN` in the **initial** user namespace, so it is `EPERM` for this
+sandbox's uid 1000 (`/proc/sys/vm/unprivileged_userfaultfd` is `0`) *and* for uid 0
+inside `unshare -Ur` - re-confirmed here, both ways, before concluding it. §6.33
+measured the call as **real root** on Linux 7.2.11 by booting the host kernel with
+the probe as its `/init`, and its table settles this argument directly:
+
+> `UFFDIO_COPY` | 0 with `copy = 4096` and the page really installed
+
+One page, and the answer is that page's length. The same table's `len`-of-0-and-1
+`EINVAL` rows are the same validation, so a longer span is refused at the
+argument like every other malformed `len` - not truncated, and not served. That is
+a *recorded* measurement rather than a fresh one, and this section says so instead
+of implying otherwise (AGENTS.md §5: "a recorded measurement is about the machine
+that made it", so the claim it supports is Linux's *shape*, and the pin's own
+counterfactual is what proves this kernel now matches it).
+
+**The change.** `copy_len_ok` became `len == page`, with the reasoning at the
+site: a fault is one address, `UFFDIO_ZEROPAGE` takes the same `len` through the
+same check, and `fill_page` writes one frame. Nothing else moved - the handler
+still allocates, but now at most one page, because the bound that refused the bad
+argument runs first.
+
+**The pin.** `t-userfaultfd` grew three claims beside the `copy == PAGE` assertion
+it already made, which is the gap that let this live: it checked the *positive*
+answer and never the bound. The new claims ask for 2, 4 and 16 pages and require
+`EINVAL` from each.
+
+**Counterfactual.** The one-line bound stashed, kernel and loader rebuilt,
+`t-userfaultfd` in the guest: **three claims red, each with a different wrong
+answer** -
+
+```
+FAIL: a COPY of 2 pages is EINVAL, not truncated (got Err(-17))   EEXIST
+FAIL: a COPY of 4 pages is EINVAL, not truncated (got Err(-2))    ENOENT
+FAIL: a COPY of 16 pages is EINVAL, not truncated (got Err(-2))   ENOENT
+```
+
+- which is worth more than one red line: the old code reached **three different
+paths** on one malformed argument (the 2-page case ran into the EEXIST of the
+already-installed page, the 4- and 16-page cases fell out of `covers_span`), so a
+caller could not have predicted the answer from the request. Restored from
+`build/scratch/uffdlen/good/*.rs` with `sha256sum -c` (成功 on both), rebuilt,
+`PASS`.
+
+**Gate.** `build/gate-item291.log`, `GATE_EXIT=0`, both arms in one run (third
+consecutive). Stage 1 **1338** host tests 0 failed (64.34 s); stage 2 **323**
+programs over 6 lanes on x86_64 (43.64 s) and **319** on aarch64 (54.29 s);
+`pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm;
+clippy ratchet unchanged at `162/168/389/273/3/1`; both workspaces formatted.
+
+### What this does not do, named
+
+1. **§8.0.2 stays open.** This closed one *instance* of "a user-steered allocation
+   with no bound", which is the shape that keeps R.8 open, and it is worth saying
+   plainly that it is one instance and not the cause: the allocator's null path is
+   still `panic!`, and the reason §8.0.2 gives for not replacing it (the null is
+   reached under a caller's borrow, and the death path allocates) still holds.
+2. **The scan was not exhaustive.** It walked `src/syscall/linux/` for
+   `with_capacity`/`vec![` with a caller-shaped size and checked each by hand;
+   `src/vfs/` and the driver layer were read only where a syscall hands them a
+   length. A systematic bound (a wrapper type that makes an unbounded size
+   unspellable) is the real fix, and it is design work rather than an item.
+3. **`UFFDIO_ZEROPAGE` shares `copy_len_ok`**, so it tightened with it - which is
+   consistent (its measured `zeropage = 4096` answer is the same one-page shape)
+   but was not independently re-measured for a multi-page `len`.
