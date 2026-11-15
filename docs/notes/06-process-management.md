@@ -17082,8 +17082,30 @@ under the borrow. The three doors that reach `populate_in` -
 (`process_vm_readv`, `PTRACE_POKEDATA`, `/proc/<pid>/mem`) and
 `populate_forced_page_at` (the `FOLL_FORCE` half) - all take the same two halves.
 
-**What is *not* proven, and this is the honest part.** I do not have a
-counterfactual. Three attempts, all recorded because the negative is the finding:
+**The pin, and why it is a boot case rather than a corruption probe.** Four
+attempts to reproduce the *corruption* all came back empty, and the reason is
+structural: the park happens on **claim contention** over the ext4 fill scratch
+(§10.5), so it needs a device-backed filesystem *and* two tasks wanting one block -
+and the sweep machines' roots are ramfs, tmpfs, or an ext4 image read entirely
+through a warm cache. A probe that waits for corruption is therefore a probe that
+cannot be relied on.
+
+So the pin is the **invariant**, not the symptom: `schedule` now asserts that no
+`with_table` closure is live when a switch is asked for, and a boot case
+(`sched` suite's `table_borrow_is_enforced`) proves the depth counter that assertion
+reads is real - that it reads **true inside** a closure, **true inside a nested**
+one, and **false** outside and after. A counter that read zero inside would make the
+assertion vacuous, and a vacuous assertion passes every test; that is exactly what
+the case is for. `mpos-kunit` went **41 → 42** on both arms.
+
+What the assertion converts is the *class*: the bug could only be found by
+corruption (a fault resolved twice), which needs luck; the violation is now a named
+halt with the rule and the pointer in the message. The assertion cannot fire on a
+correct kernel by construction, so it costs one relaxed load per borrow.
+
+The attempts, kept because the negatives are the reason the pin took this shape:
+
+**What was *not* proven by reproduction.** No counterfactual for the corruption. Three attempts, all recorded because the negative is the finding:
 
 1. a single-threaded probe faulting a private mapping of a 512 KiB file in strided
    order, **20 rounds**, on the guest's ramfs root: no corruption;
@@ -17101,7 +17123,14 @@ work, named rather than papered over: **AGENTS.md §3 rule 6 says a gap gets a p
 it is not done, and by that rule this item is not done** - it is a fix landed against
 a mechanism proven by reading, with the pin owed.
 
-**Gate.** `build/gate-item301.log`, `GATE_EXIT=0`, both arms in one run on the
+**Gate.** `build/gate-item301b.log` (with the assertion and the boot case),
+`GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed (45.20 s);
+stage 2 **324** programs over 6 lanes on x86_64 (42.05 s) and **320** on aarch64
+(54.03 s); `pass=324 fail=0` / `pass=320 fail=0`, and **`mpos-kunit 42 passed, 0
+failed`** per arm - the new case runs on both machines; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`.
+
+The earlier run `build/gate-item301.log`, `GATE_EXIT=0`, both arms in one run on the
 **fixed** kernel: stage 1 **1340** host tests 0 failed (63.43 s); stage 2 **324**
 programs over 6 lanes on x86_64 (42.82 s) and **320** on aarch64 (56.44 s);
 `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm;
