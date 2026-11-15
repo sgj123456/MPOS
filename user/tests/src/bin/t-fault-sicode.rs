@@ -28,23 +28,21 @@
 //! handler (`t-fault-at-trap` pins that half). `MPOS_ON_HOST=1` runs the same
 //! fixture against real Linux.
 //!
-//! This is x86_64's own entry: aarch64's refused EL0 faults still die without
-//! queueing a record at all (`docs/notes/` §6.159's named gap), so the program
-//! joins `tests.toml`'s `[aarch64] gaps` rather than claiming an answer there.
+//! Both machines run this. It was x86_64's own while aarch64's refused EL0
+//! faults still died without queueing a record at all; that gap closed with the
+//! machine-neutral `FaultKind` seam, which is what lets the same four claims be
+//! asked of a `Data Abort`/`Instruction Abort` as of a `#PF`
+//! (`docs/notes/` §6.165). Nothing below names a vector - the questions are
+//! "does a mapping describe this address" and "what did the record say", which
+//! are the same questions on both machines.
 
-#[cfg(target_arch = "x86_64")]
 use core::cell::Cell;
-#[cfg(target_arch = "x86_64")]
 use mpos_user_tests::Report;
-#[cfg(target_arch = "x86_64")]
 use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
-#[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `SEGV_MAPERR` / `SEGV_ACCERR`, the two answers Linux's rule can give.
-#[cfg(target_arch = "x86_64")]
 const SEGV_MAPERR: i32 = 1;
-#[cfg(target_arch = "x86_64")]
 const SEGV_ACCERR: i32 = 2;
 
 /// Where the handler records what it saw: **shared memory**, because a
@@ -57,22 +55,16 @@ const SEGV_ACCERR: i32 = 2;
 ///
 /// `[0]` is the number of times a handler ran, `[1]` its `si_code`, `[2]` its
 /// `si_addr`.
-#[cfg(target_arch = "x86_64")]
 const SLOT_RAN: usize = 0;
-#[cfg(target_arch = "x86_64")]
 const SLOT_CODE: usize = 1;
-#[cfg(target_arch = "x86_64")]
 const SLOT_ADDR: usize = 2;
-#[cfg(target_arch = "x86_64")]
 static SEE: AtomicU64 = AtomicU64::new(0);
 
 /// The shared record's address, for the handler to find.
-#[cfg(target_arch = "x86_64")]
 fn seen() -> *mut u64 {
     SEE.load(Ordering::SeqCst) as *mut u64
 }
 
-#[cfg(target_arch = "x86_64")]
 extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
     let _ = sig;
     let at = seen();
@@ -92,7 +84,6 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut l
 }
 
 /// Install the handler this program's trials rely on.
-#[cfg(target_arch = "x86_64")]
 fn install_handler() {
     unsafe {
         let mut sa: libc::sigaction = core::mem::zeroed();
@@ -106,7 +97,6 @@ fn install_handler() {
 
 /// Run one trial in a forked child and answer what its handler recorded, or
 /// `None` when the child never faulted.
-#[cfg(target_arch = "x86_64")]
 fn trial(
     r: &mut Report,
     label: &str,
@@ -184,18 +174,15 @@ fn trial(
 }
 
 /// Read one byte through a pointer the compiler cannot fold away.
-#[cfg(target_arch = "x86_64")]
 unsafe fn read_volatile(p: *const u8) -> u8 {
     unsafe { p.read_volatile() }
 }
 
 /// Write one byte through a pointer the compiler cannot fold away.
-#[cfg(target_arch = "x86_64")]
 unsafe fn write_volatile(p: *mut u8, v: u8) {
     unsafe { p.write_volatile(v) }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn main() {
     let mut r = Report::new();
     let host = mpos_user_tests::host_run();
@@ -338,9 +325,4 @@ fn main() {
         println!("note: this host's answers are Linux's; the guest arm pins the kernel's");
     }
     r.finish()
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn main() {
-    println!("t-fault-sicode: skipped (aarch64 has no ESR->signal map yet)");
 }
