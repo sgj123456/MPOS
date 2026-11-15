@@ -33,7 +33,8 @@
 
 use mpos_user_tests::Report;
 use rustix::io::Errno;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 /// How many times the CPU-clock handler ran.
 static CPU_FIRED: AtomicUsize = AtomicUsize::new(0);
@@ -233,6 +234,80 @@ fn burn_until(fired: &AtomicUsize, want: usize, budget: u32) -> u32 {
         }
     }
     chunk
+}
+
+/// Released by the main thread once the pair's target is blocked and listening:
+/// a target that read too early would report 0 records for a reason that is the
+/// fixture's, not the kernel's.
+static PAIR_RELEASE: AtomicBool = AtomicBool::new(false);
+/// The pair's target thread's tid, published once it is blocked.
+static PAIR_TARGET_TID: AtomicI32 = AtomicI32::new(0);
+
+/// This thread's own kernel tid, which is what `SIGEV_THREAD_ID` names.
+fn current_tid() -> i32 {
+    // SAFETY: `gettid` takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// `signalfd(-1, {signals}, NONBLOCK|CLOEXEC)`, or `None` when refused.
+fn make_signalfd(signals: &[i32]) -> Option<OwnedFd> {
+    // SAFETY: a zeroed `sigset_t` is the empty set; the calls below fill this one.
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in signals {
+            libc::sigaddset(&mut set, *sig);
+        }
+        let raw = libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+        (raw >= 0).then(|| OwnedFd::from_raw_fd(raw))
+    }
+}
+
+/// How many complete 128-byte records are queued on `fd` right now.
+fn drain_records(fd: &OwnedFd) -> usize {
+    let mut buf = [0u8; 128];
+    let mut count = 0;
+    loop {
+        // SAFETY: `buf` is this program's own 128 bytes and `fd` is live.
+        let n = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if n != 128 {
+            return count;
+        }
+        count += 1;
+    }
+}
+
+/// Block `sig` on this thread.
+fn block_signal(sig: i32) -> bool {
+    // SAFETY: a set this thread owns; `SIG_BLOCK` with it cannot fail for a
+    // valid signal number.
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()) == 0
+    }
+}
+
+/// Unblock `sig` on this thread, ignoring it first so a queued record cannot end
+/// the program when the mask comes off (the shape `t-sfd-timer-record` records).
+fn unblock_signal(sig: i32) -> bool {
+    // SAFETY: as `block_signal`, plus a `SIG_IGN` action this thread owns.
+    unsafe {
+        let mut action: libc::sigaction = core::mem::zeroed();
+        action.sa_sigaction = libc::SIG_IGN;
+        libc::sigaction(sig, &action, core::ptr::null_mut());
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut()) == 0
+    }
 }
 
 fn main() {
@@ -445,6 +520,124 @@ fn main() {
             );
         }
         let _ = timer_delete(threaded);
+    }
+
+    // === the clock's thread is not the signal's thread ======================
+    //
+    // Item 288 left this pair unwitnessed: a timer whose **clock** names the
+    // creating thread's CPU while its `SIGEV_THREAD_ID` names a *different*
+    // thread. Measured on Linux 7.3.4 (`build/scratch/thrsig/t.c`), and the two
+    // roles are independent:
+    //
+    //  * `timer_create` accepts the pair;
+    //  * the expiry is driven by the **clock's** thread's CPU - the target thread
+    //    burns none, and the records appear only while the creator burns;
+    //  * the record goes to the **named** thread, not to the one whose CPU fired
+    //    it and not to the process;
+    //  * and when the clock's thread exits the clock still ends (`timer_gettime`
+    //    0/0, re-arm `ESRCH`) even though the named thread is alive and still
+    //    has somewhere to put a record.
+    //
+    // The pin asserts the *routing* and the *end*, not how many expiries there
+    // were: the count is how long the burn ran, which is the machine's speed
+    // (the same 120 M-iteration loop is 499 ms on the host and 1635 ms under
+    // TCG), so a count claim would be a claim about the host.
+    let pair_signo = libc::SIGRTMIN() + 5;
+    let pair_ok = block_signal(pair_signo);
+    r.check(
+        &format!("the pair's signal can be blocked ({pair_ok})"),
+        pair_ok,
+    );
+    if pair_ok {
+        // The TARGET thread: blocks the signal, owns a signalfd, burns no CPU,
+        // and reports how many records it was handed.
+        let target = std::thread::spawn(move || {
+            let tid = current_tid();
+            // Publish the tid the instant this thread is the one that will
+            // receive the record: the main thread waits for exactly this, since
+            // aiming at 0 (or at another thread) is `EINVAL`.
+            PAIR_TARGET_TID.store(tid, Ordering::SeqCst);
+            let mut got = 0;
+            let fd = make_signalfd(&[pair_signo]);
+            // Told the main thread it is ready by parking until released.
+            while !PAIR_RELEASE.load(Ordering::SeqCst) {
+                if let Some(fd) = fd.as_ref() {
+                    got += drain_records(fd);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if let Some(fd) = fd.as_ref() {
+                got += drain_records(fd);
+            }
+            (tid, got)
+        });
+        // Wait for the target to be blocked and listening.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let target_tid = PAIR_TARGET_TID.load(Ordering::SeqCst);
+
+        // The CLOCK's thread creates the timer, so `CLOCK_THREAD_CPUTIME_ID` is
+        // *its* clock, and aims the signal at the target's tid.
+        let creator = std::thread::spawn(move || {
+            let mut ev = SigEvent::none();
+            ev.signo = pair_signo;
+            ev.notify = libc::SIGEV_THREAD_ID;
+            // The tid lives in the union at byte **16**, not in `sigval` at 0 -
+            // measured on both libcs (`offsetof(sigevent, sigev_notify_thread_id)`
+            // is 16 in musl and glibc alike), and putting it at 0 is `EINVAL`
+            // from a kernel that cannot find the thread it was told to aim at.
+            ev.un[0..4].copy_from_slice(&target_tid.to_ne_bytes());
+            let mut timer: i32 = -1;
+            let made = timer_create(3 /* CLOCK_THREAD_CPUTIME_ID */, &ev, &mut timer);
+            if made != Ok(0) {
+                return Err(made.err());
+            }
+            if timer_settime(timer, &Itimerspec::periodic(20, 20)) != Ok(0) {
+                return Err(None);
+            }
+            // Burn THIS thread's CPU: the clock is this thread's.
+            let mut x = 0.0f64;
+            for i in 0..40_000_000u64 {
+                x += (i & 1) as f64;
+            }
+            std::hint::black_box(x);
+            Ok(timer)
+        });
+        let made = creator.join().expect("the clock's thread joins");
+        r.check(
+            &format!("a timer can hold a thread clock and a different target thread ({made:?})"),
+            made.is_ok(),
+        );
+        if let Ok(timer) = made {
+            PAIR_RELEASE.store(true, Ordering::SeqCst);
+            let (tid, got) = target.join().expect("the target thread joins");
+            r.check(
+                &format!("the record goes to the named thread ({got} records on tid {tid})"),
+                got > 0,
+            );
+            // The clock's thread is gone; the named thread is not. The clock
+            // still ends, which is the half that says the two roles are
+            // independent.
+            let mut now = Itimerspec {
+                interval: TimeSpec::zero(),
+                value: TimeSpec::zero(),
+            };
+            let read = timer_gettime(timer, &mut now);
+            r.check(
+                &format!("when the clock's thread exits the timer is still readable ({read:?})"),
+                read == Ok(0),
+            );
+            r.check(
+                "and disarmed, though the named thread still lives",
+                now.value.tv_sec == 0 && now.value.tv_nsec == 0,
+            );
+            let rearm = timer_settime(timer, &Itimerspec::one_shot(1000));
+            r.check(
+                &format!("re-arming answers ESRCH ({rearm:?})"),
+                rearm == Err(Errno::SRCH),
+            );
+            let _ = timer_delete(timer);
+        }
+        let _ = unblock_signal(pair_signo);
     }
 
     // === the clocks that stay refused ======================================
