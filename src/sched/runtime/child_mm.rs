@@ -411,7 +411,105 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> crate::hal::kernel::Fault
     if super::super::userfault::deliver(pframe::align_down(virt, PAGE_SIZE), write) {
         return crate::hal::kernel::FaultAnswer::Resolved;
     }
-    with_table(|t| populate_in(t, root, virt, write, false))
+    // The **object's** page is fetched *before* the table is borrowed, and that
+    // ordering is the whole of this function's second half. `frame_at` reads the
+    // page from the filesystem, and a block transfer **parks its task** (§10.5) -
+    // so calling it inside `with_table`'s closure switches tasks under a
+    // borrowed table, which that function's own contract forbids ("`f` must not
+    // switch tasks", `task.rs`). The `userfaultfd` branch above is deferred for
+    // exactly the same reason.
+    //
+    // What the violation looked like: weston's DRM backend, faulting a private
+    // file mapping of `libgallium`, died with
+    // `segfault at 7e6c19762100 … error 4` - a **read of a page that was
+    // present** by the time the diagnostic printed (`PFDIAG pte=…025 P=1 W=0
+    // U=1`), because the fault had already been resolved by the very transfer
+    // that then corrupted the borrow. Intermittent because it needs the page to
+    // be a *cache miss*: a hit never parks (`docs/notes/` §6.181).
+    //
+    // The frame is claimed here, and adopted inside the borrow below. A frame
+    // claimed but not adopted is freed by `populate_claimed`, so the two arms
+    // stay one owner.
+    let claimed = claim_object_page(root, virt, write, false);
+    with_table(|t| match claimed {
+        Some((page, frame)) => adopt_claimed(t, root, page, frame),
+        None => populate_in(t, root, virt, write, false),
+    })
+}
+
+/// The object-backed half of a fault, resolved **without** the task table.
+///
+/// `Some((page, frame))` when the fault names a page of a `Frames` mapping and
+/// the object produced one - the caller adopts it under the table borrow.
+/// `None` covers every other case (an `Anon` page, no VMA, a permission
+/// refusal, an object that refused), which the caller then answers through
+/// [`populate_in`] as before. The table is read here only long enough to learn
+/// *which* object and index to ask, which cannot park.
+fn claim_object_page(root: usize, virt: usize, write: bool, force: bool) -> Option<(usize, usize)> {
+    let page = pframe::align_down(virt, PAGE_SIZE);
+    let (object, index, _prot) = with_table(|t| {
+        let owner = owner_of_root(t, root)?;
+        let owner = t.space_owner(owner);
+        let task = t.tasks[owner.0].as_ref()?;
+        let mm = Arc::clone(&task.mm);
+        let vma = mm.vma_at(page)?;
+        if !vma.permits(write) && !force {
+            return None;
+        }
+        match &vma.kind {
+            crate::mm::vma::VmaKind::Frames { object, offset, .. } => {
+                let index = ((offset + (page - vma.start)) / PAGE_SIZE) as u64;
+                Some((Arc::clone(object), index, vma.prot))
+            }
+            crate::mm::vma::VmaKind::Anon => None,
+        }
+    })?;
+    // **Outside** the borrow: this is the call that may park.
+    let frame = object.frame_at(index)?;
+    Some((page, frame))
+}
+
+/// Adopt a frame [`claim_object_page`] already brought in: map it, charge it,
+/// and count the fault.
+fn adopt_claimed(
+    t: &mut Table,
+    root: usize,
+    page: usize,
+    frame: usize,
+) -> crate::hal::kernel::FaultAnswer {
+    use crate::hal::kernel::FaultAnswer;
+    let Some(owner) = owner_of_root(t, root) else {
+        crate::mm::free_frames(frame, 0);
+        return FaultAnswer::Refused;
+    };
+    let owner = t.space_owner(owner);
+    let Some(task) = t.tasks[owner.0].as_mut() else {
+        crate::mm::free_frames(frame, 0);
+        return FaultAnswer::Refused;
+    };
+    let mm = Arc::clone(&task.mm);
+    let Some(space) = task.space.as_mut() else {
+        crate::mm::free_frames(frame, 0);
+        return FaultAnswer::Refused;
+    };
+    let Some(vma) = mm.vma_at(page) else {
+        crate::mm::free_frames(frame, 0);
+        return FaultAnswer::Refused;
+    };
+    if space
+        .try_map(Mapping {
+            virt: page,
+            phys: frame,
+            length: PAGE_SIZE,
+            flags: vma.prot,
+        })
+        .is_err()
+    {
+        crate::mm::free_frames(frame, 0);
+        return FaultAnswer::Refused;
+    }
+    mm.own(frame);
+    FaultAnswer::Resolved
 }
 
 /// [`resolve_anon_fault`] for an address space named by its root rather than by
@@ -424,8 +522,16 @@ pub fn resolve_anon_fault(virt: usize, write: bool) -> crate::hal::kernel::Fault
 /// the *fault handler's* answer, for a process faulting on its own memory
 /// (`docs/notes/` §8.0).
 pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
-    with_table(|t| populate_in(t, root, virt, write, false))
-        == crate::hal::kernel::FaultAnswer::Resolved
+    // The same two halves as [`resolve_anon_fault`]: claim the object's page
+    // outside the borrow, adopt it inside. This door is reached from
+    // `process_vm_readv`, `PTRACE_POKEDATA` and `/proc/<pid>/mem`, so the page it
+    // brings in is as likely to be a file cache miss as a fault's is - and a
+    // miss **parks** (§10.5), which `with_table`'s closure must not do.
+    let claimed = claim_object_page(root, virt, write, false);
+    with_table(|t| match claimed {
+        Some((page, frame)) => adopt_claimed(t, root, page, frame),
+        None => populate_in(t, root, virt, write, false),
+    }) == crate::hal::kernel::FaultAnswer::Resolved
 }
 
 /// [`populate_user_page_at`] with Linux's `FOLL_FORCE`: bring the page in even
@@ -438,8 +544,12 @@ pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
 /// reaches this - [`resolve_anon_fault`] keeps the permission check, because a
 /// ring-3 store into a read-only page is still `SIGSEGV`.
 pub fn populate_forced_page_at(root: usize, virt: usize, write: bool) -> bool {
-    with_table(|t| populate_in(t, root, virt, write, true))
-        == crate::hal::kernel::FaultAnswer::Resolved
+    // Same split, with `force` keeping Linux's `FOLL_FORCE` permission answer.
+    let claimed = claim_object_page(root, virt, write, true);
+    with_table(|t| match claimed {
+        Some((page, frame)) => adopt_claimed(t, root, page, frame),
+        None => populate_in(t, root, virt, write, true),
+    }) == crate::hal::kernel::FaultAnswer::Resolved
 }
 
 /// Break the copy-on-write page `virt` names in the address space `root` names,
