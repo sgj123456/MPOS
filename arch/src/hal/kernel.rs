@@ -142,6 +142,19 @@ pub trait Kernel: Sync {
     /// the same shape as [`report_user_trap`](Kernel::report_user_trap).
     fn signal_for_trap(&self, vector: u8) -> u8;
 
+    /// The kernel's own word for a CPU exception, given its vector.
+    ///
+    /// A ring-0 exception ends the machine, and the report it leaves behind has
+    /// to say *which* one it was - a `#UD` in the kernel and a `#GP` in the
+    /// kernel are different bugs and the words differ. The table lives with
+    /// the rest of the trap vocabulary (it is the same one `traps:` lines use),
+    /// so this seam carries the number rather than the machine layer growing a
+    /// second copy that could drift from the first. Measured fact behind
+    /// keeping one table: the door that served six vectors named every one of
+    /// them "general protection fault" until 2026-11-14 (`docs/notes/`
+    /// §6.158).
+    fn trap_name(&self, vector: u8) -> &'static str;
+
     /// Queue the signal a synchronous CPU exception raised, **with its
     /// fault-shaped `siginfo_t` record**, and answer the signal number the
     /// caller must then use for its disposition and death checks.
@@ -666,6 +679,12 @@ pub fn report_user_trap(vector: u8, ip: usize, sp: usize, error: usize) {
 #[inline]
 pub fn signal_for_trap(vector: u8) -> u8 {
     registered().signal_for_trap(vector)
+}
+
+/// The kernel's own word for a CPU exception. See [`Kernel::trap_name`].
+#[inline]
+pub fn trap_name(vector: u8) -> &'static str {
+    registered().trap_name(vector)
 }
 
 /// Queue a CPU exception's fault-shaped record. See

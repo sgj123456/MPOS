@@ -1,22 +1,27 @@
 //! Interrupt Descriptor Table and dispatch.
 //!
-//! Two entries are hand-written asm; every other handler uses the
+//! Nine entries are hand-written asm; every other handler uses the
 //! `x86-interrupt` ABI (nightly-only), which lets the compiler emit the register
 //! save/restore and `iretq` itself. That composes with preemption: a handler can
 //! switch tasks without ever returning, because the trap frame stays on the
 //! interrupted task's own stack and unwinds normally whenever that task is
 //! resumed.
 //!
-//! The two exceptions share a reason - the one thing the ABI cannot give:
+//! The nine share one reason - the one thing the ABI cannot give:
 //! `x86-interrupt` hides the general registers behind a prologue Rust cannot
 //! address, and a handled signal has to be handed over *at the trap* - Linux's
 //! delivery point - which means rewriting the interrupted program's whole
-//! register file. Both stubs push a [`TrapRegs`] block, call Rust, pop and
+//! register file. Each stub pushes a [`TrapRegs`] block, calls Rust, pops and
 //! `iretq`. The PIT entry ([`timer_stub`]) has done this since signals were
-//! first delivered at a trap; the page-fault entry ([`page_fault_stub`]) does
-//! it so a fault a task installed a `SIGSEGV` handler for enters that handler
-//! here, instead of waiting for the next tick to deliver - a measured 2/16 in a
-//! guest (`docs/notes/` §6.161). It is the same block shape `syscall_entry`
+//! first delivered at a trap. The page-fault entry ([`page_fault_stub`]) does it
+//! so a fault a task installed a `SIGSEGV` handler for enters that handler here
+//! rather than waiting for the next tick - a measured 2/16 in a guest
+//! (`docs/notes/` §6.161). The seven CPU exceptions a process can see
+//! ([`trap_common`]'s entries, `#DE`/`#BP`/`#UD`/`#NP`/`#SS`/`#GP`/`#AC`) joined
+//! them on 2026-11-15 for the same reason: a queued signal waits for a syscall
+//! boundary a faulting instruction never reaches, so `div0` died of `SIGFPE`
+//! "it could not be handed" instead of running its handler
+//! (`docs/notes/` §6.164). These stubs are the same block shape `syscall_entry`
 //! builds, which is what lets one `hal::capture_trap_regs` serve every door onto
 //! a user register file (`docs/notes/` §2.13). A hand-written stub buys control
 //! over the exact frame layout, and only an entry that must build a *signal*
@@ -71,12 +76,30 @@ pub fn init() {
     let idt = IDT.call_once(|| {
         let mut table = InterruptDescriptorTable::new();
 
-        table.divide_error.set_handler_fn(divide_error);
-        table
-            .breakpoint
-            .set_handler_fn(breakpoint)
-            .set_privilege_level(PrivilegeLevel::Ring3);
-        table.invalid_opcode.set_handler_fn(invalid_opcode);
+        // Every CPU exception a process can see is a hand-written stub, not an
+        // `x86-interrupt` handler: a handled `SIGILL`/`SIGFPE`/`SIGTRAP` has to
+        // be entered *at the trap*, which means rewriting the program's whole
+        // register file - and the ABI hides those registers behind a prologue
+        // Rust cannot address (module doc, `docs/notes/` §6.164).
+        //
+        // `#BP` keeps its DPL of 3: a software `int3` from ring 3 is checked
+        // against the gate's privilege, so a ring-0 gate refuses the
+        // instruction and raises `#GP(0x1a)` instead - whose error word names
+        // vector 3 as the one it could not deliver. Musl's `a_crash()` and
+        // chromium's padding are `int3` bytes, so that refusal turned an
+        // ordinary trap into a protection fault (`docs/notes/` §6.159).
+        unsafe {
+            table
+                .divide_error
+                .set_handler_addr(x86_64::VirtAddr::new(trap_de as *const () as u64));
+            table
+                .breakpoint
+                .set_handler_addr(x86_64::VirtAddr::new(trap_bp as *const () as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+            table
+                .invalid_opcode
+                .set_handler_addr(x86_64::VirtAddr::new(trap_ud as *const () as u64));
+        }
         // The one vector that gets a stack of its own, and it is not a
         // tidiness. Every other fault pushes its frame on the stack it just found
         // unusable; if that push is what failed, the fault promotes to `#DF`, and a
@@ -99,19 +122,23 @@ pub fn init() {
                 .set_handler_fn(double_fault)
                 .set_stack_index(DOUBLE_FAULT_IST as u16);
         }
-        table
-            .general_protection_fault
-            .set_handler_fn(general_protection);
         unsafe {
+            table
+                .general_protection_fault
+                .set_handler_addr(x86_64::VirtAddr::new(trap_gp as *const () as u64));
             table
                 .page_fault
                 .set_handler_addr(x86_64::VirtAddr::new(page_fault_stub as *const () as u64));
+            table
+                .stack_segment_fault
+                .set_handler_addr(x86_64::VirtAddr::new(trap_ss as *const () as u64));
+            table
+                .segment_not_present
+                .set_handler_addr(x86_64::VirtAddr::new(trap_np as *const () as u64));
+            table
+                .alignment_check
+                .set_handler_addr(x86_64::VirtAddr::new(trap_ac as *const () as u64));
         }
-        table.stack_segment_fault.set_handler_fn(stack_segment);
-        table
-            .segment_not_present
-            .set_handler_fn(segment_not_present);
-        table.alignment_check.set_handler_fn(alignment_check);
         // Vector 7: raised by the first floating-point instruction a task runs
         // after a switch set `CR0.TS`, which is how the deferred half of the
         // FPU switch is delivered. Not an error path - it is the mechanism.
@@ -417,70 +444,161 @@ extern "x86-interrupt" fn virtio_net(_frame: InterruptStackFrame) {
     crate::hal::kernel::preempt();
 }
 
-/// `#BP` has two callers and they are not the same event.
+/// A CPU exception taken in **ring 3**, entering through one of the stubs above.
 ///
-/// The boot's own check executes `int3` in **ring 0** (`src/board/suites.rs`),
-/// and counts on returning from this handler with the counter moved: that is a
-/// kernel probe, not a process's trap, and it must stay a no-op with a print.
+/// The one printed line matters more than it looks: a trap in ring 3 means user
+/// code executed something the CPU refuses to complete, and the only evidence
+/// that it happened is this line. Silently converting it to a signal leaves the
+/// bytes, which are the diagnostic, on the floor.
 ///
-/// A ring-3 `int3` is a program's breakpoint instruction and Linux answers it
-/// with `SIGTRAP`. The gate's DPL is 3 now (`init`), so the instruction reaches
-/// this handler at all - with DPL 0 the CPU refused the software interrupt at
-/// the gate and raised `#GP(0x1a)`, whose `error` word names vector 3 as the
-/// one it could not deliver. Musl's `a_crash()` and chromium's padding are
-/// `int3` bytes, so that refusal turned an ordinary trap into a protection
-/// fault and sent the reader after a fault that never happened. Ring 3 goes
-/// down the same trap door as the other six vectors, with vector 3, and the
-/// kernel's map answers `SIGTRAP` for it (`docs/notes/` §6.159).
-extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
-    if (frame.instruction_pointer.as_u64() as usize) < (1 << 47) {
-        user_fault_or_die(&frame, 3, 0);
+/// `vector` is which trap it was: this door serves seven (`#BP` 3, `#DE` 0,
+/// `#UD` 6, `#NP` 11, `#SS` 12, `#GP` 13, `#AC` 17), and the stub passes its own
+/// number because the frame does not carry it. Until 2026-11-14 the line said
+/// `#GP` for all of them, so the `0f 0b` musl's `a_crash` runs after the
+/// allocator has found the heap corrupted was reported as a protection fault - a
+/// word that sends the reader after a fault that was never raised
+/// (`docs/notes/` §6.158).
+///
+/// The *first* fault is reported in full: the vector, the error code, the bytes
+/// of the instruction the CPU refused, and the stack pointer it refused them on.
+/// That is because the interesting ring-3 traps are one instruction made illegal
+/// by kernel state the process cannot see, and the bytes name it. The rest are
+/// the process retrying the same instruction, which Linux logs too, rate
+/// limited, and which would otherwise bury the first one.
+///
+/// What happens after the report is the vector's own signal, not one signal for
+/// the whole door. The map was measured one instruction at a time on Linux
+/// 7.2.14 (`docs/notes/` §6.159): `#DE` ends the child `SIGFPE`, `#UD` `SIGILL`,
+/// `#BP` `SIGTRAP`, `#AC` `SIGBUS`, and `#SS`/`#NP`/`#GP` `SIGSEGV`. A parent's
+/// `wait` reads that number back through `WTERMSIG`, so a door that answers
+/// `SIGSEGV` for a `ud2` is not a cosmetic difference - it tells the caller a
+/// different event happened.
+///
+/// A handler the process installed is entered **here**, at the trap: the stub
+/// hands over a [`TrapRegs`] block, so `deliver_at_trap` rewrites the program's
+/// register file and this returns into the handler instead of returning to the
+/// faulting instruction. Until 2026-11-15 these entries were `x86-interrupt`
+/// handlers, which hide the general registers behind a prologue Rust cannot
+/// address, so the signal was queued and waited for the next tick - and a
+/// `div0` died of `SIGFPE` "it could not be handed" before one arrived
+/// (measured in a guest: `docs/notes/` §6.164). What is left of the old shape is
+/// the repeat guard, which still ends a task whose handler returns to the same
+/// instruction for ever.
+extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
+    if frame.is_null() {
         return;
     }
+    let (rip, rsp, rflags) = unsafe { ((*frame).rip, (*frame).rsp, (*frame).rflags) };
+    let vector = vector as u8;
+    // One table answers both halves: the signal number (Item 279) and the
+    // fault-shaped `siginfo_t` record (Item 280). A trap with no faulting
+    // address passes zero; `#DE`/`#UD` name `rip` as their `si_addr`, and
+    // `#BP`'s is zero because the CPU hands over the address *after* the
+    // instruction and there is nothing the program wrote that faults.
+    let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip);
+    if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
+        // Only up to the end of the page the instruction is on: a read past it
+        // would fault inside the handler, and a double fault would take the
+        // machine down instead of reporting anything.
+        let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
+        let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+        crate::hal::kernel::kprintln!(
+            "  trap {vector} code {:#x} rip {:#x} rsp {:#x} rflags {:#x}",
+            code,
+            rip,
+            rsp,
+            rflags
+        );
+        crate::hal::kernel::kprintln!("  bytes at rip: {:02x?}", bytes);
+    }
+    crate::hal::kernel::report_user_trap(vector, rip, rsp, code as usize);
+    if crate::hal::kernel::disposition_is_default(sig) {
+        crate::hal::kernel::die_of_fatal_signal(sig);
+    }
+    // The delivery point, and the reason these entries are hand-written: the
+    // block is a register file this kernel can rewrite, so the handler runs now
+    // rather than at whatever syscall the process makes next - which for a
+    // faulting instruction is never.
+    #[cfg(mpos_signal_frame)]
+    {
+        if crate::hal::kernel::deliver_at_trap(frame as *mut ()) {
+            return;
+        }
+    }
+    if fault_repeats(rip) {
+        crate::hal::kernel::kprintln!(
+            "task {} died of signal {sig} it could not be handed: trap {vector} code {code:#x} \
+             at {rip:#x}, the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
+            crate::hal::kernel::current()
+        );
+        crate::hal::kernel::die_of_fatal_signal(sig);
+    }
+    crate::hal::kernel::preempt();
+}
+
+/// A CPU exception taken in **ring 0**: a kernel bug, reported and fatal.
+///
+/// There is no signal to invent and no caller to return to, so the report is the
+/// whole point and this never returns. The raw facts arrive as arguments rather
+/// than as an [`InterruptStackFrame`] because the stub is what built the block -
+/// `base` is the `TrapRegs` it pushed, so the report can walk the kernel stack
+/// it interrupted.
+///
+/// The name comes from the kernel ([`crate::hal::kernel::trap_name`]) and not
+/// from the machine: one table serves this report and the `traps:` line, so a
+/// ring-0 `#UD` cannot be printed as a protection fault while a ring-3 one is
+/// named correctly. `code` is only a selector on `#GP`'s vectors, and printing
+/// it as one is the same judgement [`fatal`] makes for `#DF`.
+extern "C" fn rust_trap_kernel(
+    vector: u64,
+    code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    base: usize,
+) -> ! {
+    let vector = vector as u8;
+    crate::hal::kernel::force_serial();
+    crate::hal::kernel::kprintln!(
+        "\nKERNEL PANIC: {} (vector {vector})",
+        crate::hal::kernel::trap_name(vector)
+    );
+    if code != 0 {
+        crate::hal::kernel::kprintln!(
+            "  code {:#x}: gdt index {} ti {} rpl {}",
+            code,
+            code >> 3,
+            (code >> 2) & 1,
+            code & 3
+        );
+    }
+    crate::hal::kernel::kprintln!("  err {code:#x} rip {rip:#x} cs {cs:#x} rflags {rflags:#x}");
+    crate::hal::kernel::kprintln!(
+        "  rip is {} ({}), cs.rpl = {}",
+        if rip < (1 << 47) { "user" } else { "kernel" },
+        if rip & 0xfff == 0 {
+            "page-aligned"
+        } else {
+            "not page-aligned"
+        },
+        cs & 3
+    );
+    // `base` is the fifteen-register block the stub pushed, so the words above
+    // it are the kernel stack this fault landed on - which is what the walk
+    // wants, and the same start `fatal` uses for a `#DF`.
+    report_frames(base);
+    crate::hal::exit_qemu(crate::hal::TEST_EXIT_PANIC)
+}
+
+/// A `#BP` taken in **ring 0**: the boot's own probe, not a process's trap.
+///
+/// `src/board/suites.rs` executes `int3` at CPL 0 and counts on returning with
+/// the counter moved, so this path must count and return. The CPU has already
+/// pushed the address *after* the instruction, so the stub's epilogue resumes
+/// there with no adjustment - which is also why nothing here can fail.
+extern "C" fn rust_breakpoint_kernel(rip: u64) {
     BREAKPOINTS_CAUGHT.fetch_add(1, Ordering::Relaxed);
-    crate::hal::kernel::kprintln!("caught #BP at rip {:#x}", frame.instruction_pointer);
-}
-
-extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame, 0, 0) {
-        return;
-    }
-    fatal("#DE divide error", &frame, 0)
-}
-
-extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame, 6, 0) {
-        return;
-    }
-    fatal("#UD invalid opcode", &frame, 0)
-}
-
-extern "x86-interrupt" fn stack_segment(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, 12, code) {
-        return;
-    }
-    fatal("#SS stack segment", &frame, code)
-}
-
-extern "x86-interrupt" fn segment_not_present(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, 11, code) {
-        return;
-    }
-    fatal("#NP segment not present", &frame, code)
-}
-
-extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, 17, code) {
-        return;
-    }
-    fatal("#AC alignment check", &frame, code)
-}
-
-extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame, 13, code) {
-        return;
-    }
-    fatal("#GP general protection", &frame, code)
+    crate::hal::kernel::kprintln!("caught #BP at rip {:#x}", rip);
 }
 
 /// `#NM`, vector 7 - no error code, and no frame to inspect.
@@ -611,11 +729,12 @@ extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64) {
         return;
     }
 
-    // A kernel `#PF` is a bug, not a signal. A ring-0 trap pushed no `rsp`/`ss`,
-    // so the block's stack word is not a user stack pointer - walk from the
-    // frame's own address, which is the kernel stack the fault came from. The
-    // report is the whole point: on a `--mode mirror` boot the console is the
-    // framebuffer, so force it back to the wire before the machine stops.
+    // A kernel `#PF` is a bug, not a signal. A ring-0 trap's block carries the
+    // kernel's own `rsp`, not a user stack pointer, so it is no use as a walk
+    // start - walk from the frame's own address, which is the kernel stack the
+    // fault came from. The report is the whole point: on a `--mode mirror`
+    // boot the console is the framebuffer, so force it back to the wire before
+    // the machine stops.
     let kernel_stack = frame as usize + 160;
     crate::hal::kernel::force_serial();
     crate::hal::kernel::kprintln!(
@@ -691,9 +810,10 @@ core::arch::global_asm!(
     "    pop  rdx",
     "    pop  rsi",
     "    pop  rdi",
-    // What is left under rsp is the shifted CPU frame with no error-code word;
-    // `iretq` pops it exactly as far as the CS says to (ring 3 adds rsp/ss,
-    // ring 0 does not). A signal delivery rewrote rip/rsp/rflags in this frame,
+    // What is left under rsp is the shifted CPU frame with no error-code word.
+    // It is five words at every privilege level - in 64-bit mode the CPU pushes
+    // `SS:RSP` even for a same-ring trap (§6.164) - so `iretq` pops exactly
+    // what it pushed. A signal delivery rewrote rip/rsp/rflags in this frame,
     // so this same instruction enters the handler instead of re-faulting.
     "    iretq",
     // Restore the generic `.text` section so later `global_asm!`
@@ -704,6 +824,197 @@ core::arch::global_asm!(
 
 unsafe extern "C" {
     fn page_fault_stub();
+}
+
+core::arch::global_asm!(
+    ".section .text.trap_stubs, \"ax\"",
+    // Every CPU exception a process can see arrives here first.
+    //
+    // The `x86-interrupt` ABI hides the fifteen general registers behind a
+    // prologue Rust cannot address, which is why a handled trap could not be
+    // entered from the trap itself: the signal was queued and then waited for
+    // the next PIT tick to be handed over, and `fault_repeats` killed the
+    // process long before one arrived (measured in a guest: `int3` and `ud2`
+    // sometimes resumed, `div0` never did - it died of signal 8 "it could not
+    // be handed"). These entries build the same `TrapRegs` block `timer_stub`
+    // and `page_fault_stub` build, so `deliver_at_trap` can rewrite the
+    // program's registers and `iretq` enters the handler at the trap
+    // (`docs/notes/` §6.161, §6.164).
+    //
+    // Entry contract: each vector label pushes ONE tag word (the vector number)
+    // and jumps here. A vector with no error code pushes a zero first, so both
+    // shapes are identical from `trap_common` on:
+    //
+    //     [tag, code-or-zero, rip, cs, rflags, rsp, ss]
+    //
+    // One body therefore serves all seven entries, and the shift below deletes
+    // the tag/code pair so the block at `rbp` is a contiguous `TrapRegs`.
+    ".globl trap_common",
+    ".p2align 4",
+    "trap_common:",
+    "    push rdi",
+    "    push rsi",
+    "    push rdx",
+    "    push rcx",
+    "    push rax",
+    "    push r8",
+    "    push r9",
+    "    push r10",
+    "    push r11",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov  rbp, rsp",
+    // Fifteen pushes are 120 bytes: the tag is at +120, the code word below it
+    // at +128, and the CPU's frame from +136. `cs` is always at +144 whether or
+    // not the privilege change pushed `rsp`/`ss` after it.
+    "    mov  r15d, [rbp + 120]",
+    "    mov  rdx, [rbp + 128]",
+    // Shift the five-word CPU frame down over the tag/code pair, which `iretq`
+    // does not pop. This is done at *every* privilege level, because in 64-bit
+    // mode the CPU pushes `SS:RSP` even when the trap does not change rings -
+    // measured in a guest (`docs/notes/` §6.164): a ring-0 `int3` leaves
+    // `[rip, cs, rflags, rsp, ss]` on the stack. Shifting only three words there
+    // left `rsp`/`ss` reading the frame's neighbours, so `iretq` took the saved
+    // `rflags` for a selector and raised `#GP(0x280)` on the boot's own check.
+    //
+    // A forward `rep movsq` is safe because the destination is always two words
+    // below the source, so no unread source is overwritten. `cld` in case the
+    // program left DF set; rsi/rdi/rcx are scratch here and their saved values
+    // are in the block.
+    "    cld",
+    "    lea  rsi, [rbp + 136]",
+    "    lea  rdi, [rbp + 120]",
+    "    mov  ecx, 5",
+    "    rep  movsq",
+    // The block at rbp is a contiguous `TrapRegs` now, so `cs` is at +128 and
+    // the ring test can be made after the shift for both halves.
+    "    mov  rax, [rbp + 128]",
+    "    and  eax, 3",
+    "    cmp  eax, 3",
+    "    jne  3f",
+    // arg1 = the `TrapRegs` block, arg2 = vector, arg3 = error code.
+    "    mov  rdi, rbp",
+    "    mov  rsi, r15",
+    "    and  rsp, -16",
+    "    call {rust_trap}",
+    "    mov  rsp, rbp",
+    // Both halves rejoin here: a ring-0 `#BP` counts its breakpoint and returns
+    // to the instruction after it (the boot's own check runs `int3` in ring 0
+    // and counts on coming back), while every other ring-0 exception has
+    // already ended the machine inside `rust_trap_kernel`.
+    "6:",
+    "    pop  r15",
+    "    pop  r14",
+    "    pop  r13",
+    "    pop  r12",
+    "    pop  rbp",
+    "    pop  rbx",
+    "    pop  r11",
+    "    pop  r10",
+    "    pop  r9",
+    "    pop  r8",
+    "    pop  rax",
+    "    pop  rcx",
+    "    pop  rdx",
+    "    pop  rsi",
+    "    pop  rdi",
+    // What is left under rsp is the shifted CPU frame; `iretq` pops it as far
+    // as the CS says to. A delivery rewrote rip/rsp/rflags in it, so this
+    // enters the handler rather than re-faulting.
+    "    iretq",
+    // Ring 0: the vector decides, because one of them must come back.
+    //
+    // `#BP` is that one: the boot's own check runs `int3` in ring 0 and counts
+    // on returning to the instruction after it (`src/board/suites.rs`). The CPU
+    // has already pushed the *following* address, so the only work is to count
+    // it and unwind - which is why this path keeps its registers and its frame
+    // instead of ending the machine.
+    //
+    // Every other exception taken in ring 0 is a kernel bug: there is no
+    // signal to invent and no caller to return to. The report is the whole
+    // point and it never returns, so nothing is restored; the frame base goes
+    // along so the report can walk the kernel stack it interrupted.
+    "3:",
+    "    cmp  r15d, 3",
+    "    jne  4f",
+    // Ring 0 `#BP`: the block is already a `TrapRegs`, the CPU saved the
+    // address *after* the `int3` in rip, and the shared epilogue pops it back.
+    "    mov  rdi, [rbp + 120]",
+    "    and  rsp, -16",
+    "    call {rust_breakpoint_kernel}",
+    "    mov  rsp, rbp",
+    // Backwards: the shared epilogue sits above this ring-0 half, and it is
+    // reached by falling through `iretq` only from the ring-3 door.
+    "    jmp  6b",
+    "4:",
+    "    mov  rdi, r15",
+    "    mov  rsi, rdx",
+    "    mov  rdx, [rbp + 120]",
+    "    mov  rcx, [rbp + 128]",
+    "    mov  r8, [rbp + 136]",
+    "    mov  r9, rbp",
+    "    and  rsp, -16",
+    "    call {rust_trap_kernel}",
+    "    ud2",
+    // `#BP` reaches the common body like every other vector now.
+    ".globl trap_bp",
+    ".p2align 4",
+    "trap_bp:",
+    "    push 0",
+    "    push 3",
+    "    jmp  trap_common",
+    ".globl trap_de",
+    ".p2align 4",
+    "trap_de:",
+    "    push 0",
+    "    push 0",
+    "    jmp  trap_common",
+    ".globl trap_ud",
+    ".p2align 4",
+    "trap_ud:",
+    "    push 0",
+    "    push 6",
+    "    jmp  trap_common",
+    ".globl trap_np",
+    ".p2align 4",
+    "trap_np:",
+    "    push 11",
+    "    jmp  trap_common",
+    ".globl trap_ss",
+    ".p2align 4",
+    "trap_ss:",
+    "    push 12",
+    "    jmp  trap_common",
+    ".globl trap_gp",
+    ".p2align 4",
+    "trap_gp:",
+    "    push 13",
+    "    jmp  trap_common",
+    ".globl trap_ac",
+    ".p2align 4",
+    "trap_ac:",
+    "    push 17",
+    "    jmp  trap_common",
+    // Restore the generic `.text` section so later fragments that name no
+    // section do not inherit ours.
+    ".section .text, \"ax\"",
+    rust_trap = sym rust_trap,
+    rust_trap_kernel = sym rust_trap_kernel,
+    rust_breakpoint_kernel = sym rust_breakpoint_kernel,
+);
+
+unsafe extern "C" {
+    fn trap_bp();
+    fn trap_de();
+    fn trap_ud();
+    fn trap_np();
+    fn trap_ss();
+    fn trap_gp();
+    fn trap_ac();
 }
 
 /// How many words of the faulting kernel stack are walked for return addresses.
@@ -1146,96 +1457,6 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
     );
     report_frames(frame.stack_pointer.as_u64() as usize);
     crate::hal::exit_qemu(crate::hal::TEST_EXIT_PANIC)
-}
-
-/// If the faulting rip is in the lower half (user mode), end the task or send
-/// it a signal, and return `true`. Otherwise return `false` so the caller can
-/// panic.
-///
-/// The one printed line matters more than it looks: a trap in ring 3 means
-/// user code executed something the CPU refuses to complete, and the only
-/// evidence that it happened is this line. Silently converting it to a signal
-/// leaves the bytes, which are the diagnostic, on the floor.
-///
-/// `vector` is which trap it was, and this door serves six of them (`#DE` 0,
-/// `#UD` 6, `#NP` 11, `#SS` 12, `#GP` 13, `#AC` 17) - the caller passes its own
-/// vector because the frame does not carry it. Until 2026-11-14 the line said
-/// `#GP` for all six, so the `0f 0b` musl's `a_crash` runs after the allocator
-/// has found the heap corrupted was reported as a protection fault - a word
-/// that sends the reader after the wrong fault (`docs/notes/` §6.158).
-///
-/// The *first* fault is reported in full - the vector, the error code, the
-/// bytes of the instruction the CPU refused, and the stack pointer it refused
-/// them on - because the interesting ring-3 traps are one instruction made
-/// illegal by kernel state the process cannot see, and the bytes name it. The
-/// rest are the process retrying the same instruction, which Linux logs too,
-/// rate limited, and which would otherwise bury the first one.
-///
-/// What happens after the report is the vector's own signal, not one signal
-/// for the whole door. The map was measured one instruction at a time on
-/// Linux 7.2.14 (`docs/notes/` §6.159): `#DE` ends the child `SIGFPE`,
-/// `#UD` `SIGILL`, `#BP` `SIGTRAP`, `#AC` `SIGBUS`, and `#SS`/`#NP`/`#GP`
-/// `SIGSEGV`. A parent's `wait` reads that number back through `WTERMSIG`, so
-/// a door that answers `SIGSEGV` for a `ud2` is not a cosmetic difference -
-/// it tells the caller a different event happened. This door used to do
-/// exactly that, with `send_signal(11)` spelled as the only answer.
-///
-/// A signal queued here is delivered at a *syscall* boundary, and a faulting
-/// instruction never reaches one, so returning to it only faults again. A
-/// default disposition is therefore death here (with the signal number as the
-/// exit code), and a task that installed a handler is ended once it has
-/// faulted at the same instruction [`FAULT_REPEAT_LIMIT`] times - the
-/// handler cannot be entered from this trap frame either way, and a death with
-/// a reason beats a flood. That the **handler** cannot run at the trap is a
-/// named gap, not the signal's absence: §2.13 built the delivery door for the
-/// timer interrupt, whose hand-written stub preserves the general registers;
-/// these six entries are `x86-interrupt` handlers and have no such frame.
-/// `hlt` is the case that made this visible: it is musl's `a_crash()`, the
-/// instruction its allocator runs when it has found the heap corrupted, and a
-/// compositor that hits it used to spin instead of dying.
-fn user_fault_or_die(frame: &InterruptStackFrame, vector: u8, code: u64) -> bool {
-    let rip = frame.instruction_pointer.as_u64() as usize;
-    if rip < (1 << 47) {
-        // One table answers both halves: the signal number (Item 279) and the
-        // fault-shaped `siginfo_t` record (Item 280). A trap with no faulting
-        // address passes zero; `#DE`/`#UD` name `rip` as their `si_addr`.
-        let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip);
-        if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
-            // Only up to the end of the page the instruction is on: a read
-            // past it would fault inside the handler, and a double fault
-            // would take the machine down instead of reporting anything.
-            let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
-            let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
-            crate::hal::kernel::kprintln!(
-                "  trap {vector} code {:#x} rip {:#x} rsp {:#x} rflags {:#x}",
-                code,
-                rip,
-                frame.stack_pointer.as_u64(),
-                frame.cpu_flags.bits()
-            );
-            crate::hal::kernel::kprintln!("  bytes at rip: {:02x?}", bytes);
-        }
-        crate::hal::kernel::report_user_trap(
-            vector,
-            rip,
-            frame.stack_pointer.as_u64() as usize,
-            code as usize,
-        );
-        if crate::hal::kernel::disposition_is_default(sig) {
-            crate::hal::kernel::die_of_fatal_signal(sig);
-        }
-        if fault_repeats(rip) {
-            crate::hal::kernel::kprintln!(
-                "task {} died of signal {sig} it could not be handed: trap {vector} code {code:#x} \
-                 at {rip:#x}, the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
-                crate::hal::kernel::current()
-            );
-            crate::hal::kernel::die_of_fatal_signal(sig);
-        }
-        crate::hal::kernel::preempt();
-        return true;
-    }
-    false
 }
 
 /// The bytes of an instruction fit in a 16-byte window, which is also the

@@ -125,6 +125,13 @@ impl Kernel for Services {
         sched::signal::signal_for_trap(vector)
     }
 
+    fn trap_name(&self, vector: u8) -> &'static str {
+        // The table is [`trap_name`]'s - the same one `traps:` lines are named
+        // from - so a ring-0 panic and a ring-3 report cannot disagree about
+        // what vector 6 is called.
+        trap_name(vector)
+    }
+
     fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize) -> u8 {
         // One table, one record, one door. `send_signal` would queue a
         // SI_USER record with a pid at `si_addr`'s offset; the fault's own
