@@ -15677,3 +15677,67 @@ count has grown"), both workspaces formatted.
    marker lands on that thread's record. A process-directed delete from the
    leader therefore cannot mark a worker's record — the same shape §6.166 names
    for the expiry's target, unwitnessed by any fixture.
+
+## §6.168 `CLOCK_THREAD_CPUTIME_ID` timers: the clock is the creating thread's, and it freezes (measured, NOT YET BUILT)
+
+**Why this is here and not in a landing.** §6.166's gap 2 names
+`clock_create(CLOCK_THREAD_CPUTIME_ID)` staying `EOPNOTSUPP`. The refusal's
+*reason* — "the clock belongs to the thread that called `timer_create`, while the
+timer hangs off the group and outlives that thread; Linux freezes the clock when
+the thread dies, and this table cannot express a frozen reading" — had never been
+measured. It is correct, and the measurement is below, but the build is a larger
+change than the reason's one sentence suggests, so this section records the
+contract for the item that takes it rather than starting a half-built
+implementation at the end of a session.
+
+**Measured on Linux 7.3.4** (`build/scratch/thrcpu/{t,t2,t3,t4}.c`):
+
+* `timer_create(CLOCK_THREAD_CPUTIME_ID, …)` is **accepted** (0), which is what
+  the refusal here owes.
+* The clock counts the **creating thread's** CPU, not the reader's and not the
+  group's: a creator that burns ~60 ms of CPU with a 30 ms repeating timer
+  produced **1** expiry, and the process's own `RUSAGE_SELF` was irrelevant to
+  it (`t4.c`).
+* **The clock freezes when the creating thread exits.** The decisive reading —
+  after `pthread_join` of the creator, 300 ms of **main-thread** CPU produced
+  **0** further expiries (`t4.c`: `further expiries from 300 ms of MAIN CPU:
+  0`). So the timer does not silently start counting someone else's CPU, which
+  is the shape the refusal exists to avoid.
+* `timer_gettime` after the creator's death answers `remaining = 0.000000000`
+  with success (`t3.c`), and stays there as the main thread burns (`t3.c`:
+  the same value before and after 120 ms of main-thread CPU).
+* While the creator is ***alive and idle***, `timer_gettime` on a 10 s timer
+  reads `9.999995121` — i.e. only the ~5 µs of the creating call's own CPU has
+  been charged, so the reading is genuinely the thread's counter and not the
+  wall clock (`t3.c`, first line).
+* A `SIGEV_SIGNAL` expiry on such a timer is an ordinary queued signal with
+  `si_code` -2 and reaches a `signalfd` like any other (`t2.c`: one expiry, read
+  back through the descriptor).
+
+**What building it needs**, so the next session starts from the shape rather
+than the sentence:
+
+1. `TimerClock` gains a `Thread(TaskId)` arm — the creating thread's id, kept on
+   the timer because the *timer* outlives the thread and the reading belongs to
+   that thread and no other.
+2. `Task` must keep a **frozen final CPU pair**, written when a task exits, so a
+   clock that names a dead thread has something honest to answer. That is the
+   prerequisite the current comment names, and it is a task-lifecycle change
+   rather than a timer-table one.
+3. `TimerClock::now` needs the frozen pair threaded to it; the expiry scan reads
+   the group's CPU today (`group_now` in `check_posix_timers`) and would need the
+   named thread's instead, falling back to the frozen pair.
+4. The `deadline` arithmetic, `timer_settime`'s `old_value`, `timer_gettime` and
+   `timer_delete` all read the same clock through `TimerClock::now`, so one
+   reading function is the whole of the arithmetic — the shape §6.123 established
+   for the process clock.
+5. The pin belongs in `t-timer-cpuclock` (it already walks the process clock):
+   the thread's expiry fires while it burns, the reading *stops* when the thread
+   exits, and main-thread CPU does not move it. That last claim is the
+   counterfactual's own target — a clock that fell back to the group's CPU would
+   pass the first two and fail it.
+
+**Named before it is built:** a `SIGEV_THREAD_ID` expiry aims at a named thread
+while the *clock* names the creating one, and the two can differ; Linux allows
+that (the record goes to the named thread, the clock stays the creator's), so the
+pin should separate them rather than assume one thread.
