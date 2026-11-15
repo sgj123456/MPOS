@@ -16933,3 +16933,96 @@ part of the record.
    did not change" would be the one a future implementation could not satisfy by
    returning `EBADF` for a different reason; it is named here as the sharper pin
    nobody wrote.
+
+## §6.180 `fcntl`'s own `O_PATH` split: the commands that ask are served, the ones that act refuse (item 300, LANDED 2026-11-15)
+
+**The family §6.179 left for last.** Its own gap list said "`fcntl` is deliberately
+not in the list… this kernel's `fcntl` was not re-read for those two refusals, so
+the half that is wrong could be in either direction." This is that read, and the
+shape of the answer is why it belongs to the `O_PATH` family rather than to the
+lock family: **`fcntl` is a table, and `O_PATH` partitions it.**
+
+**Measured first**, raw on Linux 7.3.4 (`build/scratch/fcntl/t.c`). On an `O_PATH`
+descriptor:
+
+| group | commands | Linux |
+|---|---|---|
+| asks *what this descriptor is* | `F_GETFD`, `F_GETFL`, `F_SETFD`, `F_DUPFD`, `F_DUPFD_CLOEXEC` | **served** |
+| acts on the file behind it | `F_SETFL`, `F_SETLK`, `F_SETLKW`, `F_GETLK`, `F_OFD_*` | **`EBADF`** |
+
+That partition is not arbitrary: the served five describe the *description* (its
+flags, its number), and the refused six need the *open file* the descriptor does
+not have. This kernel had it backwards in exactly one place and absent in the
+other:
+
+```
+F_SETFL(O_PATH fd)      -> 0      (stored a status word on a descriptor with no file)
+F_SETLK(O_PATH fd)      -> 0      (took a lock through it)
+F_GETLK(O_PATH fd)      -> 0
+F_OFD_SETLK(O_PATH fd)  -> EAGAIN (answered from the lock table's own contention)
+```
+
+**The change is two checks**, and where they sit is the whole of it. `F_SETFL` got
+its refusal inside its own arm, before the `O_NOATIME`-ownership edge is computed -
+the same order §6.179 records for `ftruncate`. The six lock commands are **one
+arm** in this handler (`record_lock`), so one guard covers all of them; it sits
+*before* `record_lock` rather than inside it, so the door's answer stays the table's
+and `record_lock` keeps answering only about locks.
+
+**The served half is the claim's other side**, and it is why the pin asserts it: a
+kernel that answered `EBADF` to every `fcntl` on an `O_PATH` descriptor would pass
+all the refusals. `F_GETFD` on the same descriptor is claimed beside them.
+
+**What was *not* fixed, and why that is the honest reading.** `F_GETOWN` and
+`F_SETOWN` answer `EINVAL` on this kernel and `0` on Linux - but they are not an
+`O_PATH` question at all: they are **unimplemented**, falling through the `fcntl`
+table's default arm, and Linux serves them on an ordinary descriptor too (the
+probe's first section shows `F_GETOWN -> 0`, `F_SETOWN -> 0` there). Fixing them
+means signal-owner state (`f_owner`) that this kernel does not keep, which is a
+named gap rather than a refusal to correct. Recording that distinction is the point
+of the paragraph: a door that answers `EINVAL` for a command it never implemented
+is a *different* defect from one that serves a command whose precondition is
+missing, and only the second is in this item's scope.
+
+**The pin.** `t-open-path` grew five claims (30 total): the four refusals
+(`F_SETFL`, `F_SETLK`, `F_GETLK`, `F_OFD_SETLK`) and the `F_GETFD` neighbour that
+proves the split. Raw, like everything else in this program, and for the same
+reason.
+
+**Counterfactual.** The syscall-layer file stashed, rebuilt, the pin in the guest:
+**four claims red**, each with its own wrong answer -
+
+```
+FAIL: F_SETFL(O_PATH fd) is EBADF, got rc=0
+FAIL: F_SETLK(O_PATH fd) is EBADF, got rc=0
+FAIL: F_GETLK(O_PATH fd) is EBADF, got rc=0
+FAIL: F_OFD_SETLK(O_PATH fd) is EBADF, got rc=-1 errno=11 (EAGAIN)
+```
+
+- and the `EAGAIN` is the reading worth keeping: it is the *lock table's* answer,
+arriving from a door that should not have reached it. Restored from
+`build/scratch/fcntl/good/*.rs`, `sha256sum -c` 成功 on both, rebuilt, `PASS`.
+
+**Gate.** `build/gate-item300.log`, `GATE_EXIT=0`, both arms in one run. Stage 1
+**1340** host tests 0 failed (63.29 s); stage 2 **324** programs over 6 lanes on
+x86_64 (42.80 s) and **320** on aarch64 (59.19 s); `pass=324 fail=0` /
+`pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`; both workspaces formatted. This item's first run
+was green — no arm needed a second attempt, which after §6.179's init death is worth
+stating.
+
+### What this does not do, named
+
+1. **`F_GETOWN`/`F_SETOWN` are unimplemented**, not misrefused, and they answer
+   `EINVAL` on an ordinary descriptor as well. Serving them needs `f_owner`
+   (`SIGIO`'s recipient) and the `F_SETSIG`/`F_GETSIG` pair beside it; `F_SETLEASE`
+   and `F_GETLEASE` are the same shape (`EPERM`-gated on `CAP_LEASE` upstream, and
+   this kernel answers `EINVAL`).
+2. **`F_GETPIPE_SZ`/`F_SETPIPE_SZ`** are likewise in the default arm on both
+   descriptors; the pipe layer has a capacity, so this one is closable and is named
+   rather than done.
+3. **The ordinary-descriptor half of `fcntl` was read by the probe but not
+   pinned.** The claims are all about `O_PATH`; a claim per ordinary command is the
+   other half and is not here.
+4. **`F_SETLEASE`'s own authority** (`CAP_LEASE`, and the `EPERM` a non-owner
+   reads) is unswept, so the lease family is named in two places now.

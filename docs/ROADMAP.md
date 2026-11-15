@@ -3180,3 +3180,35 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   replaces. Gate `build/gate-item299b.log` `GATE_EXIT=0`, both arms in one run: stage 1
   1340, x86_64 `pass=324`, aarch64 `pass=320`, kunit 41/0 per arm, clippy ratchet
   unchanged. (§6.179, item 299)
+
+- **Item 300 — `fcntl`'s own `O_PATH` split: the commands that ask are served, the ones
+  that act refuse**: the family §6.179 left for last, whose gap list said "this kernel's
+  `fcntl` was not re-read for those two refusals, so the half that is wrong could be in
+  either direction". The shape of the answer is why it belongs to the `O_PATH` family
+  rather than the lock family: **`fcntl` is a table, and `O_PATH` partitions it.**
+  Measured raw on Linux 7.3.4 (`build/scratch/fcntl/t.c`): the commands that **ask what
+  the descriptor is** (`F_GETFD`, `F_GETFL`, `F_SETFD`, `F_DUPFD`, `F_DUPFD_CLOEXEC`) are
+  **served**, and the six that **act on the file behind it** (`F_SETFL` and the whole lock
+  family) are **`EBADF`** — the served ones describe the *description*, the refused ones
+  need the *open file* it does not have. This kernel was backwards in one place and absent
+  in the other: `F_SETFL` → **0** (stored a status word on a descriptor with no file),
+  `F_SETLK` → **0**, `F_GETLK` → **0**, `F_OFD_SETLK` → `EAGAIN` (answered from the lock
+  table's own contention). Two checks, and **where they sit** is the whole of it:
+  `F_SETFL` refuses inside its own arm before the `O_NOATIME`-ownership edge is computed
+  (§6.179's `ftruncate` order), and the six lock commands are **one arm**, so one guard
+  covers all of them — before `record_lock`, so the door's answer stays the table's.
+  `t-open-path` grew five claims (30 total): the four refusals **and** the `F_GETFD`
+  neighbour, because a kernel refusing every `fcntl` on an `O_PATH` descriptor would pass
+  the refusals alone. Counterfactual reddens **four**, each with its own wrong answer —
+  and the `EAGAIN` on `F_OFD_SETLK` is the one worth keeping, being the lock table's
+  answer from a door that should not have reached it. **Named, and the distinction is the
+  point**: `F_GETOWN`/`F_SETOWN` (with `F_GETPIPE_SZ`, the lease pair) answer `EINVAL`
+  where Linux answers `0` because they are **unimplemented**, not misrefused — Linux
+  serves them on an ordinary descriptor too, and serving them needs `f_owner` state this
+  kernel does not keep; a door that answers `EINVAL` for a command it never implemented
+  is a different defect from one that serves a command whose precondition is missing.
+  Also named: the ordinary-descriptor half of `fcntl` is read but not pinned, and
+  `F_SETLEASE`'s `CAP_LEASE` authority is unswept. Gate `build/gate-item300.log`
+  `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64 `pass=324`, aarch64
+  `pass=320`, kunit 41/0 per arm, clippy ratchet unchanged — green first try.
+  (§6.180, item 300)

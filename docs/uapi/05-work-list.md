@@ -13110,3 +13110,30 @@ direction. **`mmap` of an `O_PATH` descriptor** is `EBADF` on Linux and was not
 swept. And **nothing pins the authority reading** — a claim phrased as "the owner
 did not change" would be the sharper one, because a future implementation could
 satisfy a bare `EBADF` for a different reason.
+
+## Item 300 — `fcntl`'s own `O_PATH` split: the commands that ask are served, the ones that act refuse (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **The family §6.179 left for last** | Its gap list said "`fcntl` is deliberately not in the list… this kernel's `fcntl` was not re-read for those two refusals, so the half that is wrong could be in either direction." This is that read, and the shape of the answer is why it belongs to the `O_PATH` family rather than the lock family: **`fcntl` is a table, and `O_PATH` partitions it.** |
+| **Measured first** (raw) | Linux 7.3.4, `build/scratch/fcntl/t.c`. On an `O_PATH` descriptor: the commands that **ask what the descriptor is** — `F_GETFD`, `F_GETFL`, `F_SETFD`, `F_DUPFD`, `F_DUPFD_CLOEXEC` — are **served**; the six that **act on the file behind it** — `F_SETFL` and the whole lock family — are **`EBADF`**. The partition is not arbitrary: the served five describe the *description*, the refused six need the *open file* it does not have. |
+| **Before** | Backwards in one place and absent in the other: `F_SETFL(O_PATH fd)` → **0** (stored a status word on a descriptor with no file), `F_SETLK` → **0** (took a lock through it), `F_GETLK` → **0**, `F_OFD_SETLK` → `EAGAIN` (answered from the lock table's own contention). |
+| **Now** | Two checks, and *where they sit* is the whole of it: `F_SETFL` refuses inside its own arm **before** the `O_NOATIME`-ownership edge is computed (the order §6.179 records for `ftruncate`), and the six lock commands are **one arm** (`record_lock`), so one guard covers all of them — placed *before* `record_lock` rather than inside it, so the door's answer stays the table's and `record_lock` keeps answering only about locks. |
+| **Pins** | `t-open-path` grew five claims (30 total): the four refusals (`F_SETFL`, `F_SETLK`, `F_GETLK`, `F_OFD_SETLK`) **and** the `F_GETFD` neighbour — because a kernel that answered `EBADF` to every `fcntl` on an `O_PATH` descriptor would pass all the refusals. Raw, like the rest of the program. |
+| **Counterfactual** | The syscall-layer file stashed, rebuilt, the pin in the guest: **four claims red**, each with its own wrong answer — `F_SETFL … rc=0`; `F_SETLK … rc=0`; `F_GETLK … rc=0`; `F_OFD_SETLK … rc=-1 errno=11 (EAGAIN)`. The `EAGAIN` is the reading worth keeping: it is the *lock table's* answer, from a door that should not have reached it. Restored with `sha256sum -c`, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item300.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed (63.29 s); stage 2 324 programs over 6 lanes on x86_64 (42.80 s) and 320 on aarch64 (59.19 s); `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged at `162/168/389/273/3`. This item's first run was green — no arm needed a second attempt, which after §6.179's init death is worth stating. |
+
+**What was *not* fixed, and why that is the honest reading.** `F_GETOWN` and
+`F_SETOWN` answer `EINVAL` where Linux answers `0` — but they are **not an `O_PATH`
+question at all**: they are *unimplemented*, falling through the `fcntl` table's
+default arm, and Linux serves them on an ordinary descriptor too (the probe's first
+section shows `0` there). Serving them needs the `f_owner` state (`SIGIO`'s
+recipient) this kernel does not keep. **A door that answers `EINVAL` for a command
+it never implemented is a different defect from one that serves a command whose
+precondition is missing, and only the second was in this item's scope.** The same
+holds for `F_GETPIPE_SZ`/`F_SETPIPE_SZ` and the lease pair (`F_SETLEASE`/
+`F_GETLEASE`, `EPERM`-gated on `CAP_LEASE` upstream). Also named: the
+**ordinary-descriptor** half of `fcntl` was read by the probe but is not pinned —
+the claims are all about `O_PATH` — and `F_SETLEASE`'s own authority
+(`CAP_LEASE`, and the `EPERM` a non-owner reads) is unswept, so the lease family is
+now named in two places.
