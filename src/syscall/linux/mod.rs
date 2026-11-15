@@ -568,7 +568,19 @@ pub unsafe fn dispatch(
             &cwd(),
         ),
         nr::LINKAT => fs::handle_linkat(args, &cwd()),
-        nr::MKNOD => fs::handle_mknod(args, &cwd()),
+        // The legacy `mknod` is `mknodat(AT_FDCWD, …)` - the same rule the
+        // `unlink`/`mkdir`/`rename` arms above already state - so it delegates
+        // rather than keeping a second body. It had one, and the two had
+        // **drifted**: the `at` form emitted the `IN_CREATE` event a watch
+        // expects and this door did not, so a daemon watching a directory heard
+        // about a node made by `mknodat` and nothing about the same node made by
+        // `mknod` (measured on 7.3.4, `build/scratch/doorpair/t.c`: Linux
+        // answers `mask=0x100` for both doors). Two bodies for one rule is the
+        // shape §6.173 records; delegating is what makes it unspellable.
+        nr::MKNOD => fs::handle_mknodat(
+            [abi::AT_FDCWD as usize, args[0], args[1], args[2], 0, 0],
+            &cwd(),
+        ),
         // mount and umount2 are how userland builds the directory tree a
         // system needs - /proc, /sys, /dev, /run - which is init's job, not
         // the kernel's boot code's.
