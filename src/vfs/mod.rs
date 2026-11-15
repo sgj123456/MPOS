@@ -966,6 +966,35 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
+    /// Whether a mapping of this node is **anonymous memory** rather than
+    /// bytes read out of it - the one character device whose `mmap` Linux
+    /// serves, `/dev/zero`.
+    ///
+    /// This is a third question, beside [`Self::frame_backed`] (does the node
+    /// have frames to alias?) and [`Self::mappable`] (are its bytes storage?).
+    /// `/dev/zero` answers *neither*: it has no frames, and it has no storage
+    /// either - `read_at` invents zeros. What it hands a mapping is the same
+    /// thing an `MAP_ANONYMOUS` request gets, which is why it is not served by
+    /// the copy arms and not by `ENODEV` either.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/zeromap/{w,v,mat,n}.c`), and
+    /// the measurements are what force the shape rather than a "device that
+    /// maps" abstraction: two `MAP_SHARED` mappings of `/dev/zero` are *not*
+    /// aliased (`a[0] = 0xabc` leaves `b[0] = 0`), a `MAP_PRIVATE` one is
+    /// independent of both, a page-aligned offset a thousand pages past any
+    /// file size is accepted, a 1 GiB length is accepted, and `smaps` calls a
+    /// private `/dev/zero` page `Anonymous: 4 kB`. Fresh private memory is the
+    /// only thing all five agree on. `/dev/null`, `/dev/full`, `/dev/random`
+    /// and `/dev/urandom` are `ENODEV` under both flags (the same probe), so
+    /// the default stays **false** and the device answers for itself.
+    ///
+    /// The default is false for the same reason [`Self::mappable`]'s is: a node
+    /// that accepts a mapping it cannot serve fails on the first touch with a
+    /// `SIGSEGV` rather than an errno at the call.
+    fn maps_as_anonymous(&self) -> bool {
+        false
+    }
+
     /// Whether this node's pages are shmem-backed, for the resident-set split
     /// `/proc/<pid>/status` prints.
     ///

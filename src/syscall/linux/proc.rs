@@ -3919,7 +3919,34 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
             return err::EINVAL;
         }
         match crate::sched::current_fds().clone_at(fd) {
-            Ok(file) => Some(file),
+            Ok(file) => {
+                // The descriptor's own access mode is part of the request, and
+                // Linux asks it before it asks the node anything - measured on
+                // Linux 7.2.14 (`build/scratch/zeromap/{mat,n,o}.c`), where a
+                // directory mapped `MAP_SHARED | PROT_WRITE` answers `EACCES`
+                // while the same directory mapped `MAP_SHARED | PROT_READ`
+                // answers `ENODEV`: the mode question comes first.
+                //
+                // Two clauses, and the second is the one a shape written from
+                // intuition would miss. `MAP_SHARED` needs a writable
+                // descriptor for a writable mapping, because the writes go to
+                // the file. Every mapping needs a *readable* one - including
+                // `PROT_NONE` and `PROT_EXEC`, which ask for no write at all -
+                // because a mapping is a view of the file's bytes and an
+                // `O_WRONLY` descriptor has no view to give. That is why
+                // `O_WRONLY` is `EACCES` for every combination in the matrix,
+                // while `O_RDONLY | MAP_PRIVATE | PROT_WRITE` is served: a
+                // private write is the process's own copy, made from a read it
+                // was allowed to do.
+                let access = file.access();
+                if shared && prot & PROT_WRITE != 0 && access == crate::vfs::file::ACC_RDONLY {
+                    return err::EACCES;
+                }
+                if access == crate::vfs::file::ACC_WRONLY {
+                    return err::EACCES;
+                }
+                Some(file)
+            }
             Err(_) => return err::EBADF,
         }
     };
@@ -4064,6 +4091,45 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         // Private anonymous memory: frames of the process's own, zero-filled on
         // first touch.
         None => crate::sched::map_anon(base, len, mf),
+        // A node whose mapping *is* anonymous memory: `/dev/zero`, and nothing
+        // else this kernel serves. It is asked before the `ENODEV` arm below,
+        // because it is the one character device that arm must not refuse, and
+        // before the copy arms, because there are no bytes to copy - the
+        // device's `read_at` invents them and its mapping hands out fresh zero
+        // pages.
+        //
+        // Which of the two anonymous shapes it takes is the caller's flag, not
+        // the node's: measured on Linux 7.2.14
+        // (`build/scratch/zeromap/{w,v}.c`), a `MAP_SHARED` mapping of
+        // `/dev/zero` is *not* aliased by a second one (`a[0] = 0xabc` leaves
+        // `b[0] = 0`) and a `MAP_PRIVATE` one is independent of both, so both
+        // answers are the same "fresh memory" with only the sharing bookkeeping
+        // differing. The shared half therefore gets the unnamed `Memfd` the
+        // `MAP_SHARED | MAP_ANONYMOUS` arm gets, and the private half
+        // `map_anon` - with the file's name attached, which is the one thing
+        // that differs from a plain anonymous mapping: Linux prints
+        // `/dev/zero` beside those pages, and `maps` is where a program looks
+        // to find out what it mapped.
+        Some(file) if file.inode().maps_as_anonymous() => {
+            let name = file
+                .label()
+                .map(|path| alloc::sync::Arc::from(path.as_str()));
+            if shared {
+                let object = crate::vfs::memfd::Memfd::new(super::fs::next_anon_ino(), 0);
+                object.set_len(len).ok();
+                crate::sched::map_frames(
+                    base,
+                    len,
+                    mf,
+                    crate::vfs::MappedInode::new(object),
+                    0,
+                    true,
+                    Some(alloc::sync::Arc::from("/memfd: (deleted)")),
+                );
+            } else {
+                crate::sched::map_anon_named(base, len, mf, name);
+            }
+        }
         // A node that owns real pages: the mapping aliases them, and the page
         // each fault needs comes from `mmap_frame`. This is the memfd, the
         // framebuffer and a dma-buf - and, since a wl_shm pool and a scanout

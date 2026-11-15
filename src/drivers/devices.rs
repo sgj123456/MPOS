@@ -118,6 +118,23 @@ impl CharDevice for ZeroDev {
     fn write(&self, buf: &[u8]) -> usize {
         buf.len()
     }
+
+    /// `/dev/zero` is the one character device Linux lets a program map, and
+    /// what it maps is fresh anonymous memory - not this device's bytes, which
+    /// do not exist.
+    ///
+    /// Measured on Linux 7.2.14 (`build/scratch/zeromap/{w,v,mat,n}.c`): two
+    /// `MAP_SHARED` mappings are **not** aliased (`a[0] = 0xabc` leaves
+    /// `b[0] = 0`), a `MAP_PRIVATE` one is independent of both, a page-aligned
+    /// offset a thousand pages past any file size is accepted, a 1 GiB length
+    /// is accepted, and `smaps` calls a private `/dev/zero` page
+    /// `Anonymous: 4 kB`. Every one of those is what `MAP_ANONYMOUS` does.
+    /// `/dev/null`, `/dev/full`, `/dev/random` and `/dev/urandom` answer
+    /// `ENODEV` to the same probe, which is why this is an override here and a
+    /// `false` default on the trait.
+    fn maps_as_anonymous(&self) -> bool {
+        true
+    }
 }
 
 /// Reads are random bytes, however much is asked; writes vanish.

@@ -65,6 +65,29 @@ pub trait CharDevice: Send + Sync {
     fn ioctl(&self, _request: u32, _arg: usize) -> Option<isize> {
         None
     }
+
+    /// Whether a mapping of this device is anonymous memory rather than a
+    /// stream of bytes - the `mmap` a character device is allowed to have an
+    /// answer for.
+    ///
+    /// Linux asks this of the driver as `f_op->mmap`, and exactly one of the
+    /// memory streams has one: `/dev/zero`. What it hands a mapping is fresh
+    /// private zero pages - measured on Linux 7.2.14
+    /// (`build/scratch/zeromap/{w,v,mat,n}.c`) a `MAP_SHARED` mapping of it is
+    /// not aliased by a second one, a `MAP_PRIVATE` one is independent, an
+    /// offset a thousand pages past any size is accepted, and `smaps` calls
+    /// the page `Anonymous`. So this is not "map the device's bytes": there are
+    /// no bytes, and [`Inode::maps_as_anonymous`] is the door that says so.
+    ///
+    /// The default is false. `/dev/null`, `/dev/full`, `/dev/random` and
+    /// `/dev/urandom` are `ENODEV` under both flags in the same probe, and a
+    /// device that claimed this without serving it would fail on the first
+    /// touch of the page with a `SIGSEGV` instead of an errno at the call.
+    ///
+    /// [`Inode::maps_as_anonymous`]: crate::vfs::Inode::maps_as_anonymous
+    fn maps_as_anonymous(&self) -> bool {
+        false
+    }
 }
 
 /// The mode and ownership one device node keeps, behind the same
@@ -276,6 +299,14 @@ impl Inode for DevNode {
     fn as_chardev(&self) -> Option<&dyn CharDevice> {
         Some(&*self.dev)
     }
+
+    /// The node's answer is its driver's: `mmap` on a character device is the
+    /// driver's operation to have or to lack, so `/dev/zero` maps because the
+    /// device behind it says so and `/dev/null` does not.
+    fn maps_as_anonymous(&self) -> bool {
+        self.dev.maps_as_anonymous()
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -1559,5 +1590,54 @@ mod tests {
                 |(name, kind)| *kind == NodeKind::CharDev && (name == "null" || name == "sink")
             )
         );
+    }
+
+    /// A device whose mapping is anonymous memory.
+    ///
+    /// Stands in for `/dev/zero`: the driver answers, the node passes the answer
+    /// through, and a device that says nothing keeps the trait's `false` - which
+    /// is the half that matters, because a node wrongly claiming this accepts a
+    /// mapping whose first touch is a `SIGSEGV` instead of an errno at the call.
+    struct Zeroish;
+
+    impl CharDevice for Zeroish {
+        fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+
+        fn write(&self, buf: &[u8]) -> usize {
+            buf.len()
+        }
+
+        fn maps_as_anonymous(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_node_answers_a_mapping_question_the_way_its_driver_does() {
+        let _bus = crate::uevent::test_bus::take();
+        let fs = DevFs::new();
+        fs.register("zeroish", Arc::new(Zeroish));
+        fs.register("null", sink());
+
+        let zeroish = fs.root().lookup("zeroish").unwrap();
+        assert!(
+            zeroish.maps_as_anonymous(),
+            "the driver's answer is the node's"
+        );
+        assert!(
+            !zeroish.mappable(),
+            "and it is a *different* question: /dev/zero maps although its \\
+             bytes are not storage - its read_at invents them"
+        );
+
+        let null = fs.root().lookup("null").unwrap();
+        assert!(
+            !null.maps_as_anonymous(),
+            "a device that says nothing is not a mapping"
+        );
+        assert!(!null.mappable(), "and has no bytes to be one either");
     }
 }

@@ -600,10 +600,23 @@ pub(crate) fn current_mm() -> Arc<Mm> {
 /// frames arrive as the program touches them. `flags` is what each page will be
 /// mapped with, and what an access is checked against.
 pub fn map_anon(virt: usize, len: usize, flags: MapFlags) {
+    map_anon_named(virt, len, flags, None);
+}
+
+/// [`map_anon`] with the name `/proc/<pid>/maps` prints for the range.
+///
+/// The name is not decoration: a private mapping of `/dev/zero` is anonymous
+/// memory (measured on Linux 7.2.14, `build/scratch/zeromap/v.c`, which reads
+/// `Anonymous: 4 kB` in its `smaps`), and Linux still prints the file the
+/// caller named beside those anonymous pages - `/dev/zero`. The two facts are
+/// independent, which is why the name cannot be inferred from the kind: an
+/// unnamed `MAP_ANONYMOUS` range is the same kind of memory and has no name at
+/// all.
+pub fn map_anon_named(virt: usize, len: usize, flags: MapFlags, name: Option<Arc<str>>) {
     if len == 0 {
         return;
     }
-    current_mm().vma_insert(Vma::new(virt, virt + len, flags, VmaKind::Anon));
+    current_mm().vma_insert(Vma::new(virt, virt + len, flags, VmaKind::Anon).named(name));
 }
 
 /// Record a mapping of `virt..virt + len` backed by `inode`'s own frames,
