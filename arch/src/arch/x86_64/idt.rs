@@ -495,7 +495,11 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
     // address passes zero; `#DE`/`#UD` name `rip` as their `si_addr`, and
     // `#BP`'s is zero because the CPU hands over the address *after* the
     // instruction and there is nothing the program wrote that faults.
-    let sig = crate::hal::kernel::send_fault_signal(vector, 0, rip);
+    // The vector is this machine's own word; the kernel's table is keyed on the
+    // *class* of exception (item 284, `docs/notes/` §6.165), so it is read here
+    // and only here.
+    let kind = crate::hal::kernel::fault_kind_of_vector(vector);
+    let sig = crate::hal::kernel::send_fault_signal(kind, 0, rip);
     if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
         // Only up to the end of the page the instruction is on: a read past it
         // would fault inside the handler, and a double fault would take the
@@ -701,7 +705,8 @@ extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64) {
         // the most common self-repair case, a `PROT_NONE` page
         // (`docs/notes/` §6.162). `send_signal` would put a pid in those eight
         // bytes instead (`docs/notes/` §6.160).
-        let sig = crate::hal::kernel::send_fault_signal(14, addr, rip);
+        let sig =
+            crate::hal::kernel::send_fault_signal(crate::hal::kernel::FaultKind::Page, addr, rip);
         if crate::hal::kernel::disposition_is_default(sig) {
             crate::hal::kernel::die_of_fatal_signal(sig);
         }

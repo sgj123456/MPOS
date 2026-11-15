@@ -1082,6 +1082,38 @@ fn skip(pc: &mut u64) {
     *pc += 4;
 }
 
+/// Hand `sig` to the EL0 program this trap interrupted, or end it if a handler
+/// cannot be entered from here.
+///
+/// The second half is what this machine used to do unconditionally: every
+/// refused EL0 fault ended in `die_of_fatal_signal`, so a `SIGSEGV` handler or a
+/// tracer that had to see the stop never ran at all, and a program that computed
+/// rather than called could not be interrupted by its own fault either
+/// (`docs/notes/` §6.164 recorded x86_64's version of the same hole; §6.165 is
+/// this machine's).
+///
+/// A trap from EL0 already has every register on the kernel stack, saved by the
+/// stub that called [`el0_sync`], so the conditional frame a handler needs can be
+/// laid over it here - that is `deliver_at_trap`, the same door the timer
+/// interrupt uses (`docs/notes/` §2.13). When it answers `false` the signal is
+/// still pending and its disposition is the default one, so the honest end is
+/// the death Linux would have reached anyway.
+///
+/// It returns **only** when a handler's frame is installed, so every caller
+/// answers the stub with `return 0`: a non-zero answer means "the frame is dead,
+/// leave for the kernel", which is the opposite of what a delivery asks for.
+fn deliver_or_die(frame: &mut UserFrame, sig: u8) {
+    #[cfg(mpos_signal_frame)]
+    {
+        if crate::hal::kernel::deliver_at_trap(core::ptr::from_mut(frame).cast::<()>()) {
+            return;
+        }
+    }
+    // The process, not this thread: Linux's fatal signal with no handler ends
+    // the whole group (`docs/notes/` §6.77b).
+    crate::hal::kernel::die_of_fatal_signal(sig);
+}
+
 /// What [`el0_sys`] did with a trapped system instruction.
 enum Sys64Answer {
     /// The instruction is answered: the frame carries the value or the effect,
@@ -1224,9 +1256,18 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                              (pc {:#x}, ESR {esr:#x})",
                             frame.pc
                         );
-                        // The process, not this thread: Linux's `SIGSEGV` with
-                        // no handler ends the whole group (`docs/notes/` §6.77b).
-                        crate::hal::kernel::die_of_fatal_signal(11);
+                        // A page fault in Linux's sense - an address this space
+                        // does not map - so it takes the page-fault row:
+                        // `SIGSEGV` with the code the *mapping* answers, which
+                        // is `SEGV_MAPERR` here because nothing describes it
+                        // (`docs/notes/` §6.162, §6.165).
+                        let sig = crate::hal::kernel::send_fault_signal(
+                            crate::hal::kernel::FaultKind::Page,
+                            addr,
+                            frame.pc as usize,
+                        );
+                        deliver_or_die(frame, sig);
+                        return 0;
                     }
                     // `SIGILL`, Linux's answer to a trap its own table has no
                     // row for (`do_el0_sys` falls through to `do_el0_undef`) -
@@ -1243,9 +1284,20 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                             sys64_register(esr),
                             frame.pc
                         );
-                        // `SIGILL`'s default action is death, and it is the
-                        // process that dies (`docs/notes/` §6.77b).
-                        crate::hal::kernel::die_of_fatal_signal(4);
+                        // `SIGILL`, and `si_addr` is the instruction itself -
+                        // there is no faulting *address* here, and `FAR_EL1`
+                        // still holds whichever page fault came last, so
+                        // carrying it would be an invented answer. The row is
+                        // the one an `#UD` takes on x86_64, which is why the
+                        // kind is `InvalidOpcode` and the record's address is
+                        // the saved `rip`.
+                        let sig = crate::hal::kernel::send_fault_signal(
+                            crate::hal::kernel::FaultKind::InvalidOpcode,
+                            0,
+                            frame.pc as usize,
+                        );
+                        deliver_or_die(frame, sig);
+                        return 0;
                     }
                 }
             }
@@ -1301,7 +1353,22 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                 frame.pc,
                 frame.sp
             );
-            crate::hal::kernel::die_of_fatal_signal(11);
+            // The machine's word for what happened becomes the kernel's, and
+            // the kernel queues the ABI record: a data or instruction abort is a
+            // page fault (`FaultKind::Page`), whose `si_code` asks whether a
+            // mapping describes the address - the same question x86_64's `#PF`
+            // path asks, answered by the same `sched::vma_prot_at`. Every other
+            // EL0 class (an unallocated exception, a trapped `MSR`, a
+            // breakpoint) has no ABI signal of its own and lands in `Other`,
+            // which is `SIGSEGV`/`SI_KERNEL` - the honest bucket for a trap
+            // whose meaning this port does not claim to know.
+            let kind = match class {
+                EC_DATA_ABORT_EL0 | EC_INSTR_ABORT_EL0 => crate::hal::kernel::FaultKind::Page,
+                _ => crate::hal::kernel::FaultKind::Other,
+            };
+            let sig = crate::hal::kernel::send_fault_signal(kind, addr, frame.pc as usize);
+            deliver_or_die(frame, sig);
+            return 0;
         }
         let mut out = pl011::Writer;
         let _ = writeln!(out, "\nEXCEPTION: from EL0, and not a system call");

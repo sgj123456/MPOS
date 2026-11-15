@@ -50,6 +50,8 @@ pub enum FaultAnswer {
     OutOfMemory,
 }
 
+pub use mpos_vm::FaultKind;
+
 /// The kernel services a machine's trap and interrupt entry needs.
 ///
 /// Deliberately a *fact* interface rather than a policy one: each method answers
@@ -126,8 +128,8 @@ pub trait Kernel: Sync {
     /// table.
     fn report_user_trap(&self, vector: u8, ip: usize, sp: usize, error: usize);
 
-    /// The signal a synchronous CPU exception ends a process with, given the
-    /// vector that took it.
+    /// The signal a synchronous CPU exception ends a process with, given which
+    /// *kind* of exception the machine took.
     ///
     /// A trap door is not one event with one answer: Linux ends a child with
     /// `SIGFPE` for `#DE`, `SIGTRAP` for `#BP`, `SIGILL` for `#UD`, `SIGBUS`
@@ -137,10 +139,14 @@ pub trait Kernel: Sync {
     /// process that executed `ud2` died of a bad memory reference and a parent
     /// that waited for `SIGILL` was told a different signal happened.
     ///
-    /// The answer is the kernel's policy over ABI signal numbers, so this seam
-    /// carries the *number* and the machine keeps no second copy of the table -
-    /// the same shape as [`report_user_trap`](Kernel::report_user_trap).
-    fn signal_for_trap(&self, vector: u8) -> u8;
+    /// The argument is a [`FaultKind`] rather than a vector because the answer
+    /// is the kernel's policy over ABI signal numbers, and the two machines
+    /// number their exceptions differently - an `ESR_EL1` class is not a
+    /// vector and never needed to be (`docs/notes/` §6.165). Each machine
+    /// reads its own word into a kind (`sched::signal::fault_kind_of_vector`
+    /// for x86_64, the `EC` field for aarch64) and the table below that is
+    /// shared, so a class named by either arrives at the same signal.
+    fn signal_for_kind(&self, kind: FaultKind) -> u8;
 
     /// The kernel's own word for a CPU exception, given its vector.
     ///
@@ -155,30 +161,45 @@ pub trait Kernel: Sync {
     /// §6.158).
     fn trap_name(&self, vector: u8) -> &'static str;
 
+    /// The kernel's reading of an x86_64 trap vector: which [`FaultKind`] of
+    /// exception the machine took.
+    ///
+    /// Only one machine has vectors, and the meaning of one is kernel policy -
+    /// it is the same table [`signal_for_kind`](Kernel::signal_for_kind) and
+    /// [`send_fault_signal`](Kernel::send_fault_signal) are keyed on, so the
+    /// machine asks rather than keeping a second copy that could drift
+    /// (`docs/notes/` §6.165).
+    fn fault_kind_of_vector(&self, vector: u8) -> FaultKind;
+
     /// Queue the signal a synchronous CPU exception raised, **with its
     /// fault-shaped `siginfo_t` record**, and answer the signal number the
     /// caller must then use for its disposition and death checks.
     ///
-    /// `vector` is the x86_64 IDT vector (14 for a `#PF`); `addr` is `CR2`
-    /// for a page fault and zero for a trap with no faulting address; `rip`
-    /// is the interrupted instruction pointer, which is `si_addr` for `#DE`
-    /// and `#UD`; `mapped` says whether **a mapping describes the address**,
-    /// which is the question that decides `SEGV_ACCERR` over `SEGV_MAPERR`
+    /// `kind` is which exception the machine took, in the vocabulary that both
+    /// machines can name ([`FaultKind`]); `addr` is the faulting address the
+    /// machine recorded (`CR2` on x86_64, `FAR_EL1` on aarch64) and zero for a
+    /// trap with no faulting address; `rip` is the interrupted instruction
+    /// pointer, which is `si_addr` for `#DE` and `#UD`.
+    ///
+    /// The kernel owns the map from a kind to `(signal, si_code, si_addr)` -
+    /// measured on Linux 7.2.14, `docs/notes/` §6.160 - so this seam carries
+    /// the raw facts rather than a second copy of the table, the same shape as
+    /// [`signal_for_kind`](Kernel::signal_for_kind). For a
+    /// [`FaultKind::Page`] the kernel also decides `SEGV_ACCERR` over
+    /// `SEGV_MAPERR` by asking whether **a mapping describes the address**
     /// (measured on Linux 7.2.14 across four refused-access classes, and on a
-    /// never-mapped read and a hole between two mappings:
-    /// `docs/notes/` §6.162). The page-table error word is a *different*
-    /// question and answers wrong for the most common self-repair case - a
-    /// `PROT_NONE` page, which the CPU reports as not present. The kernel owns
-    /// the map of vectors to `(signal, si_code, si_addr)` - measured on Linux
-    /// 7.2.14, `docs/notes/` §6.160 - so this seam carries the raw facts
-    /// rather than a second copy of the table, the same shape as
-    /// [`signal_for_trap`](Kernel::signal_for_trap).
+    /// never-mapped read and a hole between two mappings: `docs/notes/`
+    /// §6.162). The page-table error word is a *different* question and
+    /// answers wrong for the most common self-repair case - a `PROT_NONE`
+    /// page, which the CPU reports as not present - and a machine cannot
+    /// answer it at all, which is why the question moved to the kernel rather
+    /// than travelling through this seam as a flag.
     ///
     /// This is deliberately not [`send_signal`](Kernel::send_signal): that
     /// door raises a `SI_USER` record with the sender's pid at wire offset
     /// 16, which is exactly the eight bytes a fault's `si_addr` occupies. A
     /// handler asking "which address faulted" was told a pid.
-    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize) -> u8;
+    fn send_fault_signal(&self, kind: FaultKind, addr: usize, rip: usize) -> u8;
 
     /// The `(base, top)` of the running task's kernel stack, when there is one.
     fn current_stack_range(&self) -> Option<(usize, usize)>;
@@ -675,10 +696,10 @@ pub fn report_user_trap(vector: u8, ip: usize, sp: usize, error: usize) {
 }
 
 /// The signal a synchronous CPU exception ends a process with. See
-/// [`Kernel::signal_for_trap`].
+/// [`Kernel::signal_for_kind`].
 #[inline]
-pub fn signal_for_trap(vector: u8) -> u8 {
-    registered().signal_for_trap(vector)
+pub fn signal_for_kind(kind: FaultKind) -> u8 {
+    registered().signal_for_kind(kind)
 }
 
 /// The kernel's own word for a CPU exception. See [`Kernel::trap_name`].
@@ -687,11 +708,18 @@ pub fn trap_name(vector: u8) -> &'static str {
     registered().trap_name(vector)
 }
 
+/// The kernel's reading of a trap vector. See
+/// [`Kernel::fault_kind_of_vector`].
+#[inline]
+pub fn fault_kind_of_vector(vector: u8) -> FaultKind {
+    registered().fault_kind_of_vector(vector)
+}
+
 /// Queue a CPU exception's fault-shaped record. See
 /// [`Kernel::send_fault_signal`].
 #[inline]
-pub fn send_fault_signal(vector: u8, addr: usize, rip: usize) -> u8 {
-    registered().send_fault_signal(vector, addr, rip)
+pub fn send_fault_signal(kind: FaultKind, addr: usize, rip: usize) -> u8 {
+    registered().send_fault_signal(kind, addr, rip)
 }
 
 /// The running task's `comm`. See [`Kernel::current_comm`].

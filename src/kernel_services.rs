@@ -21,7 +21,7 @@
 //! can take a trap is armed on either machine: before the IDT is loaded on
 //! x86_64, before the vector table on aarch64.
 
-use crate::hal::kernel::{self, Kernel, MemoryStartup};
+use crate::hal::kernel::{self, FaultKind, Kernel, MemoryStartup};
 use crate::{boot, console, drivers, mm, net, sched, syscall, vfs};
 
 /// The boot self-tests for the trap reporter's words.
@@ -119,10 +119,11 @@ impl Kernel for Services {
         console::print_args(format_args!("{line}\n"));
     }
 
-    fn signal_for_trap(&self, vector: u8) -> u8 {
+    fn signal_for_kind(&self, kind: FaultKind) -> u8 {
         // The vocabulary owns the table, not this impl: the numbers are ABI
-        // facts a host unit test pins, and the machine only asks the seam.
-        sched::signal::signal_for_trap(vector)
+        // facts a host unit test pins, and the machine only asks the seam after
+        // reading its own word into a kind (`docs/notes/` §6.165).
+        sched::signal::signal_for_kind(kind)
     }
 
     fn trap_name(&self, vector: u8) -> &'static str {
@@ -132,13 +133,21 @@ impl Kernel for Services {
         trap_name(vector)
     }
 
-    fn send_fault_signal(&self, vector: u8, addr: usize, rip: usize) -> u8 {
+    fn fault_kind_of_vector(&self, vector: u8) -> FaultKind {
+        // One reading of a vector, in the vocabulary's module: the signals, the
+        // `si_code`s and this classification are one table, and a machine that
+        // grew its own copy would be the second table this seam exists to
+        // prevent (`docs/notes/` §6.165).
+        sched::signal::fault_kind_of_vector(vector)
+    }
+
+    fn send_fault_signal(&self, kind: FaultKind, addr: usize, rip: usize) -> u8 {
         // One table, one record, one door. `send_signal` would queue a
         // SI_USER record with a pid at `si_addr`'s offset; the fault's own
         // `si_code`/`si_addr` are the payload a handler is given, and the
         // vocabulary keeps the measured map host-testable.
         //
-        // A `#PF`'s code is the **mapping's** answer, not the page-table
+        // A page fault's code is the **mapping's** answer, not the page-table
         // error word's (`docs/notes/` §6.162): Linux says `SEGV_ACCERR` when a
         // mapping describes the address and refused the access, and
         // `SEGV_MAPERR` only when nothing describes it. The CPU's `P` bit
@@ -148,8 +157,13 @@ impl Kernel for Services {
         // assume one: the boot's own EL0 check takes faults with no tenant
         // behind it (`in_task`, `docs/notes/` §2.13), and there the answer is
         // "no mapping describes it" because no space does either.
-        let mapped = vector == 14 && sched::in_task() && sched::vma_prot_at(addr).is_some();
-        let (sig, info) = sched::signal::fault_record(vector, addr, rip, mapped);
+        //
+        // The kind, not a vector, says when to ask: on aarch64 the machine has
+        // no vector at all and names the class from its `ESR_EL1` code, and
+        // both machines must reach this one question (`docs/notes/` §6.165).
+        let mapped =
+            kind == FaultKind::Page && sched::in_task() && sched::vma_prot_at(addr).is_some();
+        let (sig, info) = sched::signal::fault_record(kind, addr, rip, mapped);
         sched::send_signal_info(sched::current(), sig, info);
         sig
     }

@@ -32,6 +32,53 @@ use mpos_bootinfo::BootInfo;
 pub const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
+/// Which synchronous exception a machine took, in the kernel's vocabulary.
+///
+/// A machine knows *what happened* - an IDT vector on x86_64, an `ESR_EL1`
+/// exception class on aarch64 - and that word is its own; what the ABI says
+/// about it is the kernel's, so this enum is the *identification* and the
+/// signal table stays in one place (`sched::signal::fault_record`).
+///
+/// It lives in this leaf rather than beside the fault seam because both halves
+/// of that seam must name it: `arch` produces a `FaultKind` from a vector or an
+/// `ESR_EL1` class, and `sched::signal` - which is host-compiled, so it cannot
+/// name anything in `arch` - turns one into a signal. A leaf crate is the only
+/// place both sides can reach (`NOTES.md` §14 S2b, the same reason `MapFlags`
+/// is here rather than in `mm`).
+///
+/// It exists because the seam used to take an x86_64 vector number: the whole
+/// per-vector policy in `send_fault_signal` was the literal `vector == 14`, so
+/// the second machine had no way to describe its faults through the same door
+/// and answered every one of them with a hardcoded `SIGSEGV` and no record at
+/// all (`docs/notes/` §6.165). Naming the exception instead of numbering it is
+/// what lets one table serve both machines.
+///
+/// The classes are the ones an ABI signal hangs off, not the ones a machine
+/// happens to raise: an `#AC` and an unaligned-trapping access are the same row
+/// here, and so are an `#GP` and aarch64's catch-all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultKind {
+    /// An integer divide by zero: `SIGFPE`/`FPE_INTDIV`.
+    Divide,
+    /// A breakpoint instruction the process executed (`int3`, `brk`):
+    /// `SIGTRAP`/`SI_KERNEL`, with no faulting address.
+    Breakpoint,
+    /// An instruction this machine cannot execute (`ud2`, an unhandled system
+    /// register): `SIGILL`/`ILL_ILLOPN`.
+    InvalidOpcode,
+    /// An access to an address no mapping permits, or that no mapping
+    /// describes: `SIGSEGV`, with the code the *mapping* answers.
+    Page,
+    /// An unaligned access the machine was asked to check: `SIGBUS`.
+    Alignment,
+    /// A synchronous exception with no ABI signal of its own: `SIGSEGV`, code
+    /// `SI_KERNEL`. This is the bucket a `#GP`/`#NP`/`#SS` and every class a
+    /// port does not recognise land in, because a fault path that could fail to
+    /// name a signal would be worse than one that reports a memory fault for a
+    /// trap it does not know.
+    Other,
+}
+
 /// Round `value` up to a multiple of `align`, which must be a power of two.
 ///
 /// ```

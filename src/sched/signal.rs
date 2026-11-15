@@ -14,6 +14,8 @@
 //! does when the task has no handler is the [`default_action`] table, which is
 //! why that table exists at all rather than a single "fatal" answer.
 
+use crate::mm::vm::FaultKind;
+
 /// Hangup: the terminal a process was using is going away. The default
 /// action is the table's plain terminate - which is what makes a session's
 /// `TIOCNOTTY` a way to end the jobs left on a line.
@@ -474,12 +476,43 @@ pub fn stops_by_default(sig: u8) -> bool {
 /// is deliberately absent from the match below: a `#PF` never reaches this
 /// door.
 pub fn signal_for_trap(vector: u8) -> u8 {
+    signal_for_kind(fault_kind_of_vector(vector))
+}
+
+/// The signal a synchronous exception ends a process with, given the exception's
+/// *class* rather than the machine's number for it.
+///
+/// Same policy as [`signal_for_trap`], reached by both machines: x86_64 names
+/// its vector and the kernel maps it through [`fault_kind_of_vector`], while
+/// aarch64 reads its `ESR_EL1` exception class and names the class directly -
+/// the two machines' words are not each other's and never needed to be
+/// (`docs/notes/` §6.165).
+pub fn signal_for_kind(kind: FaultKind) -> u8 {
+    match kind {
+        FaultKind::Divide => SIGFPE,
+        FaultKind::Breakpoint => SIGTRAP,
+        FaultKind::InvalidOpcode => SIGILL,
+        FaultKind::Alignment => SIGBUS,
+        FaultKind::Page | FaultKind::Other => SIGSEGV,
+    }
+}
+
+/// The kernel's own reading of an x86_64 trap vector: which *class* of
+/// exception the machine took.
+///
+/// This is the one place the vector's meaning is written down. It used to live
+/// as a `match` inside [`signal_for_trap`], which was enough while x86_64 was
+/// the only machine that asked; the second machine reads `ESR_EL1` instead and
+/// must reach the *same* table, so the reading and the policy are now separate
+/// steps with a class between them (`docs/notes/` §6.165).
+pub fn fault_kind_of_vector(vector: u8) -> FaultKind {
     match vector {
-        0 => SIGFPE,  // #DE divide error
-        3 => SIGTRAP, // #BP breakpoint (`int3`)
-        6 => SIGILL,  // #UD invalid opcode
-        17 => SIGBUS, // #AC alignment check
-        _ => SIGSEGV, // #SS, #NP, #GP and every vector we do not install
+        0 => FaultKind::Divide,        // #DE divide error
+        3 => FaultKind::Breakpoint,    // #BP breakpoint (`int3`)
+        6 => FaultKind::InvalidOpcode, // #UD invalid opcode
+        14 => FaultKind::Page,         // #PF page fault
+        17 => FaultKind::Alignment,    // #AC alignment check
+        _ => FaultKind::Other,         // #SS, #NP, #GP and every vector we do not install
     }
 }
 
@@ -863,20 +896,29 @@ impl SigInfo {
 /// decoding is still absent, so on that machine every refused EL0 fault is
 /// `SIGSEGV` with no record; and the three reserved bits of `si_code` are not
 /// left for a future `SEGV_ACCERR` subclass.
-pub fn fault_record(vector: u8, addr: usize, rip: usize, mapped: bool) -> (u8, SigInfo) {
-    let (code, fault_addr) = match vector {
-        0 => (FPE_INTDIV, rip), // #DE divide error
-        3 => (SI_KERNEL, 0),    // #BP breakpoint (`int3`)
-        6 => (ILL_ILLOPN, rip), // #UD invalid opcode
-        14 => {
+pub fn fault_record(kind: FaultKind, addr: usize, rip: usize, mapped: bool) -> (u8, SigInfo) {
+    let (code, fault_addr) = match kind {
+        FaultKind::Divide => (FPE_INTDIV, rip),
+        FaultKind::Breakpoint => (SI_KERNEL, 0),
+        FaultKind::InvalidOpcode => (ILL_ILLOPN, rip),
+        FaultKind::Page => {
             let code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
             (code, addr)
-        } // #PF page fault
-        17 => (BUS_ADRALN, 0),  // #AC alignment check
-        _ => (SI_KERNEL, 0),    // #SS, #NP, #GP and unknown
+        }
+        FaultKind::Alignment => (BUS_ADRALN, 0),
+        FaultKind::Other => (SI_KERNEL, 0),
     };
-    let sig = signal_for_trap(vector);
+    let sig = signal_for_kind(kind);
     (sig, SigInfo::fault(sig, code, fault_addr))
+}
+
+/// The `(signal, record)` the trap a *vector* names must queue: the x86_64
+/// spelling of [`fault_record`].
+///
+/// Kept because that machine's doors already hold a vector and nothing else,
+/// and the reading of it is written down once ([`fault_kind_of_vector`]).
+pub fn fault_record_of_vector(vector: u8, addr: usize, rip: usize, mapped: bool) -> (u8, SigInfo) {
+    fault_record(fault_kind_of_vector(vector), addr, rip, mapped)
 }
 
 /// How many queued real-time records one task can hold. This ring is where the
@@ -1112,7 +1154,7 @@ mod tests {
     /// trap door goes back to `send_signal`.
     #[test]
     fn a_cpu_fault_record_names_its_code_and_address() {
-        let (sig, info) = fault_record(14, 0x10, 0xdead, false);
+        let (sig, info) = fault_record(FaultKind::Page, 0x10, 0xdead, false);
         assert_eq!(sig, SIGSEGV);
         assert_eq!(info.signo, SIGSEGV as i32);
         assert_eq!(info.code, SEGV_MAPERR);
@@ -1143,7 +1185,7 @@ mod tests {
             (255, SIGSEGV, SI_KERNEL, 0),     // unknown: still total
         ];
         for (vector, sig, code, addr) in cases {
-            let (got_sig, info) = fault_record(vector, 0x10, rip, false);
+            let (got_sig, info) = fault_record_of_vector(vector, 0x10, rip, false);
             assert_eq!(got_sig, sig, "vector {vector} answered the wrong signal");
             assert_eq!(
                 info.code, code,
@@ -1159,7 +1201,7 @@ mod tests {
             );
         }
         // `#PF`'s code is the mapping's answer, not the CPU's error word.
-        let (_, accerr) = fault_record(14, 0x7fff_0000, rip, true);
+        let (_, accerr) = fault_record(FaultKind::Page, 0x7fff_0000, rip, true);
         assert_eq!(accerr.code, SEGV_ACCERR);
         assert_eq!(accerr.addr, 0x7fff_0000);
         assert_ne!(accerr.code, SEGV_MAPERR);
@@ -1184,7 +1226,7 @@ mod tests {
             ("never-mapped read", false),
             ("hole between two mappings", false),
         ] {
-            let (_, info) = fault_record(14, 0x1234_5000, 0x401000, mapped);
+            let (_, info) = fault_record(FaultKind::Page, 0x1234_5000, 0x401000, mapped);
             let want = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
             assert_eq!(
                 info.code, want,

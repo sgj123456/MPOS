@@ -13,6 +13,6 @@
 //! staying here to test a re-export.
 
 pub use mpos_vm::{
-    KernelSections, MapFlags, Mapping, PAGE_SHIFT, PAGE_SIZE, PageTaken, align_down, align_up,
-    kernel_mappings,
+    FaultKind, KernelSections, MapFlags, Mapping, PAGE_SHIFT, PAGE_SIZE, PageTaken, align_down,
+    align_up, kernel_mappings,
 };
