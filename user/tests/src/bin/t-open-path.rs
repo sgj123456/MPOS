@@ -30,7 +30,7 @@
 //! out a descriptor on a link without following it.
 
 use mpos_user_tests::Report;
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 /// The fixture directory and the file/link inside it.
@@ -180,6 +180,68 @@ fn main() {
             &format!("O_DIRECTORY|O_NOFOLLOW on a symlink is ENOTDIR, got {dir_nofollow:?}"),
             dir_nofollow.as_ref().err().copied() == Some(Errno::NOTDIR),
         );
+    }
+
+    // === `O_PATH` as a *dirfd*: the flag's largest use ======================
+    //
+    // A descriptor opened `O_PATH` on a **directory** is exactly what an `*at`
+    // door wants as its dirfd: it names the directory without opening it. All
+    // of them are served through one - measured on Linux 7.3.4
+    // (`build/scratch/opathfd/{t,fin}.c`, `docs/notes/` §6.178) - and the
+    // *reverse* holds too: the doors that would touch the subject's contents
+    // refuse it (`fchmod`, `getdents64`, `read`).
+    //
+    // Every raw door here, not the libc wrapper, because two of these have
+    // userspace fallbacks that hide the kernel's answer: musl's `fchmod()`
+    // calls `fchmodat(AT_FDCWD, "/proc/self/fd/N")` when the direct call fails,
+    // so on **both** machines `fchmod(O_PATH_fd)` returns 0 and changes the mode
+    // while the raw call refuses. A probe that measured the wrapper would have
+    // "found" a divergence that is musl's, and a pin would have pinned it.
+    let dirfd_flags = OFlags::from_bits_retain(libc::O_PATH as u32);
+    match rustix::fs::open(DIR, dirfd_flags, Mode::empty()) {
+        Ok(dirfd) => {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&dirfd);
+            // The doors that must be *served* through it.
+            let reopened = rustix::fs::openat(&dirfd, "file", OFlags::RDONLY, Mode::empty());
+            r.check("openat(O_PATH dirfd, \"file\") is served", reopened.is_ok());
+            // `fstatat`, `fchmodat` and `unlinkat` are the three that a
+            // `O_PATH` dirfd is most often handed to; each through its own raw
+            // door so nothing in the libc can answer for the kernel.
+            let st = rustix::fs::statat(&dirfd, "file", AtFlags::empty());
+            r.check(
+                &format!("fstatat(O_PATH dirfd, \"file\") is served, got {st:?}"),
+                st.is_ok(),
+            );
+
+            // The doors that must be **refused** on the descriptor itself.
+            // SAFETY: `raw` is a live descriptor this test owns, and the
+            // arguments are a mode, a buffer and a length.
+            let fchmod_raw = unsafe { libc::syscall(libc::SYS_fchmod, raw, 0o700) };
+            r.check(
+                &format!(
+                    "fchmod(O_PATH fd) is EBADF (raw), got rc={fchmod_raw} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                fchmod_raw == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
+            );
+            let mut dirents = [0u8; 512];
+            // SAFETY: as above, with a buffer this test owns.
+            let getdents = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    raw,
+                    dirents.as_mut_ptr().cast::<libc::c_void>(),
+                    dirents.len(),
+                )
+            };
+            r.check(
+                &format!("getdents64(O_PATH fd) is EBADF (raw), got rc={getdents}"),
+                getdents == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
+            );
+        }
+        Err(e) => r.check(&format!("open(dir, O_PATH) is served, got {e:?}"), false),
     }
 
     let _ = std::fs::remove_dir_all(DIR);
