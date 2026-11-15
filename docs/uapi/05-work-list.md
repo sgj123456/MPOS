@@ -12661,3 +12661,84 @@ have no GPR-preserving stub (§6.161's gap 1); aarch64 `el0_sync` still has no
 `signalfd_siginfo.ssi_addr` and `PTRACE_GETSIGINFO` are their own doors;
 `fault_repeats`' counter is still global; chromium is not unblocked (§6.162,
 item 282)
+
+---
+
+## Item 283 — the seven process-visible exception vectors enter their handler at the trap
+
+**Before.** Only `#PF` had a register-preserving entry (item 281). The other six
+vectors a program can see — `#DE` 0, `#BP` 3, `#UD` 6, `#NP` 11, `#SS` 12,
+`#GP` 13, `#AC` 17 — were `x86-interrupt` handlers, whose prologue hides the
+general registers from Rust. `deliver_at_trap` therefore had no frame to write,
+so a handled `SIGILL`/`SIGFPE`/`SIGTRAP` waited for the next system call or
+timer tick, and the repeat guard usually won first:
+
+```
+div0: DIED sig=8 ran=0 resumed=0
+task 6 died of signal 8 it could not be handed: trap 0 code 0x0 at 0x4013f6,
+the same fault 3 times over, and a handler is installed
+```
+
+`int3` and `ud2` "worked" in the same run only because a tick arrived in time;
+running the probe again gave a different answer. A program that installs
+`SIGFPE` and divides by zero was killed by the kernel's backstop.
+
+**Now.** One shared body plus seven entry labels in
+`arch/src/arch/x86_64/idt.rs` (`global_asm!`, section `.text.trap_stubs`). Each
+label pushes a tag word (its vector) and — for the three vectors the CPU pushes
+no error code for — a zero, so from `trap_common` the stack is
+`[tag, code-or-zero, rip, cs, rflags, (rsp, ss)]` on every path. `trap_common`
+pushes the 15 general registers into a `TrapRegs`, reads the saved `cs`, and
+branches on the ring: ring 3 shifts the five-word CPU frame down over the
+tag/code pair and calls `rust_trap`, which ends with the §2.13 trap-time
+handover (`deliver_at_trap(frame)`) so `iretq` enters the handler directly; ring
+0 passes vector/code/rip/cs/rflags/base to `rust_trap_kernel`, which reports and
+exits the machine. The ring-0 `#BP` case stays inside `trap_common` because the
+boot's clock-suite kunit runs `int3` at CPL 0 and requires the counter to move
+and the handler to return (`src/board/suites.rs:251`). The installs all go
+through `set_handler_addr(...)`; `#BP` keeps `PrivilegeLevel::Ring3` (item 279).
+The new `Kernel::trap_name` seam lets the ring-0 report name its vector from the
+machine layer without a second table.
+
+Linux 7.2.14 measured first (`build/scratch/traptrap/h.c`, `si.c`): `int3` →
+`SIGTRAP`/`si_code` 128/`si_addr` **0**, saved `rip` **after** the instruction;
+`ud2` → `SIGILL`/2/`si_addr` = the faulting `rip`, saved `rip` **of** it; `idiv`
+by zero → `SIGFPE`/1/`si_addr` = the faulting `rip`. A frame rebuilt from one
+template for all seven would either loop on `int3` or skip an instruction after
+`ud2`.
+
+**Pins.** `user/tests/src/bin/t-trap-at-trap.rs` — eight forked children per
+vector, each claiming (a) the handler ran once, (b) `si_code` is the vector's
+own, (c) `si_addr` is zero for `#BP` and the saved `rip` for the other two, (d)
+the instruction after the trap ran (the saved-`rip` claim: a frame off by one
+byte either loops or skips). `#DE`'s child `_exit(0)`s from its handler because
+there is nothing to repair. `MPOS_ON_HOST=1` PASS on Linux 7.2.14; guest 24/24
+children `PASS` (`build/scratch/traptrap/boot-pin.log`). In `tests.toml`'s
+`[aarch64] gaps`: the second machine's `el0_sync` has no `ESR`→signal map.
+
+**Counterfactual.** (a) The trap-time handover deleted from `rust_trap` → the
+pin **still passes** 24/24, because this probe's children fault right after a
+syscall and a tick usually wins the race; written down because removing one call
+from a design with a backstop is not a counterfactual. (b) `idt.rs` restored
+from before the item, kernel **and** loader rebuilt → `int3 good=1 died=6
+wrong=1`, `ud2 good=0 died=8`, `#DE good=0 died=8`, `FAILED`, console repeating
+`died of signal 8 it could not be handed` (`build/scratch/traptrap/boot-before.log`).
+Restored from `build/scratch/traptrap/good/` with `sha256sum -c` on all four
+files; rebuilt; guest `PASS` (`build/scratch/traptrap/boot-restore.log`).
+`t-trap-signal`'s 17 claims also still pass, which is the same question one
+layer up.
+
+**Gate** `build/gate-trapstub2.log` exit 0: stage 1 **1330** tests 0 failed
+(29.16 s); x86_64 `pass=321 fail=0`; aarch64 `pass=316 fail=0`; `mpos-kunit
+**41 passed, 0 failed**` per arm; `t-trap-at-trap` `=== PASS` on the x86_64
+lane. fmt both workspaces, host lib **812** / xtask
+**162**, six-arm clippy ratchet unchanged (it first grew
+`clippy::doc_lazy_continuation` 36→39 — a `-` that Markdown read as a list item
+— and the doc was reworded rather than allowed), bare metal both arches clean.
+
+**What this does not do.** aarch64 `el0_sync` still has no `ESR`→signal map;
+`#BP`'s `PTRACE`-visible half is a different frame and unpinned; `fault_repeats`
+is still one global counter keyed on `(task, rip)` and never reset;
+`device_not_available` (7) and `double_fault` (8) stay on the `x86-interrupt`
+ABI because neither is a signal a program can handle; chromium is not unblocked
+(its `cc 0f 0b` is an intentional `__builtin_trap()`).

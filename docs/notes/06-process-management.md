@@ -14982,3 +14982,191 @@ learns to re-run it away.
 2. **The mmap region's and the heap's distributions are likewise unpinned.**
    The heap is deliberately *not* drawn by this kernel (it follows the image),
    which the test names as a divergence rather than a failure.
+
+---
+
+## §6.164 the seven process-visible exception vectors enter their handler at the trap (LANDED 2026-11-15)
+
+**The observation.** Item 282's report closed with a named gap: only `#PF` had
+a register-preserving stub, so a *handled* `SIGILL`, `SIGFPE` or `SIGTRAP` was
+queued and then waited for the next system call or timer tick. A guest probe
+(`build/scratch/traptrap/t.c`, musl static, three forked children) measured what
+that costs:
+
+```
+--- trap resume probe ---
+trap 3 code 0x0 rip 0x4013d2 rsp 0x3fbbadb0 rflags 0x246
+int3: exit=0 ran=1 resumed=1
+ud2: exit=0 ran=1 resumed=1
+div0: DIED sig=8 ran=0 resumed=0
+```
+
+`int3` and `ud2` "worked" — one PIT tick happened to hand the record over before
+the repeat guard fired — and `idiv` by zero never did. Three
+`divide error` lines, then:
+
+```
+task 6 died of signal 8 it could not be handed: trap 0 code 0x0 at 0x4013f6,
+the same fault 3 times over, and a handler is installed
+```
+
+A program that installs `SIGFPE` and divides by zero was killed by the kernel's
+own backstop, and the same probe run twice could give three different answers
+for `int3`. That is the shape the repo forbids: not a refusal, and not Linux.
+
+**Why the entry was the cause, not the signal.** `x86-interrupt` hides the
+general registers behind a prologue that Rust cannot address — that is the whole
+point of the ABI — so `deliver_at_trap` had no register file to rewrite and
+`build_frame_at` had no `ucontext_t` to fill. Item 281 proved the fix on one
+vector: a hand-written stub that pushes a `TrapRegs` block gives the kernel the
+program's own rip/rsp/rflags *and* r12, so the signal can be handed over at the
+trap and `iretq` enters the handler directly. §2.13's `deliver_at_trap` was
+already the door; there was simply no frame for it to write into.
+
+**What the machine measured first.** Linux 7.2.14, `build/scratch/traptrap/h.c`
+(fork per trial, `SA_SIGINFO` handler that steps `REG_RIP` by two for `SIGILL`):
+
+| instruction | signal | saved `rip` | Linux's resume |
+|---|---|---|---|
+| `int3` | `SIGTRAP` 5 | the address **after** the instruction | a plain return resumes |
+| `ud2` | `SIGILL` 4 | the address **of** the instruction | handler must add 2 |
+| `idiv` by 0 | `SIGFPE` 8 | the address **of** the instruction | nothing can resume it |
+
+and `build/scratch/traptrap/si.c` for the record:
+
+| instruction | `si_code` | `si_addr` |
+|---|---|---|
+| `int3` | `SI_KERNEL` 128 | **0** |
+| `ud2` | `ILL_ILLOPN` 2 | the faulting `rip` |
+| `idiv` by 0 | `FPE_INTDIV` 1 | the faulting `rip` |
+
+`#BP` is the odd one in both columns: the CPU pushes the *next* instruction, so
+a handler returns without adjusting anything — while the two real faults push
+their own address and `si_addr` names it. A frame rebuilt from one template for
+all seven would either re-execute the `int3` for ever or skip an instruction the
+program never wrote.
+
+**The change.** One shared body, seven entry labels (`arch/src/arch/x86_64/idt.rs`,
+`global_asm!` in section `.text.trap_stubs`):
+
+- each label pushes a **tag** word (its own vector) and, for the three vectors
+  the CPU pushes no error code for, a zero — so from `trap_common` the stack is
+  `[tag, code-or-zero, rip, cs, rflags, (rsp, ss)]` on every path, which is what
+  lets one body serve all seven;
+- `trap_common` pushes the 15 general registers into a `TrapRegs`, then `rep
+  movsq` shifts the CPU frame **five words** down over the tag/code pair (they
+  are not words `iretq` pops), leaving exactly the block every door expects, and
+  reads the now-shifted `cs` to branch on the ring. Ring 3 goes to `rust_trap`;
+  ring 0 to `rust_trap_kernel`, which never returns;
+- the ring-0 `#BP` case is kept inside `trap_common` rather than beside its
+  label, because the boot's own clock-suite kunit runs `asm!("int3")` at CPL 0
+  and requires `breakpoints_caught()` to move and the handler to **return**
+  (`src/board/suites.rs:251`). It answers through `rust_breakpoint_kernel` and
+  re-enters the shared epilogue;
+- **the five words are pushed at ring 0 too**, and that cost the first gate. The
+  stub originally shifted three words on the ring-0 path, on the assumption that
+  a same-ring interrupt pushes only `rip`/`cs`/`rflags`. The gate went red at the
+  boot's own clock suite and the panic's error word named the mistake:
+  `KERNEL PANIC: general protection fault (vector 13)` / `code 0x280`, and
+  `0x280` is the saved `rflags` (`0x283`) with its low three bits masked —
+  `iretq` had taken the fifth and sixth stack words for `rsp`/`ss`. A probe that
+  printed the raw block before any shift settled it: a ring-0 `int3` leaves
+  `+120 0x3 / +128 0x0 / +136 rip / +144 0x8 / +152 0x283 / +160 <kernel rsp> /
+  +168 0x10` (`build/scratch/bp-raw.log`). In 64-bit mode the CPU pushes `SS:RSP`
+  at **every** privilege level, so there is one frame shape and one shift;
+- `rust_trap` is `user_fault_or_die`'s body with `deliver_at_trap(frame)` at the
+  end — the trap-time handover item 281 built, now reached by every vector;
+- the IDT installs all seven through `set_handler_addr(...)`, and `#BP` keeps
+  `PrivilegeLevel::Ring3` (a ring-0 gate is what turned a ring-3 `int3` into
+  `#GP(0x1a)`, item 279).
+
+`arch/src/hal/kernel.rs` grew one seam, `fn trap_name(&self, vector: u8) ->
+&'static str`, because the ring-0 report has to name its vector from the machine
+layer and `src/kernel_services.rs` already owns the one table (items 278/279).
+No second copy of the names exists.
+
+**The pin.** `user/tests/src/bin/t-trap-at-trap.rs`, eight forked children per
+vector, each child claiming: the handler ran exactly once; `si_code` is the
+vector's own; `si_addr` is zero for `#BP` and the saved `rip` for the other two;
+and the instruction *after* the trap ran (`int3`'s plain return, `ud2`'s `+2`
+step) — which is the saved-rip claim, since a frame off by one byte in either
+direction either loops or skips. `#DE`'s child leaves through `_exit(0)` from
+its handler because there is nothing to repair. Exit codes 10/11/12/13 name
+which claim failed. `MPOS_ON_HOST=1` runs the same fixture against Linux 7.2.14
+and passes (`9 ok`, `PASS`), which is what makes the numbers a measurement
+rather than a description. It sits in `tests.toml`'s `[aarch64] gaps`: the second
+machine's `el0_sync` has no `ESR`→signal map, so this claim has no counterpart
+there.
+
+Guest, on the new kernel (`build/scratch/traptrap/boot-pin.log`, 24 children):
+
+```
+ok:  int3 (#BP):    all 8 ... (good=8 died=0 wrong=0)
+ok:  ud2 (#UD):     all 8 ... (good=8 died=0 wrong=0)
+ok:  idiv by zero (#DE): all 8 ... (good=8 died=0 wrong=0)
+PASS
+```
+
+The siginfo probe reads back Linux's own table on the new kernel
+(`build/scratch/traptrap/g.c` → `g-musl`, guest): `int3` → `code=128 addr=0`
+with `rip` past the instruction, `ud2` → `code=2 addr=rip`, `div0` →
+`code=1 addr=rip`. Byte for byte the host's four columns. `t-trap-signal`
+(17 claims) also passes unchanged, which matters: it was written against the
+*previous* stack and its `WTERMSIG` claims are the same question answered one
+layer up.
+
+**Counterfactual.** Two, because the first was too small. (a) The trap-time
+handover deleted from `rust_trap` → the pin **still passes**, `24/24`. That is
+the tick-rate lottery doing its work: this probe's children fault right after a
+syscall, so a tick usually wins the race. (b) The whole `idt.rs` restored from
+before the item (`build/scratch/traptrap/idt.rs.before`, kernel and loader both
+rebuilt) →
+
+```
+FAIL:  int3 (#BP): good=1 died=6 wrong=1
+FAIL:  ud2 (#UD):  good=0 died=8 wrong=0
+FAIL:  idiv by zero (#DE): good=0 died=8 wrong=0
+FAILED
+```
+
+`int3` at 1-of-8 is the coin flip measured above, `ud2` and `#DE` never deliver,
+and the console repeats `task ... died of signal 8 it could not be handed`. The
+honest counterfactual is (b); (a) is written down here because it is the more
+useful lesson — *removing one call from a working design is not a
+counterfactual when the design has a backstop that usually fires in time*.
+
+Restored from `build/scratch/traptrap/good/` with `sha256sum -c` on all four
+files, rebuilt, guest `PASS` again (`build/scratch/traptrap/boot-restore.log`).
+
+**Gate.** `build/gate-trapstub2.log`, exit 0 — stage 1 **1330** tests 0 failed
+(29.16 s), x86_64 `pass=321 fail=0`, aarch64 `pass=316 fail=0`, `mpos-kunit
+**41 passed, 0 failed**` per arm; `t-trap-at-trap` `=== PASS` on the x86_64
+lane (aarch64 names it in `gaps`). aarch64 stage 2 read `106.02 s` against the
+previous green's `123.26 s`.
+
+**A lint the gate earned.** The first ratchet run grew
+`clippy::doc_lazy_continuation` 36→39 on the x86_64 arm: three lines of the new
+`rust_trap` doc began with a `-` dash that Markdown read as a list item, so the
+following prose was "a list item without indentation". Reworded rather than
+allowed — the count is a ceiling, not a budget.
+
+### What this does not do, named
+
+1. **The second machine has no equivalent.** `el0_sync` decodes an `ESR` into
+   an exception class and this port maps none of them to a signal yet; a refused
+   EL0 fault there still dies without queueing anything (§6.159's gap, still
+   open). Every `#PF`/exception pin therefore names `t-trap-at-trap`-class
+   programs in `[aarch64] gaps`.
+2. **`#BP` from ring 3 has no `si_addr`.** Linux reports 0 and so does this
+   kernel, but nothing pins the `PTRACE`-visible half: a debugger attaching to a
+   task stopped at an `int3` reads its registers through the syscall path, which
+   is a different frame.
+3. **`fault_repeats` is still one global counter** keyed on `(task, rip)` and
+   never reset, so a task that faults at one instruction, is repaired by its
+   handler, and faults there again later in its life can be killed by a limit
+   it already spent. Named in §6.162 too; the trap-time handover makes it far
+   less reachable (the handler now runs, so the count stops growing) but does
+   not close it.
+4. **`device_not_available` (7) and `double_fault` (8) stay on the ABI.** Neither
+   is a signal a program can handle: `#DF` is unrecoverable by definition, and
+   vector 7 is the lazy-FPU path that must return into the instruction.
