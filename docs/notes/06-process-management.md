@@ -17026,3 +17026,103 @@ stating.
    other half and is not here.
 4. **`F_SETLEASE`'s own authority** (`CAP_LEASE`, and the `EPERM` a non-owner
    reads) is unswept, so the lease family is named in two places now.
+
+## §6.181 a private file mapping's fault resolved its page *inside* the task table's borrow (item 301, fix landed, **pin not yet**)
+
+**The report.** The user ran `weston` on the guest and got an intermittent segfault:
+
+```
+mpos: syscall 144 (fd 728) -> EOPNOTSUPP
+weston:disk$0[727]: segfault at 7e6c19762100 ip 00007db6822361c0 … error 4
+PFDIAG page=0x7e6c19762000 pte=0x8000000078d4c025 P=1 W=0 U=1 B9=0
+PFDIAG vma=0x9 (r--u) kind=object(private)
+PFDIAG fault_in=0x7e6c19762000 vma[/usr/lib/libgallium-26.2.6.so] … r--u
+PFDIAG rip_in=… eager[/lib/ld-musl-x86_64.so.1]
+```
+
+**The reading that names it is a contradiction in the dump.**
+`error 4` is bit 2 alone: *user mode, not present, read*. But by the time
+`PFDIAG` printed, the same page read `pte … P=1 W=0 U=1` - **present**. A read of a
+page that was absent when the CPU faulted and present when the diagnostic looked is
+not a permission problem and not a bad address: something resolved the page during
+the fault and then the fault was reported anyway.
+
+**The mechanism, and it is a contract violation rather than a race.** `populate_in`
+- the one function every lazy-fault arm goes through - ran
+`object.frame_at(index)` **inside** the `with_table` closure:
+
+```rust
+with_table(|t| populate_in(t, root, virt, write, false))   // ← the closure …
+```
+
+and `frame_at` is `FilePages::frame_at`, which calls `self.inode.read_at(..)`. A
+block transfer **parks its task** (`docs/notes/` §10.5 - "the ext4 cache claims its
+slots around the device call"), and `with_table`'s own doc says exactly what that
+may not do:
+
+> `f` must not switch tasks. See the module docs for why that is a rule rather than
+> a preference.
+
+The same function already defers `userfaultfd::deliver` **for this reason**, in a
+comment that spells the rule out: "This runs **before** the table is borrowed
+because the park switches tasks, and `with_table`'s own rule is that its closure
+must not". The `Frames` arm simply did not follow it.
+
+So on a cache **hit** nothing happens (no park, no switch) and every test passes; on
+a **miss** the fill parks, another task runs, and the table borrow and the address
+space it describes are touched by two contexts at once. That is why weston's crash
+is intermittent, why it needs a large 3D driver mapped `MAP_PRIVATE`, and why it
+appeared under contention - `disk$0` is weston's own disk thread.
+
+**The fix** splits the arm in two. `claim_object_page` reads the table only long
+enough to learn *which object and index* to ask (which cannot park), then calls
+`frame_at` **outside** the borrow, and `adopt_claimed` maps the frame it brought in
+under the borrow. The three doors that reach `populate_in` -
+`resolve_anon_fault` (the `#PF` path), `populate_user_page_at`
+(`process_vm_readv`, `PTRACE_POKEDATA`, `/proc/<pid>/mem`) and
+`populate_forced_page_at` (the `FOLL_FORCE` half) - all take the same two halves.
+
+**What is *not* proven, and this is the honest part.** I do not have a
+counterfactual. Three attempts, all recorded because the negative is the finding:
+
+1. a single-threaded probe faulting a private mapping of a 512 KiB file in strided
+   order, **20 rounds**, on the guest's ramfs root: no corruption;
+2. the same claim added to `t-mmap-file-lazy`, run on **both** arms of the gate -
+   including aarch64, whose sweep boots an ext4 root where `t-blk-sleep` proves
+   transfers *do* park - against the **unfixed** kernel: **passes on both**;
+3. a two-thread probe (one faulting cache misses, one hammering table-taking
+   syscalls) on tmpfs: no corruption with **and** without the fix.
+
+So the mechanism is established by the code's own contract, the dump's
+contradiction, and the `userfaultfd` precedent beside it - not by a red test. A pin
+needs a fault that provably parks *while* another task runs, and neither the ramfs
+root nor a single-process ext4 root produces one reliably. That is the outstanding
+work, named rather than papered over: **AGENTS.md §3 rule 6 says a gap gets a pin or
+it is not done, and by that rule this item is not done** - it is a fix landed against
+a mechanism proven by reading, with the pin owed.
+
+**Gate.** `build/gate-item301.log`, `GATE_EXIT=0`, both arms in one run on the
+**fixed** kernel: stage 1 **1340** host tests 0 failed (63.43 s); stage 2 **324**
+programs over 6 lanes on x86_64 (42.82 s) and **320** on aarch64 (56.44 s);
+`pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm;
+six-arm clippy ratchet unchanged at `162/168/389/273/3`; both workspaces formatted.
+A **second** full aarch64 arm was run against the *unfixed* kernel as attempt 2 of
+the counterfactual (`build/gate-item301-cf-arm.log`, exit 0) - and it was green,
+which is the negative result the section above records.
+
+### What this does not do, named
+
+1. **No counterfactual** (above). The next attempt should force the park: a file
+   large enough that the cache cannot hold it, faulted from one thread while a
+   second holds the table in a syscall known to touch it, with the fill site
+   instrumented to print when it parks.
+2. **`MappedObject::frame_at` is still allowed to park at all.** Every caller now
+   has to know that, and the trait's doc does not say it. A note on the trait - or a
+   `frame_at_parking` spelling - is the structural fix; this item made the three
+   existing callers correct.
+3. **The `object` is cloned under the borrow** (`Arc::clone`, no allocation, no
+   park), which is safe but means a mapping replaced between the claim and the
+   adoption would be filled from the old object. One core, and the table's own
+   borrow holds across both halves, so the window is empty in practice - recorded
+   because "in practice" is what this repository writes down instead of leaving
+   implicit.
