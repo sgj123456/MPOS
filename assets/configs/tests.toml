@@ -212,6 +212,14 @@ diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 #                 `ESR`→signal map at all, so it has no record to read a code
 #                 from. It builds on both machines and says "skipped" on the
 #                 second.
+#
+#   t-trap-at-trap
+#                 the seven process-visible x86_64 exception vectors enter a
+#                 register-preserving stub, so `#BP`/`#UD`/`#DE` reach their
+#                 handler at the trap with Linux's saved `rip` and `si_code`
+#                 (`docs/notes/` §6.164). The second machine's `el0_sync` has
+#                 no `ESR`→signal map, so there is no counterpart to claim. It
+#                 builds on both machines and says "skipped" on the second.
 
 [aarch64]
-gaps = ["t-arch-prctl", "t-trap-signal", "t-fault-at-trap", "t-fault-sicode"]
+gaps = ["t-arch-prctl", "t-trap-signal", "t-fault-at-trap", "t-fault-sicode", "t-trap-at-trap"]
