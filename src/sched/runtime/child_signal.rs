@@ -237,6 +237,27 @@ fn enqueue(task: &mut Task, sig: u8, mut info: crate::sched::signal::SigInfo) ->
     true
 }
 
+/// Is the record behind `sig` a **freed** one - a deleted timer's, whose
+/// `sigqueue` went while the pending bit stayed?
+///
+/// One question in one place because three doors have to agree about it, and a
+/// door that disagrees is how a stale bit keeps a promise nobody can keep:
+/// Linux's answer to all of them is "there is no signal here" (measured on
+/// 7.3.4, `build/scratch/timerdel/{del3,del4}.c` - unblocking runs no handler, a
+/// `signalfd` read is `EAGAIN`, and a blocking `sigtimedwait` parks its whole
+/// timeout and then answers `EAGAIN`), and the bit is dropped by whichever door
+/// looks first.
+fn record_is_freed(task: &Task, sig: u8) -> bool {
+    if crate::sched::signal::is_rt(sig) {
+        // A real-time record is freed in place, so ask the queue: `holds` stays
+        // true until the record is popped, which is exactly the stale shape.
+        task.rtq.holds_freed(sig)
+    } else {
+        let slot = (sig as usize).min(crate::sched::signal::SIGINFO_SLOTS - 1);
+        task.siginfo[slot].signo == sig as i32 && task.siginfo[slot].freed
+    }
+}
+
 /// What a [`send_signal_info`] found at the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sent {
@@ -2487,6 +2508,16 @@ pub fn take_deliverable_siginfo() -> Option<(u8, crate::sched::signal::SigInfo)>
                 task.siginfo[slot] = crate::sched::signal::SigInfo::ZERO;
                 info
             };
+            // A record whose `sigqueue` was freed - a deleted timer's - is not
+            // a signal any more: the bit goes (Linux drops it at the same
+            // dequeue) and nothing is delivered. Measured on 7.3.4
+            // (`build/scratch/timerdel/del3.c`): unblocking runs no handler and
+            // a `signalfd` read is `EAGAIN`, where this kernel used to run the
+            // handler and hand back a full record.
+            if info.freed {
+                task.signals &= !crate::sched::signal::bit(sig);
+                continue;
+            }
             // The bit clears only when the last copy of this number has drained:
             // a real-time signal stays pending while the ring still holds one, so
             // every queued copy wakes a handler (and is not lost to a single clear).
@@ -2537,6 +2568,16 @@ pub fn take_signal_in_set(
                 if !task.rtq.holds(sig) {
                     task.signals &= !crate::sched::signal::bit(sig);
                 }
+                // A freed record is not a signal to be taken: Linux answers
+                // `EAGAIN` from this door and *drops the stale bit* doing it -
+                // measured with a zero timeout and with a 150 ms one, which
+                // parks the whole timeout first (`build/scratch/timerdel/
+                // {del2,del4}.c`). Clearing the bit here is what keeps the
+                // stale marker from outliving its one misleading read.
+                if record.freed {
+                    task.signals &= !crate::sched::signal::bit(sig);
+                    return None;
+                }
                 note_timer_record_delivered(task, sig, &record);
                 Some((sig, record))
             }
@@ -2582,6 +2623,20 @@ pub fn take_fatal_signal() -> Option<u8> {
                 if crate::sched::signal::default_action(sig)
                     != crate::sched::signal::DefaultAction::Terminate
                 {
+                    continue;
+                }
+                // A **freed** record is not a signal at all - a deleted timer's
+                // `sigqueue` with the bit left behind. Linux's answer is that
+                // nothing happens: measured on 7.3.4, unblocking a stale bit
+                // runs no handler *and does not kill the task* even though the
+                // number's default action is to terminate
+                // (`build/scratch/timerdel/del2.c`: `handler runs after unblock
+                // = 0`). Dropping the bit here is the failed-dequeue half. This
+                // door used to `die_of_fatal_signal` on it, so a guest program
+                // that deleted an unread timer died of the signal it had just
+                // cancelled (`exit=166`, signal 38).
+                if record_is_freed(task, sig) {
+                    task.signals &= !crate::sched::signal::bit(sig);
                     continue;
                 }
                 task.signals &= !crate::sched::signal::bit(sig);

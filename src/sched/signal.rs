@@ -674,6 +674,22 @@ pub struct SigInfo {
     /// timer left 200 ms reads record `overrun` 9 and `timer_getoverrun` 9;
     /// `build/scratch/sfdhost/{life2,last}.c`). Zero for every other sender.
     pub overrun: i32,
+    /// This record's `sigqueue` was **freed while the pending bit stayed set**:
+    /// `timer_delete` of a timer whose expiry had already queued a signal.
+    ///
+    /// Linux's shape, measured on 7.3.4 (`build/scratch/timerdel/{del,del2,
+    /// del3,del4}.c`) and stranger than it looks: after the delete the bit is
+    /// still in `sigpending`, but there is no record behind it any more - so a
+    /// take answers `EAGAIN`, a **blocking** `sigtimedwait` parks for its whole
+    /// timeout and *then* answers `EAGAIN`, unblocking runs no handler at all,
+    /// a `signalfd` read is `EAGAIN`, and the bit only disappears when one of
+    /// those failed dequeues pops it. `kill` on the same number is delivered
+    /// normally afterwards, so the stale bit costs nothing but its own answer.
+    ///
+    /// The bit is carried here as a **marker on the record** rather than as a
+    /// second per-signal set: the record is what the two disagree about, so one
+    /// place saying "the bit is set and the record is gone" cannot drift.
+    pub freed: bool,
 }
 
 impl SigInfo {
@@ -692,6 +708,7 @@ impl SigInfo {
         fault: false,
         tid: 0,
         overrun: 0,
+        freed: false,
     };
 
     /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
@@ -710,6 +727,7 @@ impl SigInfo {
             fault: false,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 
@@ -729,6 +747,7 @@ impl SigInfo {
             fault: false,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 
@@ -755,6 +774,7 @@ impl SigInfo {
             fault: false,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 
@@ -774,6 +794,7 @@ impl SigInfo {
             fault: false,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 
@@ -811,6 +832,7 @@ impl SigInfo {
             fault: false,
             tid: tid as i32,
             overrun: overrun as i32,
+            freed: false,
         }
     }
 
@@ -877,6 +899,7 @@ impl SigInfo {
             fault: false,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 
@@ -906,6 +929,7 @@ impl SigInfo {
             fault: true,
             tid: 0,
             overrun: 0,
+            freed: false,
         }
     }
 }
@@ -1029,6 +1053,21 @@ impl RtQueue {
         self.q[..self.len].iter().any(|e| e.signo == sig as i32)
     }
 
+    /// Does the oldest record for `sig` sit there **freed** - a deleted timer's
+    /// `sigqueue`, whose pending bit outlived it?
+    ///
+    /// The queue keeps such a record so the bit's meaning stays in one place
+    /// (see [`bump_overrun`](Self::bump_overrun)'s neighbour and
+    /// [`mark_freed`](Self::mark_freed)); every door that could hand a signal
+    /// over asks this first, because Linux answers "nothing here" to all of
+    /// them (`build/scratch/timerdel/del3.c`).
+    pub fn holds_freed(&self, sig: u8) -> bool {
+        self.q[..self.len]
+            .iter()
+            .find(|e| e.signo == sig as i32)
+            .is_some_and(|e| e.freed)
+    }
+
     /// Append a record. `false` when the ring is full, and the caller turns
     /// that into the answer its door owes: `sigqueue`/`rt_sigqueueinfo` are
     /// **`EAGAIN`** (Linux's `send_sigqueue`), while `kill`/`tgkill` deliver
@@ -1079,6 +1118,29 @@ impl RtQueue {
         {
             Some(entry) => {
                 entry.overrun = overrun;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mark the queued record for `sig` that came from timer `handle` as
+    /// **freed**: its `sigqueue` is gone while the pending bit stays set, which
+    /// is what `timer_delete` does to an expiry nobody read yet.
+    ///
+    /// Answers whether such a record was found. Measured on Linux 7.3.4
+    /// (`build/scratch/timerdel/{del,del2,del3,del4}.c`): after the delete the
+    /// bit is still in `sigpending`, a take answers `EAGAIN`, a blocking wait
+    /// parks for its whole timeout and then answers `EAGAIN`, unblocking runs
+    /// no handler, a `signalfd` read is `EAGAIN`, and the bit disappears at the
+    /// first failed dequeue.
+    pub fn mark_freed(&mut self, sig: u8, handle: u32) -> bool {
+        match self.q[..self.len]
+            .iter_mut()
+            .find(|e| e.signo == sig as i32 && e.tid as u32 == handle)
+        {
+            Some(entry) => {
+                entry.freed = true;
                 true
             }
             None => false,
@@ -1638,5 +1700,50 @@ mod tests {
 
         // A number with nothing queued says so rather than inventing a record.
         assert!(!q.bump_overrun(SIGRTMIN + 3, 4));
+    }
+
+    /// A deleted timer's record is **freed**, not popped: the pending bit goes
+    /// on describing it, and the queue has to be able to say so.
+    ///
+    /// This is the half `timer_delete` needs. Linux keeps the bit and drops the
+    /// `sigqueue`, so every door that could hand the signal over must be able
+    /// to ask "is the record behind this bit a freed one?" and answer yes
+    /// (`build/scratch/timerdel/del3.c`: a handler does not run, a `signalfd`
+    /// read is `EAGAIN`, and the bit disappears at that failed dequeue). The
+    /// test pins the marker's own contract: it names a record by *handle*, so a
+    /// second timer's queued record on the same number is not marked by mistake,
+    /// and it reports whether anything was there to mark.
+    #[test]
+    fn a_freed_record_is_marked_in_place_and_still_held() {
+        let mut q = RtQueue::new();
+        // Two timers on one signal, the older one first: `mark_freed` names a
+        // handle, so it must find the one it was told about.
+        q.push(SigInfo::timer(SIGRTMIN + 5, 2, 0, 0x4242));
+        q.push(SigInfo::timer(SIGRTMIN + 5, 3, 0, 0x4243));
+        assert!(!q.holds_freed(SIGRTMIN + 5), "neither is freed yet");
+
+        assert!(q.mark_freed(SIGRTMIN + 5, 3), "handle 3 is queued");
+        assert!(
+            !q.holds_freed(SIGRTMIN + 5),
+            "it is the second record, so the front one is still live"
+        );
+        assert!(q.holds(SIGRTMIN + 5), "the bit still describes a record");
+
+        // The old one out (it was never freed), then the freed one is at the
+        // front and reports itself.
+        assert_eq!(q.pop(SIGRTMIN + 5).map(|r| r.tid), Some(2));
+        assert!(q.holds_freed(SIGRTMIN + 5));
+        // Popping it is what a failed dequeue does; clearing the flag is not a
+        // pop's job, so the record still carries it when handed back.
+        let freed = q.pop(SIGRTMIN + 5).expect("the freed record");
+        assert!(freed.freed);
+        assert!(!q.holds(SIGRTMIN + 5));
+
+        // A handle that is not queued says so rather than marking a stranger.
+        let mut q = RtQueue::new();
+        q.push(SigInfo::timer(SIGRTMIN + 5, 2, 0, 0));
+        assert!(!q.mark_freed(SIGRTMIN + 5, 99));
+        assert!(!q.holds_freed(SIGRTMIN + 5));
+        assert!(!q.holds_freed(SIGRTMIN + 6), "a number with nothing queued");
     }
 }

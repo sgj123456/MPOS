@@ -4097,6 +4097,34 @@ pub fn timer_remove(id: usize) -> bool {
         };
         let leader = t.task(t.current).tgid;
         let task = t.task_mut(leader);
+        let (signo, handle) = match task.timers.get(slot).and_then(Option::as_ref) {
+            Some(timer) => (timer.signo, timer.id),
+            None => return false,
+        };
+        // Deleting a timer whose expiry is still unread frees its `sigqueue`
+        // while leaving the pending **bit** set - Linux's own shape, measured on
+        // 7.3.4 (`build/scratch/timerdel/{del,del2,del3,del4}.c`): after the
+        // delete the bit is still in `sigpending`, but a take answers `EAGAIN`,
+        // a blocking `sigtimedwait` parks its whole timeout and then answers
+        // `EAGAIN`, unblocking runs no handler, and a `signalfd` read is
+        // `EAGAIN`. The bit disappears at the first failed dequeue.
+        //
+        // This kernel used to keep the record, so a deleted timer's expiry was
+        // still *delivered* - the handler ran and a `signalfd` read handed back
+        // a full record naming a timer that no longer existed. The marker is
+        // what tells the two apart; it is set only when a record is actually
+        // waiting, because a timer deleted before it fired leaves nothing.
+        let waiting = task.signals & crate::sched::signal::bit(signo) != 0;
+        if waiting {
+            if crate::sched::signal::is_rt(signo) {
+                task.rtq.mark_freed(signo, handle);
+            } else {
+                let at = (signo as usize).min(crate::sched::signal::SIGINFO_SLOTS - 1);
+                if task.siginfo[at].signo == signo as i32 {
+                    task.siginfo[at].freed = true;
+                }
+            }
+        }
         match task.timers.get_mut(slot) {
             Some(slot @ Some(_)) => slot.take().is_some(),
             _ => false,
