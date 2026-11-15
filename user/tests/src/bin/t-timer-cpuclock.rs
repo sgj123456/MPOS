@@ -31,7 +31,7 @@
 //! numbers and the records are spelled here at the uapi's offsets - the same
 //! shape `t-timer-create` takes, and for the same reason.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::Report;
 use rustix::io::Errno;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -72,6 +72,17 @@ struct SigEvent {
 const _: () = assert!(core::mem::size_of::<SigEvent>() == 64);
 
 impl SigEvent {
+    /// `SIGEV_NONE`: the timer counts and reports but fires nothing, which is
+    /// all the thread-clock claims need - the *clock* is the subject there.
+    fn none() -> Self {
+        Self {
+            value: 0,
+            signo: 0,
+            notify: libc::SIGEV_NONE,
+            un: [0; 48],
+        }
+    }
+
     fn signal(signo: i32) -> Self {
         Self {
             value: 0,
@@ -341,26 +352,102 @@ fn main() {
     );
     let _ = timer_delete(wall_id);
 
-    // === the clocks that stay refused ======================================
+    // === the creating thread's own clock ===================================
+    //
+    // `CLOCK_THREAD_CPUTIME_ID` counts the **creating thread's** CPU and stops
+    // when that thread exits, so the timer outlives its clock. Linux 7.3.4's
+    // three measured answers (`build/scratch/thrcpu/{t4,disarm}.c`, `§6.168`):
+    // the creator's CPU fires it and another thread's does not; once the creator
+    // is gone `timer_gettime` still succeeds with `value = interval = 0`
+    // (disarmed, not deleted), `timer_getoverrun` is 0, `timer_settime` answers
+    // **`ESRCH`**, and `timer_delete` still succeeds. This kernel refused the
+    // clock outright until item 288.
     let mut id: i32 = -1;
-    let thread_clock = timer_create(3 /* CLOCK_THREAD_CPUTIME_ID */, &silent, &mut id);
-    // Linux serves this one; this kernel refuses it on purpose, because the
-    // clock belongs to the creating thread and the timer outlives it.
-    let want = if host_run() {
-        Ok(0)
-    } else {
-        Err(Errno::OPNOTSUPP)
-    };
+    let silent_ev = SigEvent::none();
+    let thread_clock = timer_create(3 /* CLOCK_THREAD_CPUTIME_ID */, &silent_ev, &mut id);
     r.check(
-        &format!(
-            "the creating thread's clock is the half that stays refused ({thread_clock:?}, want {want:?})"
-        ),
-        thread_clock.map(|_| 0) == want.map(|_| 0),
+        &format!("a timer can be built on the creating thread's own CPU clock ({thread_clock:?})"),
+        thread_clock == Ok(0),
     );
     if thread_clock == Ok(0) {
-        let _ = timer_delete(id);
+        let threaded = id;
+        // Arm far out (60 s of CPU) so nothing fires while this is measured.
+        let armed = timer_settime(threaded, &Itimerspec::one_shot(60_000));
+        r.check(
+            &format!("60 s of that thread's CPU time can be armed ({armed:?})"),
+            armed == Ok(0),
+        );
+        // While the creator (this thread) lives, the clock counts and the
+        // reading is near the arm value.
+        let alive = left(threaded);
+        r.check(
+            &format!("while the creating thread lives the clock counts ({alive} ms left)"),
+            (0..=60_000).contains(&alive),
+        );
+
+        // Now hand the timer to a thread that exits, which is where the clock
+        // dies. The timer is created *by* that thread so it owns the clock.
+        let handoff = std::thread::spawn(|| {
+            let mut ev = SigEvent::none();
+            ev.signo = 0;
+            let mut inner: i32 = -1;
+            let made = timer_create(3, &ev, &mut inner);
+            if made != Ok(0) {
+                return (false, -1);
+            }
+            let armed = timer_settime(inner, &Itimerspec::one_shot(60_000));
+            (armed == Ok(0), inner)
+        });
+        let (made, inner) = handoff.join().expect("the creating thread joins");
+        r.check("a thread can own a timer on its own clock", made);
+        if made && inner >= 0 {
+            // The creator is gone by now (joined). Linux disarms the timer and
+            // answers 0/0 from `timer_gettime` - not `EINVAL`, which is what a
+            // *deleted* timer answers.
+            let mut now = Itimerspec {
+                interval: TimeSpec::zero(),
+                value: TimeSpec::zero(),
+            };
+            let read = timer_gettime(inner, &mut now);
+            r.check(
+                &format!("after the clock's thread exits the timer still exists ({read:?})"),
+                read == Ok(0),
+            );
+            r.check(
+                &format!(
+                    "and it is disarmed, value and interval both zero ({} ms / {} ms)",
+                    now.value.tv_sec * 1000 + now.value.tv_nsec / 1_000_000,
+                    now.interval.tv_sec * 1000 + now.interval.tv_nsec / 1_000_000,
+                ),
+                now.value.tv_sec == 0
+                    && now.value.tv_nsec == 0
+                    && now.interval.tv_sec == 0
+                    && now.interval.tv_nsec == 0,
+            );
+            let overrun = raw(libc::SYS_timer_getoverrun, inner as usize, 0, 0, 0);
+            r.check(
+                &format!("its overrun count is 0 ({overrun:?})"),
+                overrun == Ok(0),
+            );
+            // The refusal that says the clock is gone rather than the timer:
+            // Linux answers `ESRCH` to an arm, because there is no reading left
+            // to build a deadline against. A deleted timer would be `EINVAL`.
+            let rearm = timer_settime(inner, &Itimerspec::one_shot(1000));
+            r.check(
+                &format!("re-arming it answers ESRCH, not EINVAL ({rearm:?})"),
+                rearm == Err(Errno::SRCH),
+            );
+            // And it is still deletable: the timer exists.
+            let gone = timer_delete(inner);
+            r.check(
+                &format!("and it still deletes, so it was never removed ({gone:?})"),
+                gone == Ok(0),
+            );
+        }
+        let _ = timer_delete(threaded);
     }
 
+    // === the clocks that stay refused ======================================
     let raw_clock = timer_create(4 /* CLOCK_MONOTONIC_RAW */, &silent, &mut id);
     r.check(
         &format!("a raw clock timer is EOPNOTSUPP, as Linux answers ({raw_clock:?})"),
