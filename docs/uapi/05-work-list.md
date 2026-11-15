@@ -12894,3 +12894,22 @@ measured. `SIGEV_THREAD_ID`'s tid is read in the caller's pid namespace, and a
 timer created inside one aimed at a thread outside it is unmeasured. And whether a
 thread-targeted expiry accumulates `si_overrun` the way §6.166 measured for a
 process-directed one was not asked.
+
+## Item 290 — `si_code` names the door that raised the signal (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **Before** | Every sender door wrote `SI_USER` (0), so a receiver could not tell `tgkill` from `kill` — and `libc`'s `raise` **is** `tgkill`, which makes the wrong code reachable from a plain C program. `SI_TKILL` (-6) was already defined in `src/sched/signal.rs` (with its own measured note about `rt_sigqueueinfo` refusing it) and simply never used as a *sender's* code. |
+| **Now** | One door, `send_signal_tkill`, builds the record with `SigInfo::signed(sig, 0, SI_TKILL, pid, uid, 0)` — the same sender identity `send_signal` uses. `handle_tkill` and `handle_tgkill` call it; `kill` keeps `SI_USER`. The permission checks, namespace resolution and the "a gone leader answers 0" rule are untouched. |
+| **Measured first** | Linux 7.3.4, `build/scratch/sfdaddr2/t4.c` — one blocked signal read through a `signalfd` per door: `raise` **-6**, `kill(self)` **0**, `tgkill(self)` **-6**, `tkill(self)` **-6**, `sigqueue` **-1**. This kernel answered 0 for all four sender doors. |
+| **And a gap that was not one** | §6.166's gap 3 said `signalfd_siginfo.ssi_addr` "still is not written". Measured (`build/scratch/sfdaddr2/{t,t2,t3}.c`): a record reaches a descriptor only for a **blocked** signal, and a real CPU fault **kills the process even when its fault signal is blocked** (SIGSEGV/SIGBUS/SIGFPE/SIGILL all died `WIFSIGNALED`), so a fault record can never reach one; every class that *can* — `raise`/`kill`/`tgkill`/`tkill`/`sigqueue` across seven signal numbers — carries `ssi_addr` **0**. Dropping `SigInfo::addr` in `vfs::signalfd` is therefore the honest answer, and the gap list is corrected rather than quietly amended. |
+| **Pins** | `t-signalfd` grew four claims beside the `SI_QUEUE` one already there: `raise` of a blocked signal succeeds **and** its record is `SI_TKILL`; `kill` of the same blocked signal succeeds **and** its record is `SI_USER`. Both halves are needed — a kernel that answered `SI_TKILL` for everything would pass the first and fail the second, which is why the claim is the pair. |
+| **Counterfactual** | The kernel half stashed (four files), rebuilt, `t-signalfd` in the guest: **one claim red** — `FAIL: raise's record is SI_TKILL (-6), the code tgkill sends, got 0` — with `kill`'s `SI_USER` green, exactly the shape wanted: only the door that moved changed, the control stayed put. Restored with `sha256sum -c` on all five files, rebuilt, `PASS`. |
+| **Gate** | `build/gate-item290.log`, `GATE_EXIT=0`, both arms in one run. Stage 1 **1338** host tests 0 failed; stage 2 323 programs over 6 lanes on x86_64 (36.37 s) and 319 on aarch64 (59.93 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged `162/168/389/273/3/1`; both workspaces formatted. |
+
+**What this does not do, named.** `pidfd_send_signal`/`rt_sigqueueinfo` keep the
+caller's code verbatim, unchanged (`SI_TKILL` from a caller stays `EPERM`, pinned
+by `t-pidfd`). `SI_TIMER`'s door distinction belongs to §6.166/§6.167 and was not
+re-measured. And only the **self-directed** doors were measured for their codes:
+`kill(-1)`, the group door and `tgkill`'s cross-process arm are `SI_USER` by
+construction (they are `kill`'s) but were not re-read.

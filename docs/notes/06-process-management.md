@@ -15346,11 +15346,17 @@ workspaces formatted.
    global counter keyed on `(task, rip)` that is never reset (§6.164's gap 3).
    A trap-time delivery makes it far less reachable on both machines; it does
    not close it.
-3. **`si_addr_lsb`, `si_addr_bnd`, `si_pkey` stay zero** on every record, and
-   `signalfd_siginfo.ssi_addr` still is not written — `src/vfs/signalfd.rs`
-   drops `SigInfo::addr`, which is a separate door. `PTRACE_GETSIGINFO`
-   synthesizes a stop's `si_code` with no `si_addr` for the same reason: the
-   stop record (`src/sched/runtime/task.rs`'s `Stop`) carries no address at all.
+3. **`si_addr_lsb`, `si_addr_bnd`, `si_pkey` stay zero** on every record.
+   This list used to add "and `signalfd_siginfo.ssi_addr` still is not written",
+   as though that were a gap - and **it is not one**, which item 290 measured
+   rather than reasoned (`build/scratch/sfdaddr2/{t,t2,t3}.c`, Linux 7.3.4): a
+   record only reaches a `signalfd` if its signal is *blocked*, and a real CPU
+   fault **kills the process even with its fault signal blocked** (SIGSEGV,
+   SIGBUS, SIGFPE and SIGILL all died `WIFSIGNALED`). Every class that *can*
+   reach a descriptor - a `raise`, a `kill`, a `tgkill`, a `sigqueue` - carries
+   `ssi_addr` **0**, measured for seven signal numbers. So the field is correct
+   at zero, and `PTRACE_GETSIGINFO`'s synthesized stop record has the same
+   honest reason (the stop record carries no address at all).
 4. **`device_not_available` (7) and `double_fault` (8)** stay on the x86_64
    `x86-interrupt` ABI: neither is a signal a program can handle, and vector 7
    must return into the instruction.
@@ -15951,3 +15957,83 @@ with `mpos-kunit 41 passed, 0 failed` per arm; clippy ratchet unchanged at
 3. **The `si_overrun` count for this pair** is whatever the record carries, and
    nothing asked whether a thread-targeted expiry accumulates them the way §6.166
    measured for a process-directed one.
+
+## §6.171 `si_code` names the door that raised the signal (item 290, LANDED 2026-11-15)
+
+**The observation, and an errand that turned into a correction.** §6.166's gap 3
+said `signalfd_siginfo.ssi_addr` "still is not written", as though `signalfd` owed
+it. Measuring that turned out to be two findings, and the second is the item.
+
+**`ssi_addr` at zero is correct, not a gap.** Measured on Linux 7.3.4
+(`build/scratch/sfdaddr2/{t,t2,t3}.c`):
+
+* a record reaches a `signalfd` only for a **blocked** signal;
+* a real CPU fault **kills the process even with its fault signal blocked** -
+  SIGSEGV, SIGBUS, SIGFPE and SIGILL each died `WIFSIGNALED` in a forked child
+  that had blocked them and opened a descriptor, so a fault record can never
+  reach one;
+* every class that *can* reach a descriptor carries `ssi_addr` **0**: `raise`,
+  `kill(self)`, `tgkill(self)`, `tkill(self)` and `sigqueue`, measured across
+  seven signal numbers (`t3.c`, identical on glibc and musl).
+
+So `src/vfs/signalfd.rs` dropping `SigInfo::addr` is the honest answer rather
+than a missing field, and the notes' own gap list was wrong about it. That is
+corrected in place (§6.166 gap 3) rather than deleted, because a gap that turns
+out not to be one is a useful record.
+
+**The divergence the same probe found.** One probe read *which code* each door
+leaves, and the answer is not decoration - a receiver branches on it:
+
+```
+                    Linux 7.3.4    this kernel (before)
+raise              -6 (SI_TKILL)        0 (SI_USER)
+kill(self)          0 (SI_USER)         0
+tgkill(self)       -6 (SI_TKILL)        0
+tkill(self)        -6 (SI_TKILL)        0
+sigqueue(self)     -1 (SI_QUEUE)       -1
+```
+
+Every sender door answered `SI_USER`, so a receiver could not tell `tgkill` from
+`kill` at all - and `libc`'s `raise` **is** `tgkill`, which makes the wrong code
+reachable from a plain C program. `SI_TKILL` was already defined in
+`src/sched/signal.rs` (with its own measured note about `rt_sigqueueinfo`
+refusing it), and the kernel simply never used it as a *sender's* code.
+
+**The change.** One door, `send_signal_tkill`, which builds the record with
+`SigInfo::signed(sig, 0, SI_TKILL, pid, uid, 0)` - the same sender identity
+`send_signal` uses, and the code the measured table says `tkill`/`tgkill` owe.
+`handle_tkill` and `handle_tgkill` call it; `kill` keeps `SI_USER`. Nothing else
+moves: the permission checks, the namespace resolution and the "a gone leader
+answers 0" rule are the doors' original code.
+
+**The pin.** `t-signalfd` grew four claims next to the `SI_QUEUE` one it already
+had, which is where a reader of this file would look: `raise` of a blocked signal
+succeeds, and its record is `SI_TKILL`; `kill` of the same blocked signal
+succeeds, and its record is `SI_USER`. Both pairs are needed - a kernel that
+answered `SI_TKILL` for everything would pass the first and fail the second,
+which is why the claim is the *pair* rather than one code.
+
+**Counterfactual.** The kernel half stashed (four files), kernel and loader
+rebuilt, `t-signalfd` in the guest: **one claim red** -
+`FAIL: raise's record is SI_TKILL (-6), the code tgkill sends, got 0` - with
+`kill`'s `SI_USER` claim green, which is the right shape: only the door that
+moved changed, and the control stayed put. Restored from
+`build/scratch/sfdaddr2/good/*.rs` with `sha256sum -c` (成功 on all five),
+rebuilt, `PASS`.
+
+**Gate.** `build/gate-item290.log`, `GATE_EXIT=0`, both arms in one run (the
+second consecutive one since §6.169 recorded why: `TMPDIR=$PWD/build/tmp`).
+Stage 1 **1338** host tests 0 failed (56.81 s); stage 2 **323** programs over 6
+lanes on x86_64 (36.37 s) and **319** on aarch64 (59.93 s); `pass=323 fail=0` /
+`pass=319 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; clippy ratchet
+unchanged at `162/168/389/273/3/1`; both workspaces formatted.
+
+### What this does not do, named
+
+1. **`si_code` for `pidfd_send_signal` and `rt_sigqueueinfo` is unchanged** - both
+   already keep the caller's code verbatim (`SigInfo::signed`), and `SI_TKILL`
+   from a caller stays `EPERM`, which `t-pidfd` pins.
+2. **`SI_TIMER`'s door distinction is §6.166/§6.167's**, not re-measured here.
+3. **`kill(-1)`, the group door and `tgkill`'s cross-process arm** were not
+   re-measured for their codes: only the self-directed doors were, and the group
+   door's code is `SI_USER` by construction (it is `kill`'s).

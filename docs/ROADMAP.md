@@ -2881,3 +2881,26 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   asked. Gate `build/gate-item289.log` exit 0, **both arms in one run**: stage 1
   1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet
   unchanged. (§6.170, item 289)
+
+- **Item 290 — `si_code` names the door that raised the signal**: every sender door wrote
+  `SI_USER` (0), so a receiver could not tell `tgkill` from `kill` — and `libc`'s `raise`
+  **is** `tgkill`, which makes the wrong code reachable from a plain C program.
+  `SI_TKILL` (-6) was already defined in `src/sched/signal.rs` (with its own measured note
+  about `rt_sigqueueinfo` refusing it) and never used as a *sender's* code. Measured on
+  Linux 7.3.4 (`build/scratch/sfdaddr2/t4.c`, one blocked signal read through a `signalfd`
+  per door): `raise` -6, `kill(self)` 0, `tgkill(self)` -6, `tkill(self)` -6, `sigqueue` -1.
+  One new door `send_signal_tkill` builds the record with `SI_TKILL`; `handle_tkill` and
+  `handle_tgkill` call it and `kill` keeps `SI_USER`, with the permission, namespace and
+  gone-leader rules untouched. `t-signalfd` pins the **pair** (`raise` → `SI_TKILL`, `kill`
+  → `SI_USER`), because a kernel answering `SI_TKILL` for everything would pass one and fail
+  the other; counterfactual reddens exactly `raise's record is SI_TKILL … got 0` with the
+  control green. **The same probe corrected a false gap**: §6.166 gap 3 claimed
+  `signalfd_siginfo.ssi_addr` "still is not written", but a record reaches a descriptor only
+  for a blocked signal and a real CPU fault **kills even with its signal blocked**
+  (SIGSEGV/SIGBUS/SIGFPE/SIGILL all `WIFSIGNALED`), so no fault record can arrive and every
+  reachable class carries `ssi_addr` 0 across seven signal numbers — dropping `SigInfo::addr`
+  is honest, and the gap list is corrected in place rather than quietly amended. Named:
+  `pidfd_send_signal`/`rt_sigqueueinfo` keep the caller's code verbatim (unchanged), and only
+  the self-directed doors were re-read. Gate `build/gate-item290.log` `GATE_EXIT=0`,
+  both arms in one run: stage 1 1338, x86_64 `pass=323`, aarch64 `pass=319`, kunit
+  41/0 per arm, clippy ratchet unchanged. (§6.171, item 290)
