@@ -3110,3 +3110,40 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   Gate `build/gate-item297.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340,
   x86_64 `pass=324`, aarch64 `pass=320` (each one more than 323/319 — the new pin is
   in both sweeps), kunit 41/0 per arm, clippy ratchet unchanged. (§6.177, item 297)
+
+- **Item 298 — `O_PATH` as a dirfd, and two probes that measured the libc**: §6.177
+  closed with this pairing as the flag's largest remaining use, and the walk is fourteen
+  rows over Linux 7.3.4 (`build/scratch/opathfd/t.c`). **One real defect, and it was not
+  about `O_PATH`**: `linkat(dirfd, "file", AT_FDCWD, "/abs/dest")` answered **`EXDEV`**
+  where Linux links the file, because `linkat`'s filesystem comparison resolved the
+  source with `absolute()`, which uses the **calling directory** — the right base only
+  for `AT_FDCWD` — so a dirfd-relative source was resolved to a path that does not exist
+  elsewhere and the comparison said "different filesystems". The tell was that the same
+  call with both sides on the dirfd worked: one side went through the dirfd and one
+  through `absolute()`, two rules where there should be one. The fix resolves the source
+  through its own base and asks the **node**'s filesystem, the same question the
+  descriptor branch already asks. **Two of the three reported mismatches were the
+  libc**: `fchmod(O_PATH_fd)` "returned 0" against Linux's `EBADF`, but musl's `fchmod()`
+  falls back to `fchmodat(AT_FDCWD, "/proc/self/fd/N")` and **that path is served on
+  Linux too** — the same musl binary on Linux answers `0, mode 0600` while the raw
+  syscall in both kernels refuses `EBADF`. The probe had compared glibc on one side with
+  musl on the other. **Rule added: when a probe's two machines run different libcs, a
+  disagreement is a claim about the libc until a raw-door probe says otherwise** — and
+  the new claims use raw syscalls for every row where a libc has a fallback. The one
+  refusal that was real is `getdents64` over an `O_PATH` descriptor, now refused through
+  one `File::is_path_only()` predicate that `pre_read`/`pre_write` already computed
+  inline and that `handle_fchmod`/`handle_getdents64` now ask. `t-open-path` grew four
+  claims (17 total), raw-doored with the reason at the site. Counterfactual reddens both
+  refusals (`got rc=0`, `got rc=48`). Named: the sweep covered twelve doors and not
+  `name_to_handle_at` or the xattr `*at` family; `AT_EMPTY_PATH` with an `O_PATH` fd is
+  unmeasured; the `EXDEV` fallback only places a node *at* a mountpoint; and
+  `fchmod`/`getdents64` are the refusals claimed, not the set. **The first attempt at
+  both fixes regressed `t-link` and `t-fsflags` on both arms** — the `linkat` fix asked
+  `fs_serving_inode_of`, which places a node only **at** a mountpoint root, so a file
+  inside a mount answered `None` and every ordinary `link(2)` became `EXDEV`; the
+  working fix composes the source's path from the dirfd's own path and keeps the path
+  comparison primary. Recorded because a helper answering a narrower question than the
+  caller assumes is a silent wrong answer, not a compile error. Gate
+  `build/gate-item298b.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64
+  `pass=324`, aarch64 `pass=320`, kunit 41/0 per arm, clippy ratchet unchanged.
+  (§6.178, item 298)

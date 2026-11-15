@@ -16681,3 +16681,133 @@ unchanged at `162/168/389/273/3`; both workspaces formatted.
 4. **`O_SYNC`'s effect** (a write visible before the call returns) is a
    durability property this kernel cannot observe without a power cycle, and was
    not swept.
+
+## §6.178 `O_PATH` as a dirfd, and two probes that measured the libc (§6.177's next slice)
+
+**What was swept.** §6.177 closed with "`O_PATH` as a dirfd was not exercised — it
+is the flag's largest remaining use". This is that walk: an `O_PATH` descriptor on
+a directory handed to every `*at` door, plus the doors that must refuse it. Fourteen
+rows on Linux 7.3.4 (`build/scratch/opathfd/t.c`), all served or refused as Linux
+does.
+
+**One real defect, and it was not about `O_PATH` at all.** `linkat(dirfd, "file",
+AT_FDCWD, "/abs/dest")` answered **`EXDEV`** where Linux links the file:
+
+```
+  linkat(dirfd, "file", AT_FDCWD, "/tmp/lk3/a") -> -1 errno=18     this kernel
+  linkat(dirfd, "file", AT_FDCWD, "/tmp/lk3/a") ->  0              Linux
+```
+
+The cause is in `linkat`'s filesystem comparison: with the source *not* reached
+through a descriptor, it compared `fs_of_path(&absolute(&old_path))` against the
+destination's — and `absolute()` resolves a relative path against the **calling
+directory**, which is only the right base for `AT_FDCWD`. A source relative to a
+dirfd was therefore resolved to a path that does not exist, in the wrong place,
+and the comparison answered "different filesystems". The tell was that the *same
+call* with both sides on the dirfd worked: one side through the dirfd and one
+side through `absolute()` were two different rules.
+
+The fix resolves the source through its own base (`resolve_no_follow_at`) and asks
+the **node**'s filesystem, which is the same question the descriptor branch above
+already asks — one rule for both branches, with the old path comparison kept only
+as the fallback when neither node can answer.
+
+**Two probes that were measuring musl, not the kernel.** The first draft of the
+sweep reported three mismatches, and two were false:
+
+| row | "this kernel" | Linux (musl) | Linux (glibc) | verdict |
+|---|---|---|---|---|
+| `fchmod(O_PATH fd)` | 0, mode changed | **0, mode changed** | `EBADF` | **musl's fallback** |
+| `getdents64(O_PATH fd)` | listed 72 bytes | `EBADF` | `EBADF` | real |
+| `linkat(O_PATH dirfd, …)` | `EXDEV` | 0 | 0 | real |
+
+`fchmod` is the instructive one. musl's `fchmod()` is not a passthrough: when the
+direct call fails it calls `fchmodat(AT_FDCWD, "/proc/self/fd/N")`, and that path
+through `/proc` **is** served on Linux (measured: `fchmodat(/proc/self/fd/3) -> 0`,
+mode changed). So on **both** machines `fchmod(O_PATH_fd)` returns 0 and changes the
+mode, while in **both** kernels the raw `fchmod` syscall refuses `EBADF`. The probe
+had compared glibc's answer on one side with musl's on the other — a libc
+difference wearing a kernel'difference's clothes. It was settled by running the
+*same* musl binary on Linux: `fchmod() -> 0, after = 0600; raw fchmod -> -1 errno=9`.
+
+The rule this adds: **when a probe's two machines run different libcs, a
+disagreement is a claim about the libc until a raw-door probe says otherwise.** And
+the pins written for this item use the **raw syscall** for every row where a libc
+has a fallback, saying so at the site.
+
+**`getdents64` over `O_PATH` was real**, and is now refused through one predicate
+rather than three spellings: `File::is_path_only()`, which `pre_read`/`pre_write`
+already computed inline, and which `handle_fchmod` and `handle_getdents64` now ask
+before they touch the file. That is the same lesson §6.176's `O_PATH` item recorded
+one door over: one predicate, because a second spelling is how a door gets
+forgotten.
+
+**The pin.** `t-open-path` grew four claims — `openat` and `fstatat` served through
+an `O_PATH` dirfd, and `fchmod`/`getdents64` **refused** over the descriptor itself,
+all through raw syscalls so no libc can answer for the kernel. 17 claims total.
+
+**Counterfactual.** The syscall-layer file stashed, rebuilt, the pin in the guest:
+**two claims red** -
+
+```
+FAIL: fchmod(O_PATH fd) is EBADF (raw), got rc=0
+FAIL: getdents64(O_PATH fd) is EBADF (raw), got rc=48
+```
+
+- `fchmod` returning 0 and `getdents64` returning 48 bytes, which is the directory's
+contents. Restored from `build/scratch/opathfd/good/*.rs`, `sha256sum -c` 成功 on
+all three, rebuilt, `PASS`.
+
+**A regression this item caused, and what it taught.** The first versions of both
+fixes were wrong in the same direction and the gate caught it: `t-link` and
+`t-fsflags` reddened on **both** arms -
+
+```
+FAIL: the second name is made again
+FAIL: a link onto a name already taken answers EEXIST
+```
+
+- because the `linkat` fix resolved the source's filesystem through
+  `fs_serving_inode_of`, which places a node **only at a mountpoint root**: a file
+  *inside* a mounted directory answers `None`, the comparison then said "different
+  filesystems", and every ordinary `link(2)` became `EXDEV`. The lesson is the one
+  this repository keeps re-learning in a new currency each time: **a helper that
+  answers a narrower question than the caller assumes is a silent wrong answer,
+  not a compile error.** The fix that works composes the source's path from the
+  **dirfd's own path** (`mount::path_of`) and keeps the path comparison the
+  primary test it always was - which is why `t-link` and `t-fsflags` now pass:
+  ordinary hard links never went through the branch being corrected.
+
+The second half of the same lesson: a `git checkout` used to undo the wrong fix
+also discarded the `fchmod`/`getdents64` refusals written in the same edit, and
+the *next* probe showed `fchmod` serving again. Both are re-applied and the three
+pins were re-run **individually** before the gate rather than trusting one green
+pass: `t-link`, `t-fsflags` and `t-open-path` each `=== PASS`.
+
+**Gate.** `build/gate-item298b.log`, `GATE_EXIT=0`, both arms in one run. Stage 1
+**1340** host tests 0 failed (70.47 s); stage 2 **324** programs over 6 lanes on
+x86_64 (45.07 s) and **320** on aarch64 (59.17 s); `pass=324 fail=0` /
+`pass=320 fail=0`, `mpos-kunit 41 passed, 0 failed` per arm; six-arm clippy ratchet
+unchanged at `162/168/389/273/3`; both workspaces formatted. An earlier run of this
+item (`build/gate-item298.log`) reddened both arms on the two pins named above and
+is part of the record.
+
+### What this does not do, named
+
+1. **The dirfd sweep covered twelve doors, not every one.** `readlinkat`,
+   `mknodat`, `symlinkat`, `unlinkat`, `mkdirat`, `renameat`, `faccessat`,
+   `fchmodat`, `fchownat`, `utimensat`, `openat`, `fstatat`, `linkat` and the
+   legacy spellings were exercised; `name_to_handle_at` and the xattr `*at` family
+   were not.
+2. **`AT_EMPTY_PATH` with an `O_PATH` descriptor** — the spelling `linkat(fd, "",
+   …)` uses, which is how `apk` gives an `O_TMPFILE` file its name — is unmeasured
+   for this pairing.
+3. **The `EXDEV` fallback is weaker than the branch it sits beside**, and that is
+   recorded rather than fixed: when neither node answers, the path comparison only
+   places a node *at* a mountpoint, not inside one.
+4. **`fchmod`/`getdents64` are the two refusals claimed; the rest are not.** Linux
+   also refuses the xattr `f*` forms, `fchown`, `fchdir`'s opposite (`chdir`
+   through an `O_PATH` fd is served on Linux; `fchdir` too, which this kernel
+   already serves), and `ioctl`'s file-descriptor commands over one. The predicate
+   exists now, so each is one line — but a line nobody has written is a gap, not a
+   guarantee.
