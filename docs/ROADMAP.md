@@ -2974,3 +2974,42 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   re-measured. Gate `build/gate-item292b.log` `GATE_EXIT=0`, both arms in one run
   after the `symlinkat` half: stage 1 1339, x86_64 `pass=323`, aarch64 `pass=319`,
   kunit 41/0 per arm, clippy ratchet unchanged. (§6.173, item 292)
+
+- **Item 293 — the paired-door audit: `mknod` kept a body beside `mknodat`, and the two
+  had drifted**: the audit §6.173 named. Item 292 found its defect through a *pair* of
+  doors that a per-arm gate alone could not indict, and closed by naming the rest — this
+  is that walk, and the method matters more than the result: every legacy syscall is
+  Linux's `*at` form with `AT_FDCWD`, so the safe implementation is the one the dispatch
+  already uses for `unlink`/`mkdir`/`rename`/`utimes`/`link` — build the argument list
+  and call the `at` handler. Per pair: does the legacy name **delegate** or keep its own
+  body? Seven do, two did not (`chmod`, `mknod`), and one had drifted. `handle_mknod`
+  kept a 114-line duplicate with its own path resolution, and **only the `at` form
+  emitted the `IN_CREATE` event** — so a daemon watching a directory heard about a node
+  made by `mknodat` and nothing about the same node made by `mknod`. Measured on Linux
+  7.3.4 (`build/scratch/doorpair/t.c`): all four doors (`mknodat`, `mknod`, `symlinkat`,
+  `symlink`) answer `mask=0x100` naming what was made — the event belongs to the
+  *creation*, not the door; on this kernel `mknod` emitted nothing while both `symlink`
+  doors were already fine, because item 292's fix and `symlinkat`'s went into one shared
+  tail. The fix is a **deletion**: `nr::MKNOD` builds `mknodat`'s argument list, as the
+  neighbouring arms do, and the duplicate body is gone — not "add the `emit_child` call",
+  because two bodies for one rule is the shape and delegating is what makes a second
+  drift unspellable. Pairs checked and fine: `readlink`/`readlinkat` share a tail;
+  `chmod`/`fchmodat` are two bodies but identical; `access`/`faccessat` differ by design.
+  Pin: `t-inotify` grew eight claims (four doors × made/heard) — and the pin found a
+  second bug **in itself**, making its own `inotify_init1` when the host's
+  `max_user_instances` was already spent by the earlier sections, so it now reuses the
+  main queue. Counterfactual reddens **exactly** `FAIL: the watch hears mknod's entry as
+  IN_CREATE`, the other three doors green — the sharpest shape a pair audit can have,
+  because the claim is per door. A **third finding** came from the arm that would not
+  compile: the pin spelled `SYS_mknod`/`SYS_symlink` unconditionally and aarch64 refused
+  it (`E0425`) — arm64 has **no number for either**, which the kernel's own table states
+  beside them (`nr_aarch64.rs`: "no arm64 number; unreachable on aarch64"), so the pair is
+  claimed where both halves exist and the `at` forms alone where they do not. That
+  complements §6.173's rule: a pair is not always a pair on every machine, and the pin
+  must say which half it can see. Named: the walk covered the `fs` pairs and not
+  `kill`/`tgkill`, `dup`/`dup3`, `poll`/`ppoll`, `select`/`pselect6` or
+  `getrlimit`/`prlimit64` (distinct arguments, not the delegating shape); `chmod`'s two
+  bodies still agree only by reading; and `IN_CREATE` is one event class of several.
+  Gate `build/gate-item293b.log` `GATE_EXIT=0`, both arms in one run: stage 1 1339,
+  x86_64 `pass=323`, aarch64 `pass=319`, kunit 41/0 per arm, clippy ratchet
+  unchanged. (§6.174, item 293)

@@ -12963,3 +12963,30 @@ targets the kernel itself wrote and have no on-disk field to distrust — but th
 a reading of each, not a measurement, and only `ext4` has the corrupt-image
 exposure. And the link's own *name* limit (`cstr_arg`'s 255) was not re-measured
 here.
+
+## Item 293 — the paired-door audit: `mknod` kept a body beside `mknodat`, and the two had drifted (LANDED 2026-11-15)
+
+| | |
+|---|---|
+| **The audit §6.173 named** | Item 292 closed by naming the rest: "`mknod`/`mknodat`, `chmod`/`fchmodat`, `utimes`/`utimensat` and the rest are the same shape, and one arm alone is not evidence about a pair." This is that walk. Every legacy syscall is Linux's `*at` form with `AT_FDCWD`, so the safe implementation is the one the dispatch already uses for `unlink`/`mkdir`/`rename`/`utimes`/`link`: build the argument list and call the `at` handler. The audit was mechanical — per pair, does the legacy name **delegate** or keep its own body? Seven delegate; two did not (`chmod`, `mknod`), and one of those had drifted. |
+| **Before** | `handle_mknod` kept a 114-line duplicate of `handle_mknodat` with its own path resolution, and **only the `at` form emitted the `IN_CREATE` event** a watch expects — so a daemon watching a directory heard about a node made by `mknodat` and nothing about the same node made by `mknod`. A daemon-visible divergence of exactly the kind `mdev`/`udev` would meet. |
+| **Measured first** | Linux 7.3.4, `build/scratch/doorpair/t.c` — an inotify watch on a directory, then the same entry made through each door of each pair: `mknodat`, `mknod`, `symlinkat` and `symlink` each answer `mask=0x100` (`IN_CREATE`) naming what was made. So the event belongs to the *creation*, not the door. On this kernel before the change: `mknodat` `mask=0x100`, **`mknod` NO EVENT**, both `symlink` doors fine (item 292's fix and `symlinkat`'s went into one shared tail). |
+| **Now** | `nr::MKNOD` builds `mknodat`'s argument list from its own, exactly as the `mkdir`/`unlink`/`rename` arms above it do, and `handle_mknod`'s duplicate body is **deleted**. The fix is not "add the `emit_child` call": two bodies for one rule is the shape, and delegating is what makes a second drift unspellable. |
+| **Pairs checked and fine** | `readlink`/`readlinkat` share `readlink_named`; `utimes`, `mkdir`, `unlink`, `rename`, `link` and `symlink` delegate; `chmod`/`fchmodat` are two bodies but **identical** (both `resolve_opt` → `chmod_mode` → `set_mode` plus the same `IN_ATTRIB`/`fanotify` notices); `access`/`faccessat` differ **by design** (`access_ids` reads the flag word, so the `at` form is the one with the extra argument). |
+| **Pins** | `t-inotify` grew eight claims (four doors × made/heard) beside sections that already watched for `IN_CREATE` without ever asserting one arrived. The first version made its **own** `inotify_init1` and failed on the host (`got -1`) — `max_user_instances` is one per user and the earlier sections had spent it — so the section now reuses the main queue, moved before its `close`, and says why. |
+| **Counterfactual** | The dispatch arm reverted to `handle_mknod`, kernel and loader rebuilt, the pin in the guest: **exactly one claim red** — `FAIL: the watch hears mknod's entry as IN_CREATE` — with `mknodat`, `symlinkat` and `symlink` green. The sharpest possible shape for a pair audit: the claim is **per door**, so the one that drifted is the one that reddens, and a single "a create is seen" claim would have passed on whichever door the test used. Restored with `sha256sum -c` on all three files, rebuilt, `PASS`. |
+| **A third finding, from the arm that would not compile** | The first version spelled `libc::SYS_mknod`/`SYS_symlink` unconditionally and the aarch64 arm refused it (`E0425`). That is the right answer to a real question: **arm64 has no number for either** — the kernel's own table says so beside them (`nr_aarch64.rs`: `SYMLINK: 64016 // no arm64 number; unreachable on aarch64`, `MKNOD: 64023`), and `libc` defines neither constant there. So the pair is claimed where **both halves exist** and the `at` forms alone where they do not, with the reason at the site: a claim about a door a machine cannot issue is a claim about the test's `cfg`, not about the kernel. This complements §6.173's rule — **a pair is not always a pair on every machine**, and the pin must say which half it can see. |
+| **Gate** | `build/gate-item293b.log`, `GATE_EXIT=0`, both arms in one run after the per-machine door list landed: stage 1 **1339** host tests 0 failed; stage 2 323 programs over 6 lanes on x86_64 (41.87 s) and 319 on aarch64 (55.65 s); `pass=323 fail=0` / `pass=319 fail=0`, `mpos-kunit 41/0` per arm; clippy ratchet unchanged at `162/168/389/273/3`. The first run reddened on aarch64 at a **compile** error, which is what turned the machine's door set into this item's third finding. Also added a `Door` type alias, which is what clippy's `type_complexity` asked for — an alias rather than an `allow`, since the tuple is a shape a reader has to unwind. |
+
+**What this does not do, named.** The audit covered the **`fs` door pairs**, not
+every pair in the tree: ABI pairs elsewhere (`kill`/`tgkill`, `dup`/`dup3`,
+`poll`/`ppoll`, `select`/`pselect6`, `getrlimit`/`prlimit64`) were not walked, and
+those with distinct *arguments* rather than a dirfd are not the delegating shape,
+so each needs its own judgement about what "the same rule" means.
+`handle_chmod`/`handle_fchmodat` are **still two bodies** — they agree today,
+established by reading both, but nothing pins the agreement, and by this item's own
+argument that is how the next drift starts; delegating `chmod` is a small change
+not made here because it is not currently wrong, and one intent per commit is the
+rule. And the `IN_CREATE` claim is **one event class**: `IN_ATTRIB`, `IN_DELETE`,
+`IN_MOVED_*` and `IN_OPEN`/`IN_CLOSE_WRITE` each have their own door families, and
+only `IN_CREATE`'s was checked per door.
