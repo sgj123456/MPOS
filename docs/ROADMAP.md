@@ -2762,3 +2762,37 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   (`RDONLY + SHARED|RW = EACCES`) — fixed to `O_RDWR`, what a compositor does. Gate
   `build/gate-devzero2.log` `GATE_EXIT=0`: stage 1 1331, x86_64 322, aarch64 318, kunit 41/0. (§5.7,
   item 285)
+
+- **Item 286 — a timer's `siginfo_t` carries its handle and its miss count**: the
+  `SI_TIMER` arm is `{ si_timerid; si_overrun; sigval }` and this kernel wrote only
+  the payload — every timer record delivered `si_timerid` 0 and `si_overrun` 0, and
+  `signalfd` left the flat struct's `ssi_tid` (byte 24), `ssi_overrun` (32) and
+  `ssi_int` (44) at zero, so even a `sigqueue` payload read as 0 through the `int`
+  view. Measured first on Linux 7.3.4, for `SIGALRM` and `SIGRTMIN+3` alike
+  (`build/scratch/sfdhost/`): the handler words are `[0..6] = 37 0 -2 0 1 0`, so the
+  handle is byte 16 and the count byte 20 while byte 12 is padding; the flat
+  `signalfd_siginfo` puts them elsewhere (24/32/44/48/72) — and the payload is one
+  field seen twice (`ssi_int -559038737` beside `ssi_ptr 0x77441122deadbeef`).
+  **`si_overrun` is live and `timer_getoverrun` is not the same number**: a 20 ms
+  timer left unread for 500 ms delivered a record reading 24 while the door answered
+  **0** at four asks along the way and 24 only after the read — Linux's `it_overrun`
+  against `it_overrun_last`. `setitimer`'s expiry is `SI_KERNEL` (128), not
+  `SI_TIMER`; a one-shot's count is 0; one pending record per timer, ever. So
+  `SigInfo` gained `tid`/`overrun`, `SignalInfo::to_wire` chose the union arm by the
+  record's class, `vfs::signalfd`'s writer became one host-testable `write_record`,
+  `PosixTimer` split into `overrun` (the record's) and `last_overrun` (the door's),
+  and the expiry scan's bump reached **both** classes — its first version skipped
+  real-time signals, which is exactly the class musl's `SIGEV_THREAD` helper arms
+  its timer with. Pin `t-sfd-timer-record` (54 claims, both machines) plus three host tests
+  (host lib 818); counterfactual stashes the kernel half and the guest reddens **9**
+  claims while the pin's restored tree answers `=== PASS`. The **guest** found two
+  further defects the host could not: the timer arm of `to_wire` never wrote the
+  `sigval` at byte 24 (a handler got a zero payload the signalfd door carried), and
+  `last_overrun` was reset by the next expiry rather than at delivery. Gate
+  `build/gate-item286b.log`: stage 1 1336, x86_64 `pass=323`, aarch64 `pass=319`
+  (each one more than the previous green), kunit 41/0 per arm, clippy ratchet
+  unchanged; the aarch64 arm ran separately because this sandbox's `/var/tmp`
+  turned read-only and QEMU hardcodes it as the snapshot overlay's directory. Named: a deleted timer's
+  queued record is still kept (a pre-existing, separately pinned divergence),
+  `CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`, and the counters are reported
+  nowhere else. (§6.166, item 286)

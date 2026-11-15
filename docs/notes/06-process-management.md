@@ -15360,3 +15360,194 @@ workspaces formatted.
    not synchronous exceptions delivered to EL0 there — so the `FaultKind` rows
    that only that machine can produce are `Page` and `InvalidOpcode`, and the
    rest are unwitnessed on it. Recorded rather than glossed.
+
+## §6.166 a timer's record carries its handle and its miss count, and `si_overrun` is a live number (item 286, LANDED 2026-11-15)
+
+**The observation.** `siginfo_t`'s `SI_TIMER` arm is `{ int _tid; int _overrun;
+sigval_t _sigval; }` and this kernel wrote only the payload. A `signalfd`
+reader was worse off: `ssi_tid`, `ssi_overrun` and `ssi_int` were all left zero,
+because `vfs::signalfd`'s writer copied five scalars and the `sigval` and never
+touched the flat struct's other slots. So a program that asked "which timer was
+this, and how many expiries did I miss" was told 0 and 0 - legal-looking
+numbers, which is the class of defect this repository's §3 rule 2 exists for.
+It also explained a second, quieter thing: musl's `SIGEV_THREAD` helper checks
+`si_code == SI_TIMER` before running the callback, which worked, and then the
+callback it ran for a `timer_create` timer had no way to learn its handle.
+
+**Measured first** (`build/scratch/sfdhost/`, Linux 7.3.4-arch1-1, 2026-11-15).
+Every reading below is one of those probes, and every one was taken for
+`SIGALRM` (14) *and* `SIGRTMIN+3` because the two classes turned out to matter.
+
+*The wire*. A handler's raw `siginfo_t` words for one `timer_create` expiry:
+
+```
+words[0..6] = 37 0 -2 0 1 0
+```
+
+so `si_timerid` is word 4 (byte 16), `si_overrun` word 5 (byte 20), the payload
+word 6 (byte 24) - and word 3 (byte 12), where a `_rt` sender keeps `si_pid`,
+is **padding** for this class. `signalfd_siginfo` is a *flat* struct and puts
+the same facts elsewhere: `ssi_tid` at byte 24, `ssi_overrun` at 32, `ssi_int`
+at 44, `ssi_ptr` at 48, `ssi_addr` at 72 (`dump.c`, `all.c`). The payload is
+one field seen twice - `sigqueue(0x77441122deadbeef)` reads `ssi_int`
+`-559038737` (`0xdeadbeef`) *and* `ssi_ptr` `0x77441122deadbeef`, and a timer's
+`sival_int=4242` reads both slots as 4242.
+
+*`si_overrun` is live, and `timer_getoverrun` is not the same number.* This is
+the part that took the most measurement and the part a first implementation got
+wrong. Arm a 20 ms repeating timer, let a record queue, then keep not reading it
+(`frozen3.c`, `last.c`):
+
+```
+1. at 100ms  pending=1 getoverrun=0
+2. at 500ms  pending=1 getoverrun=0     <- the door answers 0 while pending
+3. record    overrun=24                 <- the record carries ALL 24 misses
+4. after read getoverrun=24             <- and now the door agrees
+```
+
+So there are **two counters**, which is Linux's `it_overrun` and
+`it_overrun_last`: the record's `si_overrun` accumulates while it sits unread,
+and `timer_getoverrun` reports the count of the last *delivered* record. It is
+0 before a first record is read, it stays at the delivered number while later
+expiries pile up (`life2.c`: delivered 9, three more unread, still 9), and it
+moves only when the next record is handed over (2). Arming and disarming both
+reset it to 0 (`rearm.c`, `first.c`: disarmed after a read of 2, answered 0).
+
+*Coalescing.* One pending record per timer, ever: expiries that arrive while it
+waits do not queue more records, they only move the count (`sem3.c`: "records
+available: 1" after ten expiries).
+
+*`setitimer` is not this class.* An `ITIMER_REAL` expiry arrives with
+`si_code` **128** (`SI_KERNEL`) and both `_timer` words zero (`it2.c`) - it has
+no `timer_create` handle and no overrun counter. This kernel queued it as
+`SI_TIMER`, which told a caller it had a handle it never had.
+
+*A one-shot* timer's record reads `si_overrun` 0, and a never-armed timer's
+`timer_getoverrun` is 0 (`it2.c`, `rearm.c`).
+
+**The change.** Two halves, and the second was found by the first.
+
+1. *The record's fields.* `SigInfo` gained `tid` and `overrun`, and
+   `SigInfo::timer` takes the handle, the count and the payload together - the
+   `_timer` member is all three. `hal::SignalInfo::to_wire` chooses between the
+   two union arms by the record's **class** (`timer_union()`: `!fault &&
+   code == SI_TIMER`), so a `SI_TIMER` record writes `{tid, overrun}` where a
+   sender writes `{pid, uid}`; `ssi_tid`/`ssi_overrun`/`ssi_int` are written by a
+   new `write_record` in `vfs::signalfd`, which is host-testable precisely
+   because the flat layout is the ABI. `setitimer`'s expiry became
+   `SigInfo::kernel` (`SI_KERNEL`), which is what the measurement says it is.
+
+2. *The two counters, and the class the bump was skipped for.* A first version
+   had one counter on the timer and answered `timer_getoverrun` from it, so a
+   caller that asked before reading its first record was told the accumulation
+   (`9` where Linux answers `0` - the counterfactual's own first line). And its
+   expiry scan bumped the queued record only for **standard** signals: the
+   standard path stores a record in `task.siginfo[signo]`, the real-time one in
+   `task.rtq`, and the loop's `if is_rt(signo) { continue; }` meant a timer
+   armed on `SIGRTMIN` - which is exactly what musl's `SIGEV_THREAD` helper
+   arms - handed its reader a count frozen at 0. `PosixTimer` now keeps
+   `overrun` (the live count, on the record) and `last_overrun` (what
+   `timer_getoverrun` answers), the bump reaches both classes
+   (`RtQueue::bump_overrun` raises the queued record in place), and delivery
+   moves `last_overrun` through one `Task::note_timer_delivered`.
+
+**The pins.** Host tests `818` (one new: `a_queued_records_overrun_is_raised_in_place`,
+which pins that a bump adds no record and leaves a neighbour's alone; plus the
+two record-shape tests in `src/vfs/signalfd.rs` and `src/sched/signal.rs`), and
+`t-sfd-timer-record` for the machine.
+
+**Guest reading, against the host's line for line.** One probe
+(`build/scratch/sfdhost/mprobe.c`, musl, static) run on both. The kernel's
+answers and Linux 7.3.4's are identical on both signal classes:
+
+```
+A. getoverrun while pending = 0
+B. record n=128 tid=1 overrun=9 int=77
+C. getoverrun right after    = 9
+D. 2nd record n=128 overrun=2
+E. getoverrun after 2nd read = 2
+F. getoverrun after disarm   = 0
+```
+
+(`build/scratch/sfdhost/guest-fixed.log`; the same program printed 9/9 for the
+door and 0 for the real-time record before the second half of the fix.)
+
+**Counterfactual.** The kernel half stashed (`git stash push` of the six files),
+kernel and loader rebuilt, and `t-sfd-timer-record` run in the guest: **9
+claims red**, `=== FAIL t-sfd-timer-record exit=1`
+(`build/scratch/sfdhost/guest-pin-cf.log`), and the four that name the subject:
+
+```
+FAIL: the frame's si_timerid (byte 16, raw word 4) is the handle (3), got 0
+FAIL: the frame's si_overrun (byte 20, raw word 5) is the count that piled up, got 0
+FAIL: its ssi_code is SI_KERNEL (128), not SI_TIMER (-2), got -2
+FAIL: its ssi_tid is the one-shot's handle
+```
+
+Restored from `build/scratch/sfdhost/good/*.rs` with `sha256sum -c good.sha` on
+all six files (成功 on every one), rebuilt, `=== PASS t-sfd-timer-record exit=0`.
+
+**And the earlier, hand-run probe of the pre-fix kernel**, from before the pin
+existed, which is why the second defect was found at all:
+
+```
+=== standard signo=14 ===
+A. getoverrun while pending = 9      (Linux: 0)
+C. getoverrun right after    = 0      (Linux: 9)
+=== real-time signo=38 ===
+A. getoverrun while pending = 9
+B. record n=128 tid=3 overrun=0      (Linux: 9)
+D. 2nd record n=128 overrun=0        (Linux: 2)
+```
+
+so the two doors were wrong in opposite *directions* for standard signals and
+the real-time record never moved at all.
+
+**Three defects, and the guest found the last two.** The pin written from the
+host measurement passed 54/54 on the host and reddened on the machine, which is
+the reverse of the usual direction and worth recording:
+
+1. `SignalInfo::to_wire`'s timer arm wrote the two `int`s and **stopped**, so a
+   handler over a timer was handed a **zero payload** at byte 24 while the
+   `signalfd` door carried it - two doors disagreeing about one record, which is
+   the shape the single writer exists to prevent. (`gprobe2.c` on the guest:
+   `[6]=0` before, `[6]=4242` after.)
+2. `last_overrun` was reset by the *next* expiry's fresh-record branch, not at
+   delivery, so a repeating timer took `timer_getoverrun` back to 0 in the window
+   between the read and the caller's ask. Linux leaves it until the next
+   delivery (`life2.c`: read 9, three unread expiries, still 9).
+3. Both of those were invisible on the host and reliable on TCG because they are
+   *timing windows*, and the pin's own handler kept overwriting its capture per
+   delivery, so on a slow machine a second (fresh, zero-count) delivery landed
+   before the check. The pin now keeps the **first** delivery and says why.
+
+**Gate.** `build/gate-item286b.log` — stage 1 **1336** host tests, 0 failed
+(and the lib itself **818** with this item's three new cases); x86_64 `pass=323
+fail=0` (one more than the previous green's 322 — the newly-open pin),
+`mpos-kunit 41 passed, 0 failed`, exit 33; 15 of 338 left out by `tests.toml`.
+aarch64 `pass=319 fail=0` (one more than 318) with `mpos-kunit 41 passed, 0
+failed`, run as its own arm (`build/gate-item286-arm.log`, exit 0) because this
+sandbox's `/var/tmp` went read-only mid-session and QEMU hardcodes it as the
+`snapshot=on` overlay directory — **an environment fault, not this item's**: every
+lane refused to start before a single program ran, the previous green gate
+(15:42, before the mount flipped at 15:50) has no such line, and the arm run with
+a writable medium was green. Clippy ratchet unchanged at
+`162/168/389/273/3/1` ("no lint has appeared and no count has grown"), both
+workspaces formatted.
+
+### What this does not do, named
+
+1. **A deleted timer's queued record is kept.** Linux frees the `sigqueue` and
+   a polling take answers `EAGAIN`; this kernel leaves the record takeable.
+   That divergence predates this item and is still pinned as such by
+   `t-timer-create`'s "a deleted timer's queued record is still takeable" claim.
+   `note_timer_delivered` finds no timer for such a record and so leaves the
+   counter alone, which is the honest half.
+2. **`CLOCK_THREAD_CPUTIME_ID` timers stay `EOPNOTSUPP`** (§6.123), so the CPU
+   clock's overrun path is unwitnessed.
+3. **The overrun counters are not reported anywhere else** - `/proc/<pid>/timers`
+   carries the clock word and the signal, not the run state, which is a
+   separate door nobody has asked for.
+4. **`si_overrun`'s saturation** at `INT_MAX` is untested: Linux caps it
+   (`it_overrun` is an `int` and `send_sigqueue` stops incrementing at
+   `INT_MAX`), and a probe would have to miss two billion expiries.
