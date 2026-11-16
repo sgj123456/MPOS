@@ -148,6 +148,107 @@ fn main() {
         fs::read(inside("c.done")).ok().as_deref() == Some(&b"by path"[..]),
     );
 
+    // === a directory rename moves the *subtree* ============================
+    //
+    // `renameat2` had no directory arm at all (`_ => return err::EISDIR`),
+    // under a comment saying a directory rename would have to move the whole
+    // subtree's parent back-pointer. What the comment had wrong is that this
+    // tree keeps no parent pointers to move: `..` is answered by a *search*
+    // (`MountTable::parent_of`), so a directory's location follows from which
+    // directory holds its name. The move is therefore a name move, and the
+    // filesystem's own `rename_dir_into` does the accounting - two map edits on
+    // ramfs, an add/`..`-rewrite/remove on ext4 (`docs/notes/` §6.186).
+    //
+    // Measured on Linux 7.3.4 (`build/scratch/opathmmap/rename_dir2.c`): a
+    // populated subtree moves whole, the moved directory keeps its mode and
+    // contents, an empty target directory is **replaced**, a non-empty one is
+    // `ENOTEMPTY` with nothing moved, a directory onto a file is `ENOTDIR`, a
+    // file onto a directory is `EISDIR`, and into its own subtree is `EINVAL`.
+    let rd = Path::new("/tmp/t-rename_dirs");
+    let _ = fs::remove_dir_all(rd);
+    let d = |p: &str| rd.join(p);
+    if fs::create_dir_all(d("a/b/c")).is_ok()
+        && fs::write(d("a/b/c/f"), b"deep").is_ok()
+        && fs::write(d("a/g"), b"top").is_ok()
+    {
+        let moved = fs::rename(d("a"), d("z"));
+        r.check("a populated subtree renames", moved.is_ok());
+        r.check(
+            "a file three levels down survived it",
+            fs::read(d("z/b/c/f")).ok().as_deref() == Some(&b"deep"[..]),
+        );
+        r.check(
+            "a file one level down survived it",
+            fs::read(d("z/g")).is_ok(),
+        );
+        r.check("the old name is gone", fs::metadata(d("a")).is_err());
+        // The claim that would pass on a half-move: `..` must reach the new
+        // parent, so `z/b/c/../..` is `z`.
+        r.check(
+            "and `..` inside the moved subtree reaches the new parent",
+            fs::metadata(d("z/b/c/../..")).is_ok() && fs::read_dir(d("z/b/c/../..")).is_ok(),
+        );
+
+        // The moved directory's own mode and owner travel with it - a rename
+        // that rebuilt the node would reset them.
+        let _ = fs::create_dir_all(d("m/sub"));
+        let _ = fs::write(d("m/sub/k"), b"k");
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(d("m"), fs::Permissions::from_mode(0o700));
+        let kept = fs::rename(d("m"), d("n"));
+        r.check("a directory with a mode renames", kept.is_ok());
+        r.check(
+            "and keeps its mode",
+            fs::metadata(d("n"))
+                .map(|m| m.permissions().mode() & 0o777 == 0o700)
+                .unwrap_or(false),
+        );
+        r.check("and its contents", fs::read(d("n/sub/k")).is_ok());
+
+        // The four refusals, each with the errno Linux gives.
+        let _ = fs::create_dir_all(d("e1"));
+        let _ = fs::create_dir_all(d("e2"));
+        r.check(
+            "a directory onto an existing EMPTY directory is served",
+            fs::rename(d("e1"), d("e2")).is_ok(),
+        );
+        r.check(
+            "and the empty target's name now reaches the source's inode",
+            fs::metadata(d("e2")).is_ok() && fs::metadata(d("e1")).is_err(),
+        );
+        let _ = fs::create_dir_all(d("ne/inner"));
+        let errno = |e: std::io::Error| e.raw_os_error();
+        r.check(
+            "a directory onto a NON-empty one is ENOTEMPTY",
+            errno(fs::rename(d("e2"), d("ne")).unwrap_err()) == Some(libc::ENOTEMPTY),
+        );
+        r.check(
+            "and nothing moved: both names are still there",
+            fs::metadata(d("e2")).is_ok() && fs::metadata(d("ne/inner")).is_ok(),
+        );
+        let _ = fs::write(d("file"), b"x");
+        r.check(
+            "a directory onto a file is ENOTDIR",
+            errno(fs::rename(d("e2"), d("file")).unwrap_err()) == Some(libc::ENOTDIR),
+        );
+        r.check(
+            "a file onto a directory is EISDIR",
+            errno(fs::rename(d("file"), d("ne")).unwrap_err()) == Some(libc::EISDIR),
+        );
+        let _ = fs::create_dir_all(d("sub/inner2"));
+        r.check(
+            "a directory into its own subtree is EINVAL",
+            errno(fs::rename(d("sub"), d("sub/inner2/x")).unwrap_err()) == Some(libc::EINVAL),
+        );
+        r.check(
+            "a directory onto itself is the no-op",
+            fs::rename(d("sub"), d("sub")).is_ok(),
+        );
+    } else {
+        r.check("the directory-rename fixture is made", false);
+    }
+    let _ = fs::remove_dir_all(rd);
+
     if r.failed {
         println!("t-rename: FAILED");
         std::process::exit(1);

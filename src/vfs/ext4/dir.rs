@@ -148,6 +148,40 @@ impl Core {
         Err(VfsError::NoEntry)
     }
 
+    /// Rewrite the inode number the `..` entry of directory `ino` names.
+    ///
+    /// Every on-disk directory stores its parent's number in its first block,
+    /// as the second entry's `inode` field. A directory that is renamed must
+    /// have it rewritten, or the subtree names a parent it no longer sits
+    /// under - the one way a rename can leave a tree that does not close.
+    ///
+    /// Only the number changes: the entry's name (`..`), its length and its
+    /// file type stay as they are, so this is an in-place edit of four bytes
+    /// rather than a remove and an insert, and the checksum is recomputed by
+    /// `update_dir_block` on the way out.
+    pub(crate) fn set_dir_parent(&self, ino: u32, parent: u32) -> VfsResult<()> {
+        let data = self.read_inode(ino);
+        if data.kind() != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        let mut done = false;
+        // `..` lives in the directory's first block, and every block of a
+        // directory is reached by `dir_blocks` in logical order - so the first
+        // one is where to look, and looking at the rest would be reading blocks
+        // that cannot hold it.
+        if let Some(&block) = self.dir_blocks(&data).first() {
+            self.update_dir_block(block, ino, data.generation, |page| {
+                done = self::dirent::rewrite_dirent_inode(page, "..", parent);
+                done
+            });
+        }
+        if !done {
+            return Err(VfsError::Invalid);
+        }
+        self.write_inode(ino, &data);
+        Ok(())
+    }
+
     /// A brand-new inode: reserved fields zeroed, mode and links set, and for
     /// a directory a first block holding "." and "..".
     pub(crate) fn new_inode(&self, kind: NodeKind, parent: u32) -> VfsResult<u32> {

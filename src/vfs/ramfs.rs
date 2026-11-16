@@ -1460,6 +1460,73 @@ impl Inode for RamDir {
         Ok(())
     }
 
+    /// Move a directory's name edge from here to `to`.
+    ///
+    /// A ramfs directory is a `BTreeMap` of names, so the whole of the move is
+    /// two map edits: take the entry out of this directory, put it in the
+    /// other. **The subtree needs nothing** - and that is the fact worth
+    /// recording, because it is the reason this filesystem can serve the call
+    /// while ext4 needs more work: no ramfs inode records its parent, so `..`
+    /// is answered by a search of the mount ([`MountTable::parent_of`]) rather
+    /// than by a stored pointer, and a search follows the tree as it is *now*.
+    /// Nothing underneath has to be told anything.
+    ///
+    /// The link counts are Linux's: the destination gains a name for the
+    /// directory (`dir.links + 1`), the source gives one up, and the moved
+    /// directory's own count is untouched - its name count is unchanged, only
+    /// which directory holds it.
+    fn rename_dir_into(&self, name: &str, to: &Arc<dyn Inode>, to_name: &str) -> VfsResult<()> {
+        let at = now();
+        let moved =
+            critical_section::with(|cs| self.entries.borrow(cs).borrow().get(name).cloned());
+        let Some(moved) = moved else {
+            return Err(VfsError::NoEntry);
+        };
+        if moved.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        // Take it out of this directory first: a failure after that point is a
+        // name that exists nowhere, and the one thing this must not do is leave
+        // two names for one directory (Linux cannot express that for a
+        // directory at all). The receiver's insert below is the only step that
+        // can refuse, and it refuses for a name it already holds - which the
+        // caller checked - or for space, which the charge below is asked about
+        // before the removal.
+        if !self.fs.charge_name(to_name.len()) {
+            return Err(VfsError::NoSpace);
+        }
+        critical_section::with(|cs| {
+            self.entries.borrow(cs).borrow_mut().remove(name);
+        });
+        let placed = critical_section::with(|cs| {
+            match to.as_any().downcast_ref::<RamDir>() {
+                Some(dst) => {
+                    let mut entries = dst.entries.borrow(cs).borrow_mut();
+                    if entries.contains_key(to_name) {
+                        return Err(VfsError::Exists);
+                    }
+                    entries.insert(alloc::string::String::from(to_name), moved.clone());
+                    dst.mtime.borrow(cs).set(at);
+                    Ok(())
+                }
+                // Not a ramfs directory: the name is already out of this one, so
+                // put it back rather than losing the subtree.
+                None => {
+                    let mut entries = self.entries.borrow(cs).borrow_mut();
+                    entries.insert(alloc::string::String::from(name), moved.clone());
+                    Err(VfsError::Unsupported)
+                }
+            }
+        });
+        if placed.is_err() {
+            self.fs.release_name(to_name.len());
+            return placed;
+        }
+        self.fs.release_name(name.len());
+        critical_section::with(|cs| self.mtime.borrow(cs).set(at));
+        Ok(())
+    }
+
     /// Drop the name edge to an **empty** directory.
     ///
     /// Nothing here counts links, so the whole of an `rmdir` is: the name must

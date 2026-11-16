@@ -1019,6 +1019,46 @@ pub fn statfs(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// The absolute, normalized spelling of a path a syscall was handed, for the
 /// filesystem lookup: `st_dev` and `statfs`'s type both key on the path, and
 /// `.` names whatever the caller's cwd is.
+/// Whether `ancestor` is `node` or somewhere above it - the question
+/// `rename(2)` asks before letting a directory move into its own subtree.
+///
+/// Asked by walking **down** from `ancestor` and comparing identity, the way
+/// every other parent question here is answered: no inode in this tree records
+/// its parent (`MountTable::parent_of` searches for the same reason), so the
+/// only honest direction is from a node to its children. Bounded, because a
+/// hostile tree could be deep and the answer to a too-deep walk must be a
+/// refusal rather than a hang - and the bound is generous: a rename target
+/// deeper than this is outside anything the images hold.
+fn subtree_contains(ancestor: &Arc<dyn Inode>, node: &Arc<dyn Inode>) -> bool {
+    const VISITS_MAX: usize = 512;
+    let mut queue: alloc::collections::VecDeque<Arc<dyn Inode>> =
+        alloc::collections::VecDeque::from([ancestor.clone()]);
+    let mut visits = 0usize;
+    while let Some(dir) = queue.pop_front() {
+        if Arc::ptr_eq(&dir, node) {
+            return true;
+        }
+        visits += 1;
+        if visits > VISITS_MAX {
+            // Too deep to answer: refuse the move rather than allow one that
+            // might detach a subtree.
+            return true;
+        }
+        let Ok(entries) = dir.read_dir() else {
+            continue;
+        };
+        for (name, kind) in entries {
+            if name == "." || name == ".." || kind != NodeKind::Dir {
+                continue;
+            }
+            if let Ok(child) = dir.lookup(&name) {
+                queue.push_back(child);
+            }
+        }
+    }
+    false
+}
+
 fn absolute(path: &str) -> alloc::string::String {
     if path.starts_with('/') {
         crate::vfs::path::normalize(path)
@@ -2294,9 +2334,67 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             let (uid, gid) = old_inode.owner();
             inode.set_owner(uid, gid);
         }
-        // A directory rename would have to move the whole subtree's parent
-        // back-pointer; nothing here needs it yet, and pretending otherwise
-        // would half-move it. Say so.
+        // A directory moves by a filesystem operation of its own, because its
+        // *contents* record where it lives: every child holds a `..` that must
+        // follow, and moving the name alone leaves a tree that does not close
+        // (`docs/notes/` §6.186). The rules that do not need the nodes were
+        // asked above - both name edges, both directories' permissions, the
+        // mount refusal - and the ones that do are here: the destination must be
+        // empty of contents, and the destination must not be inside the subtree
+        // being moved.
+        NodeKind::Dir => {
+            // Measured on Linux 7.3.4 (`build/scratch/opathmmap/rename_dir2.c`):
+            // a directory onto a **non-empty** directory is `ENOTEMPTY` and
+            // nothing moves; onto an empty one it is served and the source's
+            // inode takes the name.
+            if let Some(target) = &existing {
+                // `existing` is a directory here - the kind rules above refused
+                // every other combination - so the only question is whether it
+                // has contents.
+                match target.dir_is_empty() {
+                    Ok(true) => {}
+                    Ok(false) => return err::ENOTEMPTY,
+                    Err(e) => return err_of(e),
+                }
+            }
+            // Renaming a directory into its own subtree would detach the
+            // subtree from the tree it hangs from: measured, `rename(a, a/b/x)`
+            // is `EINVAL` however deep the target, and `rename(a, a)` - the
+            // no-op the equality check above already answered - is 0.
+            if subtree_contains(&old_inode, &dir) {
+                return err::EINVAL;
+            }
+            // An **empty directory already holding the new name is replaced**,
+            // not refused: measured on Linux 7.3.4
+            // (`build/scratch/opathmmap/rename_dir2.c`), `rename(src, dst)` over
+            // an empty `dst` is served, `dst`'s old inode goes, and the name now
+            // reaches `src`'s inode. The emptiness was checked above, so taking
+            // that name away here is `rmdir`'s job and the `ENOTEMPTY` case
+            // cannot reach this line.
+            //
+            // This has to happen *here* rather than inside the filesystem
+            // method: on ramfs the destination's name is one `BTreeMap` key
+            // (`Exists` if it is there), and on ext4 a dirent (`Exists` too), so
+            // the replace is the caller's decision in both.
+            if existing.is_some()
+                && let Err(e) = dir.rmdir(&name)
+            {
+                return err_of(e);
+            }
+            if let Err(e) = old_dir.rename_dir_into(&old_name, &dir, &name) {
+                return err_of(e);
+            }
+            // A handled directory keeps its identity across the move, so the
+            // one name it lost and the one it gained are one inode's news: the
+            // reports below are the move's, and nothing watches a "new inode"
+            // that was never made.
+            crate::vfs::inotify::emit_move(&old_dir, &old_name, &dir, &name, &old_inode);
+            // The source directory lost a name, so its own count falls; the
+            // destination gained one. Both are the filesystem's accounting, and
+            // `rename_dir_into` did it - nothing here writes the counts a
+            // second time.
+            return 0;
+        }
         _ => return err::EISDIR,
     }
 

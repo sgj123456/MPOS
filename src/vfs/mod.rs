@@ -555,6 +555,49 @@ pub trait Inode: Send + Sync + core::any::Any {
         Err(VfsError::Unsupported)
     }
 
+    /// Move the **directory** called `name` out of this directory and into
+    /// `to`, under the name `to_name`. The subtree underneath travels with it,
+    /// and the moved directory's `..` is rewritten to name `to`.
+    ///
+    /// This is `rename(2)`'s directory half, and it is its own primitive rather
+    /// than a sequence of [`Self::unlink`] + [`Self::link`] + `mkdir` because a
+    /// directory is the one node whose *contents* record where it lives: every
+    /// child holds a `..` that must follow the move, and a filesystem that
+    /// moved the name and left them naming the old parent hands the kernel a
+    /// tree that does not close. Linux makes the same split
+    /// (`vfs_rename` → `->rename`, with `-EXDEV` for a cross-filesystem pair).
+    ///
+    /// The caller has already asked everything that does not need the nodes:
+    /// the directory's own name edges, both directories' permissions, the
+    /// destination's emptiness and the "into its own subtree" refusal (measured,
+    /// `build/scratch/opathmmap/rename_dir2.c`). What is left for this method is
+    /// the accounting only the filesystem can do.
+    ///
+    /// The default refuses, which is the honest answer for a node whose
+    /// filesystem has no `rename` op - and it is why the syscall layer still
+    /// answers `EISDIR` rather than `ENOSYS` for the ones that do not: the
+    /// caller asked to rename something that *is* a directory, and "this kernel
+    /// cannot" is not the same question as "you asked wrongly".
+    fn rename_dir_into(&self, name: &str, to: &Arc<dyn Inode>, to_name: &str) -> VfsResult<()> {
+        let _ = (name, to, to_name);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Whether this directory has nothing under it but `.` and `..` - the
+    /// question `rename(2)` asks of a replaced target and `rmdir(2)` of its
+    /// subject.
+    ///
+    /// Its own method because the answer is a filesystem's, not a kernel's:
+    /// ramfs asks its `BTreeMap` and ext4 reads the dirent blocks, and a caller
+    /// that asked `read_dir()` instead would be allocating a `Vec` of every
+    /// entry to learn one bit - on a directory that may hold thousands.
+    fn dir_is_empty(&self) -> VfsResult<bool> {
+        Ok(self
+            .read_dir()?
+            .iter()
+            .all(|(name, _)| name == "." || name == ".."))
+    }
+
     /// Whether this node has a *position* at all - whether `lseek(2)` on a
     /// descriptor for it can succeed.
     ///

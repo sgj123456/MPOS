@@ -1612,6 +1612,59 @@ impl Inode for Ext4Ino {
     /// the `+1` [`Self::create`] gave it - and removing it has to give that
     /// one back. Everything is checked before anything is written, so a
     /// refusal leaves both directories exactly as they were.
+    /// Move the directory called `name` into `to`, under `to_name`.
+    ///
+    /// Three writes, and the third is the one a name-move alone would miss: the
+    /// new entry in the destination, the old one gone from here, and **the
+    /// moved directory's own `..` rewritten to `to`'s inode number**. That last
+    /// one is why this is a filesystem method rather than an unlink plus a
+    /// link: every directory on disk stores its parent's number in its first
+    /// block, and a tree whose children name the old parent does not close -
+    /// a `..` at the new location would walk back into the directory the
+    /// subtree left.
+    ///
+    /// A disk rename is a crash window rather than an atomic step: this writes
+    /// the new entry, then the child's `..`, then removes the old entry, so a
+    /// failure between any two leaves **both** names for one directory rather
+    /// than either none or a subtree that does not close. Linux's own `ext4_rename`
+    /// orders its `ext4_add_entry` before its `ext4_delete_entry` for the same
+    /// reason.
+    ///
+    /// The counts are Linux's: the destination's link count grows by one, the
+    /// source's falls by one, and the moved directory keeps its own (its name
+    /// count did not change, only the directory holding the name).
+    fn rename_dir_into(&self, name: &str, to: &Arc<dyn Inode>, to_name: &str) -> VfsResult<()> {
+        self.fs.writable()?;
+        self.require_dir()?;
+        let mut dir = self.data()?;
+        let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
+        let data = self.fs.read_inode(child);
+        if data.kind() != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        let dst = to
+            .as_any()
+            .downcast_ref::<Ext4Ino>()
+            .ok_or(VfsError::Unsupported)?;
+        let mut dst_dir = dst.data()?;
+        if self.fs.dir_lookup(&dst_dir, to_name)?.is_some() {
+            return Err(VfsError::Exists);
+        }
+        // The new name first, so a failure here changes nothing.
+        self.fs
+            .dir_add(&mut dst_dir, dst.ino, to_name, child, FT_DIR)?;
+        // Then the child's `..`, which is the whole of "the subtree follows".
+        self.fs.set_dir_parent(child, dst.ino)?;
+        // Then the old name goes. Its space is reclaimed by the entry before
+        // it, so this cannot fail for want of room.
+        self.fs.dir_remove(&mut dir, self.ino, name)?;
+        dir.links -= 1;
+        dst_dir.links += 1;
+        self.fs.write_inode(self.ino, &dir);
+        self.fs.write_inode(dst.ino, &dst_dir);
+        Ok(())
+    }
+
     fn rmdir(&self, name: &str) -> VfsResult<()> {
         self.fs.writable()?;
         self.require_dir()?;

@@ -170,6 +170,38 @@ pub(crate) fn dir_try_insert(
 /// inode it named through `found`. Its bytes go to the entry in front of it,
 /// which is how ext2 keeps a block free of holes; one at the very front has
 /// nothing in front of it, so it is emptied in place instead.
+/// Point the entry called `name` at a different inode number, leaving its
+/// name, length and file type exactly as they were.
+///
+/// This is `rename(2)`'s one in-place edit: a renamed directory's `..` keeps
+/// the name `..` and the type `FT_DIR` and changes only the number it names.
+/// `dir_take` cannot do it - that one removes the entry and gives its space to
+/// its predecessor - and a remove-plus-insert would move the entry in the
+/// block, which is a rewrite of the block for a four-byte fact.
+pub(crate) fn rewrite_dirent_inode(page: &mut [u8], name: &str, new_ino: u32) -> bool {
+    let limit = page.len();
+    let mut at = 0usize;
+    while at < limit {
+        let Some(rec) = entry_rec(page, at, limit) else {
+            return false;
+        };
+        let hit = entry_name(page, at, rec).eq_ignore_ascii_case(name.as_bytes());
+        if hit {
+            let off = at + 8;
+            if off + 4 > page.len() {
+                return false;
+            }
+            page[off..off + 4].copy_from_slice(&new_ino.to_le_bytes());
+            return true;
+        }
+        if rec == 0 {
+            return false;
+        }
+        at += rec;
+    }
+    false
+}
+
 pub(crate) fn dir_take(page: &mut [u8], name: &str, found: &mut Option<u32>) -> bool {
     let mut at = 0;
     let mut prev: Option<usize> = None;
