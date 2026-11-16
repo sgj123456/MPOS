@@ -17701,3 +17701,95 @@ workspaces formatted.
 3. **`fchmodat2`** (the `AT_EMPTY_PATH`-capable spelling, a different number from
    `fchmodat`) was not asked; this kernel's `fchmodat` serves the empty-name shape
    and glibc's wrapper does not reach it, so the claim is the raw one.
+
+## §6.186 renaming a directory: the comment said the subtree would have to move, and the tree does not work that way (item 307, LANDED 2026-11-16)
+
+**The gap, and it was a comment rather than a plan.** `renameat2` had no
+`NodeKind::Dir` arm at all:
+
+```rust
+// A directory rename would have to move the whole subtree's parent
+// back-pointer; nothing here needs it yet, and pretending otherwise
+// would half-move it. Say so.
+_ => return err::EISDIR,
+```
+
+Measured on the guest while item 306's dirfd probe ran: `mkdirat` a directory and
+`renameat` it is `-1 errno=21` for **every** dirfd spelling, where Linux answers
+`0` and the file rename beside it is served.
+
+**The comment's premise is false, and that is the finding.** This tree keeps no
+parent pointers on an `Inode`: `..` is answered by a **search**
+(`MountTable::parent_of`, bounded at 512 visits, `top` records that a `..` it
+cannot resolve "stays where it was"). A directory's location therefore follows
+from *which directory holds its name* and from nothing stored. Moving the name
+moves the subtree, because the search follows the tree as it is now. **The
+sentence that closed this for months described a data structure this kernel does
+not have.**
+
+What it *is* true of is a disk: an ext4 directory stores its parent's inode number
+in its own first block, so a disk filesystem must rewrite that entry. So the fix
+splits where Linux splits:
+
+* **`Inode::rename_dir_into(name, to, to_name)`** — the filesystem's accounting,
+  defaulting to `Unsupported`;
+* **the syscall arm** — everything that does not need the nodes, and the rules
+  measured below.
+
+**Measured first, on Linux 7.3.4** (`build/scratch/opathmmap/{rename_dir,
+rename_dir2}.c`):
+
+| what | Linux |
+|---|---|
+| a **populated subtree** renamed | served; every nested file survives, inode unchanged |
+| the moved directory's mode | travels with it (`0700` read back) |
+| onto an existing **empty** directory | served, and the target's name now reaches the source's inode |
+| onto an existing **non-empty** directory | `ENOTEMPTY`, **nothing moves** |
+| a directory onto a file | `ENOTDIR` |
+| a file onto a directory | `EISDIR` |
+| into its own subtree, any depth | `EINVAL` |
+| onto itself | `0` (the no-op the equality check above already answered) |
+
+**The two implementations, and they are different because the filesystems are.**
+On ramfs a directory is a `BTreeMap` of names, so the move is two map edits and
+**the subtree needs nothing** — the concrete demonstration of the paragraph above.
+On ext4 it is three writes in an order chosen for the crash window: the new
+`dir_add`, then the child's `..` rewritten (`set_dir_parent`, a four-byte in-place
+edit of the second entry's inode field — a remove-and-insert would rewrite the
+block to change one number), then the old `dir_remove`. A failure between any two
+leaves **both** names rather than a subtree that does not close, which is Linux's
+own order in `ext4_rename`.
+
+One thing the first draft got wrong and the guest caught: **an existing empty
+target must be replaced**, and neither filesystem's `rename_dir_into` can do it —
+both answer `Exists` for a name that is there. The replace is the caller's
+decision in both, so the syscall arm asks `dir.rmdir(&name)` first, guarded by the
+emptiness check that already ran. The guest answered `errno=17` (`EEXIST`) before
+that line existed, and Linux answers `0`.
+
+**Pins.** `t-rename` **+17**: the populated-subtree move with three files checked
+at three depths, the `..` reachability claim (`z/b/c/../..` is `z` — the one that
+would pass on a half-move), mode and contents travelling, the empty-target
+replace with the inode's new name, and the four refusals with their errnos plus
+the self-rename no-op.
+
+**Gate.** The first run `build/gate-item307.log` reddened on **clippy alone**:
+`unused_mut` up one on each of three arms, all from this change's own
+`let mut data = self.read_inode(ino)` in `set_dir_parent` — the fix was to delete
+the `mut`, not to raise a ceiling. `build/gate-item307b.log`, `GATE_EXIT=0`, both
+arms: stage 1 **1340** host tests 0 failed; stage 2 **324** on x86_64 and **320**
+on aarch64 with `mpos-kunit 42/0` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`.
+
+**What this does not do, named.**
+
+1. **A directory rename is not atomic on ext4**, by construction: there is no
+   journal transaction here, so a crash between the adds leaves both names. That
+   is recorded on the method and it is the honest limit of a write-through
+   filesystem driver.
+2. **`RENAME_EXCHANGE` and `RENAME_WHITEOUT` remain `EINVAL`** — measured before
+   this item and unchanged by it: the door refuses both flag bits as a pair rather
+   than half-serving them.
+3. **A rename that crosses mounts is `EXDEV`** for a file (the copy path) and is
+   refused by the same comparison for a directory; `move_mount(2)` is the call
+   that would do it and is not implemented.

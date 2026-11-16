@@ -3371,16 +3371,40 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   exercised with an `O_PATH` dirfd, and `fchmodat2` was not asked. (§6.185,
   item 306)
 
-- **Item 307 — renaming a directory is `EISDIR`, for every dirfd spelling** (named,
-  not started): `renameat2` has no `NodeKind::Dir` arm; the fallthrough is
-  `_ => return err::EISDIR` under a comment that a directory rename "would have to
-  move the whole subtree's parent back-pointer; nothing here needs it yet, and
-  pretending otherwise would half-move it." Measured on the guest while item 306's
-  probe ran: `mkdirat` then `renameat` of that directory is `EINVAL`-sibling
-  `EISDIR` for an ordinary **and** an `O_PATH` dirfd, where Linux answers 0, while a
-  file rename beside it is served. **Not a check to add**: no `Inode` here keeps a
-  parent link, so the honest implementations are to add one or to walk and rewrite
-  the subtree — and the half-version is what the comment refuses to ship. What it
-  blocks: `mv` of a directory, `apk`'s directory-shaped installs, any tree
-  rearrangement a package script does. Nothing in the current images needs it, which
-  is why it stayed named rather than built. (item 307)
+- **Item 307 — renaming a directory: the comment said the subtree would have to
+  move, and the tree does not work that way**: `renameat2` had no `NodeKind::Dir`
+  arm at all (`_ => return err::EISDIR`, "a directory rename would have to move the
+  whole subtree's parent back-pointer"). **The premise is false**: this tree keeps
+  no parent pointers — `..` is answered by a *search* (`MountTable::parent_of`,
+  bounded, and a `..` it cannot resolve stays put) — so a directory's location
+  follows from *which directory holds its name*, and moving the name moves the
+  subtree. The sentence that closed this for months described a data structure this
+  kernel does not have; what *is* true of it is a **disk**, where an ext4 directory
+  stores its parent's inode number in its own first block. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{rename_dir,rename_dir2}.c`): a populated subtree moves
+  whole with its mode and contents and the same inode; onto an existing **empty**
+  directory it is served and the target's name reaches the source's inode; onto a
+  **non-empty** one `ENOTEMPTY` with nothing moved; directory→file `ENOTDIR`;
+  file→directory `EISDIR`; into its own subtree at any depth `EINVAL`; onto itself
+  `0`. The fix splits where Linux splits — `Inode::rename_dir_into` for the
+  filesystem's accounting (default `Unsupported`), the syscall arm for everything
+  that does not need the nodes — and the two implementations differ because the
+  filesystems do: **ramfs** is two `BTreeMap` edits and the subtree needs nothing
+  (the concrete proof of the paragraph above), **ext4** is three writes in
+  crash-window order (`dir_add`, then `..` rewritten in place by `set_dir_parent` —
+  a four-byte edit, where a remove-and-insert would rewrite the block for one
+  number — then `dir_remove`), so a failure between any two leaves **both** names
+  rather than a subtree that does not close, which is Linux's own `ext4_rename`
+  order. **The guest caught one thing the draft had wrong**: an existing empty
+  target must be *replaced*, and neither `rename_dir_into` can do it (both answer
+  `Exists` for a name that is there), so the replace is the caller's decision and
+  the syscall arm asks `dir.rmdir` first, guarded by the emptiness check that
+  already ran — the guest answered `EEXIST` before that line existed. `t-rename`
+  **+17**, including the `..` reachability claim that a half-move would pass. First
+  gate run reddened on **clippy alone** (`unused_mut` up one on three arms from the
+  draft's `set_dir_parent`, fixed by deleting the `mut`); `build/gate-item307b.log`
+  `GATE_EXIT=0`: stage 1 1340, x86_64 **324**, aarch64 **320**, kunit 42/0 per arm,
+  clippy unchanged at `162/168/393/272/3/1`. **Named**: on ext4 the rename is not
+  atomic (no journal transaction — a crash between the adds leaves both names);
+  `RENAME_EXCHANGE`/`RENAME_WHITEOUT` remain `EINVAL`; a cross-mount rename is
+  `EXDEV` and `move_mount(2)` is not implemented. (§6.186, item 307)
