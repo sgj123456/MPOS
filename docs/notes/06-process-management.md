@@ -18212,3 +18212,73 @@ clippy ratchet unchanged at `162/168/393/272/3/1`; both workspaces formatted.
 3. **`vmsplice` (278)** remains undeclared and answers `ENOSYS` — the last of item
    310's four, and the only one that needs `mm` work (it grafts user pages into a
    pipe rather than copying bytes).
+
+## §6.192 `vmsplice`: the direction the man page does not prepare you for (item 313, LANDED 2026-11-16)
+
+**The last of item 310's four census calls**, and the one that finishes it:
+`execveat` (310), `ioprio_get`/`ioprio_set` (311), `tee` (312), `vmsplice` (313).
+Never declared, so the dispatch answered `ENOSYS`.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{vms1,vms2,vms3}.c`):
+
+| what | Linux |
+|---|---|
+| a pipe's **write** end | the iovecs' bytes land in the pipe |
+| a pipe's **read** end | it **drains into** the iovecs — returns 5, buffer holds what was in the pipe |
+| several iovecs | each contributes, in order |
+| a regular file | `EBADF` on either side |
+| `nr_segs == 0` | `0` |
+| more than `IOV_MAX` (1024) | `EINVAL` |
+| an unknown flag bit | `EINVAL` |
+| `SPLICE_F_GIFT` | **served**, no extra requirement |
+| a zero-length iovec | skipped, so an array of them answers 0 |
+| an unreadable base | `EFAULT` |
+
+**The drain row is the finding, and the first measurement nearly missed it.** The
+man page describes `vmsplice` as grafting *pages into* a pipe — one direction —
+so a probe that only wrote through a write end would have "confirmed" the man page
+and left the read side unimplemented. The probe that found it wrote bytes into a
+pipe, called `vmsplice` on the **read** end, and got 5 with `ABCDE` in the buffer.
+The man page is a description of the mechanism; the behaviour is the pipe end's.
+
+**`SPLICE_F_GIFT` is the flag whose meaning this kernel cannot honour.** Linux
+grafts the caller's pages so a following `splice` moves them without a copy, and
+`GIFT` is the caller's promise never to write them again. This kernel's pipes hold
+**bytes**, not page references, so both directions copy — which makes `GIFT`
+accepted-and-ignored, exactly the shape `tee`'s `SPLICE_F_MOVE` takes, and it is
+why the `EFAULT` question is asked **before** the transfer rather than after: a
+page that cannot be read at all must be refused even though nothing would have
+been shared.
+
+**One accessor was needed rather than a second answer.**
+`PipeEnd::role_is_write` exists because the direction is the *pipe end's*, and a
+**FIFO opened `O_RDWR`** is `Role::Both` — one role word, no separate direction
+question. A `Both` end is treated as the writing side, recorded as the
+approximation it is: no test opens a FIFO `O_RDWR` and `vmsplice`s through it.
+
+**Pins.** `t-vmsplice` **+17**: the write direction with its read-back, the
+**drain** direction with its buffer, three 2-byte iovecs in order, the two
+`EBADF`s, `nr_segs == 0`, `IOV_MAX`, the unknown flag, `GIFT` pinned as
+**accepted** rather than refused, the zero-length iovec, and `EFAULT`.
+
+**Gate.** Two findings, both the gate working: the **dispatch-versus-table check**
+named the missing row (counts 305 → 306), and **clippy** caught an unnecessary
+`&mut` of a copied iovec array (`[iov(&mut one, 1); 1025]` — the array is `Copy`,
+so the borrow in the repeat expression was already spent).
+
+`build/gate-item313b.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**
+host tests 0 failed; stage 2 **328** on x86_64 and **324** on aarch64 — both up
+one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **Nothing is grafted.** Both directions copy through a bounded scratch, so the
+   zero-copy property `vmsplice` exists for is absent — a `vmsplice` + `splice`
+   pipeline moves bytes twice here where Linux moves them once. That is a
+   performance shape (`docs/notes/` §10 territory), not a correctness one, and it
+   is the same limitation `tee`'s `SPLICE_F_MOVE` records.
+2. **A full destination or an empty source answers `EAGAIN`**, not a park — the
+   same choice `tee` makes, recorded there.
+3. **`vmsplice` on a `Role::Both` (FIFO `O_RDWR`) end is treated as a write**, and
+   that case is unpinned.

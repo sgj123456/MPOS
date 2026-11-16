@@ -3592,3 +3592,34 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `splice`'s is); a **full destination is `EAGAIN`, not a park** — recorded because
   a caller sees it as a retry loop; and **`vmsplice` (278)** remains undeclared,
   the last of item 310's four and the only one needing `mm` work. (§6.191, item 312)
+
+- **Item 313 — `vmsplice`: the direction the man page does not prepare you for**:
+  the last of item 310's four census calls (`execveat` 310, `ioprio_*` 311, `tee`
+  312, this). Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{vms1,vms2,vms3}.c`): a pipe's **write** end takes the
+  iovecs' bytes, and a pipe's **read** end **drains into** them (returns 5, buffer
+  holds the pipe's contents); several iovecs contribute in order; a regular file is
+  `EBADF` on either side; `nr_segs == 0` is 0; more than `IOV_MAX` is `EINVAL`; an
+  unknown flag bit is `EINVAL`; `SPLICE_F_GIFT` is **served**; a zero-length iovec
+  is skipped; an unreadable base is `EFAULT`. **The drain row is the finding**: the
+  man page describes the call as grafting pages *into* a pipe — one direction — so
+  a probe that only wrote through a write end would have confirmed the man page and
+  left the read side unimplemented; the probe that found it called `vmsplice` on
+  the **read** end and got the pipe's contents in the buffer. **The man page
+  describes the mechanism; the behaviour is the pipe end's.** `SPLICE_F_GIFT` is
+  accepted and ignored — Linux grafts the caller's pages so a later `splice` skips
+  the copy, and `GIFT` promises never to write them again, while this kernel's pipes
+  hold **bytes** so both directions copy (the same shape `tee`'s `SPLICE_F_MOVE`
+  takes); that is also why `EFAULT` is asked **before** the transfer. One accessor
+  was needed rather than a second answer — `PipeEnd::role_is_write`, because a FIFO
+  opened `O_RDWR` is `Role::Both` and a `Both` end is treated as the writing side,
+  recorded as the approximation it is. `t-vmsplice` **+17**. **The gate found two
+  things**: the dispatch-versus-table check named the missing row (counts 305 →
+  306), and clippy caught an unnecessary `&mut` of a copied iovec array. Gate
+  `build/gate-item313b.log` `GATE_EXIT=0`: stage 1 1340, x86_64 **328**, aarch64
+  **324** (both +1), kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1`.
+  **Named**: **nothing is grafted** — both directions copy through a bounded
+  scratch, so the zero-copy property is absent (a `vmsplice`+`splice` pipeline moves
+  bytes twice here); a full destination or empty source answers `EAGAIN`, not a
+  park; and `Role::Both` (FIFO `O_RDWR`) is treated as a write, unpinned.
+  (§6.192, item 313)

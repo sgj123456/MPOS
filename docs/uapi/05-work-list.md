@@ -13354,3 +13354,23 @@ maps it to the retry, where Linux parks a blocking `tee`; recorded because a cal
 sees it as a retry loop. And **`vmsplice` (278)** remains undeclared — the last of
 item 310's four, and the only one needing `mm` work (it grafts user pages into a pipe
 rather than copying bytes).
+
+## Item 313 — `vmsplice`: the direction the man page does not prepare you for (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What it completes** | The last of item 310's four census calls — `execveat` (310), `ioprio_*` (311), `tee` (312), this. Never declared, so the dispatch answered `ENOSYS`. |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/{vms1,vms2,vms3}.c`): a pipe's **write** end takes the iovecs' bytes; a pipe's **read** end **drains into** the iovecs (returns 5, buffer holds the pipe's bytes); several iovecs contribute in order; a regular file is `EBADF` on either side; `nr_segs == 0` is 0; more than `IOV_MAX` (1024) is `EINVAL`; an unknown flag bit is `EINVAL`; `SPLICE_F_GIFT` is **served**; a zero-length iovec is skipped; an unreadable base is `EFAULT`. |
+| **The drain row is the finding** | The man page describes the call as grafting pages *into* a pipe — one direction — so a probe that only wrote through a write end would have confirmed the man page and left the read side unimplemented. The probe that found it wrote bytes into a pipe, called `vmsplice` on the **read** end, and got 5 with the pipe's contents in the buffer. **The man page describes the mechanism; the behaviour is the pipe end's.** |
+| **`SPLICE_F_GIFT` is accepted and ignored** | Linux grafts the caller's pages so a later `splice` moves them without a copy, and `GIFT` is the promise never to write them again. This kernel's pipes hold **bytes**, so both directions copy — the same shape `tee`'s `SPLICE_F_MOVE` takes. It is also why `EFAULT` is asked **before** the transfer: a page that cannot be read must be refused even though nothing would have been shared. |
+| **One accessor, not a second answer** | `PipeEnd::role_is_write`, because the direction is the *pipe end's*, and a FIFO opened `O_RDWR` is `Role::Both` — one role word, no separate direction question. A `Both` end is treated as the writing side, recorded as the approximation it is. |
+| **Pins** | `t-vmsplice` **+17**: write direction with read-back, the **drain** direction, three 2-byte iovecs in order, the two `EBADF`s, `nr_segs == 0`, `IOV_MAX`, the unknown flag, `GIFT` **accepted rather than refused**, a zero-length iovec, and `EFAULT`. |
+| **Gate** | The **dispatch-versus-table check** named the missing row (counts 305 → 306), and **clippy** caught an unnecessary `&mut` of a copied iovec array. `build/gate-item313b.log`, `GATE_EXIT=0`: stage 1 **1340**; stage 2 **328** x86_64 / **324** aarch64 (both +1), `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. |
+
+**What this does not do, named.** **Nothing is grafted** — both directions copy
+through a bounded scratch, so the zero-copy property `vmsplice` exists for is
+absent (a `vmsplice` + `splice` pipeline moves bytes twice here where Linux moves
+them once); that is a performance shape, not a correctness one, and it is the same
+limitation `tee`'s `SPLICE_F_MOVE` records. A full destination or empty source
+answers **`EAGAIN`, not a park** (the choice `tee` also makes). And `vmsplice` on a
+`Role::Both` (FIFO `O_RDWR`) end is treated as a write, **unpinned**.
