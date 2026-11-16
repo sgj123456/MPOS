@@ -18682,3 +18682,99 @@ arm; clippy ratchet unchanged at `162/168/393/272/3/1`; both workspaces formatte
 3. **The `.`/`..` difference above is not closed** — it is the ramfs's existing
    shape, shared with `getdents64`, and changing it is a filesystem decision
    rather than a door's.
+
+## §6.198 `kcmp`: comparing two processes' resources by identity (item 319, LANDED 2026-11-16)
+
+**What it is for.** `kcmp(312)` answers "is this the *same* kernel object in both
+processes". Its callers are checkpoint/restore tools — what `criu` needs to know
+before it can decide whether a descriptor is shared or merely duplicated — and no
+other door answers that question. It was undeclared, so the dispatch answered
+`ENOSYS`.
+
+**The answer shape is the first thing to measure, because it inverts the house
+convention.** A successful `kcmp` returns the comparison of two kernel pointers:
+
+| value | meaning |
+|---|---|
+| `0` | **equal** |
+| `1` | the first pointer is lower |
+| `2` | the second pointer is lower |
+| `3` | equal but distinct |
+
+So **`0` here does not mean success** — it means equal — which is the opposite of
+every other call in this interface, and `1`/`2` both mean *not equal*, with which
+one depending on address order and therefore **not being a contract**. The pin
+asserts equality or inequality and never a specific value; a first draft asserted
+`2` and failed on the host, where the address order differs from the guest's run.
+That is the same lesson §6.170 records for a comparison whose *direction* is the
+implicit part.
+
+**Measured, Linux 7.3.4** (`build/scratch/opathmmap/{kcmp,kcmp2,kcmp3}.c`):
+
+| type | compares | measured |
+|---|---|---|
+| `KCMP_FILE` (0) | two descriptors' **open file descriptions** | one fd `0`; `dup`'d fds `0`; two `open`s **not equal** |
+| `KCMP_VM` (1) | address space | self/self `0`; across `fork` **not equal** |
+| `KCMP_FILES` (2) | descriptor table | self/self `0`; a descriptor inherited across `fork` is still the same open file |
+| `KCMP_FS` (3) | cwd/root/umask | self/self `0`; across `fork` **not equal** |
+| `KCMP_SIGHAND` (4) | handler table | self/self `0`; across `fork` **not equal** |
+| `KCMP_IO` (5) | I/O context | self/self `0` |
+| `KCMP_SYSVSEM` (6) | semaphore-undo state | **served** — self/self `0` for any index |
+| `KCMP_EPOLL_TFD` (7) | an epoll slot | `idx` is a **pointer**; `NULL` is `EFAULT` |
+
+Refusals, all measured: an unallocated descriptor is `EBADF`, a type at or past
+`KCMP_TYPES` (`8`) is `EINVAL`, and a pid naming nothing is `ESRCH` — **including
+`0`**, which is not "the caller" here the way it is at `kill`.
+
+**Two corrections the measurement made, and they are the section's point.**
+
+1. **`KCMP_SYSVSEM` is served, not refused.** A draft treated types 6 and 7
+   together as "shapes this door cannot read". `6` is not a shape problem at all:
+   a task's semaphore-undo state belongs to its **group**, so two lookups in one
+   group are one object whatever the index — measured, self/self is `0` for
+   indices 0, 1 and 2.
+2. **`KCMP_EPOLL_TFD` refuses on its *argument*, not on its type.** Its `idx` is a
+   pointer to a `struct epoll_slot`, so a `NULL` one is Linux's own **`EFAULT`**,
+   not `EINVAL`. This door does not import that struct, so a non-`NULL` pointer is
+   `EINVAL` — a named gap in the shape rather than a claim that the type is
+   unknown.
+
+**The implementation reuses what the kernel already has.** `Arc::as_ptr` on `File`
+is **exactly** the identity `KCMP_FILE` asks about — `dup` puts one `Arc` in two
+slots and two `open`s put two — so no new identity notion was invented. The four
+group-owned types ask the group's identity, which is what `fork` changing them
+means. Two accessors were added (`fds_of`, `group_identity`) carrying the
+**identity** rather than a bool, because a bool would lose the distinction
+`KCMP_FILES` is asked for — the same reason `tee` returns a count and not `OK`.
+
+**Gate, and five findings all mine.** The eight-way match had an unreachable `_`
+arm (the runtime guard refusing `kind >= KCMP_TYPES` is invisible to the
+compiler's exhaustiveness check, which then demands an arm that is dead — the
+resolution is an arm the compiler can reach, with the comment saying why). And
+**`KCMP_SYSVSEM` was matched as a variable** because its `const` was missing from
+the function's constant block: `non_snake_case` fired on a pattern that read as a
+normal catch-all, which is precisely the class the ratchet exists to catch — a
+match arm that silently binds everything.
+
+`build/gate-item319b.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1341**
+host tests 0 failed; stage 2 **333** on x86_64 and **329** on aarch64 — both up
+one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`KCMP_EPOLL_TFD` is not served.** Its `idx` is a `struct epoll_slot`
+   (a target fd plus a file descriptor of the epoll instance), and this door does
+   not import it; a `NULL` slot gets Linux's `EFAULT` and a real one gets
+   `EINVAL`. Serving it needs the epoll instance's target table, which the epoll
+   module owns.
+2. **`KCMP_SYSVSEM` answers the group's identity for every index**, because this
+   kernel keeps no per-index undo records. Linux's answer for a *shared* semaphore
+   set is the same, and a pair of processes with different undo lists is a shape
+   this kernel cannot make (it has no per-task semadj list), so the approximation
+   is exact for every pair that exists here — but it is an approximation in
+   principle and is recorded rather than hidden.
+3. **The permission check is `may_inspect`**, this kernel's `ptrace_may_access`.
+   Measured on Linux, a stranger's process without `CAP_SYS_PTRACE` is `EPERM`;
+   the pin does not exercise that path because the payload cannot become a second
+   user without dropping privileges for the rest of the lane.
