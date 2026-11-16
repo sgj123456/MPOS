@@ -913,6 +913,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             oom_score_adj_min: 0,
             syscall: None,
             nice: 0,
+            ioprio: 0,
             brk_base: loaded.brk,
             brk_pages: 0,
             mmap_cursor: layout.mmap_top,
@@ -1135,6 +1136,7 @@ pub fn try_spawn_user(
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             syscall: None,
             nice: t.task(parent).nice,
+            ioprio: t.task(parent).ioprio,
             rlimits: t.task(parent).rlimits,
             seccomp_strict: t.task(parent).seccomp_strict,
             // A filter is inherited, not shared: the child gets its own copy of

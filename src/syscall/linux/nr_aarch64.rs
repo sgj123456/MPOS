@@ -44,7 +44,10 @@ pub const FORK: u64 = 64007; // no arm64 number; unreachable on aarch64
 pub const VFORK: u64 = 64008; // no arm64 number; unreachable on aarch64
 pub const EXECVE: u64 = 221;
 /// See the x86_64 table: the same call, its own number.
-pub const EXECVEAT: u64 = 281; // 59 on x86_64
+pub const EXECVEAT: u64 = 281;
+/// See the x86_64 table: the same calls, their own numbers.
+pub const IOPRIO_SET: u64 = 30;
+pub const IOPRIO_GET: u64 = 31; // 59 on x86_64
 pub const EXIT: u64 = 93; // 60 on x86_64
 pub const WAIT4: u64 = 260; // 61 on x86_64
 pub const KILL: u64 = 129; // 62 on x86_64

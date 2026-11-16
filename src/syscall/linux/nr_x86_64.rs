@@ -37,6 +37,14 @@ pub const EXECVE: u64 = 59;
 /// `execveat(2)`: `execve` with a dirfd and `AT_EMPTY_PATH`. Since Linux 3.19,
 /// and the call musl's `fexecve` is built from.
 pub const EXECVEAT: u64 = 322;
+/// `ioprio_set(2)`: the block-I/O priority word. Part of the block layer's ABI -
+/// `ionice(1)` is the caller everybody has, and the pairing with
+/// `ioprio_get` is what lets a program read back what it set before Linux 4.13
+/// added `IOPRIO_CLASS_NONE`'s implicit form. Never declared here until
+/// item 311, so the dispatch answered `ENOSYS`.
+pub const IOPRIO_SET: u64 = 251;
+/// `ioprio_get(2)`: see [`IOPRIO_SET`].
+pub const IOPRIO_GET: u64 = 252;
 pub const EXIT: u64 = 60;
 pub const WAIT4: u64 = 61;
 pub const KILL: u64 = 62;

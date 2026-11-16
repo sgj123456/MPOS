@@ -1617,6 +1617,22 @@ pub(crate) struct Task {
     /// see what it set, or the call is the silent-success `NOTES.md` §4 forbids.
     /// Inherited across `fork`, kept across `exec`, as Linux keeps it.
     pub(crate) nice: i32,
+    /// The block-I/O priority word `ioprio_set` records and `ioprio_get`
+    /// reports: the class in the top three bits, the class data in the low
+    /// thirteen (`IOPRIO_CLASS_SHIFT` 13, `IOPRIO_PRIO_MASK` 0x1fff).
+    ///
+    /// Kept honestly rather than scheduled by, for the same reason [`Self::nice`]
+    /// is: this kernel has one disk and no I/O scheduler to weigh a class
+    /// against, so the word has no effect here (a named sub-gap) - but a program
+    /// that set it and read it back must see what it set. Inherited across
+    /// `fork` and kept across `exec`, as Linux keeps it: measured on Linux 7.3.4
+    /// (`build/scratch/opathmmap/iop3.c`), a child reads its parent's word after
+    /// a `fork`.
+    ///
+    /// `0` is the default and means `IOPRIO_CLASS_NONE`: a task nobody has
+    /// spoken for. Measured (`iop3.c`): a fresh process reads 0, **not** the
+    /// best-effort class a *group* query answers while other members are set.
+    pub(crate) ioprio: u16,
     /// The process's resource limits, the `RLIMIT_*` table `getrlimit`/
     /// `setrlimit`/`prlimit64` read and write and `/proc/<pid>/limits` prints.
     /// Inherited whole across fork and exec, the way a limit belongs to the
@@ -1988,6 +2004,7 @@ impl Task {
             oom_score_adj_min: 0,
             syscall: None,
             nice: 0,
+            ioprio: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::mm::elf::MMAP_BASE,
@@ -2880,6 +2897,7 @@ impl Table {
             oom_score_adj_min: 0,
             syscall: None,
             nice: 0,
+            ioprio: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::mm::elf::MMAP_BASE,

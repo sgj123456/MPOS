@@ -793,6 +793,54 @@ pub fn nice_of(pid: usize) -> Option<i32> {
     })
 }
 
+/// One task's block-I/O priority word - `ioprio_get`'s `IOPRIO_WHO_PROCESS`
+/// answer, and `None` for a task that is gone.
+#[cfg(target_os = "none")]
+pub fn ioprio_of(task: TaskId) -> Option<u16> {
+    with_table(|t| {
+        t.tasks
+            .get(task.0)
+            .and_then(|slot| slot.as_ref())
+            .map(|task| task.ioprio)
+    })
+}
+
+/// Set `task`'s block-I/O priority word. `false` says the task is gone.
+#[cfg(target_os = "none")]
+pub fn set_ioprio(task: TaskId, word: u16) -> bool {
+    with_table(|t| match t.tasks.get_mut(task.0) {
+        Some(Some(task)) if !task.exited => {
+            task.ioprio = word;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The word `ioprio_get`'s **`IOPRIO_WHO_PGRP`/`_USER`** shapes answer: the
+/// strongest priority any member holds.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/iop5.c`), and it is not a
+/// plain max: the **class** is the highest any member has, and among members
+/// *of that class* the **data is the lowest number** - so a parent at `BE/7`
+/// beside a child at `BE/1` answers `BE/1` (`0x4001`), because a lower data
+/// value is the stronger best-effort priority. A parent at `IDLE` beside a child
+/// at `BE/4` answers `BE/4`, the higher class winning regardless of data.
+///
+/// `None` when no member is left, which the door reports as `ESRCH`.
+#[cfg(target_os = "none")]
+pub fn strongest_ioprio(members: &[TaskId]) -> Option<u16> {
+    with_table(|t| {
+        members
+            .iter()
+            .filter_map(|id| t.tasks.get(id.0).and_then(|s| s.as_ref()))
+            .filter(|task| !task.exited)
+            .map(|task| task.ioprio)
+            // Highest class first, then the lowest data within that class.
+            .max_by_key(|word| ((word >> 13) & 7, u16::MAX - (word & 0x1fff)))
+    })
+}
+
 /// Set `pid`'s nice value. `false` says the process is gone (or was never
 /// there), which `setpriority` reports as `ESRCH`.
 #[cfg(target_os = "none")]

@@ -1001,6 +1001,207 @@ fn nice_may_raise(target: crate::sched::TaskId, prio: i32) -> bool {
 /// first would have answered `EINVAL`. This returned `EINVAL` for both, which is
 /// a refusal Linux does not make, and the one program that pinned it had written
 /// `EINVAL` down too (`t-priority`, migration batch 10).
+/// `ioprio_get(which, who)` — the block-I/O priority class and data.
+///
+/// The word is `(class << 13) | data`: three bits of class, thirteen of
+/// per-class data. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/{iop,iop2,iop3,iop5}.c`):
+///
+/// * `which` is one of three values — `0` is `IOPRIO_WHO_PROCESS`, `1`
+///   `IOPRIO_WHO_PGRP`, `2` `IOPRIO_WHO_USER` — and **anything else is
+///   `EINVAL`** (`0`, `3` and `-1` were all refused);
+/// * a `who` that names nothing is `ESRCH` (`pid`, group and uid alike);
+/// * `who == 0` means the caller for the process shape, and its group/user for
+///   the other two;
+/// * a **fresh process reads 0** — `IOPRIO_CLASS_NONE`, not best-effort — while
+///   a group query answers the strongest word any member holds (see
+///   [`crate::sched::strongest_ioprio`] for why "strongest" is a max over the
+///   class and a *min* over the data).
+///
+/// Note the argument order differs from `getpriority`'s: `which` is first here
+/// and `who` second, where `getpriority(which, who)` has the same shape but
+/// `setpriority` puts the value third. Both match their own man pages.
+pub fn handle_ioprio_get(args: [usize; ARG_COUNT]) -> isize {
+    // The `IOPRIO_WHO_*` values are **1, 2, 3**, not 0, 1, 2 - measured on Linux
+    // 7.3.4 (`build/scratch/opathmmap/iop6.c`): `which=0` is `EINVAL`, `1` is the
+    // process, `2` the group and `3` the user. A first draft wrote them
+    // 0-based and would have answered `EINVAL` for every real caller.
+    const WHO_PROCESS: usize = 1;
+    const WHO_PGRP: usize = 2;
+    const WHO_USER: usize = 3;
+    let (which, who) = (args[0], args[1] as isize);
+    match which {
+        WHO_PROCESS => {
+            let id = if who == 0 {
+                crate::sched::current()
+            } else {
+                match super::proc::pid_task(who) {
+                    Some(id) => id,
+                    None => return err::ESRCH,
+                }
+            };
+            match crate::sched::ioprio_of(id) {
+                Some(word) => word as isize,
+                None => err::ESRCH,
+            }
+        }
+        WHO_PGRP => {
+            let pgid = if who == 0 {
+                crate::sched::pgid_of(crate::sched::current())
+            } else {
+                super::proc::pid_task(who).and_then(crate::sched::pgid_of)
+            };
+            let members = pgid.map(crate::sched::group_members).unwrap_or_default();
+            match crate::sched::strongest_ioprio(&members) {
+                Some(word) => word as isize,
+                None => err::ESRCH,
+            }
+        }
+        WHO_USER => {
+            let ruid = if who == 0 {
+                crate::sched::current_identity().ruid
+            } else {
+                who as u32
+            };
+            match crate::sched::strongest_ioprio(&crate::sched::uid_members(ruid)) {
+                Some(word) => word as isize,
+                None => err::ESRCH,
+            }
+        }
+        _ => err::EINVAL,
+    }
+}
+
+/// `ioprio_set(which, who, ioprio)` — record a block-I/O priority word.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/{iop,iop2,iop4}.c`):
+///
+/// * an unknown `which` is `EINVAL`, and a `who` naming nothing is `ESRCH`;
+/// * the **class** must be one of `NONE`(0), `RT`(1), `BE`(2), `IDLE`(3), and
+///   any other value is `EINVAL`;
+/// * the **data is not validated against the class**: `BE/8` is *stored* and
+///   reads back as `BE/8` even though best-effort nominally stops at 7, and
+///   `IDLE/5` likewise. That is Linux's behaviour and it is why this door keeps
+///   the word rather than a decoded pair;
+/// * bits **above** the class word are `EINVAL` (`0x1_0000` was accepted by a
+///   mask-and-store implementation and Linux refuses it, so the mask is a
+///   refusal and not a truncation);
+/// * `RT` needs `CAP_SYS_NICE` — measured, an unprivileged caller's
+///   `IOPRIO_CLASS_RT` is `EPERM` — while `NONE`/`BE`/`IDLE` are served;
+/// * retargeting **another user's** task needs `CAP_SYS_NICE` too, and a
+///   same-uid child is served.
+///
+/// The class check comes before the capability, which is what makes
+/// `set(…, class 7)` an `EINVAL` rather than an `EPERM` for a caller without the
+/// capability.
+pub fn handle_ioprio_set(args: [usize; ARG_COUNT]) -> isize {
+    // See `handle_ioprio_get`: 1, 2, 3.
+    const WHO_PROCESS: usize = 1;
+    const WHO_PGRP: usize = 2;
+    const WHO_USER: usize = 3;
+    const CLASS_SHIFT: usize = 13;
+    const CLASS_MASK: usize = 7;
+    const CLASS_NONE: usize = 0;
+    const CLASS_RT: usize = 1;
+    const CLASS_BE: usize = 2;
+    const CLASS_IDLE: usize = 3;
+
+    let (which, who, word) = (args[0], args[1] as isize, args[2]);
+    // **The word is truncated to sixteen bits, not refused above them.**
+    // Measured on Linux 7.3.4 (`build/scratch/opathmmap/iop6.c`, `iop7.c`):
+    // `ioprio_set(…, 1 << 16)` through `1 << 19` are all **served**, and
+    // `0x1_4000` stores as `0x4000` - the class and data of the low word, with
+    // everything above dropped. (The example matters: `0x1c000` truncates to
+    // `0xc000`, whose class is 6, so it is `EINVAL` for the *class* rule - the
+    // first draft of the pin used that value and measured the wrong rule.) A
+    // first draft *refused* the high bits here, on the reasoning that a mask is
+    // a truncation and a truncation is a silent lie; Linux truncates, and a
+    // caller that computes a word with extra bits has no fallback from `EINVAL`.
+    let word = word as u16;
+    let class = ((word as usize) >> CLASS_SHIFT) & CLASS_MASK;
+    if !matches!(class, CLASS_NONE | CLASS_RT | CLASS_BE | CLASS_IDLE) {
+        return err::EINVAL;
+    }
+    // `RT` is the one class with teeth, and it needs the capability whatever the
+    // target is - Linux's `ioprio_set` asks `capable(CAP_SYS_NICE)` for it.
+    if class == CLASS_RT && !crate::sched::current_credentials().capable(crate::cred::CAP_SYS_NICE)
+    {
+        return err::EPERM;
+    }
+    match which {
+        WHO_PROCESS => {
+            let id = if who == 0 {
+                crate::sched::current()
+            } else {
+                match super::proc::pid_task(who) {
+                    Some(id) => id,
+                    None => return err::ESRCH,
+                }
+            };
+            // Another user's task is `EPERM` without the capability - the same
+            // question `setpriority`'s retarget rule asks, and asked after the
+            // number resolves so an unknown pid stays `ESRCH`.
+            if !ioprio_may_retarget(id) {
+                return err::EPERM;
+            }
+            if crate::sched::set_ioprio(id, word) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        WHO_PGRP => {
+            let pgid = if who == 0 {
+                crate::sched::pgid_of(crate::sched::current())
+            } else {
+                super::proc::pid_task(who).and_then(crate::sched::pgid_of)
+            };
+            let members = pgid.map(crate::sched::group_members).unwrap_or_default();
+            if members.is_empty() {
+                return err::ESRCH;
+            }
+            if !members.iter().all(|id| ioprio_may_retarget(*id)) {
+                return err::EPERM;
+            }
+            for id in members {
+                crate::sched::set_ioprio(id, word);
+            }
+            0
+        }
+        WHO_USER => {
+            let ruid = if who == 0 {
+                crate::sched::current_identity().ruid
+            } else {
+                who as u32
+            };
+            let members = crate::sched::uid_members(ruid);
+            if members.is_empty() {
+                return err::ESRCH;
+            }
+            if !members.iter().all(|id| ioprio_may_retarget(*id)) {
+                return err::EPERM;
+            }
+            for id in members {
+                crate::sched::set_ioprio(id, word);
+            }
+            0
+        }
+        _ => err::EINVAL,
+    }
+}
+
+/// Whether the caller may retarget `target`'s block-I/O priority.
+///
+/// The same question `setpriority` asks and by the same rule - the target is the
+/// caller's own, or `kill_ok` says the caller may reach it, or the caller holds
+/// `CAP_SYS_NICE` - because both calls move a task's position in a scheduler's
+/// ordering. Measured on Linux 7.3.4 (`build/scratch/opathmmap/iop4.c`): an
+/// unprivileged caller retargets a **same-uid** child (served) and a task of
+/// another user is `EPERM`.
+fn ioprio_may_retarget(target: crate::sched::TaskId) -> bool {
+    nice_may_retarget(target)
+}
+
 pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
     const PRIO_PROCESS: usize = 0;
     const PRIO_PGRP: usize = 1;

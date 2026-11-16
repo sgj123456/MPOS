@@ -1651,6 +1651,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             syscall: None,
             nice: t.task(parent_id).nice,
+            ioprio: t.task(parent_id).ioprio,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
             seccomp_filters: t.task(parent_id).seccomp_filters.clone(),
@@ -2154,6 +2155,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let oom_score_adj = parent.oom_score_adj;
         let oom_score_adj_min = parent.oom_score_adj_min;
         let nice = parent.nice;
+        let parent_ioprio = parent.ioprio;
         let rlimits = parent.rlimits;
         let seccomp_strict = parent.seccomp_strict;
         let seccomp_filters = parent.seccomp_filters.clone();
@@ -2307,6 +2309,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             oom_score_adj_min,
             syscall: None,
             nice,
+            ioprio: parent_ioprio,
             rlimits,
             seccomp_strict,
             seccomp_filters,

@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **302** x86_64
-syscall numbers, `nr_aarch64.rs` the same **302** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **304** x86_64
+syscall numbers, `nr_aarch64.rs` the same **304** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **every one** of them - 302 arms, no orphans, measured 2026-11-16 - plus a
+explicit arm for **every one** of them - 304 arms, no orphans, measured 2026-11-16 - plus a
 `_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
@@ -170,6 +170,8 @@ A call absent from those is served as its phase section records.
 | `statfs` | 137 | fs | 43 |
 | `fstatfs` | 138 | fs | 44 |
 | `getpriority` | 140 | posix | 141 |
+| `ioprio_get` | 252 | posix | 31 |
+| `ioprio_set` | 251 | posix | 30 |
 | `setpriority` | 141 | posix | 140 |
 | `sched_setparam` | 142 | posix | 118 |
 | `sched_getparam` | 143 | posix | 121 |
