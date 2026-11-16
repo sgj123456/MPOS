@@ -103,6 +103,42 @@ fn main() {
                 &format!("F_GETFL carries O_PATH, got {fl:?}"),
                 fl.is_ok_and(|f| f.bits() as i32 & libc::O_PATH != 0),
             );
+            // And it carries **only** what the fold keeps. Linux's
+            // `build_open_flags` does `flags &= O_DIRECTORY | O_NOFOLLOW |
+            // O_PATH` for an `O_PATH` open and sets `acc_mode = 0`, so the
+            // access bits, `O_APPEND`, `O_NONBLOCK`, `O_SYNC`, `O_TRUNC` and
+            // `O_CREAT` are all dropped: measured on Linux 7.3.4
+            // (`build/scratch/opathmmap/fold.c`), opening one file with
+            // `O_PATH|O_APPEND|O_NONBLOCK|O_SYNC|O_TRUNC|O_NOFOLLOW` reports
+            // `F_GETFL = 0x220000` - `O_PATH|O_NOFOLLOW` alone. This kernel
+            // reported the whole word *plus* the access bits (`0x208001` for
+            // `O_PATH|O_WRONLY`, measured on the guest), which is how `F_GETFL`
+            // came to advertise a writable descriptor that had opened nothing.
+            //
+            // `O_CLOEXEC` is not part of this word at all - it is a *descriptor*
+            // flag, so it survives as `FD_CLOEXEC` and is claimed separately.
+            let folded = rustix::fs::open(
+                FILE,
+                OFlags::PATH | OFlags::APPEND | OFlags::NONBLOCK | OFlags::TRUNC,
+                Mode::empty(),
+            );
+            if let Ok(f) = &folded {
+                let g = rustix::fs::fcntl_getfl(f);
+                let keep = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+                let got = g.as_ref().map(|g| g.bits() as i32).unwrap_or(-1);
+                r.check(
+                    &format!(
+                        "F_GETFL on O_PATH|APPEND|NONBLOCK|TRUNC keeps only the fold's bits \
+                         (O_PATH|O_DIRECTORY|O_NOFOLLOW), got 0x{got:x}",
+                    ),
+                    got >= 0 && got & !keep == 0 && got & libc::O_PATH != 0,
+                );
+                let size = std::fs::metadata(FILE).map(|m| m.len()).unwrap_or(0);
+                r.check(
+                    &format!("and the O_TRUNC beside it truncated nothing (size {size})"),
+                    size == 5,
+                );
+            }
             let dup = rustix::io::dup(&fd);
             r.check(
                 &format!("F_DUPFD on an O_PATH descriptor works, got {dup:?}"),
@@ -365,6 +401,185 @@ fn main() {
             &format!("F_GETFD on the same descriptor is served, got {getfd}"),
             getfd >= 0,
         );
+
+        // === the doors that read the inode directly =========================
+        //
+        // `mmap`, `readahead`, `sync_file_range`, `fsync`/`fdatasync`,
+        // `sendfile`, `copy_file_range`, `splice`, `flock` and `fallocate` all
+        // reach `Inode::read_at`/`write_at` (or the lock table) *without*
+        // passing `File::pre_read`/`pre_write`, which is the one place item 297
+        // put the `O_PATH` predicate - so each owed its own line and none had
+        // one. Measured whole on Linux 7.3.4
+        // (`build/scratch/opathmmap/{matrix,sweep,order6,order7,order9,
+        // order10,sf,fa2}.c`): **all nine answer `EBADF`**, and the wrong access
+        // *mode* is `EBADF` too (`readahead` on a write-only descriptor,
+        // `splice` from one) - the same two questions `read`/`write` ask.
+        //
+        // The guest this kernel was measured on answered `0` from
+        // `readahead`/`sync_file_range`/`fsync`, **moved bytes** from
+        // `copy_file_range` (16) and `splice` (3), and **took a lock** with
+        // `flock` - a descriptor whose entire purpose is to name a file being
+        // one that could read, copy, flush and lock it.
+        let ebadf = |rc: i64| {
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+        };
+        // A destination for the two copy doors, so their source side is the
+        // only `O_PATH` descriptor in the call.
+        let dst = rustix::fs::open(
+            "/tmp/t-open-path/copy.out",
+            OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC,
+            Mode::from(0o644),
+        );
+        let (pipe_r, pipe_w) = rustix::pipe::pipe().unwrap();
+        let dst_raw = dst
+            .as_ref()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .unwrap_or(-1);
+        let _pr = std::os::fd::AsRawFd::as_raw_fd(&pipe_r);
+        let pw = std::os::fd::AsRawFd::as_raw_fd(&pipe_w);
+        // SAFETY: `raw`, `dst_raw`, `pr` and `pw` are live descriptors this test
+        // owns; every other argument is a number or a buffer this test made.
+        let more_refused: [(&str, i64); 9] = unsafe {
+            [
+                // `mmap` is the one that was *served*: a name-only descriptor
+                // gave back an address whose bytes could be read.
+                (
+                    "mmap",
+                    libc::syscall(
+                        libc::SYS_mmap,
+                        0usize,
+                        4096usize,
+                        1usize,
+                        0x02usize,
+                        raw,
+                        0usize,
+                    ),
+                ),
+                (
+                    "readahead",
+                    libc::syscall(libc::SYS_readahead, raw, 0usize, 4096usize),
+                ),
+                (
+                    "sync_file_range",
+                    libc::syscall(libc::SYS_sync_file_range, raw, 0i64, 0i64, 0u32),
+                ),
+                ("fsync", libc::syscall(libc::SYS_fsync, raw)),
+                ("fdatasync", libc::syscall(libc::SYS_fdatasync, raw)),
+                (
+                    "sendfile",
+                    libc::syscall(libc::SYS_sendfile, dst_raw, raw, 0usize, 16usize),
+                ),
+                (
+                    "copy_file_range",
+                    libc::syscall(
+                        libc::SYS_copy_file_range,
+                        raw,
+                        0usize,
+                        dst_raw,
+                        0usize,
+                        16usize,
+                        0u32,
+                    ),
+                ),
+                (
+                    "splice",
+                    libc::syscall(libc::SYS_splice, raw, 0usize, pw, 0usize, 16usize, 0u32),
+                ),
+                ("flock", libc::syscall(libc::SYS_flock, raw, libc::LOCK_SH)),
+            ]
+        };
+        for (name, rc) in more_refused {
+            r.check(
+                &format!(
+                    "{name}(O_PATH fd) is EBADF (raw), got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                ebadf(rc),
+            );
+        }
+        // `fallocate` gets its own entry because it was the one that **wrote**:
+        // on the guest `fallocate(O_PATH|O_WRONLY_fd, 0, 0, 4096)` answered 0 and
+        // grew the file from 10 bytes to 4096. The `O_PATH` word below carries
+        // the access bits on purpose - an `O_PATH` descriptor with no access bits
+        // already refused here by accident, because `may_write` saw `O_RDONLY`.
+        let opw = rustix::fs::open(FILE, path_flags | OFlags::WRONLY, Mode::empty());
+        if let Ok(f) = &opw {
+            let opw_raw = std::os::fd::AsRawFd::as_raw_fd(f);
+            let before = std::fs::metadata(FILE).map(|m| m.len()).unwrap_or(0);
+            // SAFETY: `opw_raw` is a live descriptor this test owns.
+            let rc = unsafe { libc::syscall(libc::SYS_fallocate, opw_raw, 0i32, 0i64, 4096i64) };
+            let after = std::fs::metadata(FILE).map(|m| m.len()).unwrap_or(0);
+            r.check(
+                &format!(
+                    "fallocate(O_PATH|O_WRONLY fd) is EBADF, got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                ebadf(rc),
+            );
+            r.check(
+                &format!("and it changed nothing: size {before} -> {after}"),
+                before == after,
+            );
+        }
+        // The pair that makes the refusals above about `O_PATH` rather than
+        // "these calls are broken here": the same doors are **served** on an
+        // ordinary descriptor of the same file, and succeed together with the
+        // `fstat` neighbour already claimed. `copy_file_range` and `splice` are
+        // the two that moved bytes through the wrong descriptor, so they are the
+        // two worth proving still work on the right one.
+        if let (Ok(rd), Ok(dst)) = (
+            rustix::fs::open(FILE, OFlags::RDONLY, Mode::empty()),
+            rustix::fs::open(
+                "/tmp/t-open-path/copy2.out",
+                OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC,
+                Mode::from(0o644),
+            ),
+        ) {
+            let rd_raw = std::os::fd::AsRawFd::as_raw_fd(&rd);
+            let d_raw = std::os::fd::AsRawFd::as_raw_fd(&dst);
+            // SAFETY: both are live descriptors this test owns.
+            let copied = unsafe {
+                libc::syscall(
+                    libc::SYS_copy_file_range,
+                    rd_raw,
+                    0usize,
+                    d_raw,
+                    0usize,
+                    5usize,
+                    0u32,
+                )
+            };
+            r.check(
+                &format!(
+                    "copy_file_range over two ordinary descriptors still copies, got {copied}"
+                ),
+                copied == 5,
+            );
+        }
+        // And the access-mode half, which is the same predicate asked a
+        // different way: `readahead` on a **write-only** descriptor is `EBADF`
+        // on Linux (`build/scratch/opathmmap/mode2.c`), because the question is
+        // "may this descriptor be read", not "is this word `O_PATH`".
+        if let Ok(wr) = rustix::fs::open(FILE, OFlags::WRONLY, Mode::empty()) {
+            let wr_raw = std::os::fd::AsRawFd::as_raw_fd(&wr);
+            // SAFETY: `wr_raw` is a live descriptor this test owns.
+            let rc = unsafe { libc::syscall(libc::SYS_readahead, wr_raw, 0usize, 4096usize) };
+            r.check(
+                &format!(
+                    "readahead(write-only fd) is EBADF, got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                ebadf(rc),
+            );
+            r.check(
+                "and readahead on a read-only descriptor of the same file is still served",
+                rustix::fs::open(FILE, OFlags::RDONLY, Mode::empty()).is_ok_and(|rd2| {
+                    let rd2_raw = std::os::fd::AsRawFd::as_raw_fd(&rd2);
+                    // SAFETY: `rd2_raw` is a live descriptor this test owns.
+                    unsafe { libc::syscall(libc::SYS_readahead, rd2_raw, 0usize, 4096usize) == 0 }
+                }),
+            );
+        }
     }
 
     let _ = std::fs::remove_dir_all(DIR);
