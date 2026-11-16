@@ -165,8 +165,17 @@ pub const ARMS: &[Arm] = &[
         // `--target` invocation: a bare host `cargo clippy` also builds
         // `src/main.rs` and `src/board/`, which are `target_os = "none"`-only
         // and fail `E0432: unresolved import mpos::boot::handoff` (measured).
-        // Its 336 `dead_code` diagnostics are the host's own shape - a caller
-        // behind `target_os = "none"` does not exist here - not a debt.
+        // Its 340 `dead_code` diagnostics are the host's own shape - a caller
+        // behind `target_os = "none"` does not exist here - not a debt. The
+        // count moved 336 -> 340 on 2026-11-16 with four `fcntl` command
+        // constants (`F_GETOWN`, `F_SETOWN`, `F_GETPIPE_SZ`, `F_SETPIPE_SZ`):
+        // their only readers are the arms in `syscall/linux/fs/file.rs`, which
+        // is machine-only, and their values are pinned by `abi`'s own
+        // `fcntl(2)` number test. That is the same shape as the 256 constants
+        // already counted here (`F_GETLK`, `F_DUPFD` and `AT_EMPTY_PATH` are
+        // all in this count today), which is why raising the baseline is the
+        // honest answer rather than four site-level allows: a constant whose
+        // value is tested is not dead, it is host-unreachable.
         name: "mpos --lib (x86_64-unknown-linux-gnu)",
         args: &[
             "-p",
@@ -196,7 +205,7 @@ pub const ARMS: &[Arm] = &[
             ("clippy::type_complexity", 3),
             ("clippy::unnecessary_cast", 1),
             ("clippy::unnecessary_unwrap", 1),
-            ("dead_code", 336),
+            ("dead_code", 340),
             ("unused_imports", 1),
             ("unused_must_use", 1),
             ("unused_mut", 1),

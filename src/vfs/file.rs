@@ -243,6 +243,25 @@ pub struct File {
     /// converges. Recording the number where the path *is* known fixes it at
     /// the source. See `NOTES.md` §7.4.
     dev: core::sync::atomic::AtomicU64,
+    /// The `SIGIO` recipient this description carries: `F_SETOWN` writes it,
+    /// `F_GETOWN` reads it, and it is what makes `O_ASYNC` mean something.
+    ///
+    /// It belongs to the **description** and not to the file or the process:
+    /// Linux keeps it in `file->f_owner` (a `struct fown_struct`), so a `dup`
+    /// shares it while a second `open` of the same file has its own - measured
+    /// on Linux 7.3.4 (`build/scratch/opathmmap/gaps2.c`): `F_SETOWN(fd,
+    /// getpid())` then `F_GETOWN` on a `dup` reads the pid, and on a fresh
+    /// `open` reads 0.
+    ///
+    /// The value is stored **as `F_GETOWN` reports it**, which is not the
+    /// number `F_SETOWN` was given. Measured in the same run: a negative
+    /// argument (a process *group*) reads back **0**, not its absolute value;
+    /// `0` and `-1` both read 0; a positive pid reads back itself. So the field
+    /// holds the answer and no second question is asked of it, and a group
+    /// target is recorded as the 0 that says "this kernel has no signal
+    /// delivery to a group here" rather than as a number a reader would have to
+    /// re-sign.
+    f_owner: core::sync::atomic::AtomicI32,
 }
 
 /// `File::dev` before an open has recorded one. `u64::MAX` is not a device
@@ -261,7 +280,24 @@ impl File {
             born: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
             dev: core::sync::atomic::AtomicU64::new(DEV_UNSET),
+            f_owner: core::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// The `SIGIO` recipient this description carries - `F_GETOWN`'s answer.
+    /// See the field's note for why a process *group* target reads back 0.
+    pub fn f_owner(&self) -> i32 {
+        self.f_owner.load(Ordering::Relaxed)
+    }
+
+    /// Record the recipient `F_SETOWN` was given, in the shape `F_GETOWN`
+    /// reports. A negative `arg` names a process group; this kernel has no
+    /// group-directed `SIGIO` delivery to store one for, so it records the 0
+    /// `F_GETOWN` answers - which is what Linux answers for the same shape on
+    /// this machine (measured, `build/scratch/opathmmap/gaps2.c`).
+    pub fn set_f_owner(&self, arg: i32) {
+        self.f_owner
+            .store(if arg > 0 { arg } else { 0 }, Ordering::Relaxed);
     }
 
     /// Record the filesystem this description was opened on.

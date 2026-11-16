@@ -16,11 +16,11 @@ use crate::syscall::linux::abi;
 // and their tests live in `abi`.
 use crate::syscall::linux::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
-    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY,
-    O_EXCL, O_NOFOLLOW, O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS,
-    POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN, POLLNVAL, POLLOUT, StatTimes, normalize_path,
-    write_stat,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETOWN, F_GETPIPE_SZ, F_OFD_GETLK,
+    F_OFD_SETLK, F_OFD_SETLKW, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETOWN, F_SETPIPE_SZ,
+    FD_CLOEXEC, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TMPFILE,
+    O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN,
+    POLLNVAL, POLLOUT, StatTimes, normalize_path, write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::file::O_PATH;
@@ -4081,6 +4081,74 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             },
             Err(e) => err_of(e),
         },
+        // `F_GETOWN`/`F_SETOWN`: the `SIGIO` recipient a description carries.
+        // The state is the description's own (`File::f_owner`), so a `dup`
+        // shares it and a second `open` does not - measured, and the reason the
+        // field exists at all rather than a per-process slot.
+        //
+        // `F_SETOWN` validates the **target**, and the two shapes are one rule
+        // with one errno: measured on Linux 7.3.4
+        // (`build/scratch/opathmmap/gaps2.c`), `99999` and `-99999` both answer
+        // `ESRCH`, so the existence check runs whichever sign the caller used.
+        // What is *stored* is what `F_GETOWN` reports rather than the argument:
+        // a negative group target and the `0`/`-1` spellings all read back 0
+        // (set to `-getpgrp()`, `0` or `-1`, `F_GETOWN` answered 0 on that
+        // host), so storing the argument would make `F_GETOWN` name a group by
+        // its number - a target no delivery door here could reach.
+        //
+        // An `O_PATH` descriptor is `EBADF` from both, like the lock family
+        // beside them: measured in the same run, and it is the same question
+        // ("is there an open file behind this description").
+        F_GETOWN => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) if file.is_path_only() => err::EBADF,
+            Ok(file) => file.f_owner() as isize,
+            Err(e) => err_of(e),
+        },
+        F_SETOWN => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) if file.is_path_only() => err::EBADF,
+            Ok(file) => {
+                // A positive number names a process, a negative one a group;
+                // both are `u32` magnitudes for the existence question, and the
+                // kernel's pid namespace is where they are resolved - the same
+                // `pid_task` the pid-taking doors use (`docs/notes/` §6.91).
+                let target = arg as i32;
+                if target != 0 && target != -1 {
+                    let number = target.unsigned_abs();
+                    if super::super::proc::pid_task(number.min(i32::MAX as u32) as isize).is_none()
+                    {
+                        return err::ESRCH;
+                    }
+                }
+                file.set_f_owner(target);
+                0
+            }
+            Err(e) => err_of(e),
+        },
+        // `F_GETPIPE_SZ`/`F_SETPIPE_SZ`: a pipe's buffer ceiling. Measured on
+        // Linux 7.3.4 (`build/scratch/opathmmap/gaps2.c`): a regular file, an
+        // `O_PATH` descriptor and anything that is not a pipe answer `EBADF`
+        // (not `EINVAL`), and the pair is `1032`/`1031` - Linux-specific block.
+        F_GETPIPE_SZ => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => match file.inode().as_pipe() {
+                Some(pipe) => pipe.capacity() as isize,
+                None => err::EBADF,
+            },
+            Err(e) => err_of(e),
+        },
+        F_SETPIPE_SZ => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => match file.inode().as_pipe() {
+                // Linux's answer to a request past `pipe-max-size` without
+                // `CAP_SYS_RESOURCE` is `EPERM`; below a page it clamps up
+                // rather than refusing, and the two bounds are the capacity
+                // setter's own (see `PipeEnd::set_capacity`).
+                Some(pipe) => match pipe.set_capacity(arg) {
+                    Some(now) => now as isize,
+                    None => err::EPERM,
+                },
+                None => err::EBADF,
+            },
+            Err(e) => err_of(e),
+        },
         _ => err::EINVAL,
     }
 }
@@ -6517,10 +6585,57 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // Linux's sequence for this call is the same (`filename_lookup` of the old
     // name before `getname` of the new one); `renameat2` below is the family's
     // other shape, reading both names before it resolves either.
+    // The flag word first, as Linux validates it: an unknown bit is `EINVAL`
+    // whatever the names say. Measured (`build/scratch/opathmmap/gaps.c`):
+    // `linkat(fd, "", …, 0x40000000)` is `EINVAL`, not `ENOENT`.
+    const LINKAT_FLAGS: usize = abi::AT_SYMLINK_FOLLOW | AT_EMPTY_PATH;
+    if args[4] & !LINKAT_FLAGS != 0 {
+        return err::EINVAL;
+    }
     let old_path = match cstr_arg(args[1], true) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    // **`AT_EMPTY_PATH` names the descriptor itself as the source**, and it is
+    // the one door that gives a file with no name of its own one: `apk` writes
+    // its repository index through `O_TMPFILE` and links it in this way, and
+    // `shm_open`-style and `/proc`-style authors do the same. Measured on Linux
+    // 7.3.4 (`build/scratch/opathmmap/{p,q2,gaps}.c`):
+    //
+    //   * served for an `O_PATH` descriptor **and** for an ordinary one, and
+    //     for a `memfd`/`O_TMPFILE` inode that no name reaches;
+    //   * a **non-empty** name beside the flag is `ENOTDIR` (`20`) - the flag
+    //     says the name is empty, so a caller that gave one is describing a
+    //     directory walk that its own source is not;
+    //   * without the flag an empty name is `ENOENT`;
+    //   * `AT_SYMLINK_FOLLOW` may be combined with it;
+    //   * `linkat(-1, "", …, AT_EMPTY_PATH)` is `EBADF` (the descriptor is
+    //     looked up before the name is judged empty).
+    //
+    // The `CAP_DAC_READ_SEARCH` requirement the man page states is **not**
+    // observed on a file the caller owns (measured: uid 1000 linking its own
+    // file answers 0), so this door asks what Linux's `vfs_link` asks - the
+    // destination directory's write permission and the inode's own flags -
+    // rather than a capability the measurement does not support.
+    let descriptor_source = args[4] & AT_EMPTY_PATH != 0;
+    if descriptor_source && !old_path.is_empty() {
+        return err::ENOTDIR;
+    }
+    if descriptor_source {
+        let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+            Ok(file) => file,
+            Err(e) => return err_of(e),
+        };
+        let new_path = match cstr_arg(args[3], true) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let new_base = match base_for(args[2] as i32, &new_path, cwd) {
+            Ok(base) => base,
+            Err(e) => return e,
+        };
+        return link_descriptor_into(&file, &new_path, new_base);
+    }
     let old_base = match base_for(args[0] as i32, &old_path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
@@ -6651,6 +6766,93 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 crate::vfs::inotify::IN_CREATE,
                 name,
                 old.metadata().kind == crate::vfs::NodeKind::Dir,
+            );
+            0
+        }
+        Err(e) => err_of(e),
+    }
+}
+
+/// The destination half of `linkat`'s `AT_EMPTY_PATH` arm: give the inode a
+/// **second name** through the destination directory.
+///
+/// Split out rather than inlined because the door's ordinary path already runs
+/// thirteen questions before it links - the EXDEV comparison, `may_alter`, the
+/// create event - and this door owes the same ones with a source it already
+/// holds, so the alternative to a helper is a second copy of them that will
+/// drift. What it does *not* repeat is the source lookup: the descriptor is the
+/// source, which is the entire point of the flag.
+///
+/// The EXDEV rule is asked the way the descriptor-owned one is asked in the
+/// sibling arm (`fs_serving_inode_of`, both sides), because a descriptor has no
+/// source *path* to compose: the same reason that arm's `via_descriptor` branch
+/// exists.
+fn link_descriptor_into(
+    source: &Arc<crate::vfs::File>,
+    new_path: &str,
+    new_base: Arc<dyn Inode>,
+) -> isize {
+    let source_inode = source.inode();
+    let (parent_path, name) = match crate::vfs::split_parent(new_path) {
+        Ok(p) => p,
+        Err(e) => return err_of(e),
+    };
+    let parent = match crate::vfs::resolve_opt(parent_path, Some(new_base)) {
+        Ok(parent) => parent,
+        Err(e) => return err_of(e),
+    };
+    // A name in the destination directory is a write to it, and finding where
+    // it goes is a search - the same two bits `may_create_in` asks everywhere.
+    if let Err(e) = crate::vfs::may_create_in(&parent) {
+        return err_of(e);
+    }
+    // A second name belongs to the filesystem that keeps the directory, and the
+    // source's is asked by whatever can answer: **its recorded path first**,
+    // because a path is the only thing that places a node *inside* a mount.
+    //
+    // The first version of this asked `fs_serving_inode_of` on both inodes, on
+    // the reading that the sibling arm's `via_descriptor` branch does - and
+    // every link came back `EXDEV` on the guest. The reason is the one item
+    // 298's first attempt paid for: `MountTable::fs_serving_inode` only matches
+    // an inode that *is* a mount's root and otherwise falls back to `root_fs`,
+    // so a plain file and a plain directory answered "the root filesystem"
+    // through two separately-built `Arc`s and `Arc::ptr_eq` said no. A node
+    // inside a mount cannot say which filesystem it belongs to; a path can.
+    //
+    // A descriptor that was never opened by a path (an `O_TMPFILE`, a `memfd`)
+    // has no name to compare *and* nothing to lose: it is on the filesystem its
+    // root was made under, so the inode question is the only one available and
+    // its answer is accepted rather than turned into a refusal - refusing there
+    // would break the one caller shape this door exists for.
+    let same_filesystem = match source.label() {
+        Some(path) => {
+            crate::vfs::mount::fs_of_path(&path).0
+                == crate::vfs::mount::fs_of_path(&absolute(parent_path)).0
+        }
+        None => match (
+            crate::vfs::fs_serving_inode_of(&source_inode),
+            crate::vfs::fs_serving_inode_of(&parent),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+            _ => true,
+        },
+    };
+    if !same_filesystem {
+        return err::EXDEV;
+    }
+    let source = &source_inode;
+    // Linux's `may_linkat`: a second name for an immutable or append-only inode
+    // is `EPERM`, before the entry is made.
+    if let Err(e) = crate::vfs::may_alter(source) {
+        return err_of(e);
+    }
+    match parent.link(name, source) {
+        Ok(()) => {
+            crate::vfs::inotify::emit_child(
+                &parent,
+                crate::vfs::inotify::IN_CREATE,
+                name,
+                source.metadata().kind == crate::vfs::NodeKind::Dir,
             );
             0
         }
@@ -8632,12 +8834,25 @@ pub fn handle_open_by_handle_at(args: [usize; ARG_COUNT], from_user: bool) -> is
 
 /// `syncfs(fd)` — flush the filesystem one descriptor belongs to. Every
 /// write here already reached its storage — ramfs and ext2 write through —
-/// so the flush is empty; the call still owes the descriptor check.
+/// so the flush is empty; the call still owes the descriptor check, and there
+/// are **two** of them.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/gaps.c`): a missing
+/// descriptor is `EBADF`, an **`O_PATH`** one is `EBADF` too, and a **pipe** is
+/// **served with 0**. The last row is the surprise and it is why the check
+/// cannot be "is this a file": Linux's `syncfs` is
+/// `fdget(fd)` then `sync_filesystem(file_inode(file)->i_sb)`, and a pipe's
+/// file has an `i_sb` — so it answers 0 for something with nothing to flush.
+/// An `O_PATH` descriptor is refused by `fdget` itself, which is the whole rule.
 pub fn handle_syncfs(args: [usize; ARG_COUNT]) -> isize {
-    match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => 0,
-        Err(e) => err_of(e),
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    if file.is_path_only() {
+        return err::EBADF;
     }
+    0
 }
 
 /// `syslog(type, buf, len)` — the kernel log, `klogctl`'s door.

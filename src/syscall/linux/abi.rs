@@ -218,6 +218,33 @@ pub(super) const F_OFD_SETLKW: usize = 38;
 /// `unreachable_patterns` warning on the arms *below* it, which a build that
 /// greps for `error` never shows. Hence the test that pins the value.
 pub(super) const F_DUPFD_CLOEXEC: usize = 1030;
+/// `F_SETOWN`/`F_GETOWN`: the `SIGIO` recipient a description carries, and the
+/// pair Linux numbers `8`/`9` - inside the *portable* block rather than the
+/// Linux-specific one, which is why they are not with the `1030`s above.
+///
+/// `F_SETOWN` takes a signed word: a **positive** number is a pid and a
+/// **negative** one is a process group (`-pgrp`), and `F_GETOWN` reports the
+/// stored target. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/gaps2.c`): a fresh descriptor reads `0`, setting
+/// it to `getpid()` reads back that pid, and setting it to `-getpgrp()` or to
+/// `0`/`-1` reads back **0** - the group case is reported as 0 rather than as
+/// its absolute value, so a reader cannot recover the sign from `F_GETOWN`.
+/// A pid that names no process is `ESRCH` (measured: `99999` and `-99999` both
+/// answer `ESRCH`, so the existence check runs for both shapes).
+pub(super) const F_GETOWN: usize = 9;
+/// See [`F_GETOWN`].
+pub(super) const F_SETOWN: usize = 8;
+/// `F_GETPIPE_SZ`/`F_SETPIPE_SZ`: the pipe buffer's capacity in bytes, which
+/// Linux reports rounded up to a page and makes settable within
+/// `/proc/sys/fs/pipe-max-size`. Numbers 1032/1031 in the Linux-specific block
+/// (`F_LINUX_SPECIFIC_BASE + 8` and `+ 7`). Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/gaps2.c`): the default is 65536, a request below a
+/// page reads back 4096, `4097` reads back `8192`, and a request past
+/// `pipe-max-size` is `EPERM` - while a regular file, an `O_PATH` descriptor
+/// and any non-pipe answer `EBADF`.
+pub(super) const F_GETPIPE_SZ: usize = 1032;
+/// See [`F_GETPIPE_SZ`].
+pub(super) const F_SETPIPE_SZ: usize = 1031;
 /// The one descriptor flag: the descriptor must not survive the next execve.
 pub(super) const FD_CLOEXEC: u32 = 1;
 
@@ -6634,6 +6661,16 @@ mod tests {
             (F_OFD_GETLK, 36),
             (F_OFD_SETLK, 37),
             (F_OFD_SETLKW, 38),
+            // The `SIGIO` recipient pair sits in the *portable* block, 8/9 -
+            // not with the Linux-specific commands below, and the difference
+            // matters because these two are the pair a caller can spell without
+            // any Linux-only header.
+            (F_SETOWN, 8),
+            (F_GETOWN, 9),
+            // The pipe-sizing pair is Linux-specific, `F_LINUX_SPECIFIC_BASE`
+            // (1024) + 7 and + 8.
+            (F_SETPIPE_SZ, 1031),
+            (F_GETPIPE_SZ, 1032),
         ] {
             assert_eq!(cmd, value);
         }

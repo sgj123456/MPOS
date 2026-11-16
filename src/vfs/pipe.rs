@@ -31,12 +31,32 @@ use crate::sched::policy::TaskId;
 /// what lets two processes use a pipe as a record channel. POSIX's minimum.
 pub const PIPE_BUF: usize = 4096;
 
-/// How much a pipe buffers before writers block. Sixteen pages is Linux's
-/// default pipe capacity (`pipe-max-size`), so a pipeline holds exactly as much
-/// in flight here as it would there. (A writer that needs a whole record of
-/// room parks until one frees - see [`PipeEnd::wait_writable`] - so the buffer
-/// being an exact multiple of [`PIPE_BUF`] is not the stall it once was.)
+/// How much a pipe buffers before writers block **when nobody has asked for
+/// another size**. Sixteen pages is Linux's default pipe capacity, so a
+/// pipeline holds exactly as much in flight here as it would there. (A writer
+/// that needs a whole record of room parks until one frees - see
+/// [`PipeEnd::wait_writable`] - so the buffer being an exact multiple of
+/// [`PIPE_BUF`] is not the stall it once was.)
+///
+/// It is the *default* rather than the capacity: `F_SETPIPE_SZ` changes a
+/// pipe's own, and Linux's `pipe-max-size` (1 MiB) is the ceiling a caller
+/// without `CAP_SYS_RESOURCE` may not pass. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/gaps2.c`): the default is 65536, a request below a
+/// page reads back 4096, `4097` reads back `8192`, `1 << 20` is accepted, and
+/// `1 << 30` is `EPERM` - so requests round **up** to a page and the ceiling is
+/// the sysctl's number, not the socket's.
 const CAPACITY: usize = 16 * PIPE_BUF;
+
+/// The smallest buffer `F_SETPIPE_SZ` may name: one page, Linux's own floor
+/// (`round_pipe_size` clamps up to `PAGE_SIZE`).
+const MIN_PIPE_CAPACITY: usize = PIPE_BUF;
+
+/// The largest this kernel will let a pipe be sized to, Linux's default
+/// `pipe-max-size`. A request above it is `EPERM` for a caller without
+/// `CAP_SYS_RESOURCE` - measured on the host, and the reason this is a
+/// constant rather than a rlimit lookup: the sysctl is a machine-wide policy
+/// this kernel keeps one value for.
+const MAX_PIPE_CAPACITY: usize = 1 << 20;
 
 /// The bytes in flight through one pipe, as a ring over a `Vec`.
 ///
@@ -124,15 +144,16 @@ impl Ring {
     }
 
     /// Append the first `want` bytes of `buf`. The caller has checked that the
-    /// pipe has room for them.
-    fn put(&mut self, buf: &[u8], want: usize) {
+    /// pipe has room for them, and says how much room the pipe has: the ceiling
+    /// is the pipe's own (`F_SETPIPE_SZ`), not a constant.
+    fn put(&mut self, buf: &[u8], want: usize, capacity: usize) {
         let n = want.min(buf.len());
         debug_assert!(
-            n <= CAPACITY - self.len(),
-            "a pipe write of {n} past a {CAPACITY}-byte buffer holding {}",
+            n <= capacity - self.len(),
+            "a pipe write of {n} past a {capacity}-byte buffer holding {}",
             self.len()
         );
-        if self.bytes.len() + n > CAPACITY {
+        if self.bytes.len() + n > capacity {
             // Room for the arrival only exists at the front, behind the bytes
             // already read. One move, and only on the pass that needed it.
             self.bytes.drain(..self.start);
@@ -144,6 +165,11 @@ impl Ring {
 
 struct PipeState {
     data: Ring,
+    /// This pipe's own buffer ceiling, in bytes: [`CAPACITY`] unless
+    /// `F_SETPIPE_SZ` moved it. It lives here because the capacity belongs to
+    /// the **pipe** - both ends see one number, and a `dup` of either shares it,
+    /// which is Linux's rule (`pipe_inode_info->max_usage * PAGE_SIZE`).
+    capacity: usize,
     /// SCM_RIGHTS side channel, one entry per send that carried descriptors.
     /// It lives here - beside the bytes it travels with - because the two
     /// crossed halves of a [`DuplexEnd`] share exactly this state, so a record
@@ -290,6 +316,7 @@ pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
 fn pair_ends(partial_break_signals: bool) -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let state = Arc::new(Mutex::new(RefCell::new(PipeState {
         data: Ring::new(),
+        capacity: CAPACITY,
         scm: VecDeque::new(),
         written: 0,
         consumed: 0,
@@ -338,6 +365,7 @@ impl Channel {
         Channel {
             state: Arc::new(Mutex::new(RefCell::new(PipeState {
                 data: Ring::new(),
+                capacity: CAPACITY,
                 scm: VecDeque::new(),
                 written: 0,
                 consumed: 0,
@@ -643,7 +671,7 @@ impl PipeEnd {
             if st.readers == 0 {
                 return Err(VfsError::BrokenPipe);
             }
-            let free = CAPACITY - st.data.len();
+            let free = st.capacity - st.data.len();
             let go = if buf.len() <= PIPE_BUF {
                 free >= buf.len()
             } else {
@@ -653,7 +681,8 @@ impl PipeEnd {
                 return Ok(None);
             }
             let n = buf.len().min(free);
-            st.data.put(buf, n);
+            let capacity = st.capacity;
+            st.data.put(buf, n, capacity);
             st.written += n as u64;
             Ok(Some(n))
         })
@@ -747,6 +776,39 @@ impl PipeEnd {
 
     /// Whether the writer asking for `need` bytes can move: the far end is gone
     /// (so the next write is `EPIPE`, and the wait must end to report it), or
+    /// This pipe's buffer ceiling in bytes - `F_GETPIPE_SZ`'s answer, read off
+    /// the state both ends share.
+    pub fn capacity(&self) -> usize {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().capacity)
+    }
+
+    /// Set this pipe's buffer ceiling and answer what it landed at, or `None`
+    /// when the request is outside what a caller without `CAP_SYS_RESOURCE` may
+    /// ask for. Linux rounds **up** to a page, refuses below a page, and refuses
+    /// above `pipe-max-size` with `EPERM`; the rounding and the two bounds are
+    /// measured (`build/scratch/opathmmap/gaps2.c`: `4097` -> `8192`, `0`/`1` ->
+    /// `4096`, `1 << 20` accepted, `1 << 30` -> `EPERM`).
+    ///
+    /// A shrink is honoured: the measured host took `1048576 -> 4096` and read
+    /// `4096` back. Shrinking below what is *already buffered* is the one case
+    /// the measurement did not cover, and the honest reading is Linux's: the
+    /// capacity is a ceiling on what may be **queued**, so a pipe holding more
+    /// than the new ceiling simply delivers it before refusing more.
+    pub fn set_capacity(&self, bytes: usize) -> Option<usize> {
+        if bytes == 0 {
+            return None;
+        }
+        let rounded = bytes.div_ceil(MIN_PIPE_CAPACITY) * MIN_PIPE_CAPACITY;
+        if rounded > MAX_PIPE_CAPACITY {
+            return None;
+        }
+        Some(critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            st.capacity = rounded;
+            rounded
+        }))
+    }
+
     /// there is room for the whole request. The second half has to match what
     /// [`write_once`](Self::write_once) actually admits - a record-sized write
     /// is all-or-nothing and wants `need` free, not merely one free byte - or a
@@ -756,7 +818,7 @@ impl PipeEnd {
     fn writable_or_broken(&self, need: usize) -> bool {
         critical_section::with(|cs| {
             let st = self.state.borrow(cs).borrow();
-            st.readers == 0 || CAPACITY - st.data.len() >= need
+            st.readers == 0 || st.capacity - st.data.len() >= need
         })
     }
 
@@ -895,7 +957,7 @@ impl Inode for PipeEnd {
                 read: !st.data.is_empty(),
                 // Room for something, or a write that is about to fail: with no
                 // readers left, a write answers EPIPE rather than waiting.
-                write: st.readers == 0 || st.data.len() < CAPACITY,
+                write: st.readers == 0 || st.data.len() < st.capacity,
             }
         })
     }
