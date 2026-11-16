@@ -2252,6 +2252,117 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     }
 }
 
+/// `rt_tgsigqueueinfo(tgid, tid, sig, uinfo)` — queue a signal with a payload at
+/// **one thread**.
+///
+/// The sibling of [`handle_rt_sigqueueinfo`], and the pair is why both exist:
+/// that door names a **process** and lets the group pick a thread that may take
+/// the copy, this one names the thread and nobody else may. Measured on Linux
+/// 7.3.4 (`build/scratch/opathmmap/{tgsq,tgsq2,tgsq3,tgsq4,tgsq5}.c`):
+///
+/// * the target pair is **checked against itself**: `tgid` must be `tid`'s own
+///   thread-group, and a pair from two groups is `ESRCH` - even when both
+///   numbers name live tasks (`(self tgid, other's tid)`, `(1, self tid)`);
+/// * `tgid <= 0` or `tid <= 0` is `EINVAL`, and a number naming nothing is
+///   `ESRCH`;
+/// * `sig == 0` is **served and queues nothing** (a existence probe, like
+///   `kill`'s signal-0);
+/// * `sig > 64` is `EINVAL` and a NULL/unreadable `uinfo` is `EFAULT`;
+/// * **the record is the caller's**: `si_signo` in the buffer is *ignored* in
+///   favour of the `sig` argument (a mismatch delivers the argument's signal),
+///   while `si_code`, `si_errno`, `si_pid`, `si_uid` and `si_value` are copied
+///   verbatim - every code value is accepted, `0x1234`, `SI_USER` and negative
+///   kernel-range ones alike.
+///
+/// The last two rows are shared with the sibling door and read from it rather
+/// than restated: the code/authority rules, the record copy and the send are
+/// **the same code**, because a second copy is how two doors come to disagree
+/// about a signal.
+pub fn handle_rt_tgsigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SIGINFO_BYTES: usize = 128;
+    let (tgid, tid, sig, uinfo) = (args[0] as isize, args[1] as isize, args[2], args[3]);
+    // Both numbers name tasks, so a non-positive one is a malformed request
+    // rather than a missing task - measured, `(0, self)` and `(-1, self)` are
+    // `EINVAL` where a positive number that names nothing is `ESRCH`.
+    if tgid <= 0 || tid <= 0 {
+        return err::EINVAL;
+    }
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
+        return err::EINVAL;
+    }
+    if uinfo == 0 || !buffer_ok(uinfo, SIGINFO_BYTES, false, from_user) {
+        return err::EFAULT;
+    }
+    // The two numbers must describe **one** thread: a tid and a tgid from
+    // different groups is `ESRCH` (measured). Asked before the record is read,
+    // because the pair not describing one task is a malformed request about a
+    // target rather than a bad `siginfo`.
+    let Some(target) = crate::sched::named_thread(tid as u32) else {
+        return err::ESRCH;
+    };
+    // `tgid` must name **that thread's own group**. Asked by resolving both
+    // numbers the way every pid-crossing door resolves them (§6.91), then
+    // comparing the group's identity: a tid from one process beside a tgid from
+    // another is `ESRCH`, measured, and it is the pair disagreeing rather than
+    // either number being absent.
+    let Some(group) = crate::sched::thread_group_of(target.slot()) else {
+        return err::ESRCH;
+    };
+    let Some(named_group) = crate::sched::named_process(tgid as u32) else {
+        return err::ESRCH;
+    };
+    // A `Gone` group has no thread to compare against, and answers 0 like the
+    // sibling door's zombie arm: the record has nowhere to go but the number is
+    // still owned. Anything else must be the same group.
+    match named_group {
+        crate::sched::Named::Gone(_) => return 0,
+        crate::sched::Named::Thread(id) => {
+            if crate::sched::thread_group_of(id) != Some(group) {
+                return err::ESRCH;
+            }
+        }
+    }
+    let si_errno = unsafe { ((uinfo + 4) as *const i32).read_unaligned() };
+    let si_code = unsafe { ((uinfo + 8) as *const i32).read_unaligned() };
+    // The code/authority rule is the sibling's, and it is asked here rather than
+    // duplicated: a code at or above zero, or `SI_TKILL`, is the kernel's own
+    // ground and cannot be forged for a task that is not the caller's.
+    if target.slot() != crate::sched::current_tgid()
+        && (si_code >= 0 || si_code == crate::sched::signal::SI_TKILL)
+    {
+        return err::EPERM;
+    }
+    if !crate::sched::may_signal(sig as u8, target.slot()) {
+        return err::EPERM;
+    }
+    // **The difference from the sibling is here**: the copy goes on the named
+    // thread's own pending set, not on the group's with a thread chosen for it.
+    // That is the whole content of the call - a caller that named a thread gets
+    // that thread or an errno, never a sibling.
+    let (pid, uid, value) = unsafe {
+        (
+            ((uinfo + 16) as *const i32).read_unaligned(),
+            ((uinfo + 20) as *const i32).read_unaligned(),
+            ((uinfo + 24) as *const u64).read_unaligned(),
+        )
+    };
+    // `si_signo` in the record is **not** the sender's to choose: the argument
+    // wins (measured - a record whose `si_signo` says SIGUSR2 beside
+    // `sig = SIGUSR1` delivers SIGUSR1). That is also what `kill`-style probes
+    // rely on: signal 0 delivers nothing at all.
+    let info = crate::sched::signal::SigInfo::signed(sig as u8, si_errno, si_code, pid, uid, value);
+    if sig == 0 {
+        // An existence check: the pair resolved, the authority held, and
+        // nothing is queued.
+        return 0;
+    }
+    match crate::sched::send_signal_info(target.slot(), sig as u8, info) {
+        crate::sched::Sent::NoTask => err::ESRCH,
+        crate::sched::Sent::QueueFull => err::EAGAIN,
+        crate::sched::Sent::Taken => 0,
+    }
+}
+
 /// `rt_sigsuspend(mask, sigsetsize)` — swap the signal mask and wait for
 /// a signal the new mask lets through.
 ///

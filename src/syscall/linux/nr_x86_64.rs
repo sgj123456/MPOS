@@ -50,6 +50,12 @@ pub const IOPRIO_GET: u64 = 252;
 /// forwarded. Never declared here until item 312, so the dispatch answered
 /// `ENOSYS`.
 pub const TEE: u64 = 276;
+/// `rt_tgsigqueueinfo(2)`: queue a signal with a payload at **one thread**.
+/// The sibling of `rt_sigqueueinfo` (129), which names a process - and the
+/// difference is not just the target: the two-argument pair is checked against
+/// each other, so a tgid and a tid from different groups is `ESRCH`. Never
+/// declared here until item 316, so the dispatch answered `ENOSYS`.
+pub const RT_TGSIGQUEUEINFO: u64 = 297;
 /// `vmsplice(2)`: graft user memory into a pipe, or drain a pipe into user
 /// memory. The last of item 310's four census calls. Never declared here until
 /// item 313, so the dispatch answered `ENOSYS`.

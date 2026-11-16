@@ -238,6 +238,7 @@ mod tests {
         assert_eq!(IOPRIO_GET, 252);
         assert_eq!(TEE, 276);
         assert_eq!(VMSPLICE, 278);
+        assert_eq!(RT_TGSIGQUEUEINFO, 297);
         assert_eq!(MEMBARRIER, 324);
         // The POSIX message-queue family, whose numbers are consecutive on both
         // machines - a transcription error here is a family that silently

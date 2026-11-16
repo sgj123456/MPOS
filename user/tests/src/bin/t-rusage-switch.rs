@@ -94,12 +94,24 @@ fn main() {
         ),
         after_sleeps.voluntary - before.voluntary >= 50,
     );
+    // The threshold is **a measurement, not a preference**. The claim's content
+    // is "fifty sleeps are fifty *voluntary* switches and not fifty
+    // involuntary ones"; the exact count of the latter is the machine's
+    // business, and on a sweep six TCG lanes deep the host preempts this guest's
+    // vCPU while it sleeps, which the guest counts as an involuntary switch of
+    // its own. Measured both ways: **0** on a host, and **11** in a lane that
+    // failed this claim at the old ceiling of 10 - a single switch over, with
+    // the property it protects untouched. The bound is now 25, which still
+    // fails decisively for the defect the claim exists for (a park that is not
+    // a park counts ~50) while leaving room for the host's own scheduling
+    // noise. A claim whose miss is one unit under contention is measuring the
+    // host; one that is 50 is measuring the kernel.
     r.check(
         &format!(
-            "and none of them is a switch the machine took ({})",
+            "and few of them are switches the machine took ({})",
             after_sleeps.involuntary - before.involuntary
         ),
-        after_sleeps.involuntary - before.involuntary <= 10,
+        after_sleeps.involuntary - before.involuntary <= 25,
     );
 
     // A yield is the other column: the task is still runnable and gives the
@@ -111,12 +123,18 @@ fn main() {
         unsafe { libc::sched_yield() };
     }
     let after_yield = switches(0).unwrap_or(before_yield);
+    // **This half is the machine's.** On Linux, `sched_yield` with nothing else
+    // runnable is a no-op the scheduler skips, so neither counter moves -
+    // measured on a current host, 200 back-to-back yields leave `nvcsw` at 2 and
+    // `nivcsw` at 0. This kernel hands the CPU over on every call, which is the
+    // same *event* counted the same way. The claim is therefore about this
+    // kernel; the host run cannot see it, and a first version of this file had
+    // no escape, so the *host* leg of the sweep failed on the claim while the
+    // guest leg passed it.
+    let yielded = after_yield.involuntary - before_yield.involuntary;
     r.check(
-        &format!(
-            "a yield is an involuntary switch ({})",
-            after_yield.involuntary - before_yield.involuntary
-        ),
-        after_yield.involuntary - before_yield.involuntary >= 1,
+        &format!("a yield is an involuntary switch ({yielded})"),
+        yielded >= 1 || mpos_user_tests::host_run(),
     );
 
     // A thread's own switches are its own; the process's are the group's. A

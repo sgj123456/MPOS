@@ -718,6 +718,7 @@ pub unsafe fn dispatch(
         nr::TGKILL => posix::handle_tgkill(args),
         nr::RT_SIGPENDING => posix::handle_rt_sigpending(args, from_user),
         nr::RT_SIGQUEUEINFO => posix::handle_rt_sigqueueinfo(args, from_user),
+        nr::RT_TGSIGQUEUEINFO => posix::handle_rt_tgsigqueueinfo(args, from_user),
         nr::PIDFD_SEND_SIGNAL => proc::handle_pidfd_send_signal(args, from_user),
         nr::RT_SIGSUSPEND => posix::handle_rt_sigsuspend(args, from_user),
         nr::PAUSE => posix::handle_pause(),

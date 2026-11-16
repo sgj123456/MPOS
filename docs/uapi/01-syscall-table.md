@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **308** x86_64
-syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **308** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **309** x86_64
+syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **309** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **every one** of them - 308 arms, no orphans, measured 2026-11-16 - plus a
+explicit arm for **every one** of them - 309 arms, no orphans, measured 2026-11-16 - plus a
 `_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
@@ -162,6 +162,7 @@ A call absent from those is served as its phase section records.
 | `rt_sigpending` | 127 | posix | 136 |
 | `rt_sigtimedwait` | 128 | proc | 137 |
 | `rt_sigqueueinfo` | 129 | posix | 138 |
+| `rt_tgsigqueueinfo` | 297 | posix | 240 |
 | `rt_sigsuspend` | 130 | posix | 133 |
 | `sigaltstack` | 131 | proc | 132 |
 | `utime` | 132 | fs | 64031 |
