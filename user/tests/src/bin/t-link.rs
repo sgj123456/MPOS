@@ -226,6 +226,202 @@ fn main() {
         symlink("another", S) == Err(Errno::EXIST),
     );
 
+    // === `linkat(fd, "", …, AT_EMPTY_PATH)`: a name for a descriptor ========
+    //
+    // The one door that gives a file with **no name of its own** one, which is
+    // what `apk` does with the repository index it wrote through `O_TMPFILE`
+    // and what `shm_open`-style callers do. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/{p,q2,gaps}.c`):
+    //
+    //   * served for an **`O_PATH`** descriptor and for an ordinary one;
+    //   * a **non-empty** name beside the flag is `ENOTDIR` (20) - the flag says
+    //     the name is empty, so a caller that gave one is describing a walk its
+    //     source is not;
+    //   * without the flag an empty name is `ENOENT`;
+    //   * `AT_SYMLINK_FOLLOW` may be combined with it;
+    //   * an unknown flag bit is `EINVAL`, and a bad descriptor is `EBADF`.
+    //
+    // Raw, because `rustix::fs::linkat` takes `&CStr` and an `AtFlags` whose
+    // vocabulary has no `AT_EMPTY_PATH` - the empty-name shape *is* the claim
+    // (clause (c) again).
+    //
+    // The `CAP_DAC_READ_SEARCH` requirement the man page states is **not**
+    // observed on a file the caller owns, so the claims below hold as root; a
+    // pin that dropped privilege would be measuring the man page's sentence
+    // rather than the kernel's behaviour.
+    let empty_link = "/tmp/t-link-empty";
+    let _ = std::fs::remove_file(empty_link);
+    let target_file = "/tmp/t-link-at-empty-src";
+    let _ = std::fs::write(target_file, b"second name");
+    let e = |rc: i64| -> Option<i32> {
+        (rc == -1)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten()
+    };
+    match (
+        rustix::fs::open(target_file, OFlags::RDWR, Mode::empty()),
+        rustix::fs::open(target_file, OFlags::PATH, Mode::empty()),
+    ) {
+        (Ok(ordinary), Ok(path_only)) => {
+            let ord = std::os::fd::AsRawFd::as_raw_fd(&ordinary);
+            let op = std::os::fd::AsRawFd::as_raw_fd(&path_only);
+            // SAFETY: every descriptor is live and the two names are
+            // NUL-terminated strings this test owns.
+            let made = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    ord,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            r.check(
+                &format!("linkat(ordinary fd, empty name, AT_EMPTY_PATH) is served, got {made}"),
+                made == 0,
+            );
+            r.check(
+                "and the new name is the same inode",
+                std::fs::metadata(empty_link)
+                    .ok()
+                    .zip(std::fs::metadata(target_file).ok())
+                    .is_some_and(|(a, b)| {
+                        use std::os::unix::fs::MetadataExt;
+                        a.ino() == b.ino() && a.nlink() == 2
+                    }),
+            );
+            let _ = std::fs::remove_file(empty_link);
+            // The `O_PATH` spelling: the descriptor that exists to *name* a file
+            // is the one this door is most used with.
+            // SAFETY: as above.
+            let via_path = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    op,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            r.check(
+                &format!("linkat(O_PATH fd, empty name, AT_EMPTY_PATH) is served, got {via_path}"),
+                via_path == 0,
+            );
+            let _ = std::fs::remove_file(empty_link);
+            // A name beside the flag is ENOTDIR: the flag says there is none.
+            // SAFETY: as above.
+            let nonempty = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    ord,
+                    c"x".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            r.check(
+                &format!(
+                    "a non-empty name beside AT_EMPTY_PATH is ENOTDIR, got {}",
+                    e(nonempty)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| nonempty.to_string())
+                ),
+                e(nonempty) == Some(libc::ENOTDIR),
+            );
+            // Without the flag the empty name names nothing.
+            // SAFETY: as above.
+            let unflagged = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    ord,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    0,
+                )
+            };
+            r.check(
+                &format!(
+                    "an empty name without AT_EMPTY_PATH is ENOENT, got {}",
+                    e(unflagged)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| unflagged.to_string())
+                ),
+                e(unflagged) == Some(libc::ENOENT),
+            );
+            // An unknown flag bit is EINVAL, and it is judged before the names.
+            // SAFETY: as above.
+            let badflag = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    ord,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    0x4000_0000i64,
+                )
+            };
+            r.check(
+                &format!(
+                    "an unknown linkat flag bit is EINVAL, got {}",
+                    e(badflag)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| badflag.to_string())
+                ),
+                e(badflag) == Some(libc::EINVAL),
+            );
+            // A descriptor the table does not hold is EBADF, and it outranks
+            // the empty name.
+            // SAFETY: as above; -1 names no descriptor.
+            let badfd = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    -1i32,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            r.check(
+                &format!(
+                    "linkat(-1, empty name, AT_EMPTY_PATH) is EBADF, got {}",
+                    e(badfd)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| badfd.to_string())
+                ),
+                e(badfd) == Some(libc::EBADF),
+            );
+            // The pair that makes the above about the flag rather than about
+            // "this door refuses empty names": `AT_SYMLINK_FOLLOW` may ride
+            // along with it.
+            // SAFETY: as above.
+            let with_follow = unsafe {
+                libc::syscall(
+                    libc::SYS_linkat,
+                    ord,
+                    c"".as_ptr(),
+                    libc::AT_FDCWD,
+                    c"/tmp/t-link-empty".as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_FOLLOW,
+                )
+            };
+            r.check(
+                &format!("AT_EMPTY_PATH|AT_SYMLINK_FOLLOW is served, got {with_follow}"),
+                with_follow == 0,
+            );
+        }
+        _ => r.check(
+            "the two descriptors for the AT_EMPTY_PATH claims are opened",
+            false,
+        ),
+    }
+    let _ = std::fs::remove_file(empty_link);
+    let _ = std::fs::remove_file(target_file);
+
     for path in [A, B, S, S2] {
         let _ = std::fs::remove_file(path);
     }

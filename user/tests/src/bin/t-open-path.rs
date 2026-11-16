@@ -517,6 +517,33 @@ fn main() {
                 ebadf(rc),
             );
         }
+        // `syncfs` is the tenth door and it was not merely unpinned - item 303
+        // *named it* `ENOSYS`, which was wrong: the call has been dispatched all
+        // along and only the `O_PATH` check was missing. Its rule is this
+        // family's rather than "regular files only": measured on Linux 7.3.4
+        // (`build/scratch/opathmmap/gaps.c`), `syncfs(O_PATH)` is `EBADF` while
+        // **`syncfs(pipe)` is served with 0** - Linux asks the file's
+        // *superblock*, and a pipe's file has one. So the refusal is the
+        // `O_PATH` question, and the pipe neighbour below is what proves it.
+        // SAFETY: `raw` is a live descriptor this test owns.
+        let syncfs_rc = unsafe { libc::syscall(libc::SYS_syncfs, raw) };
+        r.check(
+            &format!(
+                "syncfs(O_PATH fd) is EBADF (raw), got rc={syncfs_rc} errno={}",
+                std::io::Error::last_os_error()
+            ),
+            ebadf(syncfs_rc),
+        );
+        // The neighbour that makes it about `O_PATH`: a pipe is served.
+        if let Ok((p_r, _p_w)) = rustix::pipe::pipe() {
+            let pr = std::os::fd::AsRawFd::as_raw_fd(&p_r);
+            // SAFETY: `pr` is a live pipe end this test owns.
+            let rc = unsafe { libc::syscall(libc::SYS_syncfs, pr) };
+            r.check(
+                &format!("and syncfs on a pipe is served, got rc={rc}"),
+                rc == 0,
+            );
+        }
         // `fallocate` gets its own entry because it was the one that **wrote**:
         // on the guest `fallocate(O_PATH|O_WRONLY_fd, 0, 0, 4096)` answered 0 and
         // grew the file from 10 bytes to 4096. The `O_PATH` word below carries
@@ -632,6 +659,13 @@ fn main() {
     let readable_by_all = format!("{DIR}/sun");
     let _ = std::fs::write(&readable_by_all, b"for anyone");
     let _ = std::fs::set_permissions(&readable_by_all, std::fs::Permissions::from_mode(0o444));
+    // A directory with no search bit: the rule that survives. The file inside
+    // is readable by anyone, so only the *directory* can explain a refusal.
+    let hidden_dir = format!("{DIR}/hidden");
+    let hidden_path = format!("{hidden_dir}/inside");
+    let _ = std::fs::create_dir_all(&hidden_dir);
+    let _ = std::fs::write(&hidden_path, b"reachable by name only");
+    let _ = std::fs::set_permissions(&hidden_dir, std::fs::Permissions::from_mode(0o000));
     {
         let mut fds = [0i32; 2];
         // SAFETY: a two-element array this test owns.
@@ -660,6 +694,15 @@ fn main() {
                         answer_code(&op),
                     ));
                 }
+                // The parent's **search** bit is still required, which is the
+                // half of the rule that survives the file's own mode being
+                // ignored: measured on Linux 7.3.4
+                // (`build/scratch/opathmmap/opening2.c`), a path inside a `0000`
+                // directory is `EACCES` under `O_PATH` too. The directory is
+                // made `0000` by the parent before the fork (see below), so the
+                // child never has to change a mode it no longer owns.
+                let inside = rustix::fs::open(&hidden_path, OFlags::PATH, Mode::empty());
+                report.push_str(&format!("hidden path={}\n", answer_code(&inside)));
                 unsafe {
                     let bytes = report.as_bytes();
                     libc::write(fds[1], bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
@@ -713,6 +756,13 @@ fn main() {
                 &format!("and serves O_PATH on the same file ({text:?})"),
                 secret_path.as_deref().is_some_and(|a| a.starts_with("ok:")),
             );
+            // The directory's search bit, from the same dropped caller: a
+            // `0000` directory is `EACCES` even for the `O_PATH` open that
+            // asks the file nothing.
+            r.check(
+                &format!("a path inside a 0000 directory is EACCES under O_PATH ({text:?})"),
+                field("hidden ", "path=").as_deref() == Some("errno:13"),
+            );
             // The neighbour that keeps the pair from being "everything is
             // refused": a world-readable file is served both ways.
             r.check(
@@ -732,6 +782,8 @@ fn main() {
         rustix::fs::open(&secret, OFlags::PATH, Mode::empty()).is_ok(),
     );
     let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644));
+    // The 0000 directory has to be searchable again before it can be emptied.
+    let _ = std::fs::set_permissions(&hidden_dir, std::fs::Permissions::from_mode(0o755));
 
     let _ = std::fs::remove_dir_all(DIR);
     r.finish()

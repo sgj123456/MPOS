@@ -435,6 +435,151 @@ fn main() {
         Err(_) => r.check("a socketpair end reports O_RDWR", false),
     }
 
+    // === `F_GETOWN`/`F_SETOWN`: the SIGIO recipient =========================
+    //
+    // The state is the **description's**, and what it stores is what
+    // `F_GETOWN` reports rather than the argument. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/gaps2.c`): a fresh descriptor reads 0; setting
+    // a pid reads that pid back; setting a **negative** number (a process
+    // group) reads back 0; `0` and `-1` read 0; and a number naming no process
+    // is `ESRCH`, whichever sign it carried.
+    //
+    // Raw, because `rustix` has no `F_GETOWN` binding (clause (a): a call it
+    // does not write) and the negative-argument shape is the claim.
+    if let Ok(f) = rustix::fs::open(FILE, OFlags::RDWR, Mode::empty()) {
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let getown = || unsafe { libc::fcntl(raw, libc::F_GETOWN) };
+        r.check(
+            &format!("F_GETOWN on a fresh descriptor is 0, got {}", getown()),
+            getown() == 0,
+        );
+        // SAFETY: `raw` is live; `F_SETOWN` takes an int.
+        let set_self = unsafe { libc::fcntl(raw, libc::F_SETOWN, std::process::id() as i32) };
+        r.check(
+            &format!("F_SETOWN(self pid) is served, got {set_self}"),
+            set_self == 0,
+        );
+        r.check(
+            &format!(
+                "and F_GETOWN reports that pid, got {} (want {})",
+                getown(),
+                std::process::id()
+            ),
+            getown() == std::process::id() as i32,
+        );
+        // A **negative** argument names a process group, and Linux's `F_GETOWN`
+        // reports 0 for it rather than the number - the sign cannot be
+        // recovered from the reading.
+        // SAFETY: as above.
+        let set_group = unsafe { libc::fcntl(raw, libc::F_SETOWN, -(std::process::id() as i32)) };
+        r.check(
+            &format!("F_SETOWN(-pid) is served, got {set_group}"),
+            set_group == 0,
+        );
+        r.check(
+            &format!("and a group target reads back 0, got {}", getown()),
+            getown() == 0,
+        );
+        // A number naming nothing is ESRCH, and it is asked for both signs.
+        for (label, target) in [("pid", 99999i32), ("group", -99999i32)] {
+            // SAFETY: as above.
+            let rc = unsafe { libc::fcntl(raw, libc::F_SETOWN, target) };
+            r.check(
+                &format!(
+                    "F_SETOWN(a {label} that names nothing) is ESRCH, got rc={rc} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+            );
+        }
+        // The description's, not the process's: a `dup` shares the value and a
+        // second `open` of the same file does not.
+        // SAFETY: as above; restore the pid first so the claim is about a
+        // non-zero stored value.
+        unsafe { libc::fcntl(raw, libc::F_SETOWN, std::process::id() as i32) };
+        let dup = rustix::io::dup(&f);
+        r.check(
+            "a dup shares the owner, so F_GETOWN on it reads the same pid",
+            dup.as_ref().is_ok_and(|d| {
+                let d_raw = std::os::fd::AsRawFd::as_raw_fd(d);
+                // SAFETY: `d_raw` is live.
+                (unsafe { libc::fcntl(d_raw, libc::F_GETOWN) }) == std::process::id() as i32
+            }),
+        );
+        r.check(
+            "and a second open of the same file has its own (0)",
+            rustix::fs::open(FILE, OFlags::RDWR, Mode::empty()).is_ok_and(|o| {
+                let o_raw = std::os::fd::AsRawFd::as_raw_fd(&o);
+                // SAFETY: `o_raw` is live.
+                (unsafe { libc::fcntl(o_raw, libc::F_GETOWN) }) == 0
+            }),
+        );
+    }
+
+    // === `F_GETPIPE_SZ`/`F_SETPIPE_SZ`: a pipe's buffer ceiling =============
+    //
+    // Measured on Linux 7.3.4 (`build/scratch/opathmmap/gaps2.c`): the default
+    // is 65536, a request below a page rounds **up** to 4096, `4097` reads back
+    // `8192`, a shrink is honoured, and a request past `pipe-max-size` (1 MiB)
+    // is `EPERM`. Anything that is not a pipe - a regular file, an `O_PATH`
+    // descriptor - is `EBADF`, not `EINVAL`.
+    match rustix::pipe::pipe() {
+        Ok((read_end, _write_end)) => {
+            let rd = std::os::fd::AsRawFd::as_raw_fd(&read_end);
+            // SAFETY: `rd` is a live pipe end this test owns.
+            let default = unsafe { libc::fcntl(rd, libc::F_GETPIPE_SZ) };
+            r.check(
+                &format!(
+                    "F_GETPIPE_SZ on a fresh pipe is a positive multiple of a page ({default})"
+                ),
+                default > 0 && default as usize & 4095 == 0,
+            );
+            // SAFETY: as above; `F_SETPIPE_SZ` takes the size as an int.
+            let shrunk = unsafe { libc::fcntl(rd, libc::F_SETPIPE_SZ, 4096) };
+            r.check(
+                &format!("F_SETPIPE_SZ(4096) is served and answers a page, got {shrunk}"),
+                shrunk == 4096,
+            );
+            // SAFETY: as above.
+            let now = unsafe { libc::fcntl(rd, libc::F_GETPIPE_SZ) };
+            r.check(
+                &format!("and F_GETPIPE_SZ reports the new size, got {now}"),
+                now == 4096,
+            );
+            // The rounding: a request between two pages lands on the upper one.
+            // SAFETY: as above.
+            let rounded = unsafe { libc::fcntl(rd, libc::F_SETPIPE_SZ, 4097) };
+            r.check(
+                &format!("F_SETPIPE_SZ(4097) rounds up to 8192, got {rounded}"),
+                rounded == 8192,
+            );
+            // Past `pipe-max-size` without `CAP_SYS_RESOURCE` is EPERM.
+            // SAFETY: as above.
+            let too_big = unsafe { libc::fcntl(rd, libc::F_SETPIPE_SZ, 1 << 30) };
+            r.check(
+                &format!(
+                    "F_SETPIPE_SZ past pipe-max-size is EPERM, got rc={too_big} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                too_big == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+            );
+        }
+        Err(_) => r.check("a pipe for the sizing claims is made", false),
+    }
+    if let Ok(f) = rustix::fs::open(FILE, OFlags::RDONLY, Mode::empty()) {
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&f);
+        // SAFETY: `raw` is a live regular-file descriptor.
+        let rc = unsafe { libc::fcntl(raw, libc::F_GETPIPE_SZ) };
+        r.check(
+            &format!(
+                "F_GETPIPE_SZ on a regular file is EBADF, got rc={rc} errno={}",
+                std::io::Error::last_os_error()
+            ),
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
+        );
+    }
+
     let _ = std::fs::remove_file(FILE);
 
     r.check(
