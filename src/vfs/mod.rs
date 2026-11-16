@@ -37,6 +37,10 @@ pub fn now_seconds() -> u64 {
     HOST_NOW.fetch_add(1, Ordering::Relaxed) as u64
 }
 
+/// The legacy POSIX AIO family (`io_setup` and friends): a context handle and a
+/// completion queue. Host-compiled, because its whole body is a table and a
+/// `Vec` - the operations a context submits are executed by the syscall door.
+pub mod aio;
 /// `/sys/fs/cgroup`: the cgroup2 control-group tree - the hierarchy a
 /// process belongs to, `/proc/<pid>/cgroup`'s answer and the cgroup
 /// namespace's subject. Organizational only (no controllers), measured

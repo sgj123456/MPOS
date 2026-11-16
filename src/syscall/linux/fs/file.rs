@@ -8982,6 +8982,248 @@ pub fn handle_vmsplice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     total as isize
 }
 
+/// `io_setup(nr_events, &ctx)` — create a legacy POSIX AIO context.
+///
+/// The handle is written through the caller's pointer and is what every other
+/// door in the family is given. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/{aio,aio2}.c`): `io_setup(0, …)` is `EINVAL`, a
+/// `NULL` pointer is `EFAULT`, and an absurd `nr_events` is `EINVAL` too.
+///
+/// **This is not `io_uring`.** That is a ring of shared memory (number 425,
+/// served since item 115); this is a context handle, and the two families are
+/// unrelated despite the shared prefix.
+pub fn handle_io_setup(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (nr_events, ctx_ptr) = (args[0], args[1]);
+    if ctx_ptr == 0 || !buffer_ok(ctx_ptr, 8, true, from_user) {
+        return err::EFAULT;
+    }
+    // Linux caps the request at a small multiple of `aio-max-nr` and answers
+    // `EINVAL` for anything past it; the same numbers here are a bound on a
+    // user-steered allocation, which §8.0 requires.
+    if nr_events == 0 || nr_events > 0x1000 {
+        return err::EINVAL;
+    }
+    match crate::vfs::aio::setup(nr_events) {
+        Ok(id) => {
+            unsafe { (ctx_ptr as *mut u64).write_unaligned(id) };
+            0
+        }
+        Err(e) => err_of(e),
+    }
+}
+
+/// `io_destroy(ctx)` — drop a context and its uncollected completions.
+///
+/// Measured: a handle that names no context is `EINVAL`, and destroying the same
+/// handle twice is `EINVAL` the second time. Zero is never a live handle - the
+/// counter starts at one - so a caller's uninitialized `aio_context_t` is
+/// refused rather than honoured.
+pub fn handle_io_destroy(args: [usize; ARG_COUNT]) -> isize {
+    if crate::vfs::aio::destroy(args[0] as u64) {
+        0
+    } else {
+        err::EINVAL
+    }
+}
+
+/// `io_submit(ctx, nr, iocbs)` — submit `nr` requests.
+///
+/// Each `iocb` is executed **inside this call** and its completion queued (the
+/// module header gives that scope and why it is still a real completion queue).
+/// The door validates in Linux's order, measured
+/// (`build/scratch/opathmmap/aio2.c`): the context, then the array, then each
+/// `iocb` in turn - a bad descriptor is that `iocb`'s `EBADF`, an unknown
+/// opcode is `EINVAL` (opcode 99), and **a failure part-way leaves the earlier
+/// requests done**, which is what Linux's answer of "the count submitted" means.
+pub fn handle_io_submit(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (ctx, nr, iocbs) = (args[0], args[1], args[2]);
+    let Some(context) = crate::vfs::aio::context(ctx as u64) else {
+        return err::EINVAL;
+    };
+    if nr > crate::vfs::aio::max_submit() {
+        return err::EINVAL;
+    }
+    if nr == 0 {
+        return 0;
+    }
+    if !buffer_ok(iocbs, nr * 8, false, from_user) {
+        return err::EFAULT;
+    }
+    let mut submitted = 0isize;
+    for index in 0..nr {
+        let slot = iocbs + index * 8;
+        let iocb_ptr = unsafe { (slot as *const usize).read_unaligned() };
+        if iocb_ptr == 0 || !buffer_ok(iocb_ptr, crate::vfs::aio::IOCB_BYTES, false, from_user) {
+            return if submitted > 0 {
+                submitted
+            } else {
+                err::EFAULT
+            };
+        }
+        if !context.has_room() {
+            return if submitted > 0 {
+                submitted
+            } else {
+                err::EAGAIN
+            };
+        }
+        match submit_one(context.as_ref(), iocb_ptr, from_user) {
+            Ok(()) => submitted += 1,
+            Err(e) => {
+                // A failure part-way answers the count already submitted, which
+                // is Linux's contract for a batch.
+                if submitted > 0 {
+                    return submitted;
+                }
+                return e;
+            }
+        }
+    }
+    submitted
+}
+
+/// Execute one `iocb` and queue its completion.
+fn submit_one(
+    context: &crate::vfs::aio::AioContext,
+    iocb_ptr: usize,
+    from_user: bool,
+) -> Result<(), isize> {
+    use crate::vfs::aio;
+    let read = |off: usize| unsafe { ((iocb_ptr + off) as *const u64).read_unaligned() };
+    let data = read(0);
+    // The offsets are **measured**, not read off the header's field order:
+    // `aio_key` and `aio_rw_flags` share the word at 8 on a little-endian
+    // machine, so `aio_lio_opcode` sits at **16** and `aio_fildes` at **20**,
+    // not at 8 and 16. A first draft used the field order and read the opcode
+    // out of `aio_rw_flags`, which made every `iocb` an unknown opcode
+    // (`build/scratch/opathmmap/aio2.c`'s `offsetof` run is the reference:
+    // data 0, key 8, rw_flags 12, opcode 16, reqprio 18, fildes 20, buf 24,
+    // nbytes 32, offset 40, and the struct is 64 bytes).
+    let opcode = unsafe { ((iocb_ptr + 16) as *const u16).read_unaligned() };
+    let fildes = unsafe { ((iocb_ptr + 20) as *const i32).read_unaligned() };
+    let buf = read(24);
+    let nbytes = read(32);
+    let offset = read(40) as i64;
+    let iocb = aio::Iocb {
+        data,
+        opcode,
+        fildes,
+        buf,
+        nbytes,
+        offset,
+    };
+    // The operation is the caller's `iocb`, and the *result* is what the event's
+    // `res` carries: a byte count on success, a negated errno on failure - both
+    // are what Linux puts there, and it is why an `io_submit` that fails a
+    // descriptor still queues an event rather than refusing the call.
+    let res: i64 = match iocb.opcode {
+        aio::IOCB_CMD_PREAD | aio::IOCB_CMD_PWRITE => {
+            let len = stream_len(iocb.nbytes as usize);
+            if len == 0 {
+                0
+            } else {
+                let writable = iocb.opcode == aio::IOCB_CMD_PREAD;
+                if !buffer_ok(iocb.buf as usize, len, writable, from_user) {
+                    let _ = context.push(aio::Event {
+                        data: iocb.data,
+                        obj: iocb_ptr as u64,
+                        res: -(err::EFAULT as i64),
+                        res2: 0,
+                    });
+                    return Ok(());
+                }
+                // **A bad descriptor fails the `io_submit` itself.** Measured
+                // (`build/scratch/opathmmap/aio4.c`): `io_submit` with
+                // `aio_fildes = 9999` answers `-1`/`EBADF` and queues no event -
+                // a first draft queued a completion carrying `-EBADF` in `res`,
+                // which is the shape for a request that *failed after being
+                // accepted*, not for one the call refused. The distinction
+                // matters to a caller: an event means "the request ran", so a
+                // refusal dressed as an event tells it work happened.
+                let file = match crate::sched::current_fds().clone_at(iocb.fildes) {
+                    Ok(file) => file,
+                    Err(e) => return Err(err_of(e)),
+                };
+                let ptr = iocb.buf as usize;
+                let bytes = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+                let answer = if writable {
+                    file.inode().read_at(iocb.offset.max(0) as u64, bytes)
+                } else {
+                    let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                    file.inode().write_at(iocb.offset.max(0) as u64, src)
+                };
+                match answer {
+                    Ok(n) => n as i64,
+                    Err(e) => -(err_of(e) as i64),
+                }
+            }
+        }
+        // **Every other opcode is `EINVAL`, and the measurement is why this
+        // list is shorter than the header suggests.** Linux 7.3.4 on this host
+        // serves `PREAD` and `PWRITE` (and `PREADV` given a real iovec); it
+        // answers `EINVAL` for `FSYNC`, `FDSYNC`, `POLL` and `NOOP`
+        // (`build/scratch/opathmmap/aio3.c`). A first draft served `FSYNC`,
+        // `FDSYNC` and `NOOP` because their names suggest work a synchronous
+        // kernel can do - and that would have been a *success* for calls Linux
+        // refuses, which is the one thing `AGENTS.md` §3.2 forbids. The two
+        // served opcodes are the two measured to be served.
+        _ => return Err(err::EINVAL),
+    };
+    context
+        .push(aio::Event {
+            data: iocb.data,
+            obj: iocb_ptr as u64,
+            res,
+            res2: 0,
+        })
+        .map_err(|_| err::EAGAIN)
+}
+
+/// `io_getevents(ctx, min_nr, nr, events, timeout)` — drain completions.
+///
+/// Measured (`aio2.c`): the answer is how many were taken, a `min_nr` larger
+/// than what is queued still returns what *is* queued (a zero timeout), and a
+/// handle naming no context is `EINVAL`.
+///
+/// The timeout is accepted and not waited on: this context's completions are
+/// never deferred, so there is nothing to wait *for* - anything submitted has
+/// already completed. A caller that asked for more than is queued gets a short
+/// answer, which is Linux's own behaviour at a zero timeout.
+pub fn handle_io_getevents(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (ctx, _min_nr, nr, events) = (args[0], args[1], args[2], args[3]);
+    let Some(context) = crate::vfs::aio::context(ctx as u64) else {
+        return err::EINVAL;
+    };
+    if nr > 0x1000 {
+        return err::EINVAL;
+    }
+    if nr == 0 {
+        return 0;
+    }
+    if events == 0
+        || !buffer_ok(
+            events,
+            nr * crate::vfs::aio::IO_EVENT_BYTES,
+            true,
+            from_user,
+        )
+    {
+        return err::EFAULT;
+    }
+    let mut out = alloc::vec::Vec::new();
+    let n = context.drain(nr, &mut out);
+    for (index, event) in out.iter().enumerate() {
+        let at = events + index * crate::vfs::aio::IO_EVENT_BYTES;
+        unsafe {
+            (at as *mut u64).write_unaligned(event.data);
+            ((at + 8) as *mut u64).write_unaligned(event.obj);
+            ((at + 16) as *mut i64).write_unaligned(event.res);
+            ((at + 24) as *mut i64).write_unaligned(event.res2);
+        }
+    }
+    n as isize
+}
+
 /// `tee(fd_in, fd_out, len, flags)` — copy a pipe's bytes into another pipe
 /// **without consuming the source**.
 ///

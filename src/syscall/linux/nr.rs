@@ -239,6 +239,12 @@ mod tests {
         assert_eq!(TEE, 276);
         assert_eq!(VMSPLICE, 278);
         assert_eq!(RT_TGSIGQUEUEINFO, 297);
+        // The legacy AIO family: a context handle, not a ring.
+        assert_eq!(IO_SETUP, 206);
+        assert_eq!(IO_DESTROY, 207);
+        assert_eq!(IO_GETEVENTS, 208);
+        assert_eq!(IO_SUBMIT, 209);
+        assert_eq!(IO_PGETEVENTS, 333);
         assert_eq!(MEMBARRIER, 324);
         // The POSIX message-queue family, whose numbers are consecutive on both
         // machines - a transcription error here is a family that silently

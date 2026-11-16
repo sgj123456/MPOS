@@ -52,6 +52,13 @@ pub const IOPRIO_GET: u64 = 31;
 pub const TEE: u64 = 77;
 /// See the x86_64 table: the same call, its own number.
 pub const RT_TGSIGQUEUEINFO: u64 = 240;
+/// The legacy AIO family, asm-generic numbering.
+pub const IO_SETUP: u64 = 0;
+pub const IO_DESTROY: u64 = 1;
+pub const IO_GETEVENTS: u64 = 4;
+pub const IO_SUBMIT: u64 = 2;
+pub const IO_CANCEL: u64 = 3;
+pub const IO_PGETEVENTS: u64 = 292;
 /// See the x86_64 table: the same call, its own number.
 pub const VMSPLICE: u64 = 75; // 59 on x86_64
 pub const EXIT: u64 = 93; // 60 on x86_64

@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **309** x86_64
-syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **309** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **314** x86_64
+syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **314** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **every one** of them - 309 arms, no orphans, measured 2026-11-16 - plus a
+explicit arm for **every one** of them - 314 arms, no orphans, measured 2026-11-16 - plus a
 `_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
@@ -332,6 +332,11 @@ A call absent from those is served as its phase section records.
 | `fchmodat2` | 452 | fs | 452 |
 | `userfaultfd` | 323 | userfaultfd | 282 |
 | `io_uring_setup` | 425 | io_uring | 425 |
+| `io_setup` | 206 | fs | 0 |
+| `io_destroy` | 207 | fs | 1 |
+| `io_submit` | 209 | fs | 2 |
+| `io_getevents` | 208 | fs | 4 |
+| `io_pgetevents` | 333 | fs | 292 |
 | `io_uring_enter` | 426 | " | " |
 | `io_uring_register` | 427 | " | " |
 | `sync_file_range` | 277 | fs | 84 |

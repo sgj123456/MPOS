@@ -56,6 +56,21 @@ pub const TEE: u64 = 276;
 /// each other, so a tgid and a tid from different groups is `ESRCH`. Never
 /// declared here until item 316, so the dispatch answered `ENOSYS`.
 pub const RT_TGSIGQUEUEINFO: u64 = 297;
+/// The legacy **POSIX AIO** family (Linux's own, not the glibc thread pool):
+/// `io_setup`, `io_destroy`, `io_submit`, `io_getevents`, `io_cancel`.
+///
+/// It is *not* `io_uring`: that is a ring of shared memory (number 425, served
+/// since item 115), and this is a context handle plus `iocb` pointers. A kernel
+/// may serve either, both or neither; all five were undeclared here until item
+/// 317, so a libaio caller heard `ENOSYS` from the first of them.
+pub const IO_SETUP: u64 = 206;
+pub const IO_DESTROY: u64 = 207;
+pub const IO_GETEVENTS: u64 = 208;
+pub const IO_SUBMIT: u64 = 209;
+pub const IO_CANCEL: u64 = 210;
+/// The `io_getevents` spelling with no `sigset_t` argument. Distinct because
+/// the older glibc emitted it and because its register shape differs by one.
+pub const IO_PGETEVENTS: u64 = 333;
 /// `vmsplice(2)`: graft user memory into a pipe, or drain a pipe into user
 /// memory. The last of item 310's four census calls. Never declared here until
 /// item 313, so the dispatch answered `ENOSYS`.
