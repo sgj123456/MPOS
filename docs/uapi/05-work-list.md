@@ -13251,3 +13251,24 @@ the honest limit of a write-through driver and is recorded on the method.
 as a pair rather than half-serving them), and a rename across mounts is `EXDEV` for
 a file and refused by the same comparison for a directory — `move_mount(2)` is the
 call that would do it and is not implemented.
+
+## Item 308 — `RENAME_EXCHANGE` swaps two names, and neither name moves (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What §6.186 left** | "`RENAME_EXCHANGE` and `RENAME_WHITEOUT` remain `EINVAL` … the door refuses both flag bits as a pair rather than half-serving them." With the directory rename landed, the first became servable. |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/{rex,rex2,rex3,rex5}.c`): two files exchange; onto a **missing** name it is **`ENOENT`** where a plain rename would create it; a **file and a directory** exchange and the subtree follows the name; two directories in **two parents** exchange; an exchanged directory keeps **the `..` it had**; `EXCHANGE\|NOREPLACE` and `EXCHANGE\|WHITEOUT` are `EINVAL`; a name exchanged with itself is `0`. |
+| **The `..` row is the finding — and a first draft got it wrong** | This looks like a rename and is not one: **both names stay where they are**, only the inode behind each changes. No parent is rewritten, no subtree follows, and §6.186's whole problem does not arise. The draft answered `EXDEV` for a cross-directory exchange — "the two parents would each have to learn what the other lost" — and they do not, because nothing left either directory. **The same shape of error as §6.186's own**, produced by the item that fixed it. |
+| **Two primitives** | `Inode::exchange_children(a, b)` and `Inode::exchange_with(a, other, b)`, both defaulting to `Unsupported`, because one directory's swap and two directories' swap are different accounting. The syscall arm asks `may_remove` on both name edges and `may_create_in` on both directories, refuses an exchange that would put a directory inside itself (`subtree_contains`), and emits **two** `IN_MOVED_*` pairs with their own cookies. |
+| **The implementations** | ramfs: four `BTreeMap` edits, subtree needs nothing. ext4: four-byte dirent edits ordered for the crash window — clear **both** entries to `0` (the zero inode a walk skips), then point each at the other's original inode, so an interruption leaves a name pointing at nothing rather than two names for one node. |
+| **`RENAME_WHITEOUT` stays refused, measured** | Not unimplemented: Linux moves the name and leaves a **character device with `rdev 0`** at the old one — an overlayfs whiteout. No overlay mount here has anything that could read one, and `mknod` of a char device is `ENXIO` because no driver stands behind any number, so creating one would be an object nothing in the tree can interpret. |
+| **Pins** | `t-renameat2` **+17**: both directions read back, `ENOENT` with nothing moved, the two pair refusals, the self-exchange no-op, the file↔directory swap with its subtree, the cross-directory file exchange, and the cross-directory **directory** exchange whose `..` claim is the one a "swap inodes and reparent" implementation would fail. |
+| **Gate** | `build/gate-item308.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**; stage 2 **324** x86_64 / **320** aarch64, `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. Green first try. |
+
+**What this does not do, named.** `RENAME_WHITEOUT` is still `EINVAL` and should
+carry **`EOPNOTSUPP`** (a small change to the flag gate, not made here).
+`EXCHANGE` across two filesystems answers `CrossDevice` on ext4 and refuses a
+non-ramfs partner on ramfs, which matches `EXDEV` but is **not pinned** — two
+mounts of different types are not a fixture a default sweep can make. And
+**`move_mount(2)`**, the call that would exchange across mounts, is
+unimplemented.
