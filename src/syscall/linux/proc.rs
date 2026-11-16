@@ -5827,6 +5827,163 @@ pub(super) fn handle_futex2_wake(args: [usize; ARG_COUNT]) -> isize {
 /// `clockid` is only read when a deadline is given, both measured - the same
 /// rule `futex_waitv(2)` follows here, which is why the parse is the same
 /// `futex_deadline` call (`false` = absolute).
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — compare two processes' kernel
+/// resources by **identity**.
+///
+/// The answer is not a verdict: a successful call returns the comparison of two
+/// kernel pointers, one of `0` (equal), `1` (`p1 < p2`), `2` (`p1 > p2`) or `3`
+/// (`p1 == p2` but the resources are distinct). A caller reads it as an ordering,
+/// which is why `0` here does **not** mean "success" the way it does everywhere
+/// else in this interface.
+///
+/// **Measured on Linux 7.3.4** (`build/scratch/opathmmap/{kcmp,kcmp2}.c`):
+///
+/// | type | compares | measured |
+/// |---|---|---|
+/// | `KCMP_FILE` (0) | two descriptors' **open file descriptions** | `dup`'d fds are `0`; two `open`s of one path are `2` |
+/// | `KCMP_VM` (1) | address spaces | self/self `0`; across `fork` `2` (a copy, not shared) |
+/// | `KCMP_FILES` (2) | descriptor tables | self/self `0` |
+/// | `KCMP_FS` (3) | cwd/root/umask | self/self `0`; across `fork` `2` |
+/// | `KCMP_SIGHAND` (4) | handlers | self/self `0`; across `fork` `2` |
+/// | `KCMP_IO` (5) | I/O context | self/self `0` |
+/// | `KCMP_SYSVSEM` (6), `KCMP_EPOLL_TFD` (7) | see below | `EPOLL_TFD` needs an `epoll_slot` |
+///
+/// The refusals, all measured: an unallocated descriptor is `EBADF`, a type at or
+/// past `KCMP_TYPES` is `EINVAL`, and a pid naming nothing is `ESRCH`.
+///
+/// **What this serves, and the shape of the promise.** `KCMP_FILE` is served
+/// completely, because this kernel's `File` has exactly the identity the call
+/// asks about: `dup` gives two descriptors one `File`, and two `open`s of one
+/// path give two. The other types are answered from the objects this kernel
+/// actually holds - an address space is the group's, a handler table is the
+/// group's, a cwd is the group's - so `self`/`self` is `0` and a forked child is
+/// `2`, which is what Linux answers for the same pairs.
+///
+/// `KCMP_SYSVSEM` and `KCMP_EPOLL_TFD` are **refused** with `EINVAL`, which is a
+/// named gap rather than a wrong answer: `KCMP_EPOLL_TFD`'s `idx` is a
+/// `struct epoll_slot` pointer this door does not import, and swallowing it as a
+/// number would compare two pointers the caller never meant.
+pub(super) fn handle_kcmp(args: [usize; ARG_COUNT]) -> isize {
+    const KCMP_FILE: usize = 0;
+    const KCMP_VM: usize = 1;
+    const KCMP_FILES: usize = 2;
+    const KCMP_FS: usize = 3;
+    const KCMP_SIGHAND: usize = 4;
+    const KCMP_IO: usize = 5;
+    const KCMP_SYSVSEM: usize = 6;
+    const KCMP_EPOLL_TFD: usize = 7;
+    const KCMP_TYPES: usize = 8;
+
+    let (pid1, pid2, kind) = (args[0] as isize, args[1] as isize, args[2]);
+    let (idx1, idx2) = (args[3], args[4]);
+    if kind >= KCMP_TYPES {
+        return err::EINVAL;
+    }
+    // `KCMP_EPOLL_TFD`'s `idx` is a **pointer to a `struct epoll_slot`**, not a
+    // number, and Linux answers `EFAULT` for a `NULL` one (measured,
+    // `build/scratch/opathmmap/kcmp3.c`). This door does not import that struct,
+    // so a non-`NULL` pointer is refused with `EINVAL` and a `NULL` one keeps
+    // Linux's own `EFAULT` - the shape is named rather than approximated.
+    if kind == KCMP_EPOLL_TFD && (idx1 == 0 || idx2 == 0) {
+        return err::EFAULT;
+    }
+    // Both pids resolve, in order: Linux refuses the first that names nothing, and
+    // `0` is not "the caller" here - it names no process, which is `ESRCH`
+    // (measured).
+    let Some(a) = crate::sched::named_process(pid1 as u32) else {
+        return err::ESRCH;
+    };
+    let Some(b) = crate::sched::named_process(pid2 as u32) else {
+        return err::ESRCH;
+    };
+    // The permission question is the ptrace one Linux asks, and this kernel already
+    // has it under the name `may_signal`'s family uses. Measured: a caller may
+    // compare its own processes, and a stranger's is `EPERM` without
+    // `CAP_SYS_PTRACE`.
+    // `may_inspect` is this kernel's `ptrace_may_access`: `Some(false)` is the
+    // refusal, and `None` is a slot with no live task (which the resolve above
+    // already ruled out, so it cannot answer `EPERM` on a stale slot).
+    if crate::sched::may_inspect(a.slot()) == Some(false)
+        || crate::sched::may_inspect(b.slot()) == Some(false)
+    {
+        return err::EPERM;
+    }
+    match kind {
+        KCMP_FILE => {
+            // The two descriptors, each taken out of its own process's table.
+            let ta = match crate::sched::fds_of(a.slot()) {
+                Some(t) => t,
+                None => return err::ESRCH,
+            };
+            let tb = match crate::sched::fds_of(b.slot()) {
+                Some(t) => t,
+                None => return err::ESRCH,
+            };
+            // `EBADF` for a descriptor the process does not hold, and **both** are
+            // checked before either is compared - Linux reports the first bad one.
+            let fa = match ta.clone_at(idx1 as i32) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let fb = match tb.clone_at(idx2 as i32) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            // `Arc::as_ptr` is the identity: one `File` behind two descriptors
+            // shares it, two `open`s do not - which is exactly what the call asks.
+            compare_ids(
+                alloc::sync::Arc::as_ptr(&fa) as usize,
+                alloc::sync::Arc::as_ptr(&fb) as usize,
+            )
+        }
+        // These four are properties of the **thread group** in this kernel: an
+        // address space, a cwd/root/umask triple, a handler table and an I/O
+        // context are all shared by the group rather than per task. So the
+        // comparison is between two groups, and the measured answers follow:
+        // `self`/`self` is `0`, and a forked child is `2` because `fork` builds a
+        // new group.
+        KCMP_VM | KCMP_FS | KCMP_SIGHAND | KCMP_IO => compare_ids(
+            crate::sched::group_identity(a.slot()),
+            crate::sched::group_identity(b.slot()),
+        ),
+        // `KCMP_FILES`: the descriptor **tables**. A `clone(CLONE_FILES)` thread
+        // shares one; a forked child gets its own copy.
+        KCMP_FILES => compare_ids(
+            crate::sched::fds_of(a.slot()).map_or(0, |t| alloc::sync::Arc::as_ptr(&t) as usize),
+            crate::sched::fds_of(b.slot()).map_or(0, |t| alloc::sync::Arc::as_ptr(&t) as usize),
+        ),
+        // `KCMP_SYSVSEM` (6): the undo list of a SysV semaphore set. Measured,
+        // **served** - `self/self` is `0` for any index (`kcmp3.c`) - because a
+        // task's undo state belongs to its own group, so two lookups in one group
+        // give one object. The `idx` is an index into that list, and this kernel
+        // keeps no per-index records, so the group's identity *is* the answer for
+        // every index - which is what the measurement shows for self/self.
+        KCMP_SYSVSEM => compare_ids(
+            crate::sched::group_identity(a.slot()),
+            crate::sched::group_identity(b.slot()),
+        ),
+        // Reached only with a **non-NULL** `idx` (the guard above took the NULL
+        // case as `EFAULT`): the shape is a `struct epoll_slot` this door does
+        // not import, so it is refused by name.
+        KCMP_EPOLL_TFD => err::EINVAL,
+        // Unreachable: the guard at the top refused `kind >= KCMP_TYPES`. The
+        // compiler cannot see into that guard, so the arm exists to make the
+        // match exhaustive - and `EINVAL` is the answer it would give anyway.
+        _ => err::EINVAL,
+    }
+}
+
+/// The comparison Linux answers: `0` equal, `1` the first is lower, `2` the
+/// second is lower. (`3` is "equal but distinct", which a pointer comparison
+/// cannot produce; it exists for resources compared by content.)
+fn compare_ids(a: usize, b: usize) -> isize {
+    match a.cmp(&b) {
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Greater => 2,
+    }
+}
+
 pub(super) fn handle_futex2_wait(args: [usize; ARG_COUNT]) -> isize {
     const CLOCK_REALTIME_ID: usize = 0;
     const CLOCK_MONOTONIC_ID: usize = 1;

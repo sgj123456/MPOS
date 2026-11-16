@@ -247,6 +247,8 @@ mod tests {
         assert_eq!(IO_PGETEVENTS, 333);
         // The legacy directory reader, one byte of header apart from its twin.
         assert_eq!(GETDENTS, 78);
+        // Identifies a resource across two processes; its answer is an ordering.
+        assert_eq!(KCMP, 312);
         assert_eq!(MEMBARRIER, 324);
         // The POSIX message-queue family, whose numbers are consecutive on both
         // machines - a transcription error here is a family that silently

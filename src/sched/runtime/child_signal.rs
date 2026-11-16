@@ -677,6 +677,36 @@ pub fn identity_of(id: TaskId) -> Option<Identity> {
 /// and refused (`EPERM`), `Some(true)` when it may be inspected. A task always
 /// passes for its own thread group, so a thread reading its own memory through
 /// `process_vm_*` is unaffected.
+/// The descriptor table a task holds, for `kcmp`'s `KCMP_FILE` and `KCMP_FILES`.
+///
+/// The `Arc` **is** the identity, which is what makes this the right accessor for
+/// a call whose answer is a pointer comparison: `dup` puts one `Arc<File>` in two
+/// slots, two `open`s put two, and a `clone(CLONE_FILES)` thread shares the whole
+/// table while a forked child gets a copy. Answering with a bool instead would
+/// lose the distinction `KCMP_FILES` is asked for.
+pub fn fds_of(target: TaskId) -> Option<alloc::sync::Arc<crate::vfs::file::FdTable>> {
+    with_table(|t| {
+        let task = t.tasks.get(target.0).and_then(Option::as_ref)?;
+        if task.exited {
+            return None;
+        }
+        Some(task.fds.clone())
+    })
+}
+
+/// The thread group a slot belongs to, or the slot itself when it is a group
+/// leader with nobody else in it.
+///
+/// `kcmp`'s `KCMP_VM`/`KCMP_FS`/`KCMP_SIGHAND`/`KCMP_IO` all compare a
+/// **group-owned** object in this kernel: an address space, a cwd/root/umask
+/// triple, a handler table and an I/O context are shared by the group rather than
+/// held per task. So the identity to compare is the group's, and `self`/`self` is
+/// equal while a forked child is not - which is what Linux answered for the same
+/// pairs (`build/scratch/opathmmap/kcmp2.c`).
+pub fn group_identity(target: TaskId) -> usize {
+    thread_group_of(target).unwrap_or(target).0
+}
+
 pub fn may_inspect(target: TaskId) -> Option<bool> {
     with_table(|t| {
         let me = t.current;

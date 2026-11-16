@@ -143,6 +143,14 @@ pub const GETDENTS64: u64 = 217;
 /// one, and a caller reading its buffer with `struct dirent64` reads the name one
 /// byte early. Never declared here until item 318.
 pub const GETDENTS: u64 = 78;
+/// `kcmp(2)` — compare two processes' kernel resources by identity.
+///
+/// Its answer is **not** an errno-shaped `0`-for-success: a successful call
+/// returns the pointer comparison's result, one of `0`/`1`/`2`/`3`, so a caller
+/// reads it as an ordering rather than as a verdict. Never declared here until
+/// item 319, so the dispatch answered `ENOSYS` - and `checkpoint/restore` tools
+/// and `criu` are the callers that ask.
+pub const KCMP: u64 = 312;
 /// `sendfile(out, in, offset, count)`: copy bytes between descriptors in the
 /// kernel. Something in the init path asks for it once.
 pub const SENDFILE: u64 = 40;
