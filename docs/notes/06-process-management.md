@@ -17351,9 +17351,10 @@ failure too, which is stage 1's verdict and not a second defect.
    not pinned, and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` remain unimplemented
    (`EINVAL` from the table's default) rather than misrefused - named there, still
    named here.
-3. **`syncfs`** takes a descriptor too and was not swept; it is `ENOSYS` here
-   rather than refused for an `O_PATH` one, so it belongs with the unimplemented
-   family rather than this one.
+3. **`syncfs`** — CLOSED by §6.184, and the sentence here was **wrong**: it said
+   `syncfs` is `ENOSYS` here, and the dispatch arm has existed all along. Only the
+   `O_PATH` check was missing, and the door is not "regular files only" (a pipe's
+   `syncfs` is served). See §6.184.
 4. **The `open`-side permission rule has no pin of its own - CLOSED by §6.183.**
    The original sentence here said the claim "needs a file the guest's payload may
    not read - which the sweep's root payload cannot make without a second uid", and
@@ -17444,11 +17445,162 @@ separates a pin from a signal. Restored by copying the saved fixed file back
 failed` per arm; six-arm clippy ratchet unchanged at `162/168/389/272/3/1`, both
 workspaces formatted.
 
-**What this does not do, named.** The `0000`-directory case (a path inside a
-directory whose search bit the caller lacks is `EACCES` even under `O_PATH`) is
-measured and **not** claimed: the fixture would need a directory the sweep's own
-payload then has to clean up as `nobody`, and one `chmod` from the parent is not
-enough to make the child's refusal unambiguous. The three remaining §6.182 gaps are
-unchanged and still named: `linkat(AT_EMPTY_PATH)` is a missing door, `syncfs` is
-`ENOSYS` rather than misrefused, and `fcntl`'s ordinary-descriptor half is unpinned
-with `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` unimplemented.
+**What this does not do — and all of it was closed by §6.184.** The
+`0000`-directory case was claimed there (the parent makes the directory `0000`
+*before* the fork, so the child never changes a mode it does not own — the cleanup
+objection recorded here was an imagined one). The three remaining §6.182 gaps were
+closed too: `linkat(AT_EMPTY_PATH)` landed, `syncfs`'s `O_PATH` check landed (and
+the "`ENOSYS`" here was false), and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` are
+implemented and pinned. What survives from this paragraph is only what §6.184 names:
+the `F_SETLEASE`/`CAP_LEASE` family is still unswept.
+
+## §6.184 the five door-shaped gaps the `O_PATH` family left open - all of them, in one pass (item 305, LANDED 2026-11-16)
+
+**What §6.182 and §6.183 left, and it was five separate things.** Item 303's gap
+list named four, item 304's closed one of its own and left three of 303's standing,
+and one of item 303's four had already been stated **wrongly**. §6.184 is the pass
+that closes all of them, and two of the five were wrong claims rather than undone
+work - which is the reason they are worth writing down together.
+
+### `syncfs` was never `ENOSYS` - it was dispatched, and it served `O_PATH`
+
+Item 303 wrote: "**`syncfs`** takes a descriptor too and was not swept; it is `ENOSYS`
+here rather than refused for an `O_PATH` one, so it belongs with the unimplemented
+family." The first clause of that sentence was false: `nr::SYNCFS => fs::handle_syncfs`
+has been in the dispatch, and the handler checked the descriptor and answered 0.
+Measured on Linux 7.3.4 (`build/scratch/opathmmap/gaps.c`):
+
+| call | Linux |
+|---|---|
+| `syncfs(missing)` | `EBADF` |
+| `syncfs(O_PATH)` | **`EBADF`** |
+| `syncfs(pipe)` | **0** |
+
+The last row is the one that decides the shape: `syncfs` is `fdget` then
+`sync_filesystem(file_inode(file)->i_sb)`, and a pipe's file **has** an `i_sb`, so
+the door cannot be "is this a regular file". The rule is the `O_PATH` question and
+nothing else, which is why the handler grew exactly that check and the pin carries
+the pipe as its neighbour.
+
+A gap list is a claim about the code, and this one was checked against the dispatch
+table for the first time here. **The lesson is not "syncfs was easy" - it is that
+"unimplemented" and "not swept" are two different sentences and the note had
+conflated them.**
+
+### `linkat(fd, "", …, AT_EMPTY_PATH)` - the one door that names an unnamed file
+
+Item 303 called this "a missing **door**, not a wrong answer" and left it, on the
+grounds that `apk` reaches the same end through `/proc/self/fd/N`. That reasoning is
+sound about `apk` and wrong about the ABI: this is the only call that gives a file
+with **no name at all** one, which is what `O_TMPFILE` authors use and what
+`shm_open`-style code expects.
+
+Measured (`build/scratch/opathmmap/{p,q2,gaps}.c`): served for an **`O_PATH`**
+descriptor and for an ordinary one; a **non-empty** name beside the flag is
+`ENOTDIR` (20) - the flag says the name is empty, so a caller giving one is
+describing a walk its source is not; without the flag an empty name is `ENOENT`; an
+unknown flag bit is `EINVAL` and outranks the names; a bad descriptor is `EBADF` and
+outranks the empty name; `AT_SYMLINK_FOLLOW` may ride along. The
+`CAP_DAC_READ_SEARCH` requirement the man page states is **not** observed on a file
+the caller owns (uid 1000 linking its own file answers 0), so the door asks what
+Linux's `vfs_link` asks - the destination directory's write bit and the inode's own
+flags - rather than a capability the measurement does not support.
+
+**The EXDEV comparison cost a round, and the lesson is item 298's.** The first
+version asked `fs_serving_inode_of` on both inodes, on the reading that the inline
+door's `via_descriptor` branch does. On the guest **every link came back `EXDEV`**.
+The reason: `MountTable::fs_serving_inode` matches an inode only when it *is* a
+mount's root and otherwise falls back to `root_fs`, so a plain file and a plain
+directory each answered "the root filesystem" through two separately-built `Arc`s
+and `Arc::ptr_eq` said no. A node inside a mount cannot say which filesystem it
+belongs to; **a path can**, so the comparison uses the descriptor's recorded
+`File::label`. A descriptor that has no path (an `O_TMPFILE`, a `memfd`) keeps the
+inode question, and there the fallback **accepts** rather than refusing: it is on
+the filesystem its root was made under, and refusing would break the one caller
+shape the door exists for. This is the second time in this family that a
+descriptor-shaped EXDEV check has been written from the inode and failed; the note
+in §6.71a's neighbourhood records the first.
+
+### `F_GETOWN`/`F_SETOWN` - the state was missing, not the door
+
+Item 300 named these as "**unimplemented**, falling through the `fcntl` table's
+default arm", and correctly distinguished that from misrefused. They are implemented
+now, and the shape is the interesting part:
+
+* the recipient is the **description's** (`File::f_owner`), so a `dup` shares it and
+  a second `open` of the same file has its own - measured
+  (`build/scratch/opathmmap/gaps2.c`): set a pid on one, `F_GETOWN` on a `dup` reads
+  it, on a fresh `open` reads 0;
+* what is **stored** is what `F_GETOWN` reports, not the argument. A **negative**
+  (process-group) target, `0` and `-1` all read back **0**; a positive pid reads
+  itself. Storing the argument would make `F_GETOWN` name a group by its number - a
+  target no delivery door here could reach;
+* a number naming no process is `ESRCH` **whichever sign it carried** (measured:
+  `99999` and `-99999` both), so the existence check runs for both;
+* an `O_PATH` descriptor is `EBADF` from both, like the lock family beside them.
+
+### `F_GETPIPE_SZ`/`F_SETPIPE_SZ` - a capacity that was a constant
+
+Also item 300's. The pipe's capacity was a `const CAPACITY` static to the ring, so
+the pair could not have been served honestly: it moved onto `PipeState`, where both
+ends and every `dup` share one number - Linux's own shape (`pipe_inode_info`'s
+`max_usage`). Measured (`build/scratch/opathmmap/gaps2.c`): default `65536`; a
+request below a page rounds **up** to `4096`; `4097` reads back `8192`; a **shrink
+is honoured** (`1048576 -> 4096` reads 4096); past `pipe-max-size` (1 MiB) is
+`EPERM` without `CAP_SYS_RESOURCE`; and a regular file, an `O_PATH` descriptor or
+anything else that is not a pipe is **`EBADF`**, not `EINVAL`.
+
+The clamp lives in `PipeEnd::set_capacity` (round up to a page, refuse above the
+ceiling), and the ring's four bounds read `st.capacity` instead of the constant.
+
+### The `0000` directory: item 304's own named gap
+
+§6.183 closed with "the `0000`-directory case is measured but not claimed … the
+fixture would need a directory the payload then has to clean up as `nobody`". The
+cleanup was the imagined obstacle and it is not one: **the parent makes the
+directory `0000` before the fork** and restores `0755` before `remove_dir_all`, so
+the child never changes a mode it does not own. The claim is now the dropped
+child's third line - a path inside a `0000` directory is `EACCES` under `O_PATH`
+too, which is the half of the rule that survives the file's own mode being ignored.
+
+### Pins and counterfactual
+
+23 claims across three programs, all raw where the wrapper cannot express the claim
+(`rustix` has no `F_GETOWN` binding; its `AtFlags` has no `AT_EMPTY_PATH`):
+
+* `t-open-path` **+2** - `syncfs(O_PATH)` `EBADF` with the **pipe neighbour** (0)
+  that makes it the O_PATH question; the `0000`-directory line;
+* `t-link` **+8** - `AT_EMPTY_PATH` served on both descriptor shapes, the same
+  inode and `nlink` 2, and the four refusals plus the `AT_SYMLINK_FOLLOW` pair;
+* `t-fcntl` **+13** - the owner pair with its 0-reads-back, the `dup`/second-open
+  split, the two `ESRCH` signs, and the six pipe-sizing claims.
+
+Counterfactual: the five arms reverted, **kernel and loader rebuilt**, all three
+pins booted - **`syncfs` 1 red** (`rc=0`), **`linkat` 5 red** (`errno=2` on the
+served lines, `got 2` on the `EBADF` claim), **`fcntl` 12 red** (`-22` from
+`F_GETOWN`, `-1` from every `SETOWN` and the whole pipe-sizing block). Each red is
+its own wrong answer rather than a shared one, which is what says the pins are
+five pins and not one.
+
+### Gate
+
+`build/gate-item305.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host
+tests 0 failed; stage 2 **324** programs over 6 lanes on x86_64 and **320** on
+aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42 passed, 0 failed` per
+arm; six-arm clippy ratchet as amended (host `dead_code` **336 → 340**, with the
+measurement on the constant). **`unreachable_patterns` and `non_snake_case`
+appeared on the first clippy run**, and the cause is the trap `abi.rs`'s own doc
+comment warns about one screen above the constants: the four new `fcntl` command
+names were **not imported into `fs/file.rs`**, so each arm's pattern was a **fresh
+binding matching every value** and every `fcntl` command was routed through
+`F_GETOWN`'s arm. The pin for that hazard is `F_DUPFD_CLOEXEC`'s value test; the
+fault this time was the import, and it is why the constants' test block also grew
+four rows.
+
+**What this does not do, named.** The `F_SETPIPE_SZ` shrink case below what is
+already buffered was not measured - the capacity is documented as a ceiling on what
+may be **queued**, and the measurement covered `1048576 -> 4096` with an empty pipe
+only. And item 303's remaining named item is unchanged: `fcntl`'s
+ordinary-descriptor half is now pinned only where this item touched it
+(`F_GETOWN`/`F_SETOWN`/the pipe pair); `F_GETLEASE`/`F_SETLEASE` and `CAP_LEASE` were
+not swept and `F_SETLEASE` still falls to the default arm.

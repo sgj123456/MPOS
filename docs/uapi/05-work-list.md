@@ -13158,11 +13158,13 @@ now named in two places.
 on Linux** (measured: 0 on an `O_PATH` descriptor, with `AT_SYMLINK_FOLLOW` too)
 and this kernel's `linkat` has no such arm - a missing *door* rather than a wrong
 answer, and `apk` reaches the same end through `/proc/self/fd/N`, which is pinned.
-**`syncfs`** takes a descriptor and was not swept; it is `ENOSYS` here, so it
-belongs with the unimplemented family. **`fcntl`'s ordinary-descriptor half** is
-still unpinned and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` still unimplemented (named
-in item 300, still named). And **the open-side permission rule is pinned now**, by
-item 304 - this item's own sentence said it would need "a payload that runs as a
+**`syncfs`** — CLOSED by item 305, and the sentence here was **wrong**: it said
+`syncfs` is `ENOSYS`, and the dispatch arm has existed all along; only the `O_PATH`
+check was missing. **`fcntl`'s ordinary-descriptor half** and
+`F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` are closed by item 305 too (the owner pair is
+`File::f_owner`, the pipe pair reads a per-pipe capacity), leaving only the
+`F_SETLEASE`/`CAP_LEASE` family unswept. And **the open-side permission rule is
+pinned now**, by item 304 - this item's own sentence said it would need "a payload that runs as a
 second uid - which the sweep's root payload is not", and that was wrong twice over:
 the payload has forked to `nobody` since long before this item, and the reason it
 mattered is that a root payload can never see the divergence (`CAP_DAC_OVERRIDE`
@@ -13181,11 +13183,32 @@ that makes them load-bearing.
 | **Counterfactual** | The fix's `want = if path_only { 0 }` put back to always computing the mode, kernel **and** loader rebuilt, pin booted in the guest: **exactly one claim red** - `FAIL: and serves O_PATH on the same file ("secret rd=errno:13 path=errno:13")` - with all three neighbours green. The red *is* the regression (the open asking the file's mode and refusing a name-only descriptor), it is the only claim that moved, and a claim that fires on the right line and leaves its neighbours alone is what separates a pin from a signal. Restored from a saved copy (`git diff src/` empty), rebuilt, `PASS` on host and guest. |
 | **Gate** | `build/gate-item304.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed; stage 2 324 programs over 6 lanes on x86_64 and 320 on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42/0` per arm; clippy ratchet unchanged at `162/168/389/272/3/1`; both workspaces formatted. |
 
-**What this does not do, named.** The **`0000`-directory** case (a path inside a
-directory whose search bit the caller lacks is `EACCES` even under `O_PATH`) is
-measured and not claimed: the fixture would need a directory the payload then has to
-clean up as `nobody`, and one `chmod` from the parent does not make the child's
-refusal unambiguous. Item 303's other three gaps stand unchanged:
-**`linkat(AT_EMPTY_PATH)`** is a missing door, **`syncfs`** is `ENOSYS` rather than
-misrefused, and **`fcntl`'s ordinary-descriptor half** is unpinned with
-`F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` unimplemented.
+**What this did not do — all closed by item 305.** The **`0000`-directory** case is
+claimed there: the parent makes the directory `0000` *before* the fork, so the child
+never changes a mode it does not own, which is the objection recorded here and it
+was an imagined one. Item 303's other three gaps were closed in the same pass —
+`linkat(AT_EMPTY_PATH)` is served, `syncfs`'s `O_PATH` check landed (the "`ENOSYS`"
+named above was **false**), and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` are implemented
+and pinned. What survives is only `F_SETLEASE`/`CAP_LEASE`, unswept.
+
+## Item 305 — the five door-shaped gaps the `O_PATH` family left open, all in one pass (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What was left** | Item 303 named four and item 304 closed one of its own, leaving three of 303's standing — and **one of 303's four was stated wrongly**. This is the pass that closes all five. |
+| **`syncfs` was never `ENOSYS`** | Item 303 wrote "it is `ENOSYS` here rather than refused for an `O_PATH` one, so it belongs with the unimplemented family". The dispatch arm exists and the handler answered 0. Measured (`build/scratch/opathmmap/gaps.c`): missing → `EBADF`, `O_PATH` → **`EBADF`**, and **a pipe → 0** — Linux asks the file's superblock and a pipe's file has one, so the door cannot be "regular files only". The rule is the `O_PATH` question. *A gap list is a claim about the code; "unimplemented" and "not swept" are different sentences and the note had conflated them.* |
+| **`linkat(AT_EMPTY_PATH)` — the one door that names an unnamed file** | Item 303 left it as "a missing door, not a wrong answer", reasoning that `apk` reaches the same end through `/proc/self/fd/N`. True about `apk`, wrong about the ABI: this is the only call that gives a file with **no name at all** one, which `O_TMPFILE` authors use. Measured: served for `O_PATH` **and** ordinary descriptors; non-empty name beside the flag → `ENOTDIR`; without the flag → `ENOENT`; unknown flag bit → `EINVAL` (outranks names); bad descriptor → `EBADF` (outranks the empty name); `AT_SYMLINK_FOLLOW` may ride along. The man page's `CAP_DAC_READ_SEARCH` is **not** observed on a file the caller owns, so the door asks what Linux's `vfs_link` asks. |
+| **The EXDEV round** | The first version asked `fs_serving_inode_of` on both inodes — and on the guest **every link returned `EXDEV`**, because that fn matches only a mount's *root* and otherwise falls back to `root_fs`, so two plain nodes answered "the root filesystem" through two separately-built `Arc`s. **A node inside a mount cannot name its filesystem; a path can** — so the comparison uses the descriptor's recorded `File::label`, with the inode question kept for a descriptor that has no path (an `O_TMPFILE`, a `memfd`), where the fallback **accepts** rather than refusing. Second time in this family that a descriptor-shaped EXDEV check written from the inode has failed. |
+| **`F_GETOWN`/`F_SETOWN`** | Item 300 correctly named these "unimplemented, not misrefused". Now implemented with `File::f_owner`, and the shape is the finding: the recipient is the **description's** (a `dup` shares, a second open does not), and what is **stored** is what `F_GETOWN` reports rather than the argument — a negative (group) target, `0` and `-1` all read back **0**, a positive pid reads itself. A number naming no process is `ESRCH` **whichever sign it carried**. An `O_PATH` descriptor is `EBADF` from both. |
+| **`F_GETPIPE_SZ`/`F_SETPIPE_SZ`** | The capacity was a `const` static to the ring, so the pair could not be served honestly. It moved onto `PipeState`, where both ends and every `dup` share one number (Linux's `pipe_inode_info->max_usage`). Measured: default `65536`; below a page rounds **up** to `4096`; `4097` → `8192`; a **shrink is honoured**; past `pipe-max-size` (1 MiB) → `EPERM`; a non-pipe → **`EBADF`**, not `EINVAL`. |
+| **The `0000` directory (item 304's own gap)** | §6.183 closed with "the fixture would need a directory the payload then has to clean up as `nobody`" — the cleanup was the imagined obstacle and it is not one: **the parent makes the directory `0000` before the fork** and restores `0755` before `remove_dir_all`, so the child never changes a mode it does not own. A path inside it is `EACCES` under `O_PATH` too, which is the half of the rule that survives the file's mode being ignored. |
+| **Pins** | **23 claims across three programs**, raw where the wrapper cannot express the claim: `t-open-path` **+2** (`syncfs(O_PATH)` with its **pipe neighbour** 0, and the `0000`-directory line), `t-link` **+8**, `t-fcntl` **+13**. |
+| **Counterfactual** | The five arms reverted, **kernel and loader rebuilt**, all three pins booted: **`syncfs` 1 red** (`rc=0`), **`linkat` 5 red** (`errno=2` on each served line, `got 2` on the `EBADF` one), **`fcntl` 12 red** (`-22` from `F_GETOWN`, `-1` from every `SETOWN` and the whole pipe-sizing block). Every red is its own wrong answer, which is what says these are five pins and not one. |
+| **Gate** | `build/gate-item305.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed; stage 2 324 programs over 6 lanes on x86_64 and 320 on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42/0` per arm; clippy ratchet with the host `dead_code` baseline **336 → 340** and the measurement on the constant. **`unreachable_patterns` + `non_snake_case` appeared on the first clippy run** — the hazard `abi.rs`'s own doc comment warns about: the four new `fcntl` command names were **not imported**, so each arm's pattern was a fresh binding matching every value and every `fcntl` command routed through `F_GETOWN`'s arm. |
+
+**What this does not do, named.** The `F_SETPIPE_SZ` shrink **below what is already
+buffered** was not measured: the capacity is documented as a ceiling on what may be
+*queued*, and the measurement covered `1048576 -> 4096` on an empty pipe only. And
+`fcntl`'s **lease** family is still unswept: `F_GETLEASE`/`F_SETLEASE` (and
+`CAP_LEASE`) fall to the table's default arm, which is the same "unimplemented, not
+misrefused" shape item 300 named and this item did not touch.
