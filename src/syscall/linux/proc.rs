@@ -3616,6 +3616,18 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // The two halves of `f_mode`, **before the count**: measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/sf.c`), `sendfile(…, count=0)` over a write-only
+    // source, a read-only destination or an `O_PATH` descriptor on either side
+    // is `EBADF`, where the same zero count over two ordinary descriptors is
+    // `0`. The comment below used to say the count was "asked first" - that was
+    // true of the *directory* question and false of these, and conflating the
+    // two left the door applying neither: this kernel read the source through
+    // `Inode::read_at` directly, so `sendfile(out, O_PATH_fd, &off)` answered
+    // **0** where Linux answers `EBADF` (measured on the guest).
+    if input.check_readable().is_err() || out.check_writable().is_err() {
+        return err::EBADF;
+    }
     if count == 0 {
         return 0;
     }
@@ -3625,9 +3637,10 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // where `read(dir, buf, 16)` on the same descriptor is `EISDIR` (21) - the
     // copy goes through the source's splice path, and a directory has none, so
     // the caller hears "this source cannot be sent" rather than "that is a
-    // directory". The count is asked first for the same reason the probe
-    // separates the two: `sendfile(..., 0)` is `0` on both kinds. Asked here,
-    // before the loop, so the answer does not depend on how the chunking falls.
+    // directory". The count is asked first *of this pair* for the same reason
+    // the probe separates the two: `sendfile(dir, …, 0)` is `0` (re-measured
+    // above, `sf.c`). Asked here, before the loop, so the answer does not depend
+    // on how the chunking falls.
     if input.inode().metadata().kind == crate::vfs::NodeKind::Dir {
         return err::EINVAL;
     }
@@ -3938,6 +3951,23 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         }
         match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
+                // An `O_PATH` descriptor is `EBADF` here - before the mode
+                // clauses below, because it has *no* mode to judge: `acc_mode =
+                // 0` at the open means neither read nor write, and Linux's
+                // `do_mmap` asks `FMODE_READ` of the file and finds none.
+                // Measured on Linux 7.3.4 (`build/scratch/opathmmap/matrix.c`,
+                // `order6.c`): `EBADF` for `MAP_PRIVATE`/`MAP_SHARED`,
+                // `PROT_READ`/`PROT_NONE`, and on a directory alike, while an
+                // ordinary directory descriptor is `ENODEV` - so the two
+                // refusals are one door's two questions and `EBADF` comes
+                // first. This kernel **served** it: on the guest
+                // `mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, O_PATH_fd, 0)`
+                // answered an address, which made the descriptor that exists so
+                // a caller may *name* a file a way to read its bytes - the last
+                // and largest hole in item 297's enforcement.
+                if file.is_path_only() {
+                    return err::EBADF;
+                }
                 // The descriptor's own access mode is part of the request, and
                 // Linux asks it before it asks the node anything - measured on
                 // Linux 7.2.14 (`build/scratch/zeromap/{mat,n,o}.c`), where a

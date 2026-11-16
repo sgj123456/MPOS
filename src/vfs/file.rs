@@ -395,6 +395,14 @@ impl File {
     /// *descriptor* (`FD_CLOEXEC`), and the access mode is already the field
     /// [`Self::access`] owns.
     ///
+    /// The caller passes the word it means to report: for an `O_PATH` open that
+    /// is the **folded** word, which needs the machine's `O_DIRECTORY` and
+    /// `O_NOFOLLOW` numbers and so is the syscall layer's to compute
+    /// (`open_linux`'s `recorded`). The reason it must be folded rather than
+    /// masked here is measured and stated there: Linux's `build_open_flags`
+    /// answers `F_GETFL = O_PATH|O_NOFOLLOW` for an open asked for with seven
+    /// flags.
+    ///
     /// A door that mints a description without knowing a flag word - a socket,
     /// an `eventfd`, a pipe end - leaves this at zero, which is what Linux
     /// reports for all of them (measured: `pipe()`'s ends answer `0` and `1`,
@@ -533,8 +541,16 @@ impl File {
     /// path (`read`/`readv`/`pread`/`preadv2`) shares it. A zero-length read still
     /// short-circuits first only when the mode permits reading at all; Linux
     /// refuses the wrong-mode `read(2, buf, 0)` with `EBADF` too.
+    ///
+    /// **An `O_PATH` descriptor is not readable either**, and the two refusals
+    /// share this door because they are one question: Linux's `f_mode` has no
+    /// `FMODE_READ` for either. The door is `may_read`'s primitive, so every
+    /// caller that asks it - `readahead` among them - gets `O_PATH` right
+    /// without naming the flag, which is the arrangement item 297 recommended
+    /// and item 303 found five doors had stepped around by calling
+    /// `Inode::read_at` directly.
     pub(crate) fn check_readable(&self) -> VfsResult<()> {
-        if self.access() == ACC_WRONLY {
+        if self.is_path_only() || self.access() == ACC_WRONLY {
             return Err(VfsError::BadFd);
         }
         Ok(())
@@ -621,7 +637,17 @@ impl File {
     /// write-shaped operation - comes to be enforced in one place and missed in
     /// the other.
     pub(crate) fn may_write(&self) -> bool {
-        self.access() != ACC_RDONLY
+        // An `O_PATH` descriptor writes nothing, whatever access bits the open
+        // was spelled with: Linux sets `acc_mode = 0` for it, so `f_mode` has
+        // no `FMODE_WRITE`. Measured on Linux 7.3.4
+        // (`build/scratch/opathmmap/matrix.c`): `fallocate`, `ftruncate`,
+        // `copy_file_range` into it and `splice` into it are all `EBADF` on an
+        // `O_PATH|O_WRONLY` descriptor. Without this clause that spelling
+        // carried `ACC_WRONLY` here and `fallocate` **grew the file from 10
+        // bytes to 4096** on the guest - a descriptor that exists to name a file
+        // granting the right to write it, which is the whole inversion `O_PATH`
+        // is.
+        !self.is_path_only() && self.access() != ACC_RDONLY
     }
 
     /// Whether this description was opened for writing.

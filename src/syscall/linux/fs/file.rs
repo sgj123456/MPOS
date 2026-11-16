@@ -225,14 +225,43 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     // reading, writing, or both. `O_TRUNC` is a write whatever the access bits
     // say - a file emptied by a caller who asked only to read it is the
     // combination Linux answers EACCES for.
-    let mut want = match flags & O_ACCMODE {
-        O_WRONLY => W_OK,
-        O_RDWR => R_OK | W_OK,
-        _ => R_OK,
+    //
+    // **`O_PATH` asks for nothing at all**, and that is the load-bearing half
+    // of the flag rather than a courtesy: the descriptor exists so a caller may
+    // hold a *name* it has no right to open, which is what `openat2`-style and
+    // `/proc`-style doors are built on. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/{opening2,shadow}.c`): as uid 1000,
+    // `open("/etc/shadow", O_RDONLY)` is `EACCES` (mode `0600`, owned by
+    // `nobody`) while `open("/etc/shadow", O_PATH)` is **served** - and the
+    // descriptor it returns answers `EBADF` from `read`, `mmap` and `fsync`,
+    // `fstat` reporting the real `0600`. The same holds for a file the caller
+    // owns opened `0000`: `O_RDONLY` refuses, `O_PATH` does not. Linux reaches
+    // it in `build_open_flags`, which sets `acc_mode = 0` for `O_PATH` and
+    // looks at `MAY_OPEN` alone; the *parent directory's* search permission is
+    // still asked, and still refused (measured: a `0000` directory's file is
+    // `EACCES` under `O_PATH` too).
+    //
+    // This kernel asked `R_OK` before, so an `O_PATH` open of an unreadable
+    // file was refused - the flag kept a caller out of a descriptor Linux hands
+    // it, and the refusal looked like a permission bug in the *program* rather
+    // than a divergence here. The pairing is deliberate: the same `O_PATH`
+    // descriptor must then be refused by every door that would touch the bytes,
+    // which is what the `is_path_only` checks below and in `File::pre_read`
+    // are for.
+    let path_only = flags & O_PATH as usize != 0;
+    let want = if path_only {
+        0
+    } else {
+        let mut want = match flags & O_ACCMODE {
+            O_WRONLY => W_OK,
+            O_RDWR => R_OK | W_OK,
+            _ => R_OK,
+        };
+        if flags & O_TRUNC != 0 {
+            want |= W_OK;
+        }
+        want
     };
-    if flags & O_TRUNC != 0 {
-        want |= W_OK;
-    }
     // Whether this open is what brought the name into being. Linux does not
     // check a mode against the caller who just asked for it: that is what
     // makes `open(name, O_CREAT | O_WRONLY, 0)` succeed and a second open of
@@ -240,6 +269,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     let mut created = false;
     // O_EXCL refuses to open a name that is already there, whatever it names.
     if flags & O_CREAT != 0
+        && !path_only
         && flags & O_EXCL != 0
         && crate::vfs::resolve_opt(path, Some(base.clone())).is_ok()
     {
@@ -301,7 +331,14 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     }
     let opened = match crate::vfs::open_opt(path, Some(base.clone()), flags) {
         Ok(fd) => Ok(fd),
-        Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 => {
+        // **Not under `O_PATH`**, where the create flag is folded away and a
+        // missing name is simply `ENOENT`: measured, Linux 7.3.4
+        // (`build/scratch/opathmmap/opening2.c`) - `open(missing, O_PATH|O_CREAT)`
+        // answers `ENOENT` **and creates nothing**, while this kernel made the
+        // file and returned a descriptor. A flag that exists so a caller can
+        // name a thing without acting on it must not be the thing that brings
+        // the name into being.
+        Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 && !path_only => {
             // O_EXCL names an existing file EEXIST; a missing directory, no
             // space: the create error is the answer, not a retry.
             //
@@ -478,19 +515,47 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             {
                 file.set_label(label);
             }
+            // The flag word this open is going to report, which for an
+            // `O_PATH` one is Linux's **folded** word: `build_open_flags`
+            // does `flags &= O_DIRECTORY | O_NOFOLLOW | O_PATH` and
+            // `acc_mode = 0`, so an open asked for with
+            // `O_PATH|O_APPEND|O_NONBLOCK|O_SYNC|O_TRUNC|O_NOFOLLOW`
+            // answers `F_GETFL = 0x220000` - `O_PATH|O_NOFOLLOW` only
+            // (measured, Linux 7.3.4, `build/scratch/opathmmap/fold.c`).
+            // This kernel reported the whole word plus the access bits
+            // (`0x208001` for `O_PATH|O_WRONLY`, measured on the guest), so
+            // `F_GETFL` claimed an `O_PATH` descriptor was writable: the
+            // same inversion as asking the file's mode at the open, and the
+            // half that made `may_write` answer yes.
+            //
+            // Computed once here, before the two description calls below that
+            // both want it (the access mode and the flag word), and outside
+            // their `if let` arms because it reads only the local flag word.
+            //
+            // The fold is here rather than in `File::set_born` because the
+            // bits it keeps are the *machine's* `O_DIRECTORY` and
+            // `O_NOFOLLOW` numbers, and `vfs` cannot name `abi`.
+            let recorded = if path_only {
+                (flags as u32) & (O_PATH | O_DIRECTORY as u32 | O_NOFOLLOW as u32)
+            } else {
+                flags as u32
+            };
             // The close events need the access mode from the moment it is
             // still only the open's flags: the description keeps it, and the
             // `IN_OPEN` report rides the same clone.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-                file.mark_opened_for(flags & O_ACCMODE != 0);
-                // Record the `O_ACCMODE` itself, not just "wrote-ish": `File::read`
-                // and `File::write` refuse a mismatch with `EBADF` from here on,
-                // which is Linux's answer for `write()` on an `O_RDONLY` fd and the
-                // reverse. This field is the one owner of the fact - `F_GETFL`
-                // composes its answer from it, and `F_SETFL` cannot reach it, which
-                // is what stops a caller that changes the status flags from
-                // reopening a direction that was refused.
-                file.set_access((flags & O_ACCMODE) as u32);
+                file.mark_opened_for(!path_only && flags & O_ACCMODE != 0);
+                // A descriptor that never opened the file has no access mode to
+                // record: Linux's `acc_mode = 0` means `read`/`write` see no
+                // `FMODE_READ`/`FMODE_WRITE` at all. `O_PATH` is `0o1000_0000`
+                // here, so the access bits of the *word* survive the fold and
+                // would otherwise be stored as `ACC_RDWR` for
+                // `O_PATH|O_RDWR`.
+                file.set_access(if path_only {
+                    0
+                } else {
+                    (flags & O_ACCMODE) as u32
+                });
                 crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
                 crate::vfs::fanotify::notice_open(&file.inode());
                 // An evdev client's read position starts here, at the
@@ -520,7 +585,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // `set_status` keeps only those bits, and the access mode is
             // already recorded in the field `F_GETFL` composes its word from.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-                file.set_status(flags as u32);
+                file.set_status(recorded);
                 // And the other half of the word: everything the caller asked
                 // for that the open answered without spending it -
                 // `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC` and the rest
@@ -529,7 +594,12 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // compares the word against what it opened with sees a
                 // disagreement on Linux's answer for every one of them
                 // (`docs/uapi/` §5.2 carried it as a gap; item 49 closes it).
-                file.set_born(flags as u32);
+                //
+                // `recorded` rather than `flags`: for an `O_PATH` open it is
+                // Linux's folded word, and storing `O_APPEND`/`O_NONBLOCK` on a
+                // descriptor that opened nothing is how `F_GETFL` came to
+                // advertise status bits the flag word had already dropped.
+                file.set_born(recorded);
                 // What landed is the masked word. `O_NONBLOCK` has to reach the
                 // node that does the blocking; `O_NOATIME` has no node to sync
                 // with - [`File::read`] reads the effective word itself.
@@ -540,12 +610,22 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // now is the whole file. Without it, `wget -O page.html` over a
             // longer page leaves the new page followed by the old one's tail.
             //
+            // **Not under `O_PATH`**: the word is folded away first (see
+            // `recorded` above), so `open(O_PATH|O_TRUNC)` on a 10-byte file
+            // leaves all 10 bytes - measured, Linux 7.3.4
+            // (`build/scratch/opathmmap/fold.c`: the size is unchanged after the
+            // call, with `F_GETFL` reporting no `O_TRUNC`). Here the truncate
+            // ran anyway, which turned a descriptor that only names the file
+            // into an operation on its contents - the same inversion as the
+            // `O_PATH|O_WRONLY` write authority below.
+            //
             // A truncate that the file's own flags refuse follows the *open*
             // out of here rather than being swallowed: `O_TRUNC` on an
             // immutable file is `EPERM` in Linux, and a kernel that opened the
             // file and quietly left it whole would be answering the wrong
             // question in the only way a caller cannot see.
             if flags & O_TRUNC != 0
+                && !path_only
                 && let Ok(file) = crate::sched::current_fds().clone_at(fd)
             {
                 let inode = file.inode();
@@ -698,6 +778,19 @@ pub fn flock(args: [usize; ARG_COUNT]) -> isize {
         LOCK_UN => None,
         _ => return err::EINVAL,
     };
+    // An `O_PATH` descriptor takes no lock: the lock belongs to the *open file*
+    // and an `O_PATH` one never opened the file. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/order3.c`): `flock(O_PATH, LOCK_SH)` is `EBADF`,
+    // and the `EINVAL` for a bad operation outranks it (`flock(O_PATH, 0x99)` is
+    // `EINVAL`) - which is why this sits *after* the word's validation and not
+    // before it. On the guest this kernel **granted the lock**: `flock(O_PATH,
+    // LOCK_EX|LOCK_NB)` answered 0, and a second `flock(LOCK_EX|LOCK_NB)` on an
+    // ordinary descriptor of the same file then answered `EAGAIN` - a
+    // name-only descriptor holding a lock `apk`'s database lock can be taken
+    // through.
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     #[cfg(target_os = "none")]
     {
         let inode = file.inode();
@@ -6031,6 +6124,16 @@ pub fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
+    // An `O_PATH` descriptor has nothing to flush: it never opened the file.
+    // `EBADF`, and it comes before the kind question - measured, Linux 7.3.4
+    // (`build/scratch/opathmmap/order6.c`): `fsync(O_PATH)` is `EBADF` while
+    // `fsync(pipe)` is the `EINVAL` below, so the two refusals are one door's
+    // two questions in Linux's order. Here the flag was never asked, so a
+    // name-only descriptor of a regular file heard **0** - "your bytes reached
+    // the disk" for a file this descriptor was never allowed to write.
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     // A byte channel is asked about by *name* rather than by kind, because the
     // kind cannot answer for it: a pipe and a `socketpair` end report `File`,
     // the filesystem's vocabulary having no word for "anonymous byte channel"
@@ -7289,6 +7392,27 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
         | FALLOC_FL_WRITE_ZEROES;
 
     let (fd, mode, offset, len) = (args[0] as i32, args[1], args[2] as i64, args[3] as i64);
+    // The descriptor is looked up first, so a missing one is `EBADF` before
+    // anything else - and an **`O_PATH`** one is `EBADF` here, *before* the
+    // range: measured on Linux 7.3.4 (`build/scratch/opathmmap/fa2.c`),
+    // `fallocate(O_PATH_fd, 0, -1, 4096)` is `EBADF` while the same bad offset
+    // on an `O_RDONLY` descriptor is the `EINVAL` below. Every `O_PATH` shape in
+    // that matrix (a bad offset, an unknown mode bit, a reshaper) answered
+    // `EBADF`, so the flag is judged ahead of all of them.
+    //
+    // On the guest this door **wrote**: `fallocate(O_PATH|O_WRONLY_fd, 0, 0,
+    // 4096)` answered 0 and grew the file from 10 bytes to 4096. The access bits
+    // of an `O_PATH` word are no longer recorded (see `open_linux`'s `recorded`),
+    // so `may_write` below would refuse it anyway - but the order matters,
+    // because a bad range would otherwise be answered `EINVAL` for a descriptor
+    // Linux refuses outright.
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     if offset < 0 || len <= 0 {
         return err::EINVAL;
     }
@@ -7308,15 +7432,17 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
         }
         return err::EOPNOTSUPP;
     }
-    let file = match crate::sched::current_fds().clone_at(fd) {
-        Ok(file) => file,
-        Err(e) => return err_of(e),
-    };
     // `fallocate` is a write to the file's block range, so a descriptor not
     // opened for writing is refused `EBADF` before the range is examined
     // (measured on the host: `fallocate(O_RDONLY)` is `EBADF` and nothing
     // changes) - the same write-mode demand `ftruncate` now makes and the
     // general "operations that write require a writable descriptor" rule.
+    //
+    // **Not before the range**, though: measured (`fa2.c`), an `O_RDONLY`
+    // descriptor with `offset = -1` is `EINVAL`, so the range is judged first
+    // and the write mode second. The `O_PATH` refusal above is the exception,
+    // and it is Linux's too - a descriptor that never opened the file has no
+    // *range* to be wrong about.
     if !file.may_write() {
         return err::EBADF;
     }
@@ -7427,12 +7553,15 @@ pub fn handle_copy_file_range(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         args[4],
         args[5],
     );
-    if flags != 0 {
-        return err::EINVAL;
-    }
-    if len == 0 {
-        return 0;
-    }
+    // **The two descriptors come first**, before the flags word and before the
+    // length. Measured on Linux 7.3.4 (`build/scratch/opathmmap/order7.c`):
+    // `copy_file_range(999, …, flags=1)` is `EBADF` and
+    // `copy_file_range(999, …, len=0)` is `EBADF`, while the same two words with
+    // two good descriptors are `EINVAL` and `0`. This door judged its arguments
+    // first, so a caller that handed it a bad descriptor heard about its flag
+    // word instead - and an `O_PATH` descriptor, which must be refused, was
+    // reached *after* both short-circuits and **copied 16 bytes** through a
+    // descriptor that only names the file (measured on the guest).
     let fds = crate::sched::current_fds();
     let input = match fds.clone_at(in_fd) {
         Ok(file) => file,
@@ -7442,15 +7571,40 @@ pub fn handle_copy_file_range(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // Then the two halves of `f_mode`: the source must be readable and the
+    // destination writable. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/{order7,order9}.c`): `EBADF` for a write-only
+    // source and for a read-only destination, and `EBADF` for `O_PATH` on
+    // either side **before** the flags word is judged - `copy_file_range(…,
+    // flags=1)` over an `O_PATH` descriptor answers `EBADF`, where two ordinary
+    // descriptors with the same flag answer `EINVAL`. This kernel judged flags
+    // first and never asked the mode at all, so a name-only descriptor reached
+    // the copy and **moved 16 bytes** (measured on the guest).
+    if input.check_readable().is_err() || output.check_writable().is_err() {
+        return err::EBADF;
+    }
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    // Then the kinds, **before** the zero length: a pipe asked for a zero-byte
+    // copy is `EINVAL`, not `0` (measured, `order9.c`). Directories are their
+    // own answer, `EISDIR`, rather than the general "not a regular file"
+    // `EINVAL` - measured in the same run, both directions.
     for file in [&input, &output] {
         // A pipe is an anonymous channel, not a file: its read has no
         // position, and a read that would block must not be mistaken for
         // seekable storage. `copy_file_range` refuses it with EINVAL - and
         // the kind check alone cannot do that, because a pipe's metadata
         // answers `File`, the filesystem's only word for an unnamed channel.
+        if file.metadata().kind == NodeKind::Dir {
+            return err::EISDIR;
+        }
         if file.inode().as_pipe().is_some() || file.metadata().kind != NodeKind::File {
             return err::EINVAL;
         }
+    }
+    if len == 0 {
+        return 0;
     }
     // The positions: a caller's word when there is one, the descriptor's
     // own cursor when there is not. A negative word is not a position.
@@ -8172,6 +8326,17 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // The two halves of `f_mode`, **before** the pipe question: measured on
+    // Linux 7.3.4 (`build/scratch/opathmmap/order10.c`), `splice` with two
+    // ordinary files and a write-only input answers `EBADF` rather than the
+    // `EINVAL` two non-pipe ends earn - so the mode is judged first, and the
+    // answer a name-only descriptor gets is `EBADF` on either side. This door
+    // read the inode directly (`Inode::read_at`/`write_at`, below) and asked
+    // neither question, so on the guest `splice(O_PATH_fd -> pipe)` **moved 3
+    // bytes** out of a file it was only allowed to name.
+    if input.check_readable().is_err() || output.check_writable().is_err() {
+        return err::EBADF;
+    }
     let in_is_pipe = input.inode().as_pipe().is_some();
     let out_is_pipe = output.inode().as_pipe().is_some();
     if !in_is_pipe && !out_is_pipe {
@@ -8326,12 +8491,21 @@ pub fn handle_readahead(args: [usize; ARG_COUNT]) -> isize {
 
 ///
 /// A read-only descriptor is served, not refused: `sync_file_range` on an
-/// `O_RDONLY` file answers 0, so nothing here asks about the mode.
+/// `O_RDONLY` file answers 0, so nothing here asks about the mode. An **`O_PATH`**
+/// one is `EBADF` though, and the placement is measured: Linux asks it
+/// **before** the flag word and before the range - `(O_PATH, flags=8)` is
+/// `EBADF` where `(O_RDONLY, flags=8)` is the `EINVAL` in
+/// `build/scratch/opathmmap/order6.c`. Here the descriptor was looked up and
+/// then both verdicts ran, so a name-only descriptor with a bad flag word heard
+/// `EINVAL` and a legal call heard **0** for a flush of a file it never opened.
 pub fn handle_sync_file_range(args: [usize; ARG_COUNT]) -> isize {
     let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
+    if file.is_path_only() {
+        return err::EBADF;
+    }
     if let Err(e) = abi::sync_file_range_range_verdict(args[1] as i64, args[2] as i64) {
         return e;
     }
