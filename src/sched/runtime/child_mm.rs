@@ -819,9 +819,30 @@ impl crate::mm::vma::MappedObject for FilePages {
         Some(frame)
     }
 
+    /// The filesystem device and inode number, which is what `/proc/<pid>/maps`
+    /// prints and what `stat`'s `st_dev` reports.
+    ///
+    /// **This is the function that made every private file mapping print
+    /// `00:00`** - the same defect `vfs::MappedInode::identity` had, in the other
+    /// object a file mapping can be built from. `rdev()` is the device a *device
+    /// node* names and `(0, 0)` for every ordinary file, so the device column was
+    /// zero for every file on every filesystem; Chromium's crash handler built a
+    /// module's layout from that column and read the wrong bytes
+    /// (`docs/notes/07-chromium-analysis.md`, finding C).
+    ///
+    /// The answer comes from the **mount table**, the same door `fstat` uses, so
+    /// the two files agree by construction.
     fn identity(&self) -> ((u32, u32), u64) {
+        // A device node's own `rdev` still wins: that is the device *it* names.
+        if let Some(rdev) = self.inode.rdev() {
+            return (rdev, self.inode.metadata().ino);
+        }
+        let packed = crate::vfs::mount::dev_of_inode(&self.inode);
         (
-            self.inode.rdev().unwrap_or((0, 0)),
+            (
+                crate::uevent::major_of(packed),
+                crate::uevent::minor_of(packed),
+            ),
             self.inode.metadata().ino,
         )
     }

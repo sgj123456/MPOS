@@ -1675,35 +1675,87 @@ pub trait Inode: Send + Sync + core::any::Any {
 /// value. For these four node types it is also unique per object: a `memfd` and
 /// a dma-buf carry their own inode number, and the framebuffer and each dumb
 /// buffer are devfs nodes that carry one too.
-pub struct MappedInode(Arc<dyn Inode>);
+pub struct MappedInode {
+    inode: Arc<dyn Inode>,
+    /// The **filesystem** device the mapping's file lives on, or `None` for an
+    /// object with no file behind it (a memfd, a dma-buf, the framebuffer).
+    ///
+    /// It is carried here rather than looked up at report time because the
+    /// lookup needs the **path the descriptor was opened through** (or the
+    /// `File`'s recorded device), and a VMA outlives the descriptor it was made
+    /// from - `close` does not unmap. A mapping made from a file whose `File` had
+    /// already been dropped had no way back to that number, which is why
+    /// `identity` used to answer `rdev()` and every ordinary file printed
+    /// `00:00` (`docs/notes/07-chromium-analysis.md`, finding C).
+    dev: Option<u64>,
+}
 
 impl MappedInode {
     /// Wrap an inode for a frame-backed mapping. The mapping holds the inner
     /// inode alive for as long as the VMA lives, which is what keeps a `memfd`'s
     /// frames from being released while somebody is still drawing into them.
-    pub fn new(inode: Arc<dyn Inode>) -> Arc<dyn crate::mm::vma::MappedObject> {
-        Arc::new(MappedInode(inode))
+    ///
+    /// `dev` is the filesystem device the caller already knows - the `File`'s
+    /// own answer, which is what `fstat` reports and therefore what `maps` must
+    /// agree with. `None` for an object with no file behind it.
+    pub fn new(inode: Arc<dyn Inode>, dev: Option<u64>) -> Arc<dyn crate::mm::vma::MappedObject> {
+        Arc::new(MappedInode { inode, dev })
     }
 }
 
 impl crate::mm::vma::MappedObject for MappedInode {
     fn frame_at(&self, index: u64) -> Option<usize> {
-        self.0.mmap_frame(index)
+        self.inode.mmap_frame(index)
     }
 
+    /// The pair `/proc/<pid>/maps` and `stat`'s `st_dev` both report: the
+    /// **filesystem** the mapped file lives on, and its inode number.
+    ///
+    /// The device half used to be `rdev()`, which is the device a **device node**
+    /// names - right for `/dev/*` and `(0, 0)` for every ordinary file. Linux's
+    /// `maps` prints `st_dev`, which is the filesystem, and the two are different
+    /// questions: measured in the guest on 2026-11-16, `stat -c %d` on
+    /// `/usr/lib/chromium/chromium` answers `65026` while its `maps` line printed
+    /// `00:00`. The consequence was not cosmetic - a snapshot reader that builds
+    /// a module's layout from `maps` cannot tell two filesystems' files apart, and
+    /// Chromium's crash handler read the wrong bytes because of it
+    /// (`docs/notes/07-chromium-analysis.md`, finding C).
+    ///
+    /// The answer comes from the **mount table** (`vfs::mount::dev_of_inode`),
+    /// the same door `stat` uses, so the two files cannot disagree again - which
+    /// is what the old comment claimed while both were zero.
     fn identity(&self) -> ((u32, u32), u64) {
-        (self.0.rdev().unwrap_or((0, 0)), self.0.metadata().ino)
+        // A device node's own `rdev` still wins: that is the device *it* names,
+        // and `maps` prints it for a character or block device mapping.
+        if let Some(rdev) = self.inode.rdev() {
+            return (rdev, self.inode.metadata().ino);
+        }
+        // The device the mapping's `File` already reported, split by `uevent` -
+        // which packed the number in the first place (`mount::Mount::dev`'s own
+        // doc names it) and which sits **below** this module. A mapping whose
+        // file was never told a device falls back to the mount table, the same
+        // door `fstat` uses.
+        let packed = self
+            .dev
+            .unwrap_or_else(|| crate::vfs::mount::dev_of_inode(&self.inode));
+        (
+            (
+                crate::uevent::major_of(packed),
+                crate::uevent::minor_of(packed),
+            ),
+            self.inode.metadata().ino,
+        )
     }
 
     fn name_is_gone(&self) -> bool {
-        self.0.name_is_gone()
+        self.inode.name_is_gone()
     }
 
     /// A memfd is shmem-backed; every other node this wraps answers the trait
     /// default's `false`. The `is_shmem` method is deliberately not gated on
     /// `target_os`, so this host-compiled impl can ask the inode.
     fn is_shmem(&self) -> bool {
-        self.0.is_shmem()
+        self.inode.is_shmem()
     }
 }
 

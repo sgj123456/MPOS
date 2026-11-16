@@ -186,14 +186,25 @@ from two probes in the guest, not from guessing.** The chain is:
 
 So there is **one** defect, and one *different* fact that explains the rest:
 
-1. **The device column is `00:00` for every ordinary file, because `rdev()` is the
-   wrong question.** `rdev` is the device a *device node* names — right for `/dev/*`,
-   and `(0,0)` for every regular file. `maps` wants **`st_dev`, the filesystem the
-   file lives on**, which this kernel's `Metadata` does not carry at all. The comment
-   in `MapLine` states the alibi plainly: "Both zero for a mapping with no file behind
-   it, and for a file on this kernel - `stat` reports zero there too, so the two agree
-   rather than disagreeing." **Two files agreeing about a value neither can compute is
-   not agreement**; it is one shared gap, reported twice.
+1. **FIXED (this turn) — the device column was `00:00` for every ordinary file,
+   because `rdev()` is the wrong question.** `rdev` is the device a *device node*
+   names — right for `/dev/*`, and `(0,0)` for every regular file. `maps` wants
+   **`st_dev`, the filesystem the file lives on**. The comment in `MapLine` stated the
+   alibi plainly: "Both zero for a mapping with no file behind it, and for a file on
+   this kernel - `stat` reports zero there too, so the two agree rather than
+   disagreeing." **Two files agreeing about a value neither can compute is not
+   agreement**; it is one shared gap, reported twice.
+
+   There were in fact **two** such functions, in different layers: `FilePages`
+   (`src/sched/runtime/child_mm.rs`, the object a **private** file mapping is built
+   from) and `MappedInode` (`src/vfs/mod.rs`, the frame-backed one). Both asked
+   `rdev()`; fixing only `MappedInode` changed nothing for an ordinary file, and the
+   measurement said so — the guest still printed `00:00`. Both now ask the mount
+   table, the same door `fstat` uses, so the two files agree by construction.
+   Verified in the guest: `/bin/busybox` mapped at offset 4096 now prints
+   `00001000 00:01 323` where it printed `00001000 00:00 323`, and `stat` answers
+   `(0,1)`/`323` — the same pair. Pinned by `t-maps-identity` (9 claims, host and
+   both arms).
 2. **The executable's segments show offset 0 because exec does not create file-backed
    VMAs at all.** `map_image` (`src/sched/runtime/load.rs`) allocates a frame per page,
    fills it from the image's source, and records `space.map(Mapping { .. })` — a

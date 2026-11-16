@@ -4253,7 +4253,7 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 base,
                 len,
                 mf,
-                crate::vfs::MappedInode::new(object),
+                crate::vfs::MappedInode::new(object, None),
                 0,
                 true,
                 Some(alloc::sync::Arc::from("/memfd: (deleted)")),
@@ -4292,7 +4292,7 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                     base,
                     len,
                     mf,
-                    crate::vfs::MappedInode::new(object),
+                    crate::vfs::MappedInode::new(object, None),
                     0,
                     true,
                     Some(alloc::sync::Arc::from("/memfd: (deleted)")),
@@ -4325,7 +4325,18 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 base,
                 len,
                 mf,
-                crate::vfs::MappedInode::new(file.inode()),
+                crate::vfs::MappedInode::new(
+                    file.inode(),
+                    // The descriptor's own answer - what `fstat` reports, so the
+                    // two files agree by construction.
+                    Some(match file.dev() {
+                        Some(dev) => dev,
+                        None => match file.label() {
+                            Some(path) => crate::vfs::mount::dev_of_path(&path),
+                            None => crate::vfs::mount::dev_of_inode(&file.inode()),
+                        },
+                    }),
+                ),
                 offset,
                 shared,
                 name,
