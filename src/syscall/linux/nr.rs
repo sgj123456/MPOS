@@ -220,7 +220,10 @@ mod tests {
         assert_eq!(UTIMENSAT, 280);
         assert_eq!(SIGNALFD, 282);
         assert_eq!(SIGNALFD4, 289);
-        assert_eq!(EVENTFD, 290);
+        // The legacy door is 284 and the flag-taking one 290: two names, two
+        // numbers, and the pair is what the pins distinguish.
+        assert_eq!(EVENTFD, 284);
+        assert_eq!(EVENTFD2, 290);
         assert_eq!(PREADV, 295);
         assert_eq!(PWRITEV, 296);
         assert_eq!(DUP3, 292);
@@ -230,6 +233,11 @@ mod tests {
         assert_eq!(GETRANDOM, 318);
         assert_eq!(RSEQ, 334);
         assert_eq!(STATX, 332);
+        assert_eq!(EXECVEAT, 322);
+        assert_eq!(IOPRIO_SET, 251);
+        assert_eq!(IOPRIO_GET, 252);
+        assert_eq!(TEE, 276);
+        assert_eq!(VMSPLICE, 278);
         assert_eq!(MEMBARRIER, 324);
         // The POSIX message-queue family, whose numbers are consecutive on both
         // machines - a transcription error here is a family that silently
@@ -424,6 +432,8 @@ mod tests {
         assert_eq!(TIMERFD_GETTIME, 287);
         // The inotify triple: the queue, the watch in and the watch out.
         assert_eq!(INOTIFY_INIT1, 294);
+        // The flagless form, which x86_64 has and the asm-generic table does not.
+        assert_eq!(INOTIFY_INIT, 253);
         assert_eq!(INOTIFY_ADD_WATCH, 254);
         assert_eq!(INOTIFY_RM_WATCH, 255);
         // File I/O: allocate, copy, the vectored pair with advice, the

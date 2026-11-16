@@ -323,7 +323,15 @@ pub const SIGNALFD: u64 = 282;
 pub const SIGNALFD4: u64 = 289;
 /// `eventfd(2)`: a counter a process can wait on. The number is the
 /// `eventfd2` spelling - the flags-taking form every libc makes.
-pub const EVENTFD: u64 = 290;
+/// `eventfd(2)` — the **legacy** form, number 284. It takes the initial counter
+/// *only*: the flag word is not part of the call, and Linux **ignores** whatever
+/// the caller passes in that second argument (measured: `0x7ffff` is served and
+/// leaves the descriptor with plain `O_RDWR`, where `eventfd2` refuses `0x99`
+/// with `EINVAL`). A libc picks `eventfd2` when it wants flags and this one
+/// otherwise, so a binary built against an older glibc calls it.
+pub const EVENTFD: u64 = 284;
+/// `eventfd2(2)` — the flag-taking form. What "eventfd" means in the modern ABI.
+pub const EVENTFD2: u64 = 290;
 /// `memfd_create(2)`: an anonymous shared buffer, the descriptor a Wayland
 /// `wl_shm` pool is made from.
 pub const MEMFD_CREATE: u64 = 319;
@@ -411,6 +419,11 @@ pub const USERFAULTFD: u64 = 323;
 pub const TIMERFD_CREATE: u64 = 283;
 /// `inotify_init1(2)`: an event queue for filesystem news, with the flag
 /// spelling. `mdev`/`udev`, `dbus` and every config re-reader start here.
+/// `inotify_init(2)` — the **legacy** form, number 253, with no flags at all.
+/// Measured: the descriptor comes back with `F_GETFL` 0 and no `FD_CLOEXEC`,
+/// where `inotify_init1(IN_CLOEXEC)` sets it.
+pub const INOTIFY_INIT: u64 = 253;
+/// `inotify_init1(2)` — the flag-taking form.
 pub const INOTIFY_INIT1: u64 = 294;
 /// `inotify_add_watch(2)`: watch one inode for the events a mask names.
 pub const INOTIFY_ADD_WATCH: u64 = 254;

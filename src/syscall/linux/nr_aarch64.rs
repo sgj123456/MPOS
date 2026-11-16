@@ -187,7 +187,6 @@ pub const SIGNALFD4: u64 = 74; // 289 on x86_64
 // spelling, not the legacy 284 - because the flags-taking form is the one every
 // libc emits and the one `handle_eventfd` reads (`args[1]` is the flags). arm64
 // has no legacy `eventfd` at all, so 19 is the whole family here.
-pub const EVENTFD: u64 = 19; // 290 on x86_64
 pub const MEMFD_CREATE: u64 = 279; // 319 on x86_64
 // The POSIX message-queue family. The asm-generic table gives it a block of its
 // own, where x86_64's sits between `sched_getaffinity` and `io_setup`.
@@ -220,7 +219,6 @@ pub const EPOLL_WAIT: u64 = 64029; // no arm64 number; unreachable on aarch64
 pub const EPOLL_PWAIT: u64 = 22; // 281 on x86_64
 pub const EPOLL_PWAIT2: u64 = 441; // 441 on x86_64
 pub const TIMERFD_CREATE: u64 = 85; // 283 on x86_64
-pub const INOTIFY_INIT1: u64 = 26; // 294 on x86_64
 pub const INOTIFY_ADD_WATCH: u64 = 27; // 254 on x86_64
 pub const INOTIFY_RM_WATCH: u64 = 28; // 255 on x86_64
 pub const TIMERFD_SETTIME: u64 = 86; // 286 on x86_64
@@ -264,6 +262,15 @@ pub const CLONE3: u64 = 435; // 435 on x86_64
 pub const PIDFD_GETFD: u64 = 438; // 438 on x86_64
 pub const RT_SIGSUSPEND: u64 = 133; // 130 on x86_64
 pub const PAUSE: u64 = 64033; // no arm64 number; unreachable on aarch64
+/// The **legacy** `eventfd` and `inotify_init` are x86_64-only: the asm-generic
+/// table never had them, so aarch64's table gives them numbers no caller can
+/// pass. The dispatch arm exists (one name set), and this is how the two tables
+/// stay one set without inventing an ABI aarch64 does not have.
+pub const EVENTFD: u64 = 64034; // no arm64 number; unreachable on aarch64
+pub const INOTIFY_INIT: u64 = 64035; // no arm64 number; unreachable on aarch64
+/// See [`EVENTFD`]: the flag-taking forms both machines have.
+pub const EVENTFD2: u64 = 19; // 290 on x86_64
+pub const INOTIFY_INIT1: u64 = 26; // 294 on x86_64
 pub const TGKILL: u64 = 131; // 234 on x86_64
 pub const PERSONALITY: u64 = 92; // 135 on x86_64
 pub const GETPRIORITY: u64 = 141; // 140 on x86_64

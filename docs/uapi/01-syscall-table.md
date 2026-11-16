@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **306** x86_64
-syscall numbers, `nr_aarch64.rs` the same **306** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **308** x86_64
+syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **308** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **every one** of them - 306 arms, no orphans, measured 2026-11-16 - plus a
+explicit arm for **every one** of them - 308 arms, no orphans, measured 2026-11-16 - plus a
 `_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
@@ -271,11 +271,13 @@ A call absent from those is served as its phase section records.
 | `timerfd_gettime` | 287 | fs | 87 |
 | `accept4` | 288 | net | 242 |
 | `signalfd4` | 289 | fs | 74 |
-| `eventfd` | 290 | fs | 19 |
+| `eventfd2` | 290 | fs | 19 |
+| `eventfd` (legacy) | 284 | fs | — (x86_64 only) |
 | `epoll_create1` | 291 | fs | 20 |
 | `dup3` | 292 | fs | 24 |
 | `pipe2` | 293 | fs | 59 |
 | `inotify_init1` | 294 | fs | 26 |
+| `inotify_init` (legacy) | 253 | fs | — (x86_64 only) |
 | `preadv` | 295 | fs | 69 |
 | `pwritev` | 296 | fs | 70 |
 | `recvmmsg` | 299 | net | 243 |

@@ -7483,6 +7483,39 @@ pub fn handle_timerfd_create(args: [usize; ARG_COUNT]) -> isize {
 /// `inotify_init1(flags)` — a fresh event queue. The flags are the `O_`
 /// pair under other names and the refusal of anything else is the man
 /// page's; the queue itself lives in `src/vfs/inotify.rs`.
+/// `eventfd(count)` — the **legacy** door, number 284, with no flag word.
+///
+/// The second argument is not part of the call: Linux's `SYSCALL_DEFINE1(eventfd,
+/// unsigned int, count)` takes one word, and whatever a caller puts in the second
+/// register is ignored rather than validated. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/{legacy,legacy2}.c`): `eventfd(0, 0x7ffff)` is
+/// served and the descriptor comes back with `F_GETFL` `O_RDWR` and **no**
+/// `FD_CLOEXEC` and no non-blocking behaviour, where `eventfd2(0, 0x99)` is
+/// `EINVAL` for the same word.
+///
+/// That asymmetry is the whole reason this is a separate handler instead of an
+/// arm on `handle_eventfd`: the modern door **must** refuse an unknown bit
+/// (`docs/notes/` §6.176 measured it), and this one must not look at the word at
+/// all. Serving it by passing the flags through would give a legacy caller a
+/// descriptor whose `F_GETFL` disagrees with Linux's for the same call.
+pub fn handle_eventfd_legacy(args: [usize; ARG_COUNT]) -> isize {
+    // `args[1]` is deliberately not read: see the doc comment.
+    handle_eventfd([args[0], 0, 0, 0, 0, 0])
+}
+
+/// `inotify_init()` — the **legacy** door, number 253, with no flags.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/legacy.c`): the descriptor
+/// comes back with `F_GETFL` 0 (`O_RDONLY`) and `FD_CLOEXEC` **clear**, where
+/// `inotify_init1(IN_CLOEXEC)` sets it. So this is `inotify_init1(0)` and nothing
+/// more — but it is a separate door because on aarch64 neither it nor `eventfd`
+/// has a number at all (the asm-generic table never had the legacy spellings), so
+/// the dispatch arm exists for one machine only and its number is a value no
+/// aarch64 caller can pass.
+pub fn handle_inotify_init(_args: [usize; ARG_COUNT]) -> isize {
+    handle_inotify_init1([0, 0, 0, 0, 0, 0])
+}
+
 pub fn handle_inotify_init1(args: [usize; ARG_COUNT]) -> isize {
     let flags = args[0];
     if flags & !(crate::vfs::inotify::IN_CLOEXEC | crate::vfs::inotify::IN_NONBLOCK) != 0 {

@@ -492,6 +492,7 @@ pub unsafe fn dispatch(
         nr::GETSID => proc::handle_getsid(args),
         nr::SETGROUPS => posix::handle_setgroups(args, from_user),
         nr::GETGROUPS => posix::handle_getgroups(args, from_user),
+        nr::INOTIFY_INIT => fs::handle_inotify_init(args),
         nr::INOTIFY_INIT1 => fs::handle_inotify_init1(args),
         nr::INOTIFY_ADD_WATCH => fs::handle_inotify_add_watch(args, &cwd()),
         nr::INOTIFY_RM_WATCH => fs::handle_inotify_rm_watch(args),
@@ -607,7 +608,8 @@ pub unsafe fn dispatch(
         nr::CHROOT => fs::handle_chroot(args, &cwd()),
         nr::SIGNALFD => fs::handle_signalfd(args, 0, from_user),
         nr::SIGNALFD4 => fs::handle_signalfd(args, args[3], from_user),
-        nr::EVENTFD => fs::handle_eventfd(args),
+        nr::EVENTFD => fs::handle_eventfd_legacy(args),
+        nr::EVENTFD2 => fs::handle_eventfd(args),
         #[cfg(target_os = "none")]
         nr::MEMFD_CREATE => fs::handle_memfd_create(args, from_user),
         // --- POSIX message queues: the family the IPC namespace waits on ---
