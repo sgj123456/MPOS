@@ -17863,11 +17863,111 @@ and reparent" implementation would fail.
 
 **What this does not do, named.**
 
-1. **`RENAME_WHITEOUT` is `EINVAL`**, as above — and `EOPNOTSUPP` is the errno
-   it should carry, which is a separate small change to the flag gate.
+1. **`RENAME_WHITEOUT` is served now** (§6.188, item 309) — and this paragraph's
+   reason for refusing it was wrong: `mknod` of a char device *is* served here,
+   and the whiteout's capability rule was already in `abi`. A filesystem without
+   support answers `EOPNOTSUPP`, as it should.
 2. **`EXCHANGE` across two filesystems is `CrossDevice`** on ext4 (and the ramfs
    path refuses a non-ramfs partner), which matches `EXDEV`; it is not pinned,
    because two mounts of different types are not a fixture a default sweep can
    make.
 3. **`move_mount(2)`**, which would be the syscall to exchange across mounts, is
    still unimplemented.
+
+## §6.188 `RENAME_WHITEOUT`: the support was already there, and the note said it was not (item 309, LANDED 2026-11-16)
+
+**What §6.187 left, and it was wrong.** Its gap list said: "`RENAME_WHITEOUT` is
+still `EINVAL` … Linux implements it by leaving a character device with `rdev 0`,
+and no overlay mount here has anything that could read one, and `mknod` of a char
+device is `ENXIO` because no driver stands behind any number, so creating one
+would be an object nothing in the tree can interpret."
+
+**Two of those three clauses are false, and the check that found out is one grep.**
+
+* **`mknod` of a char device is served here** on a memory filesystem. The
+  `ENXIO` in the note is what *opening* one answers — a different door. `RamDir`
+  keeps `i_rdev`, `Inode::create` accepts `NodeKind::CharDev` with a number, and
+  `t-mknod` pins it.
+* **The capability rule for exactly this node is already in the tree.**
+  `abi::mknod_needs_capability` has, verbatim —
+
+  ```rust
+  0o020000 => dev as u32 != 0, // S_IFCHR, except the whiteout's `0`
+  ```
+
+  with a comment naming it "the character node whose `dev` is `0` (an overlayfs
+  whiteout)". Somebody measured Linux's rule for a whiteout and wrote it down;
+  nothing was wired to it.
+
+So the support was there and the flag was not connected to it. That is the third
+time in this family that a *sentence* rather than a reading closed an item —
+§6.184's `syncfs`, §6.186's parent pointer, and this.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{wout2,wflags}.c`):
+
+| what | Linux |
+|---|---|
+| the node left behind | `mode 0000`, `S_ISCHR`, `rdev 0` |
+| the move itself | an ordinary rename: a taken target replaced, a missing one created |
+| a **directory** whited out | served, and its tree travels to the new name |
+| `WHITEOUT\|NOREPLACE` | **legal** — `EEXIST` on a taken target, nothing moved |
+| `WHITEOUT\|EXCHANGE` | `EINVAL` |
+
+**The pair rule cost a round and the probe was at fault, not the kernel.** A
+first draft refused `WHITEOUT|NOREPLACE` too, on the assumption the three flags
+partition. The probe that "confirmed" it reused one fixture directory across
+cases, so a `w` left by the previous case made the target taken and the answer
+looked like `EINVAL`. Clearing the fixtures between cases made it `EEXIST` — the
+flag pair is legal and is one operation under two rules. **A probe that does not
+reset its state measures its own leftovers.**
+
+**Which filesystems can answer is the call's own rule**, and the man page says so:
+`RENAME_WHITEOUT` "requires support from the underlying filesystem". Here that
+split is real and comes out the opposite way round from Linux's list: **ramfs**
+keeps `i_rdev` and can make the node, **ext4** has nowhere to put one
+(`Inode::create` refuses a device node there for exactly that reason). So the
+refusal a filesystem without support gives is **`EOPNOTSUPP`** — "this medium
+cannot" rather than `EINVAL`'s "you asked wrongly". The pin asserts *either*
+answer, because the sweep's root is ramfs and aarch64's root is ext4: a claim
+that demanded the whiteout on both would be a claim that the ext4 driver should
+lie about `i_rdev`.
+
+**The pin skipped its own claims twice, and that is the lesson worth more than
+the feature.** `t-renameat2` grew 13 claims and the first version left **six**
+of them silently unrun: it wrote the source name with `write(wo, b"A")` after a
+previous step had left a whiteout node on that very name, and `write` on a char
+device answers `ENXIO` — so the `if` guard was false and the harness printed
+nothing. Fixing that exposed **sixteen more** skipped for the mirror reason: the
+exchange section leaves `xa` a *directory*, so the next run's `write(xa, …)` was
+`EISDIR` and the whole block was skipped. Both are the shape this repository's
+own gate is built to catch — "a suite that silently never ran leaves its cases
+out of the count" — arriving inside a test rather than in the harness. The fix
+is to clear every fixture **by kind** (`remove_file` *and* `remove_dir_all`) at
+the start, and the count is now stable at 41 across repeated runs on both
+machines.
+
+**Gate.** `build/gate-item309b.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **324** on x86_64 and **320** on aarch64,
+`mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted. The first run
+`build/gate-item309.log` reddened on **clippy alone** — `let_unit_value` × 2 on
+three arms, from this change's own `let moved = critical_section::with(…)` whose
+value was `()` — fixed by dropping the binding rather than raising a ceiling.
+
+**What this does not do, named.**
+
+1. **A whiteout on ext4 is `EOPNOTSUPP`**, and that is deliberate: the driver has
+   no `i_rdev`. Serving it would need an inode field this format driver does not
+   keep, so an overlay root on ext4 is not bootable here.
+2. **Nothing reads a whiteout yet.** The node is created and reported correctly;
+   no mount in this kernel is an overlay, so there is no upper layer to consult
+   one. The call is the writer of a format whose reader does not exist here —
+   recorded because "we can write it" must not be mistaken for "we can use it".
+3. **`RENAME_WHITEOUT`'s `CAP_MKNOD` question** is answered by the existing
+   `mknod_needs_capability`, but this door does not itself re-ask the capability:
+   it creates the node through `Inode::create`, which does not check credentials.
+   Measured on the host, a caller with an empty `CapEff` **does** get the whiteout
+   (`wout.c`: `mknod` and `WHITEOUT` both served as uid 1000 with `CapEff: 0`) —
+   which matches, because `dev == 0` is the case that needs no capability. The
+   *nonzero-`dev`* path is not reachable through this call, so the two agree; it
+   is named because the agreement is by construction rather than by a check.

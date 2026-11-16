@@ -3440,3 +3440,44 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `EXCHANGE` across two filesystems answers `CrossDevice`/refuses a non-ramfs partner
   but is **not pinned** (two different mount types are not a default-sweep fixture);
   `move_mount(2)` is unimplemented. (§6.187, item 308)
+
+- **Item 309 — `RENAME_WHITEOUT`: the support was already there, and the note said
+  it was not**: §6.187 left the flag refused with the reason "`mknod` of a char device
+  is `ENXIO` because no driver stands behind any number, so creating one would be an
+  object nothing in the tree can interpret". **Two of those three clauses are false**:
+  `mknod` of a char device *is* served on a memory filesystem (`ENXIO` is what
+  *opening* one answers — a different door), and the capability rule for exactly this
+  node is already in the tree — `abi::mknod_needs_capability` carries
+  `0o020000 => dev as u32 != 0, // S_IFCHR, except the whiteout's 0`, under a comment
+  naming it an overlayfs whiteout. Somebody measured Linux's rule and wrote it down;
+  **nothing was wired to it.** Third time in this family that a *sentence* rather than
+  a reading closed an item (§6.184's `syncfs`, §6.186's parent pointer, this).
+  Measured on Linux 7.3.4 (`build/scratch/opathmmap/{wout2,wflags}.c`): the node reads
+  `mode 0000`, `S_ISCHR`, `rdev 0`; the move is an ordinary rename (a taken target
+  replaced, a missing one created); a **directory** may be whited out and its tree
+  travels; **`WHITEOUT|NOREPLACE` is legal** (`EEXIST` on a taken target) while
+  `WHITEOUT|EXCHANGE` is `EINVAL` — and the pair rule **cost a round with the probe at
+  fault**: a first draft refused `WHITEOUT|NOREPLACE` on the assumption the flags
+  partition, and the probe that "confirmed" it reused one fixture directory so a
+  leftover target made the answer look like `EINVAL`; **a probe that does not reset its
+  state measures its own leftovers.** Which filesystems can answer is the man page's
+  own rule and comes out opposite to Linux's list here: ramfs keeps `i_rdev` and can
+  make the node, ext4 has nowhere to put one (`Inode::create` refuses a device node
+  there for that reason), so a filesystem without support answers **`EOPNOTSUPP`** —
+  and the pin asserts *either*, because the sweep's root is ramfs and aarch64's is
+  ext4. `t-renameat2` **+13 (41 claims)** — and the pin **skipped its own claims
+  twice**: six silently unrun because it wrote a name a previous step had left a
+  whiteout node on (`write` on a char device is `ENXIO`), then sixteen more because
+  the exchange section leaves `xa` a *directory* (`write` answers `EISDIR`); both are
+  the gate's own "a suite that silently never ran leaves its cases out of the count",
+  inside a test. Fixed by clearing every fixture **by kind**; stable at 41 across runs
+  on both machines. Gate `build/gate-item309b.log` `GATE_EXIT=0`: stage 1 1340, x86_64
+  **324**, aarch64 **320**, kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1` — the first run reddened on **clippy alone**
+  (`let_unit_value` ×2 from this change's own `let moved = …` binding a `()`), fixed by
+  dropping the binding. **Named**: a whiteout on ext4 is `EOPNOTSUPP` deliberately (no
+  `i_rdev`, so an overlay root on ext4 is not bootable); **nothing reads a whiteout
+  yet** — no mount here is an overlay, so this writes a format whose reader does not
+  exist ("we can write it" is not "we can use it"); and the door does not itself re-ask
+  `CAP_MKNOD` (measured as matching, since `dev == 0` needs none, but by construction
+  rather than by a check). (§6.188, item 309)

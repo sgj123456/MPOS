@@ -13272,3 +13272,24 @@ non-ramfs partner on ramfs, which matches `EXDEV` but is **not pinned** — two
 mounts of different types are not a fixture a default sweep can make. And
 **`move_mount(2)`**, the call that would exchange across mounts, is
 unimplemented.
+
+## Item 309 — `RENAME_WHITEOUT`: the support was already there, and the note said it was not (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What §6.187 left, and it was wrong** | "`RENAME_WHITEOUT` is still `EINVAL` … `mknod` of a char device is `ENXIO` because no driver stands behind any number, so creating one would be an object nothing in the tree can interpret." Two of those three clauses are false: **`mknod` of a char device is served** on a memory filesystem (`ENXIO` is what *opening* one answers, a different door), and the capability rule for exactly this node is **already in the tree** — `abi::mknod_needs_capability` has `0o020000 => dev as u32 != 0, // S_IFCHR, except the whiteout's 0` under a comment naming it an overlayfs whiteout. Somebody measured Linux's rule and wrote it down; **nothing was wired to it.** |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/{wout2,wflags}.c`): the node reads `mode 0000`, `S_ISCHR`, `rdev 0`; the move is an ordinary rename (a taken target replaced, a missing one created); a **directory** may be whited out and its tree travels; **`WHITEOUT\|NOREPLACE` is legal** (`EEXIST` on a taken target, nothing moved); `WHITEOUT\|EXCHANGE` is `EINVAL`. |
+| **The pair rule cost a round, and the probe was at fault** | A first draft refused `WHITEOUT\|NOREPLACE` on the assumption the flags partition. The probe that "confirmed" it reused one fixture directory, so a leftover target made the answer look like `EINVAL`; clearing fixtures between cases made it `EEXIST`. **A probe that does not reset its state measures its own leftovers.** |
+| **Which filesystems can answer** | The man page's own rule ("requires support from the underlying filesystem"), and here it comes out the opposite way round from Linux's list: **ramfs** keeps `i_rdev` and can make the node, **ext4** has nowhere to put one (`Inode::create` refuses a device node there for that reason). So a filesystem without support answers **`EOPNOTSUPP`** — "this medium cannot", not `EINVAL`'s "you asked wrongly". The pin asserts *either*, because the sweep's root is ramfs and aarch64's is ext4. |
+| **The pin skipped its own claims twice** | 13 claims; the first version left **six** silently unrun — it wrote the source name after a previous step had left a whiteout node there, and `write` on a char device is `ENXIO`, so the `if` guard was false and the harness printed nothing. Fixing that exposed **sixteen more** skipped for the mirror reason: the exchange section leaves `xa` a *directory*, so the next run's `write(xa, …)` was `EISDIR`. **The gate's own rule — "a suite that silently never ran leaves its cases out of the count" — arriving inside a test.** Fixed by clearing every fixture **by kind**; stable at **41** claims across repeated runs on both machines. |
+| **Gate** | `build/gate-item309b.log`, `GATE_EXIT=0`, both arms: stage 1 **1340**; stage 2 **324** x86_64 / **320** aarch64, `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. First run `build/gate-item309.log` reddened on **clippy alone** — `let_unit_value` ×2 from this change's own `let moved = …` binding a `()` — fixed by dropping the binding. |
+
+**What this does not do, named.** A whiteout on **ext4 is `EOPNOTSUPP`** and
+deliberate: the driver keeps no `i_rdev`, so an overlay root on ext4 is not
+bootable here. **Nothing reads a whiteout yet** — no mount in this kernel is an
+overlay, so the call writes a format whose reader does not exist; recorded because
+"we can write it" must not be mistaken for "we can use it". And this door does not
+itself re-ask `CAP_MKNOD`: it creates the node through `Inode::create`, which does
+not check credentials — measured as **matching**, since the whiteout's `dev == 0`
+is the case that needs no capability, but named because the agreement is by
+construction rather than by a check.
