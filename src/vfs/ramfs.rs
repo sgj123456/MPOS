@@ -1460,6 +1460,70 @@ impl Inode for RamDir {
         Ok(())
     }
 
+    /// Swap two names in this directory.
+    ///
+    /// Two `BTreeMap` inserts and an `Arc` swap, and the subtree needs nothing
+    /// moved - the same fact that makes a directory rename cheap here: a
+    /// ramfs inode does not record its parent, so `..` is a search and it
+    /// follows the tree as it stands after the swap.
+    ///
+    /// The link counts are untouched, and that is the whole of the accounting:
+    /// both inodes keep the number of names they had (one each, before and
+    /// after), and the directory holding them is the same directory, so its own
+    /// count does not move either. Unlike [`Self::rename_dir_into`], where the
+    /// destination gained a name and the source lost one.
+    fn exchange_children(&self, a: &str, b: &str) -> VfsResult<()> {
+        let at = now();
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            let first = entries.get(a).cloned().ok_or(VfsError::NoEntry)?;
+            let second = entries.get(b).cloned().ok_or(VfsError::NoEntry)?;
+            entries.insert(alloc::string::String::from(a), second);
+            entries.insert(alloc::string::String::from(b), first);
+            self.mtime.borrow(cs).set(at);
+            Ok(())
+        })
+    }
+
+    /// Swap a name here with a name in `other`.
+    ///
+    /// Four `BTreeMap` edits across two maps, and again the subtree needs
+    /// nothing: neither name changes directory, so no `..` is affected and no
+    /// inode's location depends on which one it is behind.
+    fn exchange_with(&self, a: &str, other: &Arc<dyn Inode>, b: &str) -> VfsResult<()> {
+        let at = now();
+        let Some(dst) = other.as_any().downcast_ref::<RamDir>() else {
+            return Err(VfsError::Unsupported);
+        };
+        critical_section::with(|cs| {
+            let mine = self
+                .entries
+                .borrow(cs)
+                .borrow()
+                .get(a)
+                .cloned()
+                .ok_or(VfsError::NoEntry)?;
+            let theirs = dst
+                .entries
+                .borrow(cs)
+                .borrow()
+                .get(b)
+                .cloned()
+                .ok_or(VfsError::NoEntry)?;
+            self.entries
+                .borrow(cs)
+                .borrow_mut()
+                .insert(alloc::string::String::from(a), theirs);
+            dst.entries
+                .borrow(cs)
+                .borrow_mut()
+                .insert(alloc::string::String::from(b), mine);
+            self.mtime.borrow(cs).set(at);
+            dst.mtime.borrow(cs).set(at);
+            Ok(())
+        })
+    }
+
     /// Move a directory's name edge from here to `to`.
     ///
     /// A ramfs directory is a `BTreeMap` of names, so the whole of the move is

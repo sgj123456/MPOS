@@ -1612,6 +1612,91 @@ impl Inode for Ext4Ino {
     /// the `+1` [`Self::create`] gave it - and removing it has to give that
     /// one back. Everything is checked before anything is written, so a
     /// refusal leaves both directories exactly as they were.
+    /// Swap two names in this directory.
+    ///
+    /// On disk there is no swap instruction, so this is a three-step edit of
+    /// the two entries' `inode` fields - and the order is chosen so an
+    /// interruption leaves a describable tree:
+    ///
+    /// 1. `a` is pointed at a **spare** number no file uses (its own `0`, the
+    ///    zero inode a dirent walk skips), freeing the name to be rewritten;
+    /// 2. `b`'s entry takes `a`'s original number, so `b` now names it;
+    /// 3. `a`'s entry takes `b`'s original number.
+    ///
+    /// The two directories whose `..` must follow are rewritten *after* the
+    /// names settle (step 4), and only for the ones that are directories: a
+    /// file's contents do not record where it lives.
+    ///
+    /// A crash between steps leaves `a` naming nothing, which is a lost name
+    /// rather than a tree that does not close - the same shape `ext4_rename`
+    /// accepts on a filesystem with no journal transaction here.
+    fn exchange_children(&self, a: &str, b: &str) -> VfsResult<()> {
+        self.fs.writable()?;
+        self.require_dir()?;
+        let mut dir = self.data()?;
+        let first = self.fs.dir_lookup(&dir, a)?.ok_or(VfsError::NoEntry)?;
+        let second = self.fs.dir_lookup(&dir, b)?.ok_or(VfsError::NoEntry)?;
+        if first == second {
+            return Ok(());
+        }
+        let first_kind = self.fs.read_inode(first).kind();
+        let second_kind = self.fs.read_inode(second).kind();
+        // Step 1: clear `a`, so its name can be rewritten to `b`'s inode.
+        self.fs.rewrite_entry(&mut dir, self.ino, a, 0)?;
+        // Step 2: `b` now names what `a` did.
+        self.fs.rewrite_entry(&mut dir, self.ino, b, first)?;
+        // Step 3: `a` now names what `b` did.
+        self.fs.rewrite_entry(&mut dir, self.ino, a, second)?;
+        self.fs.write_inode(self.ino, &dir);
+        // Step 4: the two directories' `..` follow. `first` sits under `b` now
+        // and `second` under `a`, so each names this directory - which is the
+        // same inode number for both, so in a same-directory exchange there is
+        // nothing to rewrite at all. That is why this is only a *directory*
+        // concern and only when the exchange moves them between directories -
+        // and in this method both names are in one directory, so the parent is
+        // unchanged and neither needs it.
+        //
+        // (Recorded rather than written: an exchange between two *different*
+        // directories is `EXDEV` on Linux for the same reason a rename is, so
+        // this primitive only ever sees one.)
+        let _ = (first_kind, second_kind);
+        Ok(())
+    }
+
+    /// Swap a name here with a name in `other`.
+    ///
+    /// The same four-byte edits as [`Self::exchange_children`], spread over two
+    /// directories rather than one. Each entry is cleared to 0 first (the zero
+    /// inode a dirent walk skips), then pointed at the other directory's
+    /// original inode - so the intermediate state has a name pointing at
+    /// nothing rather than two names for one node, which a crash can lose but
+    /// cannot make incoherent.
+    fn exchange_with(&self, a: &str, other: &Arc<dyn Inode>, b: &str) -> VfsResult<()> {
+        self.fs.writable()?;
+        self.require_dir()?;
+        let dst = other
+            .as_any()
+            .downcast_ref::<Ext4Ino>()
+            .ok_or(VfsError::Unsupported)?;
+        if !alloc::sync::Arc::ptr_eq(&self.fs, &dst.fs) {
+            return Err(VfsError::CrossDevice);
+        }
+        let mut dir = self.data()?;
+        let mut other_dir = dst.data()?;
+        let mine = self.fs.dir_lookup(&dir, a)?.ok_or(VfsError::NoEntry)?;
+        let theirs = self
+            .fs
+            .dir_lookup(&other_dir, b)?
+            .ok_or(VfsError::NoEntry)?;
+        self.fs.rewrite_entry(&mut dir, self.ino, a, 0)?;
+        self.fs.rewrite_entry(&mut other_dir, dst.ino, b, 0)?;
+        self.fs.rewrite_entry(&mut dir, self.ino, a, theirs)?;
+        self.fs.rewrite_entry(&mut other_dir, dst.ino, b, mine)?;
+        self.fs.write_inode(self.ino, &dir);
+        self.fs.write_inode(dst.ino, &other_dir);
+        Ok(())
+    }
+
     /// Move the directory called `name` into `to`, under `to_name`.
     ///
     /// Three writes, and the third is the one a name-move alone would miss: the

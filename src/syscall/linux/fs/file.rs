@@ -2118,8 +2118,22 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     const RENAME_WHITEOUT: usize = 0x4;
 
     let flags = args[4];
+    // `RENAME_WHITEOUT` stays refused, and the reason is not "unimplemented":
+    // it is *how* Linux implements it. Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/rex2.c`): `renameat2(old -> new, WHITEOUT)`
+    // moves the name and leaves a **character device with rdev 0** at `old` -
+    // an overlayfs whiteout. A machine with no overlay mount has nothing that
+    // could read one, and this kernel refuses `mknod` of a char device with
+    // `ENXIO` because no driver stands behind any number, so creating one here
+    // would be an object nothing in the tree can interpret. `EINVAL`'s
+    // neighbour `EOPNOTSUPP` would be the better spelling and is on the gap
+    // list; the flag stays refused either way.
+    //
+    // The pair rule is measured: `EXCHANGE|NOREPLACE` and `EXCHANGE|WHITEOUT`
+    // are both `EINVAL` on Linux, so only one of the three may be named.
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
-        || flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+        || flags & RENAME_WHITEOUT != 0
+        || flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0
     {
         return err::EINVAL;
     }
@@ -2201,6 +2215,86 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // would replace. Asked of the directory that holds the name rather than by
     // walking it, which is the same question every make-or-remove asks.
     let existing = dir.lookup(&name).ok();
+
+    // **`RENAME_EXCHANGE` swaps the two names**, and its rules are its own.
+    // Measured on Linux 7.3.4 (`build/scratch/opathmmap/rex.c`, `rex2.c`):
+    //
+    //   * **both names must exist** - `EXCHANGE` onto a missing one is
+    //     `ENOENT` where a plain rename would create it;
+    //   * the two may be **different kinds** - a file and a directory swap
+    //     happily, and each subtree follows its new parent;
+    //   * `EXCHANGE|NOREPLACE` and `EXCHANGE|WHITEOUT` are `EINVAL`;
+    //   * exchanging a name with itself is 0 (the no-op above already
+    //     answered it for one directory, and this catches the same inode
+    //     reached by two names).
+    //
+    // It is handled *here*, before the type rules, because those rules exist to
+    // answer "may this kind replace that kind" - and an exchange replaces
+    // neither, it swaps. Asking `EISDIR` for a file-onto-directory exchange
+    // would be the plain rename's answer to a different question.
+    if flags & RENAME_EXCHANGE != 0 {
+        let Some(second) = existing else {
+            return err::ENOENT;
+        };
+        // Nothing moves when both names reach one node, and the answer is 0.
+        if Arc::ptr_eq(&old_inode, &second) {
+            return 0;
+        }
+        // **The two names may be in two directories**, and that is measured
+        // rather than assumed: Linux 7.3.4 (`build/scratch/opathmmap/rex3.c`,
+        // `rex5.c`) serves `renameat2(p/f, q/g, EXCHANGE)` across two
+        // directories, both files and whole directory subtrees - and each
+        // exchanged directory keeps the `..` it already had, because **both
+        // names stay where they were** and only the inode each points at
+        // changes. So there is no parent to move and no subtree to follow,
+        // which is exactly why a plain cross-directory *rename* is one
+        // question (a name travels) and this is another (no name travels).
+        //
+        // A first draft answered `EXDEV` here on the reasoning that the two
+        // parents would each have to learn what the other lost. They do not
+        // have to learn anything: nothing left either directory.
+        //
+        // Both ends' names are being given up and given, so both ask the remove
+        // rule and each destination directory asks the create rule.
+        for (dir_holding, subject) in [(&old_dir, &old_inode), (&dir, &second)] {
+            if let Err(e) = crate::vfs::may_remove(dir_holding, subject) {
+                return err_of(e);
+            }
+        }
+        for dir_holding in [&old_dir, &dir] {
+            if let Err(e) = crate::vfs::may_create_in(dir_holding) {
+                return err_of(e);
+            }
+        }
+        // An exchange cannot put a directory inside itself either - a
+        // directory and one of its own ancestors swapping names would leave
+        // the ancestor's subtree hanging off its own descendant. The reach is
+        // the same question a rename's `EINVAL` asks.
+        for (subject, other_name_dir) in [(&old_inode, &dir), (&second, &old_dir)] {
+            if subject.metadata().kind == NodeKind::Dir && subtree_contains(subject, other_name_dir)
+            {
+                return err::EINVAL;
+            }
+        }
+        // Two directories, so the swap is two `exchange_children` calls when the
+        // names are apart - each directory trades its own name for a foreign
+        // inode, and there is no single method that spans two.
+        if Arc::ptr_eq(&old_dir, &dir) {
+            if let Err(e) = old_dir.exchange_children(&old_name, &name) {
+                return err_of(e);
+            }
+        } else {
+            if let Err(e) = old_dir.exchange_with(&old_name, &dir, &name) {
+                return err_of(e);
+            }
+        }
+        // Two names changed owners, so two `IN_MOVED_*` pairs are owed - each
+        // with its own cookie, because a reader joins a from/to pair by it and
+        // one cookie for both would tell it the wrong thing.
+        crate::vfs::inotify::emit_move(&old_dir, &old_name, &dir, &name, &second);
+        crate::vfs::inotify::emit_move(&dir, &name, &old_dir, &old_name, &old_inode);
+        return 0;
+    }
 
     // Both names are resolved before either rule is asked, because the *shapes*
     // come first and they need both of them: renaming a file onto a directory

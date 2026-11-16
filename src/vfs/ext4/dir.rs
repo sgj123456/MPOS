@@ -159,6 +159,27 @@ impl Core {
     /// file type stay as they are, so this is an in-place edit of four bytes
     /// rather than a remove and an insert, and the checksum is recomputed by
     /// `update_dir_block` on the way out.
+    /// Point the entry `name` in `dir` at `ino`, in place - the four-byte edit
+    /// `RENAME_EXCHANGE` is built from, beside [`Self::set_dir_parent`]'s.
+    pub(crate) fn rewrite_entry(
+        &self,
+        dir: &mut InodeData,
+        dir_ino: u32,
+        name: &str,
+        ino: u32,
+    ) -> VfsResult<()> {
+        let mut done = false;
+        for block in self.dir_blocks(dir) {
+            if self.update_dir_block(block, dir_ino, dir.generation, |page| {
+                done = self::dirent::rewrite_dirent_inode(page, name, ino);
+                done
+            }) {
+                return Ok(());
+            }
+        }
+        Err(VfsError::NoEntry)
+    }
+
     pub(crate) fn set_dir_parent(&self, ino: u32, parent: u32) -> VfsResult<()> {
         let data = self.read_inode(ino);
         if data.kind() != NodeKind::Dir {

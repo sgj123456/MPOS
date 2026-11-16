@@ -583,6 +583,42 @@ pub trait Inode: Send + Sync + core::any::Any {
         Err(VfsError::Unsupported)
     }
 
+    /// Swap the two names this directory holds: `a` comes to name what `b`
+    /// named and `b` what `a` did. `RENAME_EXCHANGE`'s whole content.
+    ///
+    /// Its own primitive rather than two calls to [`Self::rename_dir_into`],
+    /// because the two cannot be sequenced: the second would find the name the
+    /// first had just taken. Its own *method* rather than a kernel-side pair of
+    /// `unlink`s for the same reason a directory rename is one - a name is a
+    /// filesystem's record, and the swap is one step of its accounting.
+    ///
+    /// `RENAME_EXCHANGE` has a rule the other shapes do not: **both names must
+    /// exist**. Measured on Linux 7.3.4
+    /// (`build/scratch/opathmmap/rex.c`), `renameat2(a, missing, EXCHANGE)` is
+    /// `ENOENT` and nothing moves - where a plain rename would create the
+    /// missing one. So the caller has both nodes in hand already, and the
+    /// mismatch is refused before this is reached.
+    fn exchange_children(&self, a: &str, b: &str) -> VfsResult<()> {
+        let _ = (a, b);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Swap the name `a` **in this directory** with the name `b` **in `other`**.
+    ///
+    /// The cross-directory half of `RENAME_EXCHANGE`, and it is a separate
+    /// method rather than a special case of [`Self::exchange_children`] because
+    /// the two directories are two different filesystems' business: this one
+    /// gives up a name and takes a foreign inode, `other` does the mirror.
+    ///
+    /// No parent is rewritten and no subtree follows - measured on Linux 7.3.4
+    /// (`build/scratch/opathmmap/rex5.c`), an exchanged directory keeps the
+    /// `..` it had, because **both names stay where they are** and only the
+    /// inode behind each changes. That is the whole difference from a rename.
+    fn exchange_with(&self, a: &str, other: &Arc<dyn Inode>, b: &str) -> VfsResult<()> {
+        let _ = (a, other, b);
+        Err(VfsError::Unsupported)
+    }
+
     /// Whether this directory has nothing under it but `.` and `..` - the
     /// question `rename(2)` asks of a replaced target and `rmdir(2)` of its
     /// subject.
