@@ -789,24 +789,32 @@ impl PipeEnd {
     /// measured (`build/scratch/opathmmap/gaps2.c`: `4097` -> `8192`, `0`/`1` ->
     /// `4096`, `1 << 20` accepted, `1 << 30` -> `EPERM`).
     ///
-    /// A shrink is honoured: the measured host took `1048576 -> 4096` and read
-    /// `4096` back. Shrinking below what is *already buffered* is the one case
-    /// the measurement did not cover, and the honest reading is Linux's: the
-    /// capacity is a ceiling on what may be **queued**, so a pipe holding more
-    /// than the new ceiling simply delivers it before refusing more.
-    pub fn set_capacity(&self, bytes: usize) -> Option<usize> {
+    /// A shrink is honoured **only down to what is already buffered**: measured
+    /// on Linux 7.3.4 (`build/scratch/opathmmap/shrink.c`), a pipe holding
+    /// 32768 bytes refused `F_SETPIPE_SZ(4096)` with **`EBUSY`** and kept
+    /// `65536`, and the reader then drained all 32768. That is `pipe_set_size`'s
+    /// own rule (`if (size < pipe->nrbufs) return -EBUSY`), and it is why this
+    /// answers `Err` rather than clamping: the honest answer is a refusal, not a
+    /// capacity that is smaller than what the pipe is already holding.
+    ///
+    /// The three answers are therefore `Ok(now)`, `Err(EPERM)` past the ceiling
+    /// and `Err(EBUSY)` below what is queued.
+    pub fn set_capacity(&self, bytes: usize) -> Result<usize, VfsError> {
         if bytes == 0 {
-            return None;
+            return Err(VfsError::Invalid);
         }
         let rounded = bytes.div_ceil(MIN_PIPE_CAPACITY) * MIN_PIPE_CAPACITY;
         if rounded > MAX_PIPE_CAPACITY {
-            return None;
+            return Err(VfsError::NotPermitted);
         }
-        Some(critical_section::with(|cs| {
+        critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
+            if rounded < st.data.len() {
+                return Err(VfsError::Busy);
+            }
             st.capacity = rounded;
-            rounded
-        }))
+            Ok(rounded)
+        })
     }
 
     /// there is room for the whole request. The second half has to match what

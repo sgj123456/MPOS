@@ -524,7 +524,7 @@ fn main() {
     // is `EPERM`. Anything that is not a pipe - a regular file, an `O_PATH`
     // descriptor - is `EBADF`, not `EINVAL`.
     match rustix::pipe::pipe() {
-        Ok((read_end, _write_end)) => {
+        Ok((read_end, write_end)) => {
             let rd = std::os::fd::AsRawFd::as_raw_fd(&read_end);
             // SAFETY: `rd` is a live pipe end this test owns.
             let default = unsafe { libc::fcntl(rd, libc::F_GETPIPE_SZ) };
@@ -563,6 +563,51 @@ fn main() {
                 ),
                 too_big == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+            );
+            // A shrink **below what is already buffered** is `EBUSY`, and the
+            // capacity stays where it was: measured on Linux 7.3.4
+            // (`build/scratch/opathmmap/shrink.c`), a pipe holding 32768 bytes
+            // refused `F_SETPIPE_SZ(4096)` with `EBUSY` and still reported
+            // 65536 afterwards, and the reader then drained all 32768. Linux's
+            // own `pipe_set_size` has the same guard.
+            //
+            // The capacity is grown back to 65536 first, because the earlier
+            // claim left it at 8192 - and a 32768-byte write into an 8192-byte
+            // pipe blocks, which is the shape this section must not have: the
+            // write would park with no reader, and the whole program would hang
+            // on the claim that was supposed to be about shrinking.
+            // SAFETY: `rd` and the write end are live pipe ends this test owns.
+            let regrown = unsafe { libc::fcntl(rd, libc::F_SETPIPE_SZ, 65536) };
+            r.check(
+                &format!("the capacity is grown back to 65536 first, got {regrown}"),
+                regrown == 65536,
+            );
+            // SAFETY: as above.
+            let filled = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&write_end),
+                    [b'a'; 32768].as_ptr().cast::<libc::c_void>(),
+                    32768,
+                )
+            };
+            r.check(
+                &format!("the pipe takes 32768 bytes to make the shrink interesting, got {filled}"),
+                filled == 32768,
+            );
+            // SAFETY: `rd` is live.
+            let busy = unsafe { libc::fcntl(rd, libc::F_SETPIPE_SZ, 4096) };
+            r.check(
+                &format!(
+                    "F_SETPIPE_SZ below what is buffered is EBUSY, got rc={busy} errno={}",
+                    std::io::Error::last_os_error()
+                ),
+                busy == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY),
+            );
+            // SAFETY: as above.
+            let kept = unsafe { libc::fcntl(rd, libc::F_GETPIPE_SZ) };
+            r.check(
+                &format!("and the capacity is unchanged at 65536 after the refusal, got {kept}"),
+                kept == 65536,
             );
         }
         Err(_) => r.check("a pipe for the sizing claims is made", false),

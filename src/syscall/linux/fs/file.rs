@@ -4137,13 +4137,16 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         },
         F_SETPIPE_SZ => match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => match file.inode().as_pipe() {
-                // Linux's answer to a request past `pipe-max-size` without
-                // `CAP_SYS_RESOURCE` is `EPERM`; below a page it clamps up
-                // rather than refusing, and the two bounds are the capacity
-                // setter's own (see `PipeEnd::set_capacity`).
+                // The three answers are the capacity setter's own (see
+                // `PipeEnd::set_capacity`): the new size, `EPERM` past
+                // `pipe-max-size` without `CAP_SYS_RESOURCE`, and **`EBUSY`**
+                // when the request is below what the pipe already holds -
+                // measured, a pipe buffering 32768 bytes refuses a shrink to
+                // 4096 with `EBUSY` and keeps its old capacity
+                // (`build/scratch/opathmmap/shrink.c`).
                 Some(pipe) => match pipe.set_capacity(arg) {
-                    Some(now) => now as isize,
-                    None => err::EPERM,
+                    Ok(now) => now as isize,
+                    Err(e) => err_of(e),
                 },
                 None => err::EBADF,
             },
