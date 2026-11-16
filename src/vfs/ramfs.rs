@@ -1485,6 +1485,44 @@ impl Inode for RamDir {
         })
     }
 
+    /// Move `a` to `b` and leave a whiteout where `a` was.
+    ///
+    /// Two steps, in the order that leaves the tree describable if the second
+    /// fails: the **move first**, so the node is never held by a whiteout that
+    /// claims to have replaced it; then the character device in the vacated
+    /// name. A ramfs directory can hold a device node - it keeps the number
+    /// (`rdev` in the node's metadata) - which is the whole reason this
+    /// filesystem can serve the call where ext4 answers `Unsupported`.
+    fn whiteout_rename(&self, a: &str, b: &str) -> VfsResult<()> {
+        let at = now();
+        // Take the node out under the old name; it goes back under the new one.
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            let node = entries.remove(a).ok_or(VfsError::NoEntry)?;
+            // A plain rename replaces a taken target - measured: `WHITEOUT
+            // a -> b` where `b` exists leaves `b` holding `a`'s bytes.
+            entries.insert(alloc::string::String::from(b), node);
+            Ok(())
+        })?;
+        // Then the whiteout, in the name that is now free. Built through the
+        // same `create` a `mknod` reaches, so the node is a real device node
+        // rather than a kernel-side marker only this function could read.
+        let made = self.create(a, NodeKind::CharDev, Some((0, 0)));
+        match made {
+            Ok(node) => {
+                // `mknod`'s own mode for a whiteout: `0000`, measured on Linux
+                // (`wout2.c` read back `mode=00`).
+                node.set_mode(0);
+                critical_section::with(|cs| self.mtime.borrow(cs).set(at));
+                Ok(())
+            }
+            // The move stands and the name is empty, which is a rename without
+            // its whiteout rather than a lost node: report the failure so the
+            // caller knows the call did not do what it said.
+            Err(e) => Err(e),
+        }
+    }
+
     /// Swap a name here with a name in `other`.
     ///
     /// Four `BTreeMap` edits across two maps, and again the subtree needs

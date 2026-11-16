@@ -122,11 +122,24 @@ fn main() {
     let xb = "/tmp/t-renameat2_xb";
     let xc = "/tmp/t-renameat2_xc";
     let xmissing = "/tmp/t-renameat2_xmissing";
+    // Every fixture this section makes is cleared first, and **by kind**: an
+    // exchange swaps a name between a file and a directory, so a previous run
+    // leaves `xa` a *directory* - and `write` on one is `EISDIR`, which made
+    // the guard below false and skipped all sixteen claims silently. A test
+    // whose fixtures depend on how the last run ended is a test that reports
+    // nothing.
     for p in [xa, xb, xc, xmissing] {
         let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_dir_all(p);
     }
-    let _ = std::fs::remove_dir_all("/tmp/t-renameat2_xdir");
-    let _ = std::fs::remove_dir_all("/tmp/t-renameat2_xdir2");
+    for p in [
+        "/tmp/t-renameat2_xdir",
+        "/tmp/t-renameat2_xdir2",
+        "/tmp/t-renameat2_swp",
+    ] {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_dir_all(p);
+    }
     let _ = std::fs::write(xa, b"AAA");
     let _ = std::fs::write(xb, b"BBB");
     if std::fs::read(xa).is_ok() && std::fs::read(xb).is_ok() {
@@ -247,6 +260,156 @@ fn main() {
     }
     let _ = std::fs::remove_dir_all("/tmp/t-renameat2_xdir");
     let _ = std::fs::remove_dir_all("/tmp/t-renameat2_xdir2");
+
+    // === RENAME_WHITEOUT: the name moves and a whiteout takes its place =====
+    //
+    // A whiteout is a **character device with device number 0**, which is how
+    // overlayfs records "this name was deleted from the lower layer". Measured
+    // on Linux 7.3.4 (`build/scratch/opathmmap/wout2.c`, `wflags.c`): the node
+    // reads `mode 0000`, `S_ISCHR`, `rdev 0`; the move is an ordinary rename
+    // otherwise (a taken target is replaced, a missing one created); a
+    // **directory** may be whited out and its tree travels; and
+    // **`WHITEOUT|NOREPLACE` is legal** (it answers `EEXIST` on a taken target)
+    // while `EXCHANGE` with either of the others is `EINVAL`.
+    //
+    // `RENAME_WHITEOUT` is the one flag whose answer depends on the
+    // *filesystem*: the man page says it "requires support from the underlying
+    // filesystem", and here ramfs keeps `i_rdev` and can make the node while
+    // ext4 has nowhere to put one. The sweep machine's root is ramfs and the
+    // aarch64 root is ext4, so this program's claims are made where the answer
+    // is the served one - a filesystem without support answers `EOPNOTSUPP`,
+    // which is a truth about that medium rather than a divergence.
+    const WHITEOUT: u64 = 0x4;
+    let wo = "/tmp/t-renameat2_wo";
+    let wo2 = "/tmp/t-renameat2_wo2";
+    let wotaken = "/tmp/t-renameat2_wotaken";
+    let womissing = "/tmp/t-renameat2_womissing";
+    // Cleanup must cope with what a **previous run** left: a whiteout is a
+    // character device, and `remove_file` on one is fine - but the *directories*
+    // and the `wodir2` target survive a run that failed partway, so they are
+    // cleared here rather than at the end where an early return cannot reach.
+    let _ = std::fs::remove_dir_all("/tmp/t-renameat2_wodir2");
+    for p in [wo, wo2, wotaken, womissing] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all("/tmp/t-renameat2_wodir");
+    let _ = std::fs::write(wo, b"PAYLOAD");
+    if std::fs::read(wo).is_ok() {
+        let answered = renameat2(wo, wo2, WHITEOUT);
+        // Either the filesystem can make the node or it says so; both are
+        // honest, and which one this machine gives is a property of its root.
+        let supported = answered == 0;
+        r.check(
+            &format!(
+                "RENAME_WHITEOUT is served or answers EOPNOTSUPP, never EINVAL (got {answered})"
+            ),
+            supported || refused(answered, libc::EOPNOTSUPP),
+        );
+        if supported {
+            r.check(
+                "the name moved and the node is intact",
+                std::fs::read(wo2).ok().as_deref() == Some(&b"PAYLOAD"[..]),
+            );
+            // The whiteout itself: a char device with rdev 0 and mode 0000.
+            let node = std::fs::symlink_metadata(wo);
+            r.check(
+                "a character device is left behind",
+                node.as_ref()
+                    .ok()
+                    .map(|m| {
+                        use std::os::unix::fs::FileTypeExt;
+                        m.file_type().is_char_device()
+                    })
+                    .unwrap_or(false),
+            );
+            r.check(
+                "with device number 0",
+                node.as_ref().ok().map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.rdev()
+                }) == Some(0),
+            );
+            // A directory may be whited out, and its tree travels.
+            let wodir = "/tmp/t-renameat2_wodir";
+            if std::fs::create_dir_all(format!("{wodir}/in")).is_ok()
+                && std::fs::write(format!("{wodir}/in/f"), b"Q").is_ok()
+            {
+                r.check(
+                    "a directory may be whited out",
+                    renameat2(wodir, "/tmp/t-renameat2_wodir2", WHITEOUT) == 0,
+                );
+                r.check(
+                    "and its tree travelled",
+                    std::fs::read("/tmp/t-renameat2_wodir2/in/f")
+                        .ok()
+                        .as_deref()
+                        == Some(&b"Q"[..]),
+                );
+                r.check(
+                    "and a whiteout took the directory's name",
+                    std::fs::symlink_metadata(wodir)
+                        .map(|m| {
+                            use std::os::unix::fs::FileTypeExt;
+                            m.file_type().is_char_device()
+                        })
+                        .unwrap_or(false),
+                );
+                let _ = std::fs::remove_file(wodir);
+                let _ = std::fs::remove_dir_all("/tmp/t-renameat2_wodir2");
+            }
+            // The name `wo` now holds the whiteout node, so it has to go before
+            // the name can be a file again - and the first draft of this pin did
+            // not, which made **six** claims silently never run: `write` on a
+            // char device answers `ENXIO`, the `if` was false, and the harness
+            // printed nothing. A claim that cannot run must fail rather than skip.
+            let _ = std::fs::remove_file(wo);
+            // A taken target is replaced (with no NOREPLACE).
+            if std::fs::write(wo, b"A").is_ok() && std::fs::write(wotaken, b"B").is_ok() {
+                r.check(
+                    "a taken target is replaced",
+                    renameat2(wo, wotaken, WHITEOUT) == 0,
+                );
+                r.check(
+                    "and the target holds the source's bytes",
+                    std::fs::read(wotaken).ok().as_deref() == Some(&b"A"[..]),
+                );
+                let _ = std::fs::remove_file(wo);
+            }
+            // **`WHITEOUT|NOREPLACE` is legal**, and refuses a taken target.
+            let _ = std::fs::remove_file(wo);
+            if std::fs::write(wo, b"A").is_ok() && std::fs::write(wotaken, b"B").is_ok() {
+                r.check(
+                    "WHITEOUT|NOREPLACE on a taken target is EEXIST",
+                    refused(renameat2(wo, wotaken, WHITEOUT | NOREPLACE), libc::EEXIST),
+                );
+                r.check(
+                    "and nothing moved",
+                    std::fs::read(wo).ok().as_deref() == Some(&b"A"[..]),
+                );
+            }
+            // A missing target is created, as a plain rename creates one.
+            if std::fs::write(wo, b"X").is_ok() {
+                r.check(
+                    "a missing target is created",
+                    renameat2(wo, womissing, WHITEOUT) == 0,
+                );
+                r.check(
+                    "and holds the source's bytes",
+                    std::fs::read(womissing).ok().as_deref() == Some(&b"X"[..]),
+                );
+                let _ = std::fs::remove_file(wo);
+            }
+        }
+        // The pair rule that holds on every filesystem: EXCHANGE with WHITEOUT.
+        r.check(
+            "WHITEOUT|EXCHANGE is EINVAL",
+            refused(renameat2(wo2, wo2, WHITEOUT | EXCHANGE), libc::EINVAL),
+        );
+    }
+    for p in [wo, wo2, wotaken, womissing] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all("/tmp/t-renameat2_wodir2");
 
     let _ = std::fs::remove_file(A);
     let _ = std::fs::remove_file(B);

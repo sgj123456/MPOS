@@ -2118,22 +2118,17 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     const RENAME_WHITEOUT: usize = 0x4;
 
     let flags = args[4];
-    // `RENAME_WHITEOUT` stays refused, and the reason is not "unimplemented":
-    // it is *how* Linux implements it. Measured on Linux 7.3.4
-    // (`build/scratch/opathmmap/rex2.c`): `renameat2(old -> new, WHITEOUT)`
-    // moves the name and leaves a **character device with rdev 0** at `old` -
-    // an overlayfs whiteout. A machine with no overlay mount has nothing that
-    // could read one, and this kernel refuses `mknod` of a char device with
-    // `ENXIO` because no driver stands behind any number, so creating one here
-    // would be an object nothing in the tree can interpret. `EINVAL`'s
-    // neighbour `EOPNOTSUPP` would be the better spelling and is on the gap
-    // list; the flag stays refused either way.
-    //
-    // The pair rule is measured: `EXCHANGE|NOREPLACE` and `EXCHANGE|WHITEOUT`
-    // are both `EINVAL` on Linux, so only one of the three may be named.
+    // The pair rules, measured on Linux 7.3.4 (`build/scratch/opathmmap/
+    // {rex,rex2,wout,wflags}.c`): `EXCHANGE` may not be combined with **either**
+    // of the others (`EXCHANGE|NOREPLACE` and `EXCHANGE|WHITEOUT` are `EINVAL`,
+    // and so is all three), but **`WHITEOUT|NOREPLACE` is legal** and answers
+    // `EEXIST` when the target is taken - it is one operation with two rules
+    // rather than two operations. A first draft refused that pair too, on the
+    // assumption that the flags partition; the probe that settled it had to
+    // clear its fixtures between cases, because a leftover target made the
+    // first reading look like `EINVAL`.
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
-        || flags & RENAME_WHITEOUT != 0
-        || flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0
+        || (flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0)
     {
         return err::EINVAL;
     }
@@ -2215,6 +2210,66 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // would replace. Asked of the directory that holds the name rather than by
     // walking it, which is the same question every make-or-remove asks.
     let existing = dir.lookup(&name).ok();
+
+    // **`RENAME_WHITEOUT`** moves the name and leaves a whiteout behind it - a
+    // character device with device number `0`, which is how overlayfs records
+    // "this name was deleted from the lower layer". Measured on Linux 7.3.4
+    // (`build/scratch/opathmmap/wout2.c`): the node reads `mode 0000`,
+    // `S_ISCHR`, `rdev 0`; the move is an ordinary rename otherwise (a taken
+    // target is replaced, a missing one created); a **directory** may be
+    // whited out and its tree travels.
+    //
+    // It is the one arm whose *filesystem* question is load-bearing: the man
+    // page says the flag "requires support from the underlying filesystem",
+    // and here that split is real - ramfs keeps `i_rdev` and can make the node,
+    // ext4 has nowhere to put one (`Inode::create` refuses a device node there
+    // for exactly that reason). So the refusal a filesystem without the support
+    // gives is `EOPNOTSUPP`, which is the honest errno for "this filesystem
+    // cannot" rather than `EINVAL`'s "you asked wrongly".
+    if flags & RENAME_WHITEOUT != 0 {
+        // A whiteout is a node this directory must be able to create, so the
+        // create rule governs the name it lands in, and the old name is leaving
+        // so the remove rule governs that - the same two questions every other
+        // shape asks.
+        if let Err(e) = crate::vfs::may_remove(&old_dir, &old_inode) {
+            return err_of(e);
+        }
+        if let Err(e) = crate::vfs::may_create_in(&dir) {
+            return err_of(e);
+        }
+        // Both names must be in one directory: measured, a cross-directory
+        // whiteout is `EXDEV` - the whiteout lands where the old name was, so
+        // the two ends are one directory's business.
+        if !Arc::ptr_eq(&old_dir, &dir) {
+            return err::EXDEV;
+        }
+        // `WHITEOUT|NOREPLACE` is one operation under two rules: measured, a
+        // taken target answers `EEXIST` and nothing moves, exactly as the
+        // plain rename beside it does with that flag.
+        if existing.is_some() && flags & RENAME_NOREPLACE != 0 {
+            return err::EEXIST;
+        }
+        // A taken target is replaced, as a plain rename replaces it.
+        if existing.is_some()
+            && let Err(e) = dir.rmdir(&name)
+        {
+            // A **file** target is not `rmdir`'s to take; unlink it.
+            if e != crate::vfs::VfsError::NotDir {
+                return err_of(e);
+            }
+            if let Err(e) = dir.unlink(&name) {
+                return err_of(e);
+            }
+        }
+        if let Err(e) = old_dir.whiteout_rename(&old_name, &name) {
+            return err_of(e);
+        }
+        // The name moved and a new node appeared where it was, so a watcher
+        // hears the move and then the create - which is what the two records
+        // are, together.
+        crate::vfs::inotify::emit_move(&old_dir, &old_name, &dir, &name, &old_inode);
+        return 0;
+    }
 
     // **`RENAME_EXCHANGE` swaps the two names**, and its rules are its own.
     // Measured on Linux 7.3.4 (`build/scratch/opathmmap/rex.c`, `rex2.c`):

@@ -619,6 +619,32 @@ pub trait Inode: Send + Sync + core::any::Any {
         Err(VfsError::Unsupported)
     }
 
+    /// Leave a **whiteout** in place of the name `a`, and give what it named
+    /// the name `b` (in this same directory - `RENAME_WHITEOUT`'s shape).
+    ///
+    /// A whiteout is a character device with device number `0`, which is what
+    /// overlayfs uses to record "this name was deleted from the lower layer".
+    /// Measured on Linux 7.3.4 (`build/scratch/opathmmap/wout2.c`): the node
+    /// left behind reads `mode 0000`, `S_ISCHR`, `rdev 0`; the move itself is
+    /// an ordinary rename (the target is replaced, or created if missing); a
+    /// directory may be whited out and its tree travels to the new name.
+    ///
+    /// **Which filesystems can answer is the call's own rule, not a kernel
+    /// one.** The man page says `RENAME_WHITEOUT` "requires support from the
+    /// underlying filesystem", and the list is the filesystems that can store
+    /// an `i_rdev` - tmpfs and ext4 among them in Linux's implementation. Here
+    /// it is the reverse split, and the reason is honest: `RamDir` keeps the
+    /// number and `Ext4Ino` has nowhere to put it (`Inode::create` refuses a
+    /// device node there for that reason), so a whiteout on ext4 answers
+    /// `Unsupported` - the same refusal a `mknod` of one gets, which is what
+    /// "the filesystem does not support it" means.
+    ///
+    /// The default refuses for a filesystem that cannot make the node at all.
+    fn whiteout_rename(&self, a: &str, b: &str) -> VfsResult<()> {
+        let _ = (a, b);
+        Err(VfsError::Unsupported)
+    }
+
     /// Whether this directory has nothing under it but `.` and `..` - the
     /// question `rename(2)` asks of a replaced target and `rmdir(2)` of its
     /// subject.
