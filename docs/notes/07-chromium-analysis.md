@@ -246,6 +246,40 @@ Two other things are visible and are **new information**:
 `IMMEDIATE_CRASH`) after the crashpad storm. The kernel-side faults on this path
 are now fixed; what remains is userspace/environment plus the crashpad `EIO`.
 
+## 3d. Finding B — FIXED: `NT_PRFPREG` was the whole of crashpad's `EIO` storm
+
+The 12 `ptrace: I/O error (5)` lines were **not** an unknown request: a temporary
+diagnostic on `ptrace`'s unknown-request arm printed nothing at all. Reading the
+`GETREGSET` arm found it:
+
+```rust
+abi::PTRACE_GETREGSET | abi::PTRACE_SETREGSET => {
+    if addr != abi::NT_PRSTATUS { return err::EIO; }   // <- every other note type
+```
+
+`addr` is the **note type**. `NT_PRSTATUS` (1) is the general registers;
+**`NT_PRFPREG` (2) is the x87/SSE file**, which a crash handler wants because the
+SSE control word and the vector registers are what a floating-point crash is
+about. This kernel served only the first and answered `EIO` — "I do not know this
+request" — for the second, which tells a tracer the whole mechanism is absent
+rather than that one set is.
+
+`PTRACE_GETFPREGS`/`SETFPREGS` beside it already carried the same bytes, so the
+two spellings now answer the same thing.
+
+**Verified on the image, not only in a pin**: with a loader built from the fixed
+kernel,
+
+| | before | after |
+|---|---|---|
+| `crashpad ... ptracer.cc:46] ptrace: I/O error (5)` | **12** | **0** |
+
+`t-ptrace-fpregset` (9 claims, host and both arms) pins the contract: the call is
+served, the **iovec's length is rewritten** to the bytes moved (512 on x86_64,
+528 on aarch64), `SETREGSET` round-trips a value the next `GETREGSET` reads, an
+unknown note type is **still** refused, and `NT_PRSTATUS` still works — the
+regression this change could have caused by taking the wrong branch.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
