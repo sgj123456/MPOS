@@ -18778,3 +18778,72 @@ one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
    Measured on Linux, a stranger's process without `CAP_SYS_PTRACE` is `EPERM`;
    the pin does not exercise that path because the payload cannot become a second
    user without dropping privileges for the rest of the lane.
+
+## §6.199 `cachestat`: a refusal because four of its five fields would be lies (item 320, LANDED 2026-11-16)
+
+**The call, and why it looked implementable.** `cachestat(451)` reports what the
+page cache holds for a byte range of a file — `nr_cache`, `nr_dirty`,
+`nr_writeback`, `nr_evicted`, `nr_recently_evicted`. This kernel *does* have a
+cache, so the first question was whether the five fields map onto it.
+
+**The answer is: one of them does, and four do not.**
+
+| field | what it means on Linux | this kernel |
+|---|---|---|
+| `nr_cache` | pages of the range resident | **answerable** — map the offset to a physical block, ask `Cache::ready` |
+| `nr_dirty` | pages modified, not yet on disk | **no such accounting** — the cache is write-**through**, so nothing is ever dirty |
+| `nr_writeback` | pages with a write in flight | no such accounting |
+| `nr_evicted` | pages reclaimed **since the previous call on this fd** | no eviction record, and the field is a **per-descriptor delta** |
+| `nr_recently_evicted` | reclaimed under pressure | same |
+
+**The eviction pair is the decisive one, and it took a measurement to see.**
+Measured on Linux 7.3.4 (`build/scratch/opathmmap/cs3.c`): two back-to-back calls
+on the same descriptor both answer `0`, and a *second* descriptor to the same file
+answers `0` too — because the count is **relative to that descriptor's previous
+call**. So the field is a per-fd record of what was reclaimed between the caller's
+own questions, and this kernel keeps no such record. It cannot be derived; it has
+to be accumulated.
+
+**And the other numbers** (`build/scratch/opathmmap/{cs,cs2}.c`): a file whose 16
+pages are resident reads `nr_cache=16` and zeros for the rest; an untouched file
+reads all zeros; `off`/`len` need not be page-aligned; a `NULL` range or stat is
+`EFAULT`, a bad descriptor `EBADF`, and **`flags` must be 0** — every nonzero word,
+*including the documented `CACHE_STAT_F_ALL`*, is `EINVAL`.
+
+**Why this is a refusal and not a partial answer.** The tempting shape is to serve
+`nr_cache` and leave the other four zero. That is the failure `AGENTS.md` §3.2
+names: **the zeros are not neutral.** A memory-pressure daemon reads
+`nr_dirty == 0, nr_evicted == 0` and concludes the file is clean and nothing has
+been reclaimed — a statement about state that this kernel cannot make. A caller
+with a wrong shape has a fallback; a caller with a false *fact* does not.
+
+So `cachestat` stays on the `ENOSYS` list, in the uapi gap table beside
+`memfd_secret` and the `pkey_*` trio, with the prerequisite written out: an
+eviction and writeback accounting layer — residency per page, a dirty count, a
+writeback-in-flight count, and a per-descriptor record of what was evicted since
+that descriptor last asked. Only then are the four fields answers rather than
+constant zeros.
+
+**Pinned** in `t-enosys` (+1 claim) rather than left as a doc sentence — the same
+rule as the trio beside it: a gap gets a name **and** a pin.
+
+**Gate.** `build/gate-item320b.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1341** host tests 0 failed; stage 2 **333** on x86_64 and **329** on aarch64;
+`mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`nr_cache` is answerable and is not answered.** Serving only that field is
+   possible — `extent_lookup`/`bmap_lookup` give the physical block and
+   `Cache::ready` gives residency — and it is a natural first step *if* the
+   accounting layer is ever built. Building the cheap half alone was rejected
+   because a struct whose four counters are always zero is worse than a call that
+   says it is absent.
+2. **`CACHE_STAT_F_ALL` is not distinguished from any other nonzero word.** On
+   Linux every nonzero flags value is `EINVAL` (measured, so this is Linux's own
+   shape rather than this kernel's simplification) — recorded because the name
+   suggests a bit that would be honoured.
+3. **The `.cstat_size` argument** the kernel takes on newer versions (so fields can
+   be added) is not something this refusal has to handle; a served implementation
+   would have to, and that is part of the prerequisite.

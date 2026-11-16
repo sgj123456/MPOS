@@ -12,6 +12,10 @@
 //!
 //! * `memfd_secret` wants a direct-map carve-out and a page-table shape this
 //!   kernel does not carry.
+//! * `cachestat` (451) reports page-cache residency **and the dirty, writeback
+//!   and evicted counts beside it**; this kernel has a block cache rather than a
+//!   page cache, so the four counters would be permanent zeros while the caller
+//!   reads them as facts. The measurement is in the uapi gap table.
 //! * The `pkey_*` trio runs on Linux only when the kernel was built with
 //!   `CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS`, and this kernel has no PKU at
 //!   all: `CR4.PKE` is never set, no PTE carries a protection-key field, and
@@ -46,6 +50,9 @@ use mpos_user_tests::Report;
 
 /// `memfd_secret(2)`'s number: 447 on both machines' tables.
 const SYS_MEMFD_SECRET: libc::c_long = 447;
+
+/// `cachestat(2)`'s number: 451 on both machines' tables.
+const SYS_CACHESTAT: libc::c_long = 451;
 
 /// The `pkey_*` trio's numbers. 329/330/331 on x86_64; the asm-generic table
 /// aarch64 uses has `pkey_mprotect` 288, `pkey_alloc` 289 and `pkey_free` 290,
@@ -97,6 +104,16 @@ fn main() {
     r.check(
         "memfd_secret asked a second time still answers ENOSYS",
         probe(SYS_MEMFD_SECRET),
+    );
+
+    // `cachestat`: refused because its four counters would be permanent zeros
+    // over a block cache - a caller reads those as state, not as absence.
+    // SAFETY: the number is the subject; the arguments are never read by a call
+    // that is not there.
+    let cs = unsafe { libc::syscall(SYS_CACHESTAT, 0usize, 0usize, 0usize, 0usize) };
+    r.check(
+        &format!("cachestat answers ENOSYS ({cs})"),
+        refused(cs as isize, libc::ENOSYS) || mpos_user_tests::host_run(),
     );
 
     // === the `pkey_*` trio ==================================================
