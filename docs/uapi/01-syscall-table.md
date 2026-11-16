@@ -353,11 +353,13 @@ recorded here for their history.
 | Syscall | Number | Why refused | Prerequisite to serve |
 |---|---|---|---|
 | `fspick` | 433 | **`ENOSYS`**: what it picks a mount for is reconfiguration, and no filesystem here can be reconfigured | the gap named; needs per-filesystem reconfigure support first |
+| `pkey_alloc`/`pkey_free`/`pkey_mprotect` | 330/331/329 | **`ENOSYS`**: Linux runs these only when built with `CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS` ([pkeys(7)](https://www.man7.org/linux/man-pages/man7/pkeys.7.html): "available only if the kernel was configured and built with" it), and this kernel has no PKU: `CR4.PKE` is never set, no PTE carries a protection-key field and there is no per-task `PKRU`. Measured on Linux 7.3.4 first (`build/scratch/opathmmap/{pkey,pkey2,pkey3,pkey4,pkey5}.c`): 15 keys on that machine numbered from 1, `ENOSPC` at the sixteenth, `pkey_free` of an unallocated key is `EINVAL`, `PKEY_DISABLE_ACCESS`/`_WRITE` are 1/2 and combining them is served, `pkey_mprotect(key=-1)` is `mprotect`'s own path, a bad key is `EINVAL`, and — the measurement that decides this row — **the protection is real**: memory mapped under a `PKEY_DISABLE_ACCESS` key faults a touching child with `SIGSEGV` on that host | which flags this machine has, then `CR4.PKE`, a per-task `PKRU` saved and restored with the context, and a protection-key field in the page tables — and any subset of that is a promise the key will not keep. Serving the calls while keys enforce nothing is the failure `AGENTS.md` §3.2 names: a caller that tagged its enclave and got a 0 would trust a boundary that is not there |
 | `memfd_secret` | 447 | secret memory: the pages must be absent from the kernel's own direct map, and this kernel keeps one identity map it does not walk per page; measured on Linux 7.2.11 first — `0600` file, no `FD_CLOEXEC`, size fixed once, `MAP_SHARED` only, `PROT_EXEC` `EACCES`, `pread` `ESPIPE`, inherited by a child (item 131, §8.4) | a per-page direct-map carve-out (remove + restore around a page-table walk), plus `SECRETMEM` accounting in `/proc/meminfo`, the fixed-once size / shared-only / no-exec / no-coredump rules, and `t-secretmem` as the pin |
 
 > **Every family that was on this table has since moved out of it** — what
-> remains is `memfd_secret` (447) and the four mount-context numbers
-> (430–433), each with its prerequisite written beside it. `keyctl` (250): the
+> remains is `memfd_secret` (447), the `pkey_*` trio (329–331, whose protection is a
+> hardware fact this kernel does not have), `fspick` (433) and the four
+> mount-context numbers (430–433), each with its prerequisite written beside it. `keyctl` (250): the
 > kernel keyring is
 > served (`add_key` 248, `request_key` 249, `keyctl` 250 on x86_64; 217/218/219 on
 > aarch64), pinned by `t-keyctl`, written up as item 113 with the measured shape in
