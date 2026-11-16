@@ -18282,3 +18282,67 @@ one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
    same choice `tee` makes, recorded there.
 3. **`vmsplice` on a `Role::Both` (FIFO `O_RDWR`) end is treated as a write**, and
    that case is unpinned.
+
+## §6.193 the legacy `eventfd(284)` and `inotify_init(253)`: not aliases of their modern twins (item 314, LANDED 2026-11-16)
+
+**Where they came from.** Item 310's census again — but a second pass over it,
+because the first pass had skipped these two as "the modern call exists, so the
+legacy one is the same". That reading is wrong, and the measurement is why.
+
+**Measured on Linux 7.3.4** (`build/scratch/opathmmap/{legacy,legacy2}.c`):
+
+| call | Linux |
+|---|---|
+| `eventfd(count)` | the counter is honoured; `F_GETFL` `O_RDWR`; `FD_CLOEXEC` clear |
+| `eventfd(count, ANY_WORD)` | **served for every word** — `0x7ffff` included — and the word has **no effect** |
+| `eventfd2(count, 0x99)` | `EINVAL` |
+| `inotify_init()` | `F_GETFL` 0 (`O_RDONLY`); `FD_CLOEXEC` clear |
+| `inotify_init1(0x99)` | `EINVAL` |
+| `inotify_init1(IN_CLOEXEC)` | `FD_CLOEXEC` **set** |
+
+**The asymmetry is the item.** A kernel that routed both spellings through one
+handler has exactly two outcomes available, and both are wrong:
+
+* **refuse the legacy caller's ignored second argument** — `EINVAL` for a call
+  Linux serves, on an argument Linux never reads;
+* **accept an unknown bit on the modern door** — a descriptor whose `F_GETFL`
+  disagrees with what was asked for, which is the §4.2 accept-and-drop shape
+  §6.176 closed.
+
+The modern door **must** validate its word (measured in §6.176); the legacy one
+**must not look at it at all**. Two handlers, and `handle_eventfd_legacy` reads
+only `args[0]` with a comment saying so.
+
+**Both numbers are x86_64-only, and that needed naming.** The asm-generic table
+aarch64 uses **never had** the legacy spellings (`__NR_eventfd` and
+`__NR_inotify_init` are absent from `/usr/include/asm-generic/unistd.h`), so their
+aarch64 entries take pseudo-numbers (`64034`/`64035`, the convention the file
+already uses for 33 such calls) and no aarch64 caller can pass them. The pin
+states that on aarch64 rather than printing nothing — a program that quietly
+skipped half its claims would look like a pass.
+
+**Two defects, both mine, both caught by the gate.**
+
+1. **The aarch64 arm hardcoded x86_64's numbers.** `eventfd2` is 290 on x86_64 and
+   **19** on aarch64; `inotify_init1` is 294 and **26**. The first draft used the
+   x86_64 pair on both machines, so on aarch64 the program called numbers those
+   machines give to other calls and the two *modern* doors looked broken. The
+   claim was about the program, not the kernel — the same shape §6.185 warned
+   about.
+2. **The number test still asserted `EVENTFD == 290`** after that name was given
+   the legacy value. That is the test doing its job on a rename: `EVENTFD` now
+   means 284 and `EVENTFD2` means 290, and the assertion list says both. The same
+   commit added the five numbers this session introduced (`EXECVEAT`, `IOPRIO_SET`,
+   `IOPRIO_GET`, `TEE`, `VMSPLICE`) to that list, which they had been missing.
+
+**Gate.** `build/gate-item314c.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **329** on x86_64 and **325** on aarch64 —
+both up one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged
+at `162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.** The **legacy `inotify_init` is unpinned on
+aarch64** because it cannot be called there — stated, not silently skipped.
+Nothing else from the census's legacy block is served: `uselib`, `ustat`,
+`_sysctl`, `create_module` and the `*_module` family are dead calls on modern
+Linux too, so `ENOSYS` is the right answer and they stay declared-missing rather
+than implemented.

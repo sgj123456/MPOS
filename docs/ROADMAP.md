@@ -3623,3 +3623,35 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   bytes twice here); a full destination or empty source answers `EAGAIN`, not a
   park; and `Role::Both` (FIFO `O_RDWR`) is treated as a write, unpinned.
   (§6.192, item 313)
+
+- **Item 314 — the legacy `eventfd(284)` and `inotify_init(253)`: not aliases of
+  their modern twins**: a **second** pass over item 310's census, because the first
+  skipped these two as "the modern call exists, so the legacy one is the same" —
+  which the measurement shows is wrong. On Linux 7.3.4
+  (`build/scratch/opathmmap/{legacy,legacy2}.c`): `eventfd(count)` honours the
+  counter, comes back `F_GETFL O_RDWR` with `FD_CLOEXEC` clear, and **ignores its
+  second argument entirely** (`0x7ffff` served, no effect) where `eventfd2(0, 0x99)`
+  is `EINVAL`; `inotify_init()` comes back `F_GETFL` 0 with `FD_CLOEXEC` clear,
+  where `inotify_init1(IN_CLOEXEC)` sets it. **The asymmetry is the item**: routing
+  both spellings through one handler has exactly two outcomes and both are wrong —
+  refuse the legacy caller's ignored second argument (`EINVAL` for a call Linux
+  serves), or accept an unknown bit on the modern door (a descriptor whose `F_GETFL`
+  disagrees with what was asked for, the §4.2 shape §6.176 closed). The modern door
+  must validate; the legacy one must not look at the word at all. **Both numbers are
+  x86_64-only** — the asm-generic table aarch64 uses never had the legacy spellings
+  — so their aarch64 entries take pseudo-numbers (`64034`/`64035`, the file's own
+  convention for 33 such calls) and the pin **states** that on aarch64 rather than
+  printing nothing. **Two defects, both mine, both caught by the gate**: the aarch64
+  arm first hardcoded x86_64's 290/294 (where aarch64 numbers them 19/26, so the
+  *modern* doors looked broken — the claim was about the program, not the kernel,
+  the same shape §6.185 warned about), and the number test still asserted
+  `EVENTFD == 290` after that name was given the legacy value (the test doing its
+  job on a rename; the same commit added this session's five new numbers to that
+  list). `t-legacy-fds` **+14**, with the modern doors claimed on both machines as
+  the reference point. Gate `build/gate-item314c.log` `GATE_EXIT=0`: stage 1 1340,
+  x86_64 **329**, aarch64 **325** (both +1), kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1`. **Named**: legacy `inotify_init` is unpinned on aarch64
+  because it cannot be called there; and the census's other legacy numbers
+  (`uselib`, `ustat`, `_sysctl`, `create_module`, the `*_module` family) are dead
+  calls on modern Linux too, so `ENOSYS` is right and they stay undeclared.
+  (§6.193, item 314)
