@@ -3720,3 +3720,39 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   (the pair's rule is proven with the caller's own numbers), and
   `RLIMIT_SIGPENDING`'s `EAGAIN` is shared with the sibling and not re-pinned.
   (§6.195, item 316)
+
+- **Item 317 — the legacy POSIX AIO family: a context handle, not a ring**:
+  `io_setup`/`io_destroy`/`io_submit`/`io_getevents` (206/207/209/208, plus
+  `io_pgetevents` 333) — all undeclared, so a libaio caller heard `ENOSYS` from the
+  first of them. **This is not `io_uring`**: that is a ring of shared memory (425,
+  served since item 115), this is a context handle plus `struct iocb` pointers, and
+  the shared prefix is a trap. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{aio,aio2,aio3,aio4}.c`): `io_setup` writes a handle
+  (`0`/`NULL` are `EINVAL`/`EFAULT`), `io_destroy` twice is `EINVAL`, a PREAD is
+  served with the byte count in the event and `aio_data` returned **verbatim**, a
+  bad context is `EINVAL` on every door, and `io_getevents` with too high a
+  `min_nr` returns what **is** queued. **Three of those corrected a draft**: `struct
+  iocb`'s offsets are not the header's field order (`aio_key`/`aio_rw_flags` share
+  the word at 8, so opcode is at **16** and fildes at **20** — a draft read the
+  opcode out of `aio_rw_flags` and made every request unknown); a first version
+  **served `FSYNC`/`FDSYNC`/`NOOP`** because their names suggest work a synchronous
+  kernel can do, and **Linux refuses all three** — a success for a refused call is
+  the one thing §3.2 forbids, so the served set is `PREAD`/`PWRITE` as measured; and
+  a bad descriptor was queued as an event carrying `-EBADF` where **Linux fails the
+  submit**, which matters because an event means *the request ran*. The scope is
+  the **synchronous subset** (§6.32's shape for `io_uring`): each `iocb` runs
+  inside `io_submit`, a performance shape rather than an ABI one — the observed
+  sequence is identical, only *when* the work happened differs. `t-aio` **+23**,
+  including the opcode refusals and the **handle-gone** property (a second
+  `io_destroy` is `EINVAL`, not a silent success — §6.90's class, which is why
+  handles are never reused). **The gate caught three of my own defects**: an unused
+  `AioContext::id`, three redundant casts in the pin, and — the one worth
+  recording — **the `#[cfg(target_os = "none")]` gate on `io_uring` moved onto
+  `aio`** when both declarations shared a prefix in a text replace, breaking the
+  host build of the ring. Gate `build/gate-item317c.log` `GATE_EXIT=0`: stage 1
+  1340, x86_64 **331**, aarch64 **327** (both +1), kunit 42/0 per arm, clippy
+  unchanged at `162/168/393/272/3/1`. **Named**: `PREADV`/`PWRITEV` refused with
+  `EINVAL` where Linux serves them given a real iovec (a gap *here*, not in Linux —
+  use `io_uring`'s `READV`); `IOCB_FLAG_RESFD`/`IOPRIO` read past and ignored;
+  `io_cancel` (210) still `ENOSYS`; and completions are never deferred, so
+  `io_submit` may block where Linux's would not. (§6.196, item 317)
