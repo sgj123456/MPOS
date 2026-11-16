@@ -18588,3 +18588,97 @@ one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
 4. **The completions are never deferred**, so `io_submit` may block where Linux's
    would not. That is item 1's performance shape; a caller with a slow disk and a
    large batch sees it as latency, not as a wrong answer.
+
+## §6.197 `getdents`: the directory reader one header byte from its twin (item 318, LANDED 2026-11-16)
+
+**A sibling, not a leftover.** `getdents64` (217) has been served for a long
+time; `getdents` (78) was never declared, so a program built against an old glibc
+heard `ENOSYS`. Most of the census's remaining numbers are dead calls or whole
+features; this one is a **second spelling whose records differ**, which is exactly
+the case where "the modern call exists, so the old one is the same" is wrong.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{gd,gd2,gd3,gd4}.c`).
+The same directory through both doors:
+
+```text
+getdents    ino=7 off=1 reclen=24 name='.'
+            ino=1 off=3 reclen=24 name='..'
+            ino=8 off=2147483647 reclen=32 name='alpha'
+getdents64  ino=7 off=1 reclen=24 type=4 name='.'
+            ...
+            ino=8 off=2147483647 reclen=32 type=8 name='alpha'
+```
+
+The `d_ino`, `d_off` **and** `d_reclen` agree there — because every name is short
+enough to round to the same 8-byte boundary. What differs is the layout:
+
+| | legacy `getdents` | `getdents64` |
+|---|---|---|
+| header before the name | **18** bytes | 19 |
+| `d_type` | **absent** | at 18 |
+| name starts at | **18** | 19 |
+
+A reader that uses `struct dirent64` on this buffer reads its name **one byte
+late** — the kind of divergence that shows as a wrong *name* rather than a wrong
+call, which is why the two are separate doors and not arms on one handler. Where
+a name crosses the alignment boundary the rounded `d_reclen` differs too, and
+[`reclen_of_legacy`] exists beside `reclen_of` for exactly that: the pin's host
+unit test names the lengths where the rounding actually diverges (`reclen_of(5)`
+is 32, `reclen_of_legacy(5)` is 24), because a claim that the legacy record is
+*always* shorter is false — they are equal at most lengths.
+
+**Everything else is shared rather than restated**: the `O_PATH` → `EBADF`
+refusal, the directory read, the descriptor position, the short-buffer `EINVAL`.
+Two copies of a directory walk is how two doors come to disagree about a
+position, which is the same reason §6.196 shares its record copy with its own
+sibling.
+
+**Two defects, both about ordering.**
+
+1. **The descriptor must be judged before the buffer.** Measured
+   (`gd4.c`): `getdents(-1, NULL, 64)` is **`EBADF`**, not `EFAULT`, and a good
+   descriptor with a `NULL` buffer is the `EFAULT`. The draft checked the buffer
+   first, so a bad descriptor *with* a bad buffer answered about the buffer. The
+   tell is the same one the `readv`/`writev` order notes record: two wrong
+   arguments and Linux has a fixed opinion about which.
+2. **The aarch64 arm of the pin hardcoded x86_64's 217** for `getdents64`, where
+   the asm-generic table numbers it **61** — so on that machine the program
+   called a number belonging to something else and the *twin* looked broken.
+   **This is the second time this session** (§6.193's item 314 records the first):
+   a per-machine number written as one constant. It was caught by the aarch64
+   sweep, which is the only thing that can catch it.
+
+**A third finding, and the reason the pin's entry claim is phrased carefully.**
+The host's ext4 lists `.` and `..`; this kernel's ramfs reports only what was
+made — and its `getdents64` does the same, so that is the **existing** shape of
+this filesystem's directory walk, not something this item changed. The claim is
+therefore "every fixture name is listed, and nothing invented is", not "the list
+is exactly N": which entries a directory invents is the filesystem's answer, and
+a door's pin should not assert another component's policy.
+
+**Gate.** Three rounds: the aarch64 number above, then clippy twice —
+`int_plus_one` in the pin, and `dead_code` for `reclen_of_legacy`, whose only
+caller is a machine-only handler so the host lib has no use for it. That one is
+`#[cfg_attr(not(target_os = "none"), allow(dead_code))]` **with the reason on the
+item**, which is the convention for an allow and not a raised ceiling; a host
+unit test was added beside it as the reference that would otherwise be missing.
+
+`build/gate-item318c.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1341**
+host tests 0 failed (up one — the new `reclen_of_legacy` test); stage 2 **332** on
+x86_64 and **328** on aarch64 — both up one — `mpos-kunit 42 passed, 0 failed` per
+arm; clippy ratchet unchanged at `162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`getdents` is x86_64-only**: the asm-generic table aarch64 uses never had it,
+   so its aarch64 entry is a pseudo-number (`64036`, the file's own convention)
+   that no caller can pass, and the pin **states** that on aarch64 rather than
+   printing nothing.
+2. **`d_off` is a plain index here**, not the filesystem's own hash-cookie. Linux's
+   `d_off` is whatever the filesystem's `readdir` wrote, and callers use it as an
+   opaque token for `lseek`; here it is the entry index and `lseek` treats it the
+   same way, so a caller's `seekdir` round-trip works — but it is not the
+   filesystem's cookie.
+3. **The `.`/`..` difference above is not closed** — it is the ramfs's existing
+   shape, shared with `getdents64`, and changing it is a filesystem decision
+   rather than a door's.
