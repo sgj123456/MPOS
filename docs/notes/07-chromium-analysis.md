@@ -126,76 +126,78 @@ storm (`Failed to connect to the bus: Could not parse server address` — the im
 `DBUS_SESSION_BUS_ADDRESS` is unset/empty), then took its own CHECK and trapped. That
 is a **userspace/environment** problem, not a syscall gap.
 
-## 3b. Finding A2 — a second, **different** fault: a present page with `U=0`
+## 3b. Finding A2 — FIXED: `mremap` made an eager page supervisor-only
 
 With `DBUS_SESSION_BUS_ADDRESS` set, Chromium got further and produced a fault that
-is a genuine kernel anomaly. It is recorded here as **open** — located precisely,
-not yet explained — because the analysis is worth more than a guess.
+**was** a real kernel bug. It is fixed; this is how it was found, because the route
+matters for the next one.
 
 ```
 CacheThread_Blo[725]: segfault at 7e820912c000 ip 7e6ecc892b40 error 5
    in /lib/ld-musl-x86_64.so.1
-PFDIAG page=0x7e820912c000 pte=0x800000003acfd003  P=1 W=1 U=0
+PFDIAG pte=0x800000003acfd003  P=1 W=1 U=0
 PFDIAG vma=NONE (no mapping describes 0x7e820912c000)
 PFDIAG fault_in=0x7e820912c000 eager[/tmp/cp3/Default/Web Data]
-PFDIAG rip_in=0x7e6ecc892b40 eager[/lib/ld-musl-x86_64.so.1]
-   op=[f3, 0f, 6f, 06, ...]        <- `movdqu xmm0,[rsi]`, a 16-byte SSE load
+   op=[f3, 0f, 6f, 06, ...]     <- `movdqu xmm0,[rsi]`, a 16-byte SSE load
 ```
 
-What it says:
+### The decode
 
-- `error 5 = 0b101` → `P=1` (present), `U=1` (user), **`W=0`** — a user **read** of a
-  page that **is** present;
-- the PTE is `0x800000003acfd003`: `NX=1, P=1, W=1, U=0`. The page is present and
-  writable but **supervisor-only**, so a ring-3 read faults. NX on a read is
-  irrelevant.
-- `rip_in` is a **16-byte SSE load inside `ld-musl`'s `memcpy`**, and the address
-  being read is one the process believes it owns — it is reading out of its own
-  `/tmp/cp3/Default/Web Data`.
+- `error 5 = 0b101` → `P=1`, `U=1`, `W=0`: a ring-3 **read** of a page that **is
+  present**;
+- the PTE is `0x800000003acfd003`. Masking the physical address out
+  (`phys = 0x3acfd000`, which PFDIAG printed) leaves **`P=1, W=1, U=0, NX=1`** — and
+  that is exactly `page_flags(MapFlags::READ | MapFlags::WRITE)`, i.e. a leaf
+  written from a flag set with **no `MapFlags::USER`**;
+- `rip` is a **16-byte SSE load inside `ld-musl`'s `memcpy`**, reading the process's
+  own `Web Data` file — memory it plainly owns;
+- the *first* fault of the same run had `P=1 W=0 U=1`, i.e. **correct**. Only this
+  shape was wrong.
 
-Compare with the *first* fault of the same run, whose PTE was
-`0x3fba6025` = `P=1 W=0 U=1` — **`U=1`, correct**. So the two faults are not the same
-defect, and only the second has the supervisor-only bit.
+### The bug
 
-**What was ruled out, by measurement:**
+`mremap` carries each page's frame to the new address and re-maps it with `USER`
+only when the page is *reachable from ring 3*:
 
-- ordinary `MAP_PRIVATE|MAP_ANONYMOUS` and private file mappings both get `U=1`
-  (`probe-pte`: an anonymous page and a file mapping of `/bin/busybox` are written and
-  read from ring 3 without faulting);
-- `page_flags` does translate `MapFlags::USER` → `USER_ACCESSIBLE`
-  (`arch/src/arch/x86_64/paging.rs`), so the translation is not missing;
-- `munmap_user` does clear the page tables (`unmap_user`) and does forget eager
-  ranges (`forget_ranges`), so a plain unmap is not leaving a stale supervisor entry;
-- `PFDIAG vma=NONE` is a limitation of the **diagnostic** (it consults the VMA table
-  and not the eager-range table), not necessarily of the kernel: the eager line
-  printed immediately after names a range covering the address.
+```rust
+let reachable = sched::vma_prot_at(page).is_some_and(|p| p.contains(MapFlags::USER));
+let mut mf = MapFlags::READ | MapFlags::WRITE;
+if reachable { mf |= MapFlags::USER; }
+```
 
-**Also ruled out by measurement** (`probe-mprot`): `mprotect` keeps the User bit.
-An 8 KiB mapping was read, write-protected (`PROT_READ`), read again, set to
-`PROT_NONE`, restored to `PROT_READ|PROT_WRITE` and read a third time — every read
-succeeded. So a `mprotect` that drops `PROT_WRITE` does **not** leave the leaf
-supervisor-only on this kernel.
+and `vma_prot_at` consulted **only the VMA table**. An **eager** range — a
+`MAP_SHARED` file copy, an image placed by `exec` — has **no VMA at all**
+(`record_eager_range`'s own note says so), so `vma_prot_at` answered `None`, the
+page looked unreachable, and its new leaf was written without `USER_ACCESSIBLE`.
+The process's own readable memory became supervisor-only.
 
-**What is left to check**, in order, and this is the honest handover:
+**The fix**: `vma_prot_at` now falls back to the eager-range table when no VMA
+describes the page — the same two sources `/proc/<pid>/maps` already printed
+(`mapping_lines`), so a fault report and `maps` cannot disagree.
 
-1. `protect` and `map_shared` take different flag paths from `try_map`
-   (`arch/src/arch/x86_64/paging.rs`: `protect` walks leaves by address, which is
-   what an eager range needs and what nothing above exercises with `USER`);
-2. whether the `run=[0x7e820912c000..0x7e820913a000)` in the PFDIAG line spans more
-   than one page — if the *first* page of a run gets the correct flags and a later
-   one does not, the run-scatter loop (`Cache::run_places`) is the suspect;
-3. whether `mremap` of an eager range (`move_eager_ranges`) rewrites the leaves at
-   the new address with the stored flags or with a default.
+### The pin, and the counterfactual that had to be fixed first
 
-Three hypotheses have been tested and refuted (fetch-demand, plain `mprotect`, plain
-`munmap`); the remaining ones all involve a path that **rewrites an existing leaf**,
-which is where a missing `USER_ACCESSIBLE` would survive unnoticed by every other
-test here — no other program on this machine remaps 40 KB of eager pages per
-allocation the way Chromium's allocator does.
+`t-mremap-eager` (6 guest claims, both arms). Its **first** version used an
+anonymous mapping and passed **against a deliberately broken kernel**, because
+`MREMAP_MAYMOVE` only *permits* relocation — a page that can stay put is left
+alone, so no page ever travelled and the loop never ran. The pin now reserves a
+destination and uses `MREMAP_FIXED`, which forces the carry.
 
-**This is a real bug and it is now cheap to find**: the PFDIAG line already names the
-address, the PTE, the range and the instruction. What it needs is the third
-hypothesis tested with one boot, not more reading.
+With the fallback disabled and the move forced:
+
+```
+t-mremap-eager[10]: segfault at 7ee63fca5000 ... error 5
+=== x exit=139
+```
+
+— the same `error 5` on a present page that Chromium produced. Restored, it is
+green on both arms.
+
+**Named leftover**: `move_eager_ranges` moves the *record* and `unmap_user` clears
+the old leaves, but a page that is eager **and** covered by a VMA (the dynamic
+linker's read-only pass over a shared page) is still answered from the VMA first.
+That ordering is deliberate — the VMA is the narrower claim — and is now the one
+case a reader should suspect if a similar fault reappears.
 
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 

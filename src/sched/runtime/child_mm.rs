@@ -1208,10 +1208,29 @@ pub fn mapped_pages() -> usize {
 pub fn vma_prot_at(virt: usize) -> Option<MapFlags> {
     with_table(|t| {
         let owner = t.space_owner(t.current);
-        t.task(owner)
-            .mm
-            .vma_at(pframe::align_down(virt, PAGE_SIZE))
-            .map(|vma| vma.prot)
+        let mm = &t.task(owner).mm;
+        let page = pframe::align_down(virt, PAGE_SIZE);
+        // **Both sources, in the order that makes a fault report true.** A page
+        // the VMA table describes answers from the VMA; a page of an *eager*
+        // range (a `MAP_SHARED` file copy, an image placed by `exec`) has no VMA
+        // at all - `record_eager_range`'s own note says so - and before this
+        // fallback it answered `None` even though the process could read it.
+        //
+        // That `None` was not cosmetic: `mremap` asks this function whether each
+        // page it carries is *reachable from ring 3* and re-maps the frame with
+        // `USER` only when the answer is yes. An eager page therefore came back
+        // as unreachable, the new leaf was written without `USER_ACCESSIBLE`,
+        // and the process's own readable memory became supervisor-only - the
+        // measured fault `pte=0x800000003acfd003 P=1 W=1 U=0`, a ring-3 read of
+        // a present page, from inside Chromium's allocator
+        // (`docs/notes/07-chromium-analysis.md`, finding A2).
+        if let Some(vma) = mm.vma_at(page) {
+            return Some(vma.prot);
+        }
+        mm.eager_ranges()
+            .iter()
+            .find(|range| page >= range.start && page < range.end)
+            .map(|range| range.prot)
     })
 }
 
