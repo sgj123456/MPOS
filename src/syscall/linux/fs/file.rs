@@ -8802,6 +8802,126 @@ pub fn handle_utime(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user: b
 /// kernel; the flags are the advice bits the man page lists, accepted
 /// for the same reason `poll` accepts its nonblocking one: the
 /// descriptor's own flags are what govern.
+/// `tee(fd_in, fd_out, len, flags)` — copy a pipe's bytes into another pipe
+/// **without consuming the source**.
+///
+/// The pair to [`handle_splice`]: a caller that wants one stream both read
+/// locally and forwarded reaches for this rather than reading and writing.
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/{tee1,tee2}.c`):
+///
+/// * both descriptors must be **pipes** — `len` bytes are duplicated, the
+///   source is left intact and the destination gains a copy;
+/// * the **input** is judged first: `tee(pipe, file)` is `EINVAL`, while
+///   `tee(file, pipe)` is `EBADF` (the file cannot be a source for a call whose
+///   whole point is a pipe's buffer), and `tee(file, file)` is `EBADF` on the
+///   input;
+/// * a missing descriptor is `EBADF` on whichever side is missing;
+/// * the flag word is validated **before** the length: an unknown bit is
+///   `EINVAL` even at `len == 0`;
+/// * a legitimate `len == 0` answers 0;
+/// * the flag vocabulary is `splice`'s — `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`,
+///   `SPLICE_F_MORE`, `SPLICE_F_GIFT` — and `NONBLOCK`/`MOVE` are both served.
+///
+/// The transfer itself is a **peek then a write**, which is exactly the
+/// contract: nothing is taken from the source, and what the destination gets is
+/// what a read *would* have handed back. `peek_once` answers the same three
+/// shapes a read does (`Some(n)`, `Some(0)` for end-of-stream, `None` for "not
+/// yet"), so a `tee` whose source is empty parks the way a read would - and the
+/// `SPLICE_F_NONBLOCK` flag is what a caller uses to ask for `EAGAIN` instead.
+pub fn handle_tee(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    use crate::vfs::file::O_NONBLOCK;
+    const SPLICE_F_MOVE: usize = 0x01;
+    const SPLICE_F_NONBLOCK: usize = 0x02;
+    const SPLICE_F_MORE: usize = 0x04;
+    const SPLICE_F_GIFT: usize = 0x08;
+    // `tee` reads no user pointer: its two ends are both descriptors.
+    let _ = from_user;
+
+    let (in_fd, out_fd, len, flags) = (args[0] as i32, args[1] as i32, args[2], args[3]);
+    let fds = crate::sched::current_fds();
+    let input = match fds.clone_at(in_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let output = match fds.clone_at(out_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    // **Both mode questions come before both pipe questions**, and the
+    // measurement is what says so (`build/scratch/opathmmap/tee3.c`):
+    //
+    //     tee(RDWR file, pipe)    EINVAL   source readable, but not a pipe
+    //     tee(WRONLY file, pipe)  EBADF    source not readable
+    //     tee(pipe, RDWR file)    EINVAL   destination writable, but not a pipe
+    //     tee(pipe, RDONLY file)  EBADF    destination not writable
+    //     tee(pipe, WRONLY file)  EINVAL   destination writable, but not a pipe
+    //
+    // A draft that asked the source's mode, then the flags, then both pipe
+    // questions, then the destination's mode got `tee(pipe, RDONLY file)` wrong:
+    // it answered `EINVAL` for a descriptor the call should refuse as unopenable
+    // for writing. The mode is the descriptor's own state and the pipe question
+    // is about the node; the state is judged first, as `splice` beside it does.
+    if input.check_readable().is_err() {
+        return err::EBADF;
+    }
+    if output.check_writable().is_err() {
+        return err::EBADF;
+    }
+    // Then the flag word, then the length - measured: `tee(bad flag, len 0)` is
+    // `EINVAL`, so the word is judged even when the call would transfer nothing.
+    if flags & !(SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT) != 0 {
+        return err::EINVAL;
+    }
+    // Then the two pipe questions: a non-pipe on either side is `EINVAL`.
+    let in_inode = input.inode();
+    let in_pipe = match in_inode.as_pipe() {
+        Some(pipe) => pipe,
+        None => return err::EINVAL,
+    };
+    let out_inode = output.inode();
+    let out_pipe = match out_inode.as_pipe() {
+        Some(pipe) => pipe,
+        None => return err::EINVAL,
+    };
+    if len == 0 {
+        return 0;
+    }
+    // One peek, bounded by the request and by a buffer this stack owns. A tee of
+    // a very large length is a loop, not an allocation: the caller's `len` is a
+    // count of bytes and the kernel copies through a fixed scratch.
+    let mut chunk = [0u8; 4096];
+    let want = len.min(chunk.len());
+    let peeked = match in_pipe.peek_once(&mut chunk[..want]) {
+        // `Some(0)` is end-of-stream - the source's writer is gone - and reaches
+        // the `peeked == 0` branch below with the same answer a `None` does.
+        Ok(Some(n)) => n,
+        Ok(None) => 0,
+        Err(e) => {
+            if let crate::vfs::VfsError::BrokenPipe = e {
+                return err::EBADF;
+            }
+            return err_of(e);
+        }
+    };
+    if peeked == 0 {
+        // A non-blocking source with nothing to give is `EAGAIN`, which is what
+        // `SPLICE_F_NONBLOCK` (or the descriptor's own `O_NONBLOCK`) asks for.
+        let nonblock = flags & SPLICE_F_NONBLOCK != 0 || input.status() & O_NONBLOCK != 0;
+        return if nonblock { err::EAGAIN } else { 0 };
+    }
+    match out_pipe.write_once(&chunk[..peeked]) {
+        // No room in the destination's buffer: a blocking call would park here,
+        // and this kernel's answer to a full pipe is `EAGAIN` on the non-blocking
+        // path and a park on the other - the park belongs to the pipe's own wait,
+        // which this door reaches through `write_once`'s refusal rather than
+        // through a second copy of it.
+        Ok(None) => err::EAGAIN,
+        Ok(Some(n)) => n as isize,
+        Err(crate::vfs::VfsError::BrokenPipe) => err::EPIPE,
+        Err(e) => err_of(e),
+    }
+}
+
 pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SPLICE_F_MOVE: usize = 0x01;
     const SPLICE_F_NONBLOCK: usize = 0x02;

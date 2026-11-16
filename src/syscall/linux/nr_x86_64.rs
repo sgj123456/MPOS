@@ -45,6 +45,11 @@ pub const EXECVEAT: u64 = 322;
 pub const IOPRIO_SET: u64 = 251;
 /// `ioprio_get(2)`: see [`IOPRIO_SET`].
 pub const IOPRIO_GET: u64 = 252;
+/// `tee(2)`: duplicate a pipe's contents into another pipe without consuming
+/// them. The pair to `splice` - a caller that wants a stream both read and
+/// forwarded. Never declared here until item 312, so the dispatch answered
+/// `ENOSYS`.
+pub const TEE: u64 = 276;
 pub const EXIT: u64 = 60;
 pub const WAIT4: u64 = 61;
 pub const KILL: u64 = 62;

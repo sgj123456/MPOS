@@ -47,7 +47,9 @@ pub const EXECVE: u64 = 221;
 pub const EXECVEAT: u64 = 281;
 /// See the x86_64 table: the same calls, their own numbers.
 pub const IOPRIO_SET: u64 = 30;
-pub const IOPRIO_GET: u64 = 31; // 59 on x86_64
+pub const IOPRIO_GET: u64 = 31;
+/// See the x86_64 table: the same call, its own number.
+pub const TEE: u64 = 77; // 59 on x86_64
 pub const EXIT: u64 = 93; // 60 on x86_64
 pub const WAIT4: u64 = 260; // 61 on x86_64
 pub const KILL: u64 = 129; // 62 on x86_64
