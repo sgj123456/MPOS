@@ -199,6 +199,53 @@ linker's read-only pass over a shared page) is still answered from the VMA first
 That ordering is deliberate — the VMA is the narrower claim — and is now the one
 case a reader should suspect if a similar fault reappears.
 
+## 3c. Re-measured on a kernel carrying the A2 fix — and how to boot one at all
+
+### The measurement harness, recorded because it is not obvious
+
+`cargo xtask run` cannot refresh the image here (its privileged half needs `sudo`,
+which this container blocks), and the **loader embeds the kernel**, so editing
+`build/mpos-uefi-x86_64.img`'s root filesystem can never change which kernel boots.
+The only way to run a newly-built kernel against the real Chromium environment is
+to **replace `EFI/BOOT/BOOTX64.EFI` inside the image's ESP**. There is no
+`mtools`, no loop device and no root in this sandbox, so that was done with a
+small FAT32 writer over the image (walk the root directory, follow the cluster
+chain, rewrite the data, both FATs and the directory entry's size — a rebuilt
+loader is smaller, so the tail clusters are freed).
+
+Two false starts are worth recording because both cost a boot:
+
+- the ESP is a **virtual FAT** (`-drive file=fat:<dir>`) and grows to hold the
+  250 MB test initramfs, so it enumerates as `vda` at ~500 MB and **the installed
+  disk becomes `vdb`** — mounting `vda2` silently finds the wrong thing;
+- that virtual FAT also reached QEMU's 504 MiB ceiling, which is what the kernel
+  reported as "`vda, 1032192 sectors`" — a size that has nothing to do with the
+  2 GiB image.
+
+### What the fixed kernel showed
+
+With `EFI/BOOT/BOOTX64.EFI` replaced by a loader built from the fixed kernel,
+Chromium ran again. **The `U=0` fault is gone**: the only `PFDIAG` line of the run
+is `pte=0x3fa18005 P=1 W=0 U=1` — a present, **user-accessible**, read-only page,
+which is the correct shape for an `r-x` file mapping. The A2 fix holds under the
+real workload, not just under its pin.
+
+Two other things are visible and are **new information**:
+
+- `crashpad` still logs `ptrace: I/O error (5)` **12 times**, and a temporary
+  diagnostic on `ptrace`'s unknown-request arm **printed nothing** — so those
+  `EIO`s do **not** come from a request this kernel fails to recognise. They come
+  from somewhere else in the ptrace path (most likely `PTRACE_GETREGSET`'s iovec
+  or the `may_inspect` refusal being reported with the wrong errno). That is the
+  next thing to bisect, and it is now narrowed by measurement rather than assumed.
+- one log line names **`/proc/self/locales` returning `EOPNOTSUPP`**. Whatever
+  wants that path, this kernel does not serve it. Recorded as a lead, not yet
+  chased.
+
+**Chromium itself still does not render**: it takes its own `CHECK` (`trap 3`,
+`IMMEDIATE_CRASH`) after the crashpad storm. The kernel-side faults on this path
+are now fixed; what remains is userspace/environment plus the crashpad `EIO`.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
