@@ -3558,3 +3558,37 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `ioprio_get` is `ESRCH` (pinned with `4294967294`, not a normal account); and
   **`tee`/`vmsplice`** remain undeclared — item 310's census, still open. (§6.190,
   item 311)
+
+- **Item 312 — `tee`: the pair to `splice` that does not consume its source**:
+  the third of item 310's four census calls, and the cheapest because `splice` was
+  already here. The number was never declared, so the dispatch answered `ENOSYS`;
+  `tee(1)` is the caller everybody has. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{tee1,tee2,tee3}.c`): `tee(pipe, pipe, n)` copies `n`
+  bytes and leaves the source **unchanged**; a writable-but-non-pipe side is
+  `EINVAL`; an **unopenable** side is `EBADF`; a missing descriptor is `EBADF`; an
+  unknown flag bit is `EINVAL` **even at `len == 0`**; a legitimate `len == 0`
+  answers `0`; `SPLICE_F_MOVE` and `SPLICE_F_NONBLOCK` are served. **The order cost
+  a round and is the finding**: a first draft asked the source's mode, then the
+  flags, then both pipe questions, then the destination's mode — and answered
+  `EINVAL` for `tee(pipe, O_RDONLY file)`, which should be `EBADF`. The mode is the
+  *descriptor's* state and the pipe question is about the *node*; both mode
+  questions come first, as `splice` beside it does. The four-combination table is
+  the measurement (`tee(RDWR file, pipe)` `EINVAL`, `tee(WRONLY file, pipe)`
+  `EBADF`, `tee(pipe, RDWR file)` `EINVAL`, `tee(pipe, RDONLY file)` `EBADF`). The
+  transfer is a **peek then a write**, which is the contract itself: nothing is
+  taken from the source and what arrives is what a read *would* have handed back —
+  and **no new primitive was needed**, because `PipeEnd::peek_once` (added for
+  `MSG_PEEK`) already answers a read's three shapes, so an empty source with a live
+  writer parks the way a read would and `SPLICE_F_NONBLOCK` is how a caller asks
+  for `EAGAIN`. `t-tee` **+17**, including the four-combination table and the claim
+  that separates `tee` from `read`+`write`. **The gate caught two of my own
+  defects**: the dispatch-versus-table check named the missing row (counts 304 →
+  305), and clippy caught two **unreachable match arms** — `Ok(Some(0))` written
+  after `Ok(Some(n))` in both results, the arm that *read* as the more explicit
+  one. Gate `build/gate-item312b.log` `GATE_EXIT=0`: stage 1 1340, x86_64 **327**,
+  aarch64 **323** (both +1), kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1`. **Named**: `tee` copies through a 4 KiB scratch rather
+  than sharing pipe buffers, so `SPLICE_F_MOVE` is accepted and ignored (the shape
+  `splice`'s is); a **full destination is `EAGAIN`, not a park** — recorded because
+  a caller sees it as a retry loop; and **`vmsplice` (278)** remains undeclared,
+  the last of item 310's four and the only one needing `mm` work. (§6.191, item 312)

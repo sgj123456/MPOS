@@ -18140,3 +18140,75 @@ both up one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchang
    `4294967294`, not reachable through a normal account.
 3. **`tee` (276) and `vmsplice` (278)** remain undeclared and answer `ENOSYS` —
    item 310's census, still open.
+
+## §6.191 `tee`: the pair to `splice` that does not consume its source (item 312, LANDED 2026-11-16)
+
+**Where it came from.** Item 310's census — libc's `__NR_*` minus `nr_x86_64.rs` —
+named four calls real programs make. `execveat` (310) and `ioprio_*` (311) are
+landed; this is the third and the cheapest, because `splice` was already here. The
+number was never declared, so the dispatch answered `ENOSYS`; `tee(1)` is the
+caller everybody has.
+
+**Measured first**, Linux 7.3.4 (`build/scratch/opathmmap/{tee1,tee2,tee3}.c`):
+
+| what | Linux |
+|---|---|
+| `tee(pipe, pipe, n)` | `n` bytes copied; the **source unchanged** |
+| a **writable but non-pipe** side | `EINVAL` |
+| an **unopenable** side (right kind, wrong direction) | `EBADF` |
+| a missing descriptor | `EBADF` |
+| an unknown flag bit | `EINVAL`, **even at `len == 0`** |
+| `len == 0` with good flags | `0` |
+| `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK` | served |
+
+**The order cost a round, and it is the finding.** A first draft asked: the
+source's mode, then the flags, then both pipe questions, then the destination's
+mode. On the guest that answered `EINVAL` for `tee(pipe, O_RDONLY file)` — a
+descriptor the call should refuse as unopenable for **writing**, which is
+`EBADF`. The two questions are about different things and one of them is a
+property of the *descriptor* while the other is about the *node*: the state is
+judged first, which is also what `splice` beside it does. The four-combination
+table is what settled it:
+
+```
+tee(RDWR file, pipe)    EINVAL   readable, not a pipe
+tee(WRONLY file, pipe)  EBADF    not readable
+tee(pipe, RDWR file)    EINVAL   writable, not a pipe
+tee(pipe, RDONLY file)  EBADF    not writable
+```
+
+**The transfer is a peek then a write, which is the contract itself.** Nothing is
+taken from the source, and what arrives is what a read *would* have handed back.
+The tree already had `PipeEnd::peek_once` (added for `MSG_PEEK`), whose three
+answers are a read's — `Some(n)` data, `Some(0)` end-of-stream, `None` "not yet" —
+so an empty source with a live writer parks the way a read would, and
+`SPLICE_F_NONBLOCK` is how a caller asks for `EAGAIN` instead. No new primitive
+was needed; the door composes two that existed.
+
+**Gate, and two of my own defects it caught.** The
+**dispatch-versus-table check** named the missing row (counts 304 → 305 — the
+document cannot silently fall behind, which is why it exists). **Clippy** caught
+two **unreachable match arms**: `Ok(Some(0))` written after `Ok(Some(n))` in both
+the peek and the write result, which is the compiler telling me the end-of-stream
+case was already covered by the binding above — worth recording because the arm
+*read* as the more explicit one.
+
+`build/gate-item312b.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**
+host tests 0 failed; stage 2 **327** on x86_64 and **323** on aarch64 — both up
+one, `t-tee` staging on both machines — `mpos-kunit 42 passed, 0 failed` per arm;
+clippy ratchet unchanged at `162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`tee` transfers through a 4 KiB scratch, not by reference.** Linux can share
+   the pipe buffers themselves (`SPLICE_F_MOVE` is about giving them away); here
+   the bytes are copied, which is correct but means a `tee` of a large buffer is a
+   loop rather than a pointer move. `SPLICE_F_MOVE` is therefore *accepted and
+   ignored* — the same shape `splice`'s is — rather than served.
+2. **A full destination is `EAGAIN`, not a park.** `write_once` answers `None`
+   when there is no room, and this door maps that to `EAGAIN`. Linux parks a
+   blocking `tee` there; the honest statement is that this kernel's `tee` is the
+   non-blocking shape on a full destination, which a caller sees as a retry.
+3. **`vmsplice` (278)** remains undeclared and answers `ENOSYS` — the last of item
+   310's four, and the only one that needs `mm` work (it grafts user pages into a
+   pipe rather than copying bytes).

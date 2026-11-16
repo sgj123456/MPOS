@@ -13334,3 +13334,23 @@ scheduler, so a class is a number this kernel keeps and does not act on (the sha
 `ioprio_get(USER, …)` on a foreign uid is `ESRCH` and is pinned with `4294967294`,
 not reachable through a normal account. And **`tee` (276) / `vmsplice` (278)** remain
 undeclared and answer `ENOSYS` — item 310's census, still open.
+
+## Item 312 — `tee`: the pair to `splice` that does not consume its source (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **Where it came from** | Item 310's census. `execveat` (310) and `ioprio_*` (311) are landed; this is the third of the four, and the cheapest because `splice` was already here. The number was never declared, so the dispatch answered `ENOSYS`; `tee(1)` is the caller everybody has. |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/{tee1,tee2,tee3}.c`): `tee(pipe, pipe, n)` copies `n` bytes and leaves the source **unchanged**; a writable-but-non-pipe side is `EINVAL`; an **unopenable** side is `EBADF`; a missing descriptor is `EBADF`; an unknown flag bit is `EINVAL` **even at `len == 0`**; a legitimate `len == 0` answers `0`; `SPLICE_F_MOVE` and `SPLICE_F_NONBLOCK` are served. |
+| **The order cost a round** | A first draft asked the source's mode, then the flags, then both pipe questions, then the destination's mode — and answered `EINVAL` for `tee(pipe, O_RDONLY file)`, a descriptor the call should refuse as unopenable for **writing** (`EBADF`). The mode is the *descriptor's* state; the pipe question is about the *node*. Both mode questions come first, which is also what `splice` beside it does. The four-combination table in `tee3.c` is the measurement: `tee(RDWR file, pipe)` `EINVAL`, `tee(WRONLY file, pipe)` `EBADF`, `tee(pipe, RDWR file)` `EINVAL`, `tee(pipe, RDONLY file)` `EBADF`. |
+| **The transfer** | A **peek then a write**, which is the contract itself: nothing is taken from the source and what arrives is what a read *would* have handed back. The tree already had `PipeEnd::peek_once` (added for `MSG_PEEK`) with a read's three answers — `Some(n)`, `Some(0)` end-of-stream, `None` "not yet" — so an empty source with a live writer parks the way a read would, and `SPLICE_F_NONBLOCK` is how a caller asks for `EAGAIN` instead. **No new primitive was needed**; the door composes two that existed. |
+| **Pins** | `t-tee` **+17**, including the four-combination ordering table, the flag-before-length pair, and the claim that separates `tee` from `read`+`write` — the source still has everything it had. |
+| **Gate** | Two of my own defects caught: the **dispatch-versus-table check** named the missing row (counts 304 → 305), and **clippy** caught two **unreachable match arms** (`Ok(Some(0))` written after `Ok(Some(n))` in both results — the arm that *read* as the more explicit one). `build/gate-item312b.log`, `GATE_EXIT=0`: stage 1 **1340**; stage 2 **327** x86_64 / **323** aarch64 (both +1), `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. |
+
+**What this does not do, named.** `tee` **copies through a 4 KiB scratch** rather
+than sharing pipe buffers, so `SPLICE_F_MOVE` is accepted and ignored (the shape
+`splice`'s is) and a large `tee` is a loop rather than a pointer move. **A full
+destination is `EAGAIN`, not a park** — `write_once` answers "no room" and this door
+maps it to the retry, where Linux parks a blocking `tee`; recorded because a caller
+sees it as a retry loop. And **`vmsplice` (278)** remains undeclared — the last of
+item 310's four, and the only one needing `mm` work (it grafts user pages into a pipe
+rather than copying bytes).
