@@ -6680,6 +6680,23 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(p) => p,
         Err(e) => return err_of(e),
     };
+    // The destination's absolute path, composed from **its own** dirfd.
+    // `absolute(parent_path)` was wrong for a relative new name: it uses the
+    // calling directory, where the name is relative to `newdirfd`. Measured on
+    // the guest (the diagnostic that found this read
+    // `parent_path="." source=/tmp/probe-link-dirfd/src =4 dest="/" =0`):
+    // `linkat(dirfd, "src", dirfd, "hard")` composes the source from the dirfd
+    // and the destination from the cwd, so one link inside one filesystem
+    // answered `EXDEV` - and the absolute-path spelling, where both resolve to
+    // the same string, was the only one `t-link` ever asked. This is item 298's
+    // bug one door over, in the shape its own comment beside this code
+    // describes for the *source*.
+    let destination_path = match crate::vfs::mount::caller_table().path_of(&new_base) {
+        Some(base_path) if !new_path.starts_with('/') => crate::vfs::path::normalize(
+            &alloc::format!("{}/{}", base_path.trim_end_matches('/'), new_path),
+        ),
+        _ => absolute(&new_path),
+    };
     let parent = match crate::vfs::resolve_opt(parent_path, Some(new_base)) {
         Ok(parent) => parent,
         Err(e) => return err_of(e),
@@ -6731,20 +6748,52 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         // inside a mount answers `None` and the comparison would fail - which is
         // exactly the regression the first attempt at this fix caused on
         // `t-link` and `t-fsflags`.
-        let base_path = crate::vfs::mount::caller_table()
-            .path_of(&old_base)
-            .unwrap_or_else(crate::sched::current_cwd_path);
-        let source_path = if old_path.starts_with('/') {
-            crate::vfs::path::normalize(&old_path)
-        } else {
-            crate::vfs::path::normalize(&alloc::format!(
-                "{}/{}",
-                base_path.trim_end_matches('/'),
-                old_path
-            ))
-        };
-        crate::vfs::mount::fs_of_path(&source_path).0
-            == crate::vfs::mount::fs_of_path(&absolute(parent_path)).0
+        // `path_of` cannot name a directory that no path reaches - and an
+        // `O_PATH` dirfd's inode is exactly that, because the walk is the only
+        // thing that would have given it one. Falling back to the **cwd** there
+        // was the bug: it composed a plausible path in the wrong tree, and
+        // `linkat(O_PATH_dirfd, "file", …, "hard")` answered `EXDEV` on the
+        // guest while the same call with an absolute path was served
+        // (`build/scratch/opathmmap/dirfd.c` and the guest's own
+        // `probe-link-dirfd`: `errno=18` on the dirfd spelling, 0 on the
+        // absolute one - and `t-link` had never asked, because every one of its
+        // claims passes `CWD` with an absolute name).
+        //
+        // So the fallback is the inode question, which is the one that cannot
+        // be fooled by a wrong path: both the source inode and the destination
+        // directory, asked for the filesystem serving them. It places a node
+        // only at a mount's root, so a path is still preferred when there is
+        // one - the composition below stays the primary test.
+        match crate::vfs::mount::caller_table().path_of(&old_base) {
+            Some(base_path) => {
+                let source_path = if old_path.starts_with('/') {
+                    crate::vfs::path::normalize(&old_path)
+                } else {
+                    crate::vfs::path::normalize(&alloc::format!(
+                        "{}/{}",
+                        base_path.trim_end_matches('/'),
+                        old_path
+                    ))
+                };
+                crate::vfs::mount::fs_of_path(&source_path).0
+                    == crate::vfs::mount::fs_of_path(&destination_path).0
+            }
+            // No name for the dirfd: ask the inodes. A file inside a mount that
+            // is not its root cannot answer, and the honest reading there is
+            // "one filesystem" - `parent` was reached by a real walk, and the
+            // source is a child of the same directory in every case this door
+            // serves. Refusing instead would turn an unanswerable question into
+            // a refusal, which is the worse direction here: EXDEV means "copy
+            // instead" and gets the caller a slow but correct result, while a
+            // wrong EXDEV on the same filesystem is a link that never happens.
+            None => match (
+                crate::vfs::fs_serving_inode_of(&old),
+                crate::vfs::fs_serving_inode_of(&parent),
+            ) {
+                (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+                _ => true,
+            },
+        }
     };
     if !same_filesystem {
         return err::EXDEV;

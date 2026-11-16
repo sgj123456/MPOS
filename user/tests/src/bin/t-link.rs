@@ -422,6 +422,71 @@ fn main() {
     let _ = std::fs::remove_file(empty_link);
     let _ = std::fs::remove_file(target_file);
 
+    // === a dirfd-relative link: both names in one directory =================
+    //
+    // Every claim above passes `CWD` with an **absolute** name, so the dirfd
+    // spelling was never asked - and it was broken: measured on the guest,
+    // `linkat(dirfd, "src", dirfd, "hard")` answered **`EXDEV`** while the
+    // absolute-path spelling of the same link was served. The cause was two
+    // paths composed from two different bases: the source from its dirfd, the
+    // destination from the **cwd** (`absolute()`), so `parent_path == "."`
+    // resolved to `/` and the comparison saw two filesystems. Item 298's bug
+    // one door over.
+    //
+    // Both spellings are claimed - the ordinary descriptor and `O_PATH` -
+    // because the fix had to compose the destination from *its* dirfd for
+    // either to work, and the `O_PATH` one is the flag's own largest use.
+    let dirdir = "/tmp/t-link-dirfd";
+    let _ = std::fs::remove_dir_all(dirdir);
+    if std::fs::create_dir_all(dirdir).is_ok()
+        && std::fs::write(format!("{dirdir}/src"), b"x").is_ok()
+    {
+        for (label, path_flags) in [
+            ("ordinary", OFlags::RDONLY | OFlags::DIRECTORY),
+            ("O_PATH", OFlags::PATH),
+        ] {
+            if let Ok(dfd) = rustix::fs::open(dirdir, path_flags, Mode::empty()) {
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&dfd);
+                let name = format!("hard-{}", label.to_lowercase().replace("_", "-"));
+                let cname = std::ffi::CString::new(name.as_str()).unwrap();
+                // SAFETY: `raw` is a live directory descriptor and both names
+                // are NUL-terminated strings this test owns.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_linkat,
+                        raw,
+                        c"src".as_ptr(),
+                        raw,
+                        cname.as_ptr(),
+                        0,
+                    )
+                };
+                r.check(
+                    &format!("linkat({label} dirfd, src, same dirfd, {name}) is served, got {rc}"),
+                    rc == 0,
+                );
+                r.check(
+                    &format!("and the {label}-dirfd link is the same inode"),
+                    std::fs::metadata(format!("{dirdir}/{name}"))
+                        .ok()
+                        .zip(std::fs::metadata(format!("{dirdir}/src")).ok())
+                        .is_some_and(|(a, b)| {
+                            use std::os::unix::fs::MetadataExt;
+                            a.ino() == b.ino()
+                        }),
+                );
+            } else {
+                r.check(
+                    &format!("a {label} directory descriptor for the linkat claims is opened"),
+                    false,
+                );
+            }
+        }
+    } else {
+        r.check("the dirfd fixture directory is made", false);
+    }
+    let _ = std::fs::remove_dir_all(dirdir);
+
     for path in [A, B, S, S2] {
         let _ = std::fs::remove_file(path);
     }
