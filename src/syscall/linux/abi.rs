@@ -1114,6 +1114,20 @@ pub(crate) const PTRACE_SETREGS: usize = 13;
 pub(crate) const PTRACE_GETFPREGS: usize = 14;
 pub(crate) const PTRACE_SETFPREGS: usize = 15;
 pub(crate) const PTRACE_ATTACH: usize = 16;
+/// The modern attach pair, and why it is a **different call** rather than an
+/// alias of `ATTACH`: measured on Linux 7.3.4
+/// (`build/scratch/seize/s.c`), `PTRACE_SEIZE` attaches **without stopping**
+/// the tracee (`waitpid(WNOHANG)` still answers 0 afterwards) and
+/// `PTRACE_INTERRUPT` then asks for a stop, which arrives as **`SIGTRAP`**, not
+/// the `SIGSTOP` a `PTRACE_ATTACH` produces. Crashpad (Chromium's crash handler)
+/// probes with this pair before falling back, so `EIO` here is what makes it
+/// conclude it cannot inspect a process.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) const PTRACE_SEIZE: usize = 0x4206;
+/// See [`PTRACE_SEIZE`]: stop a seized tracee now. `ESRCH` when the target is not
+/// seized (measured), which is Linux's answer for "no such tracee".
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) const PTRACE_INTERRUPT: usize = 0x4207;
 pub(crate) const PTRACE_DETACH: usize = 17;
 pub(crate) const PTRACE_SYSCALL: usize = 24;
 pub(crate) const PTRACE_SETOPTIONS: usize = 0x4200;
@@ -6993,6 +7007,12 @@ mod tests {
         assert_eq!(PTRACE_GETSIGINFO, 0x4202);
         assert_eq!(PTRACE_GETREGSET, 0x4204);
         assert_eq!(PTRACE_SETREGSET, 0x4205);
+        // The modern attach pair, `0x4206`/`0x4207`, and the listener option
+        // beside them. Pinned here rather than only in the guest pin because the
+        // **numbers** are the ABI: a request word one off is a different call,
+        // and this table is where they are written down.
+        assert_eq!(PTRACE_SEIZE, 0x4206);
+        assert_eq!(PTRACE_INTERRUPT, 0x4207);
         assert_eq!(PTRACE_GET_SYSCALL_INFO, 0x420E);
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_O_TRACEEXEC, 0x10);

@@ -1802,6 +1802,17 @@ pub(crate) struct Tracing {
     /// `None` is the overwhelmingly common case: nobody is tracing, or the
     /// tracer did not ask about this kind of child.
     pub(crate) pending_event: Option<(u32, u64)>,
+    /// A `PTRACE_INTERRUPT` the tracer asked for and the tracee has not honoured
+    /// yet.
+    ///
+    /// The tracer's half of `INTERRUPT` runs in the **tracer's** context, and the
+    /// stop has to be taken by the **tracee** - which is not running, or is
+    /// running on another turn of the same core. So the request is recorded here,
+    /// and the scheduler's own hand-over path (`take_interrupt_request`) turns it
+    /// into a stop the next time this task is about to run. That is the same
+    /// shape a pending signal takes, and for the same reason: the side that
+    /// wants it is not the side that can act on it.
+    pub(crate) interrupt_requested: bool,
 }
 
 /// The syscall a tracee is stopped at, as `PTRACE_GET_SYSCALL_INFO` reports it.

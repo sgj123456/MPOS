@@ -1282,6 +1282,55 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         return 0;
     }
 
+    // `PTRACE_SEIZE` is **not** `ATTACH` spelled differently, and the difference
+    // is the whole reason crashpad prefers it. Measured on Linux 7.3.4
+    // (`build/scratch/seize/s.c`): `SEIZE` writes the link **without stopping
+    // the tracee** - `waitpid(WNOHANG)` still answers 0 afterwards - and the
+    // tracer asks for a stop explicitly with `PTRACE_INTERRUPT`. So there is no
+    // `SIGSTOP` here; the stop is the interrupt's job.
+    //
+    // The options word is this request's `data` (Linux takes `PTRACE_O_*` at
+    // seize time, where `ATTACH` takes none and `SETOPTIONS` sets them later);
+    // it is stored so a later `INTERRUPT` stop reports the events the tracer
+    // asked for. A second `SEIZE` on an already-traced task is `EPERM` on Linux
+    // (measured), not a quiet re-attach.
+    if request == abi::PTRACE_SEIZE {
+        match crate::sched::may_inspect(id) {
+            None => return err::ESRCH,
+            Some(false) => return err::EPERM,
+            Some(true) => {}
+        }
+        // `SEIZE` on a task that already has a tracer: Linux answers `EPERM`
+        // (measured - a second `SEIZE` of the same child reads `EPERM`), and
+        // so does a tracee that is the caller itself.
+        if crate::sched::tracer_of(id).is_some() || id == me {
+            return err::EPERM;
+        }
+        if !crate::sched::set_tracer(id, me) {
+            return err::ESRCH;
+        }
+        crate::sched::set_trace_options(id, data);
+        return 0;
+    }
+
+    // `PTRACE_INTERRUPT` asks a seized tracee to stop **now**. The stop it
+    // produces is `SIGTRAP`, not the `SIGSTOP` an `ATTACH` uses (measured:
+    // `WSTOPSIG` is 5), which is how a tracer tells "you attached" from "I asked
+    // you to pause". A target with no tracer is `ESRCH` - Linux's answer for a
+    // request that names no tracee (measured).
+    if request == abi::PTRACE_INTERRUPT {
+        if crate::sched::tracer_of(id) != Some(me) {
+            return err::ESRCH;
+        }
+        // The request is recorded, not acted on: the stop belongs to the tracee,
+        // and this runs in the tracer. The scheduler honours it when the tracee is
+        // next handed the CPU, which is where the `SIGTRAP` stop is taken.
+        if !crate::sched::request_interrupt(id) {
+            return err::ESRCH;
+        }
+        return 0;
+    }
+
     // Everything else has to find a link already made. The check is `ours`
     // rather than "is my tracee" because of a race that is not hypothetical:
     // a tracer sets its options in the instruction after `fork`, and the child -

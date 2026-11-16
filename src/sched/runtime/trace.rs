@@ -50,6 +50,34 @@ pub fn tracer_of(id: TaskId) -> Option<TaskId> {
     with_table(|t| t.tasks.get(id.0)?.as_ref()?.trace.tracer)
 }
 
+/// Ask a seized tracee to stop: the tracer's half of `PTRACE_INTERRUPT`.
+///
+/// It records the request rather than stopping anything, because the two halves
+/// run in different tasks: this one is the **tracer**, and a stop is only
+/// meaningful to the task that is stopped. `take_interrupt_request` is the other
+/// half, run by the tracee where it can park itself.
+///
+/// The `SIGTRAP` that the resulting stop reports is Linux's own choice for an
+/// interrupt (measured, `build/scratch/seize/s.c`: `WSTOPSIG` 5), and it is how a
+/// tracer tells "I asked you to pause" from the `SIGSTOP` of an `ATTACH`.
+pub fn request_interrupt(id: TaskId) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited && task.trace.tracer.is_some() => {
+            task.trace.interrupt_requested = true;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Whether `id` owes its tracer an interrupt stop, taken once.
+pub fn take_interrupt_request(id: TaskId) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) => core::mem::take(&mut task.trace.interrupt_requested),
+        None => false,
+    })
+}
+
 /// The `PTRACE_O_*` word `id`'s tracer set.
 pub fn trace_options(id: TaskId) -> usize {
     with_table(|t| {
@@ -776,6 +804,29 @@ pub fn stop_at_syscall(
     sp: u64,
 ) {
     let id = current();
+    // **The tracee's half of `PTRACE_INTERRUPT`.** A `SEIZE`d task is traced but
+    // not necessarily `armed` for syscall stops, so this check is *before* the
+    // `armed` test: an interrupt is a request to stop now, and it does not need
+    // the tracer to have asked for syscall boundaries. Taken once
+    // (`take_interrupt_request`), and the stop reports `SIGTRAP` - the signal
+    // Linux gives an interrupt (`build/scratch/seize/s.c`: `WSTOPSIG` 5), which
+    // is how a tracer tells it from the `SIGSTOP` of an `ATTACH`.
+    if take_interrupt_request(id) {
+        park(
+            regs,
+            Stop {
+                signal: signal::SIGTRAP,
+                event: PTRACE_EVENT_NONE,
+                traced: true,
+                reported: false,
+                message: 0,
+                delivering: None,
+                syscall: None,
+                group: false,
+            },
+        );
+        return;
+    }
     let (armed, options, exec_exit) = with_table(|t| {
         let trace = &t.task(id).trace;
         (
