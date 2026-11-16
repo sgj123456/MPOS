@@ -3481,3 +3481,45 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   exist ("we can write it" is not "we can use it"); and the door does not itself re-ask
   `CAP_MKNOD` (measured as matching, since `dev == 0` needs none, but by construction
   rather than by a check). (§6.188, item 309)
+
+- **Item 310 — `execveat`: the door that runs a descriptor's own file**: found by a
+  **census** rather than a gap list — libc's `__NR_*` table minus `nr_x86_64.rs` gave
+  **86 numbers the kernel never declares**, most dead (`uselib`, `_sysctl`,
+  `query_module`, the `*_module` family, `nfsservctl`) but four calls real programs
+  make: **`execveat` (322)**, `ioprio_get`/`ioprio_set`, `tee`, `vmsplice`. Every
+  earlier item in this family started from a list somebody wrote; this one started
+  from *the ABI's own table minus ours*. `execveat` went first because it is the one
+  with **no fallback** — musl's `fexecve` is built from it, `posix_spawn`'s
+  file-action path reaches it, and a caller execing an **already-verified descriptor**
+  has no other way to say so. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/exat.c`): a relative name plus a dirfd is served;
+  `("", AT_EMPTY_PATH)` runs the descriptor's file; **`(-1, "", AT_EMPTY_PATH)` is
+  `EBADF`** — the descriptor judged *before* the name, which is the ordering claim (a
+  kernel answering `ENOENT` first would pass a naive test and get the refused case
+  wrong); `("", 0)` is `ENOENT`; an unknown flag bit is `EINVAL`;
+  `AT_SYMLINK_NOFOLLOW` is accepted. The implementation **shares its body** with
+  `execve` rather than copying it: `execve` resolves and delegates to `exec_inode`,
+  which takes the file, the name to report, and the two register slots the arrays
+  arrive in — the only thing the doors differ about — because a copy would be two
+  hundred lines of loader logic with one line different and the second copy is how
+  two doors come to disagree about a shebang. `base_for` became `pub(crate)` so the
+  `*at` door resolves against its dirfd with the same function every other `*at` call
+  uses. `t-execveat`: **11 claims, every one a forked child** (a successful exec does
+  not return) — the child reports a refusal through a pipe before `_exit`, so the
+  parent reads an errno rather than decoding an exit status, and the marker the new
+  image prints is the evidence a *different* image ran, which an exit code alone
+  cannot give. A drafting defect: the first version called the helper **twice per
+  claim** (once in the `format!`, once as the assertion), so each ran twice and the
+  failure message could report the second run's reading — fixed by binding once, 22
+  forks became 11. **The gate found two things, both of them it working**: the
+  dispatch-versus-table check failed ("1 row(s) of disagreement … a served call
+  without a row is the review finding that document exists to make") so
+  `docs/uapi/01-syscall-table.md` gained its row and its counts moved 301 → 302; and
+  clippy caught three `unnecessary_cast` of mine, fixed not baselined. Gate
+  `build/gate-item310b.log` `GATE_EXIT=0`: stage 1 1340, x86_64 **325**, aarch64
+  **321** (both up one), kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1`. **Named**: `ioprio_get`/`ioprio_set`, `tee` and `vmsplice`
+  are still `ENOSYS`; `AT_SYMLINK_NOFOLLOW` is measured as accepted but not pinned as
+  a *difference*; and the census's tail is **not all dead** — `fspick` (433),
+  `landlock_*` (444–446), `cachestat` (451), `setxattrat` (463) and the LSM family
+  (459–461) are current calls this kernel does not serve. (§6.189, item 310)

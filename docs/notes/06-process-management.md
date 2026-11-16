@@ -17971,3 +17971,97 @@ value was `()` — fixed by dropping the binding rather than raising a ceiling.
    which matches, because `dev == 0` is the case that needs no capability. The
    *nonzero-`dev`* path is not reachable through this call, so the two agree; it
    is named because the agreement is by construction rather than by a check.
+
+## §6.189 `execveat`: the door that runs a descriptor's own file (item 310, LANDED 2026-11-16)
+
+**How it was found.** Not from a gap list — from a census. Comparing libc's
+`__NR_*` table against `nr_x86_64.rs` gave **86 numbers the kernel never
+declares**, and most are dead (`uselib`, `_sysctl`, `query_module`, the
+`*_module` family, `nfsservctl`) or archaisms of the x86_64 table. Four stood out
+as calls a real program makes: **`execveat` (322)**, `ioprio_get`/`ioprio_set`
+(251/252), `tee` (276) and `vmsplice` (278). `execveat` is the one with no
+fallback: musl's `fexecve` is built from it, `posix_spawn`'s file-action path
+reaches it, and a caller that execs an **already-verified descriptor** has no
+other way to say so.
+
+The census is worth recording as a method. Every earlier item in this family
+started from a list somebody wrote; this one started from *the ABI's own table
+minus ours*, and it found a served-by-nobody call that no gap list mentioned.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/exat.c`):
+
+| what | Linux |
+|---|---|
+| `(dirfd, "sh", 0)` | served |
+| `(fd, "", AT_EMPTY_PATH)` | served — runs the descriptor's file |
+| `(-1, "", AT_EMPTY_PATH)` | **`EBADF`** — the descriptor before the name |
+| `(dfd, "", 0)` | `ENOENT` |
+| `(dfd, "nope", 0)` | `ENOENT` |
+| `(dfd, "sh", 0x8)` | `EINVAL` |
+| `(dfd, "sh", AT_SYMLINK_NOFOLLOW)` | served |
+
+The third row is the ordering claim: a kernel that answered `ENOENT` for an empty
+name *before* looking at the descriptor would pass a naive "empty name is
+ENOENT" test and get the refused case wrong, so the pin makes both.
+
+**The implementation shares its body rather than copying it.** `execve` now
+resolves its path and delegates to `exec_inode`, which takes the file to run, the
+name to report as the process's own, and **the two register slots the arrays
+arrive in** — the only thing the two doors differ about (`execve` has `path` at
+0, `execveat` has `dirfd` at 0 and `path` at 1). A copy would have been two
+hundred lines of loader logic with one line different, and the second copy is how
+two doors come to disagree about a shebang. `base_for` — private to `fs` until
+now — became `pub(crate)` so the at-door can resolve against its dirfd with the
+same function every other `*at` call uses.
+
+`AT_SYMLINK_NOFOLLOW` is accepted and has nothing extra to do: the resolution
+follows the name to what it reaches, and for an exec that is the file either way.
+Recorded rather than approximated — no claim distinguishes it, because the only
+way to see the difference is a symlink whose target is a *different program*, and
+that fixture would be asserting about which program ran rather than about the
+flag.
+
+**The pin, and why every claim forks.** A successful `exec` does not return, so
+each claim is a child: the parent forks, the child attempts the exec and — if it
+**fails** — writes the errno through a pipe before `_exit`. The parent then reads
+either four bytes (an errno) or EOF (nothing written, so the exec happened), and
+the marker the new image prints (`echo T-EXECVEAT-RAN` through `sh -c`) is the
+evidence a *different* image ran. An exit code alone cannot give that: a child
+that never execs can still exit 0. Eleven claims, all served or refused exactly as
+the table above.
+
+One drafting defect worth recording: the first version called
+`execveat_in_child` **twice per claim** — once inside the `format!` and once as
+the assertion — so every claim ran its child twice and the reading in the failure
+message could be the second run's. Fixed by binding the result once; twenty-two
+forks became eleven.
+
+**Gate.** Two findings, both of them the gate doing its job on a new call:
+
+1. **The dispatch-versus-table check failed**: `1 row(s) of disagreement between
+   the dispatch and docs/uapi/01-syscall-table.md; a served call without a row is
+   the review finding that document exists to make`. The table gained its
+   `execveat` row and its two counts moved 301 → 302 — the check is the reason
+   that document cannot silently fall behind.
+2. **Clippy**: `unnecessary_cast` up three — two redundant `as usize` casts of
+   `abi` constants that are already `usize`, and one `as i32` on an `i32`. Fixed,
+   not baselined.
+
+`build/gate-item310b.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**
+host tests 0 failed; stage 2 **325** programs on x86_64 and **321** on aarch64 —
+both up one, which is `t-execveat` staging on both machines — `pass=325 fail=0` /
+`pass=321 fail=0`, `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet
+unchanged at `162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`ioprio_get`/`ioprio_set` (251/252), `tee` (276), `vmsplice` (278)** are
+   still undeclared, so they answer `ENOSYS`. Each is a real gap and each needs
+   its own measurement; the census above is the list they came from.
+2. **`AT_SYMLINK_NOFOLLOW` is not distinguished** by a claim, for the fixture
+   reason above — measured as accepted, recorded as accepted, not pinned as a
+   *difference*.
+3. **The remaining ~80 undeclared numbers are not all dead**: `fspick` (433),
+   `landlock_*` (444–446), `cachestat` (451), `setxattrat` (463) and the LSM
+   family (459–461) are current Linux calls this kernel does not serve. They are
+   the census's tail and a future item's list.
