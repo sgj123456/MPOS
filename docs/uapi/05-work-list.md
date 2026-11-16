@@ -13212,3 +13212,31 @@ buffered** was not measured: the capacity is documented as a ceiling on what may
 `fcntl`'s **lease** family is still unswept: `F_GETLEASE`/`F_SETLEASE` (and
 `CAP_LEASE`) fall to the table's default arm, which is the same "unimplemented, not
 misrefused" shape item 300 named and this item did not touch.
+
+## Item 306 — `O_PATH` as a dirfd, and the dirfd-relative link that compared two trees (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **The gap §6.179 left** | "`O_PATH` as a dirfd was not exercised: it is the flag's largest remaining use (`openat(O_PATH_fd, "child")`), and the probe only used it as a *subject*." |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/dirfd.c`): **twelve** `*at` doors all served with an `O_PATH` dirfd — `openat`, `fstatat` (name and `AT_EMPTY_PATH`), `unlinkat`, `mkdirat`, `symlinkat`, `readlinkat`, `renameat`, `linkat` (both dirfds), `fchmodat`, `fchownat`, `utimensat`, `faccessat`. This kernel's `base_for` accepts any `Dir` description and never asks how it was opened, so ten of the twelve were served by construction. |
+| **The two that were not — and both are about the dirfd, not the flag** | The guest answered `renameat(…)=EISDIR` and `linkat(…)=EXDEV` for the **dirfd-relative** spelling, and *identically for an ordinary descriptor*; only the absolute-path spelling worked. That is what made `linkat` a bug rather than an `O_PATH` quirk. |
+| **The `linkat` cause, found by instrumenting** | The `EXDEV` comparison composes each name against a base, and the two bases were different things: `LINKDIAG source_path="/tmp/probe-link-dirfd/src" =4 dest="/" =0`. The source came from **its** dirfd; the destination from `absolute(parent_path)`, which uses the **calling directory** — so a bare new name (`parent_path == "."`) composed to `/`, and one link inside one filesystem was compared across two. **Item 298's bug one door over.** The fix composes the destination from `new_base`; the `O_PATH` spelling then needs nothing of its own, which is the test of whether an `O_PATH` bug is really one. |
+| **Why `t-link` never saw it** | Every claim there passes `CWD` with an **absolute** name, where both bases compose to the same string — so the comparison was **vacuously right**. A test that only exercises the spelling where the bug cannot appear is a test of the other spelling. |
+| **Pins** | `t-link` **+4**: the dirfd-relative link for an ordinary **and** an `O_PATH` descriptor, each with a same-inode claim. |
+| **The third finding, named as its own item** | `renameat`'s `EISDIR` is real and unrelated to dirfds: `renameat2` has **no `NodeKind::Dir` arm** (`_ => return err::EISDIR`, with a comment saying a directory rename would have to move the subtree's parent back-pointer and nothing needs it yet). Deliberate, same for every dirfd spelling, and closing it needs subtree movement rather than a check — recorded as item 307, not folded in: a probe that finds two things must not report one. |
+| **Gate** | `build/gate-item306.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**; stage 2 **328** on x86_64 and **324** on aarch64 — both up by four, the `t-link` claims staging on both; `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. |
+
+**What this does not do, named.** `name_to_handle_at`/`open_by_handle_at` and the
+xattr `*at` family were not exercised with an `O_PATH` dirfd (the twelve are the
+doors measured, not the set); `fchmodat2` — the `AT_EMPTY_PATH`-capable spelling
+with its own number — was not asked, because glibc's `fchmodat` wrapper does not
+reach the shape this kernel serves; and directory rename is item 307.
+
+## Item 307 — renaming a directory is `EISDIR`, for every dirfd spelling (NOT STARTED 2026-11-16)
+
+| | |
+|---|---|
+| **What it is** | `renameat2` has no `NodeKind::Dir` arm. The fallthrough is `_ => return err::EISDIR`, under a comment that says a directory rename "would have to move the whole subtree's parent back-pointer; nothing here needs it yet, and pretending otherwise would half-move it." |
+| **Measured** | Guest, `probe-rename-op`: `mkdirat` a directory then `renameat` it — `-1 errno=21` for an ordinary **and** an `O_PATH` dirfd, on Linux `0`. A file rename beside it is served. |
+| **Why it is not a check** | The subtree's entries name their parent; moving a directory means every one of them follows, and no `Inode` here keeps a parent link to move. Implementing it correctly means either adding one or walking the subtree and rewriting it, and the half-version is exactly what the comment refuses to ship. |
+| **What it blocks** | `mv` of a directory, `apk`'s directory-shaped installs, and any tree rearrangement a package script does. Nothing in the current images needs it (`docs/notes/` §6.185's probe was the first to ask), which is why it stayed named rather than built. |

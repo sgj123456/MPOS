@@ -3343,3 +3343,44 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   is already buffered* is unmeasured (the capacity is documented as a ceiling on what
   may be queued), and the `F_GETLEASE`/`F_SETLEASE` + `CAP_LEASE` family is still
   unswept. (§6.184, item 305)
+
+- **Item 306 — `O_PATH` as a dirfd, and the dirfd-relative link that compared two
+  trees**: §6.179's named gap ("the flag's largest remaining use … the probe only
+  used it as a *subject*"). Measured on Linux 7.3.4: **twelve** `*at` doors all
+  serve an `O_PATH` dirfd, and this kernel's `base_for` accepts any `Dir`
+  description without asking how it was opened — so ten were served by
+  construction. The two that were not are the finding: `renameat` and `linkat` with
+  a **dirfd-relative** name answered `EISDIR`/`EXDEV` **identically for an ordinary
+  descriptor**, while the absolute spelling worked — so neither was an `O_PATH` bug.
+  The `linkat` cause came from instrumenting, not reading:
+  `LINKDIAG source_path="…/src" =4 dest="/" =0` — the source composed from its
+  dirfd, the destination from `absolute(parent_path)`, which uses the **calling
+  directory**, so a bare new name (`"."`) composed to `/` and one link inside one
+  filesystem was compared across two. **Item 298's bug one door over**; the fix
+  composes the destination from `new_base`, and the `O_PATH` spelling then needs
+  nothing of its own. **Why `t-link` missed it**: every claim there passes `CWD`
+  with an **absolute** name, where both bases are the same string — the comparison
+  was vacuously right, and a test that only exercises the spelling where the bug
+  cannot appear tests the other spelling. `t-link` **+4**. A **third** finding is
+  named as its own item: `renameat2` has no `NodeKind::Dir` arm and answers
+  `EISDIR`, deliberately (a subtree's parent back-pointer would have to move) —
+  item 307. Gate `build/gate-item306.log` `GATE_EXIT=0`: stage 1 1340, x86_64
+  **328**, aarch64 **324** (both up four, the new claims staging on both machines),
+  kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1`. **Named**:
+  `name_to_handle_at`/`open_by_handle_at` and the xattr `*at` family were not
+  exercised with an `O_PATH` dirfd, and `fchmodat2` was not asked. (§6.185,
+  item 306)
+
+- **Item 307 — renaming a directory is `EISDIR`, for every dirfd spelling** (named,
+  not started): `renameat2` has no `NodeKind::Dir` arm; the fallthrough is
+  `_ => return err::EISDIR` under a comment that a directory rename "would have to
+  move the whole subtree's parent back-pointer; nothing here needs it yet, and
+  pretending otherwise would half-move it." Measured on the guest while item 306's
+  probe ran: `mkdirat` then `renameat` of that directory is `EINVAL`-sibling
+  `EISDIR` for an ordinary **and** an `O_PATH` dirfd, where Linux answers 0, while a
+  file rename beside it is served. **Not a check to add**: no `Inode` here keeps a
+  parent link, so the honest implementations are to add one or to walk and rewrite
+  the subtree — and the half-version is what the comment refuses to ship. What it
+  blocks: `mv` of a directory, `apk`'s directory-shaped installs, any tree
+  rearrangement a package script does. Nothing in the current images needs it, which
+  is why it stayed named rather than built. (item 307)

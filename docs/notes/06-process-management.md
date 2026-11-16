@@ -17604,3 +17604,100 @@ only. And item 303's remaining named item is unchanged: `fcntl`'s
 ordinary-descriptor half is now pinned only where this item touched it
 (`F_GETOWN`/`F_SETOWN`/the pipe pair); `F_GETLEASE`/`F_SETLEASE` and `CAP_LEASE` were
 not swept and `F_SETLEASE` still falls to the default arm.
+
+## §6.185 `O_PATH` as a dirfd, and the dirfd-relative link that compared two different trees (item 306, LANDED 2026-11-16)
+
+**The gap §6.179 left.** Its own list named "`O_PATH` as a dirfd was not exercised:
+it is the flag's largest remaining use (`openat(O_PATH_fd, "child")`), and the probe
+only used it as a *subject*". That is the question this section answers, and closing
+it found a defect the flag had nothing to do with.
+
+**Measured first, whole, on Linux 7.3.4** (`build/scratch/opathmmap/dirfd.c`).
+Twelve `*at` doors, all served with an **`O_PATH`** dirfd: `openat` (the flag's own
+largest use, and it ignores the dirfd entirely for an absolute name), `fstatat`
+(name and `AT_EMPTY_PATH`), `unlinkat`, `mkdirat`, `symlinkat`, `readlinkat`,
+`renameat`, `linkat` (both dirfds), `fchmodat`, `fchownat`, `utimensat`,
+`faccessat`. `fchmodat(fd, "", …, AT_EMPTY_PATH)` is served for an ordinary
+descriptor and an `O_PATH` one alike. This kernel's `base_for` accepts any `Dir`
+description and never asks whether it was opened `O_PATH`, so all twelve were
+served by construction — **ten of the twelve were**.
+
+**The two that were not, and the diagnostic.** `renameat` and `linkat` with a
+dirfd-relative name answered badly on the guest:
+
+```
+renameat(O_PATH, "olddir" -> "newdir")   = -1  errno=21 (EISDIR)
+renameat(ordinary, "old2" -> "new2")     = -1  errno=21 (EISDIR)
+linkat(O_PATH, "src" -> "hard-op")       = -1  errno=18 (EXDEV)
+linkat(ordinary, "src" -> "hard-ord")    = -1  errno=18 (EXDEV)
+linkat(AT_FDCWD, "/abs/src" -> "…")      =  0
+```
+
+Two findings in one table, and **both are about the dirfd spelling rather than
+about `O_PATH`**: the `renameat` failure is identical for an ordinary descriptor,
+and the `linkat` one is too. The absolute-path spelling was the only one working,
+which is why nothing had noticed.
+
+**The `linkat` cause, found by instrumenting rather than by reading.** The
+comparison that decides `EXDEV` composes each name against a base, and the two
+bases were different things:
+
+```
+LINKDIAG source_path="/tmp/probe-link-dirfd/src" =4 dest="/" =0
+```
+
+The source was composed from **its** dirfd (`path_of(old_base)` → the real path,
+filesystem `4`); the destination from `absolute(parent_path)`, which uses the
+**calling directory**. For `linkat(dirfd, "src", dirfd, "hard")` the new name is
+bare, so `parent_path == "."` and the destination composed to `/` — filesystem
+`0`. One link inside one filesystem was compared across two. **This is item 298's
+bug one door over**, in exactly the shape the comment beside that code describes
+for the source: a name relative to a dirfd must be composed from *that* dirfd, and
+`absolute()` is the cwd's answer to a different question.
+
+The fix composes the destination from `new_base`, falling back to `absolute()` for
+an absolute name or a dirfd with no path. The `O_PATH` spelling then needs nothing
+of its own — the defect was in the destination base, so both flavours were fixed by
+one line of reasoning, which is the test of whether an `O_PATH` bug is really an
+`O_PATH` bug.
+
+**Why `t-link` never saw it.** Every claim in that program passes `CWD` with an
+**absolute** name (`linkat(CWD, A, CWD, B, …)` where `A`/`B` start with `/`), and
+for those two names both bases compose to the same string, so the comparison was
+**vacuously right**. A test that only ever exercises the spelling where the bug
+cannot appear is a test of the other spelling. The pin adds four claims: the
+dirfd-relative link for an ordinary **and** an `O_PATH` descriptor, each with a
+same-inode claim.
+
+**The third finding, and it is not this item's.** `renameat`'s `EISDIR` is real and
+unrelated to dirfds: `renameat2` has no `NodeKind::Dir` arm at all —
+
+```rust
+// A directory rename would have to move the whole subtree's parent
+// back-pointer; nothing here needs it yet, and pretending otherwise
+// would half-move it. Say so.
+_ => return err::EISDIR,
+```
+
+It is a deliberate named gap in the code, it answers the same for every dirfd
+spelling, and closing it means subtree parent-pointer movement rather than a
+check. **Named as its own item** rather than folded into this one, because a probe
+that finds two things must not report one.
+
+**Gate.** `build/gate-item306.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **328** programs over 6 lanes on x86_64 and
+**324** on aarch64 — both up by four, which is the `t-link` claims staging on both
+machines; `pass=328 fail=0` / `pass=324 fail=0`, `mpos-kunit 42 passed, 0 failed`
+per arm; six-arm clippy ratchet unchanged at `162/168/393/272/3/1`, both
+workspaces formatted.
+
+**What this does not do, named.**
+
+1. **Directory rename is `EISDIR`** for every dirfd spelling — the named gap above.
+   Needs the subtree's parent back-pointer moved, which no `Inode` here keeps.
+2. **`name_to_handle_at`, `open_by_handle_at` and the xattr `*at` family** were not
+   exercised with an `O_PATH` dirfd. The twelve above are the doors measured, not
+   the set.
+3. **`fchmodat2`** (the `AT_EMPTY_PATH`-capable spelling, a different number from
+   `fchmodat`) was not asked; this kernel's `fchmodat` serves the empty-name shape
+   and glibc's wrapper does not reach it, so the claim is the raw one.
