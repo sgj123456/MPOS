@@ -3686,3 +3686,37 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `pkey_mprotect`'s `EINVAL`-vs-`EFAULT` ordering for a bad address *and* a bad key
   is unpinned because without PKU there is nothing to pin it against.
   (§6.194, item 315)
+
+- **Item 316 — `rt_tgsigqueueinfo`: the door that names one thread, and the pair
+  that must agree**: found by walking the census for a **sibling** —
+  `rt_sigqueueinfo` (129) has been served for a long time, `rt_tgsigqueueinfo` (297)
+  was never declared. The pair is the point: the first names a **process** and lets
+  the group pick a thread that may take the copy; the second names a thread and
+  nobody else may. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{tgsq,tgsq2,tgsq3,tgsq4,tgsq5}.c`): `(tgid, tid)` naming
+  one thread is served and the payload arrives on it; **a `tgid` from another group
+  than the `tid` is `ESRCH`** — two live numbers can still be a malformed request;
+  `tgid <= 0` or `tid <= 0` is `EINVAL` (malformed, not missing) where a positive
+  number naming nothing is `ESRCH`; `sig == 0` is served and queues nothing;
+  `sig > 64` / `NULL` record are `EINVAL` / `EFAULT`; and **`si_signo` in the record
+  is not the sender's to choose** — the argument wins. **The pair agreeing is the
+  claim the sibling has no analogue for.** Everything else is shared rather than
+  restated (the `si_code`/authority rule, the record copy, `may_signal`) because a
+  second copy of a signal rule is how two doors come to disagree; the difference is
+  the last step, `send_signal_info` putting the copy on the **named thread's own**
+  pending set. Two probe defects, both mine: the first probe **died of its own
+  signal** (exit 138 — it queued `SIGUSR1` unblocked), and `-1` passed through a
+  `usize` becomes `0xFFFFFFFF`, which the first pin run misread as a kernel
+  divergence. **And an existing pin that had been failing on its host leg all
+  along**: `t-rusage-switch` — `sched_yield` with nothing runnable is a no-op on
+  Linux (measured: 200 yields leave `nvcsw` 2 → 2, `nivcsw` 0 → 0), so that claim
+  needs the `host_run()` escape it never had; and the involuntary-switch bound of 10
+  is **11** in a lane six TCG deep (the host preempts the guest's vCPU while it
+  sleeps), so it moved to 25 **with both measurements written beside it** — a miss
+  of one under contention is measuring the host, fifty is measuring the kernel.
+  Gate `build/gate-item316b.log` `GATE_EXIT=0`: stage 1 1340, x86_64 **330**,
+  aarch64 **326** (both +1), kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1`. **Named**: a **sibling thread** is not pinned as a target
+  (the pair's rule is proven with the caller's own numbers), and
+  `RLIMIT_SIGPENDING`'s `EAGAIN` is shared with the sibling and not re-pinned.
+  (§6.195, item 316)

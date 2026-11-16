@@ -18419,3 +18419,80 @@ implementation is `CR4.PKE`, per-task `PKRU`, page-table bits and the fault
 handling to match, which is a feature rather than a fix. **`pkey_mprotect`'s
 exact `EINVAL`-versus-`EFAULT` ordering** for a bad address *and* a bad key is
 not pinned, because without PKU there is nothing to pin it against.
+
+## §6.195 `rt_tgsigqueueinfo`: the door that names one thread, and the pair that must agree (item 316, LANDED 2026-11-16)
+
+**Found by walking the census for a sibling.** `rt_sigqueueinfo` (129) has been
+served for a long time; `rt_tgsigqueueinfo` (297) was never declared, so the
+dispatch answered `ENOSYS`. The pair is the whole point: the first names a
+**process** and lets the group pick a thread that may take the copy, the second
+names a thread and nobody else may. A program that wants one specific thread to
+hear a payload has no other door.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{tgsq,tgsq2,tgsq3,
+tgsq4,tgsq5}.c`):
+
+| what | Linux |
+|---|---|
+| `(tgid, tid)` naming one thread | served; the payload arrives on it |
+| **`tgid` from another group than `tid`** | **`ESRCH`** |
+| `tgid <= 0` or `tid <= 0` | `EINVAL` — malformed, not missing |
+| a positive number naming nothing | `ESRCH` |
+| `sig == 0` | **`0`, queues nothing** |
+| `sig > 64` / `NULL` record | `EINVAL` / `EFAULT` |
+| **`si_signo` in the record ≠ `sig`** | the **argument** wins |
+| any `si_code` value | accepted, copied verbatim |
+
+**The pair agreeing is the claim the sibling has no analogue for.** Two numbers
+that both name live tasks can still be a malformed request: `(this process's
+tgid, another process's tid)` is `ESRCH`. A door that resolved the tid and then
+sent the copy to whatever it found there would answer `0` for a request naming
+two different things.
+
+**Everything else is shared rather than restated.** The `si_code`/authority rule
+(a code at or above zero, or `SI_TKILL`, cannot be forged for a task that is not
+the caller's), the record copy and `may_signal` are the sibling's own code path —
+because a second copy of that rule is how two doors come to disagree about a
+signal, which is exactly the class of defect §6.19x in this family keeps finding.
+What differs is the last step: `send_signal_info` puts the copy on the **named
+thread's own pending set**, where the sibling asks the group to choose.
+
+**Two probe defects, both mine, both caught by measuring.**
+
+1. **The first probe died of its own signal** (`exit 138`): it queued `SIGUSR1`
+   without blocking it, so the process was terminated before it could print
+   anything. Every probe since blocks the signal first.
+2. **`-1` passed through a `usize` argument is not `-1`.** The first pin run
+   reported `(-1, self)` as `ESRCH` where Linux says `EINVAL`; the kernel read
+   `0xFFFFFFFF` as a huge positive pid. The cause was in the *probe*, not the
+   kernel — sign-extension has to be explicit — and the pin now says so where it
+   does it.
+
+**And an existing pin that had been failing on its host leg the whole time.**
+`t-rusage-switch` failed during this item's gate run, and the failure was not
+new:
+
+* **`a yield is an involuntary switch`**: on Linux, `sched_yield` with nothing
+  else runnable is a no-op the scheduler skips — measured, 200 back-to-back
+  yields leave `nvcsw` at 2 and `nivcsw` at 0. This kernel hands the CPU over on
+  every call, counting the same event. So the claim is about *this kernel* and
+  needs the `host_run()` escape it never had.
+* **`fifty sleeps take no involuntary switch`** was bounded at 10, and a lane six
+  TCG deep measures **11**: the host preempts this guest's vCPU while it sleeps,
+  and the guest counts that as its own involuntary switch. The property the claim
+  protects is untouched at 11 and fails decisively at ~50 (a park that is not a
+  park), so the bound moved to 25 **with the two measurements written beside it**
+  — a claim whose miss is one unit under contention is measuring the host; one
+  that is fifty is measuring the kernel.
+
+**Gate.** `build/gate-item316b.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **330** on x86_64 and **326** on aarch64 —
+both up one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged
+at `162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.** **A thread other than the caller's own is not
+pinned as a target**: the pin proves the pair's agreement rule with numbers that
+are this process's and a group that is not, but it does not fork a sibling thread
+and check the payload lands on *that* thread rather than the leader — the
+`SI_QUEUE` arrival is checked on the caller. **`RLIMIT_SIGPENDING`'s `EAGAIN`** is
+shared with the sibling door and not re-pinned here.
