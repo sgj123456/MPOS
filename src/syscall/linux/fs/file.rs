@@ -8802,6 +8802,153 @@ pub fn handle_utime(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user: b
 /// kernel; the flags are the advice bits the man page lists, accepted
 /// for the same reason `poll` accepts its nonblocking one: the
 /// descriptor's own flags are what govern.
+/// `vmsplice(fd, iov, nr_segs, flags)` — move bytes between user memory and a
+/// pipe.
+///
+/// The last of item 310's four census calls, and the only one whose contract is
+/// about *memory*: the man page describes it as grafting pages into a pipe so a
+/// later `splice` can move them without a copy. Measured on Linux 7.3.4
+/// (`build/scratch/opathmmap/{vms1,vms2,vms3}.c`):
+///
+/// * on a pipe's **write** end, the iovecs' bytes land in the pipe
+///   (`vmsplice(p[1], "HELLO")` then a `read` yields `HELLO`);
+/// * on a pipe's **read** end it **drains into the iovecs** (`vmsplice(p[0],
+///   iov)` returns 5 and fills the buffer with `ABCDE`) - which is what the
+///   implementation does however the man page is read, and the measurement is
+///   the authority here;
+/// * a **regular file** is `EBADF` on either side, and a missing descriptor is
+///   `EBADF`;
+/// * `nr_segs == 0` is 0; more than `IOV_MAX` (1024) is `EINVAL`; an unknown
+///   flag bit is `EINVAL`; `SPLICE_F_GIFT` is **served** and has no additional
+///   requirement (a stack buffer is fine);
+/// * a **zero-length** iovec is skipped, so an array of them answers 0 - and a
+///   `NULL` base with `len == 0` is served, because nothing is read from it;
+/// * an unreadable/unwritable iovec base is `EFAULT`.
+///
+/// **The copy is a copy here.** Linux can graft the caller's pages into the pipe
+/// so that a following `splice` moves them without touching the bytes;
+/// `SPLICE_F_GIFT` additionally promises the caller will never write them again.
+/// This kernel's pipes hold bytes rather than page references, so both shapes
+/// copy - which makes `GIFT` accepted-and-ignored (the same shape `tee`'s
+/// `SPLICE_F_MOVE` is) and is why the `EFAULT` question is asked *before* the
+/// transfer rather than after: a page that cannot be read at all must be refused
+/// even though nothing would have been shared.
+pub fn handle_vmsplice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SPLICE_F_MOVE: usize = 0x01;
+    const SPLICE_F_NONBLOCK: usize = 0x02;
+    const SPLICE_F_MORE: usize = 0x04;
+    const SPLICE_F_GIFT: usize = 0x08;
+
+    let (fd, iov_ptr, nr_segs, flags) = (args[0] as i32, args[1], args[2], args[3]);
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    // The descriptor must be a pipe end, and the answer is `EBADF` on either
+    // side - measured: a regular file is `EBADF` whether it is named as the
+    // source or the sink.
+    let inode = file.inode();
+    let Some(pipe) = inode.as_pipe() else {
+        return err::EBADF;
+    };
+    if flags & !(SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT) != 0 {
+        return err::EINVAL;
+    }
+    let nr_segs = match abi::iov_count_verdict(nr_segs) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // Which direction: a read end drains into the iovecs, a write end fills.
+    // The role is the pipe's, not the caller's word, and it is what makes the
+    // two halves below one door.
+    let writing = pipe.role_is_write();
+    if writing && file.check_writable().is_err() {
+        return err::EBADF;
+    }
+    if !writing && file.check_readable().is_err() {
+        return err::EBADF;
+    }
+    let iov_size = 16;
+    if nr_segs != 0 && !buffer_ok(iov_ptr, nr_segs * iov_size, false, from_user) {
+        return err::EFAULT;
+    }
+    let mut total = 0usize;
+    for i in 0..nr_segs {
+        let base = iov_ptr + i * iov_size;
+        let (ptr, len): (usize, usize) = unsafe {
+            (
+                (base as *const usize).read_unaligned(),
+                ((base + 8) as *const usize).read_unaligned(),
+            )
+        };
+        let len = stream_len(len);
+        if len == 0 {
+            continue;
+        }
+        // The direction decides which side of the pointer this call may touch,
+        // and the check is `buffer_ok`'s - the same one `readv`/`writev` use.
+        let readable = !writing;
+        if !buffer_ok(ptr, len, readable, from_user) {
+            return err::EFAULT;
+        }
+        if writing {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            match pipe.write_once(bytes) {
+                Ok(Some(n)) => {
+                    total += n;
+                    if n < len {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if total > 0 {
+                        break;
+                    }
+                    return err::EAGAIN;
+                }
+                Err(crate::vfs::VfsError::BrokenPipe) => {
+                    if total > 0 {
+                        break;
+                    }
+                    return err::EPIPE;
+                }
+                Err(e) => {
+                    if total > 0 {
+                        break;
+                    }
+                    return err_of(e);
+                }
+            }
+        } else {
+            let bytes = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+            match pipe.read_once(bytes) {
+                Ok(Some(n)) => {
+                    total += n;
+                    if n < len {
+                        break;
+                    }
+                }
+                // Nothing to drain and a writer still open: a blocking call
+                // would park, which this door answers as `EAGAIN` for the same
+                // reason `tee` does - the park belongs to the pipe's own wait.
+                Ok(None) => {
+                    if total > 0 {
+                        break;
+                    }
+                    return err::EAGAIN;
+                }
+                Err(e) => {
+                    if total > 0 {
+                        break;
+                    }
+                    return err_of(e);
+                }
+            }
+        }
+    }
+    total as isize
+}
+
 /// `tee(fd_in, fd_out, len, flags)` — copy a pipe's bytes into another pipe
 /// **without consuming the source**.
 ///

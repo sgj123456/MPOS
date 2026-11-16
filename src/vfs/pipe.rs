@@ -644,6 +644,21 @@ impl PipeEnd {
         }))
     }
 
+    /// Whether this end is the **writing** end - `vmsplice`'s direction
+    /// question.
+    ///
+    /// A pipe's two ends are one `Role::Read` and one `Role::Write`, so for a
+    /// plain pipe this is unambiguous. A **FIFO opened `O_RDWR`** is
+    /// `Role::Both`, and Linux reads `vmsplice`'s direction from the descriptor
+    /// there too - but this kernel has one role word and no separate answer, so a
+    /// `Both` end is treated as the writing side, which is the direction
+    /// `splice` gives it as well (its two-offsets rule refuses a pipe only when
+    /// the caller passes an offset, not by role). Recorded rather than
+    /// approximated: no test opens a FIFO `O_RDWR` and `vmsplice`s through it.
+    pub fn role_is_write(&self) -> bool {
+        self.role.writes()
+    }
+
     /// One non-blocking peek: the bytes a read would hand back, copied into
     /// `buf` with the cursor left where it was. The three answers are
     /// [`read_once`]'s - `Some(n)` data, `Some(0)` end-of-stream, `None` "not

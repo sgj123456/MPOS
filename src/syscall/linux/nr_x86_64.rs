@@ -50,6 +50,10 @@ pub const IOPRIO_GET: u64 = 252;
 /// forwarded. Never declared here until item 312, so the dispatch answered
 /// `ENOSYS`.
 pub const TEE: u64 = 276;
+/// `vmsplice(2)`: graft user memory into a pipe, or drain a pipe into user
+/// memory. The last of item 310's four census calls. Never declared here until
+/// item 313, so the dispatch answered `ENOSYS`.
+pub const VMSPLICE: u64 = 278;
 pub const EXIT: u64 = 60;
 pub const WAIT4: u64 = 61;
 pub const KILL: u64 = 62;

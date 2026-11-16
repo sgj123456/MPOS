@@ -369,6 +369,7 @@ pub unsafe fn dispatch(
         nr::IOPRIO_GET => posix::handle_ioprio_get(args),
         nr::IOPRIO_SET => posix::handle_ioprio_set(args),
         nr::TEE => fs::handle_tee(args, from_user),
+        nr::VMSPLICE => fs::handle_vmsplice(args, from_user),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit_group(args),
         // `wait4(pid, *status, options, *rusage)` keeps its Linux argument
