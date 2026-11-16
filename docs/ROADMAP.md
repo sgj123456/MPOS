@@ -3756,3 +3756,38 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   use `io_uring`'s `READV`); `IOCB_FLAG_RESFD`/`IOPRIO` read past and ignored;
   `io_cancel` (210) still `ENOSYS`; and completions are never deferred, so
   `io_submit` may block where Linux's would not. (§6.196, item 317)
+
+- **Item 318 — `getdents`: the directory reader one header byte from its twin**: a
+  **sibling**, not a leftover — `getdents64` (217) has been served for a long time,
+  `getdents` (78) was never declared, so a program built against an old glibc heard
+  `ENOSYS`. Most of the census's remaining numbers are dead calls or whole features;
+  this is a second spellling **whose records differ**, which is exactly where "the
+  modern call exists, so the old one is the same" is wrong. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{gd,gd2,gd3,gd4}.c`): the same directory through both
+  doors agrees on `d_ino`/`d_off`/`d_reclen` (every name short enough to round
+  alike) but differs in layout — **18 bytes of header and no `d_type`** (name at 18)
+  against 19 with a `d_type` (name at 19), so a reader using `struct dirent64` reads
+  its name **one byte late**. A host unit test pins `reclen_of_legacy` beside
+  `reclen_of` at the lengths where the rounding actually diverges (`reclen_of(5)`
+  is 32, `reclen_of_legacy(5)` is 24) — a claim that the legacy record is *always*
+  shorter is false. Everything else is **shared rather than restated** (`O_PATH`
+  `EBADF`, the walk, the position, the short-buffer `EINVAL`): two copies of a
+  directory walk is how two doors disagree about a position. **Two ordering
+  defects**: the descriptor must be judged **before** the buffer — measured,
+  `getdents(-1, NULL, 64)` is `EBADF`, not `EFAULT`, and the draft answered about
+  the buffer; and the aarch64 arm of the pin **hardcoded x86_64's 217** where
+  asm-generic numbers `getdents64` **61** — **the second time this session** (item
+  314's pin records the first), caught by the aarch64 sweep. A third finding shaped
+  the pin: the host's ext4 lists `.`/`..` and this kernel's ramfs does not (its
+  `getdents64` is the same), so the claim is "every fixture name is listed and
+  nothing invented is" — which entries a directory invents is the filesystem's
+  answer, not a door's. `t-getdents` **+19**, including the layout, the position,
+  all five refusals, and the twin's `d_type` as the contrast; it is **x86_64-only**
+  and says so on aarch64. Gate `build/gate-item318c.log` `GATE_EXIT=0`: stage 1
+  **1341** (up one, the new unit test), x86_64 **332**, aarch64 **328** (both +1),
+  kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1` — after two clippy
+  rounds of my own (`int_plus_one`, and `dead_code` for `reclen_of_legacy`, allowed
+  at the item **with its reason** because its only caller is machine-only). **Named**:
+  `getdents` is x86_64-only (pseudo-number on aarch64, stated); `d_off` is the entry
+  index rather than the filesystem's opaque cookie; and the `.`/`..` difference is
+  the ramfs's existing shape, shared with its twin. (§6.197, item 318)
