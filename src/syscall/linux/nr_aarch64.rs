@@ -277,6 +277,8 @@ pub const PAUSE: u64 = 64033; // no arm64 number; unreachable on aarch64
 /// stay one set without inventing an ABI aarch64 does not have.
 pub const EVENTFD: u64 = 64034; // no arm64 number; unreachable on aarch64
 pub const INOTIFY_INIT: u64 = 64035; // no arm64 number; unreachable on aarch64
+/// The legacy `getdents` is x86_64-only: asm-generic has only `getdents64`.
+pub const GETDENTS: u64 = 64036; // no arm64 number; unreachable on aarch64
 /// See [`EVENTFD`]: the flag-taking forms both machines have.
 pub const EVENTFD2: u64 = 19; // 290 on x86_64
 pub const INOTIFY_INIT1: u64 = 26; // 294 on x86_64

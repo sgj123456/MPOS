@@ -5847,6 +5847,97 @@ pub fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     offset as isize
 }
 
+/// `getdents(fd, buf, count)` — the **legacy** directory reader, number 78.
+///
+/// The twin of [`handle_getdents64`], and the pair is why this is a separate
+/// door rather than an arm on that one: **the records differ**, and a difference
+/// of one byte in a header is the kind that reads as a wrong name rather than as
+/// a wrong call.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/{gd,gd2}.c`), the same
+/// directory through both doors:
+///
+/// ```text
+/// getdents    ino=7 off=1 reclen=24 name='.'
+///             ino=1 off=3 reclen=24 name='..'
+///             ino=8 off=2147483647 reclen=32 name='alpha'
+/// getdents64  ino=7 off=1 reclen=24 type=4 name='.'
+///             ...
+///             ino=8 off=2147483647 reclen=32 type=8 name='alpha'
+/// ```
+///
+/// The offsets and the record lengths agree *here* because every name is short
+/// enough to round to the same 8-byte boundary; what differs is the layout —
+/// **24 bytes of header and no `d_type`**, against `getdents64`'s 19 and a
+/// `d_type` byte — and the name therefore starts at 18 rather than 19. For a
+/// name whose length crosses the alignment boundary the two doors' `d_reclen`
+/// differ too, which is why [`crate::syscall::linux::abi::reclen_of_legacy`]
+/// exists beside `reclen_of`.
+///
+/// The rest is shared with the twin by **reuse rather than restatement** - the
+/// `O_PATH` refusal (`EBADF`), the directory read, the position and the
+/// short-buffer rule - because two copies of a directory walk is how two doors
+/// come to disagree about a position. Measured refusals, identical on both
+/// doors: a regular file or a bad descriptor is `EBADF`, a `NULL` buffer is
+/// `EFAULT`, a `count` too small for one record is `EINVAL`, and the position is
+/// the **descriptor's** so an `lseek` rewinds what the next call returns.
+pub fn handle_getdents(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, buf_len) = (args[0] as i32, args[1], args[2]);
+    // **The descriptor is judged before the buffer**, and the order is measured
+    // (`build/scratch/opathmmap/gd4.c`): `getdents(-1, NULL, 64)` is `EBADF`,
+    // not `EFAULT`, and a good descriptor with a `NULL` buffer is the `EFAULT`.
+    // A first draft checked the buffer first, so a bad descriptor with a bad
+    // buffer answered about the buffer - the class of defect the sibling
+    // `readv`/`writev` order notes record, and the same tell: two wrong
+    // arguments and Linux has a fixed opinion about which.
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if !buffer_ok(buf, buf_len, true, from_user) {
+        return err::EFAULT;
+    }
+    // The same `O_PATH` rule as the twin: the descriptor names the directory and
+    // does not open it.
+    if file.is_path_only() {
+        return err::EBADF;
+    }
+    let entries = match file.inode().read_dir() {
+        Ok(e) => e,
+        Err(e) => return err_of(e),
+    };
+    let start = file.pos() as usize;
+    if start >= entries.len() {
+        return 0;
+    }
+    // Linux's legacy record: u64 d_ino, u64 d_off, u16 d_reclen, then the name
+    // NUL-terminated and 8-aligned. No `d_type`, which is the byte the 64-bit
+    // record added - so a caller that reads this buffer as `struct dirent64`
+    // reads its name starting one byte late.
+    let mut offset = 0usize;
+    for (idx, (name, _kind)) in entries.iter().enumerate().skip(start) {
+        let reclen = abi::reclen_of_legacy(name.len());
+        if offset + reclen > buf_len {
+            if offset == 0 {
+                return err::EINVAL;
+            }
+            break;
+        }
+        unsafe {
+            let base = (buf + offset) as *mut u8;
+            (base as *mut u64).write_unaligned(idx as u64 + 1);
+            ((base.add(8)) as *mut u64).write_unaligned((idx + 1) as u64);
+            ((base.add(16)) as *mut u16).write_unaligned(reclen as u16);
+            let name_bytes = name.as_bytes();
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), base.add(18), name_bytes.len());
+            base.add(18 + name_bytes.len()).write_unaligned(0);
+        }
+        offset += reclen;
+        file.set_pos((idx + 1) as u64);
+    }
+    offset as isize
+}
+
 /// `dup(oldfd)` — duplicate onto the lowest free fd.
 pub fn handle_dup(args: [usize; ARG_COUNT]) -> isize {
     let old = args[0] as i32;

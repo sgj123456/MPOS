@@ -137,6 +137,12 @@ pub const GETSID: u64 = 124;
 pub const SETGROUPS: u64 = 116;
 pub const GETGROUPS: u64 = 115;
 pub const GETDENTS64: u64 = 217;
+/// `getdents(2)` — the **legacy** directory reader, number 78. Its records have
+/// no `d_type` and its header is one byte shorter than `getdents64`'s, so the two
+/// are not spellings of one call: a program built against an old glibc calls this
+/// one, and a caller reading its buffer with `struct dirent64` reads the name one
+/// byte early. Never declared here until item 318.
+pub const GETDENTS: u64 = 78;
 /// `sendfile(out, in, offset, count)`: copy bytes between descriptors in the
 /// kernel. Something in the init path asks for it once.
 pub const SENDFILE: u64 = 40;

@@ -266,6 +266,7 @@ pub unsafe fn dispatch(
         nr::STATX => fs::statx(args, &cwd()),
         nr::LSEEK => fs::handle_lseek(args),
         nr::GETDENTS64 => fs::handle_getdents64(args, from_user),
+        nr::GETDENTS => fs::handle_getdents(args, from_user),
         nr::DUP => fs::handle_dup(args),
         nr::DUP2 => fs::handle_dup2(args),
         nr::DUP3 => fs::handle_dup3(args),

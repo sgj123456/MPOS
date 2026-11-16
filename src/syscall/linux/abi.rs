@@ -945,6 +945,26 @@ pub(crate) fn reclen_of(name_len: usize) -> usize {
     (19 + name_len + 1 + 7) & !7
 }
 
+/// The `getdents(2)` record length — the **legacy** door, whose header has no
+/// `d_type` byte and whose `d_ino`/`d_off` are `unsigned long` (eight bytes each
+/// on the two machines here).
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/gd.c`): the header is 24
+/// bytes before the name — `d_ino` 0..8, `d_off` 8..16, `d_reclen` 16..18, and
+/// the name at 18 — so a one-character name needs 24 bytes in the record and the
+/// whole thing rounds to 8. That is one byte *shorter* than [`reclen_of`]'s
+/// header (19) and the name starts one byte earlier, which is the whole
+/// difference between the two doors' records.
+// Its one caller is `handle_getdents`, which exists only on a machine build, so
+// the host lib has no use for it and the host **unit test below is the only host
+// reference**. Rust counts a `#[cfg(test)]` call as a use only when the test
+// build is what is being linted, and the gate lints the plain lib too - so the
+// allow is on the item with the reason here rather than a raised ceiling.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn reclen_of_legacy(name_len: usize) -> usize {
+    (18 + name_len + 1 + 7) & !7
+}
+
 // ---------------------------------------------------------------------------
 // lseek(2): whence arithmetic
 // ---------------------------------------------------------------------------
@@ -4815,6 +4835,43 @@ mod tests {
         assert_eq!(reclen_of(5), 32);
         // The one-byte name: 19 + 1 + 1 -> 24.
         assert_eq!(reclen_of(1), 24);
+    }
+
+    /// The **legacy** `getdents` record: the same name in one byte less of
+    /// header, because it carries no `d_type`.
+    ///
+    /// The measurement (`build/scratch/opathmmap/gd2.c`) walked one directory
+    /// through both doors and the `alpha` record was 32 bytes in each - but that
+    /// name is four characters, so both layouts round to the same multiple. The
+    /// difference shows in the **name's start**, not only in the length: 18
+    /// against 19. These cases pick names where the rounding *diverges* as well,
+    /// which is what makes the pair a contract rather than a coincidence of one
+    /// fixture.
+    #[test]
+    fn the_legacy_directory_record_has_a_shorter_header_than_its_twin() {
+        // Header 18 + name + NUL, padded to 8.
+        assert_eq!(reclen_of_legacy(1), 24);
+        // The divergence: `reclen_of(5)` is 32 because 19 + 5 + 1 = 25 rounds
+        // up, while the legacy 18 + 5 + 1 = 24 already fits.
+        assert_eq!(reclen_of(5), 32);
+        assert_eq!(reclen_of_legacy(5), 24);
+        // And a name long enough to cross the same boundary in both.
+        assert_eq!(reclen_of_legacy(6), 32);
+        assert_eq!(reclen_of(6), 32);
+        // Across name lengths the legacy record is **never longer** and is
+        // sometimes shorter - the one-byte-shorter header only changes the
+        // rounded length where it crosses an 8-byte boundary. A claim that it is
+        // always shorter is wrong (they are equal at most lengths), which is why
+        // the pair above names the lengths where it matters.
+        for len in 1..40usize {
+            assert!(
+                reclen_of_legacy(len) <= reclen_of(len),
+                "len {len}: legacy {} twin {}",
+                reclen_of_legacy(len),
+                reclen_of(len)
+            );
+            assert_eq!(reclen_of_legacy(len) % 8, 0);
+        }
     }
 
     /// `lseek(2)`: SEEK_SET/CUR/END name the position three ways, an

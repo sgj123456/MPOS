@@ -5,10 +5,10 @@ section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **314** x86_64
-syscall numbers (two of them x86_64-only), `nr_aarch64.rs` the same **314** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **315** x86_64
+syscall numbers (three of them x86_64-only), `nr_aarch64.rs` the same **315** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **every one** of them - 314 arms, no orphans, measured 2026-11-16 - plus a
+explicit arm for **every one** of them - 315 arms, no orphans, measured 2026-11-16 - plus a
 `_ => ENOSYS` catch-all for numbers neither table names, deliberately
 crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
@@ -219,6 +219,7 @@ A call absent from those is served as its phase section records.
 | `sched_getaffinity` | 204 | abi | 123 |
 | `epoll_create` | 213 | fs | 64028 | (legacy door; aarch64 has no number for it (`nr_aarch64.rs`))
 | `getdents64` | 217 | fs | 61 |
+| `getdents` (legacy) | 78 | fs | — (x86_64 only) |
 | `set_tid_address` | 218 | proc | 96 |
 | `semtimedop` | 220 | ipc | 192 |
 | `fadvise64` | 221 | fs | 223 |
