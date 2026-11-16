@@ -51,6 +51,7 @@
 use mpos_user_tests::Report;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use std::os::unix::fs::PermissionsExt;
 
 /// The fixture directory and the file/link inside it.
 const DIR: &str = "/tmp/t-open-path";
@@ -601,6 +602,146 @@ fn main() {
         }
     }
 
+    // === the open asks no permission on the file ============================
+    //
+    // The half of the flag that makes every refusal above load-bearing rather
+    // than tidy: `open(path, O_PATH)` **asks nothing of the file's own mode**,
+    // which is why the descriptor must then be refused by every contents door.
+    // Measured on Linux 7.3.4 (`build/scratch/opathmmap/{opening2,shadow}.c`):
+    // as uid 1000, a file the caller owns opened `0000` refuses `O_RDONLY` with
+    // `EACCES` and **serves `O_PATH`**; `/etc/shadow` does the same (`0600`,
+    // owner `nobody`). The *parent directory's* search bit is still asked and
+    // still refused. Linux reaches it in `build_open_flags`, which sets
+    // `acc_mode = 0` for `O_PATH` and checks `MAY_OPEN` alone.
+    //
+    // **This claim needs a second uid, and that is why it is a child.** The
+    // sweep's payload runs as root, where `CAP_DAC_OVERRIDE` answers every mode
+    // question "yes" - so a claim made in this process would pass on a kernel
+    // that asked `R_OK` for an `O_PATH` open, which is exactly the divergence
+    // this pins. The child drops to `nobody` (the pattern `t-proc-access` and
+    // `t-affinity-rules` already use, and `nobody` exists in both images)
+    // **before** it opens anything, and reports over a pipe. On the host the
+    // drop fails without privilege and the child stays the caller's own user -
+    // which is still a uid that does not own a root-owned fixture, so the
+    // allowed/refused pair below reads the same rule from the other side.
+    let secret = format!("{DIR}/moon");
+    let _ = std::fs::write(&secret, b"not for you");
+    let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000));
+    // A fixture the child can still reach: its directory is 0755, so only the
+    // file's own bits are in question.
+    let readable_by_all = format!("{DIR}/sun");
+    let _ = std::fs::write(&readable_by_all, b"for anyone");
+    let _ = std::fs::set_permissions(&readable_by_all, std::fs::Permissions::from_mode(0o444));
+    {
+        let mut fds = [0i32; 2];
+        // SAFETY: a two-element array this test owns.
+        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
+        r.check("the report pipe is made", piped);
+        if piped {
+            // SAFETY: `fork` in a single-threaded std program; the child only
+            // writes to `fds[1]` and exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // The child never returns through `main`: `_exit` keeps it from
+                // unwinding the parent's `Report`.
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::setgroups(0, core::ptr::null());
+                    libc::setgid(65534);
+                    libc::setuid(65534);
+                }
+                let mut report = String::new();
+                for (label, path) in [("secret", &secret), ("world", &readable_by_all)] {
+                    let rd = rustix::fs::open(path, OFlags::RDONLY, Mode::empty());
+                    let op = rustix::fs::open(path, OFlags::PATH, Mode::empty());
+                    report.push_str(&format!(
+                        "{label} rd={} path={}\n",
+                        answer_code(&rd),
+                        answer_code(&op),
+                    ));
+                }
+                unsafe {
+                    let bytes = report.as_bytes();
+                    libc::write(fds[1], bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
+                    libc::close(fds[1]);
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(fds[1]) };
+            let mut buf = Vec::new();
+            loop {
+                let mut chunk = [0u8; 256];
+                // SAFETY: `fds[0]` is open until the child's end closes it.
+                let n = unsafe {
+                    libc::read(
+                        fds[0],
+                        chunk.as_mut_ptr().cast::<libc::c_void>(),
+                        chunk.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n as usize]);
+            }
+            unsafe { libc::close(fds[0]) };
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            let text = String::from_utf8_lossy(&buf).to_string();
+            // Parsed rather than substring-matched: the report's line shape is
+            // `<name> rd=<answer> path=<answer>`, and "secret path=ok:" is not
+            // a substring of "secret rd=errno:13 path=ok:3" - a first draft
+            // matched the two independently and failed on Linux for saying so.
+            let field = |line_start: &str, key: &str| -> Option<String> {
+                text.lines()
+                    .find(|l| l.starts_with(line_start))
+                    .and_then(|l| {
+                        l.split_whitespace()
+                            .find_map(|w| w.strip_prefix(key).map(str::to_string))
+                    })
+            };
+            let secret_rd = field("secret ", "rd=");
+            let secret_path = field("secret ", "path=");
+            let world_rd = field("world ", "rd=");
+            let world_path = field("world ", "path=");
+            // A `0000` file: `O_RDONLY` is `EACCES` and `O_PATH` is served.
+            r.check(
+                &format!("a 0000 file refuses O_RDONLY for a stranger ({text:?})"),
+                secret_rd.as_deref() == Some("errno:13"),
+            );
+            r.check(
+                &format!("and serves O_PATH on the same file ({text:?})"),
+                secret_path.as_deref().is_some_and(|a| a.starts_with("ok:")),
+            );
+            // The neighbour that keeps the pair from being "everything is
+            // refused": a world-readable file is served both ways.
+            r.check(
+                &format!("a 0444 file is served as O_PATH for the same caller ({text:?})"),
+                world_path.as_deref().is_some_and(|a| a.starts_with("ok:")),
+            );
+            r.check(
+                &format!("and as O_RDONLY too, so the caller is not simply refused ({text:?})"),
+                world_rd.as_deref().is_some_and(|a| a.starts_with("ok:")),
+            );
+        }
+    }
+    // The owner may always open it, so the fixture really is readable-by-mode
+    // and the child's refusal above is about the id rather than the file.
+    r.check(
+        "the 0000 file is served to its owner as O_PATH, so the mode is the only question",
+        rustix::fs::open(&secret, OFlags::PATH, Mode::empty()).is_ok(),
+    );
+    let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644));
+
     let _ = std::fs::remove_dir_all(DIR);
     r.finish()
+}
+
+/// The answer code of an open, as the child reports it: `ok:<fd>` or
+/// `errno:<n>`, so a claim can name the errno rather than only "it failed".
+fn answer_code(answer: &Result<std::os::fd::OwnedFd, rustix::io::Errno>) -> String {
+    match answer {
+        Ok(fd) => format!("ok:{}", std::os::fd::AsRawFd::as_raw_fd(fd)),
+        Err(e) => format!("errno:{}", e.raw_os_error()),
+    }
 }
