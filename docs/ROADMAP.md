@@ -3828,3 +3828,35 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `KCMP_SYSVSEM` answers the group identity for every index (exact for every pair
   this kernel can make, an approximation in principle); and the `EPERM` path is not
   exercised by the pin. (§6.198, item 319)
+
+- **Item 320 — `cachestat`: a refusal because four of its five fields would be
+  lies**: `cachestat(451)` reports page-cache residency **and** the dirty,
+  writeback and evicted counts beside it. This kernel has a cache, so the first
+  question was whether the five fields map onto it — measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{cs,cs2,cs3}.c`), **one does and four do not**:
+  `nr_cache` **is** answerable (map the offset to a physical block via
+  `extent_lookup`/`bmap_lookup`, ask `Cache::ready`); `nr_dirty`/`nr_writeback`
+  have no accounting here because the block cache is **write-through**; and
+  `nr_evicted`/`nr_recently_evicted` are **relative to the previous call on the
+  same fd** (two back-to-back calls read `0`, a second descriptor to the same file
+  also reads `0`), so they are a **per-descriptor delta this kernel keeps no
+  record of** — that is the decisive field, since it cannot be derived, only
+  accumulated. **Serving `nr_cache` and zeroing the rest is the tempting shape and
+  it is the failure §3.2 names**: the zeros are not neutral — a memory-pressure
+  daemon reads "nothing dirty, nothing evicted" and concludes the opposite of the
+  truth, and a caller with a wrong shape has a fallback where a caller with a false
+  *fact* does not. So it stays on the `ENOSYS` list beside `memfd_secret` and the
+  `pkey_*` trio, with the prerequisite written out (an eviction and writeback
+  accounting layer: residency per page, a dirty count, a writeback count, and a
+  per-descriptor record of what was evicted since that descriptor last asked), and
+  **pinned** in `t-enosys` (+1) rather than left as a doc sentence. Also measured
+  and recorded: `off`/`len` need not be page-aligned, `NULL` range or stat is
+  `EFAULT`, a bad descriptor `EBADF`, and **`flags` must be 0** — every nonzero
+  word, *including the documented `CACHE_STAT_F_ALL`*, is `EINVAL`. Gate
+  `build/gate-item320b.log` `GATE_EXIT=0`: stage 1 **1341**, x86_64 **333**,
+  aarch64 **329**, kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1`.
+  **Named**: `nr_cache` is answerable and is not answered (the natural first step
+  *if* the accounting layer is ever built); `CACHE_STAT_F_ALL` is not distinguished
+  from any other nonzero word (Linux's own shape); and the `.cstat_size` argument
+  a served implementation would have to honour is part of the prerequisite.
+  (§6.199, item 320)
