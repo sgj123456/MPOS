@@ -3791,3 +3791,40 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `getdents` is x86_64-only (pseudo-number on aarch64, stated); `d_off` is the entry
   index rather than the filesystem's opaque cookie; and the `.`/`..` difference is
   the ramfs's existing shape, shared with its twin. (§6.197, item 318)
+
+- **Item 319 — `kcmp`: comparing two processes' resources by identity**: `kcmp(312)`
+  was undeclared, so a checkpoint/restore tool (`criu` and friends) heard `ENOSYS`
+  on the one call that answers "is this the *same* kernel object in both processes"
+  — no other door does. **The answer shape is the first thing to measure, because
+  it inverts the house convention**: a successful `kcmp` returns a pointer
+  comparison — **`0` equal**, `1` the first lower, `2` the second lower, `3`
+  equal-but-distinct — so `0` does **not** mean success and `1`/`2` both mean *not
+  equal* with which one depending on address order and therefore **not being a
+  contract**. The pin asserts equality or inequality and never a value; a first
+  draft asserted `2` and failed on the host, where the order differs. Measured on
+  Linux 7.3.4 (`build/scratch/opathmmap/{kcmp,kcmp2,kcmp3}.c`): `KCMP_FILE` — one fd
+  `0`, `dup`'d fds `0`, two `open`s **not equal**; `KCMP_VM`/`FS`/`SIGHAND`/`IO` —
+  self/self `0` and across `fork` **not equal** (`fork` copies, it does not share);
+  `KCMP_FILES` self/self `0` while a descriptor inherited across `fork` is still the
+  same open file; an unallocated descriptor `EBADF`, a type at `KCMP_TYPES` `EINVAL`,
+  a pid naming nothing `ESRCH` — **including `0`**, which is not "the caller" here.
+  **Two corrections the measurement made**: `KCMP_SYSVSEM` is **served** (a task's
+  undo state is its group's, so self/self is `0` for any index — a draft refused it),
+  and `KCMP_EPOLL_TFD` refuses on its **argument shape** (its `idx` is a `struct
+  epoll_slot` pointer, so `NULL` is Linux's own `EFAULT` and a real one is `EINVAL`
+  because this door does not import the struct). **The implementation reuses what
+  the kernel has**: `Arc::as_ptr` on `File` is *exactly* the identity `KCMP_FILE`
+  asks about (`dup` shares one, two `open`s do not), and the four group types ask
+  the group's identity; two accessors were added (`fds_of`, `group_identity`)
+  carrying the **identity** rather than a bool, because a bool would lose the
+  distinction `KCMP_FILES` is asked for. `t-kcmp` **+21**. **The gate found five,
+  all mine**: an unreachable `_` arm (the runtime guard is invisible to the
+  compiler's exhaustiveness check) and **`KCMP_SYSVSEM` matched as a variable**
+  because its `const` was missing — `non_snake_case` on a pattern that read as a
+  normal catch-all, precisely the class the ratchet exists for. Gate
+  `build/gate-item319b.log` `GATE_EXIT=0`: stage 1 **1341**, x86_64 **333**, aarch64
+  **329**, kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1`. **Named**:
+  `KCMP_EPOLL_TFD` unserved (needs the epoll instance's target table);
+  `KCMP_SYSVSEM` answers the group identity for every index (exact for every pair
+  this kernel can make, an approximation in principle); and the `EPERM` path is not
+  exercised by the pin. (§6.198, item 319)
