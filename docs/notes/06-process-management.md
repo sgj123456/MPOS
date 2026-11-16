@@ -18496,3 +18496,95 @@ are this process's and a group that is not, but it does not fork a sibling threa
 and check the payload lands on *that* thread rather than the leader — the
 `SI_QUEUE` arrival is checked on the caller. **`RLIMIT_SIGPENDING`'s `EAGAIN`** is
 shared with the sibling door and not re-pinned here.
+
+## §6.196 the legacy POSIX AIO family: a context handle, not a ring (item 317, LANDED 2026-11-16)
+
+**What it is, and what it is not.** `io_setup`/`io_destroy`/`io_submit`/
+`io_getevents` (206/207/209/208, plus `io_pgetevents` 333) are the interface Linux
+has had since 2.5 and that `io_uring` replaced. They are **not** the same thing
+and the shared prefix is a trap: `io_uring` (425, `src/vfs/io_uring.rs`) is a
+**ring of shared memory** the caller writes SQEs into; this is a **context
+handle** from `io_setup`, a `struct iocb` per request passed by pointer, and a
+`struct io_event` per completion read out. All four were undeclared, so a libaio
+caller heard `ENOSYS` from the first of them.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{aio,aio2,aio3,aio4}.c`):
+
+| what | Linux |
+|---|---|
+| `io_setup(8, &ctx)` | `0`, handle written through the pointer |
+| `io_setup(0, …)` / `io_setup(4, NULL)` | `EINVAL` / `EFAULT` |
+| `io_destroy` live / twice | `0` / `EINVAL` |
+| `io_submit` a **PREAD** | `1`; `io_getevents` reports the byte count |
+| `aio_data` in the event | the caller's value, **verbatim** |
+| **`FSYNC`, `FDSYNC`, `POLL`, `NOOP`, unknown** | **`EINVAL`** |
+| a bad `aio_fildes` | **fails the `io_submit`** with `EBADF`; no event |
+| a bad context on every door | `EINVAL` |
+| `io_getevents` with `min_nr` too high | returns what **is** queued |
+
+**Three of those corrected a draft, and that is the section's point.**
+
+1. **`struct iocb`'s offsets are not the header's field order.** `aio_key` and
+   `aio_rw_flags` share the word at 8 on a little-endian machine, so
+   `aio_lio_opcode` sits at **16** and `aio_fildes` at **20** — not 8 and 16. The
+   first draft used the field order, read the opcode out of `aio_rw_flags`, and
+   made **every** request an unknown opcode. The `offsetof` run in `aio2.c` is the
+   reference: data 0, key 8, rw_flags 12, opcode 16, reqprio 18, fildes 20, buf
+   24, nbytes 32, offset 40, size 64.
+2. **A first version *served* `FSYNC`, `FDSYNC` and `NOOP`** because their names
+   suggest work a synchronous kernel can plainly do — and Linux refuses all three.
+   Serving them would have been a **success for a call the reference kernel
+   refuses**, which `AGENTS.md` §3.2 names as the worst thing this codebase can
+   do. The served set is `PREAD` and `PWRITE`, and that is what the measurement
+   said, not what the names suggested.
+3. **A bad descriptor was first queued as an event** carrying `-EBADF` in `res`.
+   Linux fails the `io_submit` itself. The distinction is not cosmetic: an event
+   means *the request ran*, so a refusal dressed as one tells a caller that work
+   happened when it did not.
+
+**The scope is the synchronous subset** — the same one §6.32 records for
+`io_uring`, and for the same reason: this kernel's block layer is synchronous, so
+each `iocb` is executed inside `io_submit`. That is a **performance shape, not an
+ABI one**: the sequence a caller observes (submit count, then event count, then
+results) is the same, and what differs is only *when* the work happened. A caller
+that needs true overlap needs `io_uring`, which is served to its own measured
+subset.
+
+**The handle-gone property is pinned because of §6.90's class.** `io_destroy`
+removes the handle and a second destroy is `EINVAL`, not a silent success — a
+table keyed on a recyclable number answers for whoever holds the number now, and
+the defence here is that handles are **never reused** (the counter only goes up).
+The context also carries no copy of its own handle: the table is keyed on it, and
+a second copy is state that can disagree with the key it was found by.
+
+**Gate.** Three rounds, all on clippy and the host build: an unused
+`AioContext::id` field, three redundant casts in the pin, and — the one worth
+recording — **the `#[cfg(target_os = "none")]` gate on `io_uring` moved onto
+`aio`** when both declarations shared a prefix in a text replace, which broke the
+host build of the ring. That is the §1.6 shape: a `replace` that matched a
+neighbour it was not aimed at, caught by an arm compiling where it should not.
+
+`build/gate-item317c.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**
+host tests 0 failed; stage 2 **331** on x86_64 and **327** on aarch64 — both up
+one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.**
+
+1. **`IOCB_CMD_PREADV`/`PWRITEV` are refused with `EINVAL`**, and Linux serves
+   them when `aio_buf` points at a real `struct iovec` (measured: submit `1`,
+   `res` 4, buffer filled). This door does not import the `iov` array, so the
+   refusal is this kernel's **named gap**, not a claim about Linux. A caller that
+   needs the vectored shape should use `io_uring`'s `IORING_OP_READV`, which is
+   served.
+2. **`IOCB_FLAG_RESFD` and `IOCB_FLAG_IOPRIO`** are not honoured: the fields are
+   read past and ignored, so an `aio_flags` word asking for an eventfd wakeup
+   gets none. Linux refuses neither, so this is an approximation — recorded here
+   rather than left to be discovered.
+3. **`io_cancel` (210) is still undeclared** and answers `ENOSYS`. Its contract
+   is cancelling an in-flight request, and every request here has already
+   completed by the time `io_submit` returns, so there is nothing to cancel;
+   `ENOSYS` tells a caller not to try.
+4. **The completions are never deferred**, so `io_submit` may block where Linux's
+   would not. That is item 1's performance shape; a caller with a slow disk and a
+   large batch sees it as latency, not as a wrong answer.
