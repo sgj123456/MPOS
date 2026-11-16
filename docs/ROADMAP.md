@@ -3523,3 +3523,38 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   a *difference*; and the census's tail is **not all dead** — `fspick` (433),
   `landlock_*` (444–446), `cachestat` (451), `setxattrat` (463) and the LSM family
   (459–461) are current calls this kernel does not serve. (§6.189, item 310)
+
+- **Item 311 — `ioprio_get`/`ioprio_set`: the block layer's ABI, and four drafts the
+  measurement corrected**: the next pair from item 310's census (libc's `__NR_*`
+  minus `nr_x86_64.rs`). Neither number was declared, so the dispatch answered
+  `ENOSYS`; `ionice(1)` is the caller everybody has. **The measurement corrected the
+  draft four times**, and each is a rule a written-from-memory version gets wrong:
+  the `IOPRIO_WHO_*` values are **1, 2, 3** (not 0, 1, 2 — the draft would have
+  answered `EINVAL` for every real caller); **bits above the 16-bit word are
+  truncated, not refused** (`1 << 16` … `1 << 19` all served — the draft refused
+  them, reasoning that a mask is a silent lie, but a caller with no fallback from
+  `EINVAL` has nowhere to go); **the data is not validated against the class's
+  range** (`BE/8` is stored); and **a group or user query answers the strongest
+  member, where "strongest" is a max over the class and a *min over the data*** —
+  `BE/7` beside `BE/1` answers `BE/1`, which a plain max fails. Plus the two that
+  were right and are the security surface: `RT` wants `CAP_SYS_NICE` (measured with
+  the host's empty `CapEff`) and the other three classes do not, and retargeting
+  another user's task wants it where a same-uid child is served. The state is a
+  `u16` on `Task` beside `nice`, kept honestly and **scheduling nothing** (one disk,
+  no I/O scheduler — the shape `nice`'s weight has had since it landed). `t-ioprio`:
+  **22 claims**, and the group fixture runs in a **session of its own** because a
+  group query covers every member while the sweep runs this program as one of dozens
+  in one lane's process group — asked in place, a first draft read another program's
+  `BE/4` and was right about a membership the test did not mean to name. **Two
+  pipe-based drafts of the parent/child sync were worse than the C probe's own
+  150 ms sleep** (one reused a pipe in both directions so the child blocked on a
+  closed end; the other announced with a byte and still lost the race); the sleep is
+  what the measurement itself used. **The gate found two things**: the
+  dispatch-versus-table check named the two missing rows (counts 302 → 304), and
+  clippy caught an unnecessary cast plus the `DATA_MASK` constant the truncation
+  change left unused. Gate `build/gate-item311b.log` `GATE_EXIT=0`: stage 1 1340,
+  x86_64 **326**, aarch64 **322** (both +1), kunit 42/0 per arm, clippy unchanged at
+  `162/168/393/272/3/1`. **Named**: the word schedules nothing; a foreign-uid
+  `ioprio_get` is `ESRCH` (pinned with `4294967294`, not a normal account); and
+  **`tee`/`vmsplice`** remain undeclared — item 310's census, still open. (§6.190,
+  item 311)

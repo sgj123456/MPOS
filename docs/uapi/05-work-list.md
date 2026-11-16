@@ -13316,3 +13316,21 @@ asserting about which program ran). And the remaining ~80 undeclared numbers are
 **not all dead**: `fspick` (433), `landlock_*` (444–446), `cachestat` (451),
 `setxattrat` (463) and the LSM family (459–461) are current Linux calls this
 kernel does not serve — the census's tail, and a future item's list.
+
+## Item 311 — `ioprio_get`/`ioprio_set`: the block layer's ABI, and four drafts the measurement corrected (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **Where it came from** | Item 310's census (libc's `__NR_*` minus `nr_x86_64.rs`) named four calls real programs make; this is the pair. Neither number was declared, so the dispatch answered `ENOSYS`. `ionice(1)` is the caller everybody has. |
+| **Four drafts the measurement corrected** | (1) **`IOPRIO_WHO_*` are 1, 2, 3**, not 0, 1, 2 — the draft would have answered `EINVAL` for every real caller. (2) **Bits above the 16-bit word are truncated, not refused** (`1 << 16` … `1 << 19` all served) — the draft refused them; and the pin's own first draft of *that* claim used `0x1c000`, which truncates to `0xc000` (class 6, `EINVAL` for the *class* rule), so it measured the wrong rule. (3) **Data is not validated against the class's range** — `BE/8` is stored. (4) **A group/user query answers the strongest member, and "strongest" is a max over the class and a *min over the data*** — `BE/7` beside `BE/1` answers `BE/1`; a plain max fails. |
+| **Two that were right and are the security surface** | `RT` needs `CAP_SYS_NICE` (`EPERM` without; the host's empty `CapEff` measured it), the other three classes do not, and retargeting another user's task needs it too where a same-uid child is served. |
+| **The state** | A `u16` on `Task` beside `nice`, kept honestly and **scheduling nothing** — one disk and no I/O scheduler here, the same shape `nice`'s weight has. Inherited across `fork`, kept across `exec` (measured). |
+| **The pin, and what it cost** | 22 claims. The group fixture runs in a **session of its own** (`setsid`) because a group query covers every member and the sweep runs this program as one of dozens in one lane's process group — asked in place, a first draft read another program's `BE/4` and was right about a membership the test did not mean to name. **Two pipe-based drafts of the sync were worse than the C probe's own 150 ms sleep** (one reused a pipe in both directions, the child blocking on a closed end; the other announced with a byte and still lost the race). |
+| **Gate** | Two findings, both the gate working: the dispatch-versus-table check named the two missing rows (counts 302 → 304), and clippy caught an unnecessary cast plus the `DATA_MASK` constant the truncation change left unused. `build/gate-item311b.log`, `GATE_EXIT=0`: stage 1 **1340**; stage 2 **326** x86_64 / **322** aarch64 (both +1), `mpos-kunit 42/0` per arm; clippy unchanged at `162/168/393/272/3/1`. |
+
+**What this does not do, named.** The word **schedules nothing** — one disk, no I/O
+scheduler, so a class is a number this kernel keeps and does not act on (the shape
+`nice`'s weight has had since it landed, and the same named sub-gap).
+`ioprio_get(USER, …)` on a foreign uid is `ESRCH` and is pinned with `4294967294`,
+not reachable through a normal account. And **`tee` (276) / `vmsplice` (278)** remain
+undeclared and answer `ENOSYS` — item 310's census, still open.

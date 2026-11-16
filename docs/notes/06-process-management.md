@@ -18065,3 +18065,78 @@ unchanged at `162/168/393/272/3/1`; both workspaces formatted.
    `landlock_*` (444–446), `cachestat` (451), `setxattrat` (463) and the LSM
    family (459–461) are current Linux calls this kernel does not serve. They are
    the census's tail and a future item's list.
+
+## §6.190 `ioprio_get`/`ioprio_set`: the block layer's ABI, and four drafts the measurement corrected (item 311, LANDED 2026-11-16)
+
+**Where it came from.** Item 310's census — libc's `__NR_*` table minus
+`nr_x86_64.rs` — named four calls real programs make; this is the pair, and the
+next two (`tee`, `vmsplice`) remain. Neither number was declared, so the dispatch
+answered `ENOSYS`. `ionice(1)` is the caller everybody has.
+
+**The measurement corrected the draft four times, and each is a rule a
+written-from-memory version gets wrong** (Linux 7.3.4,
+`build/scratch/opathmmap/{iop,iop2,iop3,iop5,iop6,iop7,iop8}.c`):
+
+1. **The `IOPRIO_WHO_*` values are 1, 2, 3** — not 0, 1, 2. The first draft wrote
+   them 0-based, which would have answered `EINVAL` for every real caller: `which=0`
+   is `EINVAL`, `1` process, `2` group, `3` user.
+2. **Bits above the 16-bit word are truncated, not refused.** `1 << 16` through
+   `1 << 19` are all served. The draft refused them, on the reasoning that a mask is
+   a silent lie — but a caller that computes a word with extra bits has no fallback
+   from `EINVAL`, so refusing is the worse direction. (The pin's own first draft of
+   *that* claim used `0x1c000`, which truncates to `0xc000` — class 6, `EINVAL` for
+   the *class* rule — and so measured the wrong rule entirely. `0x1_4000` → `0x4000`
+   is the value that shows truncation.)
+3. **The data is not validated against the class's nominal range.** `BE/8` is stored
+   and reads back `BE/8`, though best-effort "stops at 7" on paper. Same for
+   `IDLE/5`.
+4. **A group or user query answers the *strongest* member, and "strongest" is a max
+   over the class and a *min over the data*.** Measured: a parent at `BE/7` beside a
+   child at `BE/1` answers `BE/1`; a parent at `IDLE` beside a child at `BE/4`
+   answers `BE/4` (class wins regardless of data). A plain `max` fails the first of
+   those.
+
+Plus two that were right first time and are worth stating because they are the
+security surface: **`RT` needs `CAP_SYS_NICE`** (`EPERM` without — the host's empty
+`CapEff` measured it) and the other three classes do not, and **retargeting another
+user's task** needs it too, where a same-uid child is served.
+
+**The state** is a `u16` on `Task` beside `nice`, and the reasoning is the same one
+that field carries: this kernel has one disk and no I/O scheduler to weigh a class
+against, so the word has **no effect**, and a caller that set it and read it back
+must see what it set. Inherited across `fork` and kept across `exec` — measured, a
+child reads its parent's word.
+
+**The pin, and a synchronisation lesson that cost more than the feature.** 22
+claims. The group fixture runs in a **session of its own** (`setsid`), because a
+group query covers every member and the sweep runs this program as one of dozens in
+one lane's process group: a first draft asked `get(PGRP, 0)` in place and read
+`BE/4` — some other program in the lane had set a word *stronger* than the
+fixture's own `BE/7` — and the answer was correct about a membership the test did
+not mean to name.
+
+Two pipe-based drafts of the parent/child sync were **worse than the C probe's own
+150 ms sleep**: the first reused one pipe in both directions (the child blocked
+reading an end its parent had closed), the second announced with a byte and still
+lost the race. The `sleep` is what the measurement itself used, and "generous by two
+orders of magnitude" is the honest tool for "let the child run one syscall".
+
+**Gate.** Two findings, both the gate working on new calls: the
+**dispatch-versus-table check** named the two missing rows (and the header counts
+moved 302 → 304, `execveat` from item 310 included), and **clippy** caught an
+unnecessary `as usize` and the `DATA_MASK` constant my truncation change left
+unused. `build/gate-item311b.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **326** on x86_64 and **322** on aarch64 —
+both up one — `mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`.
+
+**What this does not do, named.**
+
+1. **The word schedules nothing.** One disk, no I/O scheduler, so a class is a
+   number this kernel keeps and does not act on — the same shape `nice`'s weight has
+   had since it landed, and the same named sub-gap.
+2. **`ioprio_get` on a `user` with no tasks is `ESRCH`**, but a uid that names the
+   caller always has one, so the interesting case is a *foreign* uid — pinned with
+   `4294967294`, not reachable through a normal account.
+3. **`tee` (276) and `vmsplice` (278)** remain undeclared and answer `ENOSYS` —
+   item 310's census, still open.
