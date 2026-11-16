@@ -13137,3 +13137,31 @@ holds for `F_GETPIPE_SZ`/`F_SETPIPE_SZ` and the lease pair (`F_SETLEASE`/
 the claims are all about `O_PATH` — and `F_SETLEASE`'s own authority
 (`CAP_LEASE`, and the `EPERM` a non-owner reads) is unswept, so the lease family is
 now named in two places.
+
+## Item 303 — `O_PATH`'s last nine doors: a descriptor that names could read, copy, flush and lock (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What §6.180 left** | Its gap list's largest entry: "**`mmap` of an `O_PATH` descriptor** is `EBADF` on Linux and was not swept." One grep for the predicate gave the size: `is_path_only` had twelve call sites, all of them *path* or `*at` doors. **Nine calls that read or write an inode through a descriptor** had none. |
+| **The mechanism** | They do not pass through `File::pre_read`/`pre_write`, where §6.179 had put the rule. Each calls `Inode::read_at`/`write_at` (or the lock table) directly. §6.179's "put it where they all funnel" was right, and these nine were outside the funnel - a rule at a funnel is only a rule for what enters it. |
+| **Measured first** (all raw) | Linux 7.3.4, `build/scratch/opathmmap/` (eight probes). Twelve doors refuse `O_PATH` with `EBADF`: `mmap`, `readahead`, `sync_file_range`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`, `splice`, `flock`, `fallocate`, and §6.179's `ftruncate`/`fadvise64`. `fstat` and `fchdir` are served. |
+| **Why it is authority, not tidiness** | `open(path, O_PATH)` **asks no permission on the file**: as uid 1000, `/etc/shadow` (`0600`, owner `65534`) refuses `O_RDONLY` with `EACCES` and **serves `O_PATH`** - whose descriptor then refuses `read`/`mmap`/`fsync` and answers `fstat` with the real `1295` bytes. Linux's `build_open_flags` sets `acc_mode = 0` and checks `MAY_OPEN` alone; the parent's search bit still applies. So the descriptor is a capability to a **name** the caller may not open, and every contents door that serves it is a permission bypass. This kernel served six. |
+| **The guest's own answers** (unfixed kernel) | `readahead`/`sync_file_range`/`fsync`/`fdatasync` → **0**; `copy_file_range(O_PATH, out)` → **16 bytes copied**; `splice(O_PATH, pipe)` → **3 bytes moved, then hung**; `flock(O_PATH, LOCK_EX\|LOCK_NB)` → **0**, and a second `flock` on the same file got `EAGAIN`; `mmap(O_PATH)` → **an address**; `fallocate(O_PATH\|O_WRONLY)` → **0, and the file grew from 10 bytes to 4096**. |
+| **The second inversion that explains the first** | `F_GETFL` reported the whole word plus the access bits (`0x208001` for `O_PATH\|O_WRONLY`). Linux reports the **fold** - `flags &= O_DIRECTORY\|O_NOFOLLOW\|O_PATH`, `acc_mode = 0` - so `O_PATH\|O_APPEND\|O_NONBLOCK\|O_SYNC\|O_TRUNC\|O_NOFOLLOW` answers `0x220000` and truncates nothing, `O_PATH\|O_CREAT` on a missing name is `ENOENT`, and `O_CLOEXEC` is a descriptor flag rather than part of the word. Because the access bits were stored where `may_write` reads them, an `O_PATH\|O_WRONLY` open was a *writable* descriptor - which is how `fallocate` reached the file. |
+| **Four more wrong refusals, all orderings** | Measured, not assumed: `copy_file_range` is fds→mode→flags→kind→len here flags→len→fds→kind; `splice` is flags→len→fds→mode→pipe-kind; `sendfile` is fds→mode→count→dir-kind, and its comment claiming "the count is asked first" was true of the *directory* question and false of the two mode ones beside it; `fallocate` is fd→`O_PATH`→range→mode→mode-word. Two of these mattered on the guest: `len == 0` short-circuited `copy_file_range` to `0` **before** the `O_PATH` check could run, and `splice` with `len == 0` answered `0` for a name-only descriptor. |
+| **Now** | `check_readable` refuses `O_PATH` as well as `ACC_WRONLY` (one question - no `FMODE_READ` for either), `may_write` refuses `O_PATH`, `open_linux` stops asking `R_OK`, folds the word for `F_GETFL`, stores no access mode, skips `O_TRUNC`'s truncate and does not create on `O_PATH\|O_CREAT`, and the nine doors each got the check at the position the table measured - `mmap`'s before its mode clauses, `fallocate`'s before the range. |
+| **Pins** | `t-open-path` **30 → 47 claims**: the nine refusals, `fallocate` *with the access bit in the word* plus its "changed nothing" size claim, the `F_GETFL` fold plus its "truncated nothing" partner, and three neighbours making them about `O_PATH` rather than broken calls (`copy_file_range` between two ordinary descriptors still copies; `readahead` on write-only is `EBADF`; on read-only it is served). All raw. |
+| **Counterfactual** | The three kernel files stashed, **kernel and loader** rebuilt, the pin in the guest: **ten claims red**, each with its own wrong answer - an address from `mmap`, `0` from four flushes, `rc=5` from `copy_file_range`, `rc=0` from `splice` and `flock`, `rc=0` from `fallocate`, and `size 5 -> 4096`. Restored with `git stash pop` alone, rebuilt, `PASS` on host and guest. |
+| **Gate** | `build/gate-item303b.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed; stage 2 324 programs over 6 lanes on x86_64 and 320 on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42/0` per arm; clippy ratchet unchanged at `162/168/389/272/3/1`. **The first run reddened on clippy alone** - `unused_mut` 3 → 4 from this change's own `let mut want` that the new branch no longer mutated - fixed by deleting the `mut`, not by raising a ceiling. |
+
+**What this does not do, named.** **`linkat(fd, "", …, AT_EMPTY_PATH)` is served
+on Linux** (measured: 0 on an `O_PATH` descriptor, with `AT_SYMLINK_FOLLOW` too)
+and this kernel's `linkat` has no such arm - a missing *door* rather than a wrong
+answer, and `apk` reaches the same end through `/proc/self/fd/N`, which is pinned.
+**`syncfs`** takes a descriptor and was not swept; it is `ENOSYS` here, so it
+belongs with the unimplemented family. **`fcntl`'s ordinary-descriptor half** is
+still unpinned and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` still unimplemented (named
+in item 300, still named). And **the open-side permission rule has no pin**: that
+`open("/etc/shadow", O_PATH)` is served where `O_RDONLY` is `EACCES` is measured
+but not claimed, and claiming it needs a payload that runs as a second uid - which
+the sweep's root payload is not. Named rather than approximated.

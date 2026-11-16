@@ -3212,3 +3212,53 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64 `pass=324`, aarch64
   `pass=320`, kunit 41/0 per arm, clippy ratchet unchanged — green first try.
   (§6.180, item 300)
+
+- **Item 303 — `O_PATH`'s last nine doors: a descriptor that names could read, copy,
+  flush and lock**: §6.180's largest named gap ("`mmap` of an `O_PATH` descriptor is
+  `EBADF` on Linux and was not swept"), and one grep for the predicate sized it —
+  `is_path_only` had twelve call sites, all path or `*at` doors, and **nine calls that
+  read or write an inode through a descriptor** had none. The mechanism is structural:
+  they do not pass through `File::pre_read`/`pre_write`, where §6.179 put the rule; each
+  calls `Inode::read_at`/`write_at` (or the lock table) directly. A rule at a funnel is
+  only a rule for what enters the funnel. Measured whole on Linux 7.3.4 (eight probes
+  under `build/scratch/opathmmap/`): twelve doors refuse `O_PATH` with `EBADF` — `mmap`,
+  `readahead`, `sync_file_range`, `fsync`, `fdatasync`, `sendfile`, `copy_file_range`,
+  `splice`, `flock`, `fallocate`, plus §6.179's `ftruncate`/`fadvise64` — while `fstat`
+  and `fchdir` are served. **And the measurement that makes it authority rather than
+  tidiness**: `open(path, O_PATH)` asks **no permission on the file** — as uid 1000,
+  `/etc/shadow` (`0600`, owner `65534`) refuses `O_RDONLY` with `EACCES` and **serves
+  `O_PATH`**, whose descriptor then refuses `read`/`mmap`/`fsync` and answers `fstat` with
+  the real `1295` bytes (Linux's `build_open_flags` sets `acc_mode = 0`, `MAY_OPEN`
+  alone; the parent's search bit still applies). So the descriptor is a capability to a
+  **name** the caller may not open, and this kernel served six contents doors on it:
+  `readahead`/`sync_file_range`/`fsync`/`fdatasync` → **0**; `copy_file_range` → **16
+  bytes copied**; `splice` → **3 bytes moved then hung**; `flock` → **0 and it held the
+  lock** (a second `flock` on the same file got `EAGAIN`); `mmap` → **an address**; and
+  `fallocate(O_PATH|O_WRONLY)` → **0 with the file grown from 10 bytes to 4096**. The
+  second inversion explains the first: `F_GETFL` reported the whole word plus access bits
+  (`0x208001` for `O_PATH|O_WRONLY`) where Linux reports the **fold**
+  (`flags &= O_DIRECTORY|O_NOFOLLOW|O_PATH`, `acc_mode = 0` — so
+  `O_PATH|O_APPEND|O_NONBLOCK|O_SYNC|O_TRUNC|O_NOFOLLOW` answers `0x220000` and truncates
+  nothing, `O_PATH|O_CREAT` on a missing name is `ENOENT`, `O_CLOEXEC` is a descriptor
+  flag), and storing the access bits where `may_write` reads them made an `O_PATH|O_WRONLY`
+  open *writable* — which is how `fallocate` reached the file. Four more refusals were
+  orderings, each measured: `copy_file_range` is fds→mode→flags→kind→len, `splice` is
+  flags→len→fds→mode→pipe-kind, `sendfile` is fds→mode→count→dir-kind (its comment's "the
+  count is asked first" was true only of the directory question), `fallocate` is
+  fd→`O_PATH`→range→mode→mode-word — and two mattered, because `len == 0` short-circuited
+  `copy_file_range` to `0` and `splice` to `0` before the `O_PATH` check could run. The
+  fix is one predicate in the two primitives (`check_readable` refuses `O_PATH` as well as
+  `ACC_WRONLY`; `may_write` refuses it), the open's `want = 0` and folded word, and nine
+  call sites placed where the table measured. `t-open-path` **30 → 47 claims**, all raw;
+  counterfactual stashes the three kernel files, rebuilds kernel **and** loader, and
+  reddens **ten** claims each with its own wrong answer (`size 5 -> 4096` among them).
+  Gate `build/gate-item303b.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340,
+  x86_64 `pass=324`, aarch64 `pass=320`, kunit 42/0 per arm, clippy ratchet unchanged at
+  `162/168/389/272/3/1` — the first run reddened on clippy alone (`unused_mut` 3 → 4 from
+  this change's own `let mut want`), fixed by deleting the `mut`. **Named**:
+  `linkat(fd, "", …, AT_EMPTY_PATH)` is served on Linux and absent here (a missing door,
+  not a wrong answer; `apk` reaches it through `/proc/self/fd/N`); `syncfs` is `ENOSYS`
+  rather than misrefused; `fcntl`'s ordinary-descriptor half still unpinned and
+  `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` still unimplemented; and the open-side permission
+  rule is measured but not pinned, because claiming it needs a payload at a second uid.
+  (§6.182, item 303)

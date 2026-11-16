@@ -17191,3 +17191,171 @@ of this comment at all.
    borrow holds across both halves, so the window is empty in practice - recorded
    because "in practice" is what this repository writes down instead of leaving
    implicit.
+
+## §6.182 `O_PATH`'s last nine doors, and the two halves that made the flag a lie in both directions (item 303, LANDED 2026-11-16)
+
+**What §6.180 left.** Its own gap list named three things and this is the largest:
+"**`mmap` of an `O_PATH` descriptor** is `EBADF` on Linux and was not swept." A grep
+for the predicate settled the size in one command: `is_path_only` had twelve call
+sites and every one of them was a *path* or `*at` door - not one of the nine calls
+that read or write an inode through a descriptor had it. They do not pass through
+`File::pre_read`/`pre_write` at all. Each calls `Inode::read_at`/`write_at` (or the
+lock table) directly, and that is the mechanism: §6.179's arrangement - "put the
+rule where they all funnel" - was right, and these nine were outside the funnel.
+
+**Measured first, whole, on Linux 7.3.4**
+(`build/scratch/opathmmap/{matrix,sweep,order6,order7,order9,order10,sf,fa2}.c`).
+Twelve doors, and **all twelve refuse an `O_PATH` descriptor with `EBADF`**:
+`mmap`, `readahead`, `sync_file_range`, `fsync`, `fdatasync`, `sendfile`,
+`copy_file_range`, `splice`, `flock`, `fallocate`, plus `ftruncate`/`fadvise64`
+which §6.179 had already claimed. The two served halves are `fstat` and `fchdir`.
+
+**The measurement that made this an authority bug rather than a tidiness bug.**
+`open(path, O_PATH)` **asks no permission on the file**: as uid 1000,
+`open("/etc/shadow", O_RDONLY)` is `EACCES` (mode `0600`, owner `65534`) while
+`open("/etc/shadow", O_PATH)` is **served**, and the descriptor answers `EBADF` from
+`read`, `mmap` and `fsync` while `fstat` reports the real `1295` bytes and `0600`.
+The same holds for a file the caller owns opened `0000`. Linux reaches it in
+`build_open_flags`, which sets `acc_mode = 0` for `O_PATH` and checks `MAY_OPEN`
+alone; the *parent directory's* search bit is still asked and still refused.
+
+**Which is why the `EBADF`s are load-bearing.** An `O_PATH` descriptor is a
+capability to a **name** the caller may not open. Every contents door that serves it
+is a permission bypass, and this kernel served six of them. Measured on the guest
+against the unfixed kernel:
+
+```
+readahead(O_PATH)              -> 0        Linux: EBADF
+sync_file_range(O_PATH)        -> 0        Linux: EBADF
+fsync/fdatasync(O_PATH)        -> 0        Linux: EBADF
+copy_file_range(O_PATH, out)   -> 16       Linux: EBADF   (16 bytes copied!)
+splice(O_PATH, pipe)           -> 3        Linux: EBADF   (3 bytes moved, then hung)
+flock(O_PATH, LOCK_EX|LOCK_NB) -> 0        Linux: EBADF   and a second flock
+                                                          on the same file got EAGAIN
+mmap(O_PATH, PROT_READ)        -> an address            Linux: EBADF
+fallocate(O_PATH|O_WRONLY)     -> 0, size 10 -> 4096    Linux: EBADF
+```
+
+The `fallocate` line is the sharpest: the file **grew from 10 bytes to 4096**
+through a descriptor Linux creates specifically so a caller can hold a name it has
+no right to act on. `flock` is the second: it took a lock `apk`'s database lock is
+taken through. And `splice` did not merely serve - it moved 3 bytes and then
+blocked, which is what a splice between a file and a pipe does when the descriptor
+check it should have failed never ran.
+
+**The second inversion, and it is the one that explains the first.** `F_GETFL` on
+an `O_PATH` descriptor reported the **whole** word plus the access bits -
+`0x208001` for `O_PATH|O_WRONLY`, `0x208002` for `O_PATH|O_RDWR` (measured on the
+guest). Linux reports the **fold**: `build_open_flags` does `flags &= O_DIRECTORY |
+O_NOFOLLOW | O_PATH` and `acc_mode = 0`, so an open asked for with
+`O_PATH|O_APPEND|O_NONBLOCK|O_SYNC|O_TRUNC|O_NOFOLLOW` answers `F_GETFL =
+0x220000` - `O_PATH|O_NOFOLLOW` alone - and the `O_TRUNC` truncates **nothing**.
+`O_CLOEXEC` is not in that word at all; it is a descriptor flag and survives as
+`FD_CLOEXEC`.
+
+This kernel also kept the access bits in the field `may_write` reads, so an
+`O_PATH|O_WRONLY` open was a **writable** descriptor to every door that asked the
+mode - which is exactly how `fallocate` reached the file. The two halves are one
+bug: the open granted an access mode the flag word had already discarded, and nine
+doors then failed to ask whether the descriptor had opened anything.
+
+**Three more doors refused for the wrong reason.** `ftruncate` and `ioctl` were
+§6.179's pair (argument judged before descriptor). The same shape turned up here in
+`sendfile`, `copy_file_range`, `splice` and `fallocate`, and in each case the
+ordering was **measured** rather than assumed:
+
+| door | Linux's order | what this kernel did |
+|---|---|---|
+| `copy_file_range` | fds → mode → flags → **kind** → len | flags → len → fds → kind |
+| `splice` | flags → len → fds → **mode** → pipe-kind | flags → len → fds → pipe-kind |
+| `sendfile` | fds → **mode** → count → dir-kind | fds → count → dir-kind |
+| `fallocate` | fd → **`O_PATH`** → range → mode → mode-word | range → mode-word → fd → mode |
+
+Two of those are worth stating because the code had a comment claiming otherwise:
+`sendfile`'s argued that "the count is asked first", which is true of the
+**directory** question and false of the two mode questions it sat beside - and
+conflating the two left the door applying neither. And `copy_file_range` judged
+`flags`/`len` before it had looked at a descriptor, so a caller whose *descriptor*
+was bad heard about its flag word; on the guest that mattered, because `len == 0`
+short-circuited to `0` **before** the `O_PATH` check could run. A zero-length copy
+is still a copy request from a descriptor that names the file.
+
+**The fix.** One predicate and the two primitives it belongs in, plus nine call
+sites:
+
+* `File::check_readable` now refuses `O_PATH` as well as `ACC_WRONLY` - one
+  question, because Linux's `f_mode` has no `FMODE_READ` for either. Every caller
+  of it (`readahead` among them) got correct without naming the flag.
+* `File::may_write` refuses `O_PATH`, which is what stops `O_PATH|O_WRONLY`
+  carrying write authority anywhere.
+* `open_linux` stops asking `R_OK` for `O_PATH` (state `want = 0`), folds the flag
+  word for `F_GETFL`/`F_SETFL` before recording it, stores no access mode, skips
+  the `O_TRUNC` truncate, and does not create on `O_PATH|O_CREAT` (Linux: `ENOENT`,
+  nothing created).
+* The nine doors each got the check at the position the table above measured.
+  `mmap`'s goes **before** its mode clauses, `fallocate`'s **before** the range -
+  because a descriptor that never opened the file has no range or mode to be wrong
+  about.
+
+**The pin** is `t-open-path` grown from 30 claims to 47: the nine refusals
+(`mmap`, `readahead`, `sync_file_range`, `fsync`, `fdatasync`, `sendfile`,
+`copy_file_range`, `splice`, `flock`), `fallocate` **with the access bit in the
+word** and its "changed nothing" size claim, the `F_GETFL` fold claim with its
+"truncated nothing" partner, and three neighbours that make the refusals a
+statement about `O_PATH` rather than about broken calls - `copy_file_range`
+between two ordinary descriptors still copies, `readahead` on a write-only
+descriptor is `EBADF` too, and `readahead` on a read-only one is still served. All
+raw, for §6.178's reason.
+
+**Counterfactual.** The three kernel files stashed, rebuilt **both** the kernel and
+the loader, the pin in the guest: **ten claims red**, each with its own wrong
+answer, and the two `fallocate` claims are one cause seen twice -
+
+```
+mmap …              got rc=139586668990464    (an address)
+readahead …         got rc=0
+sync_file_range …   got rc=0
+fsync …             got rc=0
+fdatasync …         got rc=0
+copy_file_range …   got rc=5
+splice …            got rc=0
+flock …             got rc=0
+fallocate …         got rc=0
+and it changed nothing: size 5 -> 4096
+```
+
+Restored with `git stash pop` alone, rebuilt, `PASS` on both the host and the
+guest.
+
+**Gate.** `build/gate-item303b.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **324** programs over 6 lanes on x86_64 and
+**320** on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42 passed, 0
+failed` per arm; six-arm clippy ratchet unchanged at `162/168/389/272/3/1`.
+**The first run `build/gate-item303.log` reddened on clippy alone** - `unused_mut`
+3 → 4 on both kernel arms, from this change's own `let mut want` that the new
+`if path_only` branch no longer mutated - and the fix was to delete the `mut`
+rather than raise a ceiling. The gate's message names it as a `host unit tests`
+failure too, which is stage 1's verdict and not a second defect.
+
+**What this does not do, named.**
+
+1. **`linkat(fd, "", …, AT_EMPTY_PATH)` is served on Linux** and this kernel's
+   `linkat` has no such arm (measured, `build/scratch/opathmmap/p.c`: on an
+   `O_PATH` descriptor it answers 0, with `AT_SYMLINK_FOLLOW` too, and the
+   documented `CAP_DAC_READ_SEARCH` requirement is *not* enforced on a file the
+   caller owns - the `linkat(O_PATH_dir, …)` case is `EPERM`, which is a different
+   question about directory targets). That is a missing **door**, not a wrong
+   answer, so it is not this item's shape; `apk` reaches the same end through
+   `/proc/self/fd/N` and `AT_SYMLINK_FOLLOW`, which is pinned.
+2. **`fcntl`'s ordinary-descriptor half** was read by §6.180's probe but is still
+   not pinned, and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` remain unimplemented
+   (`EINVAL` from the table's default) rather than misrefused - named there, still
+   named here.
+3. **`syncfs`** takes a descriptor too and was not swept; it is `ENOSYS` here
+   rather than refused for an `O_PATH` one, so it belongs with the unimplemented
+   family rather than this one.
+4. **The `open`-side permission rule has no pin of its own.** The nine refusals are
+   pinned; that `open("/etc/shadow", O_PATH)` is *served* while `O_RDONLY` is
+   `EACCES` is measured but not claimed, and the claim needs a file the guest's
+   payload may not read - which the sweep's root payload cannot make without a
+   second uid. Named rather than approximated.
