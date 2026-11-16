@@ -18346,3 +18346,76 @@ Nothing else from the census's legacy block is served: `uselib`, `ustat`,
 `_sysctl`, `create_module` and the `*_module` family are dead calls on modern
 Linux too, so `ENOSYS` is the right answer and they stay declared-missing rather
 than implemented.
+
+## §6.194 the `pkey_*` trio: a refusal with a measurement behind it, and a pin that was broken before it (item 315, LANDED 2026-11-16)
+
+**Found by walking the census again.** After items 310–314 landed five calls,
+the remaining plausible gaps were `pkey_alloc`/`pkey_free`/`pkey_mprotect`
+(330/331/329), `fspick`, the `landlock_*` and `lsm_*` families, and the
+`*xattrat` set. The pkey trio is the one whose refusal is a *decision* rather
+than a missing prerequisite, and this section is about making the difference
+explicit.
+
+**Measured first, Linux 7.3.4** (`build/scratch/opathmmap/{pkey,pkey2,pkey3,
+pkey4,pkey5}.c`):
+
+| what | Linux |
+|---|---|
+| `pkey_alloc(0, 0)` | served, keys numbered from **1** |
+| how many | **15** on that machine, then `ENOSPC` |
+| `pkey_free(unallocated or -1)` | `EINVAL` |
+| `pkey_alloc(0, 4)` | `EINVAL` (only `DISABLE_ACCESS` 1 and `DISABLE_WRITE` 2) |
+| `pkey_alloc(0, 3)` — both flags | served |
+| `pkey_mprotect(p, 4096, prot, -1)` | `mprotect`'s own path |
+| a key out of range | `EINVAL` |
+
+**And the row that decides it: the protection is real.** `pkey4.c` allocates a
+`PKEY_DISABLE_ACCESS` key, maps memory under it, and the child that touches the
+page **dies of `SIGSEGV`**. So this is not a call whose answer is bookkeeping.
+
+**Which is why the refusal.** This kernel has no PKU at all: `CR4.PKE` is never
+set (`arch/src/arch/x86_64/mod.rs` enables `OSFXSR`/`OSXMMEXCPT` and nothing
+else), no PTE carries a protection-key field, and there is no per-task `PKRU`.
+Serving the calls would hand a caller a zero for a boundary that does not exist —
+the exact failure `AGENTS.md` §3.2 forbids. Linux itself runs these only under
+`CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS` ([pkeys(7)](https://www.man7.org/linux/man-pages/man7/pkeys.7.html)),
+so `ENOSYS` is the answer a libc already reads as "not available here" — the same
+shape `memfd_secret` has had since item 131.
+
+**The row is now in the uapi gap table** beside `memfd_secret`, with the
+prerequisite written out rather than implied: which flags the machine has, then
+`CR4.PKE`, a per-task `PKRU` saved and restored with the context, and a
+protection-key field in the page tables. Any subset of that is a promise the key
+will not keep.
+
+**A pin that was broken before this item touched it.** `t-enosys` already claimed
+`memfd_secret` answers `ENOSYS`, with a hosted-run escape reading
+`host_run() && r == -1` — "any refusal stands in". But a current host **serves**
+`memfd_secret` (measured: it answers fd 3), so `r` is a descriptor, the clause is
+false, and **the host leg of the sweep failed on two claims that were working as
+designed**. Fixed to `host_run()` alone: the claim is about this kernel's
+dispatch, and a machine that serves the call is not the subject. That defect had
+been in the file since `rseq` moved out, and it was invisible because the host
+stage's own report is easy to read past — the same shape §6.183 recorded (a gap
+whose stated reason had aged).
+
+The pin grows the three `pkey_*` claims, with per-machine numbers: x86_64 has
+329/330/331, the asm-generic table aarch64 uses has 288/289/290 — a single set
+would call other calls on one of them, the defect §6.193's pin records.
+
+**Gate.** Two red runs before green, both mine:
+`build/gate-item315.log` and `-315b.log` reddened on **clippy alone** —
+`doc_lazy_continuation` 45 → 50, because the first draft of `t-enosys`'s header
+inserted a bulleted list **mid-sentence** and left five lines unindented. The fix
+was to rewrite the paragraph rather than raise a ceiling.
+`build/gate-item315d.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340**
+host tests 0 failed; stage 2 **329** on x86_64 and **325** on aarch64;
+`mpos-kunit 42 passed, 0 failed` per arm; clippy ratchet unchanged at
+`162/168/393/272/3/1`; both workspaces formatted.
+
+**What this does not do, named.** **PKU itself is not implemented** and the
+prerequisite list above is the honest scope of it — a protection-key
+implementation is `CR4.PKE`, per-task `PKRU`, page-table bits and the fault
+handling to match, which is a feature rather than a fix. **`pkey_mprotect`'s
+exact `EINVAL`-versus-`EFAULT` ordering** for a bad address *and* a bad key is
+not pinned, because without PKU there is nothing to pin it against.

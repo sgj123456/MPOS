@@ -3655,3 +3655,34 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   (`uselib`, `ustat`, `_sysctl`, `create_module`, the `*_module` family) are dead
   calls on modern Linux too, so `ENOSYS` is right and they stay undeclared.
   (§6.193, item 314)
+
+- **Item 315 — the `pkey_*` trio: a refusal with a measurement behind it**: found
+  walking the census after items 310–314 landed five calls. Measured on Linux 7.3.4
+  (`build/scratch/opathmmap/{pkey,pkey2,pkey3,pkey4,pkey5}.c`): keys numbered from
+  **1**, **15** of them then `ENOSPC`, `pkey_free` of an unallocated key `EINVAL`,
+  `PKEY_DISABLE_ACCESS`/`_WRITE` 1/2 with the pair served, `pkey_mprotect(key=-1)`
+  taking `mprotect`'s own path. **The row that decides it: the protection is real**
+  — memory mapped under a `PKEY_DISABLE_ACCESS` key faults a touching child with
+  `SIGSEGV`. This kernel has **no PKU at all** — `CR4.PKE` never set, no PTE carries
+  a protection-key field, no per-task `PKRU` — so serving these would hand a caller
+  a zero for a boundary that is not there (`AGENTS.md` §3.2). Linux runs them only
+  under `CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS`, so `ENOSYS` is what a libc
+  already reads as "not available here", the shape `memfd_secret` has had since
+  item 131. The row is now in the uapi gap table beside it, with the prerequisite
+  written out (flags, `CR4.PKE`, per-task `PKRU`, page-table bits). **And a pin that
+  was broken before this item touched it**: `t-enosys`'s hosted-run escape read
+  `host_run() && r == -1` — "any refusal stands in" — but a current host *serves*
+  `memfd_secret` (it answers fd 3), so the clause was always false and the host leg
+  failed on two claims working as designed; fixed to `host_run()` alone. That had
+  been in the file since `rseq` moved out, invisible because the host stage's report
+  is easy to read past (the §6.183 shape: a gap whose stated reason had aged). The
+  pin grows the three claims with per-machine numbers (x86_64 329/330/331,
+  asm-generic 288/289/290). Two red runs before green, both clippy alone:
+  `doc_lazy_continuation` 45 → 50 from a bulleted list inserted mid-sentence in the
+  header, fixed by rewriting the paragraph rather than raising a ceiling. Gate
+  `build/gate-item315d.log` `GATE_EXIT=0`: stage 1 1340, x86_64 **329**, aarch64
+  **325**, kunit 42/0 per arm, clippy unchanged at `162/168/393/272/3/1`. **Named**:
+  PKU itself is not implemented (the prerequisite list is its honest scope), and
+  `pkey_mprotect`'s `EINVAL`-vs-`EFAULT` ordering for a bad address *and* a bad key
+  is unpinned because without PKU there is nothing to pin it against.
+  (§6.194, item 315)
