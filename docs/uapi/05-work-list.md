@@ -13161,7 +13161,31 @@ answer, and `apk` reaches the same end through `/proc/self/fd/N`, which is pinne
 **`syncfs`** takes a descriptor and was not swept; it is `ENOSYS` here, so it
 belongs with the unimplemented family. **`fcntl`'s ordinary-descriptor half** is
 still unpinned and `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` still unimplemented (named
-in item 300, still named). And **the open-side permission rule has no pin**: that
-`open("/etc/shadow", O_PATH)` is served where `O_RDONLY` is `EACCES` is measured
-but not claimed, and claiming it needs a payload that runs as a second uid - which
-the sweep's root payload is not. Named rather than approximated.
+in item 300, still named). And **the open-side permission rule is pinned now**, by
+item 304 - this item's own sentence said it would need "a payload that runs as a
+second uid - which the sweep's root payload is not", and that was wrong twice over:
+the payload has forked to `nobody` since long before this item, and the reason it
+mattered is that a root payload can never see the divergence (`CAP_DAC_OVERRIDE`
+answers every mode question yes), so the refusals above had no pin for the half
+that makes them load-bearing.
+
+## Item 304 — the open that asks the file's mode nothing, and the gap list that said it could not be pinned (LANDED 2026-11-16)
+
+| | |
+|---|---|
+| **What item 303 left, and got wrong** | Its fourth named gap: "the `open`-side permission rule has no pin … the claim needs a file the guest's payload may not read - which the sweep's root payload cannot make without a second uid." The measurement was right; the **reason** was wrong. `t-proc-access` and `t-affinity-rules` have `fork`ed to `nobody` for months, and the id exists in both images. A gap closed by naming a prerequisite nobody re-checked - and the rule this item adds is on the reading side: *when you close an item by naming a gap, check the prerequisite the gap names.* |
+| **Why the missing half mattered** | Item 303's nine refusals hold **only because** the open asks nothing: an `O_PATH` descriptor is a capability to a name the caller may not open, so every contents door must refuse it. The refusals' pin cannot see that half - and **the sweep's payload is root, where `CAP_DAC_OVERRIDE` answers every mode question "yes"**. So a claim made in the payload's own process passes on a kernel that asks `R_OK` for an `O_PATH` open, which is exactly the divergence item 303 removed: its claims would have stayed green through a regression of the fix's most important half. |
+| **Measured first** | Linux 7.3.4 (`build/scratch/opathmmap/{opening2,shadow}.c`): the owner's own `0000` file refuses `O_RDONLY` with `EACCES` and **serves `O_PATH`**; `/etc/shadow` (`0600`, owner `65534`) does the same for uid 1000; a file in a `0000` directory refuses both, so the parent's search bit still applies. And the served descriptor answers `EBADF` from `read`/`mmap`/`fsync` while `fstat` reports the real `1295` bytes. Linux's `build_open_flags`: `acc_mode = 0`, `MAY_OPEN` alone. |
+| **The pin** | Four claims and a child. `t-open-path` writes `moon` at `0000` and `sun` at `0444`, forks, and the child drops to `nobody` **before** opening anything, then reports `rd=<answer> path=<answer>` over a pipe. The claim is the **contrast**: `moon` refuses `O_RDONLY` with `EACCES` **and serves `O_PATH`**, while `sun` is served both ways - so "refuse everything" cannot satisfy it. A fifth claim keeps the fixture honest (the owner still opens `moon` as `O_PATH`, so the child's refusal is about the id, not about the file being unopenable). 47 → **52** claims. |
+| **A claim that failed on the kernel that was right** | The first draft asked `text.contains("secret path=ok:")` against a line reading `secret rd=errno:13 path=ok:3` - the two fields are not separable by substring. It failed on Linux. The fix is a `field(line_prefix, key)` helper; the lesson is §6.102's (assert the *parsed* value, not a fragment): a claim that fails on the correct kernel is worth as little as one that passes on the wrong one. |
+| **Counterfactual** | The fix's `want = if path_only { 0 }` put back to always computing the mode, kernel **and** loader rebuilt, pin booted in the guest: **exactly one claim red** - `FAIL: and serves O_PATH on the same file ("secret rd=errno:13 path=errno:13")` - with all three neighbours green. The red *is* the regression (the open asking the file's mode and refusing a name-only descriptor), it is the only claim that moved, and a claim that fires on the right line and leaves its neighbours alone is what separates a pin from a signal. Restored from a saved copy (`git diff src/` empty), rebuilt, `PASS` on host and guest. |
+| **Gate** | `build/gate-item304.log`, `GATE_EXIT=0`, both arms in one run: stage 1 **1340** host tests 0 failed; stage 2 324 programs over 6 lanes on x86_64 and 320 on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42/0` per arm; clippy ratchet unchanged at `162/168/389/272/3/1`; both workspaces formatted. |
+
+**What this does not do, named.** The **`0000`-directory** case (a path inside a
+directory whose search bit the caller lacks is `EACCES` even under `O_PATH`) is
+measured and not claimed: the fixture would need a directory the payload then has to
+clean up as `nobody`, and one `chmod` from the parent does not make the child's
+refusal unambiguous. Item 303's other three gaps stand unchanged:
+**`linkat(AT_EMPTY_PATH)`** is a missing door, **`syncfs`** is `ENOSYS` rather than
+misrefused, and **`fcntl`'s ordinary-descriptor half** is unpinned with
+`F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` unimplemented.

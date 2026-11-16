@@ -3262,3 +3262,40 @@ departures stay `IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`, and - struct
   `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` still unimplemented; and the open-side permission
   rule is measured but not pinned, because claiming it needs a payload at a second uid.
   (§6.182, item 303)
+
+- **Item 304 — the open that asks the file's mode nothing, and the gap list that said it
+  could not be pinned**: item 303's own fourth gap closed, and its stated reason was
+  false. It read "the claim needs a file the guest's payload may not read — which the
+  sweep's root payload cannot make without a second uid"; but `t-proc-access` and
+  `t-affinity-rules` have `fork`ed to `nobody` for months and the id exists in both
+  images. **A gap closed by naming a prerequisite nobody re-checked** — and it mattered
+  more than the sentence suggests, because item 303's nine refusals hold *only because*
+  the open asks nothing, while **the sweep's payload is root, where `CAP_DAC_OVERRIDE`
+  answers every mode question "yes"** — so a claim made in the payload's own process
+  would have stayed green through a regression of the fix's most important half. Measured
+  on Linux 7.3.4: the owner's own `0000` file refuses `O_RDONLY` with `EACCES` and
+  **serves `O_PATH`**; `/etc/shadow` (`0600`, owner `65534`) does the same for uid 1000;
+  a file in a `0000` directory refuses both, so the parent's search bit still applies —
+  and the served descriptor answers `EBADF` from `read`/`mmap`/`fsync` while `fstat`
+  reports the real `1295` bytes. The pin is four claims and a child: `t-open-path` writes
+  `moon` at `0000` and `sun` at `0444`, forks, and the child drops to `nobody` **before**
+  opening anything, reporting `rd=<answer> path=<answer>` over a pipe. The claim is the
+  **contrast** — `moon` refuses `O_RDONLY` with `EACCES` *and serves `O_PATH`* while `sun`
+  is served both ways — so "refuse everything" cannot satisfy it, and a fifth claim keeps
+  the fixture honest (the owner still opens `moon` as `O_PATH`, so the refusal is about
+  the id and not an unopenable file). 47 → **52** claims. One draft of the claim failed
+  **on Linux**: `text.contains("secret path=ok:")` cannot match a line reading
+  `secret rd=errno:13 path=ok:3`, so the report is parsed by field now — a claim that
+  fails on the correct kernel is worth as little as one that passes on the wrong one
+  (§6.102's lesson in its own shape). Counterfactual: `want = if path_only { 0 }` put
+  back to always computing the mode, kernel **and** loader rebuilt, pin booted in the
+  guest — **exactly one claim red**, `and serves O_PATH on the same file
+  ("secret rd=errno:13 path=errno:13")`, with all three neighbours green: the red *is*
+  the regression, it is the only claim that moved, and a claim that fires on the right
+  line and leaves its neighbours alone is what separates a pin from a signal. Gate
+  `build/gate-item304.log` `GATE_EXIT=0`, both arms in one run: stage 1 1340, x86_64
+  `pass=324`, aarch64 `pass=320`, kunit 42/0 per arm, clippy ratchet unchanged at
+  `162/168/389/272/3/1`. **Named**: the `0000`-directory case is measured but not claimed
+  (the fixture would need a directory the payload then has to clean up as `nobody`), and
+  item 303's other three gaps stand — `linkat(AT_EMPTY_PATH)` missing, `syncfs` `ENOSYS`,
+  `fcntl`'s ordinary half unpinned. (§6.183, item 304)

@@ -17354,8 +17354,101 @@ failure too, which is stage 1's verdict and not a second defect.
 3. **`syncfs`** takes a descriptor too and was not swept; it is `ENOSYS` here
    rather than refused for an `O_PATH` one, so it belongs with the unimplemented
    family rather than this one.
-4. **The `open`-side permission rule has no pin of its own.** The nine refusals are
-   pinned; that `open("/etc/shadow", O_PATH)` is *served* while `O_RDONLY` is
-   `EACCES` is measured but not claimed, and the claim needs a file the guest's
-   payload may not read - which the sweep's root payload cannot make without a
-   second uid. Named rather than approximated.
+4. **The `open`-side permission rule has no pin of its own - CLOSED by §6.183.**
+   The original sentence here said the claim "needs a file the guest's payload may
+   not read - which the sweep's root payload cannot make without a second uid", and
+   the *reason* was false: `t-proc-access` and `t-affinity-rules` had been forking
+   to `nobody` for months. It mattered more than the sentence suggests, because the
+   payload is root and `CAP_DAC_OVERRIDE` answers every mode question "yes" - so the
+   nine refusals' pin was blind to the half that makes them load-bearing. Item 304
+   adds a dropped child and four claims; see §6.183 for the counterfactual that
+   reddens exactly one of them.
+
+## §6.183 the open that asks the file's mode nothing - and the gap list that said it could not be pinned (item 304, LANDED 2026-11-16)
+
+**What §6.182 left, and got wrong.** Its gap list's fourth entry read: "**The
+`open`-side permission rule has no pin of its own.** … the claim needs a file the
+guest's payload may not read - which the sweep's root payload cannot make without a
+second uid. Named rather than approximated." The measurement was right and the
+reason was wrong: **the sweep's payload has been able to take a second uid for a long
+time.** `t-proc-access` and `t-affinity-rules` both `fork`, then `setgroups(0, NULL)`,
+`setgid(65534)`, `setuid(65534)` in the child, and probe from there - and `nobody`
+exists in both images. So the sentence that closed the item was a claim about a
+prerequisite that had already been met, which is the shape this file keeps meeting:
+**a gap's stated reason ages, and the item that writes it down is the last place
+anyone looks.** The rule §6.183 is really about is on the reading side: *when you
+close an item by naming a gap, check the prerequisite the gap names, not just the
+gap.*
+
+**Why it mattered that this one was unpinned.** The nine refusals §6.182 landed are
+load-bearing **only because** the open asks nothing: an `O_PATH` descriptor is a
+capability to a name the caller may not open, so every contents door must refuse it.
+The pin for the refusals cannot see the other half. Specifically: **the sweep's
+payload runs as root, and `CAP_DAC_OVERRIDE` answers every mode question "yes"** -
+so a `t-open-path` claim made in the payload's own process passes on a kernel that
+asks `R_OK` for an `O_PATH` open, which is precisely the divergence the fix
+removed. The claims §6.182 shipped would have stayed green through a regression of
+its most important half.
+
+**Measured first.** Linux 7.3.4, `build/scratch/opathmmap/{opening2,shadow}.c`:
+
+| caller | file | `O_RDONLY` | `O_PATH` |
+|---|---|---|---|
+| owner (uid 1000) | own file, `0000` | `EACCES` | **served** |
+| uid 1000 | `/etc/shadow`, `0600`, owner `65534` | `EACCES` | **served** |
+| uid 1000 | file in a `0000` directory | `EACCES` | `EACCES` |
+
+And the descriptor the third row refuses is the one that then answers `EBADF` from
+`read`, `mmap` and `fsync` while `fstat` reports the real `1295` bytes. The parent
+directory's search bit is asked; the file's own mode is not. Linux reaches it in
+`build_open_flags` (`acc_mode = 0`, `MAY_OPEN` alone).
+
+**The pin** is four claims and a child process. `t-open-path` now writes two
+fixtures - `moon` at `0000` and `sun` at `0444` - forks, and the child drops to
+`nobody` **before** it opens anything, then reports `rd=<answer> path=<answer>` for
+both over a pipe. The claim is the contrast, not the refusal: `moon` refuses
+`O_RDONLY` with `EACCES` **and serves `O_PATH`**, while `sun` is served both ways -
+so the pair cannot be satisfied by a kernel that refuses everything, which is the
+failure mode a bare "and `O_PATH` is served" claim would miss. A fifth claim keeps
+the fixture honest: the owner still opens `moon` as `O_PATH`, so the child's
+refusal is about the id and not about the file being unopenable at all.
+
+The report is **parsed rather than substring-matched**, and that cost a round: the
+first draft asked `text.contains("secret path=ok:")` against a line reading
+`secret rd=errno:13 path=ok:3`, and failed on Linux - a claim that fails on the
+kernel that is right is worth as little as one that passes on the kernel that is
+wrong. The fix is a `field(line_prefix, key)` helper; the lesson is the same one
+§6.102's signal-field pin records (assert the *parsed* value, not a fragment).
+
+**Counterfactual, and it is the whole point of the item.** The fix's `want = if
+path_only { 0 }` was put back to always computing the mode, kernel **and** loader
+rebuilt, and the pin booted in the guest: **exactly one claim red** -
+
+```
+ok:    a 0000 file refuses O_RDONLY for a stranger ("secret rd=errno:13 path=errno:13\n…")
+FAIL:  and serves O_PATH on the same file        ("secret rd=errno:13 path=errno:13\n…")
+ok:    a 0444 file is served as O_PATH for the same caller (…)   ← the neighbour
+ok:    the 0000 file is served to its owner as O_PATH, …
+```
+
+Two things to read there. The `path=errno:13` **is** the regression - the open
+asking the file's mode and refusing a name-only descriptor - and it is the only
+claim that moved, so the pin is precise rather than noisy. And the neighbour stayed
+green: a claim that fires on the right line and leaves its neighbour alone is what
+separates a pin from a signal. Restored by copying the saved fixed file back
+(`git diff src/` empty afterwards), rebuilt, `PASS` on the host and in the guest.
+
+**Gate.** `build/gate-item304.log`, `GATE_EXIT=0`, both arms in one run: stage 1
+**1340** host tests 0 failed; stage 2 **324** programs over 6 lanes on x86_64 and
+**320** on aarch64; `pass=324 fail=0` / `pass=320 fail=0`, `mpos-kunit 42 passed, 0
+failed` per arm; six-arm clippy ratchet unchanged at `162/168/389/272/3/1`, both
+workspaces formatted.
+
+**What this does not do, named.** The `0000`-directory case (a path inside a
+directory whose search bit the caller lacks is `EACCES` even under `O_PATH`) is
+measured and **not** claimed: the fixture would need a directory the sweep's own
+payload then has to clean up as `nobody`, and one `chmod` from the parent is not
+enough to make the child's refusal unambiguous. The three remaining §6.182 gaps are
+unchanged and still named: `linkat(AT_EMPTY_PATH)` is a missing door, `syncfs` is
+`ENOSYS` rather than misrefused, and `fcntl`'s ordinary-descriptor half is unpinned
+with `F_GETOWN`/`F_SETOWN`/`F_GETPIPE_SZ` unimplemented.
