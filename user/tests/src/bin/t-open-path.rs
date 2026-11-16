@@ -28,6 +28,25 @@
 //! the flag is not "refuse a link", it is "do not *traverse* one", and `O_PATH` is
 //! what lets a caller hold the link itself - which is how `/proc`-style doors hand
 //! out a descriptor on a link without following it.
+//!
+//! # The second half: the doors that read the inode directly
+//!
+//! Items 299 and 300 closed the *path-shaped* facts and `fcntl`'s table. Item 303
+//! found the rest and it was the larger half: nine calls reach
+//! `Inode::read_at`/`write_at` (or the lock table) **without** passing
+//! `File::pre_read`/`pre_write`, so the predicate those two carry never ran for
+//! them. `mmap`, `readahead`, `sync_file_range`, `fsync`, `fdatasync`,
+//! `sendfile`, `copy_file_range`, `splice`, `flock` and `fallocate` are all
+//! **`EBADF`** on Linux for an `O_PATH` descriptor
+//! (`build/scratch/opathmmap/`, eight probes) - and the refusals are
+//! **authority**, not tidiness: `open(path, O_PATH)` asks no permission on the
+//! file, so a descriptor can name a file the caller cannot open. This kernel
+//! served six of them, copied 16 bytes through one, and *grew a file* through
+//! another.
+//!
+//! The same section pins the `F_GETFL` **fold**: Linux's `build_open_flags` keeps
+//! only `O_DIRECTORY|O_NOFOLLOW|O_PATH` and sets `acc_mode = 0`, so an
+//! `O_PATH|O_TRUNC` open reports no `O_TRUNC` and truncates nothing.
 
 use mpos_user_tests::Report;
 use rustix::fs::{AtFlags, Mode, OFlags};
