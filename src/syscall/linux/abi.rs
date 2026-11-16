@@ -1180,6 +1180,13 @@ pub(crate) const PTRACE_OPTIONS_KNOWN: usize = PTRACE_O_TRACESYSGOOD
 
 /// `NT_PRSTATUS`, the register-set a `PTRACE_GETREGSET` asks for by name.
 pub(crate) const NT_PRSTATUS: usize = 1;
+/// `NT_PRFPREG`, the second register set a `PTRACE_GETREGSET` names: the x87/SSE
+/// state. Linux serves it, and a crash handler wants it. This kernel refused it
+/// with `EIO` - the answer for a request it does not know - which is what made
+/// crashpad's ptrace path fail twelve times on the Chromium run
+/// (`docs/notes/07-chromium-analysis.md`).
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) const NT_PRFPREG: usize = 2;
 
 /// The `wait(2)` option bits a tracer passes, beyond `WNOHANG`.
 ///

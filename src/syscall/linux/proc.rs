@@ -1440,6 +1440,46 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // and falls back to `GETREGS`, so both answering is what keeps it from
         // printing an error on its way to working.
         abi::PTRACE_GETREGSET | abi::PTRACE_SETREGSET => {
+            // `NT_PRFPREG` is the **other** register set a tracer asks for by
+            // name, and refusing it with `EIO` is what made crashpad's ptrace
+            // path fail twelve times on the Chromium run: `EIO` means "this
+            // kernel does not know the request", so a tracer concludes the whole
+            // mechanism is absent rather than that one set is.
+            //
+            // `PTRACE_GETFPREGS`/`SETFPREGS` beside it already carry the same
+            // bytes, so the two spellings answer the same thing now - which is
+            // what a tracer that tries either must be able to rely on.
+            if addr == abi::NT_PRFPREG {
+                let Some((base, len)) = read_iovec(data) else {
+                    return err::EFAULT;
+                };
+                if len < abi::FPREGS_BYTES {
+                    return err::EIO;
+                }
+                if request == abi::PTRACE_GETREGSET {
+                    let Some(fpu) = crate::sched::trace_fpu(id) else {
+                        return err::ESRCH;
+                    };
+                    if !buffer_ok(base, abi::FPREGS_BYTES, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    abi::write_user_fpregs(base, &fpu);
+                } else {
+                    if !buffer_ok(base, abi::FPREGS_BYTES, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    if !crate::sched::set_trace_fpu(id, &abi::read_user_fpregs(base)) {
+                        return err::ESRCH;
+                    }
+                }
+                if let Some(at) = data
+                    .checked_add(8)
+                    .filter(|at| buffer_ok(*at, 8, true, from_user))
+                {
+                    unsafe { (at as *mut u64).write_unaligned(abi::FPREGS_BYTES as u64) };
+                }
+                return 0;
+            }
             if addr != abi::NT_PRSTATUS {
                 return err::EIO;
             }
