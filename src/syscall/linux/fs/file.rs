@@ -139,7 +139,11 @@ fn followed_link(path: &str, base: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> 
 /// where Linux's is about the name. `readlinkat` is the one caller that must not
 /// come through here with an empty name and says so in its own comment: Linux
 /// consults *its* descriptor first and only then refuses the name.
-fn base_for(dirfd: i32, path: &str, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
+pub(crate) fn base_for(
+    dirfd: i32,
+    path: &str,
+    cwd: &Arc<dyn Inode>,
+) -> Result<Arc<dyn Inode>, isize> {
     if path.is_empty() {
         return Err(err::ENOENT);
     }

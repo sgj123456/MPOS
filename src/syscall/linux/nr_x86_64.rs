@@ -34,6 +34,9 @@ pub const CLONE: u64 = 56;
 pub const FORK: u64 = 57;
 pub const VFORK: u64 = 58;
 pub const EXECVE: u64 = 59;
+/// `execveat(2)`: `execve` with a dirfd and `AT_EMPTY_PATH`. Since Linux 3.19,
+/// and the call musl's `fexecve` is built from.
+pub const EXECVEAT: u64 = 322;
 pub const EXIT: u64 = 60;
 pub const WAIT4: u64 = 61;
 pub const KILL: u64 = 62;

@@ -365,6 +365,7 @@ pub unsafe fn dispatch(
         // return-frame patch, which goes through `hal` (`set_exec_return`), and
         // the ptrace stop after it, which is a no-op where no tracer is attached.
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
+        nr::EXECVEAT => proc::handle_execveat(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit_group(args),
         // `wait4(pid, *status, options, *rusage)` keeps its Linux argument

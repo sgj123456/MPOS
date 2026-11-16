@@ -1978,28 +1978,6 @@ pub(super) fn handle_execve(
         Ok(path) => path,
         Err(e) => return e,
     };
-    // An argument is not a pathname either. Linux bounds both arrays by
-    // `MAX_ARG_STRLEN` - 32 pages - and nothing else: a program is handed
-    // whatever the caller wrote, and `fish`'s completion machinery passes an
-    // `awk` script several kilobytes long as one argument. A pathname's
-    // 255-byte ceiling here refused it with `Filename too long` before `awk`
-    // ever ran, which is the same mistake the environment's line below
-    // records - made in the array that is *not* paths.
-    let mut argv = match argv_arg(args[1], crate::syscall::MAX_ARG_STR) {
-        Ok(argv) => argv,
-        Err(e) => return e,
-    };
-    if argv.is_empty() {
-        let name = path.rsplit('/').next().unwrap_or(&path);
-        argv.push(String::from(name));
-    }
-    // The environment's strings are not paths: a real compiler's
-    // COLLECT_GCC_OPTIONS runs past 255 bytes, and Linux bounds envp by
-    // the argument block's total, not by a pathname's ceiling.
-    let envp = match argv_arg(args[2], crate::syscall::MAX_ARG_STR) {
-        Ok(envp) => envp,
-        Err(e) => return e,
-    };
     // The name has to be executable by the caller before a byte of it is
     // read, and the check comes after the argument strings for the reason
     // Linux puts it there: a caller with a bad `argv` pointer hears EFAULT
@@ -2007,6 +1985,102 @@ pub(super) fn handle_execve(
     let inode = match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
         Ok(inode) => inode,
         Err(e) => return err_of(e),
+    };
+    exec_inode(args, cwd, regs_ptr, inode, path, 1, 2)
+}
+
+/// `execveat(dirfd, path, argv, envp, flags)` — `execve` with a directory
+/// descriptor, and the one door that can run a **descriptor's own file**.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/opathmmap/exat.c`):
+///
+///   * a relative name plus a dirfd is served, exactly as `execve` serves the
+///     same name resolved against its cwd;
+///   * `AT_EMPTY_PATH` with an empty name runs the file the descriptor holds -
+///     this is how a caller execs something it has already opened and checked,
+///     and it is what musl's `fexecve` is built from;
+///   * a descriptor the table does not hold is `EBADF`, and it is judged
+///     **before** the empty name (measured: `(-1, "", AT_EMPTY_PATH)` is
+///     `EBADF`, not `ENOENT`);
+///   * an empty name **without** `AT_EMPTY_PATH` is `ENOENT`, which is the
+///     same pair rule `linkat` has;
+///   * an unknown flag bit is `EINVAL`, and `AT_SYMLINK_NOFOLLOW` is accepted.
+///
+/// The `AT_SYMLINK_NOFOLLOW` half has nothing extra to do: the resolution this
+/// door uses walks the name and lands on what it reaches, which is what the
+/// flag *prevents* - and this kernel's resolver takes the final component as
+/// the file either way for an exec, because Linux does not follow a link at the
+/// end of an `execve` path when the caller said not to. Recorded rather than
+/// approximated: no claim in `t-execveat` distinguishes it, because the only
+/// way to see the difference is a symlink whose target is a different program.
+pub(super) fn handle_execveat(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn crate::vfs::Inode>,
+    regs_ptr: *mut (),
+) -> isize {
+    let flags = args[4];
+    const AT_EMPTY_PATH: usize = crate::syscall::linux::abi::AT_EMPTY_PATH;
+    const AT_SYMLINK_NOFOLLOW: usize = crate::syscall::linux::abi::AT_SYMLINK_NOFOLLOW;
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return err::EINVAL;
+    }
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
+        let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+            Ok(file) => file,
+            Err(e) => return err_of(e),
+        };
+        // The name the process will report as its own: the path this
+        // descriptor was opened by. `/proc/<pid>/exe` reads it back, and a
+        // descriptor with no name falls back to the kind's spelling.
+        let name = file.label().unwrap_or_else(|| file.display_name());
+        let inode = file.inode();
+        return exec_inode(args, cwd, regs_ptr, inode, name, 2, 3);
+    }
+    // A real name: resolve it against the dirfd, which is what makes this door
+    // `execve`-with-a-directory-descriptor rather than a descriptor call.
+    let base = match super::fs::base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let inode = match crate::vfs::resolve_opt(&path, Some(base)) {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    exec_inode(args, cwd, regs_ptr, inode, path, 2, 3)
+}
+
+/// The body both exec doors share, given the file to run and the name to report.
+///
+/// `argv_at`/`envp_at` are the *register* slots the two arrays arrive in, which
+/// differ between the doors (`execve` has `path` first, `execveat` `dirfd` and
+/// `path`), so the caller names them rather than the indices being shared.
+fn exec_inode(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn crate::vfs::Inode>,
+    regs_ptr: *mut (),
+    inode: Arc<dyn crate::vfs::Inode>,
+    path: alloc::string::String,
+    argv_at: usize,
+    envp_at: usize,
+) -> isize {
+    let mut argv = match argv_arg(args[argv_at], crate::syscall::MAX_ARG_STR) {
+        Ok(argv) => argv,
+        Err(e) => return e,
+    };
+    if argv.is_empty() {
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        argv.push(String::from(name));
+    }
+    let envp = match argv_arg(args[envp_at], crate::syscall::MAX_ARG_STR) {
+        Ok(envp) => envp,
+        Err(e) => return e,
     };
     if let Err(e) = crate::vfs::may_access(&inode, crate::vfs::X_OK) {
         return err_of(e);
