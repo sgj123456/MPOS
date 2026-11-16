@@ -59,30 +59,143 @@ Terminated                             <- the 150 s budget, not a crash
 
 Two distinct things are visible and they must not be conflated.
 
-## 3. Finding A — `error 14` on an `r-x` mapping is **not** a kernel bug
+## 3. Finding A — the `libdbus` fault and the `trap 3` are **Chromium's own CHECK**, and the kernel is right
 
-`error 14` decodes as `P=0, W=1, U=1, RSVD=1`: a **write** fault from user mode
-against a page that was not present. The VMA is `r-xu` — readable, executable,
-**not writable** — a private file mapping of `libdbus`.
+The first reading of this run produced two alarming lines and both turned out to be
+**correct kernel behaviour**, which is worth recording because the wrong reading was
+written down here first and had to be overturned by measurement.
 
-The obvious reading ("this kernel mishandles COW on file mappings") is **wrong**,
-and was checked against Linux before being written down. On this host:
-
-```c
-p = mmap(0, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE, fd, 0);
-p[0] = 'Z';          /* write to an r-x private file mapping */
+```
+inotify_reader[719]: segfault at 7e269cad419b ip 00007e269cad419b
+   sp 000000003fa9de78 error 14 in /usr/lib/libdbus-1.so.3[1119b,...]
+  trap 3 code 0x0 rip 0x7d5568b88127 rsp 0x3fdafbc0 rflags 0x246
+  bytes at rip: [0f, 0b, cc, 0f, 0b, cc, cc, cc, cc, 55, 48, 89, e5, ...]
 ```
 
-Linux dies with `SIGSEGV` (exit 139) for the same reason this kernel does: `PROT_EXEC`
-does not imply write, and a private mapping of a **read-only** fd gives no COW right.
-So this kernel answered correctly, and `libdbus` faulted because it wrote to its own
-text segment.
+### `error 14` is not a reserved-bit violation
 
-**What that means for the analysis**: the `inotify_reader` crash is a *symptom*
-worth investigating on its own (a dbus library writing its own `.text` is either a
-relocation this kernel mishandled or dbus's own bug), but it is **not** a syscall
-gap, and it is not what a browser needs in order to run. It is listed as an open
-question, not as the blocker.
+The Intel decode reads `14 = 0b1110` as `P=0, W=1, U=1, RSVD=1`, and the obvious
+reading — "the kernel set a reserved bit in a page table" — is **wrong**. On x86 the
+W bit is *undefined* when `P=0` (the SDM only defines it for protection violations),
+and this kernel's own note (`src/sched/runtime/child_exit.rs`) records the measured
+shape: **`error 14` is an instruction fetch from a not-present page.** QEMU sets the
+bits that are undefined rather than leaving them clear.
+
+Measured on a Linux host for comparison (`build/scratch/pfcode/p.c`): a write to a
+present `r-x` page, a present `r--` page and a `PROT_NONE` page all report `error 6`;
+a never-mapped address reports `error 6` with `si_code` `SEGV_MAPERR`. So `14` is
+this machine's spelling of "not present", not a distinct fault class.
+
+### A never-touched executable page **does** populate
+
+The follow-on hypothesis — that the demand path refuses to fill an executable page
+because the fault carries `W=1` and `Vma::permits(true)` is false for `r-x` — was
+**tested and refuted** (`probe-fetchfault`, a 256 KiB `r-x` private mapping of
+`/lib/ld-musl-x86_64.so.1` with a fetch into a page never touched):
+
+```
+  mapped 262144 bytes ... r-x
+  data read of last page ok (255)
+  about to fetch from a mid page ...
+  trap 6 ... invalid opcode          <- the page WAS populated; the bytes were junk
+```
+
+The fetch reached the page's contents and died of whatever bytes were there. So the
+demand path serves executable pages correctly, and finding A's "the kernel mishandled
+this" was wrong.
+
+### `trap 3` with `bytes = [0f, 0b, …]` is self-consistent
+
+`#BP`'s saved `rip` points **after** the `int3` — the kernel's own comment says so —
+so a byte dump from that `rip` shows the *next* instruction. Verified directly with a
+purpose-built page (`probe-ripafter`, bytes `cc 0f 0b cc 0f 0b cc cc`):
+
+```
+  trap 3 code 0x0 rip 0x7e5615c9c001        <- the int3 was at ...c000
+  bytes at rip: [0f, 0b, cc, 0f, 0b, cc, cc, ...]
+  child signal=5 (SIGTRAP)
+```
+
+So Chromium's `int3` followed by `ud2` is exactly what produces the line observed, and
+`trap 3` really is its `IMMEDIATE_CRASH()` — Chromium's own `CHECK`/`LOG(FATAL)` path,
+not musl's `a_crash()` (which is `ud2` → `trap 6`, verified separately: `ud2` →
+`SIGILL(4)`, `int3` → `SIGTRAP(5)`, both correct).
+
+**Conclusion: the process did not die of a kernel fault.** It logged a dbus failure
+storm (`Failed to connect to the bus: Could not parse server address` — the image's
+`DBUS_SESSION_BUS_ADDRESS` is unset/empty), then took its own CHECK and trapped. That
+is a **userspace/environment** problem, not a syscall gap.
+
+## 3b. Finding A2 — a second, **different** fault: a present page with `U=0`
+
+With `DBUS_SESSION_BUS_ADDRESS` set, Chromium got further and produced a fault that
+is a genuine kernel anomaly. It is recorded here as **open** — located precisely,
+not yet explained — because the analysis is worth more than a guess.
+
+```
+CacheThread_Blo[725]: segfault at 7e820912c000 ip 7e6ecc892b40 error 5
+   in /lib/ld-musl-x86_64.so.1
+PFDIAG page=0x7e820912c000 pte=0x800000003acfd003  P=1 W=1 U=0
+PFDIAG vma=NONE (no mapping describes 0x7e820912c000)
+PFDIAG fault_in=0x7e820912c000 eager[/tmp/cp3/Default/Web Data]
+PFDIAG rip_in=0x7e6ecc892b40 eager[/lib/ld-musl-x86_64.so.1]
+   op=[f3, 0f, 6f, 06, ...]        <- `movdqu xmm0,[rsi]`, a 16-byte SSE load
+```
+
+What it says:
+
+- `error 5 = 0b101` → `P=1` (present), `U=1` (user), **`W=0`** — a user **read** of a
+  page that **is** present;
+- the PTE is `0x800000003acfd003`: `NX=1, P=1, W=1, U=0`. The page is present and
+  writable but **supervisor-only**, so a ring-3 read faults. NX on a read is
+  irrelevant.
+- `rip_in` is a **16-byte SSE load inside `ld-musl`'s `memcpy`**, and the address
+  being read is one the process believes it owns — it is reading out of its own
+  `/tmp/cp3/Default/Web Data`.
+
+Compare with the *first* fault of the same run, whose PTE was
+`0x3fba6025` = `P=1 W=0 U=1` — **`U=1`, correct**. So the two faults are not the same
+defect, and only the second has the supervisor-only bit.
+
+**What was ruled out, by measurement:**
+
+- ordinary `MAP_PRIVATE|MAP_ANONYMOUS` and private file mappings both get `U=1`
+  (`probe-pte`: an anonymous page and a file mapping of `/bin/busybox` are written and
+  read from ring 3 without faulting);
+- `page_flags` does translate `MapFlags::USER` → `USER_ACCESSIBLE`
+  (`arch/src/arch/x86_64/paging.rs`), so the translation is not missing;
+- `munmap_user` does clear the page tables (`unmap_user`) and does forget eager
+  ranges (`forget_ranges`), so a plain unmap is not leaving a stale supervisor entry;
+- `PFDIAG vma=NONE` is a limitation of the **diagnostic** (it consults the VMA table
+  and not the eager-range table), not necessarily of the kernel: the eager line
+  printed immediately after names a range covering the address.
+
+**Also ruled out by measurement** (`probe-mprot`): `mprotect` keeps the User bit.
+An 8 KiB mapping was read, write-protected (`PROT_READ`), read again, set to
+`PROT_NONE`, restored to `PROT_READ|PROT_WRITE` and read a third time — every read
+succeeded. So a `mprotect` that drops `PROT_WRITE` does **not** leave the leaf
+supervisor-only on this kernel.
+
+**What is left to check**, in order, and this is the honest handover:
+
+1. `protect` and `map_shared` take different flag paths from `try_map`
+   (`arch/src/arch/x86_64/paging.rs`: `protect` walks leaves by address, which is
+   what an eager range needs and what nothing above exercises with `USER`);
+2. whether the `run=[0x7e820912c000..0x7e820913a000)` in the PFDIAG line spans more
+   than one page — if the *first* page of a run gets the correct flags and a later
+   one does not, the run-scatter loop (`Cache::run_places`) is the suspect;
+3. whether `mremap` of an eager range (`move_eager_ranges`) rewrites the leaves at
+   the new address with the stored flags or with a default.
+
+Three hypotheses have been tested and refuted (fetch-demand, plain `mprotect`, plain
+`munmap`); the remaining ones all involve a path that **rewrites an existing leaf**,
+which is where a missing `USER_ACCESSIBLE` would survive unnoticed by every other
+test here — no other program on this machine remaps 40 KB of eager pages per
+allocation the way Chromium's allocator does.
+
+**This is a real bug and it is now cheap to find**: the PFDIAG line already names the
+address, the PTE, the range and the instruction. What it needs is the third
+hypothesis tested with one boot, not more reading.
 
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
