@@ -108,9 +108,25 @@ impl Kernel for Services {
         // looking for a protection fault that was never raised
         // (`docs/notes/` §6.158).
         let (comm, tid) = fault_identity();
-        let name = trap_name(vector);
-        let line =
-            alloc::format!("traps: {comm}[{tid}] {name} ip:{ip:x} sp:{sp:x} error:{error:x}");
+        let trap = trap_name(vector);
+        // **Which module raised it**, in the same clause `segfault` uses. Added
+        // 2026-11-17 because the chromium `#BP` investigation could not answer
+        // it from outside: an exec image is pre-populated private anonymous
+        // memory here, so `/proc/<pid>/maps` prints file offset 0 for every
+        // segment and a reader cannot recover the instruction's offset into the
+        // file from the mapping. The kernel can - it is the one that laid the
+        // image - and the offset it prints is the one a disassembler needs.
+        let line = match sched::mapping_span_at(ip) {
+            Some((module, start, end)) => alloc::format!(
+                "traps: {comm}[{tid}] {trap} ip:{ip:x} sp:{sp:x} error:{error:x} \
+                 in {module}[{:x},{start:x}+{:x}]",
+                ip.wrapping_sub(start),
+                end.saturating_sub(start)
+            ),
+            None => {
+                alloc::format!("traps: {comm}[{tid}] {trap} ip:{ip:x} sp:{sp:x} error:{error:x}")
+            }
+        };
         // The newline is part of the *ring* line, not decoration: the ring
         // is a byte stream, and a line filed without it is glued to whatever
         // the next writer files - which is how a `traps:` line came to carry

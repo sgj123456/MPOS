@@ -796,6 +796,51 @@ to abort a worker, which is where the next instrument belongs — a run with
 `--v=1` and `--enable-logging=stderr` that captures the `CHECK` message the
 `ud2` follows, rather than the crashpad chatter that precedes it.
 
+## 3r. The CHECK text: not on this channel, and the trap is flaky
+
+The instrument §3q named was run - headless Chromium with
+`--v=1 --enable-logging=stderr --in-process-gpu` on the installed image, stderr
+captured to a file and printed after the browser was killed - plus a sampler that
+copied `/proc/<pid>/maps` for every `chromium` process every two seconds. Five
+boots; what they settled:
+
+1. **No `CHECK`/`FATAL` line ever appears on that stderr.** `grep -aE
+   "CHECK|FATAL|Check failed"` matched nothing in any run, and the byte count was
+   4 524 in one and **20 562 in three**, i.e. the child's log is not reaching this
+   file at all. The crash is in a child (the trapping pids 737/738 are forked
+   after the zygote start, not the browser 715), and a child's `CHECK` is not on
+   the parent's stderr: the `--enable-logging=stderr` switch routes the process
+   that owns the flag, not its zygote children. So "capture the CHECK text this
+   way" was the wrong instrument, and the run says so rather than nearly working.
+2. **The `#BP` itself is flaky.** It appeared in two of five runs, always in a
+   forked child, at the same instruction class (`rip` on a `ud2` whose preceding
+   byte is `int3`); the other three runs ran to the kill with no trap. Two
+   consecutive runs without it ended the probe, per the rule the Chromium plan
+   states.
+3. **The registers at the trap are a real datum** (`rax 0`, `rbx 2`,
+   `r12 0xffffff00`, `rdi 0`, `rsi` a module pointer), and they are now printed
+   with the module clause (below). What they do **not** establish is a kernel
+   defect: no syscall failed, and the values are a child's own computation.
+4. **Outside-in address arithmetic cannot close it.** The obvious move - derive
+   the image's load base from `rsi - <string offset>` and read the instruction's
+   file offset - does not survive this kernel's exec image: every segment is
+   pre-populated private anonymous memory, so `maps` prints file offset `0` for
+   all of them (§4b, fact 2), and the ELF's `p_vaddr - p_offset` differs per
+   segment (`readelf -lW`: the executable LOAD is `offset 0x1e64304`, `vaddr
+   0x1e65304`). Two alignments fit the trap word, disagreeing by `0x2f49000`,
+   one landing in string data and one in code. **No claim is made** about which
+   function crashed; a "probably `pa_context_get_state`" from one of the two was
+   discarded rather than written down.
+
+**Instrument added instead.** The kernel's `traps:` line now carries the same
+`in <module>[<offset>,<base>+<len>]` clause the `segfault` line has
+(`src/kernel_services.rs`). The kernel laid the image, so it can say which
+mapping the `ip` is in and at what offset - the two facts an outside reader
+cannot recover - and every future user trap is self-locating. The next Chromium
+run that reproduces the trap reads the module and offset straight out of the
+line; if it does not reproduce, the next instrument is a live tracer
+(`PTRACE_SEIZE` is now faithful, §4) rather than another stderr capture.
+
 ## 4. Finding B — FIXED: `PTRACE_SEIZE`/`PTRACE_INTERRUPT` were missing, and crashpad needs them
 
 This was the first real, nameable gap in the trace:
@@ -983,17 +1028,14 @@ reach them. Naming them as gaps would repeat the mistake §6.194 records.
 
 ## 6. Recommended order, and why
 
-1. **`PTRACE_SEIZE` / `PTRACE_INTERRUPT`** (Finding B). Measured, named, bounded, and
-   it is the one item that makes every *other* failure legible: without a working
-   crash handler a browser bring-up is guesswork, because the interesting deaths are
-   the ones that leave no output. It is a shaped extension of `PTRACE_ATTACH`'s
-   existing machinery (`may_inspect` → `set_tracer` → stop → `wait` event), not a new
-   subsystem — `SEIZE` is `ATTACH` without the group-stop plus an options word, and
-   `INTERRUPT` is "stop a seized tracee now".
-2. **`st_dev` in `Metadata`, and the maps device column** (Finding C's defect 1).
-   Small and self-contained, and it is right on its own terms regardless of Chromium:
-   `maps`' device column is a fact about the file that this kernel can compute and
-   does not.
+1. **`PTRACE_SEIZE` / `PTRACE_INTERRUPT`** (Finding B) — **landed**, and re-measured
+   on 2026-11-17: the option word, the two different refusals (`EIO` for an attached
+   tracee, `ESRCH` for an untraced one) and `PTRACE_EVENT_STOP` are pinned by
+   `t-ptrace-seize`. What remains of this item is `PTRACE_LISTEN`, which needs the
+   seized group-stop path first (§4).
+2. **`st_dev` in `Metadata`, and the maps device column** — **done** (§4b, defect 1):
+   the column is the mount's `st_dev` now and `t-maps-identity` pins it. What is left
+   of Finding C is only its *fact 2*, the exec image's file-backing decision.
 3. **The `libdbus` `r-x` write** (Finding A). Not a syscall gap — Linux faults on the
    same access — but a library writing its own text segment means something upstream
    is wrong: a relocation the loader mishandled, or a `TEXTREL` the package should not
