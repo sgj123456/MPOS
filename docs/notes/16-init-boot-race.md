@@ -42,6 +42,38 @@ not a bad pointer from the program's own data.
 sweeps and two full dual-arm sweeps, all green with six summaries each. Nothing
 was changed in the tree between the failing run and those five.
 
+**Recurred 2026-11-17 22:04**, once, on x86_64 lane 2 of a full dual-arm gate
+(the run whose x86_64 arm then failed with no summary; the aarch64 arm in the
+same run was green at `pass=334 fail=0`, and the x86_64 re-run was green at
+`pass=338 fail=0`). The lane's tail, read before the re-run:
+
+```
+=== PASS t-ptrace-seize
+sh[1]: segfault at 7e467f91ec67 ip 00007dfb20aee181 sp 000000003f8d3800 error 4 \
+        in /lib/ld-musl-x86_64.so.1[1c181,7dfb20ad2000+59000]
+PFDIAG page=0x7e467f91e000 NOT MAPPED task=1 rip=0x7dfb20aee181 \
+        mapped=none around the page bytes=[41,0f,be,32,41,bb,01,00,00,00,40,84,f6,78,30,85]
+PFDIAG vma=none - no mapping of this process covers the page
+INIT_EXITED: the system has no init left
+```
+
+It is the same terminal signature as the first observation (a `#PF` **read**
+from libc's own table, `mapped=none`), not the same instruction: the first was
+`mov rdx,[r13+rcx*8]`, this one decodes as `movsx esi, byte [r10]`. The
+"decisive next measurement" this file names for a recurrence was therefore
+taken: **`mapped=none`**, while the `ip` is still executing from the same
+`ld-musl` image (`rip` inside the file's text mapping). So this is not a
+one-page hole in a live data mapping; the whole VMA the table should live in is
+absent, while the text mapping of the same file is present. That narrows the
+question to what removed or never created that mapping - it does not yet name
+it.
+
+The lane log was **not preserved before the re-run** (`build/test-lane-x86_64-2`
+was overwritten by the second gate), which is the exact mistake the next section
+records; the dump above survives only because it was read and quoted first. A
+third occurrence should copy the lane's `serial.log` to `build/probe/` *before*
+anything else.
+
 Recorded as an **observation, not a diagnosis** — the same standing this
 repository gives the aarch64 EL0 boot-check death (`AGENTS.md` §5). What differs
 is that its signature is *new*: the earlier `INIT_EXITED` recorded in
