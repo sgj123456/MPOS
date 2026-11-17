@@ -392,32 +392,56 @@ kernel defect". No code changed. The remaining Chromium blocker is in a flaky
 userspace/resource-loading path, and instrumenting it further needs a run that
 reliably reaches the same point — which the current guest setup does not.
 
-## 3h. The `/proc/self/*.pak` lead — checked from code, not landable
+## 3h. FIXED — `/proc/<pid>/exe` reported the caller's raw argument, not an absolute path
 
 Chromium's stderr named `/proc/self/chrome_100_percent.pak` and
-`/proc/self/resources.pak` as resource paths it could not load. The obvious
-suspect was `/proc/self/exe`: this kernel's `handle_execve` passes the **raw**
-path argument from `cstr_arg` into `exec_inode`, which stores it as `task.exe`,
-while Linux reports an absolute canonical pathname. A program exec'd by a
-relative name would then see a relative `exe`, and a resource loader doing
-`dirname(/proc/self/exe)` could land somewhere wrong.
+`/proc/self/resources.pak` as resource paths it could not load. A resource loader
+locates itself with `dirname(readlink("/proc/self/exe"))`, so a **relative** link
+sends it to the wrong directory. That was the lead, and it turned out to be a real
+kernel defect with a clean measurement on both sides.
 
-Two facts settled it without a guest run:
+**Measured on Linux 7.3.4** (`build/scratch/rex.c`), invoked as `./rexprobe` from
+`/tmp`:
 
-- Linux's own behaviour is the contrast: with `argv0` = `./target/.../probe`,
-  `readlink(/proc/self/exe)` still returned the **absolute**
-  `/home/mp/mpos/target/.../probe`.
-- Every guest attempt to exercise a **relative** exec was defeated by the boot
-  harness rewriting `stage/init` from its own template before QEMU started; the
-  runs that did execute used `/bin/probe-exepath` (absolute) and returned the
-  correct `/bin/probe-exepath`. So the relative case was **never measured**.
+```
+exe=/tmp/rexprobe      <- absolute, though argv0 was ./rexprobe
+```
 
-**Not landed**: `task.exe` storing the caller's raw path is a real difference
-from Linux, but without a guest measurement showing a program actually
-mis-resolving because of it, changing it would be a guess. The probe file was
-removed and the tree restored. Recorded so the relative-exec case is measured
-properly (outside the one-test harness, which overwrites `init`) before anyone
-acts on it.
+and the same absolute path when invoked absolutely. Linux canonicalises.
+
+**Measured in this kernel, before the fix** (`build/probe/rel/serial.log`), with a
+purpose-built boot whose `/init` `cd`s to `/bin` and execs `./probe-exepath`:
+
+```
+exe=./probe-exepath    <- the caller's raw argument
+argv0=./probe-exepath
+cwd=Ok("/bin")
+```
+
+**The cause**: `handle_execve` passed the raw `cstr_arg` string into `exec_inode`,
+which stored it as `Task::exe` unchanged.
+
+**The fix**: `exec_inode` normalises it once — absolute paths through
+`vfs::path::normalize`, relative ones joined to `sched::current_cwd_path()`. Both
+exec doors share the body, so both are covered; the `execveat` `AT_EMPTY_PATH` arm
+hands over the descriptor's own label, which is absolute by construction.
+
+**After**, the same relative exec reports `exe=/bin/probe-exepath` while `argv0` is
+still `./probe-exepath` — correct, because Linux leaves `/proc/self/cmdline` alone.
+The pin checks the link only; `argv[0]` is a different question.
+
+`t-proc-exe-path` pins it (4 claims): the child re-execs itself by a bare relative
+name from its own directory and reports its link back through a pipe, and the
+parent compares it against its own absolute path. **Counterfactual**: reverting only
+the normalisation reddens exactly two claims with `./t-proc-exe-path` — the defect
+as first observed — and restoring it is green on both arms.
+
+**A harness fact that cost three attempts**: `one-test-boot.sh` rewrites
+`stage/init` from its own template on every run, so a custom init is silently
+overwritten. The measurement only worked once the boot script was written
+separately (`.workbuddy/relative-exec-boot.sh`), and the earlier "the relative case
+was never measured" conclusion in this file was a consequence of that, not of the
+kernel.
 
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
