@@ -204,6 +204,22 @@ pub const PTRACE_EVENT_EXEC: u32 = 4;
 /// supervisor uses to route the call.
 pub const PTRACE_EVENT_SECCOMP: u32 = 7;
 
+/// The event a stop reports when it is not a syscall or signal boundary but a
+/// **stop the tracee was asked to take**: `PTRACE_INTERRUPT` on a seized tracee,
+/// and the first stop of a child auto-attached from a seized parent.
+///
+/// It is not a `PTRACE_O_*` request and no tracer opts into it; a tracer reads
+/// it to tell "I asked you to pause" from an ordinary `SIGTRAP`, which is what
+/// crashpad does. Measured on Linux 7.3.4
+/// (`build/scratch/seize2/p.c`): a seized tracee interrupted while running
+/// reports `status >> 8 == 0x8005`, i.e. `SIGTRAP | (PTRACE_EVENT_STOP << 8)`,
+/// where this kernel used to report a bare `0x0005`; `seize2/t.c` measures the
+/// auto-attached child's first stop the same way. A seized tracee's *group*
+/// stop is a different shape and is not produced here yet (measured: a `SIGSTOP`
+/// to a seized tracee first reports a signal-delivery stop with plain `SIGSTOP`,
+/// `0x13`).
+pub const PTRACE_EVENT_STOP: u32 = 128;
+
 /// The events this kernel accepts a name for and does not produce.
 ///
 /// `VFORK_DONE` and `EXIT` are each a separate stop a tracer can ask to be told
@@ -1186,6 +1202,7 @@ mod tests {
         assert_eq!(PTRACE_EVENT_EXEC, 4);
         assert_eq!(unwatched_events::VFORK_DONE, 5);
         assert_eq!(unwatched_events::EXIT, 6);
+        assert_eq!(PTRACE_EVENT_STOP, 128);
         assert_eq!(SYSCALL_TRAP, 0x80);
     }
 

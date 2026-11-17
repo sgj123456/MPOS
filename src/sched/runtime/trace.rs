@@ -5,9 +5,9 @@ use super::task::with_table;
 use super::task::{ChildKind, Stop, SyscallStop, Table, Task, WaitFor, current};
 use crate::abi::{
     PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
-    PTRACE_EVENT_SECCOMP, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC,
-    PTRACE_O_TRACEFORK, PTRACE_O_TRACESECCOMP, PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK,
-    SYSCALL_TRAP,
+    PTRACE_EVENT_SECCOMP, PTRACE_EVENT_STOP, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
+    PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK, PTRACE_O_TRACESECCOMP, PTRACE_O_TRACESYSGOOD,
+    PTRACE_O_TRACEVFORK, SYSCALL_TRAP,
 };
 use crate::hal;
 use crate::hal::{ABI_REG_COUNT, AbiRegs, ContextOps, UserFrame, UserFrameOps};
@@ -35,13 +35,32 @@ pub fn is_stopped(id: TaskId) -> bool {
 
 /// Bind `id` to `tracer`. Returns false when the task is gone or has exited,
 /// which the syscall layer reports as `ESRCH`.
-pub fn set_tracer(id: TaskId, tracer: TaskId) -> bool {
+///
+/// `seized` carries **which door** made the link, because Linux keeps that
+/// distinction for the tracee's whole life: `PTRACE_INTERRUPT` refuses (with
+/// `EIO`) a tracee that was merely attached, and the stop an interrupt raises
+/// reports `PTRACE_EVENT_STOP` only for the seized pair. The three callers are
+/// `TRACEME` and `ATTACH` (`false`) and `SEIZE` (`true`).
+pub fn set_tracer(id: TaskId, tracer: TaskId, seized: bool) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited => {
             task.trace.tracer = Some(tracer);
+            task.trace.seized = seized;
             true
         }
         _ => false,
+    })
+}
+
+/// Whether `id`'s link was made by `PTRACE_SEIZE`. `false` for an untraced task,
+/// which is the answer that keeps the two refusals apart: no tracer is `ESRCH`,
+/// a tracer that attached is `EIO`.
+pub fn is_seized(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| task.trace.seized)
     })
 }
 
@@ -667,9 +686,13 @@ pub(crate) fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, eve
         PTRACE_EVENT_CLONE => PTRACE_O_TRACECLONE,
         _ => return false,
     };
-    let (tracer, options) = {
+    let (tracer, seized, options) = {
         let parent = t.task(parent);
-        (parent.trace.tracer, parent.trace.options)
+        (
+            parent.trace.tracer,
+            parent.trace.seized,
+            parent.trace.options,
+        )
     };
     // No tracer, or one that did not ask about this kind of child: the child is
     // nobody's business but its parent's, and it starts running.
@@ -684,13 +707,25 @@ pub(crate) fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, eve
     // that process creates afterwards is traced with those same options without
     // the tracer saying so again.
     child_task.trace.options = options;
+    // Which door attached the *parent* decides what the new child's first stop
+    // looks like, and both shapes were measured (Linux 7.3.4): a child of a
+    // seized tracee is born stopped with `status >> 8 == 0x8005` - `SIGTRAP`
+    // carrying `PTRACE_EVENT_STOP` (`build/scratch/seize2/t.c`) - while a child
+    // of an `ATTACH`ed one reports plain `SIGSTOP`, `0x13` (`seize2/v.c`).
+    // Copying the flag is not enough on its own; the stop's signal and event
+    // follow from it.
+    child_task.trace.seized = seized;
     child_task.trace.stop = Some(Stop {
-        // The `SIGSTOP` of being newly attached - the same stop `PTRACE_ATTACH`
-        // gives, and the one a tracer is written to swallow. Linux reports
-        // `PTRACE_EVENT_STOP` instead when the tracer attached with
-        // `PTRACE_SEIZE`; this kernel has no `SEIZE`, so it is the older shape.
-        signal: signal::SIGSTOP,
-        event: PTRACE_EVENT_NONE,
+        signal: if seized {
+            signal::SIGTRAP
+        } else {
+            signal::SIGSTOP
+        },
+        event: if seized {
+            PTRACE_EVENT_STOP
+        } else {
+            PTRACE_EVENT_NONE
+        },
         traced: true,
         reported: false,
         message: 0,
@@ -816,7 +851,12 @@ pub fn stop_at_syscall(
             regs,
             Stop {
                 signal: signal::SIGTRAP,
-                event: PTRACE_EVENT_NONE,
+                // Not `NONE`: Linux reports this pair as an *event* stop, and
+                // the event is what tells a tracer "you asked for this pause"
+                // rather than "the tracee happened to raise SIGTRAP". Measured
+                // (`build/scratch/seize2/p.c`): `status >> 8 == 0x8005` on
+                // Linux, i.e. `SIGTRAP | (PTRACE_EVENT_STOP << 8)`.
+                event: PTRACE_EVENT_STOP,
                 traced: true,
                 reported: false,
                 message: 0,
@@ -1011,6 +1051,7 @@ pub fn detach_traced(id: TaskId, signal: u8) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited => {
             task.trace.tracer = None;
+            task.trace.seized = false;
             task.trace.armed = false;
             // Measured against Linux, a detach has three cases:
             //

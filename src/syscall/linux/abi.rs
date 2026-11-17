@@ -1118,14 +1118,22 @@ pub(crate) const PTRACE_ATTACH: usize = 16;
 /// alias of `ATTACH`: measured on Linux 7.3.4
 /// (`build/scratch/seize/s.c`), `PTRACE_SEIZE` attaches **without stopping**
 /// the tracee (`waitpid(WNOHANG)` still answers 0 afterwards) and
-/// `PTRACE_INTERRUPT` then asks for a stop, which arrives as **`SIGTRAP`**, not
-/// the `SIGSTOP` a `PTRACE_ATTACH` produces. Crashpad (Chromium's crash handler)
-/// probes with this pair before falling back, so `EIO` here is what makes it
-/// conclude it cannot inspect a process.
+/// `PTRACE_INTERRUPT` then asks for a stop, which arrives as **`SIGTRAP`**,
+/// not the `SIGSTOP` a `PTRACE_ATTACH` produces. Crashpad (Chromium's crash
+/// handler) probes with this pair before falling back, so `EIO` here is what
+/// makes it conclude it cannot inspect a process.
+///
+/// The options word is taken at seize time, and a bit this kernel does not
+/// know is `EIO` rather than `SETOPTIONS`' `EINVAL` (measured,
+/// `build/scratch/seize2/p.c`: `SEIZE(child, 0x200)` reads `EIO` 5).
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const PTRACE_SEIZE: usize = 0x4206;
-/// See [`PTRACE_SEIZE`]: stop a seized tracee now. `ESRCH` when the target is not
-/// seized (measured), which is Linux's answer for "no such tracee".
+/// See [`PTRACE_SEIZE`]: stop a **seized** tracee now. Its stop is `SIGTRAP`
+/// carrying `PTRACE_EVENT_STOP` (measured: `status >> 8 == 0x8005`).
+///
+/// The two refusals are two questions, measured in the same probe: a target
+/// with no tracer is `ESRCH`, while one that was merely `ATTACH`ed is `EIO` -
+/// the request only means something for the seized pair.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const PTRACE_INTERRUPT: usize = 0x4207;
 pub(crate) const PTRACE_DETACH: usize = 17;

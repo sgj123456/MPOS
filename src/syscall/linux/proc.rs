@@ -1246,7 +1246,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // task that spawned it. A task with no parent - init, or a kernel task
         // that somehow got here - has nobody to hand itself to.
         return match crate::sched::parent_of(me) {
-            Some(parent) if crate::sched::set_tracer(me, parent) => 0,
+            Some(parent) if crate::sched::set_tracer(me, parent, false) => 0,
             _ => err::EPERM,
         };
     }
@@ -1275,7 +1275,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             Some(false) => return err::EPERM,
             Some(true) => {}
         }
-        if !crate::sched::set_tracer(id, me) {
+        if !crate::sched::set_tracer(id, me, false) {
             return err::ESRCH;
         }
         crate::sched::send_signal(id, crate::sched::signal::SIGSTOP);
@@ -1292,8 +1292,12 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     // The options word is this request's `data` (Linux takes `PTRACE_O_*` at
     // seize time, where `ATTACH` takes none and `SETOPTIONS` sets them later);
     // it is stored so a later `INTERRUPT` stop reports the events the tracer
-    // asked for. A second `SEIZE` on an already-traced task is `EPERM` on Linux
-    // (measured), not a quiet re-attach.
+    // asked for. A bit the kernel does not know is **`EIO` here**, not the
+    // `EINVAL` `SETOPTIONS` answers - measured (`build/scratch/seize2/p.c`:
+    // `SEIZE(child, 0x200)` reads `EIO` 5), which is Linux judging the request
+    // word before it looks at the options table. A second `SEIZE` on an
+    // already-traced task is `EPERM` on Linux (measured), not a quiet
+    // re-attach.
     if request == abi::PTRACE_SEIZE {
         match crate::sched::may_inspect(id) {
             None => return err::ESRCH,
@@ -1306,21 +1310,31 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         if crate::sched::tracer_of(id).is_some() || id == me {
             return err::EPERM;
         }
-        if !crate::sched::set_tracer(id, me) {
+        if data & !abi::PTRACE_OPTIONS_KNOWN != 0 {
+            return err::EIO;
+        }
+        if !crate::sched::set_tracer(id, me, true) {
             return err::ESRCH;
         }
         crate::sched::set_trace_options(id, data);
         return 0;
     }
 
-    // `PTRACE_INTERRUPT` asks a seized tracee to stop **now**. The stop it
-    // produces is `SIGTRAP`, not the `SIGSTOP` an `ATTACH` uses (measured:
-    // `WSTOPSIG` is 5), which is how a tracer tells "you attached" from "I asked
-    // you to pause". A target with no tracer is `ESRCH` - Linux's answer for a
-    // request that names no tracee (measured).
+    // `PTRACE_INTERRUPT` asks a **seized** tracee to stop now. The stop it
+    // produces is `SIGTRAP` carrying `PTRACE_EVENT_STOP`, not the `SIGSTOP` an
+    // `ATTACH` uses (measured: `WSTOPSIG` 5, `status >> 8 == 0x8005`), which is
+    // how a tracer tells "I asked you to pause" from "you attached".
+    //
+    // The two refusals are different questions and Linux keeps them apart: a
+    // target with no tracer at all is `ESRCH`, while one that was merely
+    // `ATTACH`ed is `EIO` (`build/scratch/seize2/p.c`: `ATTACH` then `INTERRUPT`
+    // reads `EIO` 5) - the request is only meaningful for the seized pair.
     if request == abi::PTRACE_INTERRUPT {
         if crate::sched::tracer_of(id) != Some(me) {
             return err::ESRCH;
+        }
+        if !crate::sched::is_seized(id) {
+            return err::EIO;
         }
         // The request is recorded, not acted on: the stop belongs to the tracee,
         // and this runs in the tracer. The scheduler honours it when the tracee is

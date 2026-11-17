@@ -1363,9 +1363,11 @@ new information**.
 
 Three items the analysis names are worth doing on their own terms, in this order:
 
-1. `PTRACE_SEIZE`/`PTRACE_INTERRUPT` (Finding B) - the missing observability primitive; it is
-   what makes every later crash legible, and it is a shaped extension of `PTRACE_ATTACH`'s
-   machinery rather than a new subsystem.
+1. `PTRACE_SEIZE`/`PTRACE_INTERRUPT` (Finding B) - **landed 2026-11-16** (`57a9529`), and
+   re-measured 2026-11-17: the option word, the `EIO`-not-`EINVAL` refusal, and
+   `PTRACE_EVENT_STOP` on both the interrupt stop and an auto-attached child's first stop are
+   now pinned by `t-ptrace-seize`. What stays named is `PTRACE_LISTEN`, which needs the seized
+   group-stop path to exist first.
 2. `st_dev` in `Metadata` and the maps device column (Finding C, defect 1) - small, and the
    fact is already computable.
 3. The `exec` image's file-backing question (Finding C, fact 2) - a design decision, kept out

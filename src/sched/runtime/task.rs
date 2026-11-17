@@ -1745,6 +1745,15 @@ pub(crate) struct Tracing {
     /// `PTRACE_DETACH` has to be able to take the link away without touching
     /// the family.
     pub(crate) tracer: Option<TaskId>,
+    /// Whether the link was made with `PTRACE_SEIZE` rather than `PTRACE_ATTACH`
+    /// or `PTRACE_TRACEME`.
+    ///
+    /// The difference is not bookkeeping: Linux refuses `PTRACE_INTERRUPT` on a
+    /// tracee that was merely attached (`EIO`, measured - `build/scratch/seize2/p.c`)
+    /// and reports that pair's stop as `PTRACE_EVENT_STOP` rather than a bare
+    /// `SIGTRAP`. A tracee born to a seized parent inherits the flag with the
+    /// options, because that is how Linux attaches the child.
+    pub(crate) seized: bool,
     /// The `PTRACE_O_*` word the tracer set with `PTRACE_SETOPTIONS`.
     pub(crate) options: usize,
     /// Where this task is stopped. `None` is a running, ready or sleeping task;

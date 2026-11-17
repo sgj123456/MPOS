@@ -796,9 +796,9 @@ to abort a worker, which is where the next instrument belongs — a run with
 `--v=1` and `--enable-logging=stderr` that captures the `CHECK` message the
 `ud2` follows, rather than the crashpad chatter that precedes it.
 
-## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
+## 4. Finding B — FIXED: `PTRACE_SEIZE`/`PTRACE_INTERRUPT` were missing, and crashpad needs them
 
-This is the real, nameable gap in the trace:
+This was the first real, nameable gap in the trace:
 
 ```
 [crashpad] ptrace: I/O error (5)   x12
@@ -806,36 +806,58 @@ This is the real, nameable gap in the trace:
 
 `EIO` from `ptrace` is Linux's own answer for **a request the kernel does not know**
 (`src/syscall/linux/proc.rs`, the `_ => err::EIO` arm), and crashpad probes with it.
-What this kernel serves, and what crashpad asks for:
+What this kernel served then, and what crashpad asks for:
 
-| request | number | this kernel |
+| request | number | before this fix |
 |---|---|---|
 | `PTRACE_TRACEME` | 0 | served |
 | `PTRACE_ATTACH` | 16 | served |
 | `PTRACE_GETREGSET` | 0x4204 | served |
 | `PTRACE_GETSIGINFO` | 0x4202 | served |
 | `PTRACE_CONT` | 7 | served |
-| **`PTRACE_SEIZE`** | **0x4206** | **not defined → `EIO`** |
-| **`PTRACE_INTERRUPT`** | **0x4207** | **not defined → `EIO`** |
-| `PTRACE_LISTEN` | 0x4208 | not defined → `EIO` |
+| `PTRACE_SEIZE` | 0x4206 | **not defined → `EIO`** |
+| `PTRACE_INTERRUPT` | 0x4207 | **not defined → `EIO`** |
+| `PTRACE_LISTEN` | 0x4208 | not defined → `EIO` (still; see below) |
 
 Crashpad is Chromium's crash handler; since Linux 3.4 it prefers the
 `SEIZE`/`INTERRUPT` pair over `ATTACH`, because `SEIZE` attaches **without** stopping
 the tracee and `INTERRUPT` then asks for a stop explicitly. Every probe of it here
-gets `EIO`, crashpad concludes it cannot inspect the crashing process, and
-`thread ID 719 not found in process` follows.
+got `EIO`, crashpad concluded it could not inspect the crashing process, and
+`thread ID 719 not found in process` followed.
 
-**Why this is the blocker it looks like**: Chromium treats its crash handler as
-load-bearing. A browser whose crashpad cannot attach is not required to abort, but it
-logs a storm and loses its crash reporting; and on a kernel where the *renderer*
-crashes (which is likely during bring-up) the crashpad failure is what turns a
-recoverable renderer death into an unexplained hang.
+**Landed 2026-11-16 (`57a9529`), and re-measured 2026-11-17 against Linux 7.3.4
+(`build/scratch/seize2/{p,q,r,t}.c`).** `SEIZE` writes the link and takes the
+`PTRACE_O_*` word in its `data`; `INTERRUPT` records a request the tracee honours at
+its next syscall boundary. Four answers separate it from `ATTACH`, and all four are
+pinned by `t-ptrace-seize`:
 
-**Scope of the fix**: `PTRACE_SEIZE` is `ATTACH` minus the group-stop, plus the
-`PTRACE_O_*` options word; `PTRACE_INTERRUPT` is "stop a seized tracee now". The
-scheduler already has the attach link, the stop state and the `wait` event path that
-`ATTACH` uses — so this is a **shaped extension of an existing mechanism**, not a new
-subsystem. That is why it is the recommended first item.
+| question | Linux | this kernel |
+|---|---|---|
+| `SEIZE(child, 0)` then `waitpid(WNOHANG)` | `0` — still running | `0` |
+| `INTERRUPT` on a seized, running tracee | `status >> 8 == 0x8005` (`SIGTRAP` + `EVENT_STOP`) | same |
+| `INTERRUPT` on an `ATTACH`ed tracee | `EIO` (5) | `EIO` |
+| `SEIZE(child, 0x200)` (unknown option bit) | `EIO`, no link written | `EIO`, no link written |
+| a child auto-attached from a seized parent | born stopped with `SIGTRAP` + `EVENT_STOP` | same |
+
+That last row was measured separately (`seize2/t.c`): the fork event stop is
+`SIGTRAP` + `PTRACE_EVENT_FORK` with `GETEVENTMSG` naming the child, and the child's
+own initial stop is `SIGTRAP` + `PTRACE_EVENT_STOP` — not the `SIGSTOP` an
+`ATTACH`-era child gets.
+
+**What is still missing, and named rather than approximated**: `PTRACE_LISTEN`
+(0x4208). It is only meaningful for a tracee in a group-stop (measured: `ESRCH` on a
+running seized tracee, `EIO` on an `ATTACH`ed one, `0` on an interrupt-stopped
+seized one, which then reads `t` in `/proc/<pid>/stat` and is not woken by
+`SIGCONT`), so it needs the seized group-stop path to be a real thing first. It is
+not on crashpad's path in this trace, and a `0` there would be the approximating
+answer this repository refuses.
+
+**Why the item was first**: Chromium treats its crash handler as load-bearing. A
+browser whose crashpad cannot attach is not required to abort, but it logs a storm
+and loses its crash reporting; and on a kernel where the *renderer* crashes the
+crashpad failure is what turns a recoverable renderer death into an unexplained
+hang. What the fix does **not** do is make Chromium render — the stall in §3j-§3q
+survived it, and that is why the next instrument is the `CHECK` text.
 
 ## 4b. Finding C — `/proc/<pid>/maps` reports **file offset 0 and dev/inode 0 for every segment**, and that is a bug
 

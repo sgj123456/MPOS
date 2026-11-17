@@ -675,6 +675,7 @@ pub fn exit(code: isize) -> ! {
         for tracee in tracees {
             let task = t.task_mut(tracee);
             task.trace.tracer = None;
+            task.trace.seized = false;
             task.trace.armed = false;
             task.trace.stop = None;
             task.trace.regs = None;
