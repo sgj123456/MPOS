@@ -291,6 +291,48 @@ served, the **iovec's length is rewritten** to the bytes moved (512 on x86_64,
 unknown note type is **still** refused, and `NT_PRSTATUS` still works — the
 regression this change could have caused by taking the wrong branch.
 
+## 3e. What actually blocks Chromium now — measured state of the live process tree
+
+After the two kernel fixes (A2 `mremap`, B `NT_PRFPREG`), the picture changed
+enough that the earlier "it takes its own CHECK and dies" reading no longer holds.
+A harness that starts Chromium in the **background** and lets the guest shell
+print 45 seconds later (`build/imgcmd/bg.sh`, `wait.sh`) settles it:
+
+```
+  chromium pid=715; sleeping 45s
+  === AFTER 45s: still running? ===   alive
+  === output so far ===               (0 bytes)
+```
+
+`ps` at 30 seconds shows a **complete, live process tree**:
+
+```
+715  chromium                         {sandbox_ipc_thr}
+718  chrome_crashpad_handler          --monitor-self ...
+720  chromium --type=zygote --no-zygote-sandbox --no-sandbox
+721  chromium --type=zygote --no-sandbox
+```
+
+and the main thread's `/proc/715/stat` is `S` (sleeping), with **no**
+`mpos: syscall ... -> EOPNOTSUPP/ENOSYS/EACCES` diagnostics anywhere in the run.
+
+So the browser is **not crashing out**; it is **stuck waiting onIPC** after the
+zygotes start, before a renderer produces any DOM (`/tmp/cwo.txt` stays at 0
+bytes). The `trap 3` lines in earlier runs are child threads crashing while the
+main process kept waiting — which is why a foreground `timeout` appeared to hang
+and why no CHECK text was ever captured: there was no CHECK-driven exit.
+
+The `PFDIAG` lines in this state are **not** the kernel bug any more: e.g.
+`pte=0x3fc19025 P=1 W=0 U=1` with `vma=... r-xu` is a correct read-only executable
+mapping whose demand fault resolved (`B9=0`). Several `MemoryInfra`/`inotify_reader`
+threads take such faults and keep running.
+
+**This is the precise starting point for the next investigation** — it is no
+longer "find a crashing syscall". It is: what IPC is the zygote/sandbox channel
+waiting for, and why does it never complete? A `futex`/`poll`/`socketpair` state
+inspector, or a `strace`-style trace of the zygote's fd traffic, is the next
+instrument. No code change is claimed here.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
