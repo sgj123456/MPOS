@@ -2159,6 +2159,29 @@ fn exec_inode(
     argv_at: usize,
     envp_at: usize,
 ) -> isize {
+    // `/proc/<pid>/exe` reports an **absolute canonical** pathname, whatever the
+    // caller passed to `execve`. Measured on Linux 7.3.4
+    // (`build/scratch/rex.c`, invoked as `./rexprobe` from `/tmp`):
+    // `readlink(/proc/self/exe)` answers `/tmp/rexprobe` - not `./rexprobe` -
+    // and the same absolute path when invoked absolutely.
+    //
+    // This kernel used to store the caller's raw argument, and the difference is
+    // observable: measured in the guest (`build/probe/rel/serial.log`), a
+    // program exec'd as `./probe-exepath` from `/bin` read back
+    // `exe=./probe-exepath` where Linux answers `/bin/probe-exepath`. A program
+    // that locates its own resources with `dirname(readlink(...))` then looks in
+    // the wrong directory - the shape Chromium showed when it tried
+    // `/proc/self/chrome_100_percent.pak`.
+    //
+    // Normalised **once, here**, so both exec doors share it; the `execveat`
+    // empty-path arm already hands over the descriptor's own label, which is
+    // absolute by construction.
+    let path = if path.starts_with('/') {
+        crate::vfs::path::normalize(&path)
+    } else {
+        let cwd_path = crate::sched::current_cwd_path();
+        crate::vfs::path::normalize(&alloc::format!("{}/{path}", cwd_path.trim_end_matches('/')))
+    };
     let mut argv = match argv_arg(args[argv_at], crate::syscall::MAX_ARG_STR) {
         Ok(argv) => argv,
         Err(e) => return e,
