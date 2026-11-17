@@ -392,6 +392,33 @@ kernel defect". No code changed. The remaining Chromium blocker is in a flaky
 userspace/resource-loading path, and instrumenting it further needs a run that
 reliably reaches the same point — which the current guest setup does not.
 
+## 3h. The `/proc/self/*.pak` lead — checked from code, not landable
+
+Chromium's stderr named `/proc/self/chrome_100_percent.pak` and
+`/proc/self/resources.pak` as resource paths it could not load. The obvious
+suspect was `/proc/self/exe`: this kernel's `handle_execve` passes the **raw**
+path argument from `cstr_arg` into `exec_inode`, which stores it as `task.exe`,
+while Linux reports an absolute canonical pathname. A program exec'd by a
+relative name would then see a relative `exe`, and a resource loader doing
+`dirname(/proc/self/exe)` could land somewhere wrong.
+
+Two facts settled it without a guest run:
+
+- Linux's own behaviour is the contrast: with `argv0` = `./target/.../probe`,
+  `readlink(/proc/self/exe)` still returned the **absolute**
+  `/home/mp/mpos/target/.../probe`.
+- Every guest attempt to exercise a **relative** exec was defeated by the boot
+  harness rewriting `stage/init` from its own template before QEMU started; the
+  runs that did execute used `/bin/probe-exepath` (absolute) and returned the
+  correct `/bin/probe-exepath`. So the relative case was **never measured**.
+
+**Not landed**: `task.exe` storing the caller's raw path is a real difference
+from Linux, but without a guest measurement showing a program actually
+mis-resolving because of it, changing it would be a guess. The probe file was
+removed and the tree restored. Recorded so the relative-exec case is measured
+properly (outside the one-test harness, which overwrites `init`) before anyone
+acts on it.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
