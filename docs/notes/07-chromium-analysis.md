@@ -552,6 +552,29 @@ from several threads at once, to reproduce `error 14` under concurrency without
 Chromium's 100-second startup. That is the shortest path from here to a landable
 fix, and this pass did not attempt it.
 
+## 3l. The concurrency probe reproduced nothing — and that names the untested half
+
+Section 3k said the `error 14` needs concurrency. A 6-thread probe that maps a
+512 KiB `r-x` file privately per thread and touches every page 40 times
+(`probe-mtfetch`) completed with **30720 page touches and no fault at all**.
+
+So concurrency alone is not the trigger. What the probe is missing is the one
+thing the note in `resolve_anon_fault` names: **the file it mapped lives on the
+initramfs (ramfs), where `frame_at` never parks.** Chromium maps its libraries
+from the **ext4 disk**, where the block transfer parks the faulting task - and
+that park, while a borrow is meant not to be held, is exactly the §6.181 shape.
+
+**That is the untested half, and it is now the only remaining hypothesis with a
+named mechanism**: a multi-threaded probe over an `r-x` file on the ext4 root (a
+file the test creates on the disk, not one shipped in the initramfs), so
+`frame_at` really parks. Everything else about the fault is measured:
+
+- `ip == fault address` and `error 14` -> an instruction fetch from a not-present page;
+- `PFDIAG` prints `P=1` because it runs *after* `resolve_anon_fault` resolved it;
+- the main process exits and leaves zygote zombies (§3k).
+
+No code was changed in this pass; the probe was removed after its negative result.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
