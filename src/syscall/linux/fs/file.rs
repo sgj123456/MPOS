@@ -4754,6 +4754,11 @@ fn note_poll_spin(
         return;
     }
     let run = RUN[me.0].fetch_add(1, Ordering::Relaxed) + 1;
+    // The run is counted per *first descriptor*, so a caller polling two of them
+    // reaches 100 whether or not the first is what keeps answering. The mask
+    // below says which one is, and it is computed before this decision so a
+    // multi-descriptor wait is reported only when **every** entry it names comes
+    // back not-ready - the shape that cannot be an event loop.
     if run != 100 || SPOKEN[me.0].swap(true, Ordering::Relaxed) {
         return;
     }
@@ -4794,6 +4799,44 @@ fn note_poll_spin(
     // those is the bug this instrument was built for.
     let exe = crate::sched::current_exe();
     let before = crate::sched::prev_syscall(me.0);
+    // **Which descriptor is actually ready**, because the fields above describe
+    // only the first one and that is not enough to tell a spin from an event
+    // loop. A caller polling two descriptors can be woken by the second every
+    // time and be perfectly correct; the same caller woken by the first, with
+    // `read=false`, is spinning. Without this line the reading was ambiguous
+    // whenever `nfds > 1` - the comment above says so, and the chromium run of
+    // 2026-11-17 showed exactly that shape: `fd=12 events=0x1 ... nodes=2`
+    // with no way to see which of the two had answered.
+    //
+    // `ready_mask` is one hex digit per descriptor, `0` for "not ready" and the
+    // revents bits otherwise, so `ready=0c` reads as "the second is ready".
+    let mut ready_mask: u64 = 0;
+    for index in 0..nfds.min(16) {
+        let at = fds + index * POLLFD_SIZE;
+        let fd = unsafe { (at as *const i32).read_unaligned() };
+        let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
+        let bits = match nodes.get(index).and_then(|w| w.as_ref()) {
+            Some(watch) if fd >= 0 => {
+                let ready = watch.node.poll_ready_client(watch.ofd);
+                let mut b: u64 = 0;
+                if events & POLLIN != 0 && ready.read {
+                    b |= POLLIN as u64;
+                }
+                if events & POLLOUT != 0 && ready.write {
+                    b |= POLLOUT as u64;
+                }
+                if watch.node.poll_hup() {
+                    b |= POLLHUP as u64;
+                }
+                if watch.node.poll_err() {
+                    b |= POLLERR as u64;
+                }
+                b
+            }
+            _ => 0,
+        };
+        ready_mask |= (bits & 0xf) << (index * 4);
+    }
     // The two positional arguments are **named** rather than left `{}`: this
     // call had three arguments for two `{}`s and the wrong two first, so every
     // line it ever printed read `exe=1 … nodes=/usr/lib/…` - the slot number
@@ -4802,7 +4845,7 @@ fn note_poll_spin(
     // that one descriptor had resolved when the count was never printed at all
     // (`build/imgcmd/serial.log`, the chromium runs of 2026-11-17).
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={slot} exe={exe} before={before} fd={fd} events={events:#x} nfds={nfds} nodes={resolved} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}\n",
+        "mpos: poll spin slot={slot} exe={exe} before={before} fd={fd} events={events:#x} nfds={nfds} nodes={resolved} ready={ready_mask:x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}\n",
         slot = me.0,
         resolved = nodes.iter().filter(|n| n.is_some()).count(),
     ));
