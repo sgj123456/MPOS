@@ -28,6 +28,7 @@ This library used to be one file, `docs/NOTES.md`. It is now split per phase; th
 | §13 | Machine-seam purity and aarch64 parity | [13-machine-seam.md](13-machine-seam.md) |
 | §14 | `arch` becomes a crate | [14-arch-crate.md](14-arch-crate.md) |
 | §15 | One boot flow | [15-boot-flow.md](15-boot-flow.md) |
+| §16 | A lane whose `/init` died before any program ran — the observation, the dump, and the rule the first reading broke | [16-init-boot-race.md](16-init-boot-race.md) |
 | appendix | The evidence behind the status board | [appendix-status-board.md](appendix-status-board.md) |
 
 A bare `§N` (no `.M`) means the whole phase — file N's top section. A `(§N)` pointer on a
