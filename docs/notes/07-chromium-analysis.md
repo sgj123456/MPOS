@@ -575,6 +575,41 @@ file the test creates on the disk, not one shipped in the initramfs), so
 
 No code was changed in this pass; the probe was removed after its negative result.
 
+## 3m. The ext4 concurrency probe also faulted nowhere — so the trigger is neither concurrency nor parking
+
+Section 3l named the last hypothesis with a mechanism: a multi-threaded probe over
+an `r-x` file **on the ext4 disk**, so `frame_at` really parks. That probe was
+written and run (`probe-ext4mt`: 8 threads, each mapping its own private `r-x`
+view of the mounted ext4 fixture and walking 64 cold pages 8 times, with the SATA
+disk attached through AHCI exactly as the gate wires it):
+
+```
+  target size=67108864
+  4096 ext4 page touches across 8 threads, no fault
+```
+
+**4096 cold ext4 page touches, 8 threads, concurrent parking through the block
+layer - and no fault.** Combined with §3l's ramfs probe (30720 touches, no fault),
+both candidate triggers are refuted by direct measurement:
+
+| hypothesis | probe | result |
+|---|---|---|
+| concurrency on a ramfs `r-x` mapping | 6 threads, 30720 touches | no fault |
+| concurrency **and** block-layer parking on ext4 | 8 threads, 4096 cold touches | no fault |
+
+So the `error 14` under Chromium needs something neither probe reproduces. The
+remaining difference is the hardest to fake in a small fixture: in Chromium the
+mapping is a **shared object being concurrently executed** while the page is still
+cold - the faulting instruction *is* the page's own first instruction, and other
+threads enter the same library at that moment. A probe that reads bytes never asks
+the CPU to *execute* an unfetched page, which is precisely what `ip == fault
+address` says happened.
+
+**Named as the next instrument**: a probe that maps a real ELF `r-x` segment from
+ext4 and *calls into it* from several threads at once, so the first instruction of
+a cold page is a fetch. That is a different probe from both above, and it is where
+the remaining evidence points. No code changed in this pass.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
