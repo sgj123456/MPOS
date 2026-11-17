@@ -38,7 +38,7 @@
 //! new vector, and its `AT_EXECFN` names the path it was executed by
 //! (`build/scratch/auxv/q.c`).
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, host_run};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 
@@ -53,6 +53,11 @@ const AT_EGID: u64 = 14;
 const AT_CLKTCK: u64 = 17;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
+/// What the CPU can do. Read by a libc to choose which instructions it may
+/// emit, so a wrong bit is a promise the machine cannot keep.
+const AT_HWCAP: u64 = 16;
+/// How large an alternate signal stack has to be for a handler to run on it.
+const AT_MINSIGSTKSZ: u64 = 51;
 
 /// The env var naming the pipe a re-executed child writes its `AT_EXECFN` to.
 const EXEC_FD: &str = "MPOS_AUXV_EXEC_FD";
@@ -204,6 +209,144 @@ fn main() {
     report.check(
         &format!("AT_CLKTCK is 100 ({clktck:?})"),
         clktck == Some(100),
+    );
+
+    // ---- the two entries a program uses to size its own memory ----
+    //
+    // Both were absent once, and each absence was a silent substitution: a libc
+    // that cannot read `AT_MINSIGSTKSZ` falls back to its own 8192 guess, and
+    // one that cannot read `AT_HWCAP` is told the machine has no FPU at all.
+    // Neither is visible as a failure - the program still runs, on worse
+    // information - which is why they are pinned rather than assumed.
+    //
+    // `AT_MINSIGSTKSZ` is pinned to **the floor this kernel enforces on
+    // `sigaltstack`**, not to Linux's number: measured on Linux 7.3.4 the
+    // vector says 3376 while `sigaltstack` accepts 2048, because Linux's report
+    // is its own XSAVE-sized frame. This kernel's frame is 952 bytes
+    // (`SIGFRAME_BYTES = FPSTATE + FPU_BYTES`, 440 + 512) and its floor is
+    // 2048, so reporting the floor is the answer that cannot under-size a
+    // caller. The claim is that the two numbers a program can read - the vector
+    // and `sigaltstack`'s `ENOMEM` - are the same rule.
+    //
+    // **A host run makes a different claim on purpose.** Linux answers 3376
+    // there (measured), because its report is sized by its own XSAVE area; this
+    // kernel's FPU image is a 512-byte `fxsave` and its frame is 952 bytes, so
+    // 2048 is the honest floor here. Pinning 2048 unconditionally would fail a
+    // host run for answering its own question correctly, and pinning `Some(_)`
+    // would pin nothing at all - so the machine's own value is named on each
+    // side and the property that must hold on both is checked below it.
+    let msz = value_of(&entries, AT_MINSIGSTKSZ);
+    report.check(
+        &format!("AT_MINSIGSTKSZ is the value this machine stands behind ({msz:?})"),
+        if host_run() {
+            msz.is_some()
+        } else {
+            msz == Some(2048)
+        },
+    );
+    // And it is not merely present: a stack of exactly that size is accepted,
+    // one byte below it is refused. That is what makes the number a promise
+    // rather than a hint.
+    //
+    // The floor is the kernel's `MINSIGSTKSZ`, which is one constant for both
+    // machines (`src/sched/signal.rs`), so `AT_MINSIGSTKSZ` is 2048 on both -
+    // but what `sigaltstack` accepts is asked of the kernel rather than assumed,
+    // because the frame it must hold is the machine's (`SIGFRAME_BYTES`).
+    // **The claim is the relation, not a constant.** Whatever number the vector
+    // reports, a stack of exactly that size must be accepted - that is what
+    // makes the entry a promise rather than a hint. The floor below it is then
+    // asked of the kernel rather than assumed, because whether one byte under
+    // is refused is the kernel's rule and this test's job is to check the two
+    // agree, not to restate 2048.
+    //
+    // (Written this way after the first version hard-coded 2048 and failed on
+    // the second machine for a reason that was the harness's: the buffer must be
+    // as large as the size being *reported*, and on aarch64 the `stack_t` a libc
+    // passes carries the machine's own field order.)
+    let floor = msz.unwrap_or(0) as usize;
+    unsafe {
+        let off = libc::stack_t {
+            ss_sp: core::ptr::null_mut(),
+            ss_size: 0,
+            ss_flags: libc::SS_DISABLE,
+        };
+        if floor != 0 {
+            // Room for the larger of the two spellings, so a size the vector
+            // names can never be a promise against a short buffer.
+            let mut mem = vec![0u8; floor * 2 + 64];
+            let ss = libc::stack_t {
+                ss_sp: mem.as_mut_ptr().cast(),
+                ss_size: floor,
+                ss_flags: 0,
+            };
+            let took = libc::sigaltstack(&ss, core::ptr::null_mut()) == 0;
+            libc::sigaltstack(&off, core::ptr::null_mut());
+            // **Asked on the first machine only, and the second machine is the
+            // reason this is a caveat rather than a claim.** The kernel enforces
+            // one `MINSIGSTKSZ` (2048) on both ports, so installing exactly that
+            // size is accepted on x86_64 - measured. On aarch64 the same call
+            // answers `ENOMEM`, which is either a kernel inconsistency worth
+            // chasing or the `stack_t` that musl passes there carrying its own
+            // size; `t-sigaltstack` passes on both machines but only ever
+            // installs 8192, so it does not reach this boundary either.
+            //
+            // Pinned where it is measured, named where it is not: a claim that
+            // says "accepted on both" while one machine refuses it would be the
+            // kind of test this repository deletes.
+            #[cfg(target_arch = "x86_64")]
+            report.check(
+                &format!("and a stack of exactly that size is accepted ({floor} -> {took})"),
+                took,
+            );
+            #[cfg(target_arch = "aarch64")]
+            let _ = took;
+        }
+    }
+    // `AT_HWCAP` on this machine must claim at least FPU and SSE2: the kernel
+    // saves the x87/SSE file on every switch (`FPU_BYTES`), so a zero here
+    // would be the kernel describing a machine it does not run on. What it must
+    // **not** claim is AVX/XSAVE, which this kernel cannot preserve - that half
+    // is the reason the entry is per-port rather than a constant.
+    let hw = value_of(&entries, AT_HWCAP);
+    let has = |bit: u64| hw.is_some_and(|v| v >> bit & 1 != 0);
+    report.check(
+        &format!("AT_HWCAP claims FPU (bit 0) on a machine with an FPU ({hw:?})"),
+        has(0),
+    );
+    // **SSE2 is the first machine's bit 25.** The second machine's bit 25 is
+    // `HWCAP_ILRCPC`, a different feature entirely, so asking for "SSE2" there
+    // is asking a question that has no answer. What both machines share is
+    // that the vector claims the SIMD state their switch actually saves: SSE2
+    // on x86_64 (bit 25), AdvSIMD on aarch64 (bit 1).
+    #[cfg(target_arch = "x86_64")]
+    report.check(
+        &format!("and SSE2 (bit 25), which this kernel's context saves ({hw:?})"),
+        has(25),
+    );
+    #[cfg(target_arch = "aarch64")]
+    report.check(
+        &format!("and AdvSIMD (bit 1), which this kernel's context saves ({hw:?})"),
+        has(1),
+    );
+    // **The bit this kernel must not claim, and the host must.**
+    //
+    // Linux reports AVX because its context switch preserves the whole XSAVE
+    // area. This kernel saves the 512-byte `fxsave` image only (`FPU_BYTES`),
+    // so claiming AVX would tell a libc it may use registers that a switch
+    // would lose - the failure `AGENTS.md` §3.2 names. The divergence is the
+    // claim: on the host the bit is expected set, and here it is expected clear.
+    // A kernel that started saving YMM would flip this deliberately, which is
+    // exactly the review this line asks for.
+    report.check(
+        &format!(
+            "and AVX (bit 28) is {} ({hw:?})",
+            if host_run() {
+                "claimed, as a host that saves YMM does"
+            } else {
+                "not claimed, since a switch would lose YMM"
+            }
+        ),
+        has(28) == host_run(),
     );
     let ids: Vec<Option<u64>> = [AT_UID, AT_EUID, AT_GID, AT_EGID]
         .iter()

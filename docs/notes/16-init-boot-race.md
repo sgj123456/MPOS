@@ -125,3 +125,55 @@ handling. What it leaves is the address space itself — whether the mapping tha
 should hold `ld-musl`'s table was created and then lost, or never created. The
 `PFDIAG` line already prints `mapped=none around the page`, which is the
 loader case rather than a hole; a recurrence should be read with that in mind.
+
+## Second occurrence, 2026-11-17 — and this time the log was kept
+
+A later full gate stalled `x86_64` lane 5 at 900 s. The lane's serial log
+(`build/probe/lane5-timeout-*.log`) ends:
+
+```
+=== PASS t-seat
+=== RUN  t-exit-group
+  trap 13 code 0x0 rip 0x7dce97087f1d rsp 0x3fa74058 rflags 0x10216
+  bytes at rip: [0f, b6, 04, 0f, 0f, b6, 14, 0e, 39, d0, 75, 0e, 48, ff, c1, 85]
+traps: sh[1] general protection fault ip:7dce97087f1d sp:3fa74058 error:0
+INIT_EXITED: the system has no init left
+```
+
+**This is the same terminal state as the first occurrence and a different
+signature**: the first was a `#PF` read (`error 4`), this is a `trap 13` general
+protection fault — and it matches the shape `06-process-management.md` records
+from an unrelated cause (a guard that could panic), which is exactly why the
+family is worth knowing.
+
+### What the dump rules out
+
+- **The bytes at `rip` are a byte-wise `memcmp`** (`movzx`/`cmp`/`jne`/`inc rcx`).
+  A byte load cannot fault for alignment, so `#GP` here means a **bad base
+  register** (non-canonical) rather than a misaligned access. `rflags = 0x10216`
+  has bit 18 (`AC`) **clear** and bit 16 (`RF`) set, so this is not the
+  alignment-check path either.
+- **`exit_group` did not take init with it.** The stall begins at
+  `t-exit-group`, whose subject is precisely the group-ending call — so that was
+  the first suspicion. It is not: `end_group_siblings` walks the table and skips
+  any task whose `tgid` differs or that has already exited, so a forked child
+  calling `exit_group` cannot reach pid 1. The `#GP` **precedes** the
+  `INIT_EXITED` and is the cause; `INIT_EXITED` is only what the kernel says
+  after its init is gone.
+- **It is not `t-exit-group`'s own logic either** — the program passes on the
+  other lanes and on aarch64 in the same run (334/334 green).
+
+### The honest state
+
+Two occurrences, both `sh[1]` dying in user space before its lane finishes, with
+different fault classes and the same terminal line. Neither reproduces on demand
+(five clean gates between them, and several after). The one thing that has grown
+is the evidence: the faulting instruction is now known to be a **byte-wise
+compare**, which points at a corrupted base pointer in `sh` rather than at the
+memory system.
+
+**Next instrument, unchanged and now more specific**: catch the fault with the
+registers dumped (`rdi`/`rsi` would show whether the base is non-canonical), which
+means extending `pf_diag`'s sibling for `trap 13` — the page-fault diagnostic
+already prints `rip`, `rsp` and the bytes, and the GP path prints the same but not
+the general registers that would name the bad address.

@@ -129,12 +129,25 @@ pub fn hwcap() -> usize {
         core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
         core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
     }
+
     let mut bits = 0usize;
-    // A field of `0b0000` means "implemented"; `0b1111` means "not".
-    if pfr0 & 0xf == 0 {
+    // **`0b1111` is the only "not implemented"**, and every other field value
+    // means the feature is there in some revision. That is the whole test, and
+    // getting it wrong in the obvious direction is what this cost: the kernel
+    // documentation says `HWCAP_FP` is `PFR0.FP == 0b0000`
+    // ([elf_hwcaps.rst](https://docs.kernel.org/arm64/elf_hwcaps.html)), and a
+    // literal `== 0` reads as "only the base revision has an FPU".
+    //
+    // Measured on the gate's own aarch64 QEMU: `ID_AA64PFR0_EL1 = 0x22`, so
+    // both fields are **`0b0010`** - FP and AdvSIMD present *with* FP16
+    // (`FEAT_FP16` is `0b0001`; `0b0010` is the ARMv8.2+ encoding that a literal
+    // `== 0` test reports as absent). A machine running this kernel without an
+    // FPU is not a machine, and the literal test said it was.
+    const NOT_IMPLEMENTED: u64 = 0xf;
+    if pfr0 & 0xf != NOT_IMPLEMENTED {
         bits |= 1 << 0; // HWCAP_FP
     }
-    if (pfr0 >> 4) & 0xf == 0 {
+    if (pfr0 >> 4) & 0xf != NOT_IMPLEMENTED {
         bits |= 1 << 1; // HWCAP_ASIMD
     }
     let aes = (isar0 >> 4) & 0xf;
