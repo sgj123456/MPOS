@@ -32,7 +32,33 @@ use core::sync::atomic::Ordering;
 /// `rseq`'s feature pair (`AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN`) joined the
 /// block - and the block must hold every entry [`auxv`] writes, or an exec
 /// scribbles past the initial stack it reserved.
+///
+/// `auxv` writes **eighteen** pairs (thirty-six words) today, so the last two
+/// words of this reservation are slack. That is the safe direction - a pair more
+/// would still fit - but the margin is four words, not two: `tests::`'s
+/// `auxv_writes_no_more_pairs_than_it_reserved` counts the pairs against this
+/// constant so that adding a pair without raising the reservation fails a host
+/// test instead of scribbling on a booted machine.
 const AUXV_WORDS: usize = 40;
+
+/// The (type, value) pairs [`auxv`] actually writes, `AT_NULL` included.
+///
+/// A constant rather than a count read off the function, because the failure it
+/// guards is silent: one pair more than [`AUXV_WORDS`] allows and the write runs
+/// off the end of the block `initial_stack_rsp` reserved, which on a booted
+/// machine is a scribbled initial stack and not a failed assertion. Keeping the
+/// two numbers adjacent and asserted makes adding an entry a **host** failure.
+///
+/// It is asserted against [`AUXV_WORDS`], not against a remembered total: the
+/// doc comment above says "twenty pairs" from the era before `rseq`, and the
+/// count is eighteen today - which is exactly how a reservation and its writer
+/// drift apart when only one of them is edited.
+const AUXV_PAIRS: usize = 18;
+
+const _: () = assert!(
+    AUXV_PAIRS * 2 <= AUXV_WORDS,
+    "auxv writes more pairs than the initial stack reserved for them"
+);
 
 pub(crate) fn initial_stack_rsp(
     argv: &[String],

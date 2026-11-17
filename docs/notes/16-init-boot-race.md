@@ -79,3 +79,49 @@ loader ordering fault). `PFDIAG` already prints the run of mapped pages around t
 fault, so a recurrence should be read from `mapped=[lo..hi)` first: if a
 neighbouring page is mapped and this one is not, it is a hole; `mapped=none` says
 nothing near it was mapped, which is the loader case.
+
+## The exec path was audited against that dump, and is sound
+
+The dump points at the initial-stack and auxv construction, so those were read
+line by line against the fault. Each is **not** the cause:
+
+1. **`initial_stack_rsp` cannot underflow.** It refuses a block bigger than
+   `USER_STACK_PAGES * PAGE_SIZE` (16 pages = 64 KiB). The worst case its own two
+   checks allow is `argc = 512` with 1-byte strings plus a minimal environment:
+   `words_bytes = (1 + 512 + 1 + 1 + 1 + 40) * 8 = 4448`, `total = 4985` bytes —
+   **4.9 KiB of the 64 KiB budget**. `stack_top` is 1 GiB
+   (`USER_STACK_TOP`), so `stack_top - total` cannot wrap.
+
+2. **The auxv sizing has slack, not a shortfall.** `AUXV_WORDS = 40` is 20
+   (type, value) pairs; `auxv()` writes **18** pairs = 36 words. Its doc comment
+   says "Twenty ... pairs", which is stale by two, but the direction is safe: two
+   more entries would still fit. Worth correcting, not a bug.
+
+3. **`AT_PHDR` is the program's, not the interpreter's.**
+   `at_phdr = layout.bias + image.phdr_addr`, and Linux measured the same shape
+   (`build/scratch/auxv/a.c`: `AT_PHDR` outside the loader's `AT_BASE`,
+   `AT_PHENT` 0x38, `AT_PHNUM` 15). This is exactly what `ld-musl` needs to find
+   the program it is about to run.
+
+4. **The argument-block write is guarded by an `assert!` that cannot fire in
+   normal flow — and that is deliberate.** `apply_stack` ends with
+   `assert!(write_user_of_at(root, base, &block, false), "the argument block did
+   not fit")`. The `populate = false` half is documented: the block must land on
+   eagerly-mapped pages because the caller already holds the task table, so the
+   fault that would claim one has nothing to fault on. A violation is a **kernel**
+   bug (a layout that drifted from its own sizing), so a panic is the honest
+   answer there rather than `E2BIG` — which is what a *too-small* block is, and
+   that is answered earlier by `ArgsTooBig` → `err::E2BIG` at all three spawn
+   doors (`proc.rs:2311`).
+
+5. **The directory-borrow rule holds on this path.** `write_user_of_at` is the
+   variant that does *not* re-take the task table, precisely because the exec path
+   calls it with `with_table` on the stack; its doc comment states the rule and
+   says the flag "keeps the impossibility checked rather than assumed".
+
+So the audit narrows the unknown rather than closing it: the fault is **not** in
+the sizing, the auxv contents, `AT_PHDR`'s derivation, or the write's error
+handling. What it leaves is the address space itself — whether the mapping that
+should hold `ld-musl`'s table was created and then lost, or never created. The
+`PFDIAG` line already prints `mapped=none around the page`, which is the
+loader case rather than a hole; a recurrence should be read with that in mind.
