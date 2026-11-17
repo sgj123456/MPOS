@@ -224,3 +224,39 @@ costs as well as the programs, which is why "run it again" has failed five times
 is non-canonical, the corruption is upstream of the `memcmp`; if all are canonical
 and the fault still reports `error:0`, the vector itself is being raised for
 another reason and the report needs the segment registers as well.
+
+## Replaying the failing lane: the sequence and the load are both ruled out
+
+Section "Why it will not reproduce" named the confound: `deal_lanes` re-deals by
+measured cost on every run, so the failing lane's composition cannot come back on
+its own. The fix is to **replay the sequence by hand** rather than hope the deal
+reproduces it — the failing log names its 14 programs in order:
+
+```
+t-signal-park t-iret t-udpblock t-seccomp t-kill-all t-waitid t-io-uring
+t-wait-eintr t-drm t-sfd-timer-record t-uevent-multi t-futex-waitv t-seat
+t-exit-group
+```
+
+`.workbuddy/replay-lane5.sh` boots one guest whose `/init` runs exactly that list
+with the same 120 s budgets, and `.workbuddy/parallel-replay.sh` runs N of them
+concurrently with separate ESP directories.
+
+**Three serial replays: 14/14 programs each, no `INIT_EXITED`.**
+**Four concurrent replays: 14/14 each on all four guests, no `INIT_EXITED`.**
+
+So neither the *program sequence* nor *several TCG guests contending for one host*
+is the trigger. What remains unpinned is narrower than before:
+
+- the real sweep runs **six** guests per machine with `-m` sized from the machine
+  config, and a full gate runs both machines' lanes; four was the most this host's
+  memory allowed (`-m 2048` panics the boot with `NoSpace`, the §6.77b limit, so
+  six × 3072 MiB does not fit alongside the host's own use)
+- the failing run was the **whole gate**, not a lane: the other five lanes and the
+  aarch64 arm were live at the same time, so the contention that existed then has
+  not been reproduced here
+- the cost table moved between then and now in a way a replay does not model
+
+**A replay harness nobody has run is not evidence.** What this pass establishes is
+the negative: the obvious two hypotheses are dead, and a reproduction needs six
+guests plus the second machine, which this host cannot run concurrently.
