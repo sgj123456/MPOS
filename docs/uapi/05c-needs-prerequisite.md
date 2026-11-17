@@ -42,6 +42,30 @@ blocked by the machine rather than by a missing mechanism:*
   512 MiB if every task used it). The honest first step is a measurement of what
   a real program needs - which the table above now has.
 
+- **`AT_HWCAP` is written `0` rather than measured, and on aarch64 that is a
+  false claim about the machine.** The auxiliary vector carries 18 pairs here
+  against Linux's 22, and most of the difference is harmless (measured in the
+  guest, `probe-hwcap`): `AT_FLAGS` is 0 on Linux too, `AT_PLATFORM` is not read
+  by musl at all, `AT_SYSINFO_EHDR` is correctly absent because this kernel has
+  no vDSO, and `AT_MINSIGSTKSZ`'s absence is safe because a libc falls back to
+  8192 where this kernel's `sigaltstack` floor is 2048 (bisected on Linux:
+  1536 → `ENOMEM`, 2048 → accepted, so the floor is exact).
+
+  `AT_HWCAP` is the one entry that is a **claim without a measurement**. It is
+  zero on both machines, and the two ports differ in what that costs: on x86_64
+  glibc and musl read `CPUID` directly, so it is close to decorative; on aarch64
+  the bits are load-bearing — 0 is FP, 1 is ASIMD, 8 is ATOMICS — and this
+  port's own context switch saves `q0..q31`, so the hardware is there and the
+  vector describes a different machine. It errs in the safe direction (a libc
+  takes its scalar path rather than executing an instruction the CPU lacks),
+  which is why nothing has broken on it.
+
+  **Prerequisite**: a feature probe per machine (`CPUID` on x86_64,
+  `ID_AA64ISAR0_EL1` and its siblings on aarch64) plus a decision about
+  `AT_HWCAP2`, and the same numbers feeding any future `/proc/cpuinfo`. Until
+  then the zero is recorded as a divergence in the source comment rather than
+  left to read as a measured fact.
+
 - **`rseq`** (§1.1) — a per-thread registration maintained across preemption.
 - **Console gaps:** `console=ttyN` pinning is refused rather than approximated, and
   `/dev/console` has no preferred-console plumbing (`docs/notes/` §7.1c).

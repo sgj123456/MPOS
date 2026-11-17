@@ -306,6 +306,26 @@ fn auxv(buf: &mut [u8], loaded: &mut Loaded, random_vaddr: usize, execfn: usize)
     entry!(12, id.euid); // AT_EUID
     entry!(13, id.rgid); // AT_GID
     entry!(14, id.egid); // AT_EGID
+    // `AT_HWCAP` is **zero, and that is a claim about the machine this kernel
+    // does not actually check**. It is written here rather than measured, on
+    // both machines, and the two ports differ in what the lie costs:
+    //
+    //   * x86_64: glibc and musl read `CPUID` directly for the features they
+    //     branch on, so the entry is close to decorative - a zero there costs a
+    //     slower memcpy at worst (measured: this host reports
+    //     `0x178bfbff`, an all-flags word).
+    //   * aarch64: the bits are **load-bearing** - bit 0 is FP, bit 1 ASIMD,
+    //     bit 8 ATOMICS, and a libc told zero will not use the vector unit even
+    //     where the machine has one. This port's own context switch saves
+    //     `q0..q31` (`arch/src/arch/aarch64/context.rs`), so the hardware is
+    //     there and the vector is describing a different machine.
+    //
+    // Reading zero is safe in the direction it errs - a libc falls back to the
+    // scalar path rather than executing an instruction the CPU lacks - which is
+    // why this has not been a defect. Serving it honestly needs a feature probe
+    // per machine (x86_64 `CPUID`, aarch64 `ID_AA64ISAR0_EL1` and friends) and
+    // a decision about what `AT_HWCAP2` says; until then the zero is recorded as
+    // a divergence rather than left to look like a measured fact.
     entry!(16, 0usize); // AT_HWCAP
     entry!(17, 100usize); // AT_CLKTCK
     // The `rseq` feature shape this kernel serves: a libc reads these two and
