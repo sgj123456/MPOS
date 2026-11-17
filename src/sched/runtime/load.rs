@@ -53,7 +53,7 @@ const AUXV_WORDS: usize = 40;
 /// doc comment above says "twenty pairs" from the era before `rseq`, and the
 /// count is eighteen today - which is exactly how a reservation and its writer
 /// drift apart when only one of them is edited.
-const AUXV_PAIRS: usize = 18;
+const AUXV_PAIRS: usize = 19;
 
 const _: () = assert!(
     AUXV_PAIRS * 2 <= AUXV_WORDS,
@@ -335,6 +335,27 @@ fn auxv(buf: &mut [u8], loaded: &mut Loaded, random_vaddr: usize, execfn: usize)
     entry!(23, secure as usize); // AT_SECURE
     entry!(25, random_vaddr); // AT_RANDOM
     entry!(31, execfn); // AT_EXECFN
+    // `AT_MINSIGSTKSZ`: how large an alternate signal stack has to be for a
+    // handler to run on it. Linux computes it per machine from the size of its
+    // own `rt_sigframe` **plus its FPU state** - `0xd30` (3376) on a host with
+    // XSAVE, where the XSAVE area alone is most of it.
+    //
+    // This kernel's frame is smaller: `SIGFRAME_BYTES = FPSTATE + FPU_BYTES`
+    // (`arch/.../signal.rs`: 440 + 512) = **952 bytes**, because the FPU image
+    // here is a plain 512-byte `fxsave` area and there is no XSAVE state to
+    // carry. So Linux's 3376 would be copying a number whose reason does not
+    // hold on this machine.
+    //
+    // What is reported instead is this kernel's own `sigaltstack` floor
+    // (`MINSIGSTKSZ`, 2048), which is the honest conservative answer: it is
+    // larger than the frame, so a libc that sizes to it cannot under-run, and
+    // it is *the same number the kernel enforces*, so a program that reads the
+    // vector and a program that reads `sigaltstack`'s `ENOMEM` agree.
+    //
+    // The two are genuinely different questions and Linux proves it: measured
+    // on 7.3.4, `AT_MINSIGSTKSZ` is 3376 while `sigaltstack` accepts 2048 - the
+    // report is "safe to run a handler", the floor is "smallest we take".
+    entry!(51, crate::sched::signal::MINSIGSTKSZ); // AT_MINSIGSTKSZ
     entry!(0, 0usize); // AT_NULL
 
     // The vector the stack carries is also the vector `/proc/<pid>/auxv`
