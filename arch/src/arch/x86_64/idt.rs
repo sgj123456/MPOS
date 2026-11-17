@@ -500,7 +500,7 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
     // and only here.
     let kind = crate::hal::kernel::fault_kind_of_vector(vector);
     let sig = crate::hal::kernel::send_fault_signal(kind, 0, rip);
-    if !TRAP_REPORTED.swap(true, Ordering::Relaxed) {
+    if claim_trap_report() {
         // Only up to the end of the page the instruction is on: a read past it
         // would fault inside the handler, and a double fault would take the
         // machine down instead of reporting anything.
@@ -514,6 +514,43 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
             rflags
         );
         crate::hal::kernel::kprintln!("  bytes at rip: {:02x?}", bytes);
+        // The **general registers**, and only their values: printing what a
+        // pointer points at would fault inside the fault handler, and a double
+        // fault takes the machine down instead of reporting anything (the
+        // same reason `bytes` is bounded above).
+        //
+        // This exists for one fault class. A `#GP` from a byte-wise `memcmp`
+        // cannot be an alignment fault - a `movzx` reads one byte - so it names
+        // a **non-canonical base register**, and the register file is the only
+        // place that answer lives: `docs/notes/16-init-boot-race.md` records two
+        // `sh[1]` general-protection deaths whose instruction was a `memcmp`
+        // and whose cause could not be read off `rip`/`rsp` alone.
+        let r = unsafe { &*frame };
+        crate::hal::kernel::kprintln!(
+            "  regs: rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
+            r.rax,
+            r.rbx,
+            r.rcx,
+            r.rdx
+        );
+        crate::hal::kernel::kprintln!(
+            "        rsi {:#x} rdi {:#x} rbp {:#x} rsp {:#x}",
+            r.rsi,
+            r.rdi,
+            r.rbp,
+            r.rsp
+        );
+        crate::hal::kernel::kprintln!(
+            "        r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
+            r.r8,
+            r.r9,
+            r.r10,
+            r.r11,
+            r.r12,
+            r.r13,
+            r.r14,
+            r.r15
+        );
     }
     crate::hal::kernel::report_user_trap(vector, rip, rsp, code as usize);
     if crate::hal::kernel::disposition_is_default(sig) {
@@ -1469,9 +1506,27 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
 /// what keeps the report from faulting itself.
 const PAGE_SIZE: usize = 4096;
 
-/// Whether the full report of the first ring-3 trap has been printed. A
-/// process that returns from its own SIGSEGV handler faults again on the very
-/// next instruction, so the console sees the same fault thousands of times;
-/// one full report is what a reader needs. One flag for every vector the door
-/// serves, because the reader is debugging one crash, not counting traps.
-static TRAP_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Which task last got a full trap report, so a process that keeps faulting
+/// prints once rather than thousands of times.
+///
+/// The subject is the **task**, not the machine. A process that returns from
+/// its own `SIGSEGV` handler faults again on the very next instruction, so one
+/// full report per task is what a reader needs - but a single flag for the whole
+/// boot is too coarse in the one case this report exists for: a gate runs 338
+/// programs, and the process whose death is interesting is usually not the first
+/// one to trap. Measured need: two `sh[1]` general-protection deaths
+/// (`docs/notes/16-init-boot-race.md`) went unreported because an earlier
+/// `int3` in a different program had already consumed the flag.
+///
+/// Task ids are slots and a slot is reused, so this can suppress a *later*
+/// crash that lands on the same slot. That is the right trade: the alternative
+/// loses the report of the crash that matters, and a reused slot producing no
+/// second dump is bounded by how many tasks a boot makes.
+static TRAP_REPORTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Whether this task should print the full report, latching it if so.
+fn claim_trap_report() -> bool {
+    let me = crate::hal::kernel::current();
+    TRAP_REPORTED.swap(me, Ordering::Relaxed) != me
+}
