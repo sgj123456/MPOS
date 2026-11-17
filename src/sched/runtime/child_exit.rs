@@ -1756,6 +1756,7 @@ pub fn exec_replace(
     argv: &[String],
     env: &[String],
     exe: &str,
+    execfn: &str,
 ) -> Result<(usize, usize), SpawnError> {
     let image = elf::parse(source).ok_or(SpawnError::NotExecutable)?;
     // A dynamically linked program names the interpreter that has to run
@@ -1774,7 +1775,7 @@ pub fn exec_replace(
     // obligation - and gets no benefit - from starting where the old one did.
     let layout = new_layout(&image, interp.as_ref());
     let user_rsp =
-        initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
+        initial_stack_rsp(argv, env, execfn, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
     // --- Build the new address space before the old one is touched ---
     //
@@ -1803,7 +1804,7 @@ pub fn exec_replace(
         interp_name,
         user_rsp,
     )?;
-    write_arg_block(space.root(), user_rsp, argv, env, exe, &mut loaded);
+    write_arg_block(space.root(), user_rsp, argv, env, execfn, &mut loaded);
 
     with_table(|t| {
         let id = t.current;

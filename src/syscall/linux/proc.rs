@@ -2182,6 +2182,48 @@ fn exec_inode(
         let cwd_path = crate::sched::current_cwd_path();
         crate::vfs::path::normalize(&alloc::format!("{}/{path}", cwd_path.trim_end_matches('/')))
     };
+    // **`/proc/self/exe` names a path, not a string.** A process that re-execs
+    // itself through its own magic link - which is how a crash handler respawns
+    // and what a zygote does - must come back with the *real* pathname it is
+    // running from, because `task.exe` is what `/proc/<pid>/exe` reports and what
+    // everything downstream derives from it: `comm`, and a resource loader's
+    // `dirname(readlink("/proc/self/exe"))`.
+    //
+    // Measured on Linux 7.3.4 (`build/scratch/selfexec/t.c`): a program exec'd
+    // via `/proc/self/exe` reads `/home/mp/.../t` back and has `comm` `t`.
+    // Measured here before this fix (`probe-selfexec` in the guest): the child
+    // read `/proc/self/exe` back **as its own path** - a self-reference that
+    // never resolves - and its `comm` became `exe`. That is exactly the shape
+    // Chromium showed: `exe[780]` in the trap lines and
+    // `Failed to load /proc/self/chrome_100_percent.pak`, because `dirname` of
+    // the literal string is `/proc/self`.
+    //
+    // The substitution is narrow on purpose: only the machine's own magic links
+    // are replaced, and only by the path the running image was started from.
+    // Any other path keeps the caller's spelling, because that is what Linux
+    // reports for it.
+    // **Two different questions, and Linux answers them differently.** Measured
+    // on 7.3.4 (`build/scratch/selfexec/{t,e}.c`):
+    //
+    //   * `AT_EXECFN` keeps the **caller's spelling** - a child exec'd through
+    //     `/proc/self/exe` reads `AT_EXECFN == "/proc/self/exe"`;
+    //   * `/proc/<pid>/exe` reports the **resolved path** - that same child
+    //     reads `/home/mp/.../t`, and its `comm` is the file's name.
+    //
+    // So the literal string survives in one place and is replaced in the other.
+    // Feeding both from one value is what made a re-exec'd Chromium child
+    // report `/proc/self/exe` as its own path: its `comm` became `exe` (the
+    // `exe[780]` in its trap lines) and its resource loader took `dirname` of
+    // the literal, which is `/proc/self` - the
+    // `Failed to load /proc/self/chrome_100_percent.pak` in its stderr.
+    let execfn = path.clone();
+    let path = match path.as_str() {
+        "/proc/self/exe" | "/proc/thread-self/exe" => {
+            let real = crate::sched::current_exe();
+            if real.is_empty() { path } else { real }
+        }
+        _ => path,
+    };
     let mut argv = match argv_arg(args[argv_at], crate::syscall::MAX_ARG_STR) {
         Ok(argv) => argv,
         Err(e) => return e,
@@ -2271,7 +2313,7 @@ fn exec_inode(
     if let Some(ref id) = switched {
         crate::sched::set_current_identity(id.clone());
     }
-    let outcome = crate::sched::exec_replace(&*source, &argv, &envp, &path);
+    let outcome = crate::sched::exec_replace(&*source, &argv, &envp, &path, &execfn);
     if outcome.is_err() && switched.is_some() {
         crate::sched::set_current_identity(before);
     }
