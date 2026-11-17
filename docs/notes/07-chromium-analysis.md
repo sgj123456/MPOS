@@ -333,6 +333,39 @@ waiting for, and why does it never complete? A `futex`/`poll`/`socketpair` state
 inspector, or a `strace`-style trace of the zygote's fd traffic, is the next
 instrument. No code change is claimed here.
 
+## 3f. The live process, sampled over time — DOM once, then a stable stall on resources
+
+Sampling `/proc/<pid>/syscall` three times across ~44 s (`build/imgcmd/ipc2.sh`)
+produced **9096 bytes of output in one run** — the only time DOM-like output has
+ever appeared — but a repeat with a longer wait and **no sampling** produced 0
+bytes after 90 s (`build/imgcmd/dom2.sh`). So the success was not stable, and the
+sampling itself may have changed timing. Do not claim "Chromium renders" from
+one run.
+
+What the repeat *did* give is the first **stderr**, which names two concrete,
+different problems:
+
+```
+[crashpad] sched_getscheduler: Function not implemented (38)
+[crashpad] open /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq: ENOENT
+[769] Failed to load /proc/self/chrome_100_percent.pak
+[769] Failed to load /proc/self/resources.pak
+```
+
+- `sched_getscheduler` is **served** by this kernel (nr 145 →
+  `handle_sched_getscheduler` returns `SCHED_OTHER`), so crashpad's ENOSYS is
+  from a *different* scheduler probe; the exact number was not captured, so it
+  is not yet a gap to fix.
+- `/proc/self/exe` was checked in the guest and is **correct**:
+  `readlink /proc/self/exe` returned `/usr/bin/readlink` for that reader, and
+  `/proc/<pid>/exe` comes from `task(slot)?.exe` in `procfs.rs`, so it does not
+  follow the observer. Chromium's `/proc/self/*.pak` paths are therefore its own
+  resource-path logic, **not** a wrong `exe` link.
+
+The main process stays alive throughout, with ~51 open fds; zygotes exit (`Z`)
+in the run that produced output. The stall after that is waiting on resource
+loading, not on a crashing syscall.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
