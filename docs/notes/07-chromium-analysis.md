@@ -443,6 +443,47 @@ separately (`.workbuddy/relative-exec-boot.sh`), and the earlier "the relative c
 was never measured" conclusion in this file was a consequence of that, not of the
 kernel.
 
+## 3i. The `exe` fix verified on the image — and the next blocker is the GPU process
+
+With a loader carrying the `/proc/<pid>/exe` fix built into the image's ESP, the
+Chromium run changed in a measurable way:
+
+| signal | before | after |
+|---|---|---|
+| `Failed to load /proc/self/chrome_100_percent.pak` | present | **0 occurrences** |
+| `Failed to load /proc/self/resources.pak` | present | **0 occurrences** |
+
+The fix did what it was supposed to: a resource loader that finds itself with
+`dirname(readlink("/proc/self/exe"))` now lands in the right directory.
+
+**The next blocker is named and different**:
+
+```
+6x ERROR:content/browser/gpu/gpu_process_host.cc:1036] GPU process launch failed
+ 1x FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:385]
+    GPU process isn't usable. Goodbye.
+```
+
+Chromium launches a GPU process, it fails six times, and the browser gives up with
+a **FATAL** — a decided exit, not a hang. That is progress: the failure moved from
+"resources cannot be found" to "the GPU process cannot start".
+
+Two caveats stated plainly:
+
+- the guest stays **flaky** — repeats of the same command sometimes produce this
+  GPU FATAL and sometimes no stderr at all, with DOM output at 0 bytes either way;
+- the `PFDIAG` lines that appear alongside (`libdbus`, `libfontconfig`,
+  `pte=…025 P=1 W=0 U=1`) are **not** a leftover from an old kernel — `pf_diag`
+  lives in `arch/src/arch/x86_64/idt.rs` and runs *after* `resolve_anon_fault`, so
+  `P=1` is the **resolved** state and the faulting access was genuinely a
+  not-present page that the handler then filled.
+
+A single-threaded probe that maps `ld-musl` `r-x` and walks all 64 pages with data
+reads plus fetches through `ret` pages completed with **no fault**, so the
+`error 14` seen under Chromium needs concurrency to reproduce — consistent with
+the §6.181 note in `resolve_anon_fault` (a block transfer parks the task and the
+borrow is what suffers). Nothing was changed on that basis.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
