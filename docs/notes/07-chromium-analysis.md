@@ -484,6 +484,42 @@ reads plus fetches through `ret` pages completed with **no fault**, so the
 the §6.181 note in `resolve_anon_fault` (a block transfer parks the task and the
 borrow is what suffers). Nothing was changed on that basis.
 
+## 3j. The stall is real and stable: output freezes at ~100 s and never moves
+
+Earlier passes called this "flaky" because short runs differed. A long,
+uninterrupted run with progress sampled every 25 s (`build/imgcmd/long.sh`)
+settles it - and the answer is **not** flakiness:
+
+```
+  t=25s  alive=Y dom=0 err=0
+  t=50s  alive=Y dom=0 err=5736
+  t=75s  alive=Y dom=0 err=12472
+  t=100s alive=Y dom=0 err=12785
+  t=125s alive=Y dom=0 err=12785
+  ...
+  t=300s alive=Y dom=0 err=12785      <- unchanged for 200 s
+```
+
+Chromium **does** make progress for the first ~100 s (crashpad, policy loader,
+variations, dbus name lookups) and then **stops dead**, process alive, `dom` at 0
+bytes forever. That is a permanent block, not a slow machine - a 296 MB binary
+under TCG slows *progress*, it does not freeze a byte count.
+
+The last stderr lines repeat:
+
+```
+WARNING:crashpad ... sched_getscheduler: Function not implemented (38)
+```
+
+**That warning is not from a kernel gap**: the kernel serves `sched_getscheduler`
+(nr 145 -> `SCHED_OTHER`), and a run this long would have printed the kernel's
+once-per-number `mpos: syscall <nr> -> ENOSYS` note - **no such note appears
+anywhere in the log**. So whatever crashpad probes, the kernel answers it without
+`ENOSYS`.
+
+**The open question is now narrow**: after ~100 s, which thread is parked on what?
+Sample `/proc/<pid>/syscall` **after** the freeze, not before it.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
