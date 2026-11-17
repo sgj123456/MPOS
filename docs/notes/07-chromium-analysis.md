@@ -355,7 +355,8 @@ different problems:
 - `sched_getscheduler` is **served** by this kernel (nr 145 →
   `handle_sched_getscheduler` returns `SCHED_OTHER`), so crashpad's ENOSYS is
   from a *different* scheduler probe; the exact number was not captured, so it
-  is not yet a gap to fix.
+  is not yet a gap to fix. **Resolved in §3q**: there is no probe at all — musl's
+  wrapper is a stub returning `ENOSYS` without issuing the syscall.
 - `/proc/self/exe` was checked in the guest and is **correct**:
   `readlink /proc/self/exe` returned `/usr/bin/readlink` for that reader, and
   `/proc/<pid>/exe` comes from `task(slot)?.exe` in `procfs.rs`, so it does not
@@ -683,6 +684,15 @@ The family is already pinned - `t-sched-policy` covers the priority bounds,
 `t-sched-pid` and `sched-order` the rest - so no new pin was needed for a
 confirmation that is already a contract.
 
+**Postscript (2026-11-17): the warning's source is named, not argued.** It is
+musl's own stub: `src/sched/sched_getscheduler.c` is
+`return __syscall_ret(-ENOSYS);` (its `sched_setscheduler.c` sibling is the
+same), so the wrapper answers before any syscall exists - which is why no
+`mpos: syscall 145 -> ENOSYS` line can appear and why the warning repeats once
+per thread. The table above stands as the kernel's answer to the *raw* syscall;
+a program using musl's wrapper gets the stub's `ENOSYS` on this machine exactly
+as it would on any musl system. §3q carries the correction in place.
+
 ## 3p. FD flags and descriptor handover are correct — and one probe of mine was wrong
 
 Two measurements this pass, one of which is a correction of my own.
@@ -734,6 +744,57 @@ its own `ScopedFD` lifecycle, not a syscall shape this kernel gets wrong.
 `t-unix-scm` already pins the handover, `t-unix-peek`/`t-unix-dgram`/`t-unix-close`
 the rest of the unix-socket surface, so no new pin was warranted for a confirmation
 that is already a contract.
+
+## 3q. The stderr tail, finally — and what it rules out
+
+Every earlier pass lost Chromium's stderr because the guest's `/tmp` died with
+it. A run whose shell prints `tail -30 /tmp/te.txt` **after** the browser is
+killed finally closed that gap (`build/imgcmd/tail.sh`). The last three lines:
+
+```
+[..:WARNING:crashpad..process_reader_linux.cc:95] sched_getscheduler: Function not implemented (38)   x27
+[..:ERROR:crashpad..file_io_posix.cc:145] open /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq: ENOENT
+[..:ERROR:crashpad..file_io_posix.cc:145] open /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq: ENOENT
+[..:ERROR:crashpad..exception_handler_server.cc:131] tgkill: No such process (3)
+```
+
+Four things that follow, each checked rather than assumed:
+
+1. **`sched_getscheduler: Function not implemented (38)` never reaches this
+   kernel.** The image is Alpine, so the libc is musl, and musl does not
+   implement this call: its `src/sched/sched_getscheduler.c` is
+   `return __syscall_ret(-ENOSYS);` and `sched_setscheduler.c` is the same, so
+   the wrapper answers with `ENOSYS` **before issuing a syscall**. That is why
+   the kernel printed none of its once-per-number `mpos: syscall <nr> -> ENOSYS`
+   notes (`grep -c` = 0) and why the line repeats once per thread (`x27`)
+   rather than once: no `ptrace`-visible syscall happened. A probe that calls
+   the *raw* syscall answers `0` (SCHED_OTHER), so the kernel's side is served;
+   the warning is musl's stub, not a kernel refusal, and not "crashpad's
+   inference" either — crashpad is reporting the errno musl handed it. The
+   sibling stub is worth carrying: a program using musl's `sched_setscheduler`
+   gets `ENOSYS` on this machine as it would on any musl system.
+2. **The `cpufreq` reads are a missing sysfs file**, not a syscall gap — this
+   kernel has no cpufreq driver, and `ENOENT` is the honest answer for a file
+   that does not exist.
+3. **The last line before the freeze is `tgkill: No such process`** — crashpad's
+   exception handler signalling a thread that has already exited. `ESRCH` is
+   Linux's answer there too, so the kernel is right; crashpad gives up on that
+   client and the browser stops making progress.
+4. **The threads it was signalling die by their own `CHECK`, not by a fault.**
+   `CacheThread_Blo` appears with three different tids (727, 728, 741) — the
+   thread is recreated — and each one takes a `trap 3` with `0f 0b` at `rip`:
+   Chromium's `IMMUTABLE_CRASH`. Its registers at that point are all plausible
+   (`rdi = 0x395400004a20`, `r10 = 0x39500011bc80`, `rbx` a live stack address),
+   so it is a **failed predicate**, not a wild pointer.
+
+**So no measured defect is left on the kernel's side of this chain**: the
+`libnss3` fetch faults are resolved (`PTE P=1` afterwards, `run=` growing),
+`ESRCH` is the correct answer, and no syscall was refused. This is not "the
+kernel is clean" — a failed predicate can also be a wrong *successful* answer —
+it is "nothing here is measured wrong". What remains is Chromium's own decision
+to abort a worker, which is where the next instrument belongs — a run with
+`--v=1` and `--enable-logging=stderr` that captures the `CHECK` message the
+`ud2` follows, rather than the crashpad chatter that precedes it.
 
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 

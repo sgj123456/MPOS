@@ -1343,6 +1343,39 @@ its 900 s budget with no summary has no reading yet.
 
 ---
 
+### Chromium bring-up — measured, bounded, and not a phase
+
+Chromium is installed in the image and reaches `main`; the whole measurement is
+[notes/07-chromium-analysis.md](notes/07-chromium-analysis.md). What it has won so far is
+**three real kernel defects** - `mremap` making an eager page supervisor-only (3b),
+`NT_PRFPREG` behind crashpad's `EIO` storm (3d), and `/proc/<pid>/exe` reporting the caller's
+raw argument (3h) - each landed with a pin. What it has not reached is a rendered page: the
+main process exits, both zygotes become zombies, and worker threads die by their own
+`ud2`/`IMMEDIATE_CRASH`.
+
+The honest state is **"no measured kernel defect is left in this chain"**, not "the kernel is
+clean": a failed `CHECK` can also be a call that returned a *wrong successful* value, and the
+only thing that separates the two is the predicate text Chromium prints before the `ud2`. The
+named next instrument is one run with `--v=1 --enable-logging=stderr --in-process-gpu` that
+captures it; the reproducibility is poor (the same command has produced 0-byte stderr, a GPU
+`FATAL`, and a 100 s freeze), so **one hypothesis per boot, and stop after two runs with no
+new information**.
+
+Three items the analysis names are worth doing on their own terms, in this order:
+
+1. `PTRACE_SEIZE`/`PTRACE_INTERRUPT` (Finding B) - the missing observability primitive; it is
+   what makes every later crash legible, and it is a shaped extension of `PTRACE_ATTACH`'s
+   machinery rather than a new subsystem.
+2. `st_dev` in `Metadata` and the maps device column (Finding C, defect 1) - small, and the
+   fact is already computable.
+3. The `exec` image's file-backing question (Finding C, fact 2) - a design decision, kept out
+   of the fix commits above.
+
+Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
+**musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not
+a probe; a raw-syscall reader gets `SCHED_OTHER` (§3o, §3q).
+
+---
 
 ## Remaining ABI support (gaps + services)
 
