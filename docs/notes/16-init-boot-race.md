@@ -177,3 +177,50 @@ registers dumped (`rdi`/`rsi` would show whether the base is non-canonical), whi
 means extending `pf_diag`'s sibling for `trap 13` — the page-fault diagnostic
 already prints `rip`, `rsp` and the bytes, and the GP path prints the same but not
 the general registers that would name the bad address.
+
+## The crash, dissected as far as a log allows
+
+The 2026-11-17 log is worth reading closely, because it narrows the fault to one
+instruction class even without the registers.
+
+**The `memcmp` decode.** `rip = 0x7dce97087f1d`, bytes at it:
+
+```
+0f b6 04 0f   movzx eax, byte [rdi + rcx]
+0f b6 14 0e   movzx edx, byte [rsi + rcx]
+39 d0         cmp   eax, edx
+75 0e         jne   +0x0e
+48 ff c1      inc   rcx
+```
+
+That is the byte-at-a-time tail loop of a `memcmp`/`strcmp`, not program code -
+`rip` is at `0x7d…`, which is where this kernel puts shared objects, while a
+program's own text is linked at `0x400000`. So `sh` was inside libc comparing two
+strings when it died.
+
+**What that proves about the `#GP`.** A `movzx` reads one byte and cannot fault
+for alignment, so `error:0` on this vector means the CPU refused the address
+itself: `rdi` or `rsi` (plus `rcx`) was **non-canonical**. `rflags = 0x10216` has
+`AC` (bit 18) clear, which rules out the alignment-check path (`#AC`) as well -
+`#GP` is the right vector for a non-canonical access.
+
+**Why this is not `t-exit-group`'s doing.** The stall begins at `t-exit-group` and
+that program's subject is exactly the group-ending call, so it was the first
+suspicion. It is innocent on three counts: the last line before the crash is
+`=== PASS t-exit-group`'s own final claim, so it **completed**; the kernel's
+`end_group_siblings` walks the table and skips every task whose `tgid` differs or
+that has exited, so a forked child cannot reach pid 1 through it; and the same
+program passes on five consecutive focused boots and on the other five lanes of
+the failing run.
+
+**And it is not the fixture's fixed order.** The failing lane held 14 programs,
+the next green run's lane 5 held 73 — `deal_lanes` distributes by *measured cost*
+from `build/test-costs-x86_64.tsv`, which each run rewrites, so the partition is a
+function of the cost table and moves between runs. A reproduction has to pin the
+costs as well as the programs, which is why "run it again" has failed five times.
+
+**What the next occurrence will now say.** `trap 13` prints the general registers
+(since `edd74fc`), so the log will carry `rdi`/`rsi`/`rax` directly. If one of them
+is non-canonical, the corruption is upstream of the `memcmp`; if all are canonical
+and the fault still reports `error:0`, the vector itself is being raised for
+another reason and the report needs the segment registers as well.
