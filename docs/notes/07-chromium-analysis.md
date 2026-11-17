@@ -242,6 +242,17 @@ Two other things are visible and are **new information**:
   wants that path, this kernel does not serve it. Recorded as a lead, not yet
   chased.
 
+  **It was chased on 2026-11-17 and deliberately left unpinned.** The obvious
+  fix — overriding `ProcDir::create` to answer Linux's measured `ENOENT`
+  (`build/scratch/mkerr/m.c`) instead of the default `EOPNOTSUPP` — was written,
+  pinned, and then **withdrawn**: the counterfactual (restoring `Unsupported`)
+  left every pin claim green, so the pin named nothing. `mkdir /proc/self/locales`
+  answers `ENOENT` on the *test* boot already, which means the `EOPNOTSUPP` in the
+  Chromium run came from a state specific to that boot (a different mount or
+  resolution path), not from `ProcDir::create`. A change that cannot be made red
+  by reverting it is not a fix; it was reverted and no code landed.
+
+
 **Chromium itself still does not render**: it takes its own `CHECK` (`trap 3`,
 `IMMEDIATE_CRASH`) after the crashpad storm. The kernel-side faults on this path
 are now fixed; what remains is userspace/environment plus the crashpad `EIO`.
