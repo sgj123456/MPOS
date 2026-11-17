@@ -610,6 +610,42 @@ ext4 and *calls into it* from several threads at once, so the first instruction 
 a cold page is a fetch. That is a different probe from both above, and it is where
 the remaining evidence points. No code changed in this pass.
 
+## 3n. Calling into cold ext4 pages also faulted nowhere — three probes, three refutations
+
+Section 3m's next instrument was built and run (`probe-callfetch`): the test
+creates a file **on the mounted ext4 disk** filled with `ret` (0xc3) one byte per
+page, maps it `PROT_READ|PROT_EXEC` privately in 8 threads, and **calls** into a
+different page per thread — so each call's first instruction is a fetch of a cold
+page, and two threads race on the same page by construction.
+
+```
+  wrote 64 pages of ret into /mnt/cf/fetch.bin
+  512 cold-page CALLS across 8 threads, no fault
+```
+
+All three probes now agree:
+
+| hypothesis | probe | result |
+|---|---|---|
+| concurrency on a ramfs `r-x` mapping | 6 threads, 30720 byte touches | no fault |
+| concurrency + block-layer parking on ext4 | 8 threads, 4096 cold byte touches | no fault |
+| **cold-page instruction FETCH from ext4, 8 threads racing** | 512 calls | **no fault** |
+
+**What that establishes**: this kernel's demand-fetch path for a private `r-x`
+file mapping is correct under concurrency, under block-layer parking, and when the
+very first instruction of a cold page is the faulting one. The `error 14` Chromium
+hits is therefore **not** a general defect in that path, and three separate
+attempts to reproduce it with a small fixture have failed.
+
+**The honest conclusion for this line of investigation**: the remaining difference
+is not something a synthetic probe has captured yet — it is Chromium's own
+`SIGSEGV` handler interaction, or the trace showing `ip == addr` is being read
+from a *different* task than the fault. Continuing to guess at the mechanism
+without a reproducing fixture is no longer productive; the useful next step is
+a **reproducing Chromium run with `ptrace` attached to the zygote**, so the fault
+can be inspected live rather than reconstructed from a serial log. No code
+changed in this pass.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
