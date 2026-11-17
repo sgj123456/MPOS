@@ -520,6 +520,38 @@ anywhere in the log**. So whatever crashpad probes, the kernel answers it withou
 **The open question is now narrow**: after ~100 s, which thread is parked on what?
 Sample `/proc/<pid>/syscall` **after** the freeze, not before it.
 
+## 3k. Post-freeze sample: the main process is GONE, zygotes are zombies
+
+Section 3j said output freezes at ~100 s. Sampling `/proc` **after** the freeze
+(`build/imgcmd/frozen.sh`, t=130 s) shows why, and it is not a deadlock:
+
+```
+  pid=717 comm=chrome_crashpad   tid=717 st=S   tid=743 st=S
+  pid=719 comm=chromium          tid=719 st=Z      <- zombie
+  pid=720 comm=chromium          tid=720 st=Z      <- zombie
+  pid=742 comm=chrome_crashpad   tid=742 st=S
+```
+
+- the **main browser process is not in the list at all** - it exited;
+- both **zygotes are zombies** (`Z`), dead and uncollected;
+- only the **crashpad handlers** remain, sleeping (`S`).
+
+So the freeze is the parent shell waiting on a `--dump-dom` whose process already
+died, with the orphaned crashpad handler keeping the wait alive. The last records
+before it are the two zygotes' `int3` (`IMMEDIATE_CRASH` - their own CHECK), and
+`VideoCaptureThr` taking an `error 14` fetch fault on `libfontconfig` first.
+
+**What that narrows to**: the browser dies because its zygotes crash, and the
+zygote crash is preceded by a fetch fault on a private `r-x` file mapping. A
+single-threaded walk of 64 such pages faulted nowhere (§3i), so the fault needs
+**concurrency** - the same shape `resolve_anon_fault`'s own §6.181 note records (a
+block transfer parks the task; the borrow is what suffers).
+
+**Next instrument, named**: a multi-threaded probe that hammers `r-x` file pages
+from several threads at once, to reproduce `error 14` under concurrency without
+Chromium's 100-second startup. That is the shortest path from here to a landable
+fix, and this pass did not attempt it.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
