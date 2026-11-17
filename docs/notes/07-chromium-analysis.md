@@ -646,6 +646,43 @@ a **reproducing Chromium run with `ptrace` attached to the zygote**, so the faul
 can be inspected live rather than reconstructed from a serial log. No code
 changed in this pass.
 
+## 3o. The whole sched family is correct — crashpad's ENOSYS warning is not this kernel's
+
+Chromium's crash handler repeats `sched_getscheduler: Function not implemented
+(38)`, and three passes treated it as a possible kernel gap. It is not, and the
+measurement is direct rather than an inference.
+
+**On Linux 7.3.4** (`build/scratch/schedcmp/s.c`) and **in the guest**
+(`probe-sched`, `probe-sched2`), every call in the family answers the same:
+
+| call | Linux | this kernel |
+|---|---|---|
+| `sched_getscheduler` | `0` (SCHED_OTHER) | `0` |
+| `sched_getparam` | `0` | `0` |
+| `sched_getattr(48)` | `0`, size 48 / nice 0 / policy 0 | identical fields |
+| `sched_getaffinity(128)` | `8` | `8` |
+| `sched_rr_get_interval` | `0` | `0` |
+| `prio_max/min(SCHED_OTHER)` | `0` / `0` | `0` / `0` |
+| `prio_max/min(SCHED_FIFO)` | `99` / `1` | `99` / `1` |
+| `prio_max(SCHED_RR)` | `99` | `99` |
+| `prio_max(SCHED_BATCH)` | `0` | `0` |
+
+**No run of this kernel has ever printed its own `mpos: syscall <nr> -> ENOSYS`
+note** - grep of every saved serial log and gate log finds none. The kernel prints
+that note exactly once per number the first time it answers `ENOSYS`, so a
+`sched_getscheduler` that returned `ENOSYS` would have left a line. There is none,
+and the guest answers `rc=0`.
+
+So the warning is **crashpad's own**, not the kernel's answer: the runner is either
+reading a stale cached capability or attributing an unrelated failure to the
+scheduler query. Nothing to fix here, and this closes the last syscall-shaped
+hypothesis for the Chromium stall.
+
+The family is already pinned - `t-sched-policy` covers the priority bounds,
+`t-sched-attr` the `getattr` shapes and error order, `t-sched-getaffinity`,
+`t-sched-pid` and `sched-order` the rest - so no new pin was needed for a
+confirmation that is already a contract.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
