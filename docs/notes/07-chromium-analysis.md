@@ -366,6 +366,32 @@ The main process stays alive throughout, with ~51 open fds; zygotes exit (`Z`)
 in the run that produced output. The stall after that is waiting on resource
 loading, not on a crashing syscall.
 
+## 3g. Negative results (2026-11-17) — what did NOT reproduce, so nothing was landed
+
+Several follow-ups were tried and explicitly did **not** yield a landable fix.
+They are recorded so a later reader does not re-litigate them.
+
+- **An ENOSYS note naming crashpad's missing call**: the kernel prints
+  `mpos: syscall <nr> -> ENOSYS` once per number, so a fresh Chromium run should
+  name the exact call behind crashpad's "Function not implemented (38)". A
+  dedicated run (`build/imgcmd/eno.sh`) produced **no ENOSYS notes at all** —
+  and, like several repeats this session, **0 bytes of output** with the main
+  process still alive. So the earlier stderr that named `sched_getscheduler` was
+  from a *different*, non-reproducing run. There is no measured syscall gap to
+  fix right now.
+- **`fchroot` (472)** was checked as a candidate census item: the host is
+  non-root, so `fchroot(-1)` → `EINVAL`, a bad fd → `EBADF`, a regular file →
+  `EINVAL`, but the **successful** directory path could not be measured. A door
+  whose success half cannot be measured is not implemented here.
+- Repeats of the DOM run remain **unstable** (one 9096-byte run, several 0-byte
+  runs with no sampling). Any claim of "Chromium renders" would be reading a
+  single lucky run as a contract.
+
+**Conclusion of this pass**: the honest state is "no new measured, pin-able
+kernel defect". No code changed. The remaining Chromium blocker is in a flaky
+userspace/resource-loading path, and instrumenting it further needs a run that
+reliably reaches the same point — which the current guest setup does not.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
