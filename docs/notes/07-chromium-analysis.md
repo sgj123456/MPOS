@@ -683,6 +683,58 @@ The family is already pinned - `t-sched-policy` covers the priority bounds,
 `t-sched-pid` and `sched-order` the rest - so no new pin was needed for a
 confirmation that is already a contract.
 
+## 3p. FD flags and descriptor handover are correct — and one probe of mine was wrong
+
+Two measurements this pass, one of which is a correction of my own.
+
+### The CLOEXEC family: correct, and my first probe was wrong
+
+A probe that checked `FD_CLOEXEC` after each door that claims to set it reported
+`eventfd2(EFD_CLOEXEC)` as a MISMATCH. **The probe was wrong, not the kernel**: it
+passed `1`, which is `EFD_SEMAPHORE`, not `EFD_CLOEXEC` (`0x80000`). The kernel
+correctly did *not* set `CLOEXEC` for a flag word that never asked for it.
+
+Corrected and re-measured on Linux 7.3.4 and in the guest, all thirteen agree:
+
+| door | `F_GETFD` CLOEXEC |
+|---|---|
+| `open(O_CLOEXEC)` / `open(0)` | `1` / `0` |
+| `pipe2(O_CLOEXEC)` / `pipe2(0)` | `1` / `0` |
+| `dup3(O_CLOEXEC)` / `dup3(0)` | `1` / `0` |
+| `eventfd2(EFD_CLOEXEC)` / `(EFD_SEMAPHORE)` / `(both)` | `1` / `0` / `1` |
+| `inotify_init1(IN_CLOEXEC)` | `1` |
+| `F_DUPFD_CLOEXEC` | `1` |
+| `F_SETFD` set / clear then get | `1` / `0` |
+
+**The lesson is the one this repo already states**: a probe's own constants are
+part of the measurement, and a mismatch is as likely to be the instrument as the
+target. Had this been reported without re-reading the flag word, it would have
+been a fabricated kernel bug.
+
+### Descriptor handover: also correct
+
+Chromium's GPU child dies with `Crashing due to FD ownership violation:` (no name
+after the colon), which is `ScopedFD`'s bookkeeping DCHECK. `probe-fdsem` measured
+the primitives that bookkeeping rests on, on Linux and in the guest:
+
+```
+  open a=3, dup(a)=4
+  after close(a): fcntl(b)=0        <- the copy survives closing the original
+  after close(b): fcntl(b)=-1       <- and the close is real
+  closed 3 then opened 3            <- lowest-free reuse
+  sendmsg(SCM_RIGHTS) -> 1
+  sender fd 5 still open? fcntl=0
+  received fd=5, read 10 bytes      <- the received descriptor is USABLE
+```
+
+Every line matches Linux. So neither the flag family nor `dup`/`close`/`SCM_RIGHTS`
+is the cause, and the GPU child's DCHECK fires for a reason downstream of both -
+its own `ScopedFD` lifecycle, not a syscall shape this kernel gets wrong.
+
+`t-unix-scm` already pins the handover, `t-unix-peek`/`t-unix-dgram`/`t-unix-close`
+the rest of the unix-socket surface, so no new pin was warranted for a confirmation
+that is already a contract.
+
 ## 4. Finding B — `PTRACE_SEIZE`/`PTRACE_INTERRUPT` are missing, and crashpad needs them
 
 This is the real, nameable gap in the trace:
