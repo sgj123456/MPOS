@@ -86,3 +86,43 @@ refusals are closed business, and the 50 are ordered by what their answer proves
 the `EPERM`/`EFAULT`/`EINVAL` groups are calls other software can reach and expect
 to work, and the ten that answer `0` to zero arguments are the ones that most need
 a **real-argument** measurement before anyone decides what they should do.
+
+## Which numbers **real workloads** actually reached
+
+The census above is a synthetic sweep: it calls every number on purpose. The
+complementary question is which numbers real programs hit and were refused — and
+the kernel answers it directly, because `note_enosys` prints
+`mpos: syscall <nr> -> ENOSYS` once per number.
+
+Grepping every gate lane's serial log and the Chromium image's, across the whole
+suite plus a Chromium run, finds **exactly two** such notes:
+
+| machine | number | what it is | Linux's answer |
+|---|---|---|---|
+| aarch64 | 98 | `futex` (`202` on x86_64) | `ENOSYS` for that call shape too |
+| x86_64 | 202 | `futex` | `ENOSYS` for that call shape too |
+
+Both are the same thing on two machines, and both are **correct**: `t-pi-futex`
+issues `FUTEX_LOCK_PI | FUTEX_CLOCK_REALTIME`, a clock flag the PI operations do
+not take, and Linux refuses that pair with `ENOSYS` as well. So it is a served
+call refusing one argument shape, not a missing call.
+
+**What this establishes**: with 338 x86_64 programs and 334 aarch64 programs
+exercising the ABI — the ioctl families, DRM, evdev, sockets, namespaces, the
+SysV/POSIX IPC families, ptrace, seccomp, io_uring, and the Chromium run — **no
+real workload asked for a syscall this kernel does not have**. The 50 candidates in
+the table above are therefore *latent* gaps: reachable in principle, unreached in
+practice by everything this repository runs.
+
+That is a different and more useful statement than "50 gaps remain". It means the
+next pass should pick from those 50 by **what a program outside this repo would
+need**, not by what the list's order suggests — and it means a red
+`mpos: syscall N -> ENOSYS` line appearing in a future lane is genuinely news,
+because today there is none.
+
+**A note on reading those two numbers.** `futex` is `98` on aarch64 and `202` on
+x86_64, and `nr_aarch64.rs` carries the mapping in a comment beside the constant.
+A reader who assumes a number means the same thing on both machines will read
+`syscall 98` as `getrusage` and conclude the kernel has a defect it does not have
+— which is what happened while writing this section, and is the same trap
+`AGENTS.md` §5 records for `struct stat` and the `O_*` words.
