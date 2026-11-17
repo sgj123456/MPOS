@@ -351,7 +351,7 @@ A call absent from those is served as its phase section records.
 
 ### 1.1 Deliberately `ENOSYS` — refused, pinned
 
-`user/abitest/src/bin/syscall/t-enosys.rs` walks these and asserts `ENOSYS`, plus a console
+`user/tests/src/bin/t-enosys.rs` walks these and asserts `ENOSYS`, plus a console
 note printed once per number (`note_enosys`):
 
 None of these three is refused any more: `fsopen`, `fsconfig` and `fsmount` are **served**

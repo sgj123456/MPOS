@@ -85,6 +85,7 @@ A missing feature with a named prerequisite is not a defect; a success-for-a-thi
 | §4 | Structure layouts crossing the boundary | [04-structure-layouts.md](04-structure-layouts.md) |
 | §5 | The work list: landed passes (§5.1), small measured gaps (§5.2), gaps needing a named prerequisite (§5.3), structural work parked with Phase 11 (§5.4) | [05-work-list.md](05-work-list.md) · [05b-small-measured.md](05b-small-measured.md) · [05c-needs-prerequisite.md](05c-needs-prerequisite.md) · [05d-parked-with-phase-11.md](05d-parked-with-phase-11.md) |
 | §6 | Where the pins live | [06-pin-locations.md](06-pin-locations.md) |
+| §1.1a | The `ENOSYS` census: which refused numbers Linux also refuses (19 of 69) and which are real candidates, measured on both sides | [05-enosys-census.md](05-enosys-census.md) |
 
 This library used to be one file, `docs/UAPI.md`; the `§N.M` numbering is unchanged.
 
