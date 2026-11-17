@@ -74,6 +74,54 @@ pub fn init_interrupts() {
 /// [`serial::init`] must have run. The machine's `boot` reaches it through the
 /// `milestone` callback the wiring layer hands down, so the sink is live by the
 /// time anything prints here.
+/// What this machine's CPU can do, in `AT_HWCAP`'s bits.
+///
+/// x86_64's `AT_HWCAP` is `ELF_HWCAP` from `arch/x86/include/asm/elf.h`, which
+/// is a word of `cpu_feature` bits - **not** raw `CPUID` output. The bit numbers
+/// are the same constants `include/uapi/asm-generic/../linux/elf.h` names
+/// (`HWCAP_FPU` 0, `HWCAP_TSC` 4, `HWCAP_SSE` 6, `HWCAP_MMX` 23, `HWCAP_SSE2`
+/// 25, `HWCAP_AVX` 28, `HWCAP_FMA` 29, `HWCAP_XSAVE` 30), and each is read from
+/// the `CPUID` leaf that reports it: leaf 1 `EDX` carries FPU/TSC/SSE/SSE2/MMX,
+/// leaf 1 `ECX` carries FMA/XSAVE, and leaf 7.0 `EBX` carries AVX2.
+///
+/// **What is deliberately not claimed**: `AVX` and `XSAVE` are only usable if
+/// the kernel saves the extended state across a context switch, and this kernel
+/// saves the x87/SSE file (`crate::context`) - it does not switch `YMM` halves.
+/// Advertising `AVX` from the `CPUID` bit alone would tell a libc it may use
+/// 256-bit registers this kernel cannot preserve, which is exactly the promise
+/// `AGENTS.md` §3.2 forbids. So those two bits stay clear until the state does.
+///
+/// On this port a wrong bit is quieter than on aarch64 (glibc and musl read
+/// `CPUID` directly for the features they branch on), but that is a reason the
+/// vector has not mattered, not a reason to answer it carelessly.
+pub fn hwcap() -> usize {
+    // SAFETY: `CPUID` is unprivileged on every x86_64 and leaves no state the
+    // compiler or the kernel can observe; the port is only reached on a machine
+    // that already executed long mode, where leaf 1 exists.
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    let mut bits = 0usize;
+    if leaf1.edx & (1 << 0) != 0 {
+        bits |= 1 << 0; // HWCAP_FPU
+    }
+    if leaf1.edx & (1 << 4) != 0 {
+        bits |= 1 << 4; // HWCAP_TSC
+    }
+    if leaf1.edx & (1 << 25) != 0 {
+        bits |= 1 << 6; // HWCAP_SSE
+    }
+    if leaf1.edx & (1 << 23) != 0 {
+        bits |= 1 << 23; // HWCAP_MMX
+    }
+    if leaf1.edx & (1 << 26) != 0 {
+        bits |= 1 << 25; // HWCAP_SSE2
+    }
+    // Deliberately absent, and each for a measured reason rather than an
+    // oversight: `HWCAP_AVX` (28) and `HWCAP_XSAVE` (30) need the kernel to
+    // preserve YMM across a switch, and `HWCAP_FMA` (29) needs AVX. This
+    // kernel's switch saves the x87/SSE file only.
+    bits
+}
+
 pub fn print_args(args: core::fmt::Arguments<'_>) {
     use core::fmt::Write;
 

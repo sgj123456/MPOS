@@ -99,6 +99,63 @@ pub fn kernel_sections() -> KernelSections {
     }
 }
 
+/// What this machine's CPU can do, in `AT_HWCAP`'s bits.
+///
+/// The auxiliary vector tells every program what the hardware has, and each
+/// Linux port fills it from different registers. On this one the sources are
+/// `ID_AA64PFR0_EL1` and `ID_AA64ISAR0_EL1`, and the *mapping* is not invented
+/// here: it is the one [the kernel documents](https://www.kernel.org/doc/html/v5.14/arm64/elf_hwcaps.html)
+/// — `HWCAP_FP` is `PFR0.FP == 0`, `HWCAP_ASIMD` is `PFR0.AdvSIMD == 0`,
+/// `HWCAP_AES` is `ISAR0.AES >= 1`, and so on — with the bit numbers from
+/// `arch/arm64/include/uapi/asm/hwcap.h` (`FP` 0, `ASIMD` 1, `EVTSTRM` 2, `AES`
+/// 3, `PMULL` 4, `SHA1` 5, `SHA2` 6, `CRC32` 7, `ATOMICS` 8).
+///
+/// The same two registers already feed `/proc/cpuinfo`'s `Features` line
+/// (`src/vfs/procfs.rs`), and the two must agree: a libc reads `AT_HWCAP` to
+/// decide which instructions it may emit, and a person reads `cpuinfo` to find
+/// out what the machine claimed. Deriving them from one read is what keeps a
+/// machine from saying two different things about itself.
+///
+/// What is **not** claimed: everything this port does not implement a check
+/// for (`SVE`, `SME`, `FP16`, the atomics-as-feature split, `EVTSTRM`'s timer
+/// frequency) stays clear. A feature bit is a promise the CPU will execute an
+/// instruction, so an unexamined bit is left off rather than guessed.
+pub fn hwcap() -> usize {
+    let pfr0: u64;
+    let isar0: u64;
+    // SAFETY: `ID_AA64*` identification registers are readable at EL1 with no
+    // side effects, and EL1 is the only level this kernel runs at.
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+    }
+    let mut bits = 0usize;
+    // A field of `0b0000` means "implemented"; `0b1111` means "not".
+    if pfr0 & 0xf == 0 {
+        bits |= 1 << 0; // HWCAP_FP
+    }
+    if (pfr0 >> 4) & 0xf == 0 {
+        bits |= 1 << 1; // HWCAP_ASIMD
+    }
+    let aes = (isar0 >> 4) & 0xf;
+    if aes >= 1 {
+        bits |= 1 << 3; // HWCAP_AES
+    }
+    if aes >= 2 {
+        bits |= 1 << 4; // HWCAP_PMULL
+    }
+    if (isar0 >> 8) & 0xf >= 1 {
+        bits |= 1 << 5; // HWCAP_SHA1
+    }
+    if (isar0 >> 12) & 0xf >= 1 {
+        bits |= 1 << 6; // HWCAP_SHA2
+    }
+    if (isar0 >> 16) & 0xf >= 1 {
+        bits |= 1 << 7; // HWCAP_CRC32
+    }
+    bits
+}
+
 /// Put a formatted line on the machine's boot console.
 ///
 /// The console mux `mpos::println!` reaches is x86_64's until stage 4, so this

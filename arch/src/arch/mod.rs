@@ -88,6 +88,17 @@ pub use aarch64::print_args;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::print_args;
 
+/// What this machine's CPU can do, in `AT_HWCAP`'s Linux bit numbers. Reached
+/// by the kernel through `crate::hal::hwcap`, never directly: the dependency
+/// graph lets only the crate root and the wiring name this module, which is the
+/// rule that keeps the machine layer out of `sched`.
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::hwcap;
+
+/// The first machine's answer to the same question.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::hwcap;
+
 /// Stop the core for good. The panic path's last act, and the bring-up halt.
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::halt;

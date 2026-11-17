@@ -1392,6 +1392,25 @@ pub fn virt_to_phys(virt: usize) -> usize {
 /// Ticks per second of [`ticks`].
 pub const TICK_HZ: u32 = <Current as Clock>::TICK_HZ;
 
+/// What this machine's CPU can do, in `AT_HWCAP`'s Linux bit numbers.
+///
+/// The auxiliary vector is the one place a program is *told* about its CPU
+/// rather than asking, and each port fills it from its own registers. This
+/// forwarder exists because the answer belongs to the machine while the caller
+/// (`sched`'s exec path) may not name `crate::arch::` - the dependency graph
+/// allows only the crate root and the wiring to reach it (`AGENTS.md` §3,
+/// `xtask/src/depgraph.rs`'s `ARCH_EXEMPT`). Going through the HAL is the door
+/// that rule exists to require.
+///
+/// A constant would be wrong on one of the two machines, and both answers leave
+/// clear every bit whose claim this kernel cannot keep: a feature bit tells a
+/// libc which instructions it may emit, so an unearned one is a promise that
+/// breaks on the first `memcpy` to trust it (`AGENTS.md` §3.2).
+#[inline]
+pub fn hwcap() -> usize {
+    crate::arch::hwcap()
+}
+
 /// Monotonic tick count since boot.
 #[inline]
 pub fn ticks() -> u64 {
