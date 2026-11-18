@@ -949,6 +949,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
                 mm.set_saved_auxv(loaded.auxv.clone());
                 mm
             },
+            clear_tid: None,
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
@@ -1178,6 +1179,7 @@ pub fn try_spawn_user(
                 mm.set_saved_auxv(loaded.auxv.clone());
                 mm
             },
+            clear_tid: None,
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),

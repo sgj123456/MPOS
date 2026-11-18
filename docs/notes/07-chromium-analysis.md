@@ -2809,16 +2809,34 @@ waiting on a process that had already died). Both zygotes live. `CHECK`/`FATAL` 
 zero and stderr is 2423 bytes, *smaller* than §4y's 4513: the two zygote crash
 dumps are no longer written. What did not change is `--dump-dom`: 0 bytes.
 
-**The fault that remains is §3a's, not a new one.** `error 14` is `P=1` (a
-protection violation on a page that *is* present) `W=1` (a **write**) `U=1`, inside
-a VMA this kernel describes as `r-x` private - a thread writing its library's own
-text. §3a recorded exactly this for the same library; §4y's run had the same fault
-under a different address. (A `libnss3.so` instance of it appeared in a shorter
-run, §4aa's text; both are the same class, and which library takes it first is a
-scheduling matter.) **On a current host Linux refuses that write the same way**, so
-the fault is the correct answer and this is not a syscall gap: a library writing
-its own text means a relocation the loader mishandled or a `TEXTREL` the package
-should not carry, which is this file's item 3 and still open.
+**The fault that remains is §3a's, not a new one** - but the reading of it below
+was wrong when this section was first written, and the correction is the point.
+
+`report_user_fault` prints `error` **in hexadecimal** (`{error:x}`,
+`src/kernel_services.rs`), so `error 14` is `0x14`, not decimal fourteen. Decoded:
+bit 0 `P=0` (the page was **not present**), bit 1 `W=0`, bit 2 `U=1`, bit 4
+`I/D=1` (an **instruction fetch**). With `addr == ip` that is one thing: an
+instruction fetch from a page that was not there. That is what §3d/§3g/§3k/§3l
+already recorded, and what the original text of this section got backwards (it
+called it "`P=1` … `W=1` … a write to the library's own text", which would be
+decimal 14). The `PFDIAG` line prints `P=1` because it runs **after**
+`resolve_anon_fault` has already resolved the frame - §3l recorded that - and the
+`segfault` line prints only after both `resolve_anon_fault` and
+`resolve_stack_growth` refused, so a VMA (`vma=0xd (r-xu) kind=object(private)`)
+covered the address and no frame was produced for a *fetch*.
+
+The consequence is the opposite of what this section first claimed: this is **not**
+"a library writing its own text that Linux would refuse too", because there is no
+write. It is a fault on the kernel's own demand-paging path for an executable's
+text page - the class §3l's probe could not reproduce with six threads touching
+`r-x` pages (30720 touches, no fault). The `libdbus` disassembly at the named
+offset agrees: `0x1e134` is `cmp %r12d,%eax`, and the reported fault address
+`…13134` is **not on an instruction boundary** there - consistent with a fetch of
+the page, not with a write landing in it.
+
+Both readings are recorded here rather than the wrong one being quietly replaced,
+for the reason this file's own §3l section states: the wrong reading was written
+down as a measurement, and only the hex/decoding mismatch exposed it.
 
 **What this does and does not establish.** The `st_nlink` fix removed the first
 blocker and moved the failure past the point every earlier run stopped at; the
@@ -2829,6 +2847,107 @@ ends at the 150 s budget with the process still alive and no output, so it is a
 instrument is a `--dump-dom` run with `--enable-logging=stderr --v=1` past the
 same point, plus the §3k multi-thread `r-x` probe re-run against the fixed kernel -
 neither of which is Chromium's `st_nlink` question.
+
+## 4ac. FIXED: the clear-tid word was one per address space, so `pthread_join` hung
+
+The §4ab run left the browser alive and `--dump-dom` producing nothing. The next
+instrument was the §3k multi-thread `r-x` probe re-run against the fixed kernel.
+It reproduced something else, and it is a kernel defect, not a Chromium one.
+
+**The observation.** A 4-thread fixture that touches one distinct file page per
+thread printed every read as `ok:` and then never printed `all joined`
+(`build/scratch/race/hang.c`, `=== exit=143` from the harness's `timeout`). A
+fixture with **no mmap at all** hung the same way (`j4.c`), so it was not the
+page faults. The smallest reproduction is 2 threads and a join (`j3.c`; workers
+`usleep(120000)` so they are alive when the join arrives):
+
+```
+=== n=1
+create 0 e=0
+joining 0
+t0 exiting
+j0 e=0 r=0            <- one thread joins normally
+all joined
+=== n=2
+create 0 e=0
+create 1 e=0
+joining 0
+t1 exiting
+t0 exiting            <- both workers are gone ...
+=== exit=143          <- ... and the join of the first never returns
+```
+
+The same fixture on a current host (Linux 7.3.4) joins both threads, so the hang
+was the kernel's. A post-hang `/proc/<pid>/stat` sample shows the surviving
+thread `S` with `wchan` = `block_until_nanos`: parked for ever on a futex nobody
+would wake. The futex contract itself measured **correct**
+(`build/scratch/race/fx.c`: a mismatched `FUTEX_WAIT` is `EAGAIN` at once, a
+timeout is `ETIMEDOUT`), so the wait was legitimate and the wake never came.
+
+**The mechanism.** `pthread_join` waits on a word the exiting thread stores zero
+into, and the kernel's whole part of it is `CLONE_CHILD_CLEARTID`: "when *this*
+thread exits, store zero at *this* address and wake whoever sleeps there". The
+address is named by `set_tid_address`/the clone flag and read back through
+`prctl(PR_GET_TID_ADDRESS)`. **Linux keeps it in `task_struct` - per thread.**
+This kernel kept it on `Mm`, and `Mm` is shared by the whole thread group
+(`Task::mm: Arc<Mm>`), so the second `pthread_create` overwrote the first
+thread's address: the first thread out cleared the *second* thread's word, and the
+first thread's joiner slept for ever on a word nobody was going to write.
+
+A second defect sat beside it: in `Table::release_exited` the clear lived in the
+**`else` of `if last`**, so the thread that took the last reference never cleared
+its word at all - a single-threaded process's own `set_tid_address` word could
+stay non-zero after it exited.
+
+**The fix** (`src/sched/runtime/task.rs`, `child_mm.rs`, `child_exit.rs`): a
+`clear_tid: Option<usize>` on `Task` instead of on `Mm`, written by both clone
+shapes and by `set_tid_address`, read back by `current_tid_address`; and the read
+moved **out of** the `else` arm and **before** `mm.leave()`, so every thread that
+named a word clears it. Nothing else about the teardown order moved -
+`write_clear_tid` already answers nothing for a task whose space is gone, which is
+why clearing for a group that is being torn down is harmless.
+
+**The pin, and the three shapes that were rejected before it** (AGENTS.md: a pin
+that passes with *and* without the change pins nothing). `user/tests/src/bin/t-thread-join.rs`:
+
+1. `std::thread::spawn` + `join` - passed on a kernel carrying the defect. Rust's
+   join does not wait on the word this flag clears for a plain worker.
+2. musl's own `pthread_create`/`pthread_join` - passed on the **genuine pre-fix
+   kernel** (`build/imgcmd/disk-prefix.img`). musl's join re-reads its worker's
+   word on a retry path and survives the wrong address; static **glibc**'s does
+   not. A pin that depends on which libc the payload links is a pin of the libc.
+3. A hang as the claim - a sweep reports `timeout`, not a named failure, so a
+   hanging program cannot say *which* half was wrong.
+
+What landed instead pins the narrower fact the kernel actually promises: **each
+thread names its own word and reads it back**, so a group-wide slot hands every
+thread the last address named and at most one can match. Measured on both
+kernels with the same binary:
+
+```
+fixed kernel (build/imgcmd/disk-fix3.img)      pre-fix kernel (disk-prefix.img)
+ok: the calling thread reads back ...          ok: the calling thread reads back ...
+ok: three threads each read back their own     FAIL: three threads each read back ...
+ok: and the three are three different          FAIL: and the three are three different
+ok: the process reaches its end                ok: the process reaches its end
+PASS  exit=0                                   FAILED  exit=1
+```
+
+Three instrument bugs were paid for on the way and are recorded in the file: the
+`prctl` request number (`0x5005` remembered, where the ABI's value is 40 - the
+kernel refused the unknown option and the claim failed on a *correct* kernel); the
+argument position of the output pointer (the second, measured in
+`build/scratch/prt/r.c`: a pointer in the third slot is `-1` with the word
+untouched); and a spin barrier, which cannot work on this machine
+(`assets/configs/machine.toml`: `qemu.cpus = 1`) and hung the fixture until it
+became a parking `Barrier`.
+
+**Reach on Chromium's path: measured, and it is the remaining hang.**
+`--dump-dom about:blank` on the fixed kernel runs alive past 150 s producing
+nothing. A hang with no output and no stack is exactly what a two-thread
+`pthread_join` looked like from outside before it was reduced, so this defect is
+the first candidate for the silence - but that is a hypothesis, not a measurement,
+and it is stated as one.
 
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 

@@ -1491,6 +1491,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 }
                 mm
             },
+            clear_tid: None,
             released: false,
             tgid: TaskId(slot),
             signals: 0,
@@ -1697,10 +1698,9 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // path never set it while the thread path did (`docs/notes/` §6.20).
         if request.flags & crate::abi::CLONE_CHILD_CLEARTID != 0 {
             t.tasks[slot]
-                .as_ref()
+                .as_mut()
                 .expect("the child was just built")
-                .mm
-                .set_clear_tid(request.child_tid);
+                .clear_tid = Some(request.child_tid);
         }
 
         let child_id = TaskId(slot);
@@ -2342,6 +2342,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
                 mm.join();
                 mm
             },
+            clear_tid: None,
             released: false,
             tgid,
         });
@@ -2350,11 +2351,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // Where a joiner sleeps. The thread clears it on the way out, and
             // wakes whoever is waiting there - which is the whole of what
             // `pthread_join` needs from the kernel.
+            //
+            // Written on the **new thread's own** record, not on the group's
+            // memory: every thread names a different word, and one word per
+            // address space is what made a two-thread `pthread_join` hang
+            // (`docs/notes/` §4ac).
             t.tasks[slot]
-                .as_ref()
+                .as_mut()
                 .expect("the thread was just built")
-                .mm
-                .set_clear_tid(request.child_tid);
+                .clear_tid = Some(request.child_tid);
         }
 
         let child_id = TaskId(slot);
@@ -2550,11 +2555,11 @@ pub(crate) fn end_group_siblings(t: &mut super::task::Table, me: TaskId, tgid: T
 /// past the second.
 #[cfg(target_os = "none")]
 pub fn current_tid_address() -> usize {
-    with_table(|t| t.task(t.current).mm.clear_tid().unwrap_or(0))
+    with_table(|t| t.task(t.current).clear_tid.unwrap_or(0))
 }
 
 pub fn set_clear_tid(address: usize) {
-    with_table(|t| t.task(t.current).mm.set_clear_tid(address));
+    with_table(|t| t.task_mut(t.current).clear_tid = Some(address));
 }
 
 /// The process id of the running task: the id of its thread group's leader.

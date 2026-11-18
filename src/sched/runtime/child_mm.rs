@@ -2028,10 +2028,6 @@ pub struct Mm {
     /// The thread that started the process: its id is the group's pid, and
     /// `getpid` answers it from any of the threads.
     pub(crate) leader: TaskId,
-    /// Where a leaving thread writes zero and wakes whoever waits there -
-    /// `CLONE_CHILD_CLEARTID`, which is how a libc's `pthread_join` learns a
-    /// thread is gone without polling.
-    pub(crate) clear_tid: Mutex<RefCell<Option<usize>>>,
     /// The `MEMBARRIER_CMD_REGISTER_*` commands this process has declared it
     /// will use, as a bitmask.
     ///
@@ -2277,7 +2273,6 @@ impl Mm {
             vmas: Mutex::new(RefCell::new(VmaTable::new())),
             eager: Mutex::new(RefCell::new(eager)),
             leader,
-            clear_tid: Mutex::new(RefCell::new(None)),
             membarrier: core::sync::atomic::AtomicUsize::new(0),
             robust_head: core::sync::atomic::AtomicUsize::new(0),
             comm_name: [const { core::sync::atomic::AtomicU8::new(0) }; 16],
@@ -3298,13 +3293,5 @@ impl Mm {
 
     pub(crate) fn leader(&self) -> TaskId {
         self.leader
-    }
-
-    pub(crate) fn set_clear_tid(&self, address: usize) {
-        critical_section::with(|cs| *self.clear_tid.borrow(cs).borrow_mut() = Some(address));
-    }
-
-    pub(crate) fn clear_tid(&self) -> Option<usize> {
-        critical_section::with(|cs| *self.clear_tid.borrow(cs).borrow())
     }
 }

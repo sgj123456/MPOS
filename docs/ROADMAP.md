@@ -1438,11 +1438,17 @@ Pins: `a_proc_directories_nlink_counts_its_subdirectories` (host) and
 `t-proc-nlink` (guest, `task/` `3 -> 5 -> 3` with `pthread_create`/join while the
 same process's `fd/` stays `2`). **The zygotes no longer die**: the browser now
 stays alive for 150 s of a sampled run where it used to vanish before 45, stderr
-drops from 4513 to 2423 bytes, and the remaining fault is §3a's own shape - a
-thread taking `error 14` (a **write**) inside a library's `r-x` mapping - which
-Linux refuses identically and which is this file's item 3, not a syscall gap
-(§4ab). `--dump-dom` is still 0 bytes, but the failure is now a *hang* rather than
-a crash.
+drops from 4513 to 2423 bytes, and `--dump-dom` is still 0 bytes - but the
+failure is now a *hang* rather than a crash.
+
+**The §4ab reading of that remaining fault was WRONG, and is corrected there.**
+`report_user_fault` prints `error` in hex, so `error 14` is `0x14` = `P=0`,
+`I/D=1`: an **instruction fetch from a page that is not present**, not the
+"write into the library's own text" the first version claimed (that would be
+decimal 14). The `PFDIAG` line saying `P=1` is taken *after* `resolve_anon_fault`
+has already resolved the frame (§3l). So the fault is a demand-paging miss on an
+executable's text page - this kernel's own path, not a library misbehaving and
+not a syscall gap - which is item 3's question restated, and still open.
 
 **A second instance of the same defect, found by the pin - and FIXED** (§4aa):
 the pin's own first control failed, because **tmpfs directories answered
@@ -1456,6 +1462,23 @@ counter would have to be moved by five paths, and the `rename` shapes are where
 such a counter drifts. Claimed in `t-proc-nlink` beside the procfs ones; the
 counterfactual is the three tmpfs claims that redden when the override is
 deleted, with every procfs and sysfs claim staying green.
+
+**`pthread_join` hung on two threads, and the cause was a per-group clear-tid word**
+(2026-11-18, §4ac): the §3k multi-thread `r-x` probe re-run against the fixed
+kernel reproduced something else - a 2-thread `pthread_join` never returning,
+with the survivors parked on `block_until_nanos` and the futex contract itself
+measured correct. `CLONE_CHILD_CLEARTID`'s address lived on `Mm`, which the whole
+thread group shares, so the second `pthread_create` overwrote the first thread's
+address and the first thread out cleared the *second* thread's word. Linux keeps
+it in `task_struct`; so does this kernel now (`Task::clear_tid`), with the read
+moved out of `release_exited`'s `else` arm so the last thread to leave clears its
+word too. The pin is `t-thread-join`, and what it does **not** say is as measured
+as what it does: `std::thread::join` and musl's `pthread_join` both passed on a
+kernel carrying the defect (static glibc's is the one that hangs), so the pin
+claims the narrower fact - each thread names its own word and reads it back, and
+three threads answer three different addresses - which reddens on the pre-fix
+kernel (`disk-prefix.img`: two claims red) and passes on the fixed one. Whether
+this is why the browser still produces no DOM is a **hypothesis**, named as one.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

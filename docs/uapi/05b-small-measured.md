@@ -1752,3 +1752,20 @@ those three with `ENOMEM` 12, and with the errno lie restored, `ENOSPC` 28 - the
 - **`FUTEX_LOCK_PI`/`UNLOCK_PI`/`TRYLOCK_PI` are served** (item 276, §6.157): the PI word names its owner's tid and honours `FUTEX_WAITERS`/`FUTEX_OWNER_DIED`, a dead owner's word is handed on, and `PTHREAD_PRIO_INHERIT` is no longer `ENOSYS` — which is what pulseaudio's assert was waiting for. Priority inheritance itself is still a named gap (kernel-internal ready bands).
 
 - **`/sys/devices/system/cpu/{online,present,possible,offline}` are served** (item 277, §3.31): a Linux CPU list (`0`, one CPU, uniprocessor by design) and an empty `offline`, which is what crashpad reads before it can size its thread list. No `cpuN` directories or hotplug yet.
+
+- **The clear-tid word is a fact about a thread, not about an address space** (2026-11-18, §4ac):
+  `set_tid_address` (and `clone`'s `CLONE_CHILD_CLEARTID`) records "when *this* thread exits, store
+  zero at *this* address and wake whoever sleeps there", and Linux keeps that address in
+  `task_struct`. This kernel kept it on `Mm`, which the whole thread group shares, so the second
+  `pthread_create` overwrote the first thread's address and the first thread out cleared the
+  *second* thread's word - and the first thread's joiner slept for ever. Measured before the fix:
+  two threads plus `pthread_join` never returns (`build/scratch/race/j3.c`, a static glibc program;
+  the survivors park on `block_until_nanos` while the futex contract itself is correct). It is
+  `Task::clear_tid` now, and every thread that named a word clears it, including the one that takes
+  the last reference (that read had sat in `release_exited`'s `else` arm). Pin `t-thread-join`,
+  which claims the narrower directly observable fact - each thread names its own word and
+  `prctl(PR_GET_TID_ADDRESS)` answers for the calling thread, three threads answering three
+  different addresses - because `std::thread::join` and musl's `pthread_join` both **passed on a
+  kernel carrying the defect** and only static glibc's hangs: a pin that depends on which libc the
+  payload links is a pin of the libc. Two claims redden on the pre-fix kernel
+  (`build/imgcmd/disk-prefix.img`, `FAILED exit=1`) and all four pass on the fixed one.

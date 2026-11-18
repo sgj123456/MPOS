@@ -1316,6 +1316,19 @@ pub(crate) struct Task {
     /// one, so every task has one and nothing has to ask whether it is a
     /// thread to find its memory.
     pub(crate) mm: Arc<super::child_mm::Mm>,
+    /// Where **this** task writes zero as it leaves, and which it wakes -
+    /// `CLONE_CHILD_CLEARTID`, the word a libc's `pthread_join` sleeps on.
+    ///
+    /// Per task, and that is the whole point of it being here rather than on
+    /// the `Mm` beside it. Every thread names its own address and a joiner
+    /// waits on the address *its* thread named, so one word per address space
+    /// was one word too few: the second `pthread_create` overwrote the first
+    /// thread's address, the first thread then cleared the second's word, and
+    /// the joiner of the first slept for ever on a `clone` that had already
+    /// finished. Measured on the guest with two threads and a plain
+    /// `pthread_join` (`docs/notes/` §4ac); Linux keeps it in `task_struct`
+    /// for the same reason, and `PR_GET_TID_ADDRESS` is per thread there too.
+    pub(crate) clear_tid: Option<usize>,
     /// Set once this task's exit has been accounted for. The release pass runs
     /// on every reap, and a thread that left twice would take the group's count
     /// down twice - which would free memory a sibling is still using.
@@ -1989,6 +2002,7 @@ impl Task {
             // them is not its state.
             fpu_live: false,
             mm: Mm::new(TaskId(0), 0, alloc::vec::Vec::new()),
+            clear_tid: None,
             released: false,
             tgid: TaskId(0),
             body: None,
@@ -2885,6 +2899,7 @@ impl Table {
             space: None,
             user: false,
             mm: Mm::new(TaskId(slot), 0, alloc::vec::Vec::new()),
+            clear_tid: None,
             released: false,
             tgid: TaskId(slot),
             user_entry: None,
@@ -3046,6 +3061,30 @@ impl Table {
                 continue;
             };
             task.released = true;
+            // A thread says where it left, and wakes whoever waits there:
+            // `pthread_join` sleeps on a futex at exactly this address. The
+            // word is written first and the sleepers woken after, because a
+            // joiner that wakes early reads the word, finds the thread still
+            // there and goes back to sleep.
+            //
+            // The address is **this task's own**, which is why it is read off
+            // the task and not off the group: every thread names one at its
+            // `clone`, and a joiner waits on the one its thread named. Held on
+            // the shared `Mm` these overwrote each other, so the first thread
+            // out cleared the second's word and the first's joiner never woke
+            // (`docs/notes/` §4ac, measured with two threads and a plain
+            // `pthread_join`).
+            //
+            // Read before the `last` branch below, not inside its `else`:
+            // Linux clears the word for *every* thread that named one, and the
+            // `else` skipped the one case that is not hypothetical here - the
+            // last thread of a group whose joiner is `wait`ing on a word in
+            // another address space (a forked child). The write is harmless
+            // when the space is already gone, because [`Self::write_clear_tid`]
+            // answers nothing for a task with no space.
+            if let Some(address) = task.clear_tid {
+                clear_tids.push((group, address));
+            }
             // A thread that leaves does not take the group's memory with it:
             // its siblings are still running on the same frames. Only the last
             // one out does what a process exit has always done here.
@@ -3063,13 +3102,6 @@ impl Table {
                         mm::free_frames(frame, 0);
                     }
                 }
-            } else if let Some(address) = task.mm.clear_tid() {
-                // A thread says where it left, and wakes whoever waits there:
-                // `pthread_join` sleeps on a futex at exactly this address.
-                // The word is written first and the sleepers woken after,
-                // because a joiner that wakes early reads the word, finds the
-                // thread still there and goes back to sleep.
-                clear_tids.push((group, address));
             }
 
             // The descriptors are handed over rather than dropped: dropping a
