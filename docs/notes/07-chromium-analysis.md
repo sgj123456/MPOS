@@ -1962,6 +1962,74 @@ kernel-side fact that has survived every retraction is still §4p's: a static gl
 image reaches `btree_allocate_node`, gets NULL from `malloc(0x100)`, and stores
 through it at `0x47a983` with no null check.
 
+## 4r. `ifunc` is fine, `_exit` is fine, and the fault is a second `call *%rax`
+
+§4q left `malloc` returning NULL unexplained. This pass chased two suspects and
+**cleared both**, leaving one clean bracket around the fault.
+
+**`IRELATIVE` is not the kernel's to resolve, and I implemented it wrongly before
+noticing.** The image carries 22 `R_X86_64_IRELATIVE` records - glibc's `ifunc`
+slots for `memcpy`, `strlen`, the `str*` family - and it is tempting to conclude
+the loader must call the resolvers. It must not: this binary has **no
+`PT_DYNAMIC`** and no dynamic section (verified with `readelf -lW`/`-dW`), so its
+relocations live in `.rela.plt` and are applied by glibc's own `__libc_csu_irel`,
+which is an ordinary `.init_array` constructor. A stub-based implementation was
+written, measured, and **reverted** - and the measurement that proved it wrong is
+the useful part:
+
+```
+at exec: GOT[0x4b8f40] ok=1 0x1000000
+at main(): GOT ifunc slots:
+  [0x4b8f40] = 0x4668b0      <- __wcslen_ifunc's choice
+  [0x4b8f48] = 0x431950
+  [0x4b8f80] = 0x40cdc0
+  ...
+```
+
+Every slot is a real code address by the time `main` runs, and the value at exec
+(`0x1000000`) is what the static linker pre-set. So `.init_array` **does** run -
+`_IO_stdfiles_init` is its other entry and `printf` works - and `ifunc` resolves.
+§4f's "no `.init_array` constructor ever runs" is dead for the second time, now
+with a GOT dump instead of a step trace.
+
+**And `_exit` is fine.** On the current kernel:
+
+```
+--- t (_exit(0)) ---        about to _exit(0)   rc=0
+--- m (printf, return) ---  hello               segfault   rc=139
+--- m3 (bare return) ---                        segfault   rc=139
+```
+
+A program that calls `_exit(0)` leaves cleanly; one that *returns from `main`*
+crashes. That difference is entirely inside glibc's exit path, and it is the same
+distinction §4e opened with - now measured on a kernel that has every ptrace fix
+in this file.
+
+**Where the fault is.** With one breakpoint at the mangle pair:
+
+```
+entry word(rax)=0x650f24e8c0d8cb72 guard=0x65b9328792344fec -> unmangled=0x402f80
+  is that a code address? YES
+```
+
+The first dispatch of `__run_exit_handlers` resolves correctly to `call_fini`, so
+the guard, the mangling and the node's first entry are all sound. The crash comes
+**after** it, and the two runs put it in different places - `0x7e47...398` in one,
+`0x3fcb4b98` (inside the user stack's page range) in another - which is the
+signature of a value read from a structure being called as a function, with the
+structure's contents varying run to run.
+
+**So the bracket is now**: first dispatch correct → `call_fini` runs → something
+in the second pass calls a value that is not code. The next measurement is the
+same register read one dispatch later, which the `flame` probe already has the
+shape for.
+
+**Tally**: nine wrong readings or wrong turns retracted (the `>=` condition, reads
+before the instruction, three struct-offset guesses, 60-step sampling, `-1` as
+data, a wrong `.bss` clobber model, a wrong `IRELATIVE` implementation), and one
+implementation written then reverted. The instrument - and my own structural
+assumptions about it - has been the harder subject every time.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
