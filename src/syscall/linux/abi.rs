@@ -1136,6 +1136,21 @@ pub(crate) const PTRACE_SEIZE: usize = 0x4206;
 /// the request only means something for the seized pair.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const PTRACE_INTERRUPT: usize = 0x4207;
+/// See [`PTRACE_SEIZE`]: leave a seized tracee stopped in its group stop and
+/// tell the tracer about the *next* stop instead of resuming it.
+///
+/// Measured on Linux 7.3.4 (`build/scratch/listen/l{1,2,3,4}.c`):
+///
+/// - served only for a tracee sitting in a **group stop of a seized tracee** —
+///   `EIO` for one merely `ATTACH`ed, for a tracee stopped by `INTERRUPT`
+///   rather than by a stop signal, and for one that is running;
+/// - the tracer is not told the state changed: nothing is reported by the
+///   `LISTEN` itself, and `/proc/<pid>/stat` reads `t` both before and after;
+/// - `SIGCONT` **ends** the listen and the tracer is told with
+///   `status >> 8 == 0x8005` (an event stop) while the tracee runs again;
+/// - `SIGKILL` takes the tracee as it does in any stop, `WIFSIGNALED` 9.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) const PTRACE_LISTEN: usize = 0x4208;
 pub(crate) const PTRACE_DETACH: usize = 17;
 pub(crate) const PTRACE_SYSCALL: usize = 24;
 pub(crate) const PTRACE_SETOPTIONS: usize = 0x4200;
@@ -7028,6 +7043,7 @@ mod tests {
         // and this table is where they are written down.
         assert_eq!(PTRACE_SEIZE, 0x4206);
         assert_eq!(PTRACE_INTERRUPT, 0x4207);
+        assert_eq!(PTRACE_LISTEN, 0x4208);
         assert_eq!(PTRACE_GET_SYSCALL_INFO, 0x420E);
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_O_TRACEEXEC, 0x10);

@@ -1345,6 +1345,23 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         return 0;
     }
 
+    // `PTRACE_LISTEN` leaves a seized tracee stopped in its **group stop** and
+    // tells the tracer about the next stop rather than resuming it - the call
+    // crashpad makes after `SEIZE`+`INTERRUPT` so a crashing client can be
+    // watched without being resumed. Its refusals are measured
+    // (`build/scratch/listen/l{1,2,3}.c`): a tracee that is running, one held
+    // at an `INTERRUPT` stop, and one merely `ATTACH`ed are all `EIO`; a target
+    // that is not this caller's tracee is `ESRCH`.
+    if request == abi::PTRACE_LISTEN {
+        if crate::sched::tracer_of(id) != Some(me) {
+            return err::ESRCH;
+        }
+        return match crate::sched::listen_traced(id) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+
     // Everything else has to find a link already made. The check is `ours`
     // rather than "is my tracee" because of a race that is not hypothetical:
     // a tracer sets its options in the instruction after `fork`, and the child -

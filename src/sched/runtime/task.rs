@@ -1870,6 +1870,18 @@ pub struct Stop {
     /// ends it whether or not a tracer is watching. A tracer's stop is the
     /// tracer's alone, and no signal ends that one.
     pub group: bool,
+    /// Whether this group stop is a **`PTRACE_LISTEN`**: the tracer has told
+    /// Linux it wants to hear about new stops without resuming the tracee.
+    ///
+    /// A listening stop is still the tracee's own (a `SIGCONT` ends it), but it
+    /// is not the *pending* group stop any more: Linux reports a later stop
+    /// signal as a fresh `PTRACE_EVENT_STOP` rather than treating it as still
+    /// being in the one it is in
+    /// (`build/scratch/listen/l2.c` — the second `SIGSTOP` while listening is
+    /// reported again, with `status >> 8 == 0x8013`). Without the bit a
+    /// listening tracee would be indistinguishable from one merely resting in
+    /// its group stop, and `SIGCONT` would have nothing to tell the tracer.
+    pub listening: bool,
     /// Set once a `wait` has reported it. News is news once, and the tracee
     /// then sits in the stop until something resumes it.
     pub reported: bool,

@@ -625,6 +625,7 @@ pub fn exec_trap(regs: &mut AbiRegs) {
                 delivering: None,
                 syscall: entry,
                 group: false,
+                listening: false,
             },
         );
         return;
@@ -645,6 +646,7 @@ pub fn exec_trap(regs: &mut AbiRegs) {
                 ..call
             }),
             group: false,
+            listening: false,
         },
     );
 }
@@ -736,6 +738,7 @@ pub(crate) fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, eve
         syscall: None,
         // A stop signal's stop, so a `SIGCONT` can end it.
         group: true,
+        listening: false,
     });
     // It has no saved register file, because it has never been out of the
     // kernel: the registers it will resume with are the ones it was built with,
@@ -779,6 +782,7 @@ pub fn fork_trap(regs: &mut AbiRegs, event: u32, message: u64) {
             delivering: None,
             syscall: entry,
             group: false,
+            listening: false,
         },
     );
 }
@@ -819,6 +823,7 @@ pub fn seccomp_trap(regs: &mut AbiRegs, message: u64) {
             delivering: None,
             syscall: entry,
             group: false,
+            listening: false,
         },
     );
 }
@@ -863,6 +868,7 @@ pub fn stop_at_syscall(
                 delivering: None,
                 syscall: None,
                 group: false,
+                listening: false,
             },
         );
         return;
@@ -932,6 +938,7 @@ pub fn stop_at_syscall(
             delivering: None,
             syscall: stop_syscall,
             group: false,
+            listening: false,
         },
     );
 }
@@ -958,6 +965,13 @@ pub fn trace_signal_stop(regs: &mut AbiRegs) {
     // asked about the syscall will find nothing and say so, rather than
     // reading the previous call's arguments back and calling them this stop's.
     with_table(|t| t.task_mut(id).trace.syscall = None);
+    // The stop that *reports* a stop signal is a plain signal-delivery stop, on
+    // a seized tracee as much as on an attached one: measured on Linux 7.3.4
+    // (`build/scratch/listen/l6.c`), the first `SIGSTOP` reads `0x13` for both,
+    // and only the **group stop that follows** - after the tracer passes the
+    // signal on - reads `0x8013` for the seized pair. Marking this one as an
+    // event stop would tell a tracer "you asked for this pause" about a pause
+    // the program raised itself.
     park(
         regs,
         Stop {
@@ -976,8 +990,55 @@ pub fn trace_signal_stop(regs: &mut AbiRegs) {
             // `kill -CONT` must be able to get a task out of a `SIGSTOP`, and
             // anything that stopped it that way has only that way back.
             group: signal::stops_by_default(sig),
+            listening: false,
         },
     );
+}
+
+/// `PTRACE_LISTEN`'s half: mark a stopped tracee as **listening**, so that a
+/// stop signal arriving later is reported to the tracer as a fresh stop instead
+/// of being swallowed by the group stop the tracee is already in.
+///
+/// Linux's three refusals are measured (`build/scratch/listen/l{1,2,3}.c`):
+/// a tracee that is not in a group stop (a running one, or one held at an
+/// `INTERRUPT` stop) is `EIO`, and so is one that was `ATTACH`ed rather than
+/// seized. The caller answers them, because the questions are about the two
+/// distinct records - the stop's `group` bit and the link's `seized` bit - and
+/// the syscall layer already has both.
+pub fn listen_traced(id: TaskId) -> Result<(), isize> {
+    with_table(|t| {
+        let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {
+            return Err(crate::err::ESRCH);
+        };
+        if !task.trace.seized {
+            // Not a seized tracee: the request does not apply to it at all.
+            return Err(crate::err::EIO);
+        }
+        let Some(stop) = task.trace.stop.as_mut() else {
+            // Running - there is no stop to listen from.
+            return Err(crate::err::EIO);
+        };
+        if !stop.group {
+            // Stopped, but by the tracer rather than by a stop signal.
+            return Err(crate::err::EIO);
+        }
+        stop.listening = true;
+        Ok(())
+    })
+}
+
+/// Whether a stop signal may still stop `id`: false while it is **listening**,
+/// and the first such signal is what the tracer is told about instead
+/// (`PTRACE_EVENT_STOP`, `status >> 8 == 0x8013` for `SIGSTOP` - measured,
+/// `build/scratch/listen/l2.c`).
+pub fn listening(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|task| task.trace.stop)
+            .is_some_and(|stop| stop.listening)
+    })
 }
 
 /// Stop the running task on a stop signal with nobody tracing it, and hold it
@@ -993,18 +1054,33 @@ pub fn group_stop(regs: &mut AbiRegs, sig: u8) {
     // nobody is told about is a task nothing will ever resume, because the only
     // other way out is a `SIGCONT` and the tracee is inside a tracer that has no
     // shell to send one.
-    let traced = with_table(|t| t.task(id).trace.tracer.is_some());
+    let (traced, seized) = with_table(|t| {
+        let trace = &t.task(id).trace;
+        (trace.tracer.is_some(), trace.seized)
+    });
     park(
         regs,
         Stop {
             signal: sig,
-            event: PTRACE_EVENT_NONE,
+            // A seized tracee's group stop is an **event** stop, like every
+            // other stop that pair produces: measured on Linux 7.3.4
+            // (`build/scratch/listen/l6.c`), the group stop that follows a
+            // passed-on `SIGSTOP` reads `status >> 8 == 0x8013` while an
+            // `ATTACH`ed tracee's reads a plain `0x13`. The distinction is the
+            // same one `PTRACE_EVENT_STOP` draws everywhere: the tracer asked
+            // for this state.
+            event: if seized && signal::stops_by_default(sig) {
+                PTRACE_EVENT_STOP
+            } else {
+                PTRACE_EVENT_NONE
+            },
             traced,
             reported: false,
             message: 0,
             delivering: None,
             syscall: None,
             group: true,
+            listening: false,
         },
     );
 }

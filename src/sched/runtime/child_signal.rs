@@ -451,9 +451,28 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
             // ended here: only the tracer may resume its tracee, and a
             // `SIGCONT` that resumed one would not break the stop so much as
             // the protocol the stop exists for.
-            if task.trace.stop.is_some_and(|stop| stop.group) {
-                task.trace.stop = None;
-                task.trace.continued = true;
+            //
+            // A **listening** stop is the one exception, and it is measured
+            // (`build/scratch/listen/l6.c`): `SIGCONT` while listening leaves
+            // the tracee stopped and hands the tracer an *event* stop -
+            // `status >> 8 == 0x8005`, `/proc/<pid>/stat` still `t` - because
+            // `PTRACE_LISTEN` is the tracer saying "do not resume me, tell me".
+            // Clearing the stop there would run a tracee the tracer still owns.
+            if let Some(stop) = task.trace.stop {
+                if stop.listening {
+                    task.trace.stop = Some(crate::sched::runtime::task::Stop {
+                        signal: crate::sched::signal::SIGTRAP,
+                        event: crate::abi::PTRACE_EVENT_STOP,
+                        group: false,
+                        listening: false,
+                        reported: false,
+                        ..stop
+                    });
+                    task.trace.continued = false;
+                } else if stop.group {
+                    task.trace.stop = None;
+                    task.trace.continued = true;
+                }
             }
         }
         // A stop signal has nothing to say to a task that is already stopped,

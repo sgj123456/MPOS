@@ -51,6 +51,8 @@ const PTRACE_ATTACH: u32 = 16;
 const PTRACE_DETACH: u32 = 17;
 const PTRACE_SEIZE: u32 = 0x4206;
 const PTRACE_INTERRUPT: u32 = 0x4207;
+const PTRACE_LISTEN: u32 = 0x4208;
+const PTRACE_CONT: u32 = 7;
 const PTRACE_O_TRACESYSGOOD: usize = 1;
 /// The event an interrupt stop carries in bits 23:16, and the word a tracer
 /// compares `status >> 8` against - Linux's own discrimination of this stop
@@ -254,6 +256,111 @@ fn main() {
         unsafe {
             libc::kill(second, libc::SIGKILL);
             libc::waitpid(second, core::ptr::null_mut(), 0);
+        }
+    }
+
+    // === PTRACE_LISTEN: the third door of the seized group =================
+    //
+    // Measured on Linux 7.3.4 (`build/scratch/listen/l{1,2,3}.c`). A tracee
+    // reaches a *group stop* only by being sent a stop signal and having its
+    // tracer pass it on: the signal-delivery stop comes first (`WSTOPSIG` 19,
+    // `0x13`), the tracer resumes with `SIGSTOP` named as the signal, and the
+    // group stop that follows reads `status >> 8 == 0x8013`. `LISTEN` is served
+    // **only there**; a tracee at an `INTERRUPT` stop is `EIO`, and one merely
+    // `ATTACH`ed is `EIO` too.
+    if let Some(listend) = busy_child() {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let seized_ok = ptrace(PTRACE_SEIZE, listend, 0, 0) == 0;
+        r.check(
+            &format!("SEIZE for the listen half ({seized_ok})"),
+            seized_ok,
+        );
+        if seized_ok {
+            // Running, not stopped: LISTEN has nothing to listen from.
+            r.check(
+                "LISTEN of a running tracee is EIO",
+                refused(ptrace(PTRACE_LISTEN, listend, 0, 0), libc::EIO),
+            );
+
+            // The signal-delivery stop, then pass the signal on to reach the
+            // group stop.
+            // SAFETY: the child this block forked, and its own status word.
+            unsafe { libc::kill(listend, libc::SIGSTOP) };
+            let mut st1 = 0;
+            let w1 = unsafe { libc::waitpid(listend, &mut st1, 0) };
+            r.check(
+                &format!(
+                    "SIGSTOP first reports a delivery stop ({w1}, sig={})",
+                    if libc::WIFSTOPPED(st1) {
+                        libc::WSTOPSIG(st1)
+                    } else {
+                        -1
+                    }
+                ),
+                w1 == listend && libc::WIFSTOPPED(st1) && libc::WSTOPSIG(st1) == libc::SIGSTOP,
+            );
+            // Resume *naming* the signal: that is what turns it into a group
+            // stop instead of dropping it.
+            let cont = ptrace(PTRACE_CONT, listend, 0, libc::SIGSTOP as usize);
+            r.check(
+                &format!("CONT naming SIGSTOP is served ({cont})"),
+                cont == 0,
+            );
+            let mut st2 = 0;
+            let w2 = unsafe { libc::waitpid(listend, &mut st2, 0) };
+            r.check(
+                &format!("and the group stop follows (sh=0x{:x})", st2 >> 8),
+                w2 == listend
+                    && libc::WIFSTOPPED(st2)
+                    // `status >> 8` packs the signal in its low byte and the
+                    // event in its high one, so the seized group stop is
+                    // `0x8013` = **signal 19** with **event 128** - not
+                    // `SIGTRAP` with 19 somewhere in it.
+                    && (st2 >> 8) == (libc::SIGSTOP | (PTRACE_EVENT_STOP << 8)),
+            );
+
+            // Now the door itself.
+            let listened = ptrace(PTRACE_LISTEN, listend, 0, 0);
+            r.check(
+                &format!("LISTEN of a group-stopped seized tracee is served ({listened})"),
+                listened == 0,
+            );
+            // A stop signal arriving while listening is **held**, not
+            // reported: measured on Linux 7.3.4 (`build/scratch/listen/l6.c`),
+            // three `SIGSTOP`s and a `SIGTERM` all leave `waitpid(WNOHANG)` at
+            // 0 with `/proc/<pid>/stat` still `t`. A listen is not a stop of its
+            // own, so there is nothing to report - the tracee simply stays
+            // stopped.
+            // SAFETY: the same child.
+            unsafe { libc::kill(listend, libc::SIGSTOP) };
+            let mut st3 = 0;
+            let w3 = unsafe { libc::waitpid(listend, &mut st3, libc::WNOHANG) };
+            r.check(
+                &format!("a stop signal while listening is held, not reported ({w3})"),
+                w3 == 0,
+            );
+
+            // And `SIGCONT` ends the listen, which the tracer hears as a
+            // `SIGTRAP` event stop - and the tracee is *still stopped* after it,
+            // because a listen is ended for the tracer and not for the tracee
+            // (`l6.c`: `/proc/<pid>/stat` reads `t` after the report).
+            // SAFETY: the same child; `WSTOPSIG` 5 with the event bit.
+            unsafe { libc::kill(listend, libc::SIGCONT) };
+            let mut st4 = 0;
+            let w4 = unsafe { libc::waitpid(listend, &mut st4, 0) };
+            r.check(
+                &format!(
+                    "SIGCONT ends the listen with an event stop (sh=0x{:x})",
+                    st4 >> 8
+                ),
+                w4 == listend && (st4 >> 8) == (libc::SIGTRAP | (PTRACE_EVENT_STOP << 8)),
+            );
+            // SAFETY: resume, then kill and reap.
+            unsafe {
+                ptrace(PTRACE_CONT, listend, 0, 0);
+                libc::kill(listend, libc::SIGKILL);
+                libc::waitpid(listend, core::ptr::null_mut(), 0);
+            }
         }
     }
 

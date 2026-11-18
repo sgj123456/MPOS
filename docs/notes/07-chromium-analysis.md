@@ -889,13 +889,46 @@ That last row was measured separately (`seize2/t.c`): the fork event stop is
 own initial stop is `SIGTRAP` + `PTRACE_EVENT_STOP` — not the `SIGSTOP` an
 `ATTACH`-era child gets.
 
-**What is still missing, and named rather than approximated**: `PTRACE_LISTEN`
-(0x4208). It is only meaningful for a tracee in a group-stop (measured: `ESRCH` on a
-running seized tracee, `EIO` on an `ATTACH`ed one, `0` on an interrupt-stopped
-seized one, which then reads `t` in `/proc/<pid>/stat` and is not woken by
-`SIGCONT`), so it needs the seized group-stop path to be a real thing first. It is
-not on crashpad's path in this trace, and a `0` there would be the approximating
-answer this repository refuses.
+**`PTRACE_LISTEN` — landed 2026-11-18**, with the whole shape measured first
+(`build/scratch/listen/l{1,2,3,4,5,6}.c`, Linux 7.3.4). The earlier note here had
+two rows wrong, and the probes that produced it are kept because the correction is
+the interesting part:
+
+| question | Linux | this kernel |
+|---|---|---|
+| `LISTEN` on a **running** seized tracee | `EIO` | `EIO` |
+| `LISTEN` on a `SEIZE`+`INTERRUPT` stop | `EIO` | `EIO` |
+| `LISTEN` on an `ATTACH`ed tracee | `EIO` | `EIO` |
+| `LISTEN` on a **group-stopped** seized tracee | `0` | `0` |
+| a stop signal **while listening** | **held**, `waitpid(WNOHANG)` stays 0 | held |
+| `SIGCONT` while listening | ends it: tracer sees `0x8005`, tracee **still `t`** | same |
+| the seized group stop itself | `0x8013` = `SIGSTOP` + `PTRACE_EVENT_STOP` | same |
+| an `ATTACH`ed tracee's group stop | plain `0x13` | same |
+
+The two rows the first reading got wrong are worth naming: it said `SIGCONT`
+*wakes* a listening tracee (it does not - the tracer is told and the tracee stays
+stopped), and it implied a stop signal arriving during a listen is **reported**
+(it is not - three `SIGSTOP`s and a `SIGTERM` all leave `waitpid` at 0 and
+`/proc/<pid>/stat` at `t`). Both were caught by writing the probe that asks the
+question the note was glossing, not by reading the code again.
+
+What this needed in the kernel, and it is small because the machinery was there:
+
+- `Stop` grew `listening`, and a seized tracee's **group stop** reports
+  `PTRACE_EVENT_STOP` (the delivery stop that precedes it stays a plain `0x13` -
+  the distinction is "the program was stopped" versus "the tracer asked to be
+  told", and only the second is the pair's own event stop).
+- `sched::listen_traced` marks the stop; the three refusals are answered there
+  because they are questions about two records the syscall layer already holds
+  (the link's `seized` bit and the stop's `group` bit).
+- `SIGCONT` on a listening stop does **not** clear it: it rewrites the stop as an
+  event stop and wakes the tracer, which is exactly what `l6.c` shows.
+
+Pinned by five new claims in `t-ptrace-seize` (the running-`EIO`, the delivery
+stop, the group stop's `0x8013`, the held-while-listening signal, and `SIGCONT`'s
+`0x8005`), green on both arms. Counterfactual: making the request answer `EIO`
+unconditionally reddens exactly `LISTEN of a group-stopped seized tracee is
+served (-1)` and leaves the other claims green.
 
 **Why the item was first**: Chromium treats its crash handler as load-bearing. A
 browser whose crashpad cannot attach is not required to abort, but it logs a storm

@@ -1366,8 +1366,9 @@ Three items the analysis names are worth doing on their own terms, in this order
 1. `PTRACE_SEIZE`/`PTRACE_INTERRUPT` (Finding B) - **landed 2026-11-16** (`57a9529`), and
    re-measured 2026-11-17: the option word, the `EIO`-not-`EINVAL` refusal, and
    `PTRACE_EVENT_STOP` on both the interrupt stop and an auto-attached child's first stop are
-   now pinned by `t-ptrace-seize`. What stays named is `PTRACE_LISTEN`, which needs the seized
-   group-stop path to exist first.
+   now pinned by `t-ptrace-seize`, and `PTRACE_LISTEN` **landed 2026-11-18** with its whole
+   shape measured first (the three `EIO` refusals, the held stop signals, `SIGCONT`'s `0x8005`,
+   and the seized group stop's `0x8013`). Nothing of the `SEIZE` family stays named.
 2. **Finding C is closed** (2026-11-18): the maps device column is the mount's `st_dev` (§4b),
    and the exec image's lines now report their file's own offset/device/inode with the `.bss`
    tail as a separate file-less line (§4c), pinned by `t-maps-identity` on both arms. What the
