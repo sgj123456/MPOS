@@ -337,6 +337,10 @@ pub trait Kernel: Sync {
     /// whether a `#BP` is a planted breakpoint or the program's own `int3`.
     fn tracing_self(&self) -> bool;
 
+    /// Offer a fault's signal to the tracer as a signal-delivery-stop, and
+    /// answer whether it was taken. See `sched::fault_stop`.
+    fn fault_stop(&self, frame: *mut (), sig: u8) -> bool;
+
     // -----------------------------------------------------------------------
     // The rest of what a machine asks for. None of these is on a trap path in
     // the sense the methods above are: they are the boot bringing the kernel
@@ -637,6 +641,12 @@ pub fn step_trap(regs: *mut ()) -> bool {
 #[inline]
 pub fn tracing_self() -> bool {
     registered().tracing_self()
+}
+
+/// Offer a fault's signal to the tracer. See [`Kernel::fault_stop`].
+#[inline]
+pub fn fault_stop(frame: *mut (), sig: u8) -> bool {
+    registered().fault_stop(frame, sig)
 }
 
 /// Hand a waiting signal to the task an interrupt interrupted. See

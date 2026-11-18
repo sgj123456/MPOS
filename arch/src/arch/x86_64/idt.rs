@@ -600,6 +600,16 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
         }
     }
     crate::hal::kernel::report_user_trap(vector, rip, rsp, code as usize);
+    // **A traced program's fault is its tracer's stop before it is the program's
+    // death.** Linux offers the fatal signal to the tracer as a
+    // signal-delivery-stop; without it a traced crash reported `ended sig=11`
+    // with no stop at all, and every register read afterwards came from a corpse
+    // (`docs/notes/07-chromium-analysis.md` §4u). Asked before the disposition
+    // is consulted, because the disposition is the *program's* answer and a
+    // tracer may still change what happens.
+    if crate::hal::kernel::fault_stop(frame as *mut (), sig) {
+        return;
+    }
     if crate::hal::kernel::disposition_is_default(sig) {
         crate::hal::kernel::die_of_fatal_signal(sig);
     }
@@ -791,6 +801,15 @@ extern "C" fn rust_page_fault(frame: *mut TrapRegs, code: u64) {
         // bytes instead (`docs/notes/` §6.160).
         let sig =
             crate::hal::kernel::send_fault_signal(crate::hal::kernel::FaultKind::Page, addr, rip);
+        // The same offer the exception vectors make, on this path too: a traced
+        // process's fault is its tracer's signal-delivery-stop before it is the
+        // program's death (`docs/notes/07-chromium-analysis.md` §4u). Two
+        // separate handlers reach the fatal signal - this one for `#PF` and
+        // `rust_trap` for the rest - and adding it to only one of them is the
+        // shape that made the first attempt look like it had not worked.
+        if crate::hal::kernel::fault_stop(frame as *mut (), sig) {
+            return;
+        }
         if crate::hal::kernel::disposition_is_default(sig) {
             crate::hal::kernel::die_of_fatal_signal(sig);
         }

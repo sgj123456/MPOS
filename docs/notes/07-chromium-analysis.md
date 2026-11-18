@@ -2204,6 +2204,56 @@ file and the return address, at the fault, instead of after it.
 an implementation written and reverted - and this pass names the reason the
 instrument kept being wrong.
 
+## 4v. FIXED: a faulting tracee stops for its tracer - and the crash is inside `call_fini`
+
+§4u named the gap. This pass closes it, and the first register set the tracer ever
+saw at a fault answers where the crash is.
+
+**The fix** is `sched::fault_stop`, offered from **both** fatal-signal paths -
+`rust_trap` (the exception vectors) and `rust_page_fault` (`#PF`, its own
+`die_of_fatal_signal`). Adding it to only the first looked like it had not worked
+at all, because a `SIGSEGV` here is a page fault and takes the second path: the
+diagnostic never printed once. That is the same "two doors" mistake §6.90 records,
+and it cost one build cycle to find.
+
+`fault_stop` parks the tracee in a signal-delivery stop with `delivering: sig`, so
+`PTRACE_GETSIGINFO` answers the fault's own record and a resume that names nothing
+drops the signal - the contract `trace_signal_stop` already has for an ordinary
+signal. `SIGKILL` is exempt, as it is on Linux.
+
+**And the reading it buys, at the fault, from a live process:**
+
+```
+STOP sig=11 rip=0x3ff0fba8 rsp=0x3fef8a08 rbp=0x3fef8a60 rax=0x3ff0fba8
+      rbx=0x2 rcx=0 rdx=0x4c0280 rsi=0 rdi=0 r15=0x4bb360
+```
+
+- `rax == rip` and the page is unmapped: an **instruction fetch** at an address
+  nothing maps.
+- `r15 = 0x4bb360` (the `__exit_funcs` node), `rbx = 2` (its count),
+  `rdx = 0x4c0280` (`registered_objects.lock`): we are **inside
+  `__run_exit_handlers`'s dispatch**, not lost in libc.
+- and the stack names the frame: `[rsp] = 0x406554`, which is exactly the return
+  address `call_fini` leaves behind, with `[rsp+80] = 0x4b5160` and
+  `[rsp+56] = 0x1`, `[rsp+72] = 0x2` - the array cursor and loop counters of
+  `call_fini`'s own walk.
+
+So the fault is **inside `call_fini`, while it walks the fini/init array and calls
+an entry**: the address it calls is a **stack** address (`0x3ff0fba8`, just above
+`rsp`), not a code address. `.fini_array` itself holds two valid pointers
+(`0x402f00`, `0x402dc0`), so the bad value is not in the array - it is what the
+walk computes or what a callee leaves in a register.
+
+**What to do with this next, precisely**: `call_fini`'s loop body is `call
+*(%r12,%rbx,8)` at `0x402fb0`, with `%r12 = &fini_array - 8` and `%rbx` counting
+down from 2. A breakpoint on `0x402fb0` with the register set read there names
+the index and the target on the very call that faults - and the tracer can now do
+that, which it could not before this pass.
+
+**Tally**: this is the first pass in the file whose result is a kernel
+*capability* rather than a retraction. The tracer can see faults now; every
+earlier reading of this crash was taken from a corpse because it could not.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,

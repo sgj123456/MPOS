@@ -995,6 +995,62 @@ pub fn trace_signal_stop(regs: &mut AbiRegs) {
     );
 }
 
+/// A fault's signal, offered to the tracer **before** it is acted on - Linux's
+/// fatal-signal **signal-delivery-stop**.
+///
+/// A traced process that faults is not simply killed: the tracer is woken with
+/// `WIFSTOPPED` and `WSTOPSIG` = the fault's signal, reads the register file and
+/// `PTRACE_GETSIGINFO`, and decides whether to pass the signal on. That stop is
+/// the *only* moment the fault is inspectable, and without it a tracer learns
+/// nothing: this kernel used to go straight from `send_fault_signal` to
+/// `die_of_fatal_signal`, so a traced crash reported `ended sig=11` with no stop
+/// and every register read afterwards came from a corpse
+/// (`docs/notes/07-chromium-analysis.md` §4u - and it is the reason most of that
+/// file's early readings had to be retracted).
+///
+/// Answers `true` when the signal was handed to a tracer, in which case the
+/// machine must **not** act on it: the tracer's next `PTRACE_CONT` either passes
+/// the signal back (and `deliver_at_trap` runs the program's own handler, or the
+/// default action ends it) or drops it.
+///
+/// The fault's record is queued as a kernel raise so a `PTRACE_GETSIGINFO` at
+/// the stop answers the fault's own `si_code`/`si_addr` rather than `SI_USER`
+/// with a pid - the same distinction `send_fault_signal` makes for a handler.
+pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
+    let id = current();
+    let traced = with_table(|t| {
+        let task = t.task(id);
+        task.trace.tracer.is_some() && !task.dispositions.get(sig).is_ignore()
+    });
+    if !traced {
+        return false;
+    }
+    // A `SIGKILL` cannot be stopped for a tracer: Linux takes it at once, and a
+    // stop would let a tracer keep a task alive past a signal nothing may catch.
+    if sig == signal::SIGKILL {
+        return false;
+    }
+    park(
+        regs,
+        Stop {
+            signal: sig,
+            event: PTRACE_EVENT_NONE,
+            traced: true,
+            reported: false,
+            message: 0,
+            // `delivering` is what makes "did the tracer pass it on" answerable:
+            // a resume that names nothing drops it, and one that names `sig`
+            // delivers it, which is the same contract an ordinary signal stop
+            // has (`trace_signal_stop`).
+            delivering: Some(sig),
+            syscall: None,
+            group: false,
+            listening: false,
+        },
+    );
+    true
+}
+
 /// The machine took a **single-step trap** (`#DB` on x86_64) for the running
 /// task: if a tracer armed it with `PTRACE_SINGLESTEP`, this is that call's
 /// stop, and the task parks here until the tracer resumes it.

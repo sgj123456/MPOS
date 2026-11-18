@@ -252,6 +252,24 @@ impl Kernel for Services {
         sched::has_tracer(sched::current())
     }
 
+    fn fault_stop(&self, frame: *mut (), sig: u8) -> bool {
+        // The same conversion `step_trap` makes: the machine's `TrapRegs` is not
+        // the ABI register file, and the door that knows the difference is the
+        // one the signal path already uses.
+        let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
+        // SAFETY: `frame` is the block the stub pushed; `regs` is the
+        // `ABI_REG_COUNT`-word file the door writes.
+        if !unsafe { crate::hal::capture_trap_regs(frame, 0, &mut regs) } {
+            return false;
+        }
+        if sched::fault_stop(&mut regs, sig) {
+            // SAFETY: the same block, still the live trap frame.
+            unsafe { crate::hal::restore_trap_regs(frame, &regs) };
+            return true;
+        }
+        false
+    }
+
     fn step_trap(&self, frame: *mut ()) -> bool {
         // The machine's `TrapRegs` block is **not** the ABI register file: its
         // word 15 is `rip` where `uregs` keeps `orig_rax`, and it has no
