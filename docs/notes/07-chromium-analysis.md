@@ -1913,6 +1913,55 @@ taken before the instruction, three struct-offset guesses, a 60-step sampling, a
 this `-1`-as-data), plus two wrong models (infinite recursion, `.bss` page
 clobbered). The instrument has been the harder subject in every one of them.
 
+## 4q. `malloc`'s arena resolves correctly, and the NULL is past the bin lookup
+
+§4p left one question: why `__libc_malloc(0x100)` returns NULL during
+`frame_dummy`, when the same size succeeds thousands of times afterwards. This
+pass narrows where inside `malloc` it happens, and clears the parts that are fine.
+
+**The `%fs`-relative arena lookup is correct.** Breaking right after the
+`mov %fs:0xffffffffffffffb0,%rcx` at `0x40b154` (one patch, return values
+honoured, `build/scratch/zprobe/{mp,fs2,f3}.c`):
+
+```
+fs-load gave rcx=0x486ec0  (arena) ok=1 [arena]=0  rax(sz)=0x1d
+```
+
+`0x486ec0` is a real address in this image's data, so the TLS base is live and the
+arena pointer it dereferences is right. `[arena]` being 0 is the empty first bin,
+which is the normal state before the first allocation carves into it.
+
+**And `malloc`'s own globals are sane at that moment:**
+
+```
+malloc#1 size=0x6  mp_+0x78 ok=1 0x411  mp_ ok=1 0x20000  mp_+0x20 ok=1 0
+malloc#2 size=0x10 mp_+0x78 ok=1 0x411  mp_ ok=1 0x20000  mp_+0x20 ok=1 0
+```
+
+`mp_` holds a real value (`0x20000`), the mmap threshold beside it is `0x411`, and
+both small requests reach the size-class branch at `0x40b138` and complete. So the
+heap's own bookkeeping is initialised by the time `frame_dummy` runs.
+
+**What that leaves**: the failing `0x100` request does not die in the arena
+lookup, the `mp_` reads, or the TLS base - it dies after the bin chain is walked
+and a chunk is carved, or in the path taken when the bin is empty
+(`0x40b196`'s early return, which the caller then dereferences). The distinction
+matters: the first would be a chunk-header bug in glibc's view of this
+machine's memory, the second would be `malloc` legitimately returning NULL - and
+only the second is consistent with "it works later".
+
+**One probe note, so the next pass does not repeat it**: reading `%rsi` one
+instruction after `0x40b15d` returned `0x4844fe` on every call - a code address,
+not a bin index - because the single-step window landed past the `lea` that sets
+it. A stop's register set is only valid for the instruction the stop is *on*;
+sampling one instruction later reads a different program point. That is the same
+class as §4g's timing lesson, one layer finer.
+
+**Tally**: eight wrong probe readings now, all from the instrument. The single
+kernel-side fact that has survived every retraction is still §4p's: a static glibc
+image reaches `btree_allocate_node`, gets NULL from `malloc(0x100)`, and stores
+through it at `0x47a983` with no null check.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
