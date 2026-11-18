@@ -2,10 +2,20 @@
 name = "mpos-xtask"
 version = "0.1.0"
 edition = "2024"
+# The `cargo xtask` alias and every `cargo run -p mpos-xtask` mean this binary; a
+# second one beside it would otherwise make all of them ambiguous.
+default-run = "xtask"
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+# A developer tool, not a command: it fills a FAT32 image from a directory with
+# the same writer the ESP is made with, so a kernel fix can be measured against
+# the installed image without root and without `mtools` (see its own header).
+[[bin]]
+name = "fat-populate"
+path = "src/bin/fat-populate.rs"
 
 [dependencies]
 anyhow = "1"

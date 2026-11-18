@@ -904,6 +904,59 @@ crashpad failure is what turns a recoverable renderer death into an unexplained
 hang. What the fix does **not** do is make Chromium render — the stall in §3j-§3q
 survived it, and that is why the next instrument is the `CHECK` text.
 
+## 3s. The trap is now self-locating — and it lands in Chromium's own crash stub
+
+§3r added the `in <module>[<offset>,<base>+<len>]` clause to the `traps:` line and
+said the next reproduction would read straight out of it. It did, on the first
+boot: the image's ESP was refreshed with the current loader/kernel first (§7.9v's
+trap), and the run produced
+
+```
+traps: CacheThread_Blo[741] breakpoint ip:7e0db94f96cc sp:7ea183f71580 error:0 \
+       in /usr/lib/chromium/chromium[8c4f6cc,7e0db08aa000+ee39000]
+```
+
+That offset is a **mapping** offset, and the mapping is the executable segment's
+range. With the file in hand (`debugfs -R dump` of the image, then `readelf -lW`:
+the executable LOAD is `p_offset 0x1e64304`, `p_vaddr 0x1e65304`, aligned down to
+`0x1e64000`) the trap's file offset is `0x1e64000 + 0x8c4f6cc = 0xaab36cc`, and
+the bytes there are **`cc 0f 0b`** - exactly Chromium's `IMMEDIATE_CRASH()`.
+
+So the crash is Chromium's own `CHECK`, confirmed at the instruction rather than
+inferred from registers, and the register reading in §3q was right. The block
+around it is the shape a `LOG`-then-crash takes: a call, a branch on its answer,
+then `mov ecx, 2` / another call / `jmp` back / `int3` / `ud2`.
+
+**The kernel's part is now measured, not argued**: the fault is a breakpoint at a
+mapped, present, executable page of the program's own image. Nothing was refused,
+no address was wrong, and the module attribution the crash handler needs works -
+which is what §4c's columns bought.
+
+**Two things this needed that are worth recording**:
+
+1. The image had to carry the current kernel at all. `cargo xtask run` needs root
+   and the loader embeds the kernel, so the installed image was booting the kernel
+   it was built with. A root-free path now exists: the loader is built with
+   `MPOS_KERNEL_ELF`, a 32 MiB FAT is made by `mkfs.fat`, and the repository's own
+   FAT32 writer fills it (`xtask/src/bin/fat-populate.rs`) - then 262 144 sectors
+   are `dd`'d over partition 1. The ESP carries exactly three files: the loader
+   (kernel inside), `initramfs.tar` (the **installed** one,
+   `build/initramfs.tar`, 8.4 MiB - not the 230 MiB test archive) and
+   `mpos.cmdline` (`root=/dev/vda2 rootfstype=ext4 rootflags=rw console=ttyS0`).
+   Verified by the wire rather than by mtime: the boot prints the 1216 KiB
+   compressed / 5137 KiB loaded payload and reaches the disk's own Alpine
+   userland.
+2. The offset in the clause is worth reading against the **page-aligned**
+   `p_offset`, not the raw one: the loader reports the range's own start, which
+   is aligned out, so `p_offset` and `p_vaddr` differ by `0x1000` and only the
+   aligned pair lands on the `int3`.
+
+What is still **not** answered: *which* `CHECK` it is. The message is not in the
+binary at that site - it is a `LOG`/`CHECK` with a runtime-built stream - so the
+next instrument is a run whose crash handler can report the stream contents, i.e.
+exactly what crashpad does and what `PTRACE_LISTEN`/the seized group-stop path
+(§4) still stands in the way of.
+
 ## 4b. Finding C — `/proc/<pid>/maps` reports **file offset 0 and dev/inode 0 for every segment**, and that is a bug
 
 Two crashpad lines come *before* the ptrace storm and are a **separate** defect:
