@@ -1596,6 +1596,64 @@ site and its return address makes "did it return" unanswerable, because the call
 site's `int3` replaces the call. Every breakpoint experiment that asks a
 *control-flow* question needs one patch at a time.
 
+## 4l. `call_fini` returns, the guard byte works, and the fault is inside the first `dtors` call
+
+§4k's last probe patched a call site *and* its return, which makes "did it return"
+unanswerable. With **one patch at a time** (`build/scratch/zprobe/{one,w,two}.c`)
+the answers are clean:
+
+```
+RETURN #1 from call_fini, sp=0x3ffd5a10  count now=0x1
+DIED sig=11 after 1 return(s)
+```
+
+So `call_fini` **does** return, and the count is 1 by then - the entry was
+consumed before the call, as `0x4063f4` stores it. The node is decrementing
+correctly.
+
+**The `completed.1` guard works, and §4k's recursion story is wrong.** Read
+immediately after its store:
+
+```
+AFTER the movb: completed.1=0x1
+after pop/ret:  completed.1=0x1
+```
+
+The byte is set and it persists, so a second `call_fini` would find it and take
+`__do_global_dtors_aux`'s early `ret` at `0x402f38`. A node whose both entries are
+`call_fini` is therefore **not** an infinite recursion - and §4k's model of it is
+retracted here.
+
+**Where it actually dies.** Breakpoints at `call_fini`'s entry, the
+`.fini_array` call, and `__do_global_dtors_aux`'s entry:
+
+```
+call_fini ENTRY          sp=0x3f948a08 rbx=0x2 completed.1=0
+fini_array call          sp=0x3f9489f0 rbx=0x2 completed.1=0
+__do_global_dtors_aux    sp=0x3f9489e8 rbx=0x1 completed.1=0
+DIED sig=11
+```
+
+Three hits, then death - inside `__do_global_dtors_aux`'s **first** invocation,
+after `completed.1` was read as 0 (correct for the first pass). What that body
+does, in order: `cmpb completed.1` (0, so fall through) → `deregister_tm_clones`
+(measured safe: `0x4baa28 == 0x4baa28` so it takes its `ret` immediately) →
+`cmpq $0, 0x4b8f50` → **if non-zero**, `mov $0x49c178,%edi` and
+`call __deregister_frame_info`. That function reads `[0x49c178]` (inside
+`.eh_frame`) and, when the word is non-zero, tail-jumps into
+`__deregister_frame_info_bases` - the one remaining branch that has not been
+measured.
+
+**So the next measurement is one read**: `[0x49c178]` at that moment, and then
+whether `__deregister_frame_info_bases` is entered. Both are a single breakpoint
+each (`0x47cb09` and `0x47bf70`), and the answer decides between "the frame-info
+list is malformed" and "the call itself is refused".
+
+**Probe discipline, now written into the method**: one patch per question. Every
+run in this section that mixed a call-site patch with a return-site patch could
+not answer the control-flow question it was built for, and one of them produced
+the wrong "it never returns" reading that §4k was written on.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
