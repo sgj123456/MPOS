@@ -2095,6 +2095,60 @@ and compare the two write sites' addresses.
 the harder subject in every single one, and this pass is the first that narrowed
 by *eliminating a cause* (the store lands) rather than by finding a new suspect.
 
+## 4t. Two of §4s's three conclusions survive; the third was the probe again
+
+§4s concluded that `count` reads 2 at every dispatch. Two of its three readings
+hold up; the third was produced by a defect in the probe, and the difference
+matters for where the next pass looks.
+
+**What still holds, re-measured:**
+
+```
+after store: node=0x4bb360 count=0x1 rsp=0x3fb69a10
+after store: node=0x4bb360 count=0x1 rsp=0x3fb69a10
+```
+
+The store at `0x4063f4` lands (`count` is 1 right after it), and `rsp` is the same
+on both visits, so this is still **one loop, not recursion**.
+
+**What does not hold: "the same store site is entered repeatedly" is my own
+re-arming, not glibc's loop.** `0x4063f8` is not the target of any `jmp` or
+conditional branch in this image - checked with `objdump` - so a repeated hit on
+it cannot be the program's control flow. It is the probe: the restore path is
+
+```c
+unsigned long o; pk(c, 0x4063f8UL, &o);
+ptrace(PTRACE_POKETEXT, c, (void*)0x4063f8UL, (void*)o);
+r.rip = 0x4063f8UL; ptrace(PTRACE_SETREGS, c, 0, &r);
+```
+
+and `pk` returns **0 without writing `o`** when the peek fails, leaving `o`
+uninitialised; `POKETEXT` then writes whatever was on the stack over the
+instruction, `rip` is set back to the patched address, and the breakpoint fires
+again. A breakpoint harness must treat a failed peek as fatal, not as a value.
+
+**And the `r15`/`rax` readings in that run are therefore the probe's own state,**
+not evidence about the loop.
+
+**What the kernel side shows, and it is a real finding to keep**: `PTRACE_SETREGS`
+is applied on resume - `park` ends with
+`*regs = with_table(|t| t.task(id).trace.regs).unwrap_or(snapshot)`
+(`src/sched/runtime/trace.rs:582`), so a tracer's edit to `rip` does reach the
+frame. That is why the earlier, correctly-written probes (which restored, stepped
+one instruction, and re-armed deliberately) produced sane traces, and why this one
+did not.
+
+**Where that leaves the search.** The surviving facts are: `_exit(0)` leaves
+cleanly and `return` from `main` does not; the first `__run_exit_handlers`
+dispatch resolves correctly to `call_fini`; and `.bss`/fixed-address writes stick.
+The next probe must re-arm breakpoints by **single-stepping over the original
+instruction** rather than by restoring a word whose read it did not verify - and
+read the count at the `0x4063dc` head, which the §4s probe did reach and did show
+as 2.
+
+**Tally**: eleven. The instrument, not the kernel, has been the subject of ten of
+them.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
