@@ -1193,6 +1193,43 @@ impl Inode for RamDir {
         }
     }
 
+    /// `2 + the subdirectories it holds`, derived rather than counted.
+    ///
+    /// A directory's link count is the two names every directory carries (`.`)
+    /// and (`.`) plus one per child directory, each of which holds a `..` back
+    /// to this one. Files and symlinks add nothing, and a symlink does not
+    /// either, however it is aimed.
+    ///
+    /// **Derived, not maintained.** The alternative - a counter moved by every
+    /// `mkdir`, `create`, `unlink`, `rmdir` and `rename` - is five paths that
+    /// must agree, and the `rename` shapes are the ones that would drift: a
+    /// directory renamed *out* of this one and into another drops a link here
+    /// and adds one there, and a `rename` that replaces an empty directory
+    /// takes one and gives one. Measured on tmpfs and on ext4, with the
+    /// rename/rmdir/symlink cases walked one at a time
+    /// (`build/scratch/nlkt`, Linux 7.3.4): both filesystems answer
+    /// `2 + subdirectories` at every step, and `mv d1/a d2/` moves exactly one
+    /// from `d1`'s count to `d2`'s. Since the entries map *is* the tree, the
+    /// count cannot disagree with it - which is the property a counter does not
+    /// have (`docs/notes/` §4aa's second instance, found by `t-proc-nlink`).
+    ///
+    /// One consequence to know about: this makes `nlink` cost a walk of the
+    /// directory rather than a field read. Linux keeps `i_nlink` and pays a
+    /// write on every name change instead; on a `tmpfs` whose entries are one
+    /// map under one lock, the walk is the cheaper half and the one that cannot
+    /// be wrong.
+    fn nlink(&self) -> u64 {
+        2 + self
+            .read_dir()
+            .map(|listed| {
+                listed
+                    .iter()
+                    .filter(|(_, kind)| *kind == NodeKind::Dir)
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
     fn mode(&self) -> u32 {
         critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
     }
@@ -2348,6 +2385,50 @@ mod tests {
         assert_eq!(sock.nlink(), 1);
         root.link("s2", &sock).unwrap();
         assert_eq!(sock.nlink(), 2);
+    }
+
+    #[test]
+    fn a_directory_counts_its_subdirectories_and_nothing_else() {
+        // Measured on Linux 7.3.4 first, on tmpfs and on ext4 alike
+        // (`build/scratch/nlkt`, every step walked): a directory is `2` plus
+        // one per child *directory*, because each of those holds a `..` back
+        // to it. Files, symlinks and a symlink aimed at a directory add
+        // nothing.
+        let fs = RamFs::new();
+        let root = fs.root();
+        assert_eq!(root.nlink(), 2, "an empty directory is `.` and `..`");
+
+        root.create("f", NodeKind::File, None).unwrap();
+        root.symlink("l", "f").unwrap();
+        root.symlink("ld", ".").unwrap();
+        assert_eq!(root.nlink(), 2, "a file and two symlinks add nothing");
+
+        root.create("d1", NodeKind::Dir, None).unwrap();
+        assert_eq!(root.nlink(), 3, "a subdirectory adds its `..`");
+
+        root.create("d2", NodeKind::Dir, None).unwrap();
+        assert_eq!(root.nlink(), 4);
+
+        // Removing one takes its `..` away again.
+        root.rmdir("d1").unwrap();
+        assert_eq!(root.nlink(), 3);
+
+        // A directory moved *out* of one parent and *into* another moves a
+        // link with it -- the shape a maintained counter would get wrong, and
+        // why this is derived from the entries instead.
+        let inner = root.create("in", NodeKind::Dir, None).unwrap();
+        assert_eq!(root.nlink(), 4, "`in` is root's second subdirectory");
+        assert_eq!(inner.nlink(), 2);
+        inner.create("in2", NodeKind::Dir, None).unwrap();
+        assert_eq!(inner.nlink(), 3, "a directory inside `in`");
+        assert_eq!(root.nlink(), 4, "a grandchild is not root's link");
+        // Moving it up: `in` gives one back, root takes one on. (A
+        // `rename` is the only door for this - `link` refuses a directory,
+        // which Linux does too.)
+        let to: Arc<dyn crate::vfs::Inode> = root.clone();
+        inner.rename_dir_into("in2", &to, "in2moved").unwrap();
+        assert_eq!(inner.nlink(), 2, "`in` gave its link back");
+        assert_eq!(root.nlink(), 5, "and root holds one more `..`");
     }
 
     #[test]

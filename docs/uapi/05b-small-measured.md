@@ -654,13 +654,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   real programs: **Chromium's zygote `fstatat`s `self/task/` and crashes on purpose when the
   answer is `<= 2`**, because a task directory with no tasks is an impossible kernel
   (`0xbc0709c` `cmp $0x2,%rbx` / `0xbc070a0` `jbe` into its own `int3;ud2`), so the flat `2` was
-  the whole reason every Chromium child died on startup here. **One number stays named**:
+  the whole reason every Chromium child died on startup here. **The same rule in tmpfs** (`RamDir`,
+  `src/vfs/ramfs.rs`) was the pin's own first counterexample and is fixed in the
+  same commit: `/tmp`, `/run` and `/dev/shm` answered `2` whatever they held, and
+  now derive `2 + subdirectories` from their entries (measured on the host with
+  `mkdir`, `rename` out of and into a parent, a cross-parent `rename`, `rmdir`
+  and a symlink to a directory walked one step at a time - tmpfs and ext4 agree
+  at every step). **One number stays named**:
   `/proc` itself follows the process table *and* roughly 400 links no formula fitted
   (`2 + direct subdirs` = 16, `2 + recursive dirs` = 339, `2 + direct dirs + their surplus` = 125
   against a measured 400), so the root keeps the trait's `0` - the honest fallback - rather than
   a guessed number. Owner: `src/vfs/procfs.rs`'s `ProcDir` (`links: Links`, `sys_dir()`) and
   `src/vfs/sysfs.rs`'s `SysDir::nlink`. Pins: `t-proc-nlink` (guest) and
-  `a_proc_directories_nlink_counts_its_subdirectories` (host).
+  `a_proc_directories_nlink_counts_its_subdirectories` and
+  `a_directory_counts_its_subdirectories_and_nothing_else` (host).
 
 - **`getcwd` derives the cwd's name from the directory. Landed 2026-10-17** (`docs/uapi/` §5.1
   item 31). This entry used to read that `getcwd` reported the path the process `chdir`'d by where

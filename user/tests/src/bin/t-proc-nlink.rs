@@ -208,11 +208,12 @@ fn main() {
     // more than 3 there. This is the same question one level down: a pid
     // directory holds dozens of files and four directories, and must answer 6.
     // (A tmpfs directory of this program's own was going to be the control for
-    // this, and it is not: `RamDir` answers the trait's flat `0` - i.e. `2` -
+    // this, and it is not: `RamDir` answered the trait's flat `0` - i.e. `2` -
     // exactly as procfs did, so the control found a *second* instance of this
-    // defect rather than confirming the first. Named in `docs/notes/` §4aa as
-    // the next one to fix; claiming it here would make this program about a
-    // third filesystem.)
+    // defect rather than confirming the first. That one is fixed now and has
+    // its own claims at the end of this program; `/proc` remains the better
+    // discriminator because its entries are dozens against a handful of
+    // directories, where a fresh tmpfs directory holds whatever the test made.)
     let pid_path = format!("/proc/{pid}");
     let mut entries_here = 0usize;
     let mut dirs_here = 0u64;
@@ -274,6 +275,57 @@ fn main() {
         }
         Err(e) => report.check(&format!("opening /proc/self: {e}"), false),
     }
+
+    // ---- the second filesystem with the same question ----------------------
+    //
+    // This program's own first draft used a tmpfs directory as the *control*
+    // for the rule above and found the rule broken there too: `RamDir`
+    // implemented no `nlink`, so `/tmp`, `/run` and `/dev/shm` answered the
+    // flat `2` whatever they held (`docs/notes/` §4aa). The same Linux rule
+    // applies - measured on tmpfs and on ext4 alike, rename and rmdir walked
+    // one at a time (`build/scratch/nlkt`) - so it is claimed here rather than
+    // in a program of its own: it is one rule in two filesystems.
+    let scratch = format!("/tmp/nlink-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&scratch);
+    match std::fs::create_dir(&scratch) {
+        Ok(()) => {
+            report.check(
+                "a directory of this program's own on tmpfs starts at 2",
+                nlink_of(&scratch) == Some(2),
+            );
+            let _ = std::fs::create_dir(format!("{scratch}/sub"));
+            report.check(
+                &format!(
+                    "and a subdirectory makes it 3 (got {:?})",
+                    nlink_of(&scratch)
+                ),
+                nlink_of(&scratch) == Some(3),
+            );
+            let _ = std::fs::write(format!("{scratch}/file"), b"x");
+            report.check(
+                "while a file in it adds nothing",
+                nlink_of(&scratch) == Some(3),
+            );
+            // A symlink aimed at a directory is still not a subdirectory, and
+            // this is the shape a "count every entry" rule gets wrong.
+            let _ = std::os::unix::fs::symlink("sub", format!("{scratch}/link"));
+            report.check(
+                "and neither does a symlink aimed at one",
+                nlink_of(&scratch) == Some(3),
+            );
+            // Removing the *subdirectory* only - `remove_dir_all` would take
+            // the directory under test with it, leaving `stat` to answer `None`
+            // and the claim to fail for a reason that says nothing about
+            // `nlink` (this program's first version did exactly that).
+            let _ = std::fs::remove_dir(format!("{scratch}/sub"));
+            report.check(
+                "removing the subdirectory gives the link back",
+                nlink_of(&scratch) == Some(2),
+            );
+        }
+        Err(e) => report.check(&format!("making {scratch}: {e}"), false),
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
 
     report.finish();
 }

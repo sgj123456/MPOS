@@ -1444,14 +1444,18 @@ Linux refuses identically and which is this file's item 3, not a syscall gap
 (§4ab). `--dump-dom` is still 0 bytes, but the failure is now a *hang* rather than
 a crash.
 
-**A second instance of the same defect, found by the pin and NAMED** (§4aa):
-**tmpfs/ramfs directories answer `st_nlink = 2` whatever they hold**, because
-`RamDir` (`src/vfs/ramfs.rs:1146`) implements no `nlink` - so `/tmp`, `/run` and
-`/dev/shm` are wrong here where the host answers `3` for a directory with one
-subdirectory. Not fixed in this commit: maintaining `2 + subdirs` on tmpfs means
-five paths (`create`, `mkdir`, `unlink`, `rmdir`, `rename`) each adding or
-dropping one, which is its own change. The rule, the host's answer and the pin's
-first failure are recorded in §4aa so that work starts from a measurement.
+**A second instance of the same defect, found by the pin - and FIXED** (§4aa):
+the pin's own first control failed, because **tmpfs directories answered
+`st_nlink = 2` whatever they held** - `RamDir` (`src/vfs/ramfs.rs`) implemented no
+`nlink`, so `/tmp`, `/run` and `/dev/shm` were wrong here where the host answers
+`3` for a directory with one subdirectory. The rule is the one above, and it was
+measured on the host with rename, rmdir and a symlink walked one step at a time:
+tmpfs and ext4 answer identically. `RamDir::nlink` now **derives** `2 +
+subdirectories` from its own entries instead of maintaining a counter - the
+counter would have to be moved by five paths, and the `rename` shapes are where
+such a counter drifts. Claimed in `t-proc-nlink` beside the procfs ones; the
+counterfactual is the three tmpfs claims that redden when the override is
+deleted, with every procfs and sysfs claim staying green.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

@@ -2730,29 +2730,53 @@ still 0 bytes, and the failure is now a hang rather than a crash.
 trait default, i.e. the flat `2`) reddens the `task/` claims and the `/proc/sys`
 claims while leaving `fd/` and the scratch-directory control green.
 
-### A second instance of the same defect, found by the pin and NAMED
+### A second instance of the same defect, found by the pin - and FIXED
 
 The pin's first draft used a scratch directory of its own as the control - "an
-empty ramfs directory is `2`, one subdirectory makes it `3`", the rule everyone
-knows. It failed: **this kernel answers `2` there too.** `RamDir`
-(`src/vfs/ramfs.rs:1146`) implements no `nlink` at all, so a tmpfs mount - which
-is what `/tmp`, `/run` and `/dev/shm` are here - reports the same flat `2` for
-every directory, and the host answers `3` for a directory holding one.
+empty tmpfs directory is `2`, one subdirectory makes it `3`", the rule everyone
+knows. It failed: **this kernel answered `2` there too.** `RamDir`
+(`src/vfs/ramfs.rs`) implemented no `nlink` at all, so a tmpfs mount - which is
+what `/tmp`, `/run` and `/dev/shm` are here - reported the flat `2` for every
+directory, and the host answers `3` for a directory holding one.
 
-That is a second instance of §4aa's defect in a *third* filesystem, and it is
-**not fixed here**: ramfs's link bookkeeping is a different question from procfs's
-(its `counts_its_names!` macro counts names on files, and a directory would need
-`2 + subdirs` maintained across `create`, `mkdir`, `unlink`, `rmdir`, `rename` and
-`link` - five paths, each of which can add or drop a subdirectory). What the pin
-now claims instead is a *relationship* it can state without that work:
-`/proc/<pid>` holds 36 entries of which 4 are directories (its `exe`/`cwd`/`root`
-siblings are links, which a `metadata()`-following count would miscount as
-directories - this pin's own first version did, reading 6 where the answer is 4),
-and it answers `2 + 4`. An implementation that counted entries would answer 38.
+That is the same defect in a *third* filesystem, and the rule is the same one:
+`2 + subdirectories`. Measured on the host with every step walked
+(`build/scratch/nlkt`):
 
-**Named, with its measurement**, in the shape AGENTS.md §3 rule 5 asks for: the
-next person to fix tmpfs `st_nlink` has the rule, the host's answer, the five code
-paths, and this pin's failure as the counterfactual.
+```
+mkdir -p d1/a d2 ; touch f     root=4  d1=3  d2=2    2 subdirs, and `a` inside d1
+mv d1/a .                      root=5  d1=2           root gained a `..`, d1 lost it
+mv a d1/                       root=4  d1=3           and back
+mv d1/a d2/                    d1=2    d2=3           one link across parents
+rmdir d2/a                     d2=2                   `rmdir` takes it back
+ln -s d1 lnk                   root=4                 a symlink adds nothing
+mkdir -p deep/x                deep=3  root=5         a fresh pair, same rule
+```
+
+The same script on tmpfs (`/tmp`, `stat -f` -> `tmpfs`) and on ext4 gives these
+same numbers at every step, which is what makes one rule enough.
+
+**The fix derives the number instead of maintaining it.** `RamDir::nlink` counts
+its `Dir`-kind entries and adds two. The alternative - a counter moved by
+`create`, `mkdir`, `unlink`, `rmdir` and `rename` - is five paths that must
+agree, and the `rename` shapes are exactly where such a counter drifts (a
+directory renamed out of one parent and into another moves one link from one
+count to the other; a rename that replaces an empty directory takes one and
+gives one). Since the entries map *is* the tree, the derived number cannot
+disagree with it. The cost is a walk under one lock rather than a field read,
+which is the cheaper half on a `tmpfs` whose entries are one `BTreeMap`.
+
+Claimed in `t-proc-nlink` itself rather than in a program of its own - it is one
+rule in two filesystems, and the tmpfs claims sit beside the procfs ones. The
+counterfactual is the three claims that redden with the override deleted:
+`and a subdirectory makes it 3 (got Some(2))`, `while a file in it adds
+nothing`, `and neither does a symlink aimed at one`, while every procfs and
+sysfs claim stays green.
+
+Host pin: `a_directory_counts_its_subdirectories_and_nothing_else` - the empty
+case, a file and two symlinks adding nothing, a subdirectory adding one,
+`rmdir` giving it back, and a `rename_dir_into` moving a link from one parent to
+the other.
 
 **A pin that was never running, found on the way.** `a_proc_nodes_own_mode_follows_its_shape`
 in `src/vfs/procfs.rs` was written without a `#[test]` attribute in 2b4693a
