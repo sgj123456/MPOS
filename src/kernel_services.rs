@@ -248,6 +248,10 @@ impl Kernel for Services {
         sched::charge_cpu(in_user)
     }
 
+    fn tracing_self(&self) -> bool {
+        sched::has_tracer(sched::current())
+    }
+
     fn step_trap(&self, frame: *mut ()) -> bool {
         // The machine's `TrapRegs` block is **not** the ABI register file: its
         // word 15 is `rip` where `uregs` keeps `orig_rax`, and it has no

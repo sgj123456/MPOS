@@ -333,6 +333,10 @@ pub trait Kernel: Sync {
     /// the program's own `SIGTRAP`. The machine cannot tell which it is.
     fn step_trap(&self, regs: *mut ()) -> bool;
 
+    /// Whether the running task has a tracer - the question that decides
+    /// whether a `#BP` is a planted breakpoint or the program's own `int3`.
+    fn tracing_self(&self) -> bool;
+
     // -----------------------------------------------------------------------
     // The rest of what a machine asks for. None of these is on a trap path in
     // the sense the methods above are: they are the boot bringing the kernel
@@ -627,6 +631,12 @@ pub fn charge_cpu(in_user: bool) {
 #[inline]
 pub fn step_trap(regs: *mut ()) -> bool {
     registered().step_trap(regs)
+}
+
+/// Whether the running task is traced. See [`Kernel::tracing_self`].
+#[inline]
+pub fn tracing_self() -> bool {
+    registered().tracing_self()
 }
 
 /// Hand a waiting signal to the task an interrupt interrupted. See

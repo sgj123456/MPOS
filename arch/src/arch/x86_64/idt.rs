@@ -571,6 +571,34 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
             r.r15
         );
     }
+    // **A breakpoint a tracer planted is the tracer's stop, not the program's
+    // fault.** `PTRACE_POKETEXT` writes `0xcc` over an instruction, the tracee
+    // executes it, and what must happen is what Linux does: the tracee parks,
+    // the tracer is woken with a `SIGTRAP` stop, and the traced program never
+    // sees a trap at all. Without this the `int3` was signed `SIGTRAP` and the
+    // *default disposition killed the tracee* - so a tracer could plant a
+    // breakpoint and then watch its subject die on the resume, which is the
+    // shape every probe in §4g hit.
+    //
+    // Two things separate it from a step trap: the saved `rip` points *after*
+    // the `int3` (the CPU pushes the following instruction), and Linux's tracer
+    // rewinds it by one before reporting, so `PTRACE_GETREGS` answers the
+    // address of the byte the tracer wrote. Doing that rewind here is what lets
+    // a tracer restore the original instruction and resume.
+    if vector == 3 {
+        // The rewind is **the tracer's**, not the program's: Linux reports a
+        // planted breakpoint with `rip` on the byte the tracer wrote, and
+        // reports a program's own `int3` with the saved `rip` (one past it).
+        // Rewinding unconditionally put a signal-handling program back on its
+        // own `int3` for ever - measured as `t-trap-at-trap` hanging at
+        // `traps: … breakpoint ip:43abc4` repeated until its budget ran out.
+        if crate::hal::kernel::tracing_self() {
+            unsafe { (*frame).rip -= 1 };
+            if crate::hal::kernel::step_trap(frame as *mut ()) {
+                return;
+            }
+        }
+    }
     crate::hal::kernel::report_user_trap(vector, rip, rsp, code as usize);
     if crate::hal::kernel::disposition_is_default(sig) {
         crate::hal::kernel::die_of_fatal_signal(sig);

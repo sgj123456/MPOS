@@ -1379,6 +1379,56 @@ dispatches through an `__exit_funcs` node that is still zero at that moment. The
 next pass should read the guard and the node **at `0x406552` with after-execution
 timing**, which the two bugs above prevented every earlier attempt from doing.
 
+## 4h. A planted breakpoint is the tracer's stop, and the exit fault is located
+
+Two more `ptrace` defects fell out of making the instrument honest, and with both
+fixed the static-exit question is finally narrowed to a **specific instruction
+range** rather than a guess.
+
+**1. A planted `int3` killed the tracee.** `PTRACE_POKETEXT` writes `0xcc` over an
+instruction; the tracee executes it; this kernel signed it `SIGTRAP` and the
+**default disposition killed the process** - so a tracer could plant a breakpoint
+and then watch its subject die on the first resume. Linux instead parks the
+tracee and reports the stop to the tracer, and it rewinds `rip` by one so
+`PTRACE_GETREGS` answers the byte the tracer wrote (which is what lets a tracer
+restore the original instruction and continue). Both halves are now there.
+
+**The rewind is the tracer's, not the program's** - and getting that wrong cost a
+gate run: applying it unconditionally put a program's *own* `int3` back on itself
+for ever, and `t-trap-at-trap` hung at
+`traps: … breakpoint ip:43abc4` until its budget ran out (338/338 → `FAIL
+t-trap-at-trap timeout=120s`). It is gated on `tracing_self()` now, and the gate
+is green again. The lesson is the repository's own: a change to how a trap is
+*signed* is a change to every program that handles `SIGTRAP`, not only to the
+tracer's path.
+
+**2. Where the static-exit fault actually is.** With breakpoints that work, three
+stops bracket the exit (`build/scratch/zprobe/near.c`,
+`build/scratch/zprobe/final.c`):
+
+```
+planted; guard at start = 0
+AT 406552 (the faulting `call *%rax`): guard=0x9740cec rax=0x402f80
+  __exit_funcs=0x4bb360  node: [0]=0 [1]=0x1 [2]=0x4 [3]=0x6dfcce880000
+HIT after call_fini at 0x406554
+HIT loop head       at 0x40645b
+DIED sig=11
+```
+
+Read what that overturns: at `0x406552` the guard is **non-zero**
+(`0x9740cec`), `rax` is **`0x402f80 = call_fini`** - a real function, unmangled
+correctly - and the `__exit_funcs` node **has content**. So §4e's "the guard is
+never filled" and §4f's "no constructor runs" are both dead: the machinery works
+up to and including `call_fini`. The fault is **after** it: `call_fini` returns
+cleanly, the loop head at `0x40645b` runs, and the `jne 0x4063d0` at `0x406465`
+takes a **second trip** through the handler loop - because `__new_exitfn_called`
+changed, i.e. something registered an atexit function during `call_fini` - and
+that second trip dispatches a pointer that faults.
+
+That is the next measurement, and it is a narrow one: read the node the second
+trip dispatches from, at its own `call *%rax`, with the timing lesson of §4g
+applied (read *after* the instruction).
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
