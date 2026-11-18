@@ -1534,6 +1534,68 @@ its `count`/`flavor` were read with the wrong offsets in §4i, so what that node
 *contains* is not yet claimed). §4e's and §4f's earlier stories are fully
 retracted.
 
+## 4k. The dispatches point at `call_fini` twice, and the second one never returns
+
+§4j left one question: is the node's `count` decrementing, and what does each
+dispatch actually call. Read from the register, at the mangle pair itself
+(`build/scratch/zprobe/{same,first,dump,cnt}.c`):
+
+```
+mangle site: rax(mangled)=0x1b185b1a3aed5ed4 guard=0xaf6a0d8c2dcd32f6
+             -> unmangled=0x402f80     in .text? YES
+   after ror+xor: rax=0x402f80
+```
+
+**`0x402f80` is `call_fini` again.** So the entry the exit loop dispatches is
+glibc's own `__cxa_atexit(call_fini, dso, …)` registration - the one that runs
+the *finalisers* - and what happens is:
+
+```
+LOOP count=0x2
+  CALL call_fini #1
+  DIED (the RET is never reached)
+```
+
+**The node's layout, now read whole rather than inferred** (`dump.c`, twelve words
+from the node):
+
+```
+node=0x4bb360  count=0x1  rax(entry)=0x4bb380
+  +0x08 = 0x1            count
+  +0x10 = 0x4            entry 0 flavor  (ef_at)
+  +0x18 = 0xbd39...2594  entry 0 fn      (mangled: unmangles to call_fini)
+  +0x20 = 0
+  +0x28 = 0
+  +0x30 = 0x4            entry 1 flavor
+  +0x38 = 0xbd39...2594  entry 1 fn      (call_fini too)
+```
+
+So the header is `next@0x0`, `count@0x8`, and the entries begin at **`+0x10`**,
+each `0x20` bytes - the dispatch arithmetic `node + index*0x20 + 0x10` is
+**correct**, and §4i's "the probe misread the entry" was right about the probe and
+wrong about the code. Both flavours are `4` and both functions are `call_fini`.
+
+**That is a recursion, and it is the fault.** `call_fini` walks `.fini_array` →
+`__do_global_dtors_aux` → `deregister_tm_clones` → `__deregister_frame_info` →
+`_fini` → returns into `__run_exit_handlers`, which dispatches the *next* entry -
+also `call_fini` - and re-enters it. On Linux this terminates; here the second
+call never returns, and the process dies with `SIGSEGV` at the depth the machine
+can still reach.
+
+**What is NOT yet established** is which half is wrong on this machine: whether
+`call_fini` should be registered twice at all (a `DT_NEEDED`/`__cxa_finalize`
+question), or whether the *first* invocation does not reach the state that makes
+the second a no-op. The instrument to tell them apart is a breakpoint on
+`0x406554` (the return) with the call site left **un**patched, which the last
+probe could not do because it had patched both - the run above `DIED` with the
+`RET` breakpoint never hit, and an `int3` planted over the `call *%rax` is itself
+part of that picture.
+
+**One more probe defect, recorded so it is not repeated**: patching both the call
+site and its return address makes "did it return" unanswerable, because the call
+site's `int3` replaces the call. Every breakpoint experiment that asks a
+*control-flow* question needs one patch at a time.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
