@@ -1777,6 +1777,73 @@ reading, not by argument, and each correction is recorded at the point it was
 overturned rather than edited away. That is the only way this file stays usable
 to whoever picks it up next.
 
+## 4o. The last `.bss` page is filled with `0xff` at the moment of death
+
+§4n ended on a lock question. The locks are not the fault, and the answer is
+stranger: **a page of the process's own `.bss` is overwritten with `0xff` as it
+dies.**
+
+Measured with a sentinel, a value no code in this program writes
+(`build/scratch/zprobe/{lock,ff,sentinel,lastlive,alive}.c`):
+
+```
+exec:              obj.root=0 obj.lock=0 frm.root=0
+insert entry rdi=0x4c0270
+after insert #1:   obj.root=0x4c2160 obj.lock=0x4 frm.root=0     <- all correct
+DIED sig=11
+death: obj.root=0xffffffffffffffff obj.lock=0xffffffffffffffff frm.root=0xffffffffffffffff
+```
+
+The btree insert **works** the first time: root set to a real node, lock word
+`0x4` (a version, unheld - exactly what `version_lock_lock_exclusive` leaves). The
+second insert at `0x47c057` is where it dies, and by then three separate globals -
+`registered_objects` at `0x4c0270`, `registered_frames` at `0x4c0290`, the global
+mutex at `0x4c0300` - are **all** `0xffffffffffffffff`.
+
+**A sentinel proves it is an overwrite, not a stale read.** Stamping
+`0x5e571e1100000001` into that page through `PTRACE_POKEDATA` and sampling at
+every stop:
+
+```
+stamped [0x4c0300]=0x5e571e1100000001 (read back 0x5e571e1100000001)
+stop 0: alive=1 sig=5 sentinel=0x5e571e1100000001
+stop 1: alive=1 sig=5 sentinel=0x5e571e1100000001
+stop 2: alive=0 sig=-1 sentinel=0xffffffffffffffff
+```
+
+Two live stops see the sentinel intact; the stop that reports the death sees the
+whole page as `0xff`. And the same value is read **after the reap**, so it is not
+a reading of a torn-down address space either (`lastlive.c`).
+
+**Why this matters**: `0x4c0270..0x4c0328` is the **last page** of this image's
+`.bss` (`_end = 0x4c0328`, page base `0x4c0000`), i.e. the tail of the last
+`PT_LOAD`'s `p_memsz` - the part of the image with no file bytes behind it, which
+the loader has to create by zero-filling. Everything the exit path needs lives on
+that one page. A kernel that either mis-sizes the last page's frame, or reuses a
+frame that is still mapped, would produce exactly this: correct for the whole run,
+then the content of one page replaced by another owner's `0xff` fill at the end.
+
+**`.bss` writes themselves are fine** (§4n: 263 pages written and read back, the
+last byte included), so this is not a general mapping failure - it is specific to
+what happens to that page around the death.
+
+**The next measurement is a kernel one, and it is small**: whether a byte written
+to the last page of the image's `.bss` survives a `SIGSEGV`-triggered death at all
+when *no* tracer is attached - i.e. is `0xff` the *fault path's* doing (a frame
+handed back and re-used while still mapped) or a property of this process only.
+The fixture is a static binary that stamps its own `.bss` tail, faults
+deliberately, and a parent with a core-dump-free `waitpid` that reads the page
+through `/proc/<pid>/mem` before reaping. If the sentinel survives there and is
+destroyed only under `ptrace`, the story is about stops; if it is destroyed in
+both, it is about death.
+
+**Honest status**: this is the first reading in the whole investigation that
+points at the **kernel's own page lifetime** rather than at libc or at a probe.
+It is not yet a diagnosis - the `0xff` fill has not been found in this kernel's
+source (there is no `0xff` poison in `mm` or `child_exit`), so either it comes
+from a path not yet read, or from a frame that was freed and re-filled by an
+allocator this tree does share. That is what the next run decides.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
