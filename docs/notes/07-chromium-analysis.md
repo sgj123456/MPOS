@@ -1479,6 +1479,61 @@ one was found by asking *what would this probe print if my assumption about the
 layout were wrong*, and every one cost a round. The instrument is the thing to
 verify first.
 
+## 4j. `call_fini` returns cleanly; the fault is one instruction into the next dispatch
+
+§4i's probe misread the entry, so this pass read the **register** instead of a
+guessed struct offset, and then walked the whole exit with breakpoints.
+
+**Everything through `call_fini` is correct** (`build/scratch/zprobe/{reg,reg2,fin,ret}.c`):
+
+```
+CALL #1: rax=0x402f80 (guard non-zero)          <- call_fini, unmangled correctly
+HIT fini loop call      at 0x402fb0  (rbx=0x2 r12=0x4b5168 rax=0x4b5170)
+HIT __do_global_dtors_aux at 0x402f00
+HIT deregister_tm_clones  at 0x402e90
+HIT __deregister_frame_info at 0x47cb00
+HIT _fini               at 0x47f630
+AT _fini's ret: rsp=0x3fea6a08  [rsp]=0x406554      <- the right return address
+  after the ret: rip=0x406554                        <- and it lands there
+```
+
+So the whole `.fini_array` walk runs, `__deregister_frame_info` is called with
+its `.eh_frame` argument, `_fini` returns to exactly `0x406554`, and `.fini_array`
+holds two valid code pointers (`0x402f00`, `0x402dc0`). Nothing here is broken.
+
+**The fault is the next dispatch, and it is bracketed to one instruction.** From
+`0x406554` the single-step trace runs cleanly to `0x4063f8` and stops:
+
+```
+step  9: rip=0x4063e9  rax=0x1     <- sub $1
+step 10: rip=0x4063ed  rax=0       <- count is now 0
+step 11: rip=0x4063f4
+step 12: rip=0x4063f8  rax=0       <- shl $0x5 of 0
+   (no step 13: the process dies here)
+```
+
+`shl $0x5` of 0 is 0, `add %r15` makes the entry address **`0x4bb360` - the node's
+own header**, not an entry - and `0x4063ff` then reads `+0x10` (`0x4bb370`, inside
+`.bss`, which is mapped and reads zero). A zero flavor matches none of the three
+`cmp`s, so `0x40641b`'s `jne` sends control back to `0x4063dc`, which reads
+`0x8(%r15)` - the count - and loops. **That is where the run ends**, and the next
+pass must read the count and the entry address at `0x4063dc`/`0x4063e9` on the
+*second* visit with breakpoints (not single-step, which is far too slow here).
+
+**The question to ask next** is therefore narrow and testable: is `count` at
+`node + 0x8` actually decrementing, or is `exited`/`ef_free` re-arming it? A node
+whose count never reaches zero would walk its header for ever, and each pass
+reads a "flavor" out of whatever neighbours `+0x10` - which is exactly the shape
+of the fault.
+
+**What is now ruled out, with readings**: the guard (correct, non-zero, at the
+call), pointer mangling (unmangles to a real function), `AT_RANDOM`
+(`_dl_random` = its address), the `.fini_array` walk and `_fini`'s return, and
+and `__exit_funcs` being empty (the shape of one node holds a flavor-`4` entry;
+its `count`/`flavor` were read with the wrong offsets in §4i, so what that node
+*contains* is not yet claimed). §4e's and §4f's earlier stories are fully
+retracted.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
