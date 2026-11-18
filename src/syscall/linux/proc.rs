@@ -1745,12 +1745,21 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             err::EOPNOTSUPP
         }
         // Letting the tracee go on. `SYSCALL` re-arms the syscall trace and
-        // `CONT` does not; `SINGLESTEP` is answered as a `SYSCALL` because this
-        // kernel has no single-step trap, and a tracer that asked for one gets
-        // stops at the next boundaries rather than none at all.
+        // `CONT` does not; `SINGLESTEP` runs **one instruction** and stops
+        // again, which is the machine's step flag (`hal::STEP_BIT`) rather than
+        // a syscall boundary.
+        //
+        // This used to answer `SINGLESTEP` as `SYSCALL` - "stops at the next
+        // boundaries rather than none at all" - and that is not the same
+        // contract: a tracee sitting on a `syscall` instruction never advances,
+        // so a probe built on it reported the same `rip` for three hundred
+        // thousand steps (`docs/notes/07-chromium-analysis.md` §4e). A tracer
+        // that cannot step cannot inspect an instruction stream at all, which is
+        // what `gdb` and every unwinder do first.
         abi::PTRACE_CONT | abi::PTRACE_SYSCALL | abi::PTRACE_SINGLESTEP => {
-            let arm = request != abi::PTRACE_CONT;
-            if crate::sched::resume_traced(id, data as u8, arm) {
+            let arm = request == abi::PTRACE_SYSCALL;
+            let step = request == abi::PTRACE_SINGLESTEP;
+            if crate::sched::resume_traced_with(id, data as u8, arm, step) {
                 0
             } else {
                 err::ESRCH

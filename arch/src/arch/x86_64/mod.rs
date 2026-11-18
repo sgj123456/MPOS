@@ -560,6 +560,7 @@ impl crate::hal::Contexts for crate::hal::Current {
 
     const FPU_BYTES: usize = context::FPU_BYTES;
     const ABI_REG_COUNT: usize = context::ABI_REG_COUNT;
+    const STEP_BIT: (usize, u64) = (18, 1 << 8); // x86_64: `RFLAGS.TF` (bit 8) in the `EFLAGS` slot, which `#DB` reports.
     const EPOLL_EVENT_BYTES: usize = 12;
     const EPOLL_EVENT_DATA: usize = 4;
 

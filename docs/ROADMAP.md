@@ -1385,7 +1385,13 @@ Three items the analysis names are worth doing on their own terms, in this order
 PTR_MANGLE pair over `__pointer_chk_guard_local`. `AT_RANDOM` is placed and
 filled correctly here (measured), so the breakage is downstream of it - *why* is
 not yet measured, and no fix is claimed. Every self-contained C program on this
-machine ends this way, so it is worth a session of its own.
+machine ends this way, so it is worth a session of its own - and the instrument
+that will find it now exists: `PTRACE_SINGLESTEP` ran no instruction until
+2026-11-18 (it was answered as `SYSCALL`, so a probe "stepping" 300 000 times
+reported one `rip`), and with it working the trace shows **no `.init_array`
+constructor ever runs** (`rip` never leaves `[0x402e40..0x41c560]`), which is why
+the pointer guard and the exit-function list are still zero. The PTR_MANGLE
+reading in §4e was a symptom.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

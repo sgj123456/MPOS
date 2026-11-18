@@ -507,7 +507,13 @@ pub fn signal_for_kind(kind: FaultKind) -> u8 {
 /// steps with a class between them (`docs/notes/` §6.165).
 pub fn fault_kind_of_vector(vector: u8) -> FaultKind {
     match vector {
-        0 => FaultKind::Divide,        // #DE divide error
+        0 => FaultKind::Divide, // #DE divide error
+        // `#DB` is the **single-step trap** (`RFLAGS.TF`, which
+        // `PTRACE_SINGLESTEP` arms) as well as a hardware debug exception. Linux
+        // signs either `SIGTRAP`, which is what a tracer's single-step stop is -
+        // so it shares the breakpoint's row rather than falling to `Other`
+        // (`SIGSEGV`), which is what an uninstalled vector would have produced.
+        1 => FaultKind::Breakpoint,    // #DB debug / single-step
         3 => FaultKind::Breakpoint,    // #BP breakpoint (`int3`)
         6 => FaultKind::InvalidOpcode, // #UD invalid opcode
         14 => FaultKind::Page,         // #PF page fault

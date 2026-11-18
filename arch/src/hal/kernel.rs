@@ -324,6 +324,15 @@ pub trait Kernel: Sync {
     #[cfg(mpos_signal_frame)]
     fn deliver_at_trap(&self, frame: *mut ()) -> bool;
 
+    /// The machine took a single-step trap for the running task: turn it into
+    /// the tracer's stop when one is tracing, and answer whether it did.
+    ///
+    /// A `ptrace` word rather than a signal because the two are different
+    /// events on the same vector: `#DB` with a tracer is `PTRACE_SINGLESTEP`'s
+    /// stop (the tracee parks and the tracer is woken), and `#DB` without one is
+    /// the program's own `SIGTRAP`. The machine cannot tell which it is.
+    fn step_trap(&self, regs: *mut ()) -> bool;
+
     // -----------------------------------------------------------------------
     // The rest of what a machine asks for. None of these is on a trap path in
     // the sense the methods above are: they are the boot bringing the kernel
@@ -612,6 +621,12 @@ pub fn preempt_at(ip: usize) {
 #[inline]
 pub fn charge_cpu(in_user: bool) {
     registered().charge_cpu(in_user)
+}
+
+/// A single-step trap for the running task. See [`Kernel::step_trap`].
+#[inline]
+pub fn step_trap(regs: *mut ()) -> bool {
+    registered().step_trap(regs)
 }
 
 /// Hand a waiting signal to the task an interrupt interrupted. See

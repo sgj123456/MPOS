@@ -90,6 +90,9 @@ pub fn init() {
         // ordinary trap into a protection fault (`docs/notes/` §6.159).
         unsafe {
             table
+                .debug
+                .set_handler_addr(x86_64::VirtAddr::new(trap_db as *const () as u64));
+            table
                 .divide_error
                 .set_handler_addr(x86_64::VirtAddr::new(trap_de as *const () as u64));
             table
@@ -498,6 +501,22 @@ extern "C" fn rust_trap(frame: *mut TrapRegs, vector: u64, code: u64) {
     // The vector is this machine's own word; the kernel's table is keyed on the
     // *class* of exception (item 284, `docs/notes/` §6.165), so it is read here
     // and only here.
+    // **A single-step trap is a `ptrace` stop, not a fault.** `#DB` (vector 1)
+    // arrives after every instruction when `RFLAGS.TF` is set, and with a
+    // tracer that is exactly `PTRACE_SINGLESTEP`'s stop: the tracee parks, the
+    // tracer is woken, and no signal is invented. Without a tracer it falls
+    // through to the ordinary path below and is signed `SIGTRAP` like any other
+    // trap. The step bit is cleared here so a resumed tracee does not trap
+    // again immediately - `PTRACE_SINGLESTEP` sets it afresh each time.
+    if vector == 1 {
+        let (_slot, bit) = crate::hal::STEP_BIT;
+        unsafe { (*frame).rflags &= !(bit as usize) };
+        // SAFETY: the stub pushed the general registers at the block's start,
+        // which is the `AbiRegs` the scheduler parks with.
+        if crate::hal::kernel::step_trap(frame as *mut ()) {
+            return;
+        }
+    }
     let kind = crate::hal::kernel::fault_kind_of_vector(vector);
     let sig = crate::hal::kernel::send_fault_signal(kind, 0, rip);
     if claim_trap_report() {
@@ -1009,6 +1028,15 @@ core::arch::global_asm!(
     "    push 0",
     "    push 3",
     "    jmp  trap_common",
+    // `#DB` (vector 1): the single-step trap a tracer arms with `RFLAGS.TF`, and
+    // the reason `PTRACE_SINGLESTEP` had no meaning here before (it was answered
+    // as `SYSCALL`). No error code; tag 1 so the entry knows which it was.
+    ".globl trap_db",
+    ".p2align 4",
+    "trap_db:",
+    "    push 0",
+    "    push 1",
+    "    jmp  trap_common",
     ".globl trap_de",
     ".p2align 4",
     "trap_de:",
@@ -1051,6 +1079,7 @@ core::arch::global_asm!(
 
 unsafe extern "C" {
     fn trap_bp();
+    fn trap_db();
     fn trap_de();
     fn trap_ud();
     fn trap_np();

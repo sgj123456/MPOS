@@ -836,6 +836,7 @@ impl crate::hal::Contexts for crate::hal::Current {
 
     const FPU_BYTES: usize = context::FPU_BYTES;
     const ABI_REG_COUNT: usize = context::ABI_REG_COUNT;
+    const STEP_BIT: (usize, u64) = (33, 1 << 21); // aarch64: `SPSR_EL1.SS` (bit 21), reported as `EC_SOFTWARE_STEP`.
     const EPOLL_EVENT_BYTES: usize = 16;
     const EPOLL_EVENT_DATA: usize = 8;
 

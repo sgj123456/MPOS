@@ -248,6 +248,27 @@ impl Kernel for Services {
         sched::charge_cpu(in_user)
     }
 
+    fn step_trap(&self, frame: *mut ()) -> bool {
+        // The machine's `TrapRegs` block is **not** the ABI register file: its
+        // word 15 is `rip` where `uregs` keeps `orig_rax`, and it has no
+        // `origs` at all. So the conversion is the machine's own door rather
+        // than a cast, exactly as the signal path does it.
+        let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
+        // SAFETY: `frame` is the block the stub pushed, and `out` is the
+        // `ABI_REG_COUNT`-word file the door writes.
+        if !unsafe { crate::hal::capture_trap_regs(frame, 0, &mut regs) } {
+            return false;
+        }
+        if sched::step_trap(&mut regs) {
+            // The stop rewrites the registers the task resumes with, so the
+            // block the trap frame carries is the one to put them back into.
+            // SAFETY: the same block, still the live trap frame.
+            unsafe { crate::hal::restore_trap_regs(frame, &regs) };
+            return true;
+        }
+        false
+    }
+
     #[cfg(mpos_signal_frame)]
     fn deliver_at_trap(&self, frame: *mut ()) -> bool {
         // Through the syscall layer rather than straight to the scheduler: what

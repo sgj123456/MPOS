@@ -1265,6 +1265,20 @@ pub trait Contexts {
     /// [`UserFrameOps::to_user_regs`].
     const ABI_REG_COUNT: usize;
 
+    /// Which slot of the register file holds the processor's **flags**, and
+    /// the bit in it that asks for a single-step trap: `RFLAGS.TF` (slot 18,
+    /// bit 8) on x86_64 where `#DB` reports it, `SPSR_EL1.SS` (bit 21) on
+    /// aarch64 where the step trap is `EC_SOFTWARE_STEP`.
+    ///
+    /// A `ptrace` word that means "run one instruction" is the machine's
+    /// secret for the same reason every other register role is
+    /// ([`Contexts::ABI_REG_COUNT`]'s doc says it): the kernel owns the
+    /// question, the machine owns where the answer lives. `PTRACE_SINGLESTEP`
+    /// reads this pair; before it existed the call was answered as `SYSCALL`,
+    /// which stops at a *boundary* rather than after one instruction
+    /// (`docs/notes/07-chromium-analysis.md` §4e).
+    const STEP_BIT: (usize, u64);
+
     /// `struct epoll_event`'s width on this machine: 12 bytes packed on x86_64
     /// (`data` at 4), 16 naturally aligned on aarch64 (`data` at 8).
     ///
@@ -1755,6 +1769,9 @@ pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
 /// Words in the ABI's register file - [`Contexts::ABI_REG_COUNT`], named at the
 /// crate level for the same reason as [`FPU_BYTES`]: it is an array length.
 pub const ABI_REG_COUNT: usize = <Current as Contexts>::ABI_REG_COUNT;
+
+/// The slot and bit that arm a single-step trap, on this machine.
+pub const STEP_BIT: (usize, u64) = <Current as Contexts>::STEP_BIT;
 
 /// `struct epoll_event`'s width, and where `data` sits inside it - the machine's
 /// struct ABI fact, named at the crate level so the event code above the machine

@@ -995,6 +995,41 @@ pub fn trace_signal_stop(regs: &mut AbiRegs) {
     );
 }
 
+/// The machine took a **single-step trap** (`#DB` on x86_64) for the running
+/// task: if a tracer armed it with `PTRACE_SINGLESTEP`, this is that call's
+/// stop, and the task parks here until the tracer resumes it.
+///
+/// Answers `false` when nobody is tracing, which is the only case the machine
+/// has left to handle - a `#DB` with no tracer is the program's own business
+/// and is reported as `SIGTRAP` the ordinary way.
+///
+/// The stop reports `SIGTRAP` with no event: Linux's single-step stop is a
+/// plain signal-delivery stop whose signal is 5, which is the same word a
+/// tracer distinguishes from a breakpoint by asking `PTRACE_GETREGS` for `rip`
+/// (a breakpoint's `rip` is one past the `int3`).
+pub fn step_trap(regs: &mut AbiRegs) -> bool {
+    let id = current();
+    let traced = with_table(|t| t.task(id).trace.tracer.is_some());
+    if !traced {
+        return false;
+    }
+    park(
+        regs,
+        Stop {
+            signal: signal::SIGTRAP,
+            event: PTRACE_EVENT_NONE,
+            traced: true,
+            reported: false,
+            message: 0,
+            delivering: None,
+            syscall: None,
+            group: false,
+            listening: false,
+        },
+    );
+    true
+}
+
 /// `PTRACE_LISTEN`'s half: mark a stopped tracee as **listening**, so that a
 /// stop signal arriving later is reported to the tracer as a fresh stop instead
 /// of being swallowed by the group stop the tracee is already in.
@@ -1102,6 +1137,22 @@ pub fn group_stop(regs: &mut AbiRegs, sig: u8) {
 /// useless. A task that is running simply gets the arm, and stops at the next
 /// boundary as asked.
 pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
+    resume_traced_with(id, signal, arm, false)
+}
+
+/// [`resume_traced`] with the one extra word `PTRACE_SINGLESTEP` needs.
+///
+/// Linux's `PTRACE_SINGLESTEP` resumes the tracee for exactly one instruction
+/// and stops it again, which on x86_64 is `RFLAGS.TF` and nothing else: the CPU
+/// raises `#DB` after the instruction retires, and that vector is signed
+/// `SIGTRAP` ([`crate::sched::signal::fault_kind_of_vector`]'s row 1).
+///
+/// This kernel used to answer `SINGLESTEP` as `SYSCALL` - a stop at the next
+/// syscall boundary - which is **not** the same thing and is what made a
+/// single-step-based probe of mine trace a static glibc binary in circles: the
+/// tracee never advanced past a `syscall` instruction, so 300 000 "steps" all
+/// reported `rip` at one address (`docs/notes/07-chromium-analysis.md` §4e).
+pub fn resume_traced_with(id: TaskId, signal: u8, arm: bool, single_step: bool) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited => {
             if let Some(reported) = task.trace.stop.and_then(|stop| stop.delivering) {
@@ -1109,6 +1160,26 @@ pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
             }
             task.trace.stop = None;
             task.trace.armed = arm;
+            // The flag is set or cleared on whichever register file the stop
+            // saved: a tracee stopped before its first instruction has only the
+            // `user_resume` state, and one stopped by a fault has a snapshot.
+            // The flag lives on the *saved register file*, which every stop
+            // that a `SINGLESTEP` can be asked at has: a stop is entered from a
+            // trap or a syscall boundary, and both snapshot the registers. A
+            // tracee stopped before its first instruction has no snapshot and
+            // nothing to step from, so it is left alone rather than trapping
+            // against a state the loader owns.
+            let (slot, bit) = crate::hal::STEP_BIT;
+            let word = task.trace.regs.as_mut().map(|regs| &mut regs[slot]);
+            if let Some(word) = word {
+                if single_step {
+                    *word |= bit;
+                } else {
+                    // Cleared on every other resume, or a tracee that was once
+                    // single-stepped would keep trapping for ever.
+                    *word &= !bit;
+                }
+            }
             if signal != 0 {
                 queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
             }

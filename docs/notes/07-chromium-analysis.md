@@ -1280,6 +1280,59 @@ named gap with a five-run reproduction, recorded here, and the next step is a
 kernel-side instrument rather than another userland probe - the guard's value at
 `__libc_start_main` and at the unmangle, printed from a build that can see both.
 
+## 4f. `PTRACE_SINGLESTEP` was a synonym for `SYSCALL`, and the static-exit bug is not PTR_MANGLE
+
+§4e left two things open: why a static glibc program segfaults on its way out of
+`main`, and how to inspect it. The instrument came first, and it was itself the
+defect.
+
+**`PTRACE_SINGLESTEP` ran no instruction.** `handle_ptrace` answered it exactly as
+`PTRACE_SYSCALL` - the comment said so plainly ("this kernel has no single-step
+trap, and a tracer that asked for one gets stops at the next boundaries rather
+than none at all"). That is not the same contract: a tracee sitting on a
+`syscall` instruction never advances, so a probe built on it reported the **same
+`rip` for 300 000 steps** - the first trace produced
+`rip range [0x41c509..0x41c509]`, one address, and every conclusion drawn from it
+was worthless. It is worth stating exactly why that mattered: I had already
+written down `_dl_random == 0` as a finding before noticing the probe could not
+move.
+
+**Now it steps, and the shape is the machine's.** `Contexts::STEP_BIT` (a `hal`
+associated constant, so both ports answer and neither arch is named in the
+kernel) carries x86_64's `(EFLAGS slot, 1<<8)` and aarch64's `(SPSR slot, 1<<21)`;
+`resume_traced_with` sets or clears that bit on whichever register file the stop
+saved; a `#DB` vector was installed (`trap_db`, signed `SIGTRAP` through a new
+`FaultKind::Breakpoint` row); and `rust_trap` turns vector 1 into the tracer's
+stop through a new `Kernel::step_trap` seam rather than into a signal. A resume
+that is **not** a step clears the bit, or a tracee would trap for ever.
+
+**What the working instrument then showed** (`build/scratch/zprobe/bp{7,8,9}.c`,
+frame converted through `capture_trap_regs`/`restore_trap_regs` - the `TrapRegs`
+block is *not* the ABI register file, its word 15 is `rip` where `uregs` keeps
+`orig_rax`, and the first cast-based version faulted on step two):
+
+- the step trace is real: 107 steps to `_dl_aux_init`, then on to the faulting
+  call at `0x406552`;
+- `__pointer_chk_guard_local` is **0 all the way**, and so are the four words of
+  the `__exit_funcs` node the call dispatches through
+  (`__exit_funcs = 0x4bb360` is inside `.bss`, `0x4baa40`, which is NOBITS -
+  everything there starts zero and glibc fills it at run time);
+- and **no `.init_array` constructor ever ran**: across the whole trace the
+  instruction pointer never left `[0x402e40..0x41c560]`, so the table at
+  `0x4b5160` was never entered.
+
+So §4e's PTR_MANGLE reading was **a symptom, not the cause**: with the
+constructors skipped, the guard and the exit-func list are still zero, and the
+unmangled "pointer" is whatever those zeroes produce. The real question is why
+`__libc_start_main` never reaches its `.init_array` loop - and that is where the
+next pass starts, with an instrument that now works.
+
+**Unpinned, and named**: `PTRACE_SINGLESTEP` has no claim yet. A pin needs a
+tracee whose instruction stream the test can predict - a three-instruction
+fixture, stepping and reading `rip` after each - and that fixture has to run on
+both machines, whose step bits differ. The mechanism is in and the full gate is
+green with it; the contract is not yet asserted.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
