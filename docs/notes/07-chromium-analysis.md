@@ -2030,6 +2030,71 @@ data, a wrong `.bss` clobber model, a wrong `IRELATIVE` implementation), and one
 implementation written then reverted. The instrument - and my own structural
 assumptions about it - has been the harder subject every time.
 
+## 4s. The exit loop never advances: `count` reads 2 at every dispatch, `rsp` never moves
+
+§4r bracketed the fault to "the second `call *%rax`". This pass reads the loop
+directly, and the answer is not a bad pointer at all - it is a **loop that does
+not advance**.
+
+Two breakpoints, one before the count is decremented (`0x4063dc`) and one after
+(`0x4063ff`), both printing the node's own count word at `0x4bb368`
+(`build/scratch/zprobe/{cx,cnt2,deep}.c`):
+
+```
+BEFORE decrement: count=0x2 rsp=0x3ff69a10
+BEFORE decrement: count=0x2 rsp=0x3ff69a10
+BEFORE decrement: count=0x2 rsp=0x3ff69a10
+   ... 12 times, identical
+```
+
+and, watching the dispatch itself:
+
+```
+dispatch  1: count 0x1  flavor=0x4  rsp=0x3f86aa10
+dispatch  2: count 0x1  flavor=0x4  rsp=0x3f86aa10
+   ... 12 times, identical
+```
+
+**Three things follow, and they rule out the previous story.**
+
+1. **`count` is 2 before the decrement and 1 after it**, every time - so the
+   store at `0x4063f4` *does* land, and by the next dispatch the word is **2
+   again**. Something re-arms it between iterations. §4k's "the second call never
+   returns" and §4r's "a structure value called as a function" were both reading
+   the eventual death, not the cause.
+2. **`rsp` is identical at every dispatch.** So this is not recursion and not
+   stack growth - it is one loop spinning, which is why the crash takes as long
+   as it does and why the earlier probes saw the same mangled value ten times.
+3. **The same entry is dispatched every time** (`unmangled=0x402f80`, `call_fini`,
+   identical mangled word and guard). The loop re-enters the *first* entry forever.
+
+**And the word itself is writable.** A program that writes those exact fixed
+addresses and reads them back gets what it wrote:
+
+```
+before: 0
+after write #1: 0xdeadbeef
+after write #2: 0
+[0x4bb000] = 0
+after write: 0x1234
+rmw store: 0x1
+```
+
+So §4p's ".bss writes" and this pass's fixed-address writes both work; the count
+being 2 again is not a lost store.
+
+**What that leaves, precisely**: something between one dispatch and the next
+writes 2 back into `node + 8`. The candidates are `__new_exitfn` (which is what a
+`__cxa_atexit` during exit would call - and `call_fini` runs the `.fini_array`,
+whose constructors could register), or the loop reading a **different node** each
+time whose header happens to look identical. The next measurement distinguishes
+them in one run: break at the store `0x4063f4` and at whatever writes `0x4bb368`,
+and compare the two write sites' addresses.
+
+**Tally**: ten wrong readings or wrong turns retracted. The instrument has been
+the harder subject in every single one, and this pass is the first that narrowed
+by *eliminating a cause* (the store lands) rather than by finding a new suspect.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
