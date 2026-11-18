@@ -37,23 +37,52 @@
 //!
 //! | child's `SIGSEGV` disposition | `PTRACE_CONT` with `SIGSEGV` |
 //! |---|---|
-//! | inherited handler (`sa_sigaction` = 0x558a…) | **another delivery stop**, `0x0b7f`, however many times it is resumed |
+//! | inherited handler whose own body returns | another **delivery stop**, `0x0b7f`, however many times it is resumed |
 //! | `SIG_DFL` | `WIFSIGNALED`, `WTERMSIG` 11, raw status `0x8b` |
 //!
-//! So a tracer cannot hand its subject a handler at all: every pass-on is a new
-//! signal-delivery-stop. This kernel gets that case wrong in the same way and one
-//! step further - it neither runs the handler (`deliver_at_trap` refuses a traced
-//! task, `src/syscall/linux/proc.rs`) nor ends the task, which is a **named gap**
-//! (`docs/notes/07-chromium-analysis.md` §4z) and *not* what this pin measures.
+//! So a tracer *can* hand its subject a handler: the pass-on releases the signal
+//! to the program's own, which runs at once, and what a handler that returns
+//! without repairing the page shows is the same fault arriving again - a second
+//! fault, not a second stop (probe `build/scratch/fsp2`, both shapes).
 //! The child below asks for `SIG_DFL` explicitly so the claim and the table
-//! describe one experiment.
+//! describe one experiment; the last section measures the hand-off itself.
 //!
 //! The fault is caused deliberately, from the child, at an address nothing maps.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use mpos_user_tests::Report;
 
 const PTRACE_GETREGS: u32 = 12;
 const PTRACE_CONT: u32 = 7;
+const PAGE: usize = 4096;
+
+/// The page the handling child unmaps, written **by that child** after the fork.
+///
+/// A static is per-process memory: the child's copy is its own, and the handler
+/// that reads it runs in the child, so this is one process's note to itself. (A
+/// counter the *parent* expected to see move would not work - fork's copy-on-
+/// write hides the child's writes, which is how a first draft of this section
+/// read "the handler never ran" on a kernel that ran it.)
+static FAULTING_PAGE: AtomicUsize = AtomicUsize::new(0);
+
+/// The child's `SIGSEGV` handler: put the page back and return.
+///
+/// Returning is the point. It makes the faulting instruction re-execute against
+/// memory that now works, so the child reaches its own `_exit` - which only a
+/// kernel that actually delivered the signal to this handler can produce.
+extern "C" fn repair_the_page(_sig: libc::c_int) {
+    let at = FAULTING_PAGE.load(Ordering::SeqCst);
+    // SAFETY: a page this process mapped and then made inaccessible; the address
+    // was page-aligned by `mmap`. The call's failure is not checked because a
+    // failed repair turns into the child's own exit code, which the claim reads.
+    unsafe {
+        libc::mprotect(
+            at as *mut libc::c_void,
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+    }
+}
 
 fn ptrace(request: u32, pid: libc::pid_t, addr: usize, data: usize) -> isize {
     // SAFETY: the variadic shape libc's wrapper takes; `request` decides what the
@@ -206,6 +235,84 @@ fn main() {
         &format!("passing the signal on kills it ({gone}, signaled {killed})"),
         gone == child && killed,
     );
+
+    // === a passed-on fault reaches the program's own handler ==============
+    //
+    // The half the `SIG_DFL` child above cannot show. Linux hands the released
+    // signal to the program's own handler, which runs **at the faulting
+    // instruction** on the tracer's very next resume - measured on 7.3.4 with a
+    // handler that repairs the page and returns: `HANDLER`, then the child
+    // reaches its own `_exit` (`build/scratch/fsp2`, shape B). A kernel that
+    // refuses a traced task the delivery door leaves it neither handler nor
+    // death, and that gap is `docs/notes/07-chromium-analysis.md` §4z.
+    //
+    // The page is repaired rather than skipped on purpose: a handler that
+    // returns to an unrepaired instruction faults again, and the claim would
+    // pass on a kernel re-faulting its way to the same stop.
+    // SAFETY: `fork`; this child maps a page, has a handler unmap it, and exits.
+    let handled = unsafe { libc::fork() };
+    if handled == 0 {
+        // SAFETY: a child that traces itself; the fault is the fixture and the
+        // handler below is what turns it back into a running program.
+        unsafe {
+            libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+            libc::raise(libc::SIGSTOP);
+
+            let page = libc::mmap(
+                core::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if page == libc::MAP_FAILED {
+                libc::_exit(90); // the fixture could not be set up; not the claim
+            }
+            FAULTING_PAGE.store(page as usize, core::sync::atomic::Ordering::SeqCst);
+            libc::signal(
+                libc::SIGSEGV,
+                repair_the_page as *const () as libc::sighandler_t,
+            );
+            if libc::mprotect(page, PAGE, libc::PROT_NONE) != 0 {
+                libc::_exit(91);
+            }
+            core::ptr::write_volatile(page.cast::<u8>(), 0x5a);
+            let back = core::ptr::read_volatile(page.cast::<u8>());
+            libc::_exit(if back == 0x5a { 7 } else { 8 });
+        }
+    }
+    if handled > 0 {
+        let mut st3 = 0;
+        // SAFETY: this child's own SIGSTOP, then its fault.
+        unsafe { libc::waitpid(handled, &mut st3, 0) };
+        ptrace(PTRACE_CONT, handled, 0, 0);
+        // SAFETY: the same child, now expected at its fault.
+        let faulted = unsafe { libc::waitpid(handled, &mut st3, 0) };
+        let fsig = if libc::WIFSTOPPED(st3) {
+            libc::WSTOPSIG(st3)
+        } else {
+            -1
+        };
+        r.check(
+            &format!("a handled fault still stops for the tracer ({faulted}, {fsig})"),
+            faulted == handled && fsig == libc::SIGSEGV,
+        );
+
+        // One resume, and the handler is what the child gets back.
+        ptrace(PTRACE_CONT, handled, 0, libc::SIGSEGV as usize);
+        // SAFETY: the same child, expected to leave by its own `_exit`.
+        let out = unsafe { libc::waitpid(handled, &mut st3, 0) };
+        let code = if libc::WIFEXITED(st3) {
+            libc::WEXITSTATUS(st3)
+        } else {
+            -1
+        };
+        r.check(
+            &format!("and one resume runs the program's own handler ({out}, code {code})"),
+            out == handled && code == 7,
+        );
+    }
 
     r.finish()
 }

@@ -1402,14 +1402,24 @@ layout was guessed three times, and `ptrace`'s `-1` error return was read as dat
 the way (`e00d4f5`, `1699220`), and §4w's `fault_stop` gap is what made the last
 step possible at all.
 
-**A gap the fixed kernel still has, named** (§4z): a **traced** task that faults
-with a handler installed gets neither the handler nor death -
-`deliver_at_trap` (`src/syscall/linux/proc.rs`) refuses anything with a tracer, so
-the task re-faults until `fault_repeats` ends it. Linux keeps the task alive and
-makes every pass-on another delivery stop (`build/scratch/fsp`, measured both
-ways on Linux 7.3.4). Not on Chromium's measured path - crashpad wants the stop,
-which it now gets - but recorded because "nearly right" there is the shape that
-sends a caller down a path it cannot recover from.
+**A gap the fixed kernel had, now closed** (§4z): a **traced** task that faults
+with a handler installed got neither the handler nor death -
+`deliver_at_trap` (`src/syscall/linux/proc.rs`) refused anything with a tracer, so
+the task re-faulted until `fault_repeats` ended it. The section that named it
+asserted Linux never runs a handler under a tracer, and **that was the probe's
+flaw, not Linux's rule**: `build/scratch/fsp`'s handler returned without repairing
+the page, so every resume faulted again and the repeated stops read as protocol.
+`build/scratch/fsp2` (both handler shapes, Linux 7.3.4) measures the truth - a
+pass-on releases the signal to the program's own handler, which runs at the
+faulting instruction on the tracer's next resume. The refusal is now narrowed to
+one signal: a traced task may be served a delivery for the fault its tracer has
+just released (`sched::released_fault`, `Tracing::passed_on`), and any other
+pending signal still takes the refusal, whose reason (a stop off a trap frame has
+no syscall context for the tracer) is untouched. `sched::deliverable_signal`
+answers "which signal is next" without consuming it, and `requeue_keeping_record`
+keeps the fault's own `si_code`/`si_addr` instead of overwriting it with
+`SI_USER`. Pin: `t-ptrace-fault-stop`'s last two claims (a third child, a handler
+that repairs the page, `_exit(7)` on one resume), green on both arms.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

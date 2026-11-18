@@ -2429,31 +2429,35 @@ the browser still does not render - and the one instrument that would read *why*
 is a crash handler that can inspect the CHECK's message, which is the `sized`
 capability §4v's `fault_stop` now makes possible for the first time.
 
-## 4z. NAMED GAP: a traced task with a signal handler gets neither the handler nor death
+## 4z. FIXED: a traced task whose tracer passed the fault on now runs its own handler
 
-Found while writing `t-ptrace-fault-stop` (§4v's pin), and it is the one shape in
-the `fault_stop` family that is **not** closed. It is named here rather than fixed
-because the fix is a design change in `deliver_at_trap`, not a one-line correction.
+Found while writing `t-ptrace-fault-stop` (§4v's pin), and it was the one shape in
+the `fault_stop` family left open at §4v - named then, **closed here**. It is
+recorded at this length because the section that named it stated a rule that was
+never measured, and the measurement refuted the rule.
 
-**The measurement, and the reason the pin was wrong before it.** A `mpos-user`
-program is Rust `std`, whose runtime installs a `SIGSEGV` handler at startup (the
-stack-overflow detector). A forked child inherits it, so the pin's first fixture
-was not the experiment its own table cited: that table came from a C probe running
-with `SIG_DFL`. `build/scratch/fsp` (the same fixture as a host Rust `std` program,
-Linux 7.3.4) measures both:
+**The claim that was wrong, and how it got written.** §4z's first version said
+"Linux's own answer for the handler case is that the handler does not run while the
+task is traced - each pass-on is a fresh signal-delivery-stop, and only a tracer's
+`PTRACE_CONT` **with signal 0** after that lets the tracee run the handler". That
+came from `build/scratch/fsp`, whose handler could not repair the page: it printed,
+returned, and the faulting instruction faulted again, so every resume produced a
+`0x0b7f` stop and the probe read protocol where it was looking at its own fixture.
+The identical-looking stops are **new faults**, not repeated delivery stops.
 
-| child's `SIGSEGV` disposition | `PTRACE_CONT` with `SIGSEGV` |
+**The measurement that decides it** (`build/scratch/fsp2`, the same fork/trace/
+fault fixture as a host Rust `std` program, Linux 7.3.4, two handler shapes):
+
+| handler | what the tracer sees after one pass-on |
 |---|---|
-| inherited handler (`sa_sigaction` = `0x558a4cdfa750`) | **another delivery stop**, raw status `0x0b7f`, and the same again at every resume |
-| `SIG_DFL` | `WIFSIGNALED`, `WTERMSIG` 11, raw status `0x8b` |
+| prints `HANDLER`, returns without repairing | `HANDLER` printed, then a stop for **a new fault** at the same instruction, for ever |
+| prints `HANDLER`, `mprotect`s the page, returns | `HANDLER` printed, then `EXITED code=7` - the child reached its own `_exit` |
 
-So Linux's own answer for the handler case is "the handler does not run while the
-task is traced" — each pass-on is a fresh signal-delivery-stop, and only a tracer's
-`PTRACE_CONT` **with signal 0** after that lets the tracee run the handler. The
-death is not immediate, but nothing is lost either.
+So a pass-on **does** release the signal to the program's own handler, and it runs
+at once, whether or not a tracer is watching. There is no second delivery stop.
 
-**What this kernel does instead**, measured on the same fixture with the working
-`passed_on` bookkeeping (`RSDIAG`/`FSDIAG`/`PFDIAG2` diagnostics, since removed):
+**What this kernel did instead**, measured when §4z was written (diagnostics since
+removed):
 
 ```
 RSDIAG resumed id=7 signal=11 reported=Some(11)
@@ -2462,40 +2466,73 @@ PFDIAG2 sig=11 default=false
 FAIL:  passing the signal on kills it (288, signaled false)
 ```
 
-`passed_on` works: the resume records it, `fault_stop` consumes it and returns
-`false`, so the fault path is entered. It then asks
-`disposition_is_default(SIGSEGV)` — `false`, the tracee has a handler — so
-`die_of_fatal_signal` is skipped, and `deliver_at_trap`
-(`src/syscall/linux/proc.rs`) **declines anything with a tracer**
-(`crate::sched::has_tracer(crate::sched::current())`). The tracee is therefore
-neither handed its handler nor ended; it re-faults until
-`fault_repeats(rip)` (`arch/src/arch/x86_64/idt.rs`) ends it at
+`passed_on` worked: the resume recorded it, `fault_stop` consumed it and returned
+`false`, so the fault path was entered. It then asked
+`disposition_is_default(SIGSEGV)` - `false`, the tracee has a handler - so
+`die_of_fatal_signal` was skipped, and `deliver_at_trap`
+(`src/syscall/linux/proc.rs`) **declined anything with a tracer**. The tracee was
+therefore neither handed its handler nor ended; it re-faulted until
+`fault_repeats(rip)` (`arch/src/arch/x86_64/idt.rs`) ended it at
 `FAULT_REPEAT_LIMIT` with "died of SIGSEGV it could not be handed".
 
-**Why it is a gap and not a bug to approximate.** The honest Linux shape is that
-the handler runs *through the tracer's decision*, which means `deliver_at_trap`
-must be able to build a signal frame for a traced task (and the `%rax`-return path
-must interact with the stop protocol). Returning `true` from `fault_stop` for the
-handler case — i.e. parking the tracee for ever — would be a plausible number that
-is worse than the honest one; ending it immediately would be the approximation that
-AGENTS.md §3 rule 2 forbids. The pin therefore states the `SIG_DFL` experiment it
-can actually pin (the child calls `libc::signal(SIGSEGV, SIG_DFL)` first), and this
-section names the case it does not.
+**The fix, and why it is this shape.** Two roads were open: let `fault_stop` build
+the frame itself (it holds the `AbiRegs`), or narrow the trap door's refusal. The
+second was taken, because the refusal's own reason is narrow and the fix should keep
+it: a stop taken off a trap frame is a stop whose *syscall context* the tracer
+cannot read (`docs/notes/` §2.13 - the aarch64 `there is no task 255` measurement),
+which is why the door refuses a traced task at all. A **delivery** raises no new
+stop, so it is not that question. The refusal now asks about the *signal*:
 
-**Reach on Chromium's path: none measured.** crashpad wants a *stop* to inspect a
-crash, which is what `fault_stop` now gives it; whether it wants to pass the signal
-on and run a handler afterwards is not something §4y's run exercised. This is a
-correctness gap in the ptrace surface, not a named Chromium blocker - and it is
-recorded because "nearly right" there is the shape that sends a caller down
-a path it cannot recover from.
+```rust
+    if crate::sched::has_tracer(crate::sched::current()) {
+        match crate::sched::released_fault() {
+            Some(released) if crate::sched::deliverable_signal() == Some(released) => {
+                // Spent here, before the frame is built: the licence is for
+                // **one** delivery, and a second fault must earn its own.
+                crate::sched::clear_released_fault();
+            }
+            _ => return false,
+        }
+    }
+```
 
-**The second machine had the same hole at a different level** (found while pinning
-this, 2026-11-18): aarch64's `deliver_or_die`
+Four supporting pieces, each of them load-bearing:
+
+- `Tracing::passed_on: Option<u8>` (`src/sched/runtime/task.rs`) records the number
+  the tracer named at `PTRACE_CONT` - a resume is the *tracer's* syscall and the
+  signal's effect belongs to the *tracee*, so the decision is recorded where it can
+  be acted on. `sched::released_fault()` / `clear_released_fault()`
+  (`src/sched/runtime/trace.rs`) are its readers, and `fault_stop` leaves the record
+  standing when it is **this fault's own signal** (a resume that names a fault's
+  signal hands the task back to the faulting instruction, so the same fault arrives
+  a second time - parking again is how a tracee came to stop for ever at one
+  address).
+- `sched::deliverable_signal()` (`src/sched/runtime/child_signal.rs`) answers *which*
+  signal is next without consuming it, so the door can ask "is the released one the
+  pending one" before the frame exists. `take_deliverable_siginfo` destroys the
+  answer.
+- `requeue_keeping_record` replaces `queue_signal` in `resume_traced_with`: the
+  fault's `si_code`/`si_addr` record is already queued by `send_fault_signal`, and
+  `queue_signal` would overwrite it with `SI_USER` - telling the handler that the
+  tracer's pid is the faulting address. Linux's handler sees `SEGV_MAPERR` and the
+  real address.
+- The licence is spent **before** the frame is built, so one delivery cannot serve
+  a second fault.
+
+**The pin** gained the handler shape as its last two claims
+(`user/tests/src/bin/t-ptrace-fault-stop.rs`): a third child maps a page, starts
+unmapping it inside its handler, and on one `PTRACE_CONT` with `SIGSEGV` must print
+neither stop nor death but reach its own `_exit(7)` -
+`ok: and one resume runs the program's own handler (…, code 7)`. Counterfactual:
+restoring the flat `if has_tracer { return false; }` reddens exactly that claim.
+
+**The second machine had the same hole at two levels** (both found while pinning
+this, 2026-11-18). At first aarch64's `deliver_or_die`
 (`arch/src/arch/aarch64/vectors.rs`) went straight to
-`deliver_at_trap`-or-`die_of_fatal_signal` and never offered the fault to a
-tracer, so `t-ptrace-fault-stop` failed **four of its six claims** on that arm -
-the fault arrived as an *exit*, `WSTOPSIG` read `-1`, the register file was
-unreadable and the pass-on had nothing to pass on:
+`deliver_at_trap`-or-`die_of_fatal_signal` and never offered the fault to a tracer,
+so the pin failed **four of its six claims** on that arm - the fault arrived as an
+*exit*, `WSTOPSIG` read `-1`, the register file was unreadable and the pass-on had
+nothing to pass on:
 
 ```
 FAIL:  the fault arrives as a STOP, not an exit (445)
@@ -2504,14 +2541,18 @@ FAIL:  the register file is readable there (ip None)
 FAIL:  passing the signal on kills it (-1, signaled true)
 ```
 
-The x86_64 wiring (§4v) had been added to `rust_page_fault` **and** `rust_trap`
-for exactly this reason - "adding it to only one of them is the shape that made the
-first attempt look like it had not worked" - and the second machine has one door
-for every EL0 fault, so one call covers it. `fault_stop` now runs **before**
-`deliver_at_trap` there, matching x86_64's order: the tracer decides whether the
-signal is passed on at all, so asking the handler first would run a handler for a
-signal the tracer had not yet released. Pin green on both arms (x86_64 340/340,
-aarch64 335/335, kunit 42/0 each).
+`fault_stop` now runs **before** `deliver_at_trap` there, matching x86_64's order
+(the tracer decides whether the signal is passed on at all, so asking the handler
+first would run a handler for a signal the tracer had not yet released). The
+delivery fix itself is machine-independent - aarch64's EL0 fault paths all funnel
+through the one `deliver_or_die` - so the handler claims pass on both arms.
+
+**Reach on Chromium's path: none measured.** crashpad wants a *stop* to inspect a
+crash, which is what `fault_stop` gives it; whether it wants to pass a signal on and
+run a handler afterwards is not something §4y's run exercised. This was a
+correctness gap in the ptrace surface, not a named Chromium blocker - recorded
+because "nearly right" there is the shape that sends a caller down a path it cannot
+recover from.
 
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 

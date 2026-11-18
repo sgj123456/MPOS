@@ -2609,6 +2609,54 @@ fn note_timer_record_delivered(task: &mut Task, sig: u8, info: &crate::sched::si
     task.note_timer_delivered(sig, info.tid as u32, info.overrun.max(0) as u32);
 }
 
+/// The number [`take_deliverable_siginfo`] would hand back, without taking
+/// anything - so a caller can ask *which* signal is next before it commits to
+/// consuming one.
+///
+/// The delivery door needs the distinction and not the signal: a traced task's
+/// pending signals are its tracer's business, with one exception - the fault
+/// whose signal the tracer has just passed on - and telling that exception
+/// apart from "some other signal is pending" has to happen before the take
+/// destroys the answer. Reading it and then putting it back is not possible
+/// (`take_deliverable_siginfo` clears the bit and pops a real-time record), so
+/// the question is asked first.
+pub fn deliverable_signal() -> Option<u8> {
+    with_table(|t| {
+        let task = t.task(t.current);
+        let mut ready = task.signals & !task.blocked;
+        while let Some(sig) = crate::sched::signal::take(&mut ready) {
+            if task.dispositions.get(sig).is_ignore() {
+                continue;
+            }
+            // A record whose `sigqueue` was freed is not a signal any more, so
+            // the take would skip it too; agreeing here is what keeps the two
+            // doors from naming different signals.
+            if record_is_freed(task, sig) {
+                continue;
+            }
+            return Some(sig);
+        }
+        None
+    })
+}
+
+/// Re-arm `sig` as pending **without touching its `siginfo_t` record**.
+///
+/// A tracer that passes a stop's signal on is re-delivering the signal the stop
+/// was about, and that signal already has its record: the sender's, or - the
+/// case this exists for - the fault's own `SEGV_MAPERR`/`SEGV_ACCERR` with
+/// `si_addr` naming the address. [`queue_signal`] would overwrite it with an
+/// `SI_USER` record naming the tracer's pid, which is what a handler reads to
+/// decide whether the address it was given is one it can repair: measured, a
+/// Linux handler for a passed-on `SIGSEGV` sees `si_code` `SEGV_MAPERR` and the
+/// faulting address, never `SI_USER`.
+pub(crate) fn requeue_keeping_record(task: &mut Task, sig: u8) {
+    if discarded_when_generated(task, sig) || init_discards(task, sig, false) {
+        return;
+    }
+    crate::sched::signal::add(&mut task.signals, sig);
+}
+
 /// As [`take_deliverable_signal`], but also handing back the `siginfo_t` the
 /// sender attached, so the delivery path can build a handler's frame with the
 /// real record - `si_code`, `si_pid`, the `sigqueue` payload - rather than a

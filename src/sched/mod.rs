@@ -100,14 +100,14 @@ pub use runtime::{
     current_rlimit, current_root, current_stack_range, current_switches, current_tgid,
     current_thread_cpu_ticks, current_thread_io, current_thread_switches, current_tid_address,
     current_tls, current_umask, current_user_ns, current_uts, deliver_pending_signal,
-    descriptor_access, descriptor_file_of, descriptor_flags_of, descriptor_inode_of,
-    descriptor_numbers, descriptors_of, destructive_advice_refused, detach_traced,
-    die_of_fatal_signal, discard_exit_code, enter_syscall, environment_of, exec_replace, exit,
-    exit_code, exit_group, fds_of, fill_owner, fork, frames_range_free, get_mmap_cursor,
-    group_identity, group_members, has_children, has_deliverable_signal, has_live_child,
-    has_matching_children, has_seccomp_filter, has_tracer, identity_of, in_task, init, insert_vma,
-    io_of, io_of_group, ioprio_of, is_child, is_exited, is_running, is_seized, is_stopped,
-    itimer_snapshot, itimer_swap, kernel_lazy_accessible, last_syscall, leave_syscall,
+    deliverable_signal, descriptor_access, descriptor_file_of, descriptor_flags_of,
+    descriptor_inode_of, descriptor_numbers, descriptors_of, destructive_advice_refused,
+    detach_traced, die_of_fatal_signal, discard_exit_code, enter_syscall, environment_of,
+    exec_replace, exit, exit_code, exit_group, fds_of, fill_owner, fork, frames_range_free,
+    get_mmap_cursor, group_identity, group_members, has_children, has_deliverable_signal,
+    has_live_child, has_matching_children, has_seccomp_filter, has_tracer, identity_of, in_task,
+    init, insert_vma, io_of, io_of_group, ioprio_of, is_child, is_exited, is_running, is_seized,
+    is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible, last_syscall, leave_syscall,
     listen_traced, listening, lock_current, lock_future, locked_advice_refused, locked_pages,
     locked_within, madvise_dontneed, map_anon, map_anon_named, map_facts, map_frames, mapped_pages,
     mapping_name_at, mapping_span_at, maxrss_of, may_inspect, may_mint_pid_ns, may_signal,
@@ -177,9 +177,9 @@ pub(crate) use runtime::with_table;
 ///
 #[cfg(target_os = "none")]
 pub use runtime::{
-    exec_trap, fault_stop, fork_trap, group_stop, request_interrupt, seccomp_trace_armed,
-    seccomp_trap, set_trace_fpu, set_trace_regs, step_trap, stop_at_syscall,
-    take_interrupt_request, trace_fpu, trace_regs, trace_signal_stop,
+    clear_released_fault, exec_trap, fault_stop, fork_trap, group_stop, released_fault,
+    request_interrupt, seccomp_trace_armed, seccomp_trap, set_trace_fpu, set_trace_regs, step_trap,
+    stop_at_syscall, take_interrupt_request, trace_fpu, trace_regs, trace_signal_stop,
 };
 
 /// The `#NM` vector's entry, named only where the machine traps a lazy FPU.

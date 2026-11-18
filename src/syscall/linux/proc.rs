@@ -249,11 +249,17 @@ fn restart_verdict(
 /// Run a pending signal's handler, or take its default action.
 ///
 /// Called on the way out of every syscall, holding the register frame the task
-/// will `sysretq` through. That frame is why this is the place: entering a
-/// handler means rewriting the task's whole return context, and a syscall is
-/// the only moment the kernel has it in a form it can both read and write.
-/// The clock can deliver a signal with no handler, but not one with a handler,
-/// for exactly this reason.
+/// will `sysretq` through. Entering a handler means rewriting the task's whole
+/// return context, and this is the door with the most complete context: the
+/// report carries the call number, so the interrupted call can be told about a
+/// restart it has to make.
+///
+/// **[`deliver_at_trap`] is the second door**, and it is why the sentence this
+/// paragraph used to end with ("a syscall is the only moment the kernel has the
+/// frame in a form it can both read and write") is gone: a trap that returns to
+/// ring 3 does have one, and `hal::capture_trap_regs` reads it. That door serves
+/// what this one cannot - a fault, which arrives as a trap and not as a call -
+/// and it pays a price for it: no call number, so no restart advice.
 ///
 /// Returns `true` when a handler was entered, so the caller can report a
 /// reassuring zero to the interrupted call instead of its own return value -
@@ -371,13 +377,28 @@ pub(super) fn deliver_at_trap(frame: *mut ()) -> bool {
     // cannot read. Leaving it pending is the safe answer and the honest one: the
     // next syscall the task makes takes the door that has the shape for it.
     //
-    // Measured consequence of getting this wrong would be a tracee that stops
-    // for a signal and never reports the call that is still in flight; there is
-    // no measurement yet because the branch has never run - on x86_64 this whole
-    // function is unreachable (`hal::capture_trap_regs` answers false) and on
-    // aarch64 no test in the suite runs a signal under a tracer.
+    // **One signal is not that task's business any more: the fault the tracer
+    // has just passed on.** The stop is over - the tracer answered it by naming
+    // this signal at `PTRACE_CONT` - and what is left is the delivery Linux
+    // performs immediately: the program's own handler runs, at the faulting
+    // instruction, whether or not a tracer is watching. Measured on Linux 7.3.4
+    // (`build/scratch/fsp2` shape B: handler prints and the child reaches its
+    // own `_exit` on the *first* resume after the pass-on). Refusing it here left
+    // a traced task with a handler neither the handler nor its death - the gap
+    // `docs/notes/07-chromium-analysis.md` §4z names.
+    //
+    // The question is asked of the *signal*, not of the task: `released_fault`
+    // names the one number the tracer released, and any other pending signal
+    // still takes the refusal above.
     if crate::sched::has_tracer(crate::sched::current()) {
-        return false;
+        match crate::sched::released_fault() {
+            Some(released) if crate::sched::deliverable_signal() == Some(released) => {
+                // Spent here, before the frame is built: the licence is for
+                // **one** delivery, and a second fault must earn its own.
+                crate::sched::clear_released_fault();
+            }
+            _ => return false,
+        }
     }
     let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
     // SAFETY: the caller hands the machine's own trap frame for this task.

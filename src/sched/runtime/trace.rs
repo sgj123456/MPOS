@@ -1031,11 +1031,25 @@ pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
         return false;
     }
     // **A decision from an earlier stop must not answer for this one.** The
-    // record is written by whatever resume ends *this* park, so it is cleared
-    // before parking: a tracer that passed a signal on at an ordinary delivery
+    // record is written by whatever resume ends *this* park, so one left behind
+    // is cleared here: a tracer that passed a signal on at an ordinary delivery
     // stop, and then drops the fault it is shown next, must get its drop. Left
     // standing, that stale value would read as "the tracer let this fault
     // through" and end a task the tracer had just decided to keep.
+    //
+    // **Unless it is this fault's own signal, which has already been released.**
+    // A resume that names a fault's signal hands the task back to the
+    // instruction that faulted, so the *same* fault arrives here a second time
+    // with the tracer's answer already recorded - and asking the tracer again
+    // is how a tracee came to stop for ever at one address. This is not a stale
+    // decision but the live one: answer "not mine" without parking, and let the
+    // fault path's delivery door run the program's own handler, which is what
+    // Linux does at exactly this moment (measured, `build/scratch/fsp2` shape
+    // B). The record is left standing for that door to spend.
+    let already_released = with_table(|t| t.task(id).trace.passed_on == Some(sig));
+    if already_released {
+        return false;
+    }
     with_table(|t| t.task_mut(id).trace.passed_on = None);
     park(
         regs,
@@ -1063,14 +1077,42 @@ pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
     // that merely queued the signal could not do, because the tracee was still
     // standing on the faulting instruction and would fault again for ever
     // (`t-ptrace-fault-stop`'s last claim read `signaled false`).
-    let passed = with_table(|t| {
-        let task = t.task_mut(id);
-        // Taken whatever it is: this stop is over, and a decision left behind
-        // would be applied to the *next* fault this task takes.
-        let passed = task.trace.passed_on.take();
-        passed == Some(sig)
-    });
+    //
+    // The record is **read, not taken**: the ordinary course runs a few
+    // instructions later in the fault path, and the delivery door there has to
+    // be able to tell this signal apart from any other the task has pending
+    // (`released_fault`, consumed by `deliver_at_trap`). A decision left
+    // standing past that door answers for the *next* fault the task takes - so
+    // every reader clears it, and `fault_stop` clears it again before parking.
+    let passed = with_table(|t| t.task(id).trace.passed_on == Some(sig));
     !passed
+}
+
+/// The signal of the fault whose stop the tracer has just passed on, if the
+/// running task is standing in one.
+///
+/// One case, and it is the one Linux serves without asking anybody: a traced
+/// task faults, the tracer is shown the fault's signal as a signal-delivery
+/// stop, and a `PTRACE_CONT` naming that signal releases it - so the *program's
+/// own handler* runs, immediately, exactly as it would with no tracer involved
+/// (measured on Linux 7.3.4, `build/scratch/fsp2` shape B: the handler prints and
+/// the child reaches its own `_exit` on the first resume; the earlier note that
+/// said Linux never runs a handler under a tracer was a probe that only tested a
+/// handler that could not repair the page).
+///
+/// [`crate::syscall::linux::deliver_at_trap`] refuses traced tasks as a class,
+/// because a stop taken off a trap frame is a stop a tracer cannot read the
+/// syscall context of. This is not that stop - it is the delivery *after* the
+/// stop, which the tracer has already answered - so the door asks this question
+/// and nothing wider.
+pub fn released_fault() -> Option<u8> {
+    with_table(|t| t.task(t.current).trace.passed_on)
+}
+
+/// Spend [`released_fault`]: the delivery it licensed has happened, and the
+/// decision must not license a second one.
+pub fn clear_released_fault() {
+    with_table(|t| t.task_mut(t.current).trace.passed_on = None);
 }
 
 /// The machine took a **single-step trap** (`#DB` on x86_64) for the running
@@ -1270,7 +1312,13 @@ pub fn resume_traced_with(id: TaskId, signal: u8, arm: bool, single_step: bool) 
                 }
             }
             if signal != 0 {
-                queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
+                // **Keeping the record, not replacing it.** A resume that names
+                // a signal is re-delivering the one the stop was about, whose
+                // record is already there - the sender's, or a fault's own
+                // `si_code`/`si_addr`. Queuing an `SI_USER` record over it told
+                // a handler the tracer's pid was the faulting address, which is
+                // the one thing a `SIGSEGV` handler reads.
+                super::child_signal::requeue_keeping_record(task, signal);
                 // **A signal the tracer names at a delivery stop is passed on**,
                 // and what that means is the tracee's to act on - the tracer's
                 // `PTRACE_CONT` is not the context the signal takes effect in.
