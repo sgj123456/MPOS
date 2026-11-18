@@ -1376,26 +1376,40 @@ Three items the analysis names are worth doing on their own terms, in this order
    load, and `ETXTBSY` is not raised for a write-open of a running executable - both named in
    §4c, neither on Chromium's path.
 
-**A defect found on the way, and named rather than fixed** (2026-11-18, §4e): a
-**statically linked glibc** program whose `main` simply returns dies of `SIGSEGV`
+**A defect found on the way, and FIXED** (2026-11-18, §4e → §4x): a
+**statically linked glibc** program whose `main` simply returns died of `SIGSEGV`
 (exit 139) on this kernel, while the same program calling `_exit(0)` or
-`exit_group(0)` exits 0. It is reproducible in every boot, it is not the binary
-(`gcc -static` of `int main(void){return 0;}` is enough), and the fault is a
-`call *%rax` in glibc's `__run_exit_handlers` whose pointer came out of the
-PTR_MANGLE pair over `__pointer_chk_guard_local`. `AT_RANDOM` is placed and
-filled correctly here (measured), so the breakage is downstream of it - *why* is
-not yet measured, and no fix is claimed. Every self-contained C program on this
-machine ends this way, so it is worth a session of its own - and the instrument
-that will find it now exists: `PTRACE_SINGLESTEP` ran no instruction until
-2026-11-18 (it was answered as `SYSCALL`, so a probe "stepping" 300 000 times
-reported one `rip`), and with it working the trace shows **no `.init_array`
-constructor ever runs** (`rip` never leaves `[0x402e40..0x41c560]`), which is why
-the pointer guard and the exit-function list are still zero. §4g then shows that
-claim was a **probe artifact** too (a `rip >= 0x406552` break condition matched
-`_dl_aux_init` at `0x41c560`, and reads were taken before the instruction ran):
-`_dl_random` is in fact written correctly. Two genuine defects fell out of that
-work - `PTRACE_SINGLESTEP` ran no instruction at all, and a `ptrace` stop with no
-`delivering` leaves its `SIGTRAP` pending so the next resume kills the tracee.
+`exit_group(0)` exited 0. Every self-contained C program on this machine ended
+that way. The root cause was **`execve` not defining `%rdx`**: Linux enters a new
+image with exactly two registers defined - `%rsp` and `%rdx` = `rtld_fini`, **0**
+when there is no dynamic linker - and this kernel left `%rdx` holding whatever the
+previous program had. glibc's `_start` (`0x402e46`, `mov %rdx,%r9`) passes it to
+`__libc_start_main` as the `rtld_fini` callback, `0x405c5e` registers it with
+`__cxa_atexit`, and at exit `__run_exit_handlers` **calls** it at `0x406552`. One
+line closes it - `regs.rdx = 0` in `set_exec_return`
+(`arch/src/arch/x86_64/syscall.rs`) - pinned by `t-exec-rdx`, whose counterfactual
+reddens exactly that claim (`got 0x3fdcce68`).
+
+The hunt is worth reading for what it cost rather than what it found: **thirteen
+wrong readings**, every one of them the instrument or the model and none of them
+the kernel - `PTRACE_SINGLESTEP` ran no instruction at all (answered as `SYSCALL`,
+so a probe "stepping" 300 000 times reported one `rip`), a `ptrace` stop with no
+`delivering` left its `SIGTRAP` pending so the next resume killed the tracee, a
+`rip >= 0x406552` break condition matched `_dl_aux_init` at `0x41c560`, reads were
+taken *before* the instruction they were read for ran, glibc's `exit_function`
+layout was guessed three times, and `ptrace`'s `-1` error return was read as data.
+`PTRACE_SINGLESTEP` and the `delivering` fix both landed as real defects found on
+the way (`e00d4f5`, `1699220`), and §4w's `fault_stop` gap is what made the last
+step possible at all.
+
+**A gap the fixed kernel still has, named** (§4z): a **traced** task that faults
+with a handler installed gets neither the handler nor death -
+`deliver_at_trap` (`src/syscall/linux/proc.rs`) refuses anything with a tracer, so
+the task re-faults until `fault_repeats` ends it. Linux keeps the task alive and
+makes every pass-on another delivery stop (`build/scratch/fsp`, measured both
+ways on Linux 7.3.4). Not on Chromium's measured path - crashpad wants the stop,
+which it now gets - but recorded because "nearly right" there is the shape that
+sends a caller down a path it cannot recover from.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

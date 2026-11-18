@@ -2429,6 +2429,90 @@ the browser still does not render - and the one instrument that would read *why*
 is a crash handler that can inspect the CHECK's message, which is the `sized`
 capability §4v's `fault_stop` now makes possible for the first time.
 
+## 4z. NAMED GAP: a traced task with a signal handler gets neither the handler nor death
+
+Found while writing `t-ptrace-fault-stop` (§4v's pin), and it is the one shape in
+the `fault_stop` family that is **not** closed. It is named here rather than fixed
+because the fix is a design change in `deliver_at_trap`, not a one-line correction.
+
+**The measurement, and the reason the pin was wrong before it.** A `mpos-user`
+program is Rust `std`, whose runtime installs a `SIGSEGV` handler at startup (the
+stack-overflow detector). A forked child inherits it, so the pin's first fixture
+was not the experiment its own table cited: that table came from a C probe running
+with `SIG_DFL`. `build/scratch/fsp` (the same fixture as a host Rust `std` program,
+Linux 7.3.4) measures both:
+
+| child's `SIGSEGV` disposition | `PTRACE_CONT` with `SIGSEGV` |
+|---|---|
+| inherited handler (`sa_sigaction` = `0x558a4cdfa750`) | **another delivery stop**, raw status `0x0b7f`, and the same again at every resume |
+| `SIG_DFL` | `WIFSIGNALED`, `WTERMSIG` 11, raw status `0x8b` |
+
+So Linux's own answer for the handler case is "the handler does not run while the
+task is traced" — each pass-on is a fresh signal-delivery-stop, and only a tracer's
+`PTRACE_CONT` **with signal 0** after that lets the tracee run the handler. The
+death is not immediate, but nothing is lost either.
+
+**What this kernel does instead**, measured on the same fixture with the working
+`passed_on` bookkeeping (`RSDIAG`/`FSDIAG`/`PFDIAG2` diagnostics, since removed):
+
+```
+RSDIAG resumed id=7 signal=11 reported=Some(11)
+FSDIAG sig=11 passed=true
+PFDIAG2 sig=11 default=false
+FAIL:  passing the signal on kills it (288, signaled false)
+```
+
+`passed_on` works: the resume records it, `fault_stop` consumes it and returns
+`false`, so the fault path is entered. It then asks
+`disposition_is_default(SIGSEGV)` — `false`, the tracee has a handler — so
+`die_of_fatal_signal` is skipped, and `deliver_at_trap`
+(`src/syscall/linux/proc.rs`) **declines anything with a tracer**
+(`crate::sched::has_tracer(crate::sched::current())`). The tracee is therefore
+neither handed its handler nor ended; it re-faults until
+`fault_repeats(rip)` (`arch/src/arch/x86_64/idt.rs`) ends it at
+`FAULT_REPEAT_LIMIT` with "died of SIGSEGV it could not be handed".
+
+**Why it is a gap and not a bug to approximate.** The honest Linux shape is that
+the handler runs *through the tracer's decision*, which means `deliver_at_trap`
+must be able to build a signal frame for a traced task (and the `%rax`-return path
+must interact with the stop protocol). Returning `true` from `fault_stop` for the
+handler case — i.e. parking the tracee for ever — would be a plausible number that
+is worse than the honest one; ending it immediately would be the approximation that
+AGENTS.md §3 rule 2 forbids. The pin therefore states the `SIG_DFL` experiment it
+can actually pin (the child calls `libc::signal(SIGSEGV, SIG_DFL)` first), and this
+section names the case it does not.
+
+**Reach on Chromium's path: none measured.** crashpad wants a *stop* to inspect a
+crash, which is what `fault_stop` now gives it; whether it wants to pass the signal
+on and run a handler afterwards is not something §4y's run exercised. This is a
+correctness gap in the ptrace surface, not a named Chromium blocker - and it is
+recorded because "nearly right" there is the shape that sends a caller down
+a path it cannot recover from.
+
+**The second machine had the same hole at a different level** (found while pinning
+this, 2026-11-18): aarch64's `deliver_or_die`
+(`arch/src/arch/aarch64/vectors.rs`) went straight to
+`deliver_at_trap`-or-`die_of_fatal_signal` and never offered the fault to a
+tracer, so `t-ptrace-fault-stop` failed **four of its six claims** on that arm -
+the fault arrived as an *exit*, `WSTOPSIG` read `-1`, the register file was
+unreadable and the pass-on had nothing to pass on:
+
+```
+FAIL:  the fault arrives as a STOP, not an exit (445)
+FAIL:  and its signal is SIGSEGV (-1)
+FAIL:  the register file is readable there (ip None)
+FAIL:  passing the signal on kills it (-1, signaled true)
+```
+
+The x86_64 wiring (§4v) had been added to `rust_page_fault` **and** `rust_trap`
+for exactly this reason - "adding it to only one of them is the shape that made the
+first attempt look like it had not worked" - and the second machine has one door
+for every EL0 fault, so one call covers it. `fault_stop` now runs **before**
+`deliver_at_trap` there, matching x86_64's order: the tracer decides whether the
+signal is passed on at all, so asking the handler first would run a handler for a
+signal the tracer had not yet released. Pin green on both arms (x86_64 340/340,
+aarch64 335/335, kunit 42/0 each).
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,

@@ -116,3 +116,7 @@ workspace = true
 [[bin]]
 name = "t-exec-rdx"
 path = "src/bin/t-exec-rdx.rs"
+
+[[bin]]
+name = "t-ptrace-fault-stop"
+path = "src/bin/t-ptrace-fault-stop.rs"

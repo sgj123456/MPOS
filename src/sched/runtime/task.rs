@@ -1822,6 +1822,29 @@ pub(crate) struct Tracing {
     /// shape a pending signal takes, and for the same reason: the side that
     /// wants it is not the side that can act on it.
     pub(crate) interrupt_requested: bool,
+    /// The signal a tracer **passed on** at a stop, waiting for the tracee to act
+    /// on it.
+    ///
+    /// A resume and the stop it ends run in different contexts: the resume is the
+    /// *tracer's* syscall, and the thing the signal then does belongs to the
+    /// *tracee*, which is not running at that moment. So the decision is recorded
+    /// here and read where it can be acted on.
+    ///
+    /// It exists because of one case, and it is the case a tracer most wants: a
+    /// tracee stopped at a **fault** whose tracer `PTRACE_CONT`s it naming the
+    /// signal the stop reported. Linux delivers that signal - for `SIGSEGV` with
+    /// no handler, the process dies - while a resume that merely queued it left
+    /// the tracee to re-execute the faulting instruction, fault again, and stop
+    /// again, for ever (measured: `t-ptrace-fault-stop`'s last claim read
+    /// `signaled false` after the tracee had parked a second time).
+    ///
+    /// Read by [`super::trace::fault_stop`], which clears it before it parks (so
+    /// a decision from an *earlier* stop cannot answer for this one) and answers
+    /// "not mine" when the resume ending the park named this fault's own signal -
+    /// letting the fault path take its ordinary course. An ordinary signal stop
+    /// needs nothing from it: `stop.delivering` already records the same fact
+    /// there, and `resume_traced_with` acts on it directly.
+    pub(crate) passed_on: Option<u8>,
 }
 
 /// The syscall a tracee is stopped at, as `PTRACE_GET_SYSCALL_INFO` reports it.

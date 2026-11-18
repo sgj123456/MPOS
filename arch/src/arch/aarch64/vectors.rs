@@ -1102,7 +1102,26 @@ fn skip(pc: &mut u64) {
 /// It returns **only** when a handler's frame is installed, so every caller
 /// answers the stub with `return 0`: a non-zero answer means "the frame is dead,
 /// leave for the kernel", which is the opposite of what a delivery asks for.
+///
+/// A **traced** task is offered to its tracer first, and that offer outranks this
+/// one: `fault_stop` parks the task for the stop, and when the tracer passes the
+/// signal on it answers `false` so the ordinary course below runs.
 fn deliver_or_die(frame: &mut UserFrame, sig: u8) {
+    // **A traced task's fault is its tracer's stop before it is the program's
+    // death**, and the order matters: the tracer chooses whether the signal is
+    // passed on at all. This is the same offer x86_64's `rust_page_fault` and
+    // `rust_trap` make (`docs/notes/07-chromium-analysis.md` §4u, §4v); it was
+    // missing here, so a traced fault on this machine went straight to the
+    // handler-or-death choice and a tracer never saw the stop - `t-ptrace-fault-
+    // stop` failed four of its six claims on this arm with the fault arriving as
+    // an exit.
+    //
+    // The frame is this machine's `UserFrame`, which is also what its gate frame
+    // takes, so the seam's own `capture_trap_regs`/`restore_trap_regs` pair
+    // serves it unchanged.
+    if crate::hal::kernel::fault_stop(core::ptr::from_mut(frame).cast::<()>(), sig) {
+        return;
+    }
     #[cfg(mpos_signal_frame)]
     {
         if crate::hal::kernel::deliver_at_trap(core::ptr::from_mut(frame).cast::<()>()) {

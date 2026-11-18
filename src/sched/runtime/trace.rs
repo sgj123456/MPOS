@@ -1030,6 +1030,13 @@ pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
     if sig == signal::SIGKILL {
         return false;
     }
+    // **A decision from an earlier stop must not answer for this one.** The
+    // record is written by whatever resume ends *this* park, so it is cleared
+    // before parking: a tracer that passed a signal on at an ordinary delivery
+    // stop, and then drops the fault it is shown next, must get its drop. Left
+    // standing, that stale value would read as "the tracer let this fault
+    // through" and end a task the tracer had just decided to keep.
+    with_table(|t| t.task_mut(id).trace.passed_on = None);
     park(
         regs,
         Stop {
@@ -1040,7 +1047,7 @@ pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
             message: 0,
             // `delivering` is what makes "did the tracer pass it on" answerable:
             // a resume that names nothing drops it, and one that names `sig`
-            // delivers it, which is the same contract an ordinary signal stop
+            // passes it on, which is the same contract an ordinary signal stop
             // has (`trace_signal_stop`).
             delivering: Some(sig),
             syscall: None,
@@ -1048,7 +1055,22 @@ pub fn fault_stop(regs: &mut AbiRegs, sig: u8) -> bool {
             listening: false,
         },
     );
-    true
+    // **The tracer decided, and the decision is now ours to carry out.** A resume
+    // that named this signal passed it on, so the fault must take its ordinary
+    // course: answer `false`, and the fault path's own default-disposition and
+    // handler logic run exactly as they would for an untraced fault. That is what
+    // makes the stop a *decision* rather than a notification - and what a resume
+    // that merely queued the signal could not do, because the tracee was still
+    // standing on the faulting instruction and would fault again for ever
+    // (`t-ptrace-fault-stop`'s last claim read `signaled false`).
+    let passed = with_table(|t| {
+        let task = t.task_mut(id);
+        // Taken whatever it is: this stop is over, and a decision left behind
+        // would be applied to the *next* fault this task takes.
+        let passed = task.trace.passed_on.take();
+        passed == Some(sig)
+    });
+    !passed
 }
 
 /// The machine took a **single-step trap** (`#DB` on x86_64) for the running
@@ -1218,7 +1240,11 @@ pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
 pub fn resume_traced_with(id: TaskId, signal: u8, arm: bool, single_step: bool) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited => {
-            if let Some(reported) = task.trace.stop.and_then(|stop| stop.delivering) {
+            // The signal this stop was reporting, if it was a delivery stop. It
+            // outlives the stop below, because a resume has to know whether the
+            // tracer *passed the signal on* or dropped it.
+            let reported = task.trace.stop.and_then(|stop| stop.delivering);
+            if let Some(reported) = reported {
                 task.signals &= !signal::bit(reported);
             }
             task.trace.stop = None;
@@ -1245,6 +1271,13 @@ pub fn resume_traced_with(id: TaskId, signal: u8, arm: bool, single_step: bool) 
             }
             if signal != 0 {
                 queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
+                // **A signal the tracer names at a delivery stop is passed on**,
+                // and what that means is the tracee's to act on - the tracer's
+                // `PTRACE_CONT` is not the context the signal takes effect in.
+                // Recorded so `fault_stop` can let the fault's default action
+                // happen instead of parking the tracee at the same instruction
+                // again (`t-ptrace-fault-stop`'s last claim).
+                task.trace.passed_on = Some(signal);
             }
             t.sched.wake(id);
             true
