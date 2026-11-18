@@ -232,6 +232,22 @@ impl crate::hal::Gate for crate::hal::Current {
         // `PTRACE_EVENT_EXEC` stop reports.
         regs.rcx = entry;
         regs.user_rsp = sp;
+        // **`rdx` must be zero on entry to a new program.** Linux's `execve`
+        // contract leaves every register undefined except `%rsp` and `%rdx`,
+        // and `%rdx` is defined as the *rtld finaliser* - zero when there is no
+        // dynamic linker. glibc's `_start` takes it as `rtld_fini` and hands it
+        // to `__libc_start_main`, which registers it with `__cxa_atexit`; a
+        // non-zero value here therefore becomes an exit handler that gets
+        // **called** when the program leaves, and whatever the register held is
+        // not a function.
+        //
+        // Measured: a static glibc program read `rdx = 0x7e9c40d77628` from the
+        // kernel and `0x0` on a Linux host, and its exit died of `SIGSEGV` in
+        // `call *%rax` inside `__run_exit_handlers` - the "static program cannot
+        // return from main" defect this kernel had, traced through six wrong
+        // hypotheses to this one instruction
+        // (`docs/notes/07-chromium-analysis.md` §4x).
+        regs.rdx = 0;
     }
 
     unsafe fn user_context(frame: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {

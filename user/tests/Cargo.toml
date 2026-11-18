@@ -113,3 +113,6 @@ libc = "0.2"
 [lints]
 workspace = true
 
+[[bin]]
+name = "t-exec-rdx"
+path = "src/bin/t-exec-rdx.rs"

@@ -2316,6 +2316,70 @@ walk is clean, and the death follows the return. That is the thirteenth reading 
 this file to need correction, and the first that was corrected *by* the capability
 the pass before it added.
 
+## 4x. FIXED: `execve` did not zero `%rdx`, and that is the whole static-exit defect
+
+The investigation that began at §4e with "a static glibc program segfaults
+returning from `main`" ends here, and it ends at **one instruction**.
+
+**The measurement.** A 38-byte assembly `_start` that writes the eight bytes of
+its incoming `%rdx` to fd 1 and exits:
+
+```
+guest:  00000000  28 76 d7 40 9c 7e 00 00      -> %rdx = 0x7e9c40d77628
+Linux 7.3.4:                                    -> %rdx = 0x0
+```
+
+**The chain, and every link is now measured**:
+
+1. Linux's `execve` contract defines exactly two registers on entry to the new
+   program: `%rsp`, and `%rdx` = the dynamic loader's finaliser, **zero when there
+   is no dynamic linker**.
+2. glibc's `_start` does `mov %rdx,%r9` and passes it to `__libc_start_main` as
+   `rtld_fini` (verified in the binary: `0x402e46`, and `0x405c5e` reads the
+   saved copy before `call __cxa_atexit`).
+3. `__cxa_atexit` registers it, so it becomes an **exit handler**.
+4. At exit, `__run_exit_handlers` **calls** it - and what the register held is a
+   leftover pointer, not a function. Watched at registration:
+
+```
+REGISTER #0: fn(rbx)=0x3fcb4ba8 dso(r12)=0 arg(r13)=0xc   <- the bad one
+REGISTER #1: fn(rbx)=0x402f80 dso(r12)=0 arg(r13)=0xc     <- call_fini, correct
+```
+
+`__internal_atexit`'s caller is `0x405c6e` inside `__libc_start_main`, and it is
+`__cxa_atexit(saved_r9, 0, 0)` - the `rtld_fini` slot.
+
+**The fix** is one line in `set_exec_return` (`arch/src/arch/x86_64/syscall.rs`):
+`regs.rdx = 0`. That function already rewrote the frame's `rcx` (the entry) and
+`user_rsp`; `%rdx` was the register the ABI also pins, and it was left carrying
+whatever the pre-exec call had in it.
+
+**Verified on the machine**, the three programs that used to exit `139`:
+
+```
+rdx at _start: 00 00 00 00 00 00 00 00
+m3 (bare return):    rc=0
+m  (printf, return): hello   rc=0
+d  (atexit handler): HANDLER RAN   rc=0
+```
+
+**Pinned** by `t-exec-rdx`, which builds a 38-byte ELF in `/tmp` (hand-assembled
+so the guest needs no compiler), forks it with a pipe on stdout, and asserts the
+eight bytes are zero. **Counterfactual**: commenting out the one line reddens
+exactly that claim with `got 0x3fdcce68` and leaves the neighbour green.
+
+**And the accounting this file owes a reader**: this took thirteen wrong readings
+to reach - a `>=` break condition, reads taken before the instruction, three
+struct-offset guesses, a 60-step sampling, ptrace's `-1` read as data, a wrong
+`.bss` clobber model, a wrong `IRELATIVE` implementation, a wrong recursion model,
+a broken breakpoint restore, and two "the fault is inside X" claims that the next
+pass overturned. **All thirteen were the instrument or the model, none was the
+kernel** - and the defect itself, when it came, was a single register the ABI
+pins and the loader did not write.
+
+The `fault_stop` capability §4u named, and that §4v added, is what made the last
+step possible: without a tracer that can see a fault, the bad value is invisible.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
