@@ -20,6 +20,17 @@
 //! register at the **first instruction** and a libc would clobber it before any
 //! of its own code could report it. It writes the eight bytes of `%rdx` to
 //! stdout and exits 0; the parent reads them back and compares.
+//!
+//! # The second machine
+//!
+//! aarch64 has **no `rtld_fini` register**: `_start` receives `argc` in `x0`, and
+//! the ABI pins nothing else. The same *class* of question still applies - does a
+//! fresh `execve` leave the frame with only the registers the ABI defines, or
+//! with whatever the pre-exec call had in the others - but the answer is not a
+//! single-magic-register claim, and the fixture's hand-built ELF is x86_64 machine
+//! code. So the exact `%rdx == 0` claim is x86_64's, this test builds and runs on
+//! both, and the second machine reports it as **skipped** rather than passing a
+//! claim it did not check (`tests.toml`'s `[aarch64] gaps`).
 
 use mpos_user_tests::Report;
 
@@ -57,6 +68,19 @@ const PROBE: &[u8] = &[
 fn main() {
     println!("t-exec-rdx");
     let mut r = Report::new();
+
+    // The claim below is x86_64's `%rdx`; see the module doc. The program still
+    // runs on the second machine so the group decision in `tests.toml` and this
+    // file's own build stay honest, and says so rather than reporting a pass.
+    if !cfg!(target_arch = "x86_64") {
+        // `Report` has no "skipped" - a program that claims nothing prints PASS,
+        // which would be a claim it did not check. This machine is named in
+        // `tests.toml`'s `[aarch64] gaps`, so a sweep should never reach here;
+        // if one does, the message says what happened and the exit status is a
+        // deliberate failure rather than a silent pass.
+        println!("FAIL: this claim is x86_64's and this machine ran it anyway");
+        std::process::exit(1);
+    }
 
     // A scratch directory this program owns, so two concurrent lanes cannot
     // collide on the probe's name.

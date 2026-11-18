@@ -222,4 +222,4 @@ diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 #                 builds on both machines and says "skipped" on the second.
 
 [aarch64]
-gaps = ["t-arch-prctl", "t-trap-signal", "t-fault-at-trap", "t-trap-at-trap"]
+gaps = ["t-arch-prctl", "t-trap-signal", "t-fault-at-trap", "t-trap-at-trap", "t-exec-rdx"]
