@@ -2380,6 +2380,55 @@ pins and the loader did not write.
 The `fault_stop` capability §4u named, and that §4v added, is what made the last
 step possible: without a tracer that can see a fault, the bad value is invisible.
 
+## 4y. Re-measured on the fixed kernel: Chromium's stderr is clean, and the trap site is confirmed
+
+With `%rdx` fixed (§4x), the same headless run against the installed image:
+
+```
+=== ve=4513 vo=0 ===
+--- CHECK/FATAL ---   (none)
+last lines:
+  crashpad file_io_posix.cc:145  open /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq: ENOENT
+  crashpad file_io_posix.cc:145  open /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq: ENOENT
+```
+
+That is a **new baseline**: no `CHECK`, no `FATAL`, and - for the first time in
+this file - **no `ptrace` error at all**. Every crashpad complaint that earlier
+passes chased (`EIO`, `no module mappings`, `Unexpected registers size`,
+`No such process` storms, `Couldn't initialize main thread`) is gone. What remains
+is a sysfs file this kernel does not have, which is the honest `ENOENT`.
+
+**And the `traps:` line now names a site without any base arithmetic.** Two child
+threads died at the *same* module offset:
+
+```
+traps: chromium[720] breakpoint ip:7d2b2d4f5127 ... in /usr/lib/chromium/chromium[9da2127,...]
+traps: chromium[721] breakpoint ip:7ca006f74127 ... in /usr/lib/chromium/chromium[9da2127,...]
+```
+
+`0x9da2127` is a *mapping* offset, and with the executable LOAD's page-aligned
+`p_offset` (`0x1e64000`) the file offset is `0xbc06127` - whose bytes are
+
+```
+0bc06123: cc          int3
+0bc06124: 0f 0b       ud2
+0bc06126: cc          int3
+0bc06127: 0f 0b       ud2
+```
+
+**exactly Chromium's `IMMEDIATE_CRASH()` idiom**, and the same instruction class
+§3s identified by hand. So the crash has not moved; what changed is that the
+kernel reports it correctly on the first try.
+
+**What this does and does not change about the Chromium question.** The kernel's
+part of the chain now has *no* measurable defect left in it: the static-exit bug
+that produced a storm of child deaths is fixed, crashpad's own calls all answer
+correctly, and the surviving fault is the program's own `CHECK` at a named
+instruction. The stderr still freezes and `--dump-dom` still yields 0 bytes, so
+the browser still does not render - and the one instrument that would read *why*
+is a crash handler that can inspect the CHECK's message, which is the `sized`
+capability §4v's `fault_stop` now makes possible for the first time.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
