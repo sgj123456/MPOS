@@ -1333,6 +1333,52 @@ fixture, stepping and reading `rip` after each - and that fixture has to run on
 both machines, whose step bits differ. The mechanism is in and the full gate is
 green with it; the contract is not yet asserted.
 
+## 4g. Two probe bugs, one real finding, and one still-open stop
+
+§4f said "no `.init_array` constructor ever runs" from a trace, and §4e before it
+said the pointer guard was zero. **Both readings were artifacts of the probes**,
+and this section is the correction, because in this repository a wrong reading
+written down is worse than no reading.
+
+1. **The loop's break condition was wrong.** `bp9`/`bp10` broke on
+   `rip >= 0x406552`, but `_dl_aux_init` lives at `0x41c560` - **above** that
+   address - so the "we reached the faulting call" line fired on the *first*
+   entry into `_dl_aux_init`, after 107 steps, and every "visited: all false"
+   reading was the probe stopping early rather than the program skipping code.
+2. **The reads happened before the instruction executed.** A single-step stop
+   lands *on* the instruction, so reading `_dl_random` at `0x41c636` gives the
+   value from before the store. Read at the *next* instruction (`0x41c63d`) it
+   is right:
+
+```
+i=345 at _dl_aux_init store 0x41c636: rdx=0x3ff92ff0  _dl_random(after)=0
+i=346 AFTER the store (0x41c63d): _dl_random=0x3ff92ff0
+```
+
+So **`_dl_random` is written correctly**, with `AT_RANDOM`'s own address, and
+§4e's "the guard never got filled" was measuring nothing. What survives from
+§4e is the *observation* - a static glibc program segfaults returning from
+`main` (five boots, `rc=139`, `int main(void){return 0;}` is enough) - and the
+`__exit_funcs` node reading four zero words, which is real but is a
+consequence to be explained, not a cause.
+
+**A real defect the probing did find** (and this one is in the kernel): a
+`ptrace` stop whose `Stop::delivering` is `None` leaves the machine's pending
+`SIGTRAP` in the task's signal set, so the tracer's *next* resume delivers it and
+the tracee dies where the tracer meant to continue it. Measured as every probe
+ending `ended sig=5` on its first `PTRACE_CONT`. `step_trap` now sets
+`delivering: Some(SIGTRAP)`; the **exec** stop after `PTRACE_TRACEME` still does
+not, which is why the same symptom survives for a tracer that plants a
+breakpoint in a freshly-exec'd child. That is the next thing to fix, and it has
+nothing to do with Chromium.
+
+**Where the static-exit question stands**: the instrument now works (single-step
+is real, and reads must be taken *after* the instruction), `_dl_random` is
+confirmed correct, and the faulting `call *%rax` in `__run_exit_handlers`
+dispatches through an `__exit_funcs` node that is still zero at that moment. The
+next pass should read the guard and the node **at `0x406552` with after-execution
+timing**, which the two bugs above prevented every earlier attempt from doing.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,

@@ -1021,7 +1021,14 @@ pub fn step_trap(regs: &mut AbiRegs) -> bool {
             traced: true,
             reported: false,
             message: 0,
-            delivering: None,
+            // **`delivering` is what makes the trap stop a stop.** Resume
+            // clears the *delivered* signal from the pending set, and it only
+            // knows which one from this field: a single-step stop whose
+            // `delivering` was `None` left the machine's `SIGTRAP` pending, so
+            // the very next resume delivered it and the tracee died where the
+            // tracer meant to continue it (measured: every `bp1x` probe ended
+            // `ended sig=5` on its first `CONT`).
+            delivering: Some(signal::SIGTRAP),
             syscall: None,
             group: false,
             listening: false,

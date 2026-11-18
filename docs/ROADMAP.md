@@ -1390,8 +1390,12 @@ that will find it now exists: `PTRACE_SINGLESTEP` ran no instruction until
 2026-11-18 (it was answered as `SYSCALL`, so a probe "stepping" 300 000 times
 reported one `rip`), and with it working the trace shows **no `.init_array`
 constructor ever runs** (`rip` never leaves `[0x402e40..0x41c560]`), which is why
-the pointer guard and the exit-function list are still zero. The PTR_MANGLE
-reading in §4e was a symptom.
+the pointer guard and the exit-function list are still zero. §4g then shows that
+claim was a **probe artifact** too (a `rip >= 0x406552` break condition matched
+`_dl_aux_init` at `0x41c560`, and reads were taken before the instruction ran):
+`_dl_random` is in fact written correctly. Two genuine defects fell out of that
+work - `PTRACE_SINGLESTEP` ran no instruction at all, and a `ptrace` stop with no
+`delivering` leaves its `SIGTRAP` pending so the next resume kills the tracee.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not
