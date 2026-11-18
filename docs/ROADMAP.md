@@ -1421,6 +1421,38 @@ keeps the fault's own `si_code`/`si_addr` instead of overwriting it with
 `SI_USER`. Pin: `t-ptrace-fault-stop`'s last two claims (a third child, a handler
 that repairs the page, `_exit(7)` on one resume), green on both arms.
 
+**The zygote crash is FIXED, and it was `st_nlink`** (2026-11-18, §4aa): every
+Chromium child died of `IMMEDIATE_CRASH` at the same instruction, and reading that
+instruction against the binary showed it is not a `CHECK` - Chromium **stats
+`self/task/` and crashes on purpose when `st_nlink <= 2`**, because a task
+directory with no tasks is an impossible kernel (`0xbc0709c` `cmp $0x2,%rbx` /
+`0xbc070a0` `jbe` into `int3;ud2`). This kernel answered the flat `2` that any
+untracked directory falls back to, because procfs overrode `nlink` **nowhere**.
+Linux's rule measured on the host: `2 + real subdirectories` for every ordinary
+directory - which is what makes `task/` `2 + tasks`, not a rule of its own - and a
+constant `1` for `/proc/sys` and everything beneath it. Both are implemented now
+(`ProcDir`'s `links: Links` in `src/vfs/procfs.rs`, `SysDir::nlink` in
+`src/vfs/sysfs.rs`), the `/proc` root is left on the fallback and named as a gap
+because its count follows the process table *and* ~400 links no formula fitted.
+Pins: `a_proc_directories_nlink_counts_its_subdirectories` (host) and
+`t-proc-nlink` (guest, `task/` `3 -> 5 -> 3` with `pthread_create`/join while the
+same process's `fd/` stays `2`). **The zygotes no longer die**: the browser now
+stays alive for 150 s of a sampled run where it used to vanish before 45, stderr
+drops from 4513 to 2423 bytes, and the remaining fault is §3a's own shape - a
+thread taking `error 14` (a **write**) inside a library's `r-x` mapping - which
+Linux refuses identically and which is this file's item 3, not a syscall gap
+(§4ab). `--dump-dom` is still 0 bytes, but the failure is now a *hang* rather than
+a crash.
+
+**A second instance of the same defect, found by the pin and NAMED** (§4aa):
+**tmpfs/ramfs directories answer `st_nlink = 2` whatever they hold**, because
+`RamDir` (`src/vfs/ramfs.rs:1146`) implements no `nlink` - so `/tmp`, `/run` and
+`/dev/shm` are wrong here where the host answers `3` for a directory with one
+subdirectory. Not fixed in this commit: maintaining `2 + subdirs` on tmpfs means
+five paths (`create`, `mkdir`, `unlink`, `rmdir`, `rename`) each adding or
+dropping one, which is its own change. The rule, the host's answer and the pin's
+first failure are recorded in §4aa so that work starts from a measurement.
+
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not
 a probe; a raw-syscall reader gets `SCHED_OTHER` (§3o, §3q).

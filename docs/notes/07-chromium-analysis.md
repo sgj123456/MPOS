@@ -2554,6 +2554,258 @@ correctness gap in the ptrace surface, not a named Chromium blocker - recorded
 because "nearly right" there is the shape that sends a caller down a path it cannot
 recover from.
 
+## 4aa. FIXED: `/proc/<pid>/task/` answered `st_nlink = 2`, and that is why every zygote died
+
+The `IMMEDIATE_CRASH` §4y located is not a `CHECK` with a message. Read at the
+instruction, it is a **`fstatat` of `self/task/` whose answer the program
+rejects** - and the reject is correct, because the number this kernel gave it
+described an impossible kernel.
+
+### The instruction that fires
+
+`rip` in the `traps:` dump is the `ud2` after the `int3`, and with no tracer
+attached this kernel does not rewind it (the `-1` is gated on `tracing_self()`,
+0d7e65b), so the instruction that actually fired is one byte earlier. Disassembled
+against `build/imgout/chromium.bin` - whose text LOAD carries
+`vaddr = file offset + 0x1000`, so `--start-address` wants **file** offsets:
+
+```
+     bc0701c: mov %fs:0x28,%rax
+     bc07025: mov %rax,-0x10(%rbp)          <- canary stored (a real one)
+     bc0707b: lea -0x9ffd736(%rip),%rsi    # 1c0994c   <- in LOAD0, vaddr==offset
+     bc07082: lea -0xa0(%rbp),%rdx                      <- &statbuf
+     bc07089: xor %ecx,%ecx
+     bc0708b: call *0x5d7e1b7(%rip)        # 11985248   <- fstatat (GLOB_DAT)
+     bc07091: test %eax,%eax ; jne bc07101              <- the call failed
+     bc07095: mov -0x90(%rbp),%rbx          <- statbuf+0x10 == st_nlink
+     bc0709c: cmp $0x2,%rbx
+     bc070a0: jbe bc07126                   <- ** THE FAULTING BRANCH **
+     ...
+     bc070e1: cmp $0x3,%rbx ; sete %al      <- "exactly 3" == "one thread"
+     bc07126: cc          int3              <- fired here (rip reported the ud2)
+     bc07127: 0f 0b       ud2
+```
+
+The path string at vaddr `0x1c0994c` is **`self/task/`**: that vaddr lies in
+LOAD0 (`file 0x0 / vaddr 0x0`), where vaddr *is* the file offset. Applying the
+text LOAD's `-0x1000` instead lands in the neighbouring `.rodata.str1.1` and
+reads `omo_dark.svg`, which is how an earlier reading of this site went wrong
+twice - once by taking the `ud2` for the faulting instruction, once by reading
+the string through the wrong LOAD.
+
+The registers agree with the disassembly rather than with a canary: `rax = 0`
+(the `fstatat` succeeded), `rbx = 2` (the number it got), `rcx = 0` (never
+loaded - `%fs:0x28` is read only on the return path at `bc070e8`, which this
+branch does not take).
+
+**So the program asks "how many tasks does this process have" by statting the
+directory, and crashes on purpose when the answer says "none".**
+
+### What Linux answers, measured
+
+Host, Linux 7.3.4, `os.lstat`:
+
+```
+/proc                  nlink=  400 entries=   63 realdirs=   14
+/proc/sys              nlink=    1 entries=    9 realdirs=   9
+/proc/sys/kernel       nlink=    1 entries=  131 realdirs=    6
+/proc/bus              nlink=    4 entries=    2 realdirs=    2
+/proc/1                nlink=    9 entries=   54 realdirs=    7
+/proc/1/task           nlink=    3 entries=    1 realdirs=    1   threads=1
+/proc/1/task           nlink=    6 entries=    4                    threads=4
+/proc/1/task/1         nlink=    7 entries=   60 realdirs=    5
+/sys                   nlink=   13 entries=   11 realdirs=   11
+/sys/kernel            nlink=   18 entries=   35 realdirs=   16
+```
+
+Three rules, and the one that matters is the ordinary one:
+
+1. **`2 + real subdirectories`** for every directory whose number was measured -
+   which includes `task/`. It is *not* a special thread-count rule: `task/` is
+   `2 + tasks` because a process's tasks *are* its subdirectories. Measured both
+   ways (`threads 1 -> 3`, `4 -> 6`, and back to `3` after joining).
+2. **`1`, constant**, for `/proc/sys` and every directory beneath it -
+   `sys`, `sys/kernel`, `sys/kernel/random`, `sys/kernel/pty`, `sys/net`,
+   `sys/net/ipv4`, `sys/net/ipv4/conf`, `sys/net/ipv4/conf/all`, `sys/fs`,
+   `sys/vm` alike, while `/proc/sysvipc` beside them answers `2`. `stat -f`
+   says both are the same `proc` filesystem, so this is a per-inode rule and
+   not a separate mount.
+3. **`/proc` root fits none of them**, and is deliberately not fixed. It follows
+   the process table (`403 -> 407` with four children, back after reaping) *and*
+   roughly 400 links nothing accounted for: `2 + direct subdirs` = 16,
+   `2 + recursive dirs` = 339, `2 + direct dirs + their surplus` = 125,
+   `2 + Σ(recursive nlink - 2)` = 238, `2 + all recursive entries` = 3022. A
+   guessed number there would be worse than the honest fallback, so `/proc`
+   keeps the trait's `0` (which the `stat` writer reads as a directory's `2`) and
+   is a **named gap**.
+
+### What this kernel answered
+
+One boot, `busybox stat -c '%h'`, **before** the fix:
+
+```
+/proc/1/task      nlink=2      <- Linux 3   ** the Chromium crash **
+/proc/self/task   nlink=2      <- Linux 3   ** the Chromium crash **
+/proc             nlink=2      <- Linux 400
+/proc/1           nlink=2      <- Linux 9
+/proc/sys         nlink=2      <- Linux 1   (wrong in the OTHER direction)
+/sys              nlink=2      <- Linux 13
+/sys/kernel       nlink=2      <- Linux 18
+```
+
+`2` is what an **untracked** directory falls back to (`nlink_of` in
+`src/syscall/linux/abi.rs`: `tracked` if non-zero, else `2` for a directory),
+and procfs overrode `nlink` **nowhere** - so every directory in both synthetic
+trees answered the same flat two, as an empty tmpfs directory does.
+
+### The fix
+
+`Inode::nlink` is overridden where the count is a fact about the tree, with the
+rule recorded **on the directory** rather than derived from its contents,
+because two directories of the same shape disagree (`/proc/bus` is `2 + its one
+subdirectory`, `/proc/sys` is `1` however many it holds):
+
+- `src/vfs/procfs.rs` - `ProcDir` gained `links: Links`, with
+  `Links::{Children, One, Untracked}` and a doc comment per variant carrying the
+  measurement; `nlink()` answers `2 + Dir-kind entries` from `read_dir()` (which
+  already merges the fixed entries with the live ones, de-duplicates and sorts -
+  the same door `size_is_count` already used), `1` for `One`, and the trait's `0`
+  for `Untracked`. `sys_dir()` is the constructor for the whole `/proc/sys`
+  subtree; `ProcFs::new` marks the root `Untracked`.
+- `src/vfs/sysfs.rs` - `SysDir::nlink()` answers the same `2 + Dir-kind entries`,
+  because `/sys` and `/sys/kernel` were wrong for the same reason.
+
+`Metadata` deliberately did **not** grow a field: it is documented as the ABI's
+shape, and adding one would touch every filesystem for a number only two keep.
+
+### Re-measured, same boot after the fix
+
+```
+/proc/1/task      nlink=3   entries=1     <- Linux 3, and the number Chromium reads
+/proc/1/task/1    nlink=5   entries=17    <- 2 + 3 subdirs (this tree has fd/fdinfo/ns)
+/proc/1           nlink=6   entries=36    <- 2 + 4 subdirs
+/proc/1/fd        nlink=2                 <- unchanged, correctly
+/proc/1/ns        nlink=2
+/proc/sys         nlink=1                 <- was 2, wrong in the other direction
+/proc/sys/kernel  nlink=1
+/proc/sys/net     nlink=1
+/proc/sys/net/ipv4 nlink=1
+/proc/sys/fs      nlink=1
+/proc/sys/vm      nlink=1
+/proc/net         nlink=2  /proc/sysvipc nlink=2   <- ordinary rule, as on Linux
+/proc/bus         nlink=3                 <- 2 + pci (Linux 4: it has one more)
+/proc             nlink=2                 <- the named gap, unchanged
+/sys              nlink=9                 <- 2 + 7 subdirs this tree has
+/sys/kernel       nlink=2                 <- 2 + 0 subdirs this tree has
+```
+
+The absolute numbers differ from the host where the *trees* differ - this kernel
+has no `/proc/fs`, no `/proc/irq`, four subdirectories under a pid where Linux
+has seven - and the rule is what is claimed, not the constant.
+
+### What it changes about Chromium
+
+**The zygotes stop dying, and the browser runs where it used to vanish**: see
+§4ab for the sampled run. What was the first blocker is no longer one; the fault
+that remains is §3a's libdbus/libnss3 `r-x` self-write, which Linux refuses
+identically - a loader/package question, not a `st_nlink` one. `--dump-dom` is
+still 0 bytes, and the failure is now a hang rather than a crash.
+
+### The pin
+
+- Host: `vfs::procfs::tests::a_proc_directories_nlink_counts_its_subdirectories` -
+  the three rules, each as a **movement** (a file must not move the count, a
+  subdirectory must; `/proc/sys` must stay `1` beside an identically-shaped
+  ordinary directory that answers `3`; the root must answer `0` rather than a
+  number it invented).
+- Guest: `user/tests/src/bin/t-proc-nlink.rs` - `task/` is `3`, two threads make
+  it `5`, joining brings it back to `3`; the same process's `fd/` stays `2`
+  throughout (a `2 + entries` implementation counts files and answers tens); the
+  `/proc/sys` subtree is `1` while `/proc/bus` is not; `fstatat(dirfd, "task/")`
+  - the exact door Chromium uses - answers the same; and a scratch directory of
+  the program's own keeps the ordinary rule, which is the claim that catches a
+  *global* change to the directory fallback.
+
+**Counterfactual**: restoring `fn nlink(&self) -> u64 { 0 }` on `ProcDir` (the
+trait default, i.e. the flat `2`) reddens the `task/` claims and the `/proc/sys`
+claims while leaving `fd/` and the scratch-directory control green.
+
+### A second instance of the same defect, found by the pin and NAMED
+
+The pin's first draft used a scratch directory of its own as the control - "an
+empty ramfs directory is `2`, one subdirectory makes it `3`", the rule everyone
+knows. It failed: **this kernel answers `2` there too.** `RamDir`
+(`src/vfs/ramfs.rs:1146`) implements no `nlink` at all, so a tmpfs mount - which
+is what `/tmp`, `/run` and `/dev/shm` are here - reports the same flat `2` for
+every directory, and the host answers `3` for a directory holding one.
+
+That is a second instance of §4aa's defect in a *third* filesystem, and it is
+**not fixed here**: ramfs's link bookkeeping is a different question from procfs's
+(its `counts_its_names!` macro counts names on files, and a directory would need
+`2 + subdirs` maintained across `create`, `mkdir`, `unlink`, `rmdir`, `rename` and
+`link` - five paths, each of which can add or drop a subdirectory). What the pin
+now claims instead is a *relationship* it can state without that work:
+`/proc/<pid>` holds 36 entries of which 4 are directories (its `exe`/`cwd`/`root`
+siblings are links, which a `metadata()`-following count would miscount as
+directories - this pin's own first version did, reading 6 where the answer is 4),
+and it answers `2 + 4`. An implementation that counted entries would answer 38.
+
+**Named, with its measurement**, in the shape AGENTS.md §3 rule 5 asks for: the
+next person to fix tmpfs `st_nlink` has the rule, the host's answer, the five code
+paths, and this pin's failure as the counterfactual.
+
+**A pin that was never running, found on the way.** `a_proc_nodes_own_mode_follows_its_shape`
+in `src/vfs/procfs.rs` was written without a `#[test]` attribute in 2b4693a
+(2026-10-17) and had never executed: the compiler called it dead and the suite
+reported one fewer test. The attribute is restored in the same commit, so the
+three words it asserts are pinned now rather than claimed in a commit message.
+
+## 4ab. Re-measured after §4aa: the browser survives, and the remaining fault is the §3a shape
+
+With `st_nlink` fixed, the same headless run (`--dump-dom about:blank`, sampling every
+15 s):
+
+```
+=== DOM3 START ===
+  t=15s alive=A dom_bytes=0 procs=18
+inotify_reader[715]: segfault at 7e4272513134 ip 00007e4272513134 sp 3fdb6048
+  error 14 in /usr/lib/libdbus-1.so.3[1e134,7e42724f5000+25000]
+PFDIAG page=0x7e4272513000 pte=0x3f9e7025 P=1 W=0 U=1
+PFDIAG vma=0xd (r-xu) kind=object(private)
+  t=30s alive=A dom_bytes=0 procs=20
+  ... (nothing sampled in between) ...
+  t=150s alive=A dom_bytes=0 procs=19
+=== ve=2423 vo=0 ===
+--- CHECK/FATAL ---   (none)
+```
+
+**Three things changed, and one did not.** The browser process is `alive=A` at every
+sample for 150 s - it used to be gone before 45 s (§3j/§3k's freeze was the shell
+waiting on a process that had already died). Both zygotes live. `CHECK`/`FATAL` is
+zero and stderr is 2423 bytes, *smaller* than §4y's 4513: the two zygote crash
+dumps are no longer written. What did not change is `--dump-dom`: 0 bytes.
+
+**The fault that remains is §3a's, not a new one.** `error 14` is `P=1` (a
+protection violation on a page that *is* present) `W=1` (a **write**) `U=1`, inside
+a VMA this kernel describes as `r-x` private - a thread writing its library's own
+text. §3a recorded exactly this for the same library; §4y's run had the same fault
+under a different address. (A `libnss3.so` instance of it appeared in a shorter
+run, §4aa's text; both are the same class, and which library takes it first is a
+scheduling matter.) **On a current host Linux refuses that write the same way**, so
+the fault is the correct answer and this is not a syscall gap: a library writing
+its own text means a relocation the loader mishandled or a `TEXTREL` the package
+should not carry, which is this file's item 3 and still open.
+
+**What this does and does not establish.** The `st_nlink` fix removed the first
+blocker and moved the failure past the point every earlier run stopped at; the
+browser now runs long enough to reach the D-Bus/inotify work that faults. Whether
+the DOM would ever be produced with that fault fixed is **unmeasured** - the run
+ends at the 150 s budget with the process still alive and no output, so it is a
+*hang* rather than a crash now, and a hang has no stack to read. The next
+instrument is a `--dump-dom` run with `--enable-logging=stderr --v=1` past the
+same point, plus the §3k multi-thread `r-x` probe re-run against the fixed kernel -
+neither of which is Chromium's `st_nlink` question.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,

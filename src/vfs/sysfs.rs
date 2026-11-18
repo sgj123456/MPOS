@@ -126,6 +126,24 @@ impl Inode for SysDir {
         Ok(())
     }
 
+    /// What Linux answers for `st_nlink`: two (`.` and `..`) plus one per real
+    /// subdirectory, the same rule procfs follows for its ordinary directories
+    /// (`docs/notes/` §4aa). Measured on the host for the two that have any:
+    /// `/sys` is `13` (`2 + 11` subdirectories) and `/sys/kernel` is `18`
+    /// (`2 + 16`), while this tree answered the flat `2` every directory got
+    /// before it kept the count.
+    fn nlink(&self) -> u64 {
+        2 + self
+            .read_dir()
+            .map(|listed| {
+                listed
+                    .iter()
+                    .filter(|(_, kind)| *kind == NodeKind::Dir)
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,

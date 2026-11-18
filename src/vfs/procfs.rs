@@ -1140,6 +1140,51 @@ struct ProcDir {
     /// rather than "has generated children", because `/proc` itself has those
     /// and is not a mirror.
     mirror: bool,
+    /// What `st_nlink` answers here: see [`Links`].
+    links: Links,
+}
+
+/// What a proc directory answers for `st_nlink`.
+///
+/// Three rules, each measured on Linux 7.3.4 (`docs/notes/` §4aa). They are a
+/// field rather than something derived from the tree's shape because two
+/// directories with the same shape answer differently - `/proc/bus` reports
+/// `2 + its one subdirectory` while `/proc/sys` reports `1` however many it
+/// holds - so the rule is a property of the directory, not of its contents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Links {
+    /// Two (`.` and `..`) plus one per real subdirectory listed. This is the
+    /// rule for every directory in this tree whose number was measured:
+    /// `/proc/<pid>` (`2 + 7 = 9`), `/proc/<pid>/task` (`2 + tasks`, so `3`
+    /// for a single-threaded process and `n + 3` for one with `n` extra
+    /// threads), `/proc/<pid>/task/<tid>` (`2 + 5 = 7`), `/proc/bus`
+    /// (`2 + 1 = 4`), and the empty ones (`/proc/<pid>/fd`, `/ns` = `2`).
+    ///
+    /// The `task` directory falling out of the *same* rule as the rest is the
+    /// finding that mattered: Chromium asks `fstatat(2)` for `self/task/` and
+    /// treats `st_nlink <= 2` as "a task directory with no tasks" - an
+    /// impossible kernel - then crashes with its own `IMMEDIATE_CRASH`. This
+    /// kernel answered the flat `2` any untracked directory gets, so every
+    /// zygote died on startup (`docs/notes/` §4aa; the crash site is
+    /// `0xbc070a0` in `build/imgout/chromium.bin`).
+    Children,
+    /// One, whatever the directory holds. `/proc/sys` and every directory
+    /// beneath it: measured `1` for `sys`, `sys/kernel`, `sys/kernel/random`,
+    /// `sys/kernel/pty`, `sys/net`, `sys/net/ipv4`, `sys/net/ipv4/conf`,
+    /// `sys/net/ipv4/conf/all`, `sys/fs` and `sys/vm` alike, while `sysvipc`
+    /// beside them follows [`Links::Children`].
+    One,
+    /// This tree does not answer here: it keeps the trait's `0`, which the
+    /// `stat` writer reads as the kind's own fallback (a directory's two).
+    /// `/proc` itself is the one such directory. Linux derives its count from
+    /// the whole process table (measured `405 -> 408` when three `sleep`
+    /// children were started, and back when they were reaped), and no formula
+    /// fitted the rest of it (`2 + direct subdirs` = 16, `2 + recursive dirs`
+    /// = 339, `2 + direct dirs + their own surplus` = 125, against a measured
+    /// 400). It is not on Chromium's path, and a guessed number there would be
+    /// worse than the honest fallback, so it is named as a gap in
+    /// `docs/notes/` §4aa rather than approximated.
+    Untracked,
 }
 
 impl ProcDir {
@@ -1167,6 +1212,7 @@ impl ProcDir {
             mode,
             size_is_count,
             mirror: false,
+            links: Links::Children,
             owner: Inherited::new(),
             process: Mutex::new(RefCell::new(None)),
         })
@@ -1230,6 +1276,36 @@ impl Inode for ProcDir {
         // has no `setattr` either, and answers `EPERM` to root for the
         // same call (`docs/notes/` §3.17, item 138).
         true
+    }
+
+    /// What Linux answers for `st_nlink`, by the rule this directory was made
+    /// with: see [`Links`]. Measured rather than derived from the tree, because
+    /// two directories of the same shape disagree - `/proc/bus` is `2 + its one
+    /// subdirectory` and `/proc/sys` is `1` however many it holds.
+    ///
+    /// This is the number Chromium's zygote reads: it stats `self/task/` and
+    /// treats `<= 2` as a task directory with no tasks, which is impossible, so
+    /// it crashes on purpose. Answering the trait's `0` (the fallback any
+    /// untracked directory gets) made every zygote die at startup
+    /// (`docs/notes/` §4aa).
+    fn nlink(&self) -> u64 {
+        match self.links {
+            Links::Children => {
+                2 + self
+                    .read_dir()
+                    .map(|listed| {
+                        listed
+                            .iter()
+                            .filter(|(_, kind)| *kind == NodeKind::Dir)
+                            .count() as u64
+                    })
+                    .unwrap_or(0)
+            }
+            Links::One => 1,
+            // The trait's own "this filesystem does not track the count",
+            // which the `stat` writer turns into the kind's convention.
+            Links::Untracked => 0,
+        }
     }
 
     fn metadata(&self) -> Metadata {
@@ -1679,6 +1755,16 @@ fn fd_link(
 /// A directory of fixed entries.
 fn dir() -> Arc<ProcDir> {
     ProcDir::new(None)
+}
+
+/// A directory of fixed entries that answers `st_nlink` the way `/proc/sys`
+/// and everything beneath it does: `1`, whatever it holds. See [`Links::One`].
+fn sys_dir() -> Arc<ProcDir> {
+    let mut node = ProcDir::new(None);
+    if let Some(dir) = Arc::get_mut(&mut node) {
+        dir.links = Links::One;
+    }
+    node
 }
 
 // ---------------------------------------------------------------------------
@@ -6220,9 +6306,15 @@ pub struct ProcFs {
 
 impl ProcFs {
     pub fn new() -> Arc<ProcFs> {
-        let fs = Arc::new(ProcFs {
-            root: ProcDir::new(Some(Arc::new(Processes))),
-        });
+        // `/proc` itself is the one directory whose `st_nlink` this tree does
+        // not answer: Linux derives it from the process table *and* from
+        // something else no measurement fitted (`docs/notes/` §4aa), so it
+        // keeps the trait's fallback rather than a guessed number.
+        let mut root = ProcDir::new(Some(Arc::new(Processes)));
+        if let Some(dir) = Arc::get_mut(&mut root) {
+            dir.links = Links::Untracked;
+        }
+        let fs = Arc::new(ProcFs { root });
         fs.build();
         fs
     }
@@ -6424,8 +6516,8 @@ impl ProcFs {
         // `sysctl` service writes into it at boot - a tree that is absent is
         // a service that fails on every entry in /etc/sysctl.conf, not one
         // that quietly does nothing.
-        let sys = dir();
-        let kernel = dir();
+        let sys = sys_dir();
+        let kernel = sys_dir();
         // The three `uname` answers that live here rather than in /proc: a
         // program asking what it is running on reads these, and they have to
         // agree with what `uname(2)` said or the two disagree about the
@@ -6524,7 +6616,7 @@ impl ProcFs {
         // resolution does not follow symlinks in the sticky-world-writable
         // sense these knobs toggle, so the defaults are reported and writes
         // accepted, but nothing re-checks on the kernel's side.
-        let fs_knobs = dir();
+        let fs_knobs = sys_dir();
         fs_knobs.add("protected_hardlinks", NodeKind::File, stub("1"));
         fs_knobs.add("protected_symlinks", NodeKind::File, stub("1"));
         // `/proc/sys/fs/inotify`: the three ceilings the `inotify` code
@@ -6541,7 +6633,7 @@ impl ProcFs {
         // named rather than hidden: Linux counts watches per *user*, this
         // kernel per descriptor, because the machine has one user.
         fs_knobs.add("inotify", NodeKind::Dir, {
-            let inotify = dir();
+            let inotify = sys_dir();
             inotify.add(
                 "max_queued_events",
                 NodeKind::File,
@@ -6580,7 +6672,7 @@ impl ProcFs {
         // under `/proc/sys/vm` exists here yet, and an absent file answers
         // `ENOENT` - which is what Linux's own answer is for a knob a kernel
         // does not carry.
-        let vm = dir();
+        let vm = sys_dir();
         vm.add(
             "max_map_count",
             NodeKind::File,
@@ -6682,7 +6774,7 @@ impl ProcFs {
 /// ceiling, since a pty is driven by whoever opened it - and `nr` counts the
 /// descriptors devpts has handed out.
 fn pty_dir() -> Arc<ProcDir> {
-    let pty = dir();
+    let pty = sys_dir();
     pty.add(
         "max",
         NodeKind::File,
@@ -6707,7 +6799,7 @@ fn pty_dir() -> Arc<ProcDir> {
 /// present and nothing if not), `urandom_min_res_cov` as the creditable
 /// fraction, and `boot_id` as one UUID per boot.
 fn random_dir() -> Arc<ProcDir> {
-    let random = dir();
+    let random = sys_dir();
     random.add("poolsize", NodeKind::File, file(|| String::from("4096\n")));
     random.add(
         "urandom_min_res_cov",
@@ -6761,9 +6853,9 @@ static BOOT_ID: Mutex<RefCell<Option<String>>> = Mutex::new(RefCell::new(None));
 /// does anything else here.
 fn sysnet_dir() -> Arc<ProcDir> {
     fn conf_dir(keys: &[(&str, &'static str)]) -> Arc<ProcDir> {
-        let conf = dir();
+        let conf = sys_dir();
         for iface in ["all", "default"] {
-            let entry = dir();
+            let entry = sys_dir();
             for (name, value) in keys {
                 entry.add(name, NodeKind::File, stub(value));
             }
@@ -6772,8 +6864,8 @@ fn sysnet_dir() -> Arc<ProcDir> {
         conf
     }
 
-    let net = dir();
-    let ipv4 = dir();
+    let net = sys_dir();
+    let ipv4 = sys_dir();
     ipv4.add("tcp_syncookies", NodeKind::File, stub("1"));
     ipv4.add("tcp_rfc1337", NodeKind::File, stub("0"));
     // Linux's default is the empty range `1 0` - no group may ping.
@@ -6788,7 +6880,7 @@ fn sysnet_dir() -> Arc<ProcDir> {
             ("accept_source_route", "0"),
         ]),
     );
-    let ipv6 = dir();
+    let ipv6 = sys_dir();
     ipv6.add(
         "conf",
         NodeKind::Dir,
@@ -7953,6 +8045,15 @@ mod tests {
         );
     }
 
+    /// The word a node reports is a promise about who may touch it, so the
+    /// tree's own words are pinned here rather than left to the kind's
+    /// defaults.
+    ///
+    /// This function sat without its `#[test]` attribute from 2b4693a
+    /// (2026-10-17) until 2026-11-18: the compiler called it dead and the suite
+    /// never ran it, so the three words it asserts had no pin at all while the
+    /// commit that added it claimed one.
+    #[test]
     fn a_proc_nodes_own_mode_follows_its_shape() {
         // A directory in the tree is `0555`, not the kind's `0755`; the two
         // whose own word is narrower are `/proc/<pid>/fd` and
@@ -7973,6 +8074,67 @@ mod tests {
         // reports another process's activity. Measured (`build/scratch/pidio/perm.c`):
         // `/proc/1/io` read by uid 1000 is `EACCES`.
         assert_eq!(owner_file(|| None).mode(), 0o400);
+    }
+
+    /// `st_nlink` is the one number in `/proc` that a program reads as a *fact
+    /// about the tree's shape*, and the tree was answering the flat `2` every
+    /// untracked directory gets. Chromium's zygote dies of it: it stats
+    /// `self/task/` and crashes on purpose when the answer is `<= 2`, because a
+    /// task directory with no tasks is an impossible kernel (`docs/notes/`
+    /// §4aa; the crash site is `0xbc070a0` in `build/imgout/chromium.bin`).
+    ///
+    /// The host build is enough to pin two of the three rules - `thread_ids`
+    /// answers an empty `Vec` here, so the `task/` count it feeds is the guest's
+    /// claim, not this one. What these assertions hold is the *rule*: `2 +` the
+    /// real subdirectories, and `/proc/sys`'s constant `1` - which is why both
+    /// are stated as movements (a file must not move it, a directory must) and
+    /// not as constants a wrong implementation could still stumble onto.
+    #[test]
+    fn a_proc_directories_nlink_counts_its_subdirectories() {
+        let links = |node: &Arc<ProcDir>| node.nlink();
+
+        // Empty: the two names every directory has.
+        assert_eq!(links(&dir()), 2, "an empty directory is `.' and `..'");
+
+        // A file is not a link into a directory; a subdirectory is.
+        let children = dir();
+        children.add("stat", NodeKind::File, file(|| String::new()));
+        assert_eq!(links(&children), 2, "a file moves no link count");
+        children.add("task", NodeKind::Dir, dir());
+        assert_eq!(links(&children), 3, "one subdirectory is one link");
+        children.add("fd", NodeKind::Dir, dir());
+        children.add("ns", NodeKind::Dir, dir());
+        assert_eq!(links(&children), 5, "three subdirectories, three links");
+
+        // `/proc/sys` and everything beneath it answers `1` whatever it holds -
+        // a rule of its own, and the one the tree had wrong in the *other*
+        // direction (it said `2` where Linux says `1`).
+        let sys = sys_dir();
+        assert_eq!(links(&sys), 1, "`/proc/sys` is one link");
+        sys.add("kernel", NodeKind::Dir, sys_dir());
+        sys.add("ostype", NodeKind::File, file(|| String::new()));
+        assert_eq!(links(&sys), 1, "and stays one however much it holds");
+
+        // The two rules are a property of the directory, not of its shape:
+        // these have the same one subdirectory and answer differently.
+        let ordinary = dir();
+        ordinary.add("kernel", NodeKind::Dir, dir());
+        assert_eq!(links(&ordinary), 3);
+        assert_eq!(links(&sys), 1);
+
+        // `/proc` itself keeps the trait's "not tracked here", which the `stat`
+        // writer reads as the kind's fallback: its count is derived from the
+        // process table *and* from something no measurement fitted, so it is a
+        // named gap rather than a guess (`docs/notes/` §4aa).
+        let mut root = ProcDir::new(None);
+        Arc::get_mut(&mut root).unwrap().links = Links::Untracked;
+        root.add("1", NodeKind::Dir, dir());
+        root.add("sys", NodeKind::Dir, sys_dir());
+        assert_eq!(
+            links(&root),
+            0,
+            "the root says it does not track, rather than a number it invented"
+        );
     }
 
     /// The memory files' own `open` is where Linux's two refusals come from, and
