@@ -1654,6 +1654,67 @@ run in this section that mixed a call-site patch with a return-site patch could
 not answer the control-flow question it was built for, and one of them produced
 the wrong "it never returns" reading that §4k was written on.
 
+## 4m. The frame-info registration is called and does not land - the defect is named
+
+§4l asked two questions and both are answered, which closes the search for the
+static-exit fault's *location*:
+
+```
+AT the [rdi] read: rdi=0x49c178  [rdi]=0x5c0000001c
+ENTERED __deregister_frame_info_bases (rdi=0x49c178)
+```
+
+So the `.eh_frame` word is a well-formed CIE length (`0x5c0000001c`), not a
+zeroed hole, and the deregister path **is** entered. Inside it, the first act is
+`btree_remove(&registered_objects, 0x49c178)` at `0x47bf83`, and
+`registered_objects` lives at `0x4c0270` - inside `.bss`, which starts all-zero.
+
+**And that is the defect, measured:**
+
+```
+at exec stop: GOT[0x4b8fc8] = 0x47c990
+frame_dummy:  GOT[0x4b8fc8] = 0x47c990  -> WILL REGISTER
+after frame_dummy: registered_objects head = 0
+```
+
+`frame_dummy` is `.init_array`'s first entry and its whole job is
+`__register_frame_info(0x49c178, &registered_objects_node)`; its gate is the GOT
+slot at `0x4b8fc8`, which holds the function's address (`0x47c990`), so the branch
+is **taken** and the call **is made**. Yet the tree head is still zero afterwards.
+
+So the chain is: the registration call runs and leaves the btree empty → the
+finaliser's `btree_remove` walks a tree that was never populated → `get_pc_range`
+on a null/absent node → `SIGSEGV` in `__deregister_frame_info_bases`. The
+breakpoint at `0x47bf70` proved the entry; the tree being empty is what the
+death follows from.
+
+**Why `__register_frame_info` does not land is now the single open question**, and
+it is narrow: whether the call is entered at all (a breakpoint at `0x47c990`
+answers it), and whether its internal `btree_insert` is reached. `0x47c990`'s
+first acts are a NULL/zero-length guard on `%rdi` (`test %rdi,%rdi`, `mov (%rdi)`
+= `0x5c0000001c`, so non-zero - it does not take the early `ret`) and then the
+node initialisation into `(%rsi)`. A breakpoint on the insert call is the next
+measurement.
+
+**What is now established beyond doubt about this defect**: it is not `AT_RANDOM`,
+not pointer mangling, not `_dl_random`, not `.fini_array` contents, not `_fini`'s
+return, not infinite recursion, and not the `.eh_frame` data being malformed. It
+is a **registration that does not register**, and every earlier story in §4e-§4k
+was a symptom read one layer too high.
+
+**And it is very plausibly not a libc problem at all.** A `.bss` write that does
+not appear to stick is the shape this repository has been bitten by before
+(`docs/notes/` §9.1: a `static` with a zero initializer and no writer lands in
+`.rodata`, and a write to it faults or is lost). `registered_objects` is
+`.bss`-resident and starts zero, and `0x4c0270` sits **past** the point where the
+loader's `.bss` mapping is known to be correct for this image - the exact
+question a static binary with a 0x58e8-byte `.bss` at the end of its last LOAD
+would ask of a kernel that maps `.memsz` correctly or does not.
+
+That is the next thing to test, and it is a kernel measurement, not a libc one:
+write a byte into the last page of this image's `.bss` from userland and read it
+back.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
