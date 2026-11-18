@@ -2254,6 +2254,68 @@ that, which it could not before this pass.
 *capability* rather than a retraction. The tracer can see faults now; every
 earlier reading of this crash was taken from a corpse because it could not.
 
+## 4w. `call_fini` is clean; the first `atexit` entry holds a **stack address**
+
+With §4v's `fault_stop` in, a breakpoint at `call_fini`'s loop body and `_fini`'s
+`ret` produces a complete, trustworthy trace of the finaliser walk
+(`build/scratch/zprobe/{loop2,after}.c`):
+
+```
+LOOP rbx=0x2 -> *(r12+rbx*8)=[0x4b5178] ok=1 0x402dc0
+LOOP rbx=0x1 -> *(r12+rbx*8)=[0x4b5170] ok=1 0x402f00
+_fini ret: rsp=0x3fee9a08 [rsp]=0x406554
+```
+
+Both `.fini_array` entries are read correctly and both are code
+(`0x402dc0`, `0x402f00`); `_fini` returns to exactly `0x406554`. **`call_fini` is
+clean** - it is not where the bad value comes from, and §4w's "the fault is inside
+`call_fini`" is narrowed to "the fault follows it".
+
+**The node right after that return** is where the bad value is:
+
+```
+after call_fini: count 0x1 | entry0 fn 0x1086e7c3289dbf21 | entry1 fn 0x108698e7c0cdbf21
+                 guard 0xdf9088434c33cfe6
+```
+
+Unmangled with the guard read in the same stop:
+
+| slot | mangled | unmangled | verdict |
+|---|---|---|---|
+| `node+0x38` (entry 1) | `0x108698e7c0cdbf21` | **`0x402f80`** | `call_fini` - correct |
+| `node+0x18` (entry 0) | `0x1086e7c3289dbf21` | **`0x3fd25ba8`** | a **stack address**, not code |
+
+So the registration machinery works: both entries carry plausible mangled words
+and the guard unmangles one of them to exactly the function that was registered.
+The **first** entry's function pointer unmangles to a stack address - which is
+precisely the shape the fault has (`rax == rip` on unmapped stack memory), and it
+is the same class of value as the `0x3ff0fba8` in §4v's register dump.
+
+**How the slot is written, read from the binary** (`__internal_atexit`,
+`0x406291`-`0x4062a8`):
+
+```
+xor  __pointer_chk_guard_local,%rbx     ; rbx = fn
+mov  %r13,0x10(%rax)                    ; arg
+rol  $0x11,%rbx                         ; mangle
+mov  %r12,0x18(%rax)                    ; <- +0x18 receives %r12, NOT the fn
+mov  %rbx,0x8(%rax)                     ; <- +0x08 receives the mangled fn
+movq $0x4,(%rax)                        ; flavor
+```
+
+That is glibc's `struct exit_function` as this build lays it out: `flavor@0`,
+`fn@8`, `arg@0x10`, `dso@0x18` - **sixteen bytes per entry from `+0`**, not the
+`+0x10`-relative layout the dispatcher's arithmetic suggested. So the question is
+now sharp and one breakpoint wide: **`__internal_atexit` ran with an `%r12` that
+was a stack address**, or the dispatcher is reading a different slot than
+`__internal_atexit` wrote. Breaking at `0x4062a0` (the `+0x18` store) and at
+`0x406520` (the `ef_at` dispatch) in one run names both.
+
+**And a correction to §4v**: its "the fault is inside `call_fini`" was wrong - the
+walk is clean, and the death follows the return. That is the thirteenth reading in
+this file to need correction, and the first that was corrected *by* the capability
+the pass before it added.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
