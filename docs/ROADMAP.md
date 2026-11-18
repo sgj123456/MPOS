@@ -1368,9 +1368,12 @@ Three items the analysis names are worth doing on their own terms, in this order
    `PTRACE_EVENT_STOP` on both the interrupt stop and an auto-attached child's first stop are
    now pinned by `t-ptrace-seize`. What stays named is `PTRACE_LISTEN`, which needs the seized
    group-stop path to exist first.
-2. The `exec` image's file-backing question (Finding C, fact 2) - a design decision, kept out
-   of the fix commits above. Finding C's defect 1 (the maps device column) is **done**: the
-   column is the mount's `st_dev` and `t-maps-identity` pins it (§4b in the analysis).
+2. **Finding C is closed** (2026-11-18): the maps device column is the mount's `st_dev` (§4b),
+   and the exec image's lines now report their file's own offset/device/inode with the `.bss`
+   tail as a separate file-less line (§4c), pinned by `t-maps-identity` on both arms. What the
+   fix deliberately does **not** do is demand-page the image: the pages are still placed at
+   load, and `ETXTBSY` is not raised for a write-open of a running executable - both named in
+   §4c, neither on Chromium's path.
 
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not

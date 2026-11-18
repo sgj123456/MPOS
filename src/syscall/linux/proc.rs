@@ -4534,11 +4534,47 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
             // Every page is present, so this mapping has no VMA and no fault
             // will ever describe it; it is recorded beside the table so that
             // `/proc/<pid>/maps` can report it - under the name of the file it
-            // was copied from, which is the one thing about it a reader wants.
+            // was copied from, **and with that file's own offset, device and
+            // inode**, which are the columns a reader recovers a file's layout
+            // from.
+            //
+            // The three numbers are not the mapping's paging state, and that is
+            // the point: Linux's `maps` describes where each page's *bytes came
+            // from*, not whether the kernel can page it back. A private copy of
+            // a file still has to name the file, or every tool that attributes
+            // an address to a file and an offset - `pmap`, a crash reporter, a
+            // JIT symboliser - reads offset 0 for every line and attributes
+            // every address to the ELF header (`docs/notes/`
+            // `07-chromium-analysis.md` §4b).
             let name = file
                 .label()
                 .map(|path| alloc::sync::Arc::from(path.as_str()));
-            crate::sched::record_eager_range(base, base + len, mf, name);
+            // The same pair `FilePages`/`MappedInode` report, from the same
+            // door - a device node's own `rdev` first, else the mount table -
+            // so a mapping and `fstat` cannot disagree about which filesystem
+            // holds the bytes.
+            let packed = match file.dev() {
+                Some(dev) => dev,
+                None => match file.label() {
+                    Some(path) => crate::vfs::mount::dev_of_path(&path),
+                    None => crate::vfs::mount::dev_of_inode(&inode),
+                },
+            };
+            let dev = (
+                crate::uevent::major_of(packed),
+                crate::uevent::minor_of(packed),
+            );
+            crate::sched::record_eager_range(
+                base,
+                base + len,
+                mf,
+                name,
+                Some(crate::mm::vma::RangeFile {
+                    offset: offset as u64,
+                    dev,
+                    inode: inode.metadata().ino,
+                }),
+            );
         }
     }
 

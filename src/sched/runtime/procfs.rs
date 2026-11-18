@@ -1071,7 +1071,13 @@ pub struct MapFacts {
 /// VMA cannot say: the mapping has no VMA at all, because every page of it was
 /// read in at `mmap` time and no address in it will ever fault. See
 /// [`MappedRange`].
-pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option<Arc<str>>) {
+pub fn record_eager_range(
+    start: usize,
+    end: usize,
+    prot: MapFlags,
+    name: Option<Arc<str>>,
+    file: Option<crate::mm::vma::RangeFile>,
+) {
     if start >= end {
         return;
     }
@@ -1080,6 +1086,7 @@ pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option
         end,
         prot,
         name,
+        file,
         sealed: false,
         locked: false,
     });

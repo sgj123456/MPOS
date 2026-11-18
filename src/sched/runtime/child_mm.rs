@@ -2387,6 +2387,7 @@ impl Mm {
                         end: start,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });
@@ -2397,6 +2398,7 @@ impl Mm {
                         end: range.end,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });
@@ -2431,6 +2433,7 @@ impl Mm {
                         end: start,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });
@@ -2443,6 +2446,7 @@ impl Mm {
                     end: hi,
                     prot: range.prot,
                     name: range.name.clone(),
+                    file: range.file,
                     sealed: true,
                     locked: range.locked,
                 });
@@ -2453,6 +2457,7 @@ impl Mm {
                         end: range.end,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });
@@ -2583,6 +2588,7 @@ impl Mm {
                         end: start,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });
@@ -2592,6 +2598,7 @@ impl Mm {
                     end: range.end.min(end),
                     prot: range.prot,
                     name: range.name.clone(),
+                    file: range.file,
                     sealed: range.sealed,
                     locked,
                 });
@@ -2601,6 +2608,7 @@ impl Mm {
                         end: range.end,
                         prot: range.prot,
                         name: range.name.clone(),
+                        file: range.file,
                         sealed: range.sealed,
                         locked: range.locked,
                     });

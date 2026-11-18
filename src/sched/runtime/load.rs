@@ -17,7 +17,7 @@ use crate::hal;
 use crate::hal::AddressSpace;
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
-use crate::mm::vma::{ArgBounds, ImageBounds, MappedRange, merge_ranges};
+use crate::mm::vma::{ArgBounds, ImageBounds, MappedRange, RangeFile, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{ARGS_BYTES_MAX, ARGV_MAX};
 use crate::sched::policy::{Priority, TaskId};
@@ -627,6 +627,7 @@ pub(crate) fn load_user(
         name: Some(Arc::from("[stack]")),
         sealed: false,
         locked: false,
+        file: None,
     });
 
     // Control goes to the interpreter when there is one, and to the program
@@ -725,21 +726,60 @@ fn segment_ranges(
     name: Option<&str>,
     ranges: &mut Vec<MappedRange>,
 ) {
+    // The file the image was read from, when there is one. `None` for a spawn
+    // whose source is the bytes themselves (a script's buffer, a host test's
+    // slice), and then every column stays zero.
+    let source = image.source.identity();
     for segment in &image.segments {
         let vaddr = base + segment.vaddr;
         let mut prot = MapFlags::READ | MapFlags::USER;
         prot.insert(segment.flags & (MapFlags::WRITE | MapFlags::EXEC));
+        let start = pframe::align_down(vaddr, PAGE_SIZE);
+        let end = pframe::align_up(vaddr + segment.memsz, PAGE_SIZE);
+        // An empty name is no name: a kernel-started task's `exe` is empty
+        // (there is no path it was run by), and a maps line with an empty
+        // column is not the shape a reader parses.
+        let named = name.filter(|name| !name.is_empty()).map(Arc::from);
+        let file = source.map(|(dev, inode)| RangeFile {
+            // The offset column is the *file* offset this range starts at, and
+            // the page alignment is Linux's own: the range begins at the
+            // segment's `p_offset` rounded down to the page the segment starts
+            // in, which is what `p_vaddr - p_offset` being page-aligned makes
+            // the two alignments the same number.
+            offset: (segment.offset as u64).saturating_sub((vaddr - start) as u64),
+            dev,
+            inode,
+        });
+        // Linux splits a segment's tail: the file bytes and the zero-filled
+        // `.bss` behind them are **two lines**, the second with `00:00 0` and
+        // no name (`build/scratch/execmap/probe6.c` - a segment with `FileSiz
+        // 0x290` and `MemSiz 0x1002b0` prints `rw-p 00003000 dev:ino <path>`
+        // then `rw-p 00000000 00:00 0 ` for the megabyte of zeros). Reporting
+        // one line for both would claim the whole range is the file's, and a
+        // reader that trusts it preads file bytes for `.bss` pages.
+        let file_end = pframe::align_up(vaddr + segment.filesz, PAGE_SIZE).min(end);
         ranges.push(MappedRange {
-            start: pframe::align_down(vaddr, PAGE_SIZE),
-            end: pframe::align_up(vaddr + segment.memsz, PAGE_SIZE),
+            start,
+            end: file_end.max(start),
             prot,
-            // An empty name is no name: a kernel-started task's `exe` is empty
-            // (there is no path it was run by), and a maps line with an empty
-            // column is not the shape a reader parses.
-            name: name.filter(|name| !name.is_empty()).map(Arc::from),
+            name: named.clone(),
             sealed: false,
             locked: false,
+            file,
         });
+        if file_end < end {
+            ranges.push(MappedRange {
+                start: file_end,
+                end,
+                prot,
+                // The anonymous tail carries **no name**: Linux's line is
+                // blank there, because the pages are not the file's.
+                name: None,
+                sealed: false,
+                locked: false,
+                file: None,
+            });
+        }
     }
 }
 // The bytes and argv of the program a spawn actually runs.

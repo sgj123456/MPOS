@@ -3744,9 +3744,15 @@ fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
                 // Eagerly-filled ranges are a private copy or an image: `private`,
                 // which is what Linux prints for both.
                 shared: false,
-                offset: 0,
-                dev: (0, 0),
-                inode: 0,
+                // A private copy of a file still reports the file: these
+                // columns say where the bytes came from, not whether the
+                // kernel can page them back. A range with no file behind it -
+                // the stack, an image's anonymous tail - keeps the zero
+                // triple, which is what Linux prints for `[stack]` and for a
+                // `bss` tail as well.
+                offset: range.file.map_or(0, |file| file.offset),
+                dev: range.file.map_or((0, 0), |file| file.dev),
+                inode: range.file.map_or(0, |file| file.inode),
                 name: range.name.as_deref().map(String::from),
             },
             rss_pages: 0,

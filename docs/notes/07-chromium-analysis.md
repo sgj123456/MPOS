@@ -1009,6 +1009,59 @@ numbers are well-formed, just wrong. That is the same class as §6.101's "a fiel
 readable in the common case is answered from the kernel, not from the common case":
 here the common case (no device node) is answered for every file.
 
+## 4c. FIXED — the exec image reports the file it came from, and `.bss` is its own line
+
+§4b's fact 2 said a fix needed "file-backed VMAs for `exec` images (a real
+memory-management change) or an acceptance that `maps`-based unwinders cannot
+resolve this kernel's images". The first reading was too strong, and measuring
+before designing is what showed it.
+
+**What Linux actually provides** (`build/scratch/execmap/{probe6,s1,t1,t2}.c`):
+a program's segments are printed with **their own file offset, the file's device
+and its inode**, and a segment whose `p_memsz` exceeds its `p_filesz` gets a
+**second line** for the zero-filled tail - `rw-p 00000000 00:00 0 ` with a blank
+name. The pages themselves are demand-paged, but that is not what the columns
+describe: they describe **where the bytes came from**. That question has an
+answer here too, and it does not require the paging to change.
+
+So the fix is the columns, not the pager:
+
+- `mm::elf::Source` grew `identity()` - default `None` (a `&[u8]` really has no
+  file), and `vfs::InodeSource` answers its inode's device/inode through the
+  same door the mapping objects use, so `maps` and `fstat` cannot disagree.
+- `MappedRange` carries `file: Option<RangeFile>` (`offset`, `dev`, `inode`).
+  Two runs merge only where the file offsets continue each other **and** the
+  identity matches - otherwise a merged line would report an offset that is
+  wrong for half of it, and a `.bss` tail would claim to be the file's.
+- `segment_ranges` splits each segment at `p_filesz`: file bytes under the
+  path, tail under no name and the zero triple.
+- The private-copy `mmap` arm records the same three numbers for the range it
+  fills, so a `MAP_PRIVATE` mapping of a file reports the file - Linux does the
+  same (`pmap` and a crash reporter both read it that way).
+
+**Pinned** by four new claims in `t-maps-identity`: the exec image has named
+lines, every one reports its file's device and inode, at least one segment
+offset is non-zero, and an unnamed range reports no file. Green on both arms
+(x86_64 `pass=338`, aarch64 `pass=334`, kunit 42/0 each). Host tests pin the
+merge rule in `mm::vma` (offsets continue / a gap / a file range beside a
+file-less one).
+
+**Counterfactual**: restoring `let source = None` reddens exactly the two
+claims about the image's columns (`every exec-image line reports the file's
+device and inode`, `and its segment offsets are the file's own (non-zero:
+false)`) and leaves the rest green - so the pin measures this change and not a
+neighbour.
+
+**What is still not file-backed, and is now named rather than assumed**: the
+pages are still filled at load time, so `mprotect(PROT_WRITE)` on the text does
+not change the file, `MAP_SHARED` semantics do not apply to an image, and
+`ETXTBSY` - which Linux raises for a write-open of a running executable
+(`build/scratch/execmap/t1.c`: `O_WRONLY` and `O_RDWR` are `26 (Text file
+busy)` while a copy runs, `truncate` the same, `unlink` succeeds) - is not
+implemented here. That is the smaller half of Linux's answer and it is what a
+boot loader's "replace the running binary" step would need; it is not on
+Chromium's path, which is why it is named and not built.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
@@ -1034,8 +1087,11 @@ reach them. Naming them as gaps would repeat the mistake §6.194 records.
    `t-ptrace-seize`. What remains of this item is `PTRACE_LISTEN`, which needs the
    seized group-stop path first (§4).
 2. **`st_dev` in `Metadata`, and the maps device column** — **done** (§4b, defect 1):
-   the column is the mount's `st_dev` now and `t-maps-identity` pins it. What is left
-   of Finding C is only its *fact 2*, the exec image's file-backing decision.
+   the column is the mount's `st_dev` now and `t-maps-identity` pins it. Finding C's
+   *fact 2* is **done too** (§4c): the exec image's lines report their file's offset,
+   device and inode, and its `.bss` tail is a separate file-less line. What remains of
+   the family is the paging itself (the pages are still placed, not demand-paged) and
+   `ETXTBSY`, both named in §4c and neither on Chromium's path.
 3. **The `libdbus` `r-x` write** (Finding A). Not a syscall gap — Linux faults on the
    same access — but a library writing its own text segment means something upstream
    is wrong: a relocation the loader mishandled, or a `TEXTREL` the package should not

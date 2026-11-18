@@ -240,6 +240,20 @@ pub struct MappedRange {
     pub end: usize,
     pub prot: MapFlags,
     pub name: Option<Arc<str>>,
+    /// The byte offset into the file the range was copied from, and the file's
+    /// `(st_dev, st_ino)` - what the `offset`/`dev`/`inode` columns of
+    /// `/proc/<pid>/maps` report.
+    ///
+    /// Kept on the range because the columns are about the *file*, and a range
+    /// whose pages are a private copy of one still has to name it: Linux's
+    /// `maps` describes where each page's bytes came from, and a reader that
+    /// recovers a module's layout from those columns (every crash reporter,
+    /// `pmap`, a JIT symboliser) asks exactly that question. `(0, 0)`/`0` is
+    /// the answer for the ranges with no file behind them - the stack, the
+    /// anonymous tail of an image's last segment, and this kernel's own
+    /// program image, whose pages are placed rather than paged (`docs/notes/`
+    /// `07-chromium-analysis.md` §4b).
+    pub file: Option<RangeFile>,
     /// `mseal(2)`'s bit, for the ranges that have no VMA - the program image,
     /// the loader's shared objects, the stack and a `MAP_PRIVATE` mapping of an
     /// ordinary file.
@@ -265,6 +279,22 @@ pub struct MappedRange {
     pub locked: bool,
 }
 
+/// The file a recorded range's bytes came from: the mapping's byte offset into
+/// it, and its device and inode numbers.
+///
+/// `Copy`, and deliberately not an `Arc<dyn Inode>`: the columns are three
+/// numbers, `MappedRange` is cloned by every split, and holding the node alive
+/// would change when a file's last reference dies (an unlinked image would keep
+/// its blocks for as long as the process ran, which Linux does not do).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RangeFile {
+    /// `p_offset` of the segment this range covers, plus the page's own offset
+    /// into it. Linux's offset column is the file offset the mapping starts at.
+    pub offset: u64,
+    pub dev: (u32, u32),
+    pub inode: u64,
+}
+
 impl MappedRange {
     /// Whether `next` continues this range, so a segment list can be reported
     /// as the runs a reader expects rather than one line per ELF segment.
@@ -274,6 +304,19 @@ impl MappedRange {
             && self.sealed == next.sealed
             && self.locked == next.locked
             && same_name(&self.name, &next.name)
+            // Two runs of one file merge only when the file offsets continue
+            // each other: `r--` at 0 and `r-x` at 0x1000 are one file and two
+            // lines, and lines that merged across a gap in the file would
+            // report an offset that is not the one a reader computes with.
+            && match (&self.file, &next.file) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    b.offset == a.offset + (next.start - self.start) as u64
+                        && a.dev == b.dev
+                        && a.inode == b.inode
+                }
+                _ => false,
+            }
     }
 }
 
@@ -289,23 +332,23 @@ impl MappedRange {
 /// let rw = MapFlags::READ | MapFlags::WRITE;
 /// // Out of order, and the second continues the first: sorted, then folded.
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: false },
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: false, file: None },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false, file: None },
 /// ]);
 /// assert_eq!(merged.len(), 1);
 /// assert_eq!((merged[0].start, merged[0].end), (0x1000, 0x3000));
 /// // A permission change ends the run even when the addresses abut.
 /// let rx = MapFlags::READ | MapFlags::EXEC;
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None, sealed: false, locked: false },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false, file: None },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None, sealed: false, locked: false, file: None },
 /// ]);
 /// assert_eq!(merged.len(), 2);
 /// // And so does a lock bit: a pinned page is its own run, because a
 /// // `munlock` of the rest has to be able to take it back out.
 /// let merged = merge_ranges(vec![
-///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false },
-///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: true },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None, sealed: false, locked: false, file: None },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None, sealed: false, locked: true, file: None },
 /// ]);
 /// assert_eq!(merged.len(), 2);
 /// ```
@@ -1114,6 +1157,7 @@ impl VmaTable {
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
+    use alloc::vec;
     // The host build's `MMAP_BASE` is the x86_64 one, which is what the
     // placement arithmetic below is measured against (`mm::elf`'s doc).
     use crate::mm::elf::MMAP_BASE;
@@ -1169,6 +1213,109 @@ mod tests {
     }
 
     const RW: MapFlags = MapFlags::READ.union(MapFlags::WRITE).union(MapFlags::USER);
+
+    /// One recorded range with the given file behind it.
+    fn recorded(
+        start: usize,
+        end: usize,
+        prot: MapFlags,
+        name: Option<&str>,
+        file: Option<RangeFile>,
+    ) -> MappedRange {
+        MappedRange {
+            start,
+            end,
+            prot,
+            name: name.map(Arc::from),
+            file,
+            sealed: false,
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn two_runs_of_one_file_merge_only_where_the_offsets_continue() {
+        // The two halves of one segment: `r--` at file offset 0, `r-x` at
+        // 0x1000, and the addresses continue - Linux prints these as two lines
+        // because the permission word differs, and they must not fold into a
+        // line whose offset would be wrong for half of it.
+        let dev = (0xfe, 0x02);
+        let ino = 4242;
+        let text = recorded(
+            0x1000,
+            0x2000,
+            RW,
+            Some("prog"),
+            Some(RangeFile {
+                offset: 0,
+                dev,
+                inode: ino,
+            }),
+        );
+        let more = recorded(
+            0x2000,
+            0x3000,
+            MapFlags::READ | MapFlags::USER,
+            Some("prog"),
+            Some(RangeFile {
+                offset: 0x1000,
+                dev,
+                inode: ino,
+            }),
+        );
+        let merged = merge_ranges(vec![text.clone(), more.clone()]);
+        assert_eq!(merged.len(), 2, "a permission change ends the run");
+
+        // With one permission word the same pair folds into one range whose
+        // offset is still the first one's.
+        let mut a = text.clone();
+        a.prot = RW;
+        let mut b = more;
+        b.prot = RW;
+        let merged = merge_ranges(vec![a, b]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].file.map(|f| f.offset), Some(0));
+
+        // ...but a *gap* in the file must not fold: the offset a reader
+        // computes from the second half would point at the wrong bytes.
+        let gapped = recorded(
+            0x2000,
+            0x3000,
+            RW,
+            Some("prog"),
+            Some(RangeFile {
+                offset: 0x5000,
+                dev,
+                inode: ino,
+            }),
+        );
+        let mut first = text;
+        first.prot = RW;
+        assert_eq!(merge_ranges(vec![first, gapped]).len(), 2);
+    }
+
+    #[test]
+    fn a_file_range_does_not_merge_with_one_that_names_no_file() {
+        // The `.bss` tail beside its file: same permission word, same name,
+        // contiguous - and still two ranges, because one of them is not the
+        // file's. Linux prints the tail with `00:00 0` and a blank name.
+        let file = recorded(
+            0x1000,
+            0x2000,
+            RW,
+            Some("prog"),
+            Some(RangeFile {
+                offset: 0x1000,
+                dev: (1, 2),
+                inode: 3,
+            }),
+        );
+        let tail = recorded(0x2000, 0x3000, RW, None, None);
+        let merged = merge_ranges(vec![file, tail]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].file.is_some());
+        assert!(merged[1].file.is_none());
+    }
 
     #[test]
     fn lookup_finds_the_covering_area_and_nothing_else() {

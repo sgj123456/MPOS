@@ -133,6 +133,105 @@ fn main() {
     // SAFETY: the mapping made above.
     unsafe { libc::munmap(mapped, 4096) };
 
+    // === the program's own exec image ======================================
+    //
+    // `exec` places the image in pages it fills itself, so the *paging* is not
+    // the file's - but `maps` describes where the bytes came from, and every
+    // tool that attributes an address to a file (a crash reporter, `pmap`, a
+    // symboliser) reads exactly these columns. Linux prints the segment's own
+    // file offset, the file's device and its inode on each line, and a separate
+    // zero line for the `.bss` tail
+    // (`build/scratch/execmap/{probe6,s1}.c`).
+    let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    let exe_str = exe.to_string_lossy().to_string();
+    if !exe_str.is_empty() {
+        let exe_dev = std::fs::metadata(&exe).map(|m| split(m.dev())).ok();
+        let exe_ino = std::fs::metadata(&exe).map(|m| m.ino()).ok();
+        // A struct rather than a six-tuple: the fields are read in several of
+        // the claims below, and a tuple of six is unreadable at every use.
+        struct Line {
+            #[allow(dead_code)] // the address range is parsed for the shape only
+            lo: usize,
+            offset: u64,
+            dev: (u32, u32),
+            inode: u64,
+            named: bool,
+            text: String,
+        }
+        let lines: Vec<Line> = text
+            .lines()
+            .filter_map(|line| {
+                let mut f = line.split_whitespace();
+                let range = f.next()?;
+                let _perms = f.next()?;
+                let offset = u64::from_str_radix(f.next()?, 16).ok()?;
+                let dev = f.next()?;
+                let inode = f.next()?.parse::<u64>().ok()?;
+                let (lo, hi) = range.split_once('-')?;
+                let lo = usize::from_str_radix(lo, 16).ok()?;
+                let hi = usize::from_str_radix(hi, 16).ok()?;
+                let (maj, min) = dev.split_once(':')?;
+                let _ = hi;
+                Some(Line {
+                    lo,
+                    offset,
+                    dev: (
+                        u32::from_str_radix(maj, 16).ok()?,
+                        u32::from_str_radix(min, 16).ok()?,
+                    ),
+                    inode,
+                    named: line.split_whitespace().count() > 5,
+                    text: line.to_string(),
+                })
+            })
+            .collect();
+        // The image's own lines: named with the exe path.
+        let image: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.text.ends_with(&exe_str))
+            .collect();
+        r.check(
+            &format!(
+                "the exec image has named maps lines ({} lines)",
+                image.len()
+            ),
+            !image.is_empty(),
+        );
+        if let (Some(dev), Some(ino)) = (exe_dev, exe_ino) {
+            r.check(
+                "every exec-image line reports the file's device and inode",
+                !image.is_empty() && image.iter().all(|l| l.dev == dev && l.inode == ino),
+            );
+            // The offsets are the segments' own, so at least one is non-zero:
+            // an image whose every line said 0 is the defect this pins.
+            let nonzero = image.iter().any(|l| l.offset != 0);
+            r.check(
+                &format!("and its segment offsets are the file's own (non-zero: {nonzero})"),
+                nonzero,
+            );
+        }
+        // The `.bss` tail, when a segment has one, is a **separate** line
+        // whose three columns are zero and which carries no name - Linux's
+        // `rw-p 00000000 00:00 0 ` with a blank last column
+        // (`build/scratch/execmap/probe6.c`). A program whose loads have no
+        // memory tail has none, so the claim only says the shape holds for the
+        // lines that are there.
+        let unnamed_image: Vec<&Line> = lines
+            .iter()
+            .filter(|l| !l.named && l.text.split_whitespace().count() == 5)
+            .collect();
+        let tail_ok = unnamed_image
+            .iter()
+            .all(|l| l.offset == 0 && l.dev == (0, 0) && l.inode == 0);
+        r.check(
+            &format!(
+                "an unnamed range reports no file ({} unnamed line(s))",
+                unnamed_image.len()
+            ),
+            tail_ok,
+        );
+    }
+
     // === two files on one filesystem share the device ======================
     let root_dev = std::fs::metadata("/").map(|m| split(m.dev())).ok();
     let tmp_dev = std::fs::metadata("/tmp").map(|m| split(m.dev())).ok();

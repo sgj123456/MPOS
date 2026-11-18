@@ -99,6 +99,19 @@ pub trait Source {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The file this source's bytes live in, when they live in one: its device
+    /// and inode, which `/proc/<pid>/maps` reports beside each mapped segment.
+    ///
+    /// Default `None`, and that is the honest answer for a source that *is* the
+    /// bytes (`&[u8]`, a script's buffer): there is no file to name, and a
+    /// mapping of it has no offset to report. A file-backed source answers the
+    /// pair, and the loader puts it on each segment's range so a reader can
+    /// attribute an address to a file and an offset - the question every crash
+    /// reporter and symboliser asks of `maps`.
+    fn identity(&self) -> Option<((u32, u32), u64)> {
+        None
+    }
 }
 
 impl Source for [u8] {

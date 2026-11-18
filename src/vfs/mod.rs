@@ -1961,6 +1961,26 @@ impl crate::mm::elf::Source for InodeSource {
         self.len
     }
 
+    /// The file's own identity, in the encoding `maps` prints: a device node's
+    /// `rdev` first, else the mount table's `st_dev` - the same door
+    /// the mapping-side objects use, so `maps` and `fstat` cannot disagree.
+    fn identity(&self) -> Option<((u32, u32), u64)> {
+        let packed = match self.inode.rdev() {
+            Some(rdev) => {
+                // A device node's own numbers are already a pair.
+                return Some((rdev, self.inode.metadata().ino));
+            }
+            None => crate::vfs::mount::dev_of_inode(&self.inode),
+        };
+        Some((
+            (
+                crate::uevent::major_of(packed),
+                crate::uevent::minor_of(packed),
+            ),
+            self.inode.metadata().ino,
+        ))
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
         self.inode.read_at(offset as u64, buf).ok()
     }
