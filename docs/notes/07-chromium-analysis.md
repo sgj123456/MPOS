@@ -896,8 +896,8 @@ the interesting part:
 
 | question | Linux | this kernel |
 |---|---|---|
-| `LISTEN` on a **running** seized tracee | `EIO` | `EIO` |
-| `LISTEN` on a `SEIZE`+`INTERRUPT` stop | `EIO` | `EIO` |
+| `LISTEN` on a **running** seized tracee | `ESRCH` | `ESRCH` |
+| `LISTEN` on a `SEIZE`+`INTERRUPT` stop | **`0`** | `0` |
 | `LISTEN` on an `ATTACH`ed tracee | `EIO` | `EIO` |
 | `LISTEN` on a **group-stopped** seized tracee | `0` | `0` |
 | a stop signal **while listening** | **held**, `waitpid(WNOHANG)` stays 0 | held |
@@ -905,12 +905,26 @@ the interesting part:
 | the seized group stop itself | `0x8013` = `SIGSTOP` + `PTRACE_EVENT_STOP` | same |
 | an `ATTACH`ed tracee's group stop | plain `0x13` | same |
 
-The two rows the first reading got wrong are worth naming: it said `SIGCONT`
-*wakes* a listening tracee (it does not - the tracer is told and the tracee stays
-stopped), and it implied a stop signal arriving during a listen is **reported**
-(it is not - three `SIGSTOP`s and a `SIGTERM` all leave `waitpid` at 0 and
-`/proc/<pid>/stat` at `t`). Both were caught by writing the probe that asks the
-question the note was glossing, not by reading the code again.
+**Three readings were wrong on the way to this table, and each was corrected by
+a probe rather than by re-reading the code** - which is the point of writing the
+table down at all:
+
+1. the first draft said a stop signal arriving during a listen is *reported*;
+   three `SIGSTOP`s and a `SIGTERM` all leave `waitpid(WNOHANG)` at 0 and
+   `/proc/<pid>/stat` at `t` (`l6.c`, `l10.c`). It is **held**.
+2. it said `SIGCONT` *wakes* the listening tracee; the tracer is told
+   (`0x8005`) and the tracee stays `t` (`l10.c`).
+3. it said `LISTEN` on an `INTERRUPT` stop is `EIO`, and that a running tracee's
+   is `EIO` too. Both wrong: the interrupt stop is **served** and a running one
+   is `ESRCH` (`l7.c`, `l8.c`). Only an `ATTACH`ed tracee is `EIO`.
+
+One shape is still **not measured, and is named rather than guessed**: after a
+`LISTEN` on an *interrupt* stop, a later `SIGSTOP` never arrives at the tracer at
+all (`l9.c` blocks indefinitely where the group-stop case reports at once), and
+neither does a second `LISTEN` answer cleanly (`ESRCH` after `SIGSTOP`). What
+Linux is doing there needs a probe that does not block to find out, and this
+kernel's answer - the stop simply stays a listening stop - is the shape the
+measured rows require. Closing it is its own item.
 
 What this needed in the kernel, and it is small because the machinery was there:
 

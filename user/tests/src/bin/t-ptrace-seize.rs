@@ -276,10 +276,12 @@ fn main() {
             seized_ok,
         );
         if seized_ok {
-            // Running, not stopped: LISTEN has nothing to listen from.
+            // Running, not stopped: LISTEN has nothing to listen from, and
+            // Linux's refusal for that is `ESRCH` (`build/scratch/listen/l8.c`),
+            // not the `EIO` an attached tracee gets.
             r.check(
-                "LISTEN of a running tracee is EIO",
-                refused(ptrace(PTRACE_LISTEN, listend, 0, 0), libc::EIO),
+                "LISTEN of a running seized tracee is ESRCH",
+                refused(ptrace(PTRACE_LISTEN, listend, 0, 0), libc::ESRCH),
             );
 
             // The signal-delivery stop, then pass the signal on to reach the
@@ -326,11 +328,10 @@ fn main() {
                 listened == 0,
             );
             // A stop signal arriving while listening is **held**, not
-            // reported: measured on Linux 7.3.4 (`build/scratch/listen/l6.c`),
-            // three `SIGSTOP`s and a `SIGTERM` all leave `waitpid(WNOHANG)` at
-            // 0 with `/proc/<pid>/stat` still `t`. A listen is not a stop of its
-            // own, so there is nothing to report - the tracee simply stays
-            // stopped.
+            // reported: measured on Linux 7.3.4 (`build/scratch/listen/l10.c`),
+            // a `SIGSTOP` leaves `waitpid(WNOHANG)` at 0 with the tracee still
+            // `t`. The listen is not a stop of its own, so there is nothing to
+            // report - the tracee simply stays stopped.
             // SAFETY: the same child.
             unsafe { libc::kill(listend, libc::SIGSTOP) };
             let mut st3 = 0;

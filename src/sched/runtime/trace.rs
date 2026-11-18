@@ -1011,17 +1011,20 @@ pub fn listen_traced(id: TaskId) -> Result<(), isize> {
             return Err(crate::err::ESRCH);
         };
         if !task.trace.seized {
-            // Not a seized tracee: the request does not apply to it at all.
+            // Attached, not seized: `EIO`, measured
+            // (`build/scratch/listen/l7.c`: an `ATTACH` stop is `EIO`).
             return Err(crate::err::EIO);
         }
         let Some(stop) = task.trace.stop.as_mut() else {
-            // Running - there is no stop to listen from.
-            return Err(crate::err::EIO);
+            // Running, so there is no stop to listen from - and Linux's answer
+            // is `ESRCH`, not `EIO` (`build/scratch/listen/l8.c`:
+            // `LISTEN` of a running seized tracee reads `ESRCH` 3).
+            return Err(crate::err::ESRCH);
         };
-        if !stop.group {
-            // Stopped, but by the tracer rather than by a stop signal.
-            return Err(crate::err::EIO);
-        }
+        // Both of a seized tracee's stops are listenable - the interrupt stop
+        // (`0x8005`) and the group stop (`0x8013`) alike
+        // (`build/scratch/listen/l7.c`: both answer `0`). The earlier note here
+        // said only the group stop was, which was wrong.
         stop.listening = true;
         Ok(())
     })
