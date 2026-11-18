@@ -1429,6 +1429,56 @@ That is the next measurement, and it is a narrow one: read the node the second
 trip dispatches from, at its own `call *%rax`, with the timing lesson of §4g
 applied (read *after* the instruction).
 
+## 4i. The second trip dispatches `ef_at`, and the probe's entry arithmetic was wrong
+
+§4h ended with a narrow question: read the node that the second trip through
+`__run_exit_handlers` dispatches from. Measured
+(`build/scratch/zprobe/{trip2,rd}.c`, breakpoints at `0x4063ff` and `0x406427`):
+
+```
+DISPATCH trip 1: r15(node)=0x4bb360 rax(count)=0x2
+  after shl/add: rax=0x4bb380 (index*32 + node)
+  entry=0x4bb380  [0]=0 [1]=0 type(+0x10)=0x4 fn(+0x18)=0x998f35090046cc7d
+DIED sig=11
+```
+
+Two facts, and one of them is mine, not the kernel's:
+
+1. **The dispatched entry is flavor `4`** - `ef_at`, an `atexit`-registered
+   function - and it is dispatched through `0x406520`, which takes `+0x18`, does
+   `ror $0x11` over the guard and calls it. That is the branch that faults.
+2. **The value at `+0x18` is not a pointer.** `0x998f35090046cc7d` unmangles to
+   `0x663eccc793f08ccf` under the guard read at that moment, and its low 24 bits
+   (`0x46cc7d`) land inside `.text` - in `__mpn_impn_sqr_n_basecase`, a GMP
+   routine with nothing to do with exiting. That is the signature of reading a
+   **struct field that is not the one I think it is**, not of a corrupted pointer.
+
+**And that is what it was.** glibc's `struct exit_function` is
+`{ flavor; fn; ... }` laid out from `fl_entry`, and the entries of one
+`exit_function_list` begin at `node + 0x20` - while the dispatch arithmetic is
+`node + index*0x20`. With `count = 2` the code's last index is 1, so it reads
+`node + 0x20`, **entry 0**. The probe read `+0x10`/`+0x18` off *that* address
+believing it was entry 1's `flavor`/`fn` pair, so it reported entry 0's
+neighbouring words as if they were a mangled function pointer. A wrong field
+offset in the instrument, for the fourth time in this investigation.
+
+**So the honest state of the static-exit question**: the machinery up to and
+including `call_fini` is confirmed working (guard non-zero and correct there,
+`rax = call_fini`), the second trip is confirmed to dispatch a flavor-`4` entry
+through the guard-mangling path, and **the value it actually dispatches has not
+yet been read correctly**. The next probe must compute the entry address the way
+glibc does (`node + index*0x20`, where index is `count - 1` and entry 0 lives at
+`node + 0x20`) and read `flavor`/`fn` from *that*, or better, read the pointer
+out of `%rax` at `0x406552` after the `ror`/`xor` pair has run - the register,
+not a guessed struct offset.
+
+**What this section is for**: four rounds of this investigation have now produced
+a wrong reading from a probe (the `>=` break condition, reads taken before the
+instruction, and twice a wrong struct offset). The pattern is worth naming: every
+one was found by asking *what would this probe print if my assumption about the
+layout were wrong*, and every one cost a round. The instrument is the thing to
+verify first.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
