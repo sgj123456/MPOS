@@ -1715,6 +1715,68 @@ That is the next thing to test, and it is a kernel measurement, not a libc one:
 write a byte into the last page of this image's `.bss` from userland and read it
 back.
 
+## 4n. `.bss` writes are fine, the registration works, and the fault is the second `btree_insert`
+
+Three hypotheses from §4m fell in one pass, each to a reading.
+
+**`.bss` is not the problem.** A probe that writes every page of a 1 MiB `.bss`
+and reads it back (`build/scratch/zprobe/bss.c`):
+
+```
+__bss_start=0x4bb000 _end=0x5c1888 span=1075336 bytes
+page writes: 263 pages, 0 did not stick, first at +-1
+last byte 0x5c1887: wrote 0xa5, read 0xa5
+```
+
+263 pages written and read back, the last byte included. The kernel maps
+`p_memsz` correctly and a `.bss` write sticks. §4m's "`.bss` write that does not
+stick" is retracted.
+
+**The frame registration does work.** §4m read `registered_objects` after
+`frame_dummy` and saw zero; that was a **timing artifact of 60 single steps**,
+which do not reach the insert. With breakpoints at the insert itself:
+
+```
+register_pc_range_for_object  head=0
+btree_insert                  head=0
+after btree_insert            head=0x4c2160      <- the tree IS populated
+```
+
+**And `get_pc_range` returns a correct range.** Breaking it and its caller:
+
+```
+get_pc_range ENTRY rdi=0x4baa60
+after get_pc_range: [rbp-0x20]=0x4010c0 [rbp-0x18]=0x47f62d
+taking the registered_frames insert path
+DIED sig=11
+```
+
+`0x4010c0..0x47f62d` is exactly this image's `.text`. So the unwind tables are
+read correctly, the object is registered in the btree, and the pc-range is
+extracted.
+
+**The fault is the second `btree_insert`** - the one into `registered_frames` at
+`0x47c057`, which runs only when the pc-range is non-empty (it is). That is the
+last unmeasured step, and it is one breakpoint away: the entry is `0x47aab0` with
+`%rdi = 0x4c0290`, and its first act is
+`version_lock_lock_exclusive(&tree->lock)` on `0x4c02a0`, whose slow path falls
+back to the global `version_lock_mutex` at `0x4c0300`.
+
+**What is left is a lock question, and it is testable in one run**: whether
+`registered_frames`' lock word is already held when that insert begins. Two
+`btree_insert`s are made against **different** trees (`0x4c0270` and `0x4c0290`,
+locks at `0x4c0280`/`0x4c02a0`), so a self-deadlock would mean they are not
+different after all - or that the first insert leaves the *global* mutex held.
+A single read of `[0x4c02a0]` and `[0x4c0300]` at `0x47aab0` answers it.
+
+**Honest tally of this investigation**: six wrong readings have now been found
+and retracted in the course of it (a `>=` break condition, reads taken before the
+instruction, three wrong struct offsets, and a 60-step "registration does not
+land"), plus one wrong model (infinite recursion). Every one was corrected by a
+reading, not by argument, and each correction is recorded at the point it was
+overturned rather than edited away. That is the only way this file stays usable
+to whoever picks it up next.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
