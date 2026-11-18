@@ -1376,6 +1376,17 @@ Three items the analysis names are worth doing on their own terms, in this order
    load, and `ETXTBSY` is not raised for a write-open of a running executable - both named in
    §4c, neither on Chromium's path.
 
+**A defect found on the way, and named rather than fixed** (2026-11-18, §4e): a
+**statically linked glibc** program whose `main` simply returns dies of `SIGSEGV`
+(exit 139) on this kernel, while the same program calling `_exit(0)` or
+`exit_group(0)` exits 0. It is reproducible in every boot, it is not the binary
+(`gcc -static` of `int main(void){return 0;}` is enough), and the fault is a
+`call *%rax` in glibc's `__run_exit_handlers` whose pointer came out of the
+PTR_MANGLE pair over `__pointer_chk_guard_local`. `AT_RANDOM` is placed and
+filled correctly here (measured), so the breakage is downstream of it - *why* is
+not yet measured, and no fix is claimed. Every self-contained C program on this
+machine ends this way, so it is worth a session of its own.
+
 Not a gap, recorded so it is not chased again: crashpad's `sched_getscheduler: ENOSYS (38)` is
 **musl's stub** (the image is Alpine), answered before any syscall, not a kernel refusal and not
 a probe; a raw-syscall reader gets `SCHED_OTHER` (§3o, §3q).

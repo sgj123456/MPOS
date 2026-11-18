@@ -1228,6 +1228,58 @@ defect, and the claims that say so are now pinned in `t-tid-dir` (four of them:
 the zombie's state, its directory, its `task/` listing, and both going away at
 the reap).
 
+## 4e. An observed defect that is **not** Chromium's: a static glibc binary cannot return from `main`
+
+Chasing §3s's `CHECK` down, a smaller and much sharper fact fell out, and it is
+written down here because it changes what "the kernel's part of this chain is
+clean" can mean.
+
+**Reproduction, five boots, identical every time.** A statically linked glibc
+program whose `main` simply returns dies with `SIGSEGV`:
+
+```c
+int main(void){ return 0; }          /* cc -static -O0 */
+```
+```
+m[717]: segfault at 7dcde46043f0 ip 00007dcde46043f0 sp 000000003fc53a08 error 14
+rc=139
+```
+
+- the same program calling `_exit(0)` exits **0**, and one calling
+  `syscall(SYS_exit_group, 0)` exits **0** - so the kernel's exit path is fine;
+- `atexit` handlers **do** run before the fault (a handler that writes
+  `HANDLER RAN` prints, then the crash);
+- it is not the binary: `gcc -static -O0/-O2` and a bare `int main(void){return 0;}`
+  all crash, at `rip == fault address` with the page reported `NOT MAPPED`;
+- the fault is a **`call *%rax`** in glibc's `__run_exit_handlers`
+  (`0x406552` in the fixture), whose `%rax` was just unmangled by
+  `ror $0x11` over `__pointer_chk_guard_local` - glibc's PTR_MANGLE pair;
+- that guard is derived from the `AT_RANDOM` auxv bytes, and `AT_RANDOM` itself
+  is **correct here**: measured in the guest, it reads `0x3fe87ff0` for
+  `sp = 0x3fe87a08`, i.e. exactly 16 bytes below the stack top, inside the
+  argument block, holding fresh random bytes.
+
+So the defect is **downstream of `AT_RANDOM`** and upstream of the exit: the
+mangled pointer does not survive its round trip. That much is measured; *why* is
+not, and no fix is claimed here. The two candidates a later pass should separate
+are the `fs:`-relative read of the guard versus the static global glibc actually
+uses, and whether `__libc_start_main`'s `%fs:0x28` canary and the guard are being
+written from the same 8 bytes when glibc expects two different offsets.
+
+**Why this matters beyond the fixture**: every statically linked C program on
+this machine ends in this fault - which includes anything a boot or a test would
+build to be self-contained - and the failure is a `SIGSEGV` at exit, i.e. a
+*successful* program reported as killed. It is also very possibly what a real
+Chromium child was doing in §3s: the `#BP` there is `IMMEDIATE_CRASH`, but a
+child that segfaults on its way out needs no `CHECK` at all to look like one.
+
+**No pin yet, deliberately.** The claim would have to compile C inside the
+guest, and the installed image has no compiler; a checked-in static binary would
+pin this suite's build rather than the libc's exit path. The honest state is a
+named gap with a five-run reproduction, recorded here, and the next step is a
+kernel-side instrument rather than another userland probe - the guard's value at
+`__libc_start_main` and at the unmangle, printed from a build that can see both.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
