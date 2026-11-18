@@ -1467,9 +1467,12 @@ const FPREGS_ABI_TAIL: usize = FPCR_IN_ABI + 4;
 /// The floating-point image, for a tracer to read. Word at a time and unaligned
 /// for the same reason the register file is: the buffer belongs to the tracer,
 /// and its alignment is whatever the tracer chose.
-pub(crate) fn write_user_fpregs(at: usize, bytes: &[u8; FPREGS_BYTES]) {
+pub(crate) fn write_user_fpregs(at: usize, bytes: &[u8; FPREGS_BYTES], moved: usize) {
     #[cfg(not(target_arch = "aarch64"))]
     for (word, chunk) in bytes.chunks_exact(8).enumerate() {
+        if word * 8 >= moved {
+            break;
+        }
         let value = u64::from_le_bytes(chunk.try_into().unwrap());
         unsafe { ((at + word * 8) as *mut u64).write_unaligned(value) };
     }
@@ -1478,6 +1481,9 @@ pub(crate) fn write_user_fpregs(at: usize, bytes: &[u8; FPREGS_BYTES]) {
         // The registers themselves are the same 512 bytes in the same order on
         // both sides - `vregs[i]` and `q[i]` are one register under two names.
         for (word, chunk) in bytes[..512].chunks_exact(8).enumerate() {
+            if word * 8 >= moved {
+                break;
+            }
             let value = u64::from_le_bytes(chunk.try_into().unwrap());
             unsafe { ((at + word * 8) as *mut u64).write_unaligned(value) };
         }

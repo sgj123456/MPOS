@@ -1484,19 +1484,34 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                 let Some((base, len)) = read_iovec(data) else {
                     return err::EFAULT;
                 };
-                if len < abi::FPREGS_BYTES {
-                    return err::EIO;
-                }
+                // The `iov_len` contract, measured on Linux 7.3.4
+                // (`build/scratch/regsz/q.c`) rather than assumed:
+                //
+                // | offered | Linux |
+                // |---|---|
+                // | 512 (exact) | `0`, `iov_len` 512 |
+                // | 1024 (roomy) | `0`, `iov_len` **512** - the size moved |
+                // | 216 (short) | `0`, `iov_len` 216 - truncated, **not** refused |
+                // | 0 | `0`, `iov_len` 0 |
+                //
+                // So the answer is the caller's own length, clamped down to the
+                // register set's; a short buffer is *served* truncated. This
+                // path used to refuse a short buffer with `EIO`, which is the
+                // shape that makes a tracer believe the set is missing.
+                let moved = len.min(abi::FPREGS_BYTES);
                 if request == abi::PTRACE_GETREGSET {
                     let Some(fpu) = crate::sched::trace_fpu(id) else {
                         return err::ESRCH;
                     };
-                    if !buffer_ok(base, abi::FPREGS_BYTES, true, from_user) {
+                    if moved != 0 && !buffer_ok(base, moved, true, from_user) {
                         return err::EFAULT;
                     }
-                    abi::write_user_fpregs(base, &fpu);
+                    // Truncated to what the caller offered, which is Linux's
+                    // "the output data is truncated" and the reason a tracer
+                    // with a smaller struct still gets an answer.
+                    abi::write_user_fpregs(base, &fpu, moved);
                 } else {
-                    if !buffer_ok(base, abi::FPREGS_BYTES, false, from_user) {
+                    if moved != 0 && !buffer_ok(base, moved, false, from_user) {
                         return err::EFAULT;
                     }
                     if !crate::sched::set_trace_fpu(id, &abi::read_user_fpregs(base)) {
@@ -1507,29 +1522,36 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                     .checked_add(8)
                     .filter(|at| buffer_ok(*at, 8, true, from_user))
                 {
-                    unsafe { (at as *mut u64).write_unaligned(abi::FPREGS_BYTES as u64) };
+                    unsafe { (at as *mut u64).write_unaligned(moved as u64) };
                 }
                 return 0;
             }
             if addr != abi::NT_PRSTATUS {
-                return err::EIO;
+                // An unrecognised note type is `EINVAL`, measured - not `EIO`,
+                // which is what this answered and which a tracer reads as "the
+                // kernel does not know ptrace at all" rather than "not this
+                // register set" (`build/scratch/regsz/q.c`: `which=99` is
+                // `EINVAL` 22).
+                return err::EINVAL;
             }
             let Some((base, len)) = read_iovec(data) else {
                 return err::EFAULT;
             };
             if len < abi::uregs::BYTES {
-                // A short buffer is not a request for a short answer: the
-                // register set is one structure, and half of it is a tracer
-                // acting on registers it did not read. (Linux truncates to what
-                // the caller offered; refusing is the stricter reading of the
-                // same rule and the one a tracer cannot mistake.)
-                return err::EIO;
+                // Measured (`build/scratch/regsz/q.c`): a **short** `NT_PRSTATUS`
+                // buffer is `EINVAL` (22), not `EIO` and not a truncated success
+                // - the general-register set is the one Linux refuses to cut
+                // down, unlike `NT_PRFPREG` above, which it truncates. Both
+                // facts are Linux's and they disagree, which is exactly why
+                // each was measured instead of generalised from the other.
+                return err::EINVAL;
             }
+            let moved = abi::uregs::BYTES;
             if request == abi::PTRACE_GETREGSET {
                 let Some(regs) = crate::sched::trace_regs(id) else {
                     return err::ESRCH;
                 };
-                if !buffer_ok(base, abi::uregs::BYTES, true, from_user) {
+                if moved != 0 && !buffer_ok(base, moved, true, from_user) {
                     return err::EFAULT;
                 }
                 abi::write_user_regs(base, &regs);
@@ -1548,7 +1570,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             if !buffer_ok(data, 16, true, from_user) {
                 return err::EFAULT;
             }
-            unsafe { ((data + 8) as *mut u64).write_unaligned(abi::uregs::BYTES as u64) };
+            unsafe { ((data + 8) as *mut u64).write_unaligned(moved as u64) };
             0
         }
         // The syscall this stop is a boundary of. `addr` is the size of the
@@ -1771,7 +1793,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             let Some(fpu) = crate::sched::trace_fpu(id) else {
                 return err::ESRCH;
             };
-            abi::write_user_fpregs(data, &fpu);
+            abi::write_user_fpregs(data, &fpu, abi::FPREGS_BYTES);
             0
         }
         abi::PTRACE_SETFPREGS => {

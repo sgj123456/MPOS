@@ -1162,6 +1162,72 @@ implemented here. That is the smaller half of Linux's answer and it is what a
 boot loader's "replace the running binary" step would need; it is not on
 Chromium's path, which is why it is named and not built.
 
+## 4d. FIXED — `GETREGSET`'s `iov_len`, and a probe that refuted its own first reading
+
+With `LISTEN` in and the image carrying the current kernel (§3s), the crashpad
+stderr changed shape:
+
+```
+ptracer.cc:482  Unexpected registers size 0 != 216
+ptracer.cc:569  ptrace: No such process (3)
+```
+
+The first line is exact and was the real defect: `PTRACE_GETREGSET` answered `0`
+(served) while leaving the caller's `iov_len` at **0**, so a tracer read a
+successful call as an empty register file. Measured on Linux 7.3.4
+(`build/scratch/regsz/q.c`) - and the two register sets **disagree**, which is
+why each row was taken rather than generalised:
+
+| offered | Linux |
+|---|---|
+| `NT_PRSTATUS` 216 (exact) | `0`, `iov_len` 216 |
+| `NT_PRSTATUS` 1024 (roomy) | `0`, `iov_len` **216** - the size moved |
+| `NT_PRSTATUS` 100 (short) | `EINVAL` (22), buffer untouched |
+| `NT_PRSTATUS` 0 | `0`, `iov_len` 0 - a query answered with nothing |
+| `NT_PRFPREG` 1024 (roomy) | `0`, `iov_len` **512** |
+| `NT_PRFPREG` 128 (short) | `0`, `iov_len` 128 - **truncated**, not refused |
+| an unknown note type | `EINVAL` |
+
+The kernel now writes the moved size back on both sets, truncates `NT_PRFPREG`
+to what the caller offered, refuses a short `NT_PRSTATUS` with `EINVAL` (it had
+been `EIO`), and answers an unknown note type with `EINVAL` rather than `EIO` -
+`EIO` being the answer a tracer reads as "this kernel has no ptrace at all".
+Pinned by four new claims in `t-ptrace-fpregset`; counterfactual restores
+`moved = 0` and reddens exactly the two `NT_PRSTATUS` claims (`len 0`,
+`EIO`) and leaves the `NT_PRFPREG` ones green.
+
+**After the fix, on the image**: `Unexpected registers size` is gone from the
+stderr entirely, and so is every `ptracer.cc` line except two `ESRCH`s for a
+process that had already exited.
+
+**And then the probe refuted its own first reading, which is the part worth
+recording.** The next crashpad line was
+
+```
+directory_reader_posix.cc:43  opendir /proc/730/task: No such file or directory (2)
+```
+
+`730` was the `inotify_reader` thread that had just died in `libdbus`
+(`inotify_reader[730]: segfault …`). A shell fixture appeared to show that this
+kernel drops a killed child's `/proc/<pid>` **at exit**, which would have been a
+real divergence from Linux's `__unhash_process` (it unhooks a task at exit
+*unless it leads the group*, so a zombie keeps its directory until it is
+collected). It does not: **the shell was reaping its own background child**, so
+every reading was of a *collected* process - `ENOENT` on Linux too. A probe that
+never calls `waitpid` (`build/scratch/zprobe/{z,y}.c`) shows the truth:
+
+- a killed, unreaped child keeps `/proc/<pid>/stat` at `state=Z`, and its
+  `/proc/<pid>/task` stays readable;
+- the same holds when the reader is a **different process** (the crashpad
+  shape), with the dead group's tids still listed;
+- and both disappear at the `waitpid`, which is the other side of the rule.
+
+So the `ENOENT` crashpad logs is about a process that had already been *reaped*
+by the time the handler looked - Linux answers `ENOENT` there too. No kernel
+defect, and the claims that say so are now pinned in `t-tid-dir` (four of them:
+the zombie's state, its directory, its `task/` listing, and both going away at
+the reap).
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,

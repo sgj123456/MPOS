@@ -24,6 +24,8 @@ const PTRACE_GETREGSET: libc::c_int = 0x4204;
 const PTRACE_SETREGSET: libc::c_int = 0x4205;
 /// `NT_PRFPREG` - the x87/SSE register set.
 const NT_PRFPREG: usize = 2;
+/// `NT_PRSTATUS` - the general register set.
+const NT_PRSTATUS: usize = 1;
 /// Big enough for either machine's FPU image (512 bytes on x86_64).
 const FP_BUF: usize = 1024;
 
@@ -129,6 +131,81 @@ fn main() {
     r.check(
         "the value round-trips",
         back[..iov3.iov_len] == fp[..iov3.iov_len],
+    );
+
+    // === the `iov_len` contract, all six shapes ==========================
+    //
+    // Measured on Linux 7.3.4 (`build/scratch/regsz/q.c`), because the two sets
+    // disagree and generalising from one to the other was wrong twice:
+    //
+    // | what | Linux |
+    // |---|---|
+    // | `NT_PRSTATUS` 216 (exact) | `0`, len 216 |
+    // | `NT_PRSTATUS` 1024 (roomy) | `0`, len **216** - the size moved |
+    // | `NT_PRSTATUS` 100 (short) | `EINVAL`, buffer untouched |
+    // | `NT_PRSTATUS` 0 | `0`, len 0 - a query answered with nothing |
+    // | `NT_PRFPREG` 1024 (roomy) | `0`, len **512** |
+    // | `NT_PRFPREG` 216 (short than the set) | `0`, len 216 - **truncated** |
+    //
+    // The short-general-registers row is why crashpad could never work here
+    // before: the field it reads came back 0 and it logged `Unexpected
+    // registers size 0 != 216`.
+    let mut big = [0u8; 1024];
+    let mut iov_big = libc::iovec {
+        iov_base: big.as_mut_ptr().cast(),
+        iov_len: big.len(),
+    };
+    let roomy = ptrace(
+        PTRACE_GETREGSET,
+        child,
+        NT_PRSTATUS,
+        &mut iov_big as *mut _ as usize,
+    );
+    r.check(
+        &format!(
+            "a roomy NT_PRSTATUS buffer reports the set's own size ({roomy}, len {})",
+            iov_big.iov_len
+        ),
+        roomy == 0 && iov_big.iov_len > 0 && iov_big.iov_len < big.len(),
+    );
+    // A short general-register buffer is refused, not truncated.
+    let mut small = [0u8; 8];
+    let mut iov_small = libc::iovec {
+        iov_base: small.as_mut_ptr().cast(),
+        iov_len: small.len(),
+    };
+    let short = ptrace(
+        PTRACE_GETREGSET,
+        child,
+        NT_PRSTATUS,
+        &mut iov_small as *mut _ as usize,
+    );
+    r.check(
+        &format!(
+            "a short NT_PRSTATUS buffer is EINVAL ({short}, {:?})",
+            errno()
+        ),
+        short == -1 && errno() == Some(libc::EINVAL),
+    );
+    // ... while the *FPU* set is truncated instead, which is the row the two
+    // sets disagree on and the one a "they behave alike" fix gets wrong.
+    let mut fp_short = [0u8; 128];
+    let mut iov_fp_short = libc::iovec {
+        iov_base: fp_short.as_mut_ptr().cast(),
+        iov_len: fp_short.len(),
+    };
+    let fp_cut = ptrace(
+        PTRACE_GETREGSET,
+        child,
+        NT_PRFPREG,
+        &mut iov_fp_short as *mut _ as usize,
+    );
+    r.check(
+        &format!(
+            "a short NT_PRFPREG buffer is served truncated ({fp_cut}, len {})",
+            iov_fp_short.iov_len
+        ),
+        fp_cut == 0 && iov_fp_short.iov_len == fp_short.len(),
     );
 
     // === a note type nobody serves is still EIO ===========================

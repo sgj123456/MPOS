@@ -617,6 +617,55 @@ fn main() {
         "and its tid names no directory at all",
         mode_of(&tid_dir).is_none(),
     );
+    // **And a zombie process keeps its own**, which is the other half of the
+    // same clause and the one a crash reporter depends on: Linux unhooks a task
+    // at exit *unless it leads the group*, so `/proc/<pid>` and its `task/` stay
+    // readable until the corpse is collected. Measured here rather than
+    // inferred, because the shape is what crashpad reads when a client dies:
+    // a child that is killed and **never reaped** must keep both.
+    //
+    // The earlier probe that said otherwise used a shell, and a shell reaps its
+    // own background children - the reading was of a *collected* process, which
+    // is `ENOENT` on Linux too.
+    if let Some(zombie) = {
+        // SAFETY: `fork`; the child kills itself at once and is never waited
+        // for until after the claims, which is what keeps it a zombie.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: the child's only act.
+            unsafe { libc::_exit(0) };
+        }
+        (pid > 0).then_some(pid)
+    } {
+        // Let it die without collecting it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let zdir = format!("/proc/{zombie}");
+        let state = std::fs::read_to_string(format!("{zdir}/stat"))
+            .ok()
+            .and_then(|text| text.rfind(')').and_then(|at| text[at + 2..].chars().next()))
+            .unwrap_or('?');
+        r.check(
+            &format!("a killed child that was never reaped is a zombie ({state})"),
+            state == 'Z',
+        );
+        r.check(
+            "and its /proc/<pid> is still there",
+            mode_of(&zdir).is_some(),
+        );
+        r.check(
+            "with its task/ listing readable",
+            names(&format!("{zdir}/task")).is_some_and(|list| !list.is_empty()),
+        );
+        // Now collect it, and both halves go - which is the other side of the
+        // same rule and proves the retention above was the zombie's, not a
+        // directory nothing ever removes.
+        // SAFETY: the child this block forked.
+        unsafe { libc::waitpid(zombie, core::ptr::null_mut(), 0) };
+        r.check(
+            "and both are gone once it is reaped",
+            mode_of(&zdir).is_none(),
+        );
+    }
     r.check(
         "so the child it forked is on the leader's children file now",
         text(&leader_children).as_deref() == Some(format!("{child_a} {child_b} ").as_str()),
