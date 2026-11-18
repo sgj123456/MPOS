@@ -2149,6 +2149,61 @@ as 2.
 **Tally**: eleven. The instrument, not the kernel, has been the subject of ten of
 them.
 
+## 4u. A fault's signal never reaches the tracer - the gap that hid every crash from me
+
+§4t ended with "the next probe must re-arm correctly". It can, now
+(`build/scratch/zprobe/clean.c` is a harness whose peek failure is fatal and
+whose re-arm is a single-step over the original instruction), and its first
+reading is clean and short:
+
+```
+head 0: count ok=1 0x2  rsp=0x3f9bea10  r15=0x4bb360
+DIED sig=11 after 1 heads
+```
+
+**One pass through the loop head, then death.** No repetition - so §4s's "count
+reads 2 every dispatch" was indeed the probe, and the loop runs *once*. The fault
+is inside `call_fini`, not in a loop.
+
+**And the reason every attempt to look at it failed is a kernel gap, not a probe
+one.** A tracer that asks for the fault never gets it:
+
+```c
+ptrace(PTRACE_CONT, c, 0, 0);          /* then wait */
+/* -> ended sig=11, with NO stop reported */
+```
+
+Linux delivers a faulting signal to a tracer as a **signal-delivery-stop**: the
+tracer is woken with `WIFSTOPPED` and `WSTOPSIG == SIGSEGV`, reads the registers
+and `PTRACE_GETSIGINFO`, and decides whether to pass it on. This kernel's trap
+path calls `send_fault_signal` and then goes straight to
+
+```rust
+if crate::hal::kernel::disposition_is_default(sig) {
+    crate::hal::kernel::die_of_fatal_signal(sig);
+}
+```
+
+(`arch/src/arch/x86_64/idt.rs`, the vector-agnostic tail of `rust_trap`) - no
+consultation of the tracer at all. So a traced process that faults **dies without
+its tracer being told**, and every reading taken after that point was a reading of
+a corpse: `rip=0x100`, `rsp=0x4ba140`, `rbp=0x1080000` in one run, and `0xffff…`
+from a failed peek in another. That is the mechanism behind most of this file's
+retractions: **the instrument was not merely imprecise, it was being handed
+state from after the event it meant to observe.**
+
+**This is a real, nameable ptrace gap and it is the next thing to fix**: a
+faulting traced task must park in a signal-delivery stop before the signal is
+acted on, exactly as `trace_signal_stop` already does for an ordinary signal
+(`src/sched/runtime/trace.rs`), with the fault's `siginfo_t` record available to
+`PTRACE_GETSIGINFO` at that stop. Once that lands, the crash that this whole
+investigation has been circling becomes readable in one run: `rip`, the register
+file and the return address, at the fault, instead of after it.
+
+**Tally**: twelve. Ten of them were the instrument, one was a wrong model, one was
+an implementation written and reverted - and this pass names the reason the
+instrument kept being wrong.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
