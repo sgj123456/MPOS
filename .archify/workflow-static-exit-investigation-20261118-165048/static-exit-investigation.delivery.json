@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "ccba84a5-4958-4ab8-ae8e-d5fac4526b0f",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "/home/mp/mpos/.archify/workflow-static-exit-investigation-20261118-165048/candidate.json",
+  "output": "/home/mp/mpos/.archify/workflow-static-exit-investigation-20261118-165048/static-exit-investigation.html",
+  "specification": {
+    "sha256": "dde4d4dcbd823b68c50b17e58ea6b2e1d143bbdce1d6b5e4b0b85442c0e26778",
+    "bytes": 8404
+  },
+  "artifact": {
+    "sha256": "a5fcdb5ae7203c7a1ad61ca4dc81b52f7ada1f55746cd1d3cf851dd226f20bb7",
+    "bytes": 857727
+  }
+}

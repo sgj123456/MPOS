@@ -1,0 +1,386 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "A static glibc exit bug, and the instrument that had to be built first",
+    "subtitle": "Six probe readings were retracted before the first kernel-side fact",
+    "locale": "en",
+    "output": ".archify/workflow-static-exit-investigation-20261118-165048/static-exit-investigation.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@gitee.com:maopaonew/mpos.git",
+      "provider": "gitee",
+      "link_mode": "local-only",
+      "revision": "bf6f3ff194572ac202cc5527882de95767270ebb"
+    }
+  },
+  "lanes": [
+    {
+      "id": "defect",
+      "label": "Observed defect"
+    },
+    {
+      "id": "instrument",
+      "label": "ptrace instrument"
+    },
+    {
+      "id": "probes",
+      "label": "Probe readings, later retracted",
+      "variant": "exception"
+    },
+    {
+      "id": "hypotheses",
+      "label": "Causal stories, refuted",
+      "variant": "exception"
+    },
+    {
+      "id": "frontier",
+      "label": "What is measured now"
+    }
+  ],
+  "phases": [
+    {
+      "id": "reach",
+      "label": "Reach the exit path",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "see",
+      "label": "Make the machine observable",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "correct",
+      "label": "Retract and re-measure",
+      "fromCol": 4,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "groups": [
+    {
+      "id": "seize_family",
+      "label": "Seized-tracee doors",
+      "lane": "instrument",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "emphasis"
+    },
+    {
+      "id": "retractions",
+      "label": "Not the kernel",
+      "lane": "probes",
+      "fromCol": 2,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "symptom",
+    "seize",
+    "listen",
+    "step",
+    "brk",
+    "page"
+  ],
+  "nodes": [
+    {
+      "id": "symptom",
+      "lane": "defect",
+      "col": 0,
+      "type": "external",
+      "label": "static exit SIGSEGV",
+      "sublabel": "int main(void){return 0;}",
+      "tag": "5 of 5 boots, rc=139",
+      "width": 148,
+      "sources": [
+        {
+          "path": "docs/notes/07-chromium-analysis.md",
+          "line": 1780,
+          "end_line": 1795
+        }
+      ]
+    },
+    {
+      "id": "seize",
+      "lane": "instrument",
+      "col": 1,
+      "type": "backend",
+      "label": "SEIZE + INTERRUPT",
+      "sublabel": "attach without stopping",
+      "width": 140,
+      "sources": [
+        {
+          "path": "src/syscall/linux/abi.rs",
+          "line": 1126,
+          "end_line": 1136
+        }
+      ]
+    },
+    {
+      "id": "listen",
+      "lane": "instrument",
+      "col": 2,
+      "type": "backend",
+      "label": "PTRACE_LISTEN",
+      "sublabel": "stop without resuming",
+      "width": 140,
+      "sources": [
+        {
+          "path": "src/syscall/linux/proc.rs",
+          "line": 1355,
+          "end_line": 1366
+        },
+        {
+          "path": "src/syscall/linux/abi.rs",
+          "line": 1153,
+          "end_line": 1160
+        }
+      ]
+    },
+    {
+      "id": "step",
+      "lane": "instrument",
+      "col": 3,
+      "type": "backend",
+      "label": "SINGLESTEP",
+      "sublabel": "was answered as SYSCALL",
+      "tag": "one instruction now",
+      "width": 148,
+      "sources": [
+        {
+          "path": "src/syscall/linux/proc.rs",
+          "line": 1759,
+          "end_line": 1770
+        },
+        {
+          "path": "arch/src/arch/x86_64/idt.rs",
+          "line": 511,
+          "end_line": 520
+        }
+      ]
+    },
+    {
+      "id": "brk",
+      "lane": "instrument",
+      "col": 4,
+      "type": "backend",
+      "label": "planted int3",
+      "sublabel": "tracer's stop, rip rewound",
+      "width": 148,
+      "sources": [
+        {
+          "path": "arch/src/arch/x86_64/idt.rs",
+          "line": 588,
+          "end_line": 600
+        }
+      ]
+    },
+    {
+      "id": "p_cond",
+      "lane": "probes",
+      "col": 2,
+      "type": "security",
+      "label": "wrong break test",
+      "sublabel": "rip >= call matched a callee",
+      "width": 148
+    },
+    {
+      "id": "p_read",
+      "lane": "probes",
+      "col": 3,
+      "type": "security",
+      "label": "read too early",
+      "sublabel": "stop sits on the instruction",
+      "width": 148
+    },
+    {
+      "id": "p_off",
+      "lane": "probes",
+      "col": 4,
+      "type": "security",
+      "label": "guessed struct offset",
+      "sublabel": "three separate times",
+      "width": 148
+    },
+    {
+      "id": "p_step",
+      "lane": "probes",
+      "col": 5,
+      "type": "security",
+      "label": "60-step sampling",
+      "sublabel": "never reached the insert",
+      "width": 148
+    },
+    {
+      "id": "h_mangle",
+      "lane": "hypotheses",
+      "col": 1,
+      "type": "messagebus",
+      "label": "PTR_MANGLE broken",
+      "sublabel": "guard was non-zero",
+      "width": 140
+    },
+    {
+      "id": "h_init",
+      "lane": "hypotheses",
+      "col": 2,
+      "type": "messagebus",
+      "label": ".init_array skipped",
+      "sublabel": "constructors did run",
+      "width": 140
+    },
+    {
+      "id": "h_rec",
+      "lane": "hypotheses",
+      "col": 3,
+      "type": "messagebus",
+      "label": "infinite recursion",
+      "sublabel": "guard byte works",
+      "width": 140
+    },
+    {
+      "id": "h_bss",
+      "lane": "hypotheses",
+      "col": 4,
+      "type": "messagebus",
+      "label": ".bss write lost",
+      "sublabel": "263 pages read back",
+      "width": 140
+    },
+    {
+      "id": "page",
+      "lane": "frontier",
+      "col": 5,
+      "type": "database",
+      "label": "last .bss page -> 0xff",
+      "sublabel": "sentinel intact while alive",
+      "tag": "kernel page lifetime",
+      "width": 168,
+      "sources": [
+        {
+          "path": "docs/notes/07-chromium-analysis.md",
+          "line": 1780,
+          "end_line": 1856
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "from": "symptom",
+      "to": "seize",
+      "label": "needs a tracer",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e2",
+      "from": "seize",
+      "to": "listen",
+      "variant": "default"
+    },
+    {
+      "id": "e3",
+      "from": "listen",
+      "to": "step",
+      "label": "then real stepping",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e4",
+      "from": "step",
+      "to": "brk",
+      "variant": "default"
+    },
+    {
+      "id": "e5",
+      "from": "brk",
+      "to": "page",
+      "label": "brackets the fault",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e6",
+      "from": "listen",
+      "to": "p_cond",
+      "label": "misread",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e7",
+      "from": "step",
+      "to": "p_read",
+      "label": "misread",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e8",
+      "from": "brk",
+      "to": "p_off",
+      "label": "misread",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e9",
+      "from": "p_off",
+      "to": "p_step",
+      "label": "and again",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e10",
+      "from": "h_mangle",
+      "to": "h_init",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e11",
+      "from": "h_init",
+      "to": "h_rec",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e12",
+      "from": "h_rec",
+      "to": "h_bss",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e13",
+      "from": "h_bss",
+      "to": "page",
+      "label": "only this survived",
+      "variant": "emphasis",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Six readings, all retracted",
+      "items": [
+        "Each was found by asking what the probe would print if its own assumption were wrong",
+        "One of them (the 60-step sampling) produced the wrong causal story that the next round had to unpick"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "What the instrument still lacks",
+      "items": [
+        "PTRACE_SINGLESTEP and planted breakpoints have no pin yet",
+        "A breakpoint experiment that asks a control-flow question needs one patch at a time"
+      ]
+    }
+  ]
+}

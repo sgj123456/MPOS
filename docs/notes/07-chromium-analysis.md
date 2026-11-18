@@ -1844,6 +1844,75 @@ source (there is no `0xff` poison in `mm` or `child_exit`), so either it comes
 from a path not yet read, or from a frame that was freed and re-filled by an
 allocator this tree does share. That is what the next run decides.
 
+## 4p. The `0xff` was the probe's own error return, and TLS is fine
+
+§4o's headline - "the last `.bss` page is filled with `0xff` at the moment of
+death" - is **wrong, and it was the probe.** Two readings settle it.
+
+**`ptrace` returns `-1` with an errno when it cannot read, and my probe cast that
+to an unsigned word.** With the return value honoured
+(`build/scratch/zprobe/{strict,pre,notrace}.c`):
+
+```
+stop 0: alive=0 peek_ok=0 val=0 errno=3
+```
+
+The stop that reports the death is not a stop at all - the task is gone - and
+`PTRACE_PEEKDATA` answers `ESRCH`, whose `-1` is `0xffffffffffffffff`. Every
+`0xff...ff` in §4o is that sentinel read as data. Read through `/proc/<pid>/mem`
+instead, the same page answers `0x5e571e1100000001` while alive and `EIO` at
+death, never `0xff`.
+
+**And `ESRCH` is Linux's own answer there**: measured on the host
+(`build/scratch/zprobe/lx.c`), `open("/proc/<pid>/mem")` on an unreaped zombie is
+`-1 ESRCH` on Linux 7.3.4 too.
+
+**TLS is not the defect either.** §4p's momentary suspect was `%fs` being zero,
+because `PTRACE_GETREGS` reported `fs_base=0`. That field is `uregs::FS_BASE`
+(`src/syscall/linux/abi.rs:1273`), which **nothing in this kernel ever writes** -
+`ARCH_SET_FS` stores the base on the task and calls `hal::set_thread_pointer`,
+the register file's slot stays zero. A probe reading it reads a constant. The
+kernel's TLS works:
+
+```
+tlsvar = 0x1234
+after write = 0x5678
+```
+
+So `%fs` is live, per-thread variables have their own copy, and glibc's
+`__libc_setup_tls` reaches `ARCH_SET_FS` successfully.
+
+**Where that leaves the defect - and it is a real one.** With one patch at a time
+and the return values honoured:
+
+```
+AT 47c057 (2nd insert): obj.root ok=1 0x4c2160  frm.root ok=1 0
+btree_allocate_node: rdi(tree)=0x4c0270 rsi=0  tree+8(freelist)=0
+  after malloc: rip=0x40b127 rax=0
+```
+
+`btree_allocate_node` calls `__libc_malloc(0x100)` and gets **NULL**, then writes
+through it at `0x47a983` with no null check (`movq $0x1,(%rax)`) - a store to
+address 0, which is the `SIGSEGV`. And `malloc(0x100)` is not exhausted:
+
+```
+allocated 4000 blocks of 0x100 and filled them
+malloc(64MiB) = 0x7edf27a80010 errno=0
+filled 64MiB ok
+```
+
+So the open question is now sharp and entirely inside `__libc_malloc`: why it
+returns NULL for 0x100 bytes **at that moment** - during `frame_dummy`, i.e. from
+inside `.init_array`, before `main` has run - when the same size succeeds
+thousands of times afterwards. The next measurement is the malloc path's own
+state at that call: `mp_` at `0x4b9120` and the TLS slot it dereferences at
+`%fs-0x50`.
+
+**Tally**: seven wrong probe readings retracted (a `>=` break condition, reads
+taken before the instruction, three struct-offset guesses, a 60-step sampling, and
+this `-1`-as-data), plus two wrong models (infinite recursion, `.bss` page
+clobbered). The instrument has been the harder subject in every one of them.
+
 ## 5. Third item — the GFXINFO/sandbox surface, unmeasured here
 
 Not reached in this run because the process died before the browser proper started,
